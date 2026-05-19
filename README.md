@@ -20,7 +20,7 @@ This app will replace the old Outer Loop Services UI and the built-in log viewer
 
 ```bash
 PORT=7354
-./build/macos/Release/BackendsBackend --port "$PORT" --bundles-dir ./build/run/bundles
+./build/macos/Release/NavigatorBackend --port "$PORT" --bundles-dir ./build/run/bundles
 ```
 
 Open this URL in Outer Loop or Outerframe:
@@ -33,7 +33,7 @@ For Outer Loop-managed deployments, prefer a Unix socket and register that socke
 
 ```bash
 SOCKET_PATH="$XDG_RUNTIME_DIR/dev.outergroup.Navigator"
-./build/macos/Release/BackendsBackend \
+./build/macos/Release/NavigatorBackend \
   --socket-path "$SOCKET_PATH" \
   --bundles-dir ./build/run/bundles
 outerctl app add --backend dev.outergroup.Navigator \
@@ -43,11 +43,14 @@ outerctl app add --backend dev.outergroup.Navigator \
   --home-screen
 ```
 
+Navigator uses `/` for Apps, `/backends` for the backend table, and `/new` for
+the create flow.
+
 For a user systemd unit, use `%t` for the socket root so systemd resolves it to
 the user's `XDG_RUNTIME_DIR`:
 
 ```ini
-ExecStart=/path/to/BackendsBackend --socket-path %t/dev.outergroup.Navigator --bundles-dir /path/to/bundles
+ExecStart=/path/to/NavigatorBackend --socket-path %t/dev.outergroup.Navigator --bundles-dir /path/to/bundles
 ```
 
 By default the backend reads the user registry:
@@ -65,7 +68,7 @@ On Linux it also reads the system/root registry:
 Override the user registry path with either `--database`, `BACKENDS_REGISTRY_DB`, or `OUTERLOOP_REGISTRY_DB`. Override the system registry path with `--system-database`, `BACKENDS_SYSTEM_REGISTRY_DB`, or `OUTERLOOP_SYSTEM_REGISTRY_DB`.
 
 ```bash
-./build/macos/Release/BackendsBackend \
+./build/macos/Release/NavigatorBackend \
   --port 7354 \
   --bundles-dir ./build/run/bundles \
   --database ~/Library/dev.outergroup.OuterLoop/registry.sqlite3

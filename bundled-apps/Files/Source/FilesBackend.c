@@ -42,6 +42,7 @@ static char g_backend_label[256] = "dev.outergroup.Files";
 static char g_outerctl_path[PATH_MAX] = "";
 static char g_app_icon_path[PATH_MAX] = "";
 static char g_listen_socket_path[PATH_MAX] = "";
+static bool g_systemd_socket_activation = false;
 static volatile sig_atomic_t g_shutdown_requested = 0;
 static volatile sig_atomic_t g_listener_fd = -1;
 
@@ -417,7 +418,7 @@ static void run_outerctl_announcement(const char *action, int port, const char *
 }
 
 static void cleanup_handler(void) {
-    if (g_listen_socket_path[0]) {
+    if (g_listen_socket_path[0] && !g_systemd_socket_activation) {
         run_outerctl_announcement("remove", 0, g_listen_socket_path);
         unlink(g_listen_socket_path);
     }
@@ -892,7 +893,7 @@ static int create_unix_listener(const char *socket_path) {
         close(fd);
         return -1;
     }
-    if (chmod(socket_path, geteuid() == 0 ? 0666 : 0600) != 0) {
+    if (chmod(socket_path, 0600) != 0) {
         perror("chmod");
         close(fd);
         unlink(socket_path);
@@ -906,6 +907,29 @@ static int create_unix_listener(const char *socket_path) {
     }
     snprintf(g_listen_socket_path, sizeof(g_listen_socket_path), "%s", socket_path);
     return fd;
+}
+
+static int systemd_activated_listener(void) {
+    const char *listen_pid = getenv("LISTEN_PID");
+    const char *listen_fds = getenv("LISTEN_FDS");
+    if (!listen_pid || !listen_fds) {
+        return -1;
+    }
+    char *end = NULL;
+    long pid = strtol(listen_pid, &end, 10);
+    if (!end || *end != '\0' || pid != (long)getpid()) {
+        return -1;
+    }
+    end = NULL;
+    long fds = strtol(listen_fds, &end, 10);
+    if (!end || *end != '\0' || fds < 1) {
+        return -1;
+    }
+    unsetenv("LISTEN_PID");
+    unsetenv("LISTEN_FDS");
+    unsetenv("LISTEN_FDNAMES");
+    g_systemd_socket_activation = true;
+    return 3;
 }
 
 static void usage(const char *program) {
@@ -955,7 +979,12 @@ int main(int argc, char **argv) {
     signal(SIGPIPE, SIG_IGN);
     atexit(cleanup_handler);
 
-    int listener = use_port ? create_tcp_listener(port) : create_unix_listener(socket_path);
+    int listener = !use_port ? systemd_activated_listener() : -1;
+    if (listener < 0) {
+        listener = use_port ? create_tcp_listener(port) : create_unix_listener(socket_path);
+    } else if (socket_path[0]) {
+        snprintf(g_listen_socket_path, sizeof(g_listen_socket_path), "%s", socket_path);
+    }
     if (listener < 0) {
         return 1;
     }
@@ -969,6 +998,20 @@ int main(int argc, char **argv) {
     }
 
     while (!g_shutdown_requested) {
+        if (g_systemd_socket_activation) {
+            struct pollfd poll_fd = {.fd = listener, .events = POLLIN};
+            int poll_result = poll(&poll_fd, 1, 60000);
+            if (poll_result == 0) {
+                break;
+            }
+            if (poll_result < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                perror("poll");
+                break;
+            }
+        }
         struct sockaddr_storage peer;
         socklen_t peer_len = sizeof(peer);
         int client = accept(listener, (struct sockaddr *)&peer, &peer_len);

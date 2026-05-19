@@ -418,11 +418,23 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate {
 
     private func modeFromURL(_ urlString: String?) -> BackendsViewMode {
         guard let urlString,
-              let components = URLComponents(string: urlString),
-              let view = components.queryItems?.first(where: { $0.name == "view" })?.value else {
+              let components = URLComponents(string: urlString) else {
             return .apps
         }
-        switch view {
+
+        let normalizedPath = components.path.trimmingCharacters(in: CharacterSet(charactersIn: "/")).lowercased()
+        switch normalizedPath {
+        case "backends":
+            return .backends
+        case "new":
+            return .create
+        case "", "apps":
+            return .apps
+        default:
+            break
+        }
+
+        switch components.queryItems?.first(where: { $0.name == "view" })?.value {
         case "backends":
             return .backends
         case "new":
@@ -439,10 +451,13 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate {
         }
         var queryItems = components.queryItems ?? []
         queryItems.removeAll { $0.name == "view" }
-        if mode == .backends {
-            queryItems.append(URLQueryItem(name: "view", value: "backends"))
-        } else if mode == .create {
-            queryItems.append(URLQueryItem(name: "view", value: "new"))
+        switch mode {
+        case .apps:
+            components.path = "/"
+        case .backends:
+            components.path = "/backends"
+        case .create:
+            components.path = "/new"
         }
         components.queryItems = queryItems.isEmpty ? nil : queryItems
         return components.url
@@ -475,6 +490,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate {
     private func animateIconTransition(to nextMode: BackendsViewMode) {
         let startStates = iconMatchStates
         let startTextStates = textMatchStates
+        let startIconLayers = iconMatchLayers
+        let startTextLayers = textMatchLayers
         let previousMode = mode
         let outgoingLayers = visibleModeLayers(for: previousMode)
         let wasRecordingTransitionTargets = isRecordingTransitionTargets
@@ -489,13 +506,29 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate {
         let incomingLayers = visibleModeLayers(for: nextMode)
         let sharedKeys = Set(startStates.keys).intersection(endStates.keys)
         let sharedTextKeys = Set(startTextStates.keys).intersection(endTextStates.keys)
+        let incomingIconKeys = Set(endStates.keys).subtracting(startStates.keys)
+        let outgoingIconKeys = Set(startStates.keys).subtracting(endStates.keys)
+        let incomingTextKeys = Set(endTextStates.keys).subtracting(startTextStates.keys)
+        let outgoingTextKeys = Set(startTextStates.keys).subtracting(endTextStates.keys)
         guard !sharedKeys.isEmpty || !sharedTextKeys.isEmpty || !outgoingLayers.isEmpty || !incomingLayers.isEmpty else { return }
 
         prepareCrossfade(from: outgoingLayers, to: incomingLayers)
+        prepareMatchedLayerFades(incomingIconKeys: incomingIconKeys,
+                                 outgoingIconKeys: outgoingIconKeys,
+                                 incomingTextKeys: incomingTextKeys,
+                                 outgoingTextKeys: outgoingTextKeys,
+                                 startIconLayers: startIconLayers,
+                                 startTextLayers: startTextLayers)
 
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         animateCrossfade(from: outgoingLayers, to: incomingLayers)
+        animateMatchedLayerFades(incomingIconKeys: incomingIconKeys,
+                                 outgoingIconKeys: outgoingIconKeys,
+                                 incomingTextKeys: incomingTextKeys,
+                                 outgoingTextKeys: outgoingTextKeys,
+                                 startIconLayers: startIconLayers,
+                                 startTextLayers: startTextLayers)
         for key in sharedKeys {
             guard let start = startStates[key],
                   let end = endStates[key],
@@ -569,6 +602,106 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate {
             guard let self else { return }
             self.finishCrossfade(from: outgoingLayers, to: incomingLayers, currentMode: nextMode)
             self.finishMatchedTextTransition(endTextStates: endTextStates, sharedTextKeys: sharedTextKeys)
+            self.finishMatchedLayerFades(incomingIconKeys: incomingIconKeys,
+                                         outgoingIconKeys: outgoingIconKeys,
+                                         incomingTextKeys: incomingTextKeys,
+                                         outgoingTextKeys: outgoingTextKeys,
+                                         startIconLayers: startIconLayers,
+                                         startTextLayers: startTextLayers,
+                                         currentMode: nextMode)
+        }
+    }
+
+    private func prepareMatchedLayerFades(incomingIconKeys: Set<String>,
+                                          outgoingIconKeys: Set<String>,
+                                          incomingTextKeys: Set<String>,
+                                          outgoingTextKeys: Set<String>,
+                                          startIconLayers: [String: CALayer],
+                                          startTextLayers: [String: CATextLayer]) {
+        withoutImplicitAnimations {
+            for key in incomingIconKeys {
+                guard let layer = iconMatchLayers[key] else { continue }
+                layer.isHidden = false
+                layer.opacity = 0
+            }
+            for key in incomingTextKeys {
+                guard let layer = textMatchLayers[key] else { continue }
+                layer.isHidden = false
+                layer.opacity = 0
+            }
+            for key in outgoingIconKeys {
+                guard let layer = startIconLayers[key] else { continue }
+                layer.isHidden = false
+                layer.opacity = 1
+            }
+            for key in outgoingTextKeys {
+                guard let layer = startTextLayers[key] else { continue }
+                layer.isHidden = false
+                layer.opacity = 1
+            }
+        }
+    }
+
+    private func animateMatchedLayerFades(incomingIconKeys: Set<String>,
+                                          outgoingIconKeys: Set<String>,
+                                          incomingTextKeys: Set<String>,
+                                          outgoingTextKeys: Set<String>,
+                                          startIconLayers: [String: CALayer],
+                                          startTextLayers: [String: CATextLayer]) {
+        for key in incomingIconKeys {
+            guard let layer = iconMatchLayers[key] else { continue }
+            addOpacityAnimation(to: layer, from: 0, to: 1, key: "matchedIconAppear")
+            layer.opacity = 1
+        }
+        for key in incomingTextKeys {
+            guard let layer = textMatchLayers[key] else { continue }
+            addOpacityAnimation(to: layer, from: 0, to: 1, key: "matchedTextAppear")
+            layer.opacity = 1
+        }
+        for key in outgoingIconKeys {
+            guard let layer = startIconLayers[key] else { continue }
+            addOpacityAnimation(to: layer, from: 1, to: 0, key: "matchedIconDisappear")
+            layer.opacity = 0
+        }
+        for key in outgoingTextKeys {
+            guard let layer = startTextLayers[key] else { continue }
+            addOpacityAnimation(to: layer, from: 1, to: 0, key: "matchedTextDisappear")
+            layer.opacity = 0
+        }
+    }
+
+    private func finishMatchedLayerFades(incomingIconKeys: Set<String>,
+                                         outgoingIconKeys: Set<String>,
+                                         incomingTextKeys: Set<String>,
+                                         outgoingTextKeys: Set<String>,
+                                         startIconLayers: [String: CALayer],
+                                         startTextLayers: [String: CATextLayer],
+                                         currentMode: BackendsViewMode) {
+        withoutImplicitAnimations {
+            for key in incomingIconKeys {
+                guard let layer = iconMatchLayers[key] else { continue }
+                layer.removeAnimation(forKey: "matchedIconAppear")
+                layer.opacity = 1
+                layer.isHidden = mode != currentMode
+            }
+            for key in incomingTextKeys {
+                guard let layer = textMatchLayers[key] else { continue }
+                layer.removeAnimation(forKey: "matchedTextAppear")
+                layer.opacity = 1
+                layer.isHidden = mode != currentMode
+            }
+            for key in outgoingIconKeys {
+                guard let layer = startIconLayers[key] else { continue }
+                layer.removeAnimation(forKey: "matchedIconDisappear")
+                layer.opacity = 1
+                layer.isHidden = true
+            }
+            for key in outgoingTextKeys {
+                guard let layer = startTextLayers[key] else { continue }
+                layer.removeAnimation(forKey: "matchedTextDisappear")
+                layer.opacity = 1
+                layer.isHidden = true
+            }
         }
     }
 
@@ -2172,8 +2305,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate {
     }
 
     private func appLauncherItems() -> [AppLauncherItem] {
-        backends.flatMap { backend in
-            backend.frontends.enumerated().compactMap { index, frontend in
+        backends.flatMap { backend -> [AppLauncherItem] in
+            guard !backend.isBackendsSelf else { return [] }
+            return backend.frontends.enumerated().compactMap { index, frontend in
                 guard frontend.hasEndpoint else { return nil }
                 return AppLauncherItem(backend: backend, frontend: frontend, frontendIndex: index)
             }

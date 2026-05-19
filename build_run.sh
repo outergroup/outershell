@@ -40,15 +40,16 @@ echo "==> Archiving BackendsContent bundles"
     "${RUN_ROOT}/bundles" \
     BackendsContent.bundle
 
-echo "==> Building BackendsBackend"
+echo "==> Building NavigatorBackend"
 cc -std=gnu17 -Wall -Wextra -O2 \
-    -o "${BUILD_ROOT}/${CONFIGURATION}/BackendsBackend" \
+    -o "${BUILD_ROOT}/${CONFIGURATION}/NavigatorBackend" \
     "${SCRIPT_DIR}/Backend/main.c" \
     -lsqlite3
+ln -sf NavigatorBackend "${BUILD_ROOT}/${CONFIGURATION}/BackendsBackend"
 
 echo "Built:"
-echo "  ${BUILD_ROOT}/${CONFIGURATION}/BackendsBackend"
+echo "  ${BUILD_ROOT}/${CONFIGURATION}/NavigatorBackend"
 echo "  ${RUN_ROOT}/bundles"
 echo
 echo "Run:"
-echo "  \"${BUILD_ROOT}/${CONFIGURATION}/BackendsBackend\" --port 7354 --bundles-dir \"${RUN_ROOT}/bundles\""
+echo "  \"${BUILD_ROOT}/${CONFIGURATION}/NavigatorBackend\" --port 7354 --bundles-dir \"${RUN_ROOT}/bundles\""

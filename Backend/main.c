@@ -48,6 +48,7 @@ static char g_bundle_file_path_macos_x86[PATH_MAX] = "";
 static char g_registry_database_path[PATH_MAX] = "";
 static char g_system_registry_database_path[PATH_MAX] = "";
 static char g_listen_socket_path[PATH_MAX] = "";
+static bool g_systemd_socket_activation = false;
 static volatile sig_atomic_t g_shutdown_requested = 0;
 static volatile sig_atomic_t g_listener_fd = -1;
 
@@ -62,6 +63,7 @@ typedef struct {
     const char *icon_name;
     const char *source_name;
     const char *socket_name;
+    bool socket_activated;
     const char *version;
 } BundledAppDefinition;
 
@@ -77,6 +79,7 @@ static const BundledAppDefinition kBundledApps[] = {
         .icon_name = "app-icon.png",
         .source_name = "TopBackend.c",
         .socket_name = "dev.outergroup.Top",
+        .socket_activated = false,
         .version = "1"
     },
     {
@@ -90,6 +93,7 @@ static const BundledAppDefinition kBundledApps[] = {
         .icon_name = "",
         .source_name = "FilesBackend.c",
         .socket_name = "dev.outergroup.Files",
+        .socket_activated = true,
         .version = "1"
     }
 };
@@ -439,6 +443,36 @@ static const BundledAppDefinition *bundled_app_for_service_id(const char *servic
     return NULL;
 }
 
+static void systemd_socket_unit_name(const char *unit_name, char *out, size_t out_size) {
+    snprintf(out, out_size, "%s", unit_name && unit_name[0] ? unit_name : "");
+    size_t length = strlen(out);
+    const char *suffix = ".service";
+    size_t suffix_length = strlen(suffix);
+    if (length > suffix_length && strcmp(out + length - suffix_length, suffix) == 0) {
+        snprintf(out + length - suffix_length, out_size - (length - suffix_length), ".socket");
+    }
+}
+
+static void bundled_socket_path_for_scope(const BundledAppDefinition *app,
+                                          const char *scope,
+                                          char *out,
+                                          size_t out_size) {
+    if (!app || !app->socket_name || !app->socket_name[0]) {
+        out[0] = '\0';
+        return;
+    }
+    if (scope && strcmp(scope, "system") == 0) {
+        snprintf(out, out_size, "/run/%s", app->socket_name);
+        return;
+    }
+    const char *runtime_dir = getenv("XDG_RUNTIME_DIR");
+    if (runtime_dir && runtime_dir[0]) {
+        snprintf(out, out_size, "%s/%s", runtime_dir, app->socket_name);
+    } else {
+        snprintf(out, out_size, "/run/user/%d/%s", (int)getuid(), app->socket_name);
+    }
+}
+
 static bool safe_service_directory_name(const char *value) {
     if (!value || !value[0] || value[0] == '.') return false;
     for (const char *p = value; *p; p++) {
@@ -662,6 +696,22 @@ static void systemd_status(const char *unit_name, const char *scope, char *out, 
     if (result == 0) {
         snprintf(out, out_size, "running");
     } else if (WIFEXITED(result) && WEXITSTATUS(result) == 3) {
+        for (size_t i = 0; i < sizeof(kBundledApps) / sizeof(kBundledApps[0]); i++) {
+            if (!kBundledApps[i].socket_activated || strcmp(kBundledApps[i].unit_name, unit_name) != 0) {
+                continue;
+            }
+            char socket_unit[256];
+            char quoted_socket_unit[320];
+            systemd_socket_unit_name(unit_name, socket_unit, sizeof(socket_unit));
+            if (safe_unit_name(socket_unit)) {
+                shell_quote(socket_unit, quoted_socket_unit, sizeof(quoted_socket_unit));
+                snprintf(command, sizeof(command), "timeout 2s systemctl %s is-active --quiet %s", scope_argument, quoted_socket_unit);
+                if (system(command) == 0) {
+                    snprintf(out, out_size, "available");
+                    return;
+                }
+            }
+        }
         snprintf(out, out_size, "stopped");
     } else {
         snprintf(out, out_size, "unknown");
@@ -1777,6 +1827,7 @@ static bool upsert_systemd_backend_registry(const char *service_id,
                                             const char *display_name,
                                             const char *unit_name,
                                             const char *scope,
+                                            const char *socket_path,
                                             const char *log_path,
                                             const char *icon_path,
                                             char *error,
@@ -1816,6 +1867,26 @@ static bool upsert_systemd_backend_registry(const char *service_id,
     }
     if (ok) {
         ok = bind_and_step(database, "DELETE FROM frontends WHERE service_id = ?;", service_id, NULL, NULL, NULL, error, error_size);
+    }
+    if (ok && socket_path && socket_path[0]) {
+        sqlite3_stmt *statement = NULL;
+        const char *sql =
+            "INSERT INTO frontends(url, service_id, name, port, socket_path, icon) VALUES(?, ?, ?, 0, ?, ?);";
+        ok = sqlite3_prepare_v2(database, sql, -1, &statement, NULL) == SQLITE_OK;
+        if (ok) {
+            sqlite3_bind_text(statement, 1, socket_path, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(statement, 2, service_id, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(statement, 3, display_name, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(statement, 4, socket_path, -1, SQLITE_TRANSIENT);
+            if (icon_path && icon_path[0]) {
+                sqlite3_bind_text(statement, 5, icon_path, -1, SQLITE_TRANSIENT);
+            } else {
+                sqlite3_bind_null(statement, 5);
+            }
+            ok = sqlite3_step(statement) == SQLITE_DONE;
+        }
+        if (!ok) snprintf(error, error_size, "%s", sqlite3_errmsg(database));
+        if (statement) sqlite3_finalize(statement);
     }
     if (ok) {
         ok = bind_and_step(database, "DELETE FROM log_files WHERE service_id = ?;", service_id, NULL, NULL, NULL, error, error_size);
@@ -1983,6 +2054,12 @@ static bool install_bundled_app(const BundledAppDefinition *app, const char *sco
         snprintf(log_path, sizeof(log_path), "/var/log/outergroup/%s.log", app->service_id);
         char unit_path[PATH_MAX];
         snprintf(unit_path, sizeof(unit_path), "/etc/systemd/system/%s", app->unit_name);
+        char socket_unit_name[256] = "";
+        char socket_unit_path[PATH_MAX] = "";
+        if (app->socket_activated) {
+            systemd_socket_unit_name(app->unit_name, socket_unit_name, sizeof(socket_unit_name));
+            snprintf(socket_unit_path, sizeof(socket_unit_path), "/etc/systemd/system/%s", socket_unit_name);
+        }
 
         char user_unit_path[PATH_MAX];
         snprintf(user_unit_path, sizeof(user_unit_path), "%s/.config/systemd/user/%s", home_directory(), app->unit_name);
@@ -1992,6 +2069,17 @@ static bool install_bundled_app(const BundledAppDefinition *app, const char *sco
         snprintf(stop_user_command, sizeof(stop_user_command), "systemctl --user disable --now %s >/dev/null 2>&1 || true", quoted_unit);
         run_shell_ignored(stop_user_command);
         unlink(user_unit_path);
+        if (app->socket_activated) {
+            char user_socket_unit[256];
+            char quoted_user_socket_unit[320];
+            char user_socket_path[PATH_MAX];
+            systemd_socket_unit_name(app->unit_name, user_socket_unit, sizeof(user_socket_unit));
+            shell_quote(user_socket_unit, quoted_user_socket_unit, sizeof(quoted_user_socket_unit));
+            snprintf(stop_user_command, sizeof(stop_user_command), "systemctl --user disable --now %s >/dev/null 2>&1 || true", quoted_user_socket_unit);
+            run_shell_ignored(stop_user_command);
+            snprintf(user_socket_path, sizeof(user_socket_path), "%s/.config/systemd/user/%s", home_directory(), user_socket_unit);
+            unlink(user_socket_path);
+        }
         run_shell_ignored("systemctl --user daemon-reload >/dev/null 2>&1 || true");
 
         const char *binary_source = has_source_code ? compiled_binary : source_binary;
@@ -2009,6 +2097,9 @@ static bool install_bundled_app(const BundledAppDefinition *app, const char *sco
         char quoted_wrapper_path[PATH_MAX + 8];
         char quoted_log_path[PATH_MAX + 8];
         char quoted_unit_path[PATH_MAX + 8];
+        char quoted_socket_unit[320] = "";
+        char quoted_socket_unit_path[PATH_MAX + 8] = "";
+        char quoted_actual_socket_path[PATH_MAX + 8] = "";
         shell_quote(binary_source, quoted_binary_source, sizeof(quoted_binary_source));
         shell_quote(source_bundle_arm, quoted_source_bundle_arm, sizeof(quoted_source_bundle_arm));
         shell_quote(source_bundle_x86, quoted_source_bundle_x86, sizeof(quoted_source_bundle_x86));
@@ -2023,6 +2114,8 @@ static bool install_bundled_app(const BundledAppDefinition *app, const char *sco
         shell_quote(wrapper_path, quoted_wrapper_path, sizeof(quoted_wrapper_path));
         shell_quote(log_path, quoted_log_path, sizeof(quoted_log_path));
         shell_quote(unit_path, quoted_unit_path, sizeof(quoted_unit_path));
+        if (socket_unit_name[0]) shell_quote(socket_unit_name, quoted_socket_unit, sizeof(quoted_socket_unit)); else quoted_socket_unit[0] = '\0';
+        if (socket_unit_path[0]) shell_quote(socket_unit_path, quoted_socket_unit_path, sizeof(quoted_socket_unit_path)); else quoted_socket_unit_path[0] = '\0';
 
         char quoted_binary[PATH_MAX + 8];
         char quoted_bundles[PATH_MAX + 8];
@@ -2032,6 +2125,8 @@ static bool install_bundled_app(const BundledAppDefinition *app, const char *sco
         char quoted_display_name[512];
         char quoted_target_icon_for_registry[PATH_MAX + 8];
         char quoted_socket_path[PATH_MAX + 32];
+        char actual_socket_path[PATH_MAX] = "";
+        char systemd_socket_path[PATH_MAX] = "";
         shell_quote(target_binary, quoted_binary, sizeof(quoted_binary));
         shell_quote(bundles_dir, quoted_bundles, sizeof(quoted_bundles));
         if (target_icon[0]) shell_quote(target_icon, quoted_icon, sizeof(quoted_icon)); else quoted_icon[0] = '\0';
@@ -2040,11 +2135,13 @@ static bool install_bundled_app(const BundledAppDefinition *app, const char *sco
         shell_quote(app->display_name, quoted_display_name, sizeof(quoted_display_name));
         shell_quote(target_icon, quoted_target_icon_for_registry, sizeof(quoted_target_icon_for_registry));
         if (app->socket_name && app->socket_name[0]) {
-            char socket_path[PATH_MAX];
-            snprintf(socket_path, sizeof(socket_path), "%%t/%s", app->socket_name);
-            shell_quote(socket_path, quoted_socket_path, sizeof(quoted_socket_path));
+            snprintf(systemd_socket_path, sizeof(systemd_socket_path), "%%t/%s", app->socket_name);
+            shell_quote(systemd_socket_path, quoted_socket_path, sizeof(quoted_socket_path));
+            bundled_socket_path_for_scope(app, "system", actual_socket_path, sizeof(actual_socket_path));
+            shell_quote(actual_socket_path, quoted_actual_socket_path, sizeof(quoted_actual_socket_path));
         } else {
             quoted_socket_path[0] = '\0';
+            quoted_actual_socket_path[0] = '\0';
         }
 
         char run_script[PATH_MAX * 4];
@@ -2101,6 +2198,23 @@ static bool install_bundled_app(const BundledAppDefinition *app, const char *sco
                  wrapper_path,
                  quoted_run_script);
 
+        char socket_contents[2048] = "";
+        if (app->socket_activated && quoted_socket_path[0]) {
+            snprintf(socket_contents, sizeof(socket_contents),
+                     "[Unit]\n"
+                     "Description=%s Socket\n"
+                     "\n"
+                     "[Socket]\n"
+                     "ListenStream=%s\n"
+                     "SocketMode=%s\n"
+                     "\n"
+                     "[Install]\n"
+                     "WantedBy=sockets.target\n",
+                     description,
+                     systemd_socket_path,
+                     strcmp(app->service_id, "dev.outergroup.Files") == 0 ? "0666" : "0600");
+        }
+
         char quoted_outerctl[PATH_MAX + 8];
         char quoted_system_outeragent_root[PATH_MAX + 8];
         char outerctl_path[PATH_MAX];
@@ -2150,6 +2264,13 @@ static bool install_bundled_app(const BundledAppDefinition *app, const char *sco
                 quoted_target_bundle_arm,
                 quoted_source_bundle_x86,
                 quoted_target_bundle_x86);
+        if (quoted_socket_unit[0]) {
+            fprintf(script,
+                    "systemctl --system disable --now %s >/dev/null 2>&1 || true\n"
+                    "systemctl --system reset-failed %s >/dev/null 2>&1 || true\n",
+                    quoted_socket_unit,
+                    quoted_socket_unit);
+        }
         if (quoted_source_icon[0] && quoted_target_icon[0]) {
             fprintf(script, "install -m 0644 %s %s\n", quoted_source_icon, quoted_target_icon);
         }
@@ -2162,7 +2283,7 @@ static bool install_bundled_app(const BundledAppDefinition *app, const char *sco
                 "chmod 0644 %s\n"
                 "touch %s\n"
                 "chmod 0644 %s\n"
-                "REGISTRY_ROOT=%s SERVICE_ID=%s DISPLAY_NAME=%s UNIT_NAME=%s LOG_PATH=%s ICON_PATH=%s python3 - <<'__BACKENDS_REGISTRY__'\n"
+                "REGISTRY_ROOT=%s SERVICE_ID=%s DISPLAY_NAME=%s UNIT_NAME=%s LOG_PATH=%s ICON_PATH=%s SOCKET_PATH=%s python3 - <<'__BACKENDS_REGISTRY__'\n"
                 "import os, sqlite3\n"
                 "root = os.environ['REGISTRY_ROOT']\n"
                 "service_id = os.environ['SERVICE_ID']\n"
@@ -2170,6 +2291,7 @@ static bool install_bundled_app(const BundledAppDefinition *app, const char *sco
                 "unit_name = os.environ['UNIT_NAME']\n"
                 "log_path = os.environ['LOG_PATH']\n"
                 "icon_path = os.environ.get('ICON_PATH') or None\n"
+                "socket_path = os.environ.get('SOCKET_PATH') or ''\n"
                 "os.makedirs(root, exist_ok=True)\n"
                 "database_path = os.path.join(root, 'registry.sqlite3')\n"
                 "database = sqlite3.connect(database_path)\n"
@@ -2208,15 +2330,15 @@ static bool install_bundled_app(const BundledAppDefinition *app, const char *sco
                 "    database.execute('INSERT INTO backends(service_id, display_name, icon, service_unit) VALUES(?, ?, ?, ?) ON CONFLICT(service_id) DO UPDATE SET display_name=excluded.display_name, icon=excluded.icon, service_unit=excluded.service_unit', (service_id, display_name, icon_path, unit_name))\n"
                 "    database.execute('INSERT INTO systemd_backends(service_id, unit_name, scope) VALUES(?, ?, ?) ON CONFLICT(service_id) DO UPDATE SET unit_name=excluded.unit_name, scope=excluded.scope', (service_id, unit_name, 'system'))\n"
                 "    database.execute('DELETE FROM frontends WHERE service_id = ?', (service_id,))\n"
+                "    if socket_path:\n"
+                "        database.execute('INSERT INTO frontends(url, service_id, name, port, socket_path, icon) VALUES(?, ?, ?, 0, ?, ?)', (socket_path, service_id, display_name, socket_path, icon_path))\n"
                 "    database.execute('DELETE FROM log_files WHERE service_id = ?', (service_id,))\n"
                 "    database.execute('INSERT INTO log_files(path, service_id) VALUES(?, ?)', (log_path, service_id))\n"
                 "database.close()\n"
                 "os.chmod(database_path, 0o644)\n"
                 "__BACKENDS_REGISTRY__\n"
                 "chmod 0644 %s/registry.sqlite3 >/dev/null 2>&1 || true\n"
-                "systemctl --system daemon-reload\n"
-                "systemctl --system enable %s >/dev/null 2>&1 || true\n"
-                "systemctl --system restart %s || systemctl --system start %s\n",
+                "systemctl --system daemon-reload\n",
                 quoted_version_path,
                 app->version,
                 quoted_version_path,
@@ -2234,10 +2356,25 @@ static bool install_bundled_app(const BundledAppDefinition *app, const char *sco
                 quoted_unit,
                 quoted_log_path,
                 quoted_target_icon_for_registry,
-                quoted_system_outeragent_root,
-                quoted_unit,
-                quoted_unit,
-                quoted_unit);
+                quoted_actual_socket_path,
+                quoted_system_outeragent_root);
+        if (quoted_socket_unit[0] && quoted_socket_unit_path[0]) {
+            fprintf(script,
+                    "cat > %s <<'__BACKENDS_SOCKET__'\n%s__BACKENDS_SOCKET__\n"
+                    "chmod 0644 %s\n"
+                    "systemctl --system enable --now %s >/dev/null 2>&1\n",
+                    quoted_socket_unit_path,
+                    socket_contents,
+                    quoted_socket_unit_path,
+                    quoted_socket_unit);
+        } else {
+            fprintf(script,
+                    "systemctl --system enable %s >/dev/null 2>&1 || true\n"
+                    "systemctl --system restart %s || systemctl --system start %s\n",
+                    quoted_unit,
+                    quoted_unit,
+                    quoted_unit);
+        }
         fclose(script);
         chmod(script_template, 0700);
 
@@ -2285,6 +2422,12 @@ static bool install_bundled_app(const BundledAppDefinition *app, const char *sco
     snprintf(log_path, sizeof(log_path), "%s/outeragent.log", install_root);
     char unit_path[PATH_MAX];
     snprintf(unit_path, sizeof(unit_path), "%s/.config/systemd/user/%s", home_directory(), app->unit_name);
+    char socket_unit_name[256] = "";
+    char socket_unit_path[PATH_MAX] = "";
+    if (app->socket_activated) {
+        systemd_socket_unit_name(app->unit_name, socket_unit_name, sizeof(socket_unit_name));
+        snprintf(socket_unit_path, sizeof(socket_unit_path), "%s/.config/systemd/user/%s", home_directory(), socket_unit_name);
+    }
 
     char stop_command[512];
     char quoted_unit[320];
@@ -2293,6 +2436,14 @@ static bool install_bundled_app(const BundledAppDefinition *app, const char *sco
     run_shell_ignored(stop_command);
     snprintf(stop_command, sizeof(stop_command), "systemctl --user reset-failed %s >/dev/null 2>&1 || true", quoted_unit);
     run_shell_ignored(stop_command);
+    if (socket_unit_name[0]) {
+        char quoted_socket_unit[320];
+        shell_quote(socket_unit_name, quoted_socket_unit, sizeof(quoted_socket_unit));
+        snprintf(stop_command, sizeof(stop_command), "systemctl --user disable --now %s >/dev/null 2>&1 || true", quoted_socket_unit);
+        run_shell_ignored(stop_command);
+        snprintf(stop_command, sizeof(stop_command), "systemctl --user reset-failed %s >/dev/null 2>&1 || true", quoted_socket_unit);
+        run_shell_ignored(stop_command);
+    }
 
     if (!mkdir_p(bundles_dir)) {
         snprintf(message, message_size, "Failed to create %s: %s", bundles_dir, strerror(errno));
@@ -2351,6 +2502,8 @@ static bool install_bundled_app(const BundledAppDefinition *app, const char *sco
     char quoted_log[PATH_MAX + 8];
     char quoted_service_id[512];
     char quoted_socket_path[PATH_MAX + 32];
+    char actual_socket_path[PATH_MAX] = "";
+    char systemd_socket_path[PATH_MAX] = "";
     shell_quote(target_binary, quoted_binary, sizeof(quoted_binary));
     shell_quote(bundles_dir, quoted_bundles, sizeof(quoted_bundles));
     if (target_icon[0]) {
@@ -2361,9 +2514,9 @@ static bool install_bundled_app(const BundledAppDefinition *app, const char *sco
     shell_quote(log_path, quoted_log, sizeof(quoted_log));
     shell_quote(app->service_id, quoted_service_id, sizeof(quoted_service_id));
     if (app->socket_name && app->socket_name[0]) {
-        char socket_path[PATH_MAX];
-        snprintf(socket_path, sizeof(socket_path), "%%t/%s", app->socket_name);
-        shell_quote(socket_path, quoted_socket_path, sizeof(quoted_socket_path));
+        snprintf(systemd_socket_path, sizeof(systemd_socket_path), "%%t/%s", app->socket_name);
+        shell_quote(systemd_socket_path, quoted_socket_path, sizeof(quoted_socket_path));
+        bundled_socket_path_for_scope(app, "user", actual_socket_path, sizeof(actual_socket_path));
     } else {
         quoted_socket_path[0] = '\0';
     }
@@ -2421,28 +2574,60 @@ static bool install_bundled_app(const BundledAppDefinition *app, const char *sco
              user_name,
              home_directory(),
              quoted_run_script);
+    char socket_contents[2048] = "";
+    if (app->socket_activated && quoted_socket_path[0]) {
+        snprintf(socket_contents, sizeof(socket_contents),
+                 "[Unit]\n"
+                 "Description=%s Socket\n"
+                 "\n"
+                 "[Socket]\n"
+                 "ListenStream=%s\n"
+                 "SocketMode=0600\n"
+                 "\n"
+                 "[Install]\n"
+                 "WantedBy=sockets.target\n",
+                 description,
+                 systemd_socket_path);
+    }
     if (!write_text_file(unit_path, unit_contents, error, sizeof(error))) {
         snprintf(message, message_size, "%s", error);
         return false;
     }
-    if (!upsert_systemd_backend_registry(app->service_id, app->display_name, app->unit_name, "user", log_path, target_icon, error, sizeof(error))) {
+    if (socket_unit_path[0] && !write_text_file(socket_unit_path, socket_contents, error, sizeof(error))) {
         unlink(unit_path);
+        snprintf(message, message_size, "%s", error);
+        return false;
+    }
+    if (!upsert_systemd_backend_registry(app->service_id, app->display_name, app->unit_name, "user", actual_socket_path, log_path, target_icon, error, sizeof(error))) {
+        unlink(unit_path);
+        if (socket_unit_path[0]) unlink(socket_unit_path);
         snprintf(message, message_size, "%s", error);
         return false;
     }
 
     char enable_command[512];
     run_shell_ignored("systemctl --user daemon-reload >/dev/null 2>&1");
-    snprintf(enable_command, sizeof(enable_command), "systemctl --user enable %s >/dev/null 2>&1 || true", quoted_unit);
-    run_shell_ignored(enable_command);
-    char systemd_message[4096] = "";
-    bool started = run_systemd_operation(app->unit_name, "user", "restart", NULL, NULL, systemd_message, sizeof(systemd_message));
-    if (!started) {
-        started = run_systemd_operation(app->unit_name, "user", "start", NULL, NULL, systemd_message, sizeof(systemd_message));
-    }
-    if (!started) {
-        snprintf(message, message_size, "Installed %s, but failed to start it: %s", app->display_name, systemd_message);
-        return false;
+    if (socket_unit_name[0]) {
+        char quoted_socket_unit[320];
+        shell_quote(socket_unit_name, quoted_socket_unit, sizeof(quoted_socket_unit));
+        snprintf(enable_command, sizeof(enable_command), "systemctl --user enable --now %s >/dev/null 2>&1", quoted_socket_unit);
+        int status = system(enable_command);
+        if (status != 0) {
+            snprintf(message, message_size, "Installed %s, but failed to enable its socket.", app->display_name);
+            return false;
+        }
+    } else {
+        snprintf(enable_command, sizeof(enable_command), "systemctl --user enable %s >/dev/null 2>&1 || true", quoted_unit);
+        run_shell_ignored(enable_command);
+        char systemd_message[4096] = "";
+        bool started = run_systemd_operation(app->unit_name, "user", "restart", NULL, NULL, systemd_message, sizeof(systemd_message));
+        if (!started) {
+            started = run_systemd_operation(app->unit_name, "user", "start", NULL, NULL, systemd_message, sizeof(systemd_message));
+        }
+        if (!started) {
+            snprintf(message, message_size, "Installed %s, but failed to start it: %s", app->display_name, systemd_message);
+            return false;
+        }
     }
 
     snprintf(message, message_size, "Installed %s.", app->display_name);
@@ -2471,12 +2656,20 @@ static bool uninstall_backend(const char *service_id, const char *sudo_password,
             snprintf(log_path, sizeof(log_path), "/var/log/outergroup/%s.log", service_id);
             char unit_path[PATH_MAX];
             snprintf(unit_path, sizeof(unit_path), "/etc/systemd/system/%s", unit_name);
+            char socket_unit_name[256] = "";
+            char socket_unit_path[PATH_MAX] = "";
+            if (app && app->socket_activated) {
+                systemd_socket_unit_name(unit_name, socket_unit_name, sizeof(socket_unit_name));
+                snprintf(socket_unit_path, sizeof(socket_unit_path), "/etc/systemd/system/%s", socket_unit_name);
+            }
             char wrapper_path[PATH_MAX] = "";
             if (install_root[0]) {
                 snprintf(wrapper_path, sizeof(wrapper_path), "%s/outerctl-as-user", install_root);
             }
 
             char quoted_unit_path[PATH_MAX + 8];
+            char quoted_socket_unit[320] = "";
+            char quoted_socket_unit_path[PATH_MAX + 8] = "";
             char quoted_install_root[PATH_MAX + 8];
             char quoted_log_path[PATH_MAX + 8];
             char quoted_wrapper_path[PATH_MAX + 8];
@@ -2484,6 +2677,8 @@ static bool uninstall_backend(const char *service_id, const char *sudo_password,
             char quoted_system_outeragent_root[PATH_MAX + 8];
             char quoted_service_id[512];
             shell_quote(unit_path, quoted_unit_path, sizeof(quoted_unit_path));
+            if (socket_unit_name[0]) shell_quote(socket_unit_name, quoted_socket_unit, sizeof(quoted_socket_unit)); else quoted_socket_unit[0] = '\0';
+            if (socket_unit_path[0]) shell_quote(socket_unit_path, quoted_socket_unit_path, sizeof(quoted_socket_unit_path)); else quoted_socket_unit_path[0] = '\0';
             if (install_root[0]) shell_quote(install_root, quoted_install_root, sizeof(quoted_install_root)); else quoted_install_root[0] = '\0';
             shell_quote(log_path, quoted_log_path, sizeof(quoted_log_path));
             if (wrapper_path[0]) shell_quote(wrapper_path, quoted_wrapper_path, sizeof(quoted_wrapper_path)); else quoted_wrapper_path[0] = '\0';
@@ -2509,6 +2704,7 @@ static bool uninstall_backend(const char *service_id, const char *sudo_password,
             fprintf(script,
                     "set -eu\n"
                     "systemctl --system disable --now %s >/dev/null 2>&1 || true\n"
+                    "%s%s%s"
                     "if [ -x %s ]; then\n"
                     "  %s app clear --backend %s >/dev/null 2>&1 || true\n"
                     "  %s log clear --backend %s >/dev/null 2>&1 || true\n"
@@ -2520,8 +2716,11 @@ static bool uninstall_backend(const char *service_id, const char *sudo_password,
                     "  env OUTERAGENT_ROOT=%s %s systemd clear --backend %s >/dev/null 2>&1 || true\n"
                     "  env OUTERAGENT_ROOT=%s %s backend remove --backend %s >/dev/null 2>&1 || true\n"
                     "fi\n"
-                    "rm -f -- %s\n",
+                    "rm -f -- %s %s\n",
                     quoted_unit,
+                    quoted_socket_unit[0] ? "systemctl --system disable --now " : "",
+                    quoted_socket_unit[0] ? quoted_socket_unit : "",
+                    quoted_socket_unit[0] ? " >/dev/null 2>&1 || true\n" : "",
                     quoted_wrapper_path[0] ? quoted_wrapper_path : "''",
                     quoted_wrapper_path[0] ? quoted_wrapper_path : "''",
                     quoted_service_id,
@@ -2544,7 +2743,8 @@ static bool uninstall_backend(const char *service_id, const char *sudo_password,
                     quoted_system_outeragent_root,
                     quoted_outerctl_path,
                     quoted_service_id,
-                    quoted_unit_path);
+                    quoted_unit_path,
+                    quoted_socket_unit_path[0] ? quoted_socket_unit_path : "''");
             if (quoted_install_root[0]) {
                 fprintf(script, "rm -rf -- %s\n", quoted_install_root);
             }
@@ -2564,6 +2764,20 @@ static bool uninstall_backend(const char *service_id, const char *sudo_password,
             char unit_path[PATH_MAX];
             snprintf(unit_path, sizeof(unit_path), "%s/.config/systemd/user/%s", home_directory(), unit_name);
             unlink(unit_path);
+            const BundledAppDefinition *app = bundled_app_for_service_id(service_id);
+            if (app && app->socket_activated) {
+                char socket_unit[256];
+                char quoted_socket_unit[320];
+                char socket_unit_path[PATH_MAX];
+                systemd_socket_unit_name(unit_name, socket_unit, sizeof(socket_unit));
+                if (safe_unit_name(socket_unit)) {
+                    shell_quote(socket_unit, quoted_socket_unit, sizeof(quoted_socket_unit));
+                    snprintf(command, sizeof(command), "systemctl --user disable --now %s >/dev/null 2>&1 || true", quoted_socket_unit);
+                    run_shell_ignored(command);
+                    snprintf(socket_unit_path, sizeof(socket_unit_path), "%s/.config/systemd/user/%s", home_directory(), socket_unit);
+                    unlink(socket_unit_path);
+                }
+            }
             run_shell_ignored("systemctl --user daemon-reload >/dev/null 2>&1 || true");
         }
     }
@@ -3216,6 +3430,14 @@ static void send_bundle_file(int fd, const char *path) {
     free(data);
 }
 
+static bool is_navigator_route(const char *target) {
+    return strcmp(target, "/") == 0 ||
+           strcmp(target, "/apps") == 0 ||
+           strcmp(target, "/backends") == 0 ||
+           strcmp(target, "/new") == 0 ||
+           strcmp(target, "/backends.outer") == 0;
+}
+
 static void handle_client(int fd) {
     struct timeval timeout;
     timeout.tv_sec = 5;
@@ -3281,7 +3503,7 @@ static void handle_client(int fd) {
         } else {
             send_text_response(fd, 404, "not found\n");
         }
-    } else if (strcmp(target, "/") == 0 || strcmp(target, "/backends.outer") == 0) {
+    } else if (is_navigator_route(target)) {
         send_outer_descriptor(fd);
     } else if (strcmp(target, kBundleUrlPath) == 0) {
         send_text_response(fd, 200, "macos-arm\nmacos-x86\n");
@@ -3382,6 +3604,29 @@ static int create_unix_listener(const char *socket_path) {
     return fd;
 }
 
+static int systemd_activated_listener(void) {
+    const char *listen_pid = getenv("LISTEN_PID");
+    const char *listen_fds = getenv("LISTEN_FDS");
+    if (!listen_pid || !listen_fds) {
+        return -1;
+    }
+    char *end = NULL;
+    long pid = strtol(listen_pid, &end, 10);
+    if (!end || *end != '\0' || pid != (long)getpid()) {
+        return -1;
+    }
+    end = NULL;
+    long fds = strtol(listen_fds, &end, 10);
+    if (!end || *end != '\0' || fds < 1) {
+        return -1;
+    }
+    unsetenv("LISTEN_PID");
+    unsetenv("LISTEN_FDS");
+    unsetenv("LISTEN_FDNAMES");
+    g_systemd_socket_activation = true;
+    return 3;
+}
+
 static void usage(const char *program) {
     fprintf(stderr, "Usage: %s [--port PORT | --socket-path PATH] [--bundles-dir DIR] [--database PATH] [--system-database PATH]\n", program);
 }
@@ -3423,13 +3668,18 @@ int main(int argc, char **argv) {
     signal(SIGTERM, handle_shutdown_signal);
     signal(SIGPIPE, SIG_IGN);
 
-    int listener = use_port ? create_tcp_listener(port) : create_unix_listener(socket_path);
+    int listener = !use_port ? systemd_activated_listener() : -1;
+    if (listener < 0) {
+        listener = use_port ? create_tcp_listener(port) : create_unix_listener(socket_path);
+    } else if (socket_path[0]) {
+        snprintf(g_listen_socket_path, sizeof(g_listen_socket_path), "%s", socket_path);
+    }
     if (listener < 0) return 1;
     g_listener_fd = listener;
     if (use_port) {
-        fprintf(stderr, "BackendsBackend listening on http://127.0.0.1:%d/\n", port);
+        fprintf(stderr, "NavigatorBackend listening on http://127.0.0.1:%d/\n", port);
     } else {
-        fprintf(stderr, "BackendsBackend listening on %s/\n", socket_path);
+        fprintf(stderr, "NavigatorBackend listening on %s/\n", socket_path);
     }
     fprintf(stderr, "Registry database: %s\n", g_registry_database_path);
     if (g_system_registry_database_path[0]) {
@@ -3437,6 +3687,18 @@ int main(int argc, char **argv) {
     }
 
     while (!g_shutdown_requested) {
+        if (g_systemd_socket_activation) {
+            struct pollfd poll_fd = {.fd = listener, .events = POLLIN, .revents = 0};
+            int poll_result = poll(&poll_fd, 1, 60000);
+            if (poll_result == 0) {
+                break;
+            }
+            if (poll_result < 0) {
+                if (errno == EINTR) continue;
+                perror("poll");
+                break;
+            }
+        }
         struct sockaddr_storage peer;
         socklen_t peer_len = sizeof(peer);
         int client = accept(listener, (struct sockaddr *)&peer, &peer_len);
@@ -3451,7 +3713,7 @@ int main(int argc, char **argv) {
 
     close(listener);
     g_listener_fd = -1;
-    if (!use_port && g_listen_socket_path[0]) {
+    if (!use_port && g_listen_socket_path[0] && !g_systemd_socket_activation) {
         unlink(g_listen_socket_path);
     }
     return 0;
