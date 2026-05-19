@@ -1,6 +1,6 @@
-# Backends
+# Navigator
 
-Backends is an outerframe app for viewing the backends registered on the machine where the app is running. It reads the Outer Loop registry SQLite database directly and tails registered log files in place, so logs do not need to be synced back to Outer Loop.
+Navigator is an outerframe app for launching apps and viewing the backends registered on the machine where the app is running. It reads the Outer Loop registry SQLite database directly and tails registered log files in place, so logs do not need to be synced back to Outer Loop.
 
 This app will replace the old Outer Loop Services UI and the built-in log viewer. It currently includes:
 
@@ -32,13 +32,13 @@ http://127.0.0.1:7354/
 For Outer Loop-managed deployments, prefer a Unix socket and register that socket with `outerctl`:
 
 ```bash
-SOCKET_PATH="$XDG_RUNTIME_DIR/dev.outergroup.Backends"
+SOCKET_PATH="$XDG_RUNTIME_DIR/dev.outergroup.Navigator"
 ./build/macos/Release/BackendsBackend \
   --socket-path "$SOCKET_PATH" \
   --bundles-dir ./build/run/bundles
-outerctl app add --backend dev.outergroup.Backends \
+outerctl app add --backend dev.outergroup.Navigator \
   --socket-path "$SOCKET_PATH" \
-  --name Backends \
+  --name Navigator \
   --url http+unix://$SOCKET_PATH/ \
   --home-screen
 ```
@@ -47,7 +47,7 @@ For a user systemd unit, use `%t` for the socket root so systemd resolves it to
 the user's `XDG_RUNTIME_DIR`:
 
 ```ini
-ExecStart=/path/to/BackendsBackend --socket-path %t/dev.outergroup.Backends --bundles-dir /path/to/bundles
+ExecStart=/path/to/BackendsBackend --socket-path %t/dev.outergroup.Navigator --bundles-dir /path/to/bundles
 ```
 
 By default the backend reads the user registry:

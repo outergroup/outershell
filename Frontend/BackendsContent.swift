@@ -46,7 +46,7 @@ private struct BackendRecord: Decodable {
     }
 
     var isBackendsSelf: Bool {
-        serviceID == "dev.outergroup.Backends"
+        serviceID == "dev.outergroup.Navigator" || serviceID == "dev.outergroup.Backends"
     }
 
     var pathText: String {
@@ -69,9 +69,28 @@ private struct FrontendRecord: Decodable {
     let url: String
     let port: Int
     let socketPath: String
+    let iconPath: String?
+    let iconData: String?
 
     var hasEndpoint: Bool {
         !socketPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || port > 0 || !url.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    var iconImage: NSImage? {
+        guard let iconData,
+              let data = Data(base64Encoded: base64IconPayload(iconData)),
+              !data.isEmpty else {
+            return nil
+        }
+        return NSImage(data: data)
+    }
+
+    private func base64IconPayload(_ value: String) -> String {
+        guard value.hasPrefix("data:"),
+              let commaIndex = value.firstIndex(of: ",") else {
+            return value
+        }
+        return String(value[value.index(after: commaIndex)...])
     }
 }
 
@@ -133,8 +152,37 @@ private struct LogSelection: Equatable {
 }
 
 private enum BackendsViewMode {
+    case apps
     case backends
     case create
+}
+
+private struct AppLauncherItem {
+    let backend: BackendRecord
+    let frontend: FrontendRecord
+    let frontendIndex: Int
+
+    var displayName: String {
+        let frontendName = frontend.name.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !frontendName.isEmpty {
+            return frontendName
+        }
+        let backendName = backend.displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+        return backendName.isEmpty ? "App" : backendName
+    }
+
+    var subtitle: String {
+        let backendName = backend.displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+        return backendName.isEmpty || backendName == displayName ? backend.serviceID : backendName
+    }
+
+    var iconImage: NSImage? {
+        frontend.iconImage
+    }
+
+    var iconKey: String {
+        "\(backend.serviceID):frontend:\(frontendIndex)"
+    }
 }
 
 private struct BackendListRow {
@@ -144,6 +192,11 @@ private struct BackendListRow {
     let isFrontendChild: Bool
 
     var serviceID: String { backend.serviceID }
+
+    var iconKey: String? {
+        guard let frontendIndex else { return nil }
+        return "\(backend.serviceID):frontend:\(frontendIndex)"
+    }
 
     var rowID: String {
         if let frontendIndex {
@@ -157,6 +210,21 @@ private struct PendingPasswordAction {
     let serviceID: String
     let operation: String
     let displayName: String
+}
+
+private struct IconMatchState {
+    let frame: CGRect
+    let image: NSImage?
+    let title: String
+}
+
+private struct TextMatchState {
+    let frame: CGRect
+    let title: String
+    let fontSize: CGFloat
+    let weight: NSFont.Weight
+    let alignment: CATextLayerAlignmentMode
+    let isWrapped: Bool
 }
 
 @MainActor
@@ -193,6 +261,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate {
     private var createMessage = ""
     private var backendScroll: CGFloat = 0
     private var logScroll: CGFloat = 0
+    private var appsScroll: CGFloat = 0
     private var createScroll: CGFloat = 0
     private var createContentBottom: CGFloat = 0
     private var pendingPasswordAction: PendingPasswordAction?
@@ -204,7 +273,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate {
     private let titleLayer = CATextLayer()
     private let statusLayer = CATextLayer()
     private let refreshLayer = CenteredButtonLayer(title: "Refresh")
+    private let appsToggleLayer = CenteredButtonLayer(title: "Apps")
+    private let backendsToggleLayer = CenteredButtonLayer(title: "Backends")
     private let contentLayer = CALayer()
+    private let appsLayer = CALayer()
     private let bottomBarLayer = CALayer()
     private let newButtonLayer = CenteredButtonLayer(title: "New")
     private let tableHeaderLayer = CALayer()
@@ -213,12 +285,22 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate {
     private let logRowsClipLayer = CALayer()
     private let dividerLayer = CALayer()
     private let createLayer = CALayer()
+    private let iconTransitionLayer = CALayer()
     private let passwordOverlayLayer = CALayer()
 
     private var newButtonFrame = CGRect.zero
     private var refreshFrame = CGRect.zero
+    private var appsToggleFrame = CGRect.zero
+    private var backendsToggleFrame = CGRect.zero
+    private var appCardFrames: [(frame: CGRect, item: AppLauncherItem)] = []
+    private var appsContentBottom: CGFloat = 0
     private var backendRowFrames: [(frame: CGRect, row: BackendListRow)] = []
     private var backendActionFrames: [(frame: CGRect, row: BackendListRow, operation: String)] = []
+    private var iconMatchStates: [String: IconMatchState] = [:]
+    private var iconMatchLayers: [String: CALayer] = [:]
+    private var textMatchStates: [String: TextMatchState] = [:]
+    private var textMatchLayers: [String: CATextLayer] = [:]
+    private var isRecordingTransitionTargets = false
     private var pendingMenuActions: [UUID: (serviceID: String, operationByItemID: [String: String])] = [:]
     private var recipeFrames: [(frame: CGRect, recipeID: String)] = []
     private var createFieldFrames: [(frame: CGRect, key: String)] = []
@@ -239,6 +321,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate {
     private let logLineHeight: CGFloat = 18
     private let horizontalInset: CGFloat = 18
     private let createBottomInset: CGFloat = 18
+    private let pageTransitionDuration: CFTimeInterval = 0.28
 
     init(outerframeHost: OuterframeHost, appConnection: OuterframeAppConnection) {
         self.outerframeHost = outerframeHost
@@ -336,10 +419,17 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate {
     private func modeFromURL(_ urlString: String?) -> BackendsViewMode {
         guard let urlString,
               let components = URLComponents(string: urlString),
-              components.queryItems?.first(where: { $0.name == "view" })?.value == "new" else {
-            return .backends
+              let view = components.queryItems?.first(where: { $0.name == "view" })?.value else {
+            return .apps
         }
-        return .create
+        switch view {
+        case "backends":
+            return .backends
+        case "new":
+            return .create
+        default:
+            return .apps
+        }
     }
 
     private func urlForMode(_ mode: BackendsViewMode) -> URL? {
@@ -349,7 +439,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate {
         }
         var queryItems = components.queryItems ?? []
         queryItems.removeAll { $0.name == "view" }
-        if mode == .create {
+        if mode == .backends {
+            queryItems.append(URLQueryItem(name: "view", value: "backends"))
+        } else if mode == .create {
             queryItems.append(URLQueryItem(name: "view", value: "new"))
         }
         components.queryItems = queryItems.isEmpty ? nil : queryItems
@@ -365,15 +457,245 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate {
                 outerframeHost.replaceHistoryEntry(url: url)
             }
         }
+        if (mode == .apps && nextMode == .backends) || (mode == .backends && nextMode == .apps) {
+            animateIconTransition(to: nextMode)
+            return
+        }
         applyMode(nextMode)
     }
 
     private func applyMode(_ nextMode: BackendsViewMode) {
         mode = nextMode
-        if mode == .create {
+        if mode == .create || mode == .apps {
             clampScrollOffsets()
         }
         updateColors()
+    }
+
+    private func animateIconTransition(to nextMode: BackendsViewMode) {
+        let startStates = iconMatchStates
+        let startTextStates = textMatchStates
+        let previousMode = mode
+        let outgoingLayers = visibleModeLayers(for: previousMode)
+        let wasRecordingTransitionTargets = isRecordingTransitionTargets
+        isRecordingTransitionTargets = true
+        defer {
+            isRecordingTransitionTargets = wasRecordingTransitionTargets
+        }
+        applyMode(nextMode)
+        isRecordingTransitionTargets = wasRecordingTransitionTargets
+        let endStates = iconMatchStates
+        let endTextStates = textMatchStates
+        let incomingLayers = visibleModeLayers(for: nextMode)
+        let sharedKeys = Set(startStates.keys).intersection(endStates.keys)
+        let sharedTextKeys = Set(startTextStates.keys).intersection(endTextStates.keys)
+        guard !sharedKeys.isEmpty || !sharedTextKeys.isEmpty || !outgoingLayers.isEmpty || !incomingLayers.isEmpty else { return }
+
+        prepareCrossfade(from: outgoingLayers, to: incomingLayers)
+
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        animateCrossfade(from: outgoingLayers, to: incomingLayers)
+        for key in sharedKeys {
+            guard let start = startStates[key],
+                  let end = endStates[key],
+                  let layer = iconMatchLayers[key] else {
+                continue
+            }
+
+            let positionAnimation = CABasicAnimation(keyPath: "position")
+            positionAnimation.fromValue = CGPoint(x: start.frame.midX, y: start.frame.midY)
+            positionAnimation.toValue = CGPoint(x: end.frame.midX, y: end.frame.midY)
+
+            let boundsAnimation = CABasicAnimation(keyPath: "bounds")
+            boundsAnimation.fromValue = CGRect(origin: .zero, size: start.frame.size)
+            boundsAnimation.toValue = CGRect(origin: .zero, size: end.frame.size)
+
+            let radiusAnimation = CABasicAnimation(keyPath: "cornerRadius")
+            radiusAnimation.fromValue = layer.cornerRadius
+            radiusAnimation.toValue = iconCornerRadius(for: end.frame.width)
+
+            let group = CAAnimationGroup()
+            group.animations = [positionAnimation, boundsAnimation, radiusAnimation]
+            group.duration = pageTransitionDuration
+            group.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+            layer.position = CGPoint(x: end.frame.midX, y: end.frame.midY)
+            layer.bounds = CGRect(origin: .zero, size: end.frame.size)
+            configureLauncherIconLayer(layer, image: end.image, title: end.title, iconSize: end.frame.width)
+            layer.cornerRadius = iconCornerRadius(for: end.frame.width)
+            layer.add(group, forKey: "matchedIconTransition")
+        }
+        for key in sharedTextKeys {
+            guard let start = startTextStates[key],
+                  let end = endTextStates[key],
+                  let layer = textMatchLayers[key] else {
+                continue
+            }
+            let startFlightFrame = flightFrame(for: start)
+            let endFlightFrame = flightFrame(for: end)
+            configureTextLayer(layer,
+                               title: start.title,
+                               fontSize: start.fontSize,
+                               weight: start.weight,
+                               color: .labelColor,
+                               alignment: .left,
+                               isWrapped: false)
+            layer.frame = startFlightFrame
+
+            let positionAnimation = CABasicAnimation(keyPath: "position")
+            positionAnimation.fromValue = CGPoint(x: startFlightFrame.midX, y: startFlightFrame.midY)
+            positionAnimation.toValue = CGPoint(x: endFlightFrame.midX, y: endFlightFrame.midY)
+
+            let boundsAnimation = CABasicAnimation(keyPath: "bounds")
+            boundsAnimation.fromValue = CGRect(origin: .zero, size: startFlightFrame.size)
+            boundsAnimation.toValue = CGRect(origin: .zero, size: endFlightFrame.size)
+
+            let fontAnimation = CABasicAnimation(keyPath: "fontSize")
+            fontAnimation.fromValue = start.fontSize
+            fontAnimation.toValue = end.fontSize
+
+            let group = CAAnimationGroup()
+            group.animations = [positionAnimation, boundsAnimation, fontAnimation]
+            group.duration = pageTransitionDuration
+            group.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+            layer.position = CGPoint(x: endFlightFrame.midX, y: endFlightFrame.midY)
+            layer.bounds = CGRect(origin: .zero, size: endFlightFrame.size)
+            layer.fontSize = end.fontSize
+            layer.add(group, forKey: "matchedTextTransition")
+        }
+        CATransaction.commit()
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + pageTransitionDuration + 0.01) { [weak self] in
+            guard let self else { return }
+            self.finishCrossfade(from: outgoingLayers, to: incomingLayers, currentMode: nextMode)
+            self.finishMatchedTextTransition(endTextStates: endTextStates, sharedTextKeys: sharedTextKeys)
+        }
+    }
+
+    private func flightFrame(for state: TextMatchState) -> CGRect {
+        let width = max(measuredTextWidth(for: state), 1)
+        return CGRect(x: glyphOriginX(for: state),
+                      y: state.frame.minY,
+                      width: width,
+                      height: state.frame.height)
+    }
+
+    private func glyphOriginX(for state: TextMatchState) -> CGFloat {
+        let textWidth = measuredTextWidth(for: state)
+        switch state.alignment {
+        case .center:
+            return state.frame.minX + max((state.frame.width - textWidth) / 2, 0)
+        case .right:
+            return state.frame.minX + max(state.frame.width - textWidth, 0)
+        default:
+            return state.frame.minX
+        }
+    }
+
+    private func measuredTextWidth(for state: TextMatchState) -> CGFloat {
+        let font = NSFont.systemFont(ofSize: state.fontSize, weight: state.weight)
+        let attributes: [NSAttributedString.Key: Any] = [.font: font]
+        let width = (state.title as NSString).size(withAttributes: attributes).width
+        return min(ceil(width), state.frame.width)
+    }
+
+    private func finishMatchedTextTransition(endTextStates: [String: TextMatchState], sharedTextKeys: Set<String>) {
+        withoutImplicitAnimations {
+            for key in sharedTextKeys {
+                guard let state = endTextStates[key],
+                      let layer = textMatchLayers[key] else {
+                    continue
+                }
+                configureTextLayer(layer,
+                                   title: state.title,
+                                   fontSize: state.fontSize,
+                                   weight: state.weight,
+                                   color: .labelColor,
+                                   alignment: state.alignment,
+                                   isWrapped: state.isWrapped)
+                layer.frame = state.frame
+            }
+        }
+    }
+
+    private func visibleModeLayers(for mode: BackendsViewMode) -> [CALayer] {
+        let layers: [CALayer]
+        switch mode {
+        case .apps:
+            layers = [appsLayer]
+        case .backends:
+            layers = [
+                bottomBarLayer,
+                tableHeaderLayer,
+                rowsClipLayer,
+                dividerLayer,
+                logHeaderLayer,
+                logRowsClipLayer
+            ]
+        case .create:
+            layers = [createLayer]
+        }
+        return layers.filter { !$0.isHidden && $0.opacity > 0 }
+    }
+
+    private func prepareCrossfade(from outgoingLayers: [CALayer], to incomingLayers: [CALayer]) {
+        withoutImplicitAnimations {
+            for layer in outgoingLayers {
+                layer.isHidden = false
+                layer.opacity = 1
+            }
+            for layer in incomingLayers {
+                layer.isHidden = false
+                layer.opacity = 0
+            }
+        }
+    }
+
+    private func animateCrossfade(from outgoingLayers: [CALayer], to incomingLayers: [CALayer]) {
+        for layer in outgoingLayers {
+            addOpacityAnimation(to: layer, from: 1, to: 0, key: "outerframeDisappear")
+            layer.opacity = 0
+        }
+        for layer in incomingLayers {
+            addOpacityAnimation(to: layer, from: 0, to: 1, key: "outerframeAppear")
+            layer.opacity = 1
+        }
+    }
+
+    private func addOpacityAnimation(to layer: CALayer, from startOpacity: Float, to endOpacity: Float, key: String) {
+        let animation = CABasicAnimation(keyPath: "opacity")
+        animation.fromValue = startOpacity
+        animation.toValue = endOpacity
+        animation.duration = pageTransitionDuration
+        animation.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+        layer.add(animation, forKey: key)
+    }
+
+    private func finishCrossfade(from outgoingLayers: [CALayer],
+                                 to incomingLayers: [CALayer],
+                                 currentMode: BackendsViewMode) {
+        withoutImplicitAnimations {
+            for layer in outgoingLayers {
+                layer.removeAnimation(forKey: "outerframeDisappear")
+                layer.opacity = 1
+                if mode == currentMode {
+                    layer.isHidden = true
+                }
+            }
+            for layer in incomingLayers {
+                layer.removeAnimation(forKey: "outerframeAppear")
+                layer.opacity = 1
+                if mode == currentMode {
+                    layer.isHidden = false
+                }
+            }
+            if mode != currentMode {
+                for layer in visibleModeLayers(for: mode) {
+                    layer.isHidden = false
+                    layer.opacity = 1
+                }
+            }
+        }
     }
 
     private func returnToBackendsFromCreate() {
@@ -404,10 +726,14 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate {
         rootLayer.masksToBounds = true
         rootLayer.addSublayer(toolbarLayer)
         rootLayer.addSublayer(contentLayer)
+        rootLayer.addSublayer(iconTransitionLayer)
         rootLayer.addSublayer(passwordOverlayLayer)
         toolbarLayer.addSublayer(titleLayer)
         toolbarLayer.addSublayer(statusLayer)
         toolbarLayer.addSublayer(refreshLayer)
+        toolbarLayer.addSublayer(appsToggleLayer)
+        toolbarLayer.addSublayer(backendsToggleLayer)
+        contentLayer.addSublayer(appsLayer)
         contentLayer.addSublayer(bottomBarLayer)
         bottomBarLayer.addSublayer(newButtonLayer)
         contentLayer.addSublayer(tableHeaderLayer)
@@ -417,7 +743,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate {
         contentLayer.addSublayer(logRowsClipLayer)
         contentLayer.addSublayer(createLayer)
 
-        titleLayer.string = "Backends"
+        titleLayer.string = ""
         passwordOverlayLayer.isHidden = true
 
         for layer in [titleLayer, statusLayer] {
@@ -459,14 +785,34 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate {
                 rootLayer.frame = CGRect(origin: .zero, size: CGSize(width: width, height: height))
                 toolbarLayer.frame = CGRect(x: 0, y: max(height - toolbarHeight, 0), width: width, height: toolbarHeight)
                 contentLayer.frame = CGRect(x: 0, y: 0, width: width, height: max(height - toolbarHeight, 0))
+                iconTransitionLayer.frame = rootLayer.bounds
 
-                titleLayer.frame = CGRect(x: horizontalInset, y: 14, width: 120, height: 22)
+                titleLayer.frame = .zero
                 refreshFrame = CGRect(x: max(width - 96, 8), y: 10, width: 78, height: 28)
                 refreshLayer.frame = refreshFrame
-                statusLayer.frame = CGRect(x: 152, y: 14, width: max(width - 264, 1), height: 18)
+                let toggleWidth: CGFloat = 184
+                let toggleHeight: CGFloat = 30
+                let toggleX = floor((width - toggleWidth) / 2)
+                appsToggleFrame = CGRect(x: toggleX, y: 9, width: 84, height: toggleHeight)
+                backendsToggleFrame = CGRect(x: toggleX + 86, y: 9, width: 98, height: toggleHeight)
+                appsToggleLayer.frame = appsToggleFrame
+                backendsToggleLayer.frame = backendsToggleFrame
+                statusLayer.frame = CGRect(x: 152, y: 14, width: max(toggleX - 170, 1), height: 18)
 
                 let contentHeight = contentLayer.bounds.height
-                if mode == .backends {
+                if mode == .apps {
+                    appsLayer.isHidden = false
+                    bottomBarLayer.isHidden = true
+                    tableHeaderLayer.isHidden = true
+                    rowsClipLayer.isHidden = true
+                    dividerLayer.isHidden = true
+                    logHeaderLayer.isHidden = true
+                    logRowsClipLayer.isHidden = true
+                    createLayer.isHidden = true
+                    appsLayer.frame = CGRect(x: 0, y: 0, width: width, height: contentHeight)
+                    renderAppsPage()
+                } else if mode == .backends {
+                    appsLayer.isHidden = true
                     bottomBarLayer.isHidden = false
                     tableHeaderLayer.isHidden = false
                     rowsClipLayer.isHidden = false
@@ -494,6 +840,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate {
                     renderBackendsHeader()
                     renderBackendsRows()
                 } else {
+                    appsLayer.isHidden = true
                     bottomBarLayer.isHidden = true
                     tableHeaderLayer.isHidden = true
                     rowsClipLayer.isHidden = true
@@ -502,6 +849,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate {
                     logRowsClipLayer.isHidden = true
                     createLayer.isHidden = false
                     createLayer.frame = CGRect(x: 0, y: 0, width: width, height: contentHeight)
+                    hideAllMatchedLayers()
                     renderCreateForm()
                 }
                 updateStatusText()
@@ -526,6 +874,12 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate {
                 refreshLayer.applyStyle(textCGColor: resolvedCGColor(.controlAccentColor),
                                         backgroundCGColor: resolvedCGColor(NSColor.controlAccentColor.withAlphaComponent(0.12)),
                                         font: NSFont.systemFont(ofSize: 12, weight: .medium))
+                appsToggleLayer.applyStyle(textCGColor: resolvedCGColor(mode == .apps ? .white : .controlAccentColor),
+                                           backgroundCGColor: resolvedCGColor(mode == .apps ? .controlAccentColor : NSColor.controlAccentColor.withAlphaComponent(0.12)),
+                                           font: NSFont.systemFont(ofSize: 12, weight: .medium))
+                backendsToggleLayer.applyStyle(textCGColor: resolvedCGColor(mode == .backends || mode == .create ? .white : .controlAccentColor),
+                                               backgroundCGColor: resolvedCGColor(mode == .backends || mode == .create ? .controlAccentColor : NSColor.controlAccentColor.withAlphaComponent(0.12)),
+                                               font: NSFont.systemFont(ofSize: 12, weight: .medium))
                 newButtonLayer.applyStyle(textCGColor: resolvedCGColor(.white),
                                           backgroundCGColor: resolvedCGColor(.controlAccentColor),
                                           font: NSFont.systemFont(ofSize: 12, weight: .medium))
@@ -556,9 +910,14 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate {
         rowsClipLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
         backendRowFrames.removeAll()
         backendActionFrames.removeAll()
+        iconMatchStates.removeAll()
+        textMatchStates.removeAll()
+        var visibleIconKeys = Set<String>()
+        var visibleTextKeys = Set<String>()
 
         let rows = backendListRows()
         if rows.isEmpty {
+            hideUnrenderedMatchedLayers(visibleIconKeys: visibleIconKeys, visibleTextKeys: visibleTextKeys)
             let empty = makeTextLayer(size: 13, weight: .regular, color: .tertiaryLabelColor, alignment: .center)
             empty.string = isLoadingBackends ? "Loading backends..." : (backendError.isEmpty ? "No registered backends." : backendError)
             empty.frame = CGRect(x: horizontalInset, y: max(rowsClipLayer.bounds.midY - 10, 0), width: max(rowsClipLayer.bounds.width - horizontalInset * 2, 1), height: 20)
@@ -589,10 +948,29 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate {
             } else {
                 rowLayer.backgroundColor = alternating.odd
             }
+            rowsClipLayer.addSublayer(rowLayer)
 
             let italic = backend.isBundledPlaceholder
-            let indent: CGFloat = row.isFrontendChild ? 18 : 0
-            addCell(to: rowLayer, text: rowName(for: row), column: columns[0], y: 14, xOffset: indent, weight: row.isFrontendChild ? .regular : .medium, italic: italic, emptyPlaceholder: "")
+            let indent: CGFloat
+            if row.isFrontendChild {
+                indent = addFrontendIcon(for: row,
+                                         rowLayer: rowLayer,
+                                         column: columns[0],
+                                         visibleIconKeys: &visibleIconKeys)
+            } else {
+                indent = 0
+            }
+            let visibleName = rowName(for: row)
+            if !recordBackendNameMatches(for: row,
+                                          visibleName: visibleName,
+                                          rowLayer: rowLayer,
+                                          column: columns[0],
+                                          y: 14,
+                                          xOffset: indent,
+                                          italic: italic,
+                                          visibleTextKeys: &visibleTextKeys) {
+                addCell(to: rowLayer, text: visibleName, column: columns[0], y: 14, xOffset: indent, weight: row.isFrontendChild ? .regular : .medium, italic: italic, emptyPlaceholder: "")
+            }
             addCell(to: rowLayer, text: rowStatus(for: row), column: columns[1], y: 14, color: row.isFrontendChild ? .secondaryLabelColor : statusColor(backend.status), italic: italic, emptyPlaceholder: "")
             addCell(to: rowLayer, text: rowPathText(for: row), column: columns[2], y: 14, color: .secondaryLabelColor, italic: italic)
 
@@ -617,8 +995,288 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate {
             } else {
                 addCell(to: rowLayer, text: "--", column: columns[3], y: 14, color: .tertiaryLabelColor, alignment: .center)
             }
-            rowsClipLayer.addSublayer(rowLayer)
         }
+        hideUnrenderedMatchedLayers(visibleIconKeys: visibleIconKeys, visibleTextKeys: visibleTextKeys)
+    }
+
+    private func renderAppsPage() {
+        appsLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
+        appCardFrames.removeAll()
+        iconMatchStates.removeAll()
+        textMatchStates.removeAll()
+        var visibleIconKeys = Set<String>()
+        var visibleTextKeys = Set<String>()
+
+        let items = appLauncherItems()
+        let contentWidth = max(appsLayer.bounds.width - horizontalInset * 2, 1)
+        let left = horizontalInset
+        let top = max(appsLayer.bounds.height - 28, 0) + appsScroll
+
+        if items.isEmpty {
+            appsContentBottom = top
+            hideUnrenderedMatchedLayers(visibleIconKeys: visibleIconKeys, visibleTextKeys: visibleTextKeys)
+            if clampAppsScrollUsingRenderedContent() {
+                renderAppsPage()
+            }
+            return
+        }
+
+        let itemWidth = max(min(floor(contentWidth / 3) - 18, 174), 136)
+        let itemHeight: CGFloat = 148
+        let iconSize: CGFloat = 58
+        let horizontalGap: CGFloat = 18
+        let verticalGap: CGFloat = 20
+        let columns = max(Int((contentWidth + horizontalGap) / (itemWidth + horizontalGap)), 1)
+        let usedWidth = CGFloat(columns) * itemWidth + CGFloat(max(columns - 1, 0)) * horizontalGap
+        var x = left + max(floor((contentWidth - usedWidth) / 2), 0)
+        var y = top - itemHeight
+
+        for (index, item) in items.enumerated() {
+            if index > 0 && index.isMultiple(of: columns) {
+                x = left + max(floor((contentWidth - usedWidth) / 2), 0)
+                y -= itemHeight + verticalGap
+            }
+
+            let frame = CGRect(x: x, y: y, width: itemWidth, height: itemHeight)
+            appCardFrames.append((frame, item))
+
+            recordMatchedIcon(key: item.iconKey,
+                              frame: rootLayer.convert(CGRect(x: frame.minX + floor((itemWidth - iconSize) / 2),
+                                                              y: frame.maxY - iconSize - 16,
+                                                              width: iconSize,
+                                                              height: iconSize),
+                                                       from: appsLayer),
+                              image: item.iconImage,
+                              title: item.displayName)
+            visibleIconKeys.insert(item.iconKey)
+
+            recordMatchedText(key: item.iconKey,
+                              frame: rootLayer.convert(CGRect(x: frame.minX, y: frame.minY + 16, width: itemWidth, height: 48),
+                                                       from: appsLayer),
+                              title: item.displayName,
+                              fontSize: 12,
+                              weight: .medium,
+                              alignment: .center,
+                              isWrapped: true)
+            visibleTextKeys.insert(item.iconKey)
+
+            x += itemWidth + horizontalGap
+        }
+
+        appsContentBottom = y
+        hideUnrenderedMatchedLayers(visibleIconKeys: visibleIconKeys, visibleTextKeys: visibleTextKeys)
+        if clampAppsScrollUsingRenderedContent() {
+            renderAppsPage()
+        }
+    }
+
+    private func addFrontendIcon(for row: BackendListRow,
+                                 rowLayer: CALayer,
+                                 column: (title: String, x: CGFloat, width: CGFloat),
+                                 visibleIconKeys: inout Set<String>) -> CGFloat {
+        guard row.isFrontendChild else { return 0 }
+        let iconSize: CGFloat = 22
+        let iconX = column.x + 18
+        let title = frontendIconTitle(for: row)
+        if let key = row.iconKey {
+            recordMatchedIcon(key: key,
+                              frame: rootLayer.convert(CGRect(x: iconX,
+                                                              y: floor((backendRowHeight - iconSize) / 2),
+                                                              width: iconSize,
+                                                              height: iconSize),
+                                                       from: rowLayer),
+                              image: row.frontend?.iconImage,
+                              title: title)
+            visibleIconKeys.insert(key)
+        }
+        return 48
+    }
+
+    private func makeLauncherIconLayer(image: NSImage?, title: String, iconSize: CGFloat) -> CALayer {
+        let icon = CALayer()
+        icon.cornerRadius = iconCornerRadius(for: iconSize)
+        icon.masksToBounds = true
+        icon.contentsGravity = .resizeAspect
+        icon.contentsScale = 2
+        configureLauncherIconLayer(icon, image: image, title: title, iconSize: iconSize)
+        return icon
+    }
+
+    private func configureLauncherIconLayer(_ icon: CALayer, image: NSImage?, title: String, iconSize: CGFloat) {
+        icon.cornerRadius = iconCornerRadius(for: iconSize)
+        if let image,
+           let cgImage = cgImage(for: image) {
+            icon.contents = cgImage
+            icon.backgroundColor = resolvedCGColor(.clear)
+        } else {
+            icon.contents = letterIconCGImage(for: title)
+            icon.backgroundColor = resolvedCGColor(.clear)
+        }
+    }
+
+    private func frontendIconTitle(for row: BackendListRow) -> String {
+        let frontendName = row.frontend?.name.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !frontendName.isEmpty {
+            return frontendName
+        }
+        let backendName = row.backend.displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+        return backendName.isEmpty ? "Frontend" : backendName
+    }
+
+    private func letterIconCGImage(for title: String) -> CGImage? {
+        let imageSize: CGFloat = 96
+        let image = NSImage(size: NSSize(width: imageSize, height: imageSize))
+        image.lockFocus()
+        withEffectiveAppearance {
+            NSColor.controlAccentColor.withAlphaComponent(0.18).setFill()
+            NSBezierPath(roundedRect: NSRect(x: 0, y: 0, width: imageSize, height: imageSize),
+                         xRadius: 22,
+                         yRadius: 22).fill()
+
+            let font = NSFont.systemFont(ofSize: 40, weight: .semibold)
+            let paragraph = NSMutableParagraphStyle()
+            paragraph.alignment = .center
+            let attributes: [NSAttributedString.Key: Any] = [
+                .font: font,
+                .foregroundColor: NSColor.controlAccentColor,
+                .paragraphStyle: paragraph
+            ]
+            let text = appInitial(for: title) as NSString
+            let textHeight = font.ascender - font.descender
+            let textRect = NSRect(x: 0,
+                                  y: floor((imageSize - textHeight) / 2) - 2,
+                                  width: imageSize,
+                                  height: textHeight + 6)
+            text.draw(in: textRect, withAttributes: attributes)
+        }
+        image.unlockFocus()
+        return cgImage(for: image)
+    }
+
+    private func iconCornerRadius(for iconSize: CGFloat) -> CGFloat {
+        iconSize >= 44 ? 13 : 5
+    }
+
+    private func recordMatchedIcon(key: String, frame: CGRect, image: NSImage?, title: String) {
+        let existingLayer = iconMatchLayers[key]
+        let layer = existingLayer ?? makeLauncherIconLayer(image: image, title: title, iconSize: frame.width)
+        if layer.superlayer == nil {
+            iconTransitionLayer.addSublayer(layer)
+        }
+        if !isRecordingTransitionTargets || existingLayer == nil {
+            configureLauncherIconLayer(layer, image: image, title: title, iconSize: frame.width)
+            layer.frame = frame
+        }
+        layer.isHidden = false
+        layer.opacity = 1
+        iconMatchStates[key] = IconMatchState(frame: frame,
+                                              image: image,
+                                              title: title)
+        iconMatchLayers[key] = layer
+    }
+
+    private func recordBackendNameMatches(for row: BackendListRow,
+                                          visibleName: String,
+                                          rowLayer: CALayer,
+                                          column: (title: String, x: CGFloat, width: CGFloat),
+                                          y: CGFloat,
+                                          xOffset: CGFloat,
+                                          italic: Bool,
+                                          visibleTextKeys: inout Set<String>) -> Bool {
+        if row.isFrontendChild {
+            guard !visibleName.isEmpty,
+                  let key = row.iconKey else {
+                return false
+            }
+            let frame = rootLayer.convert(cellFrame(column: column, y: y, xOffset: xOffset), from: rowLayer)
+            recordMatchedText(key: key,
+                              frame: frame,
+                              title: visibleName,
+                              fontSize: 12,
+                              weight: .regular,
+                              alignment: .left,
+                              isWrapped: false)
+            visibleTextKeys.insert(key)
+            return true
+        }
+
+        let backendName = row.backend.displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let match = row.backend.frontends.enumerated().first(where: { _, frontend in
+            let frontendName = frontend.name.trimmingCharacters(in: .whitespacesAndNewlines)
+            return frontendName.isEmpty || frontendName == backendName
+        }) else {
+            return false
+        }
+        let key = "\(row.backend.serviceID):frontend:\(match.offset)"
+        let frame = rootLayer.convert(cellFrame(column: column, y: y, xOffset: xOffset), from: rowLayer)
+        recordMatchedText(key: key,
+                          frame: frame,
+                          title: backendName.isEmpty ? row.backend.serviceID : backendName,
+                          fontSize: 12,
+                          weight: .medium,
+                          alignment: .left,
+                          isWrapped: false,
+                          italic: italic)
+        visibleTextKeys.insert(key)
+        return true
+    }
+
+    private func recordMatchedText(key: String,
+                                   frame: CGRect,
+                                   title: String,
+                                   fontSize: CGFloat,
+                                   weight: NSFont.Weight,
+                                   alignment: CATextLayerAlignmentMode,
+                                   isWrapped: Bool,
+                                   italic: Bool = false) {
+        let existingLayer = textMatchLayers[key]
+        let layer = existingLayer ?? makeTextLayer(size: fontSize,
+                                                   weight: weight,
+                                                   color: .labelColor,
+                                                   alignment: alignment,
+                                                   italic: italic)
+        if layer.superlayer == nil {
+            iconTransitionLayer.addSublayer(layer)
+        }
+        if !isRecordingTransitionTargets || existingLayer == nil {
+            configureTextLayer(layer,
+                               title: title,
+                               fontSize: fontSize,
+                               weight: weight,
+                               color: .labelColor,
+                               alignment: alignment,
+                               isWrapped: isWrapped,
+                               italic: italic)
+            layer.frame = frame
+        }
+        layer.isHidden = false
+        layer.opacity = 1
+        textMatchStates[key] = TextMatchState(frame: frame,
+                                              title: title,
+                                              fontSize: fontSize,
+                                              weight: weight,
+                                              alignment: alignment,
+                                              isWrapped: isWrapped)
+        textMatchLayers[key] = layer
+    }
+
+    private func hideUnrenderedMatchedLayers(visibleIconKeys: Set<String>, visibleTextKeys: Set<String>) {
+        for (key, layer) in iconMatchLayers {
+            if !visibleIconKeys.contains(key) {
+                layer.isHidden = true
+            }
+        }
+        for (key, layer) in textMatchLayers {
+            if !visibleTextKeys.contains(key) {
+                layer.isHidden = true
+            }
+        }
+    }
+
+    private func hideAllMatchedLayers() {
+        hideUnrenderedMatchedLayers(visibleIconKeys: [], visibleTextKeys: [])
+        iconMatchStates.removeAll()
+        textMatchStates.removeAll()
     }
 
     private func renderPasswordPromptIfNeeded(width: CGFloat, height: CGFloat) {
@@ -1109,6 +1767,20 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate {
         }
     }
 
+    private func openLauncherItem(_ item: AppLauncherItem, opensInNewTab: Bool) {
+        guard let url = frontendNavigationURL(item.frontend) else {
+            backendError = "Could not build frontend URL."
+            updateLayout()
+            return
+        }
+
+        if opensInNewTab {
+            outerframeHost.openNewTab(with: url, displayString: item.displayName)
+        } else {
+            outerframeHost.navigate(to: url)
+        }
+    }
+
     private func submitCreateForm() {
         guard !isPerformingAction, let createEndpoint, let urlSession else { return }
         guard let recipe = selectedRecipe() else {
@@ -1229,7 +1901,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate {
 
     private func handleScroll(at point: CGPoint, delta: CGPoint, precise: Bool) {
         let multiplier: CGFloat = precise ? 1 : backendRowHeight
-        if mode == .backends {
+        if mode == .apps {
+            appsScroll -= delta.y * multiplier
+        } else if mode == .backends {
             let contentPoint = contentLayer.convert(point, from: rootLayer)
             if selectedServiceID != nil && logRowsClipLayer.frame.contains(contentPoint) {
                 logScroll -= delta.y * (precise ? 1 : logLineHeight)
@@ -1254,6 +1928,14 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate {
         }
 
         let toolbarPoint = toolbarLayer.convert(point, from: rootLayer)
+        if appsToggleFrame.contains(toolbarPoint) {
+            navigateToMode(.apps, pushHistory: true)
+            return
+        }
+        if backendsToggleFrame.contains(toolbarPoint) {
+            navigateToMode(.backends, pushHistory: true)
+            return
+        }
         if refreshFrame.contains(toolbarPoint) {
             fetchBackends()
             if selectedLog != nil {
@@ -1263,7 +1945,13 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate {
         }
 
         let contentPoint = contentLayer.convert(point, from: rootLayer)
-        if mode == .backends {
+        if mode == .apps {
+            let appsPoint = appsLayer.convert(contentPoint, from: contentLayer)
+            if let card = appCardFrames.first(where: { $0.frame.contains(appsPoint) }) {
+                openLauncherItem(card.item, opensInNewTab: modifierFlags.contains(.command))
+                return
+            }
+        } else if mode == .backends {
             if bottomBarLayer.frame.contains(contentPoint) {
                 let bottomPoint = bottomBarLayer.convert(contentPoint, from: contentLayer)
                 if newButtonFrame.contains(bottomPoint) {
@@ -1353,8 +2041,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate {
                 clearLogSelection()
                 updateLayout()
             } else {
-                mode = .backends
-                updateColors()
+                navigateToMode(.apps, pushHistory: true)
             }
         case 125:
             moveSelection(delta: 1)
@@ -1484,6 +2171,21 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate {
         return backends.first { $0.serviceID == selectedServiceID }
     }
 
+    private func appLauncherItems() -> [AppLauncherItem] {
+        backends.flatMap { backend in
+            backend.frontends.enumerated().compactMap { index, frontend in
+                guard frontend.hasEndpoint else { return nil }
+                return AppLauncherItem(backend: backend, frontend: frontend, frontendIndex: index)
+            }
+        }
+    }
+
+    private func appInitial(for name: String) -> String {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let first = trimmed.first else { return "A" }
+        return String(first).uppercased()
+    }
+
     private func backendListRows() -> [BackendListRow] {
         backends.flatMap { backend -> [BackendListRow] in
             let parent = BackendListRow(backend: backend,
@@ -1504,6 +2206,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate {
     }
 
     private func clampScrollOffsets() {
+        _ = clampAppsScrollUsingRenderedContent()
         backendScroll = clampedScroll(backendScroll, contentRows: backendListRows().count, rowHeight: backendRowHeight, viewportHeight: rowsClipLayer.bounds.height)
         logScroll = clampedScroll(logScroll, contentRows: logLines(from: currentLogText()).count, rowHeight: logLineHeight, viewportHeight: logRowsClipLayer.bounds.height)
         _ = clampCreateScrollUsingRenderedContent()
@@ -1513,6 +2216,16 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate {
         let contentHeight = CGFloat(contentRows) * rowHeight
         let maxScroll = max(contentHeight - viewportHeight, 0)
         return min(max(value, 0), maxScroll)
+    }
+
+    private func clampAppsScrollUsingRenderedContent() -> Bool {
+        let maxScroll = max(appsScroll + createBottomInset - appsContentBottom, 0)
+        let clamped = min(max(appsScroll, 0), maxScroll)
+        if abs(clamped - appsScroll) > 0.5 {
+            appsScroll = clamped
+            return true
+        }
+        return false
     }
 
     private func clampCreateScrollUsingRenderedContent() -> Bool {
@@ -1818,6 +2531,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate {
         return result
     }
 
+    @discardableResult
     private func addCell(to rowLayer: CALayer,
                          text: String,
                          column: (title: String, x: CGFloat, width: CGFloat),
@@ -1827,11 +2541,18 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate {
                          weight: NSFont.Weight = .regular,
                          alignment: CATextLayerAlignmentMode = .left,
                          italic: Bool = false,
-                         emptyPlaceholder: String = "--") {
+                         emptyPlaceholder: String = "--") -> CATextLayer {
         let layer = makeTextLayer(size: 12, weight: weight, color: color, alignment: alignment, italic: italic)
         layer.string = text.isEmpty ? emptyPlaceholder : text
-        layer.frame = CGRect(x: column.x + xOffset, y: y, width: max(column.width - 10 - xOffset, 1), height: 16)
+        layer.frame = cellFrame(column: column, y: y, xOffset: xOffset)
         rowLayer.addSublayer(layer)
+        return layer
+    }
+
+    private func cellFrame(column: (title: String, x: CGFloat, width: CGFloat),
+                           y: CGFloat,
+                           xOffset: CGFloat = 0) -> CGRect {
+        CGRect(x: column.x + xOffset, y: y, width: max(column.width - 10 - xOffset, 1), height: 16)
     }
 
     private func makeTextLayer(size: CGFloat,
@@ -1855,6 +2576,31 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate {
         layer.truncationMode = .end
         layer.alignmentMode = alignment
         return layer
+    }
+
+    private func configureTextLayer(_ layer: CATextLayer,
+                                    title: String,
+                                    fontSize: CGFloat,
+                                    weight: NSFont.Weight,
+                                    color: NSColor,
+                                    alignment: CATextLayerAlignmentMode,
+                                    isWrapped: Bool,
+                                    italic: Bool = false,
+                                    monospaced: Bool = false) {
+        var font = monospaced ? NSFont.monospacedSystemFont(ofSize: fontSize, weight: weight) : NSFont.systemFont(ofSize: fontSize, weight: weight)
+        if italic {
+            let descriptor = font.fontDescriptor.withSymbolicTraits(.italic)
+            if let italicFont = NSFont(descriptor: descriptor, size: fontSize) {
+                font = italicFont
+            }
+        }
+        layer.string = title
+        layer.font = font
+        layer.fontSize = fontSize
+        layer.foregroundColor = resolvedCGColor(color)
+        layer.alignmentMode = alignment
+        layer.isWrapped = isWrapped
+        layer.truncationMode = isWrapped ? .none : .end
     }
 
     private func makeButtonLayer(title: String, emphasized: Bool) -> CenteredButtonLayer {
@@ -1883,6 +2629,11 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate {
         layer.applyStyle(tintCGColor: resolvedCGColor(.secondaryLabelColor),
                          backgroundCGColor: resolvedCGColor(.clear))
         return layer
+    }
+
+    private func cgImage(for image: NSImage) -> CGImage? {
+        var rect = NSRect(origin: .zero, size: image.size)
+        return image.cgImage(forProposedRect: &rect, context: nil, hints: nil)
     }
 
     private func alternatingRowColors() -> (even: CGColor, odd: CGColor) {

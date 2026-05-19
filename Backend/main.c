@@ -34,7 +34,8 @@
 #define DEFAULT_LOG_BYTES 131072
 #define MAX_LOG_BYTES 1048576
 
-static const char *kBackendsServiceID = "dev.outergroup.Backends";
+static const char *kNavigatorServiceID = "dev.outergroup.Navigator";
+static const char *kLegacyBackendsServiceID = "dev.outergroup.Backends";
 static const char *kBundleUrlPath = "/bundles/BackendsContent";
 static const char *kBundleUrlPathMacosArm = "/bundles/BackendsContent/macos-arm";
 static const char *kBundleUrlPathMacosX86 = "/bundles/BackendsContent/macos-x86";
@@ -92,6 +93,12 @@ static const BundledAppDefinition kBundledApps[] = {
         .version = "1"
     }
 };
+
+static bool is_navigator_service_id(const char *service_id) {
+    return service_id &&
+           (strcmp(service_id, kNavigatorServiceID) == 0 ||
+            strcmp(service_id, kLegacyBackendsServiceID) == 0);
+}
 
 typedef struct {
     char *data;
@@ -207,6 +214,62 @@ static bool sb_append_json_string(StringBuilder *builder, const char *text) {
         }
     }
     return sb_append(builder, "\"");
+}
+
+static bool sb_append_base64_file_json_string(StringBuilder *builder, const char *path) {
+    static const char table[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    if (!path || !path[0]) {
+        return sb_append_json_string(builder, "");
+    }
+
+    if (strncmp(path, "data:", 5) == 0) {
+        const char *comma = strchr(path, ',');
+        if (comma && strstr(path, ";base64")) {
+            return sb_append_json_string(builder, comma + 1);
+        }
+        return sb_append_json_string(builder, "");
+    }
+
+    struct stat st;
+    if (stat(path, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0 || st.st_size > 1024 * 1024) {
+        return sb_append_json_string(builder, "");
+    }
+
+    FILE *file = fopen(path, "rb");
+    if (!file) {
+        return sb_append_json_string(builder, "");
+    }
+
+    unsigned char *bytes = malloc((size_t)st.st_size);
+    if (!bytes) {
+        fclose(file);
+        return false;
+    }
+    size_t read_count = fread(bytes, 1, (size_t)st.st_size, file);
+    fclose(file);
+    if (read_count != (size_t)st.st_size) {
+        free(bytes);
+        return sb_append_json_string(builder, "");
+    }
+
+    bool ok = sb_append(builder, "\"");
+    for (size_t i = 0; ok && i < read_count; i += 3) {
+        unsigned int value = (unsigned int)bytes[i] << 16;
+        bool has_second = i + 1 < read_count;
+        bool has_third = i + 2 < read_count;
+        if (has_second) value |= (unsigned int)bytes[i + 1] << 8;
+        if (has_third) value |= (unsigned int)bytes[i + 2];
+
+        char chunk[4] = {
+            table[(value >> 18) & 0x3f],
+            table[(value >> 12) & 0x3f],
+            has_second ? table[(value >> 6) & 0x3f] : '=',
+            has_third ? table[value & 0x3f] : '='
+        };
+        ok = sb_append_n(builder, chunk, sizeof(chunk));
+    }
+    free(bytes);
+    return ok && sb_append(builder, "\"");
 }
 
 static bool sb_append_python_string(StringBuilder *builder, const char *text) {
@@ -733,12 +796,12 @@ static bool append_frontends_json(StringBuilder *builder, sqlite3 *database, con
     char column_error[256] = "";
     bool has_home_screen_column = frontends_has_column(database, "is_home_screen", column_error, sizeof(column_error));
     const char *sql = has_home_screen_column ?
-        "SELECT name, COALESCE(url, ''), COALESCE(port, 0), COALESCE(socket_path, ''), COALESCE(is_home_screen, 0) "
-        "FROM frontends WHERE service_id = ? "
-        "ORDER BY name, url;" :
-        "SELECT name, COALESCE(url, ''), COALESCE(port, 0), COALESCE(socket_path, ''), 0 "
-        "FROM frontends WHERE service_id = ? "
-        "ORDER BY name, url;";
+        "SELECT f.name, COALESCE(f.url, ''), COALESCE(f.port, 0), COALESCE(f.socket_path, ''), COALESCE(f.is_home_screen, 0), COALESCE(NULLIF(f.icon, ''), COALESCE(b.icon, '')) "
+        "FROM frontends f LEFT JOIN backends b ON b.service_id = f.service_id WHERE f.service_id = ? "
+        "ORDER BY f.name, f.url;" :
+        "SELECT f.name, COALESCE(f.url, ''), COALESCE(f.port, 0), COALESCE(f.socket_path, ''), 0, COALESCE(NULLIF(f.icon, ''), COALESCE(b.icon, '')) "
+        "FROM frontends f LEFT JOIN backends b ON b.service_id = f.service_id WHERE f.service_id = ? "
+        "ORDER BY f.name, f.url;";
     if (sqlite3_prepare_v2(database, sql, -1, &statement, NULL) != SQLITE_OK) {
         return false;
     }
@@ -760,6 +823,10 @@ static bool append_frontends_json(StringBuilder *builder, sqlite3 *database, con
         ok = ok && sb_append_json_string(builder, sqlite_column_text_or_empty(statement, 3));
         ok = ok && sb_append(builder, ",\"isHomeScreen\":");
         ok = ok && sb_append(builder, sqlite3_column_int(statement, 4) != 0 ? "true" : "false");
+        ok = ok && sb_append(builder, ",\"iconPath\":");
+        ok = ok && sb_append_json_string(builder, sqlite_column_text_or_empty(statement, 5));
+        ok = ok && sb_append(builder, ",\"iconData\":");
+        ok = ok && sb_append_base64_file_json_string(builder, sqlite_column_text_or_empty(statement, 5));
         ok = ok && sb_append(builder, "}");
     }
     sqlite3_finalize(statement);
@@ -840,7 +907,7 @@ static bool append_registered_backends_json(StringBuilder *builder,
         int owns_plist = sqlite3_column_int(statement, 4);
         const char *service_scope = sqlite_column_text_or_empty(statement, 5);
         const BundledAppDefinition *bundled_app = bundled_app_for_service_id(service_id);
-        bool is_self = strcmp(service_id, kBackendsServiceID) == 0;
+        bool is_self = is_navigator_service_id(service_id);
         if (bundled_app) {
             size_t bundled_index = (size_t)(bundled_app - kBundledApps);
             if (bundled_index < bundled_installed_count) {
@@ -1057,8 +1124,8 @@ static void send_control_response(int fd, const char *query, const char *body) {
     }
     query_value_any(query, body, "sudoPassword", sudo_password, sizeof(sudo_password));
 
-    if (strcmp(service_id, kBackendsServiceID) == 0) {
-        send_action_json(fd, 400, false, "Backends cannot stop, start, or uninstall itself.");
+    if (is_navigator_service_id(service_id)) {
+        send_action_json(fd, 400, false, "Navigator cannot stop, start, or uninstall itself.");
         return;
     }
 
