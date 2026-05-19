@@ -33,6 +33,10 @@
 #define READ_BUFFER_SIZE 65536
 #define DEFAULT_LOG_BYTES 131072
 #define MAX_LOG_BYTES 1048576
+#define MAX_REACTOR_CLIENTS 128
+#define CLIENT_IDLE_TIMEOUT_MS 10000
+#define SYSTEMD_STATUS_CACHE_TTL_MS 1500
+#define MAX_SYSTEMD_STATUS_ENTRIES 512
 
 static const char *kNavigatorServiceID = "dev.outergroup.Navigator";
 static const char *kLegacyBackendsServiceID = "dev.outergroup.Backends";
@@ -51,6 +55,27 @@ static char g_listen_socket_path[PATH_MAX] = "";
 static bool g_systemd_socket_activation = false;
 static volatile sig_atomic_t g_shutdown_requested = 0;
 static volatile sig_atomic_t g_listener_fd = -1;
+
+typedef struct {
+    int fd;
+    char request[READ_BUFFER_SIZE];
+    size_t length;
+    int64_t last_activity_ms;
+} ReactorClient;
+
+typedef struct {
+    char unit_name[256];
+    char scope[16];
+    char active_state[32];
+} SystemdStatusEntry;
+
+typedef struct {
+    SystemdStatusEntry entries[MAX_SYSTEMD_STATUS_ENTRIES];
+    size_t count;
+    int64_t refreshed_at_ms;
+} SystemdStatusCache;
+
+static SystemdStatusCache g_systemd_status_cache = {0};
 
 typedef struct {
     const char *service_id;
@@ -130,6 +155,22 @@ static bool queue_all(int fd, const void *data, size_t len) {
         len -= (size_t)written;
     }
     return true;
+}
+
+static int64_t monotonic_milliseconds(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+        return (int64_t)time(NULL) * 1000;
+    }
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static bool set_fd_nonblocking(int fd, bool nonblocking) {
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0) return false;
+    int new_flags = nonblocking ? (flags | O_NONBLOCK) : (flags & ~O_NONBLOCK);
+    if (new_flags == flags) return true;
+    return fcntl(fd, F_SETFL, new_flags) == 0;
 }
 
 static void write_uint32_le(unsigned char *dst, uint32_t value) {
@@ -682,31 +723,86 @@ static bool sqlite_table_exists(sqlite3 *database, const char *table_name) {
     return exists;
 }
 
+static void append_systemd_status_scope(const char *scope) {
+    const char *scope_argument = (scope && strcmp(scope, "system") == 0) ? "--system" : "--user";
+    char command[256];
+    snprintf(command,
+             sizeof(command),
+             "timeout 2s systemctl %s list-units --all --type=service --type=socket --no-legend --no-pager --plain 2>/dev/null",
+             scope_argument);
+
+    FILE *pipe = popen(command, "r");
+    if (!pipe) return;
+
+    char line[2048];
+    while (g_systemd_status_cache.count < MAX_SYSTEMD_STATUS_ENTRIES &&
+           fgets(line, sizeof(line), pipe)) {
+        char unit_name[256] = "";
+        char load_state[32] = "";
+        char active_state[32] = "";
+        if (sscanf(line, "%255s %31s %31s", unit_name, load_state, active_state) != 3) {
+            continue;
+        }
+        if (!safe_unit_name(unit_name)) {
+            continue;
+        }
+        SystemdStatusEntry *entry = &g_systemd_status_cache.entries[g_systemd_status_cache.count++];
+        snprintf(entry->unit_name, sizeof(entry->unit_name), "%s", unit_name);
+        snprintf(entry->scope, sizeof(entry->scope), "%s", scope && scope[0] ? scope : "user");
+        snprintf(entry->active_state, sizeof(entry->active_state), "%s", active_state);
+    }
+    pclose(pipe);
+}
+
+static void refresh_systemd_status_cache_if_needed(void) {
+    int64_t now = monotonic_milliseconds();
+    if (g_systemd_status_cache.refreshed_at_ms > 0 &&
+        now - g_systemd_status_cache.refreshed_at_ms < SYSTEMD_STATUS_CACHE_TTL_MS) {
+        return;
+    }
+
+    g_systemd_status_cache.count = 0;
+    g_systemd_status_cache.refreshed_at_ms = now;
+    append_systemd_status_scope("user");
+#ifndef __APPLE__
+    append_systemd_status_scope("system");
+#endif
+}
+
+static const char *cached_systemd_active_state(const char *unit_name, const char *scope) {
+    if (!safe_unit_name(unit_name)) return NULL;
+    const char *normalized_scope = (scope && strcmp(scope, "system") == 0) ? "system" : "user";
+    refresh_systemd_status_cache_if_needed();
+    for (size_t i = 0; i < g_systemd_status_cache.count; i++) {
+        SystemdStatusEntry *entry = &g_systemd_status_cache.entries[i];
+        if (strcmp(entry->scope, normalized_scope) == 0 &&
+            strcmp(entry->unit_name, unit_name) == 0) {
+            return entry->active_state;
+        }
+    }
+    return NULL;
+}
+
 static void systemd_status(const char *unit_name, const char *scope, char *out, size_t out_size) {
     if (!safe_unit_name(unit_name)) {
         snprintf(out, out_size, "unknown");
         return;
     }
-    char quoted_unit[320];
-    shell_quote(unit_name, quoted_unit, sizeof(quoted_unit));
-    char command[512];
-    const char *scope_argument = (scope && strcmp(scope, "system") == 0) ? "--system" : "--user";
-    snprintf(command, sizeof(command), "timeout 2s systemctl %s is-active --quiet %s", scope_argument, quoted_unit);
-    int result = system(command);
-    if (result == 0) {
+    const char *active_state = cached_systemd_active_state(unit_name, scope);
+    if (active_state && strcmp(active_state, "active") == 0) {
         snprintf(out, out_size, "running");
-    } else if (WIFEXITED(result) && WEXITSTATUS(result) == 3) {
+    } else if (!active_state ||
+               strcmp(active_state, "inactive") == 0 ||
+               strcmp(active_state, "failed") == 0) {
         for (size_t i = 0; i < sizeof(kBundledApps) / sizeof(kBundledApps[0]); i++) {
             if (!kBundledApps[i].socket_activated || strcmp(kBundledApps[i].unit_name, unit_name) != 0) {
                 continue;
             }
             char socket_unit[256];
-            char quoted_socket_unit[320];
             systemd_socket_unit_name(unit_name, socket_unit, sizeof(socket_unit));
             if (safe_unit_name(socket_unit)) {
-                shell_quote(socket_unit, quoted_socket_unit, sizeof(quoted_socket_unit));
-                snprintf(command, sizeof(command), "timeout 2s systemctl %s is-active --quiet %s", scope_argument, quoted_socket_unit);
-                if (system(command) == 0) {
+                const char *socket_active_state = cached_systemd_active_state(socket_unit, scope);
+                if (socket_active_state && strcmp(socket_active_state, "active") == 0) {
                     snprintf(out, out_size, "available");
                     return;
                 }
@@ -3438,23 +3534,58 @@ static bool is_navigator_route(const char *target) {
            strcmp(target, "/backends.outer") == 0;
 }
 
-static void handle_client(int fd) {
-    struct timeval timeout;
-    timeout.tv_sec = 5;
-    timeout.tv_usec = 0;
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+static bool parsed_content_length(const char *request,
+                                  size_t header_length,
+                                  size_t *content_length) {
+    *content_length = 0;
+    char header[READ_BUFFER_SIZE];
+    if (header_length >= sizeof(header)) {
+        return false;
+    }
+    memcpy(header, request, header_length);
+    header[header_length] = '\0';
 
-    struct pollfd poll_fd = {.fd = fd, .events = POLLIN, .revents = 0};
-    int ready;
-    do {
-        ready = poll(&poll_fd, 1, 500);
-    } while (ready < 0 && errno == EINTR);
-    if (ready <= 0 || !(poll_fd.revents & POLLIN)) return;
+    char *content_length_header = strcasestr(header, "\r\nContent-Length:");
+    if (!content_length_header) {
+        return true;
+    }
+    *content_length = (size_t)strtoull(content_length_header + 17, NULL, 10);
+    return true;
+}
 
-    char request[READ_BUFFER_SIZE];
-    ssize_t n = read(fd, request, sizeof(request) - 1);
-    if (n <= 0) return;
+static bool request_is_complete(const char *request, size_t length, size_t *complete_length) {
+    *complete_length = 0;
+    const char *body_separator = NULL;
+    for (size_t i = 0; i + 3 < length; i++) {
+        if (request[i] == '\r' &&
+            request[i + 1] == '\n' &&
+            request[i + 2] == '\r' &&
+            request[i + 3] == '\n') {
+            body_separator = request + i;
+            break;
+        }
+    }
+    if (!body_separator) {
+        return false;
+    }
+
+    size_t header_length = (size_t)(body_separator + 4 - request);
+    size_t content_length = 0;
+    if (!parsed_content_length(request, header_length, &content_length)) {
+        return false;
+    }
+    if (content_length > READ_BUFFER_SIZE || header_length + content_length > READ_BUFFER_SIZE) {
+        *complete_length = READ_BUFFER_SIZE + 1;
+        return true;
+    }
+    if (length < header_length + content_length) {
+        return false;
+    }
+    *complete_length = header_length + content_length;
+    return true;
+}
+
+static void process_client_request(int fd, char *request, size_t n) {
     request[n] = '\0';
 
     char *body = strstr(request, "\r\n\r\n");
@@ -3627,6 +3758,165 @@ static int systemd_activated_listener(void) {
     return 3;
 }
 
+static void close_reactor_client(ReactorClient *clients, size_t *client_count, size_t index) {
+    if (index >= *client_count) return;
+    close(clients[index].fd);
+    if (index + 1 < *client_count) {
+        memmove(&clients[index],
+                &clients[index + 1],
+                (*client_count - index - 1) * sizeof(clients[0]));
+    }
+    (*client_count)--;
+}
+
+static void add_reactor_client(ReactorClient *clients, size_t *client_count, int client_fd) {
+    if (*client_count >= MAX_REACTOR_CLIENTS) {
+        close(client_fd);
+        return;
+    }
+    set_fd_nonblocking(client_fd, true);
+    ReactorClient *client = &clients[(*client_count)++];
+    memset(client, 0, sizeof(*client));
+    client->fd = client_fd;
+    client->last_activity_ms = monotonic_milliseconds();
+}
+
+static bool read_reactor_client(ReactorClient *client,
+                                size_t *complete_length,
+                                bool *should_close) {
+    *complete_length = 0;
+    *should_close = false;
+
+    for (;;) {
+        if (client->length >= sizeof(client->request) - 1) {
+            *complete_length = READ_BUFFER_SIZE + 1;
+            return true;
+        }
+
+        ssize_t got = read(client->fd,
+                           client->request + client->length,
+                           sizeof(client->request) - client->length - 1);
+        if (got > 0) {
+            client->length += (size_t)got;
+            client->request[client->length] = '\0';
+            client->last_activity_ms = monotonic_milliseconds();
+            if (request_is_complete(client->request, client->length, complete_length)) {
+                return true;
+            }
+            continue;
+        }
+        if (got == 0) {
+            *should_close = true;
+            return false;
+        }
+        if (errno == EINTR) {
+            continue;
+        }
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            return false;
+        }
+        *should_close = true;
+        return false;
+    }
+}
+
+static void accept_ready_clients(int listener, ReactorClient *clients, size_t *client_count) {
+    for (;;) {
+        struct sockaddr_storage peer;
+        socklen_t peer_len = sizeof(peer);
+        int client = accept(listener, (struct sockaddr *)&peer, &peer_len);
+        if (client < 0) {
+            if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) return;
+            perror("accept");
+            g_shutdown_requested = 1;
+            return;
+        }
+        add_reactor_client(clients, client_count, client);
+    }
+}
+
+static void run_reactor(int listener) {
+    ReactorClient *clients = calloc(MAX_REACTOR_CLIENTS, sizeof(ReactorClient));
+    if (!clients) {
+        fprintf(stderr, "failed to allocate reactor clients\n");
+        return;
+    }
+    size_t client_count = 0;
+
+    set_fd_nonblocking(listener, true);
+    while (!g_shutdown_requested) {
+        struct pollfd poll_fds[MAX_REACTOR_CLIENTS + 1];
+        size_t polled_client_count = client_count;
+        poll_fds[0] = (struct pollfd){.fd = listener, .events = POLLIN, .revents = 0};
+        for (size_t i = 0; i < polled_client_count; i++) {
+            poll_fds[i + 1] = (struct pollfd){.fd = clients[i].fd, .events = POLLIN, .revents = 0};
+        }
+
+        int timeout_ms = 1000;
+        if (g_systemd_socket_activation && polled_client_count == 0) {
+            timeout_ms = 60000;
+        }
+
+        int poll_result = poll(poll_fds, polled_client_count + 1, timeout_ms);
+        if (poll_result == 0) {
+            if (g_systemd_socket_activation && client_count == 0) {
+                break;
+            }
+        } else if (poll_result < 0) {
+            if (errno == EINTR) continue;
+            perror("poll");
+            break;
+        } else {
+            if (poll_fds[0].revents & POLLIN) {
+                accept_ready_clients(listener, clients, &client_count);
+            } else if (poll_fds[0].revents & (POLLERR | POLLHUP | POLLNVAL)) {
+                break;
+            }
+
+            for (size_t i = polled_client_count; i > 0; i--) {
+                size_t index = i - 1;
+                short revents = poll_fds[index + 1].revents;
+                if (revents == 0) continue;
+
+                if (revents & POLLIN) {
+                    size_t complete_length = 0;
+                    bool should_close = false;
+                    bool complete = read_reactor_client(&clients[index], &complete_length, &should_close);
+                    if (complete) {
+                        set_fd_nonblocking(clients[index].fd, false);
+                        if (complete_length > READ_BUFFER_SIZE) {
+                            send_text_response(clients[index].fd, 400, "request too large\n");
+                        } else {
+                            process_client_request(clients[index].fd,
+                                                   clients[index].request,
+                                                   complete_length);
+                        }
+                        close_reactor_client(clients, &client_count, index);
+                    } else if (should_close) {
+                        close_reactor_client(clients, &client_count, index);
+                    }
+                } else if (revents & (POLLERR | POLLHUP | POLLNVAL)) {
+                    close_reactor_client(clients, &client_count, index);
+                }
+            }
+        }
+
+        int64_t now = monotonic_milliseconds();
+        for (size_t i = client_count; i > 0; i--) {
+            size_t index = i - 1;
+            if (now - clients[index].last_activity_ms > CLIENT_IDLE_TIMEOUT_MS) {
+                close_reactor_client(clients, &client_count, index);
+            }
+        }
+    }
+
+    for (size_t i = 0; i < client_count; i++) {
+        close(clients[i].fd);
+    }
+    free(clients);
+}
+
 static void usage(const char *program) {
     fprintf(stderr, "Usage: %s [--port PORT | --socket-path PATH] [--bundles-dir DIR] [--database PATH] [--system-database PATH]\n", program);
 }
@@ -3686,30 +3976,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "System registry database: %s\n", g_system_registry_database_path);
     }
 
-    while (!g_shutdown_requested) {
-        if (g_systemd_socket_activation) {
-            struct pollfd poll_fd = {.fd = listener, .events = POLLIN, .revents = 0};
-            int poll_result = poll(&poll_fd, 1, 60000);
-            if (poll_result == 0) {
-                break;
-            }
-            if (poll_result < 0) {
-                if (errno == EINTR) continue;
-                perror("poll");
-                break;
-            }
-        }
-        struct sockaddr_storage peer;
-        socklen_t peer_len = sizeof(peer);
-        int client = accept(listener, (struct sockaddr *)&peer, &peer_len);
-        if (client < 0) {
-            if (errno == EINTR) continue;
-            perror("accept");
-            break;
-        }
-        handle_client(client);
-        close(client);
-    }
+    run_reactor(listener);
 
     close(listener);
     g_listener_fd = -1;
