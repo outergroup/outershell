@@ -1,0 +1,51 @@
+# macOS filesystem noise
+.DS_Store
+._*
+.AppleDouble
+.LSOverride
+
+# Xcode user/local state
+xcuserdata/
+*.xcuserstate
+*.xcuserdatad/
+*.xcscmblueprint
+*.moved-aside
+*.xccheckout
+
+# Build products and derived data
+build/
+.build/
+DerivedData/
+DerivedData-*/
+*.hmap
+*.dSYM/
+*.dSYM.zip
+*.ipa
+
+# Generated bundle/package artifacts
+*.aar
+!bundled-apps/**/bundles/*.aar
+*.outer
+*.bundle/
+*.framework/
+*.xcarchive/
+
+# Local backend/runtime output and logs
+BackendsBackend
+BackendsBackend.*
+*.log
+*.pid
+outerloop-backends/
+
+# Local config/secrets
+.env
+.env.*
+!.env.example
+
+# SwiftPM/editor scratch
+.swiftpm/
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
