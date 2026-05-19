@@ -892,7 +892,7 @@ static int create_unix_listener(const char *socket_path) {
         close(fd);
         return -1;
     }
-    if (chmod(socket_path, 0600) != 0) {
+    if (chmod(socket_path, geteuid() == 0 ? 0666 : 0600) != 0) {
         perror("chmod");
         close(fd);
         unlink(socket_path);

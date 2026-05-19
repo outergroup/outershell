@@ -40,10 +40,12 @@ static const char *kBundleUrlPathMacosArm = "/bundles/BackendsContent/macos-arm"
 static const char *kBundleUrlPathMacosX86 = "/bundles/BackendsContent/macos-x86";
 static const char *kBundleFilePathMacosArm = "bundles/BackendsContent.bundle.macos-arm.aar";
 static const char *kBundleFilePathMacosX86 = "bundles/BackendsContent.bundle.macos-x86.aar";
+static const char *kSystemOuterAgentRoot = "/var/lib/outergroup/outeragent";
 
 static char g_bundle_file_path_macos_arm[PATH_MAX] = "";
 static char g_bundle_file_path_macos_x86[PATH_MAX] = "";
 static char g_registry_database_path[PATH_MAX] = "";
+static char g_system_registry_database_path[PATH_MAX] = "";
 static char g_listen_socket_path[PATH_MAX] = "";
 static volatile sig_atomic_t g_shutdown_requested = 0;
 static volatile sig_atomic_t g_listener_fd = -1;
@@ -334,6 +336,10 @@ static bool query_value(const char *query, const char *name, char *dst, size_t d
     return false;
 }
 
+static bool query_value_any(const char *query, const char *body, const char *name, char *dst, size_t dst_size) {
+    return query_value(query, name, dst, dst_size) || query_value(body, name, dst, dst_size);
+}
+
 static const char *home_directory(void) {
     const char *home = getenv("HOME");
     if (home && home[0]) return home;
@@ -356,6 +362,9 @@ static void expand_tilde_path(const char *path, char *out, size_t out_size) {
 static void append_path_component(char *out, size_t out_size, const char *base, const char *component) {
     snprintf(out, out_size, "%s/%s", base && base[0] ? base : "", component && component[0] ? component : "");
 }
+
+static bool sudo_failure_needs_password(const char *output, int exit_status);
+static bool run_sudo_shell(const char *command, const char *password, char *output, size_t output_size, int *exit_status);
 
 static const BundledAppDefinition *bundled_app_for_service_id(const char *service_id) {
     if (!service_id) return NULL;
@@ -428,9 +437,29 @@ static void default_registry_database_path(char *out, size_t out_size) {
 #endif
 }
 
-static sqlite3 *open_registry_readonly(char *error, size_t error_size) {
+static void default_system_registry_database_path(char *out, size_t out_size) {
+    const char *env_path = getenv("BACKENDS_SYSTEM_REGISTRY_DB");
+    if (!env_path || !env_path[0]) {
+        env_path = getenv("OUTERLOOP_SYSTEM_REGISTRY_DB");
+    }
+    if (env_path && env_path[0]) {
+        expand_tilde_path(env_path, out, out_size);
+        return;
+    }
+#ifdef __APPLE__
+    out[0] = '\0';
+#else
+    snprintf(out, out_size, "%s/registry.sqlite3", kSystemOuterAgentRoot);
+#endif
+}
+
+static sqlite3 *open_registry_readonly_at(const char *path, char *error, size_t error_size) {
+    if (!path || !path[0]) {
+        snprintf(error, error_size, "registry database path is empty");
+        return NULL;
+    }
     sqlite3 *database = NULL;
-    int result = sqlite3_open_v2(g_registry_database_path, &database,
+    int result = sqlite3_open_v2(path, &database,
                                  SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX, NULL);
     if (result != SQLITE_OK) {
         snprintf(error, error_size, "%s", database ? sqlite3_errmsg(database) : "failed to open registry database");
@@ -441,9 +470,21 @@ static sqlite3 *open_registry_readonly(char *error, size_t error_size) {
     return database;
 }
 
-static sqlite3 *open_registry_readwrite(char *error, size_t error_size) {
+static sqlite3 *open_registry_readonly(char *error, size_t error_size) {
+    return open_registry_readonly_at(g_registry_database_path, error, error_size);
+}
+
+static sqlite3 *open_system_registry_readonly(char *error, size_t error_size) {
+    return open_registry_readonly_at(g_system_registry_database_path, error, error_size);
+}
+
+static sqlite3 *open_registry_readwrite_at(const char *path, char *error, size_t error_size) {
+    if (!path || !path[0]) {
+        snprintf(error, error_size, "registry database path is empty");
+        return NULL;
+    }
     sqlite3 *database = NULL;
-    int result = sqlite3_open_v2(g_registry_database_path, &database,
+    int result = sqlite3_open_v2(path, &database,
                                  SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX, NULL);
     if (result != SQLITE_OK) {
         snprintf(error, error_size, "%s", database ? sqlite3_errmsg(database) : "failed to open registry database");
@@ -452,6 +493,10 @@ static sqlite3 *open_registry_readwrite(char *error, size_t error_size) {
     }
     sqlite3_busy_timeout(database, 5000);
     return database;
+}
+
+static sqlite3 *open_registry_readwrite(char *error, size_t error_size) {
+    return open_registry_readwrite_at(g_registry_database_path, error, error_size);
 }
 
 static bool sqlite_exec_ok(sqlite3 *database, const char *sql, char *error, size_t error_size) {
@@ -463,35 +508,63 @@ static bool sqlite_exec_ok(sqlite3 *database, const char *sql, char *error, size
     return false;
 }
 
+static bool frontends_has_column(sqlite3 *database, const char *name, char *error, size_t error_size) {
+    sqlite3_stmt *statement = NULL;
+    if (sqlite3_prepare_v2(database, "PRAGMA table_info(frontends);", -1, &statement, NULL) != SQLITE_OK) {
+        snprintf(error, error_size, "%s", sqlite3_errmsg(database));
+        return false;
+    }
+    bool has_column = false;
+    while (sqlite3_step(statement) == SQLITE_ROW) {
+        const char *column_name = (const char *)sqlite3_column_text(statement, 1);
+        if (column_name && strcmp(column_name, name) == 0) {
+            has_column = true;
+            break;
+        }
+    }
+    sqlite3_finalize(statement);
+    return has_column;
+}
+
 static bool ensure_registry_schema(sqlite3 *database, char *error, size_t error_size) {
-    return sqlite_exec_ok(database,
-                          "CREATE TABLE IF NOT EXISTS backends ("
-                          "service_id TEXT PRIMARY KEY,"
-                          "display_name TEXT NOT NULL DEFAULT '',"
-                          "icon TEXT,"
-                          "service_unit TEXT"
-                          ");"
-                          "CREATE TABLE IF NOT EXISTS frontends ("
-                          "url TEXT PRIMARY KEY,"
-                          "service_id TEXT,"
-                          "name TEXT NOT NULL,"
-                          "port INTEGER NOT NULL DEFAULT 0,"
-                          "socket_path TEXT NOT NULL DEFAULT '',"
-                          "icon TEXT"
-                          ");"
-                          "CREATE INDEX IF NOT EXISTS frontends_service_id_idx ON frontends(service_id);"
-                          "CREATE TABLE IF NOT EXISTS log_files ("
-                          "path TEXT PRIMARY KEY,"
-                          "service_id TEXT NOT NULL"
-                          ");"
-                          "CREATE INDEX IF NOT EXISTS log_files_service_id_idx ON log_files(service_id);"
-                          "CREATE TABLE IF NOT EXISTS systemd_backends ("
-                          "service_id TEXT PRIMARY KEY,"
-                          "unit_name TEXT NOT NULL,"
-                          "scope TEXT NOT NULL DEFAULT 'user'"
-                          ");",
-                          error,
-                          error_size);
+    if (!sqlite_exec_ok(database,
+                        "CREATE TABLE IF NOT EXISTS backends ("
+                        "service_id TEXT PRIMARY KEY,"
+                        "display_name TEXT NOT NULL DEFAULT '',"
+                        "icon TEXT,"
+                        "service_unit TEXT"
+                        ");"
+                        "CREATE TABLE IF NOT EXISTS frontends ("
+                        "url TEXT PRIMARY KEY,"
+                        "service_id TEXT,"
+                        "name TEXT NOT NULL,"
+                        "port INTEGER NOT NULL DEFAULT 0,"
+                        "socket_path TEXT NOT NULL DEFAULT '',"
+                        "icon TEXT,"
+                        "is_home_screen INTEGER NOT NULL DEFAULT 0"
+                        ");"
+                        "CREATE INDEX IF NOT EXISTS frontends_service_id_idx ON frontends(service_id);"
+                        "CREATE TABLE IF NOT EXISTS log_files ("
+                        "path TEXT PRIMARY KEY,"
+                        "service_id TEXT NOT NULL"
+                        ");"
+                        "CREATE INDEX IF NOT EXISTS log_files_service_id_idx ON log_files(service_id);"
+                        "CREATE TABLE IF NOT EXISTS systemd_backends ("
+                        "service_id TEXT PRIMARY KEY,"
+                        "unit_name TEXT NOT NULL,"
+                        "scope TEXT NOT NULL DEFAULT 'user'"
+                        ");",
+                        error,
+                        error_size)) {
+        return false;
+    }
+    if (!frontends_has_column(database, "is_home_screen", error, error_size)) {
+        return sqlite_exec_ok(database,
+                              "ALTER TABLE frontends ADD COLUMN is_home_screen INTEGER NOT NULL DEFAULT 0;",
+                              error,
+                              error_size);
+    }
+    return true;
 }
 
 static const char *sqlite_column_text_or_empty(sqlite3_stmt *statement, int column) {
@@ -551,8 +624,11 @@ static void systemd_unit_path(const char *unit_name, const char *scope, char *ou
 static bool run_systemd_operation(const char *unit_name,
                                   const char *scope,
                                   const char *operation,
+                                  const char *sudo_password,
+                                  bool *needs_password,
                                   char *message,
                                   size_t message_size) {
+    if (needs_password) *needs_password = false;
     if (!safe_unit_name(unit_name)) {
         snprintf(message, message_size, "Invalid systemd unit name.");
         return false;
@@ -569,6 +645,19 @@ static bool run_systemd_operation(const char *unit_name,
     char command[768];
     const char *scope_argument = (scope && strcmp(scope, "system") == 0) ? "--system" : "--user";
     snprintf(command, sizeof(command), "systemctl %s %s %s 2>&1", scope_argument, operation, quoted_unit);
+
+    if (strcmp(scope_argument, "--system") == 0) {
+        int exit_status = -1;
+        bool ok = run_sudo_shell(command, sudo_password, message, message_size, &exit_status);
+        if (!ok && sudo_failure_needs_password(message, exit_status)) {
+            if (needs_password) *needs_password = true;
+            snprintf(message, message_size, "Administrator password required.");
+        } else if (!ok && message[0] == '\0') {
+            snprintf(message, message_size, "systemctl %s failed.", operation);
+        }
+        if (ok && message[0] == '\0') snprintf(message, message_size, "ok");
+        return ok;
+    }
 
     FILE *pipe = popen(command, "r");
     if (!pipe) {
@@ -617,10 +706,37 @@ static bool lookup_systemd_backend(sqlite3 *database,
     return found;
 }
 
+static bool lookup_systemd_backend_any(const char *service_id,
+                                       char *unit_name,
+                                       size_t unit_name_size,
+                                       char *scope,
+                                       size_t scope_size) {
+    char error[512] = "";
+    sqlite3 *database = open_registry_readonly(error, sizeof(error));
+    if (database) {
+        bool found = lookup_systemd_backend(database, service_id, unit_name, unit_name_size, scope, scope_size);
+        sqlite3_close(database);
+        if (found) return true;
+    }
+
+    database = open_system_registry_readonly(error, sizeof(error));
+    if (database) {
+        bool found = lookup_systemd_backend(database, service_id, unit_name, unit_name_size, scope, scope_size);
+        sqlite3_close(database);
+        if (found) return true;
+    }
+    return false;
+}
+
 static bool append_frontends_json(StringBuilder *builder, sqlite3 *database, const char *service_id) {
     sqlite3_stmt *statement = NULL;
-    const char *sql =
-        "SELECT name, COALESCE(url, ''), COALESCE(port, 0), COALESCE(socket_path, '') "
+    char column_error[256] = "";
+    bool has_home_screen_column = frontends_has_column(database, "is_home_screen", column_error, sizeof(column_error));
+    const char *sql = has_home_screen_column ?
+        "SELECT name, COALESCE(url, ''), COALESCE(port, 0), COALESCE(socket_path, ''), COALESCE(is_home_screen, 0) "
+        "FROM frontends WHERE service_id = ? "
+        "ORDER BY name, url;" :
+        "SELECT name, COALESCE(url, ''), COALESCE(port, 0), COALESCE(socket_path, ''), 0 "
         "FROM frontends WHERE service_id = ? "
         "ORDER BY name, url;";
     if (sqlite3_prepare_v2(database, sql, -1, &statement, NULL) != SQLITE_OK) {
@@ -642,6 +758,8 @@ static bool append_frontends_json(StringBuilder *builder, sqlite3 *database, con
         ok = ok && sb_append(builder, number);
         ok = ok && sb_append(builder, ",\"socketPath\":");
         ok = ok && sb_append_json_string(builder, sqlite_column_text_or_empty(statement, 3));
+        ok = ok && sb_append(builder, ",\"isHomeScreen\":");
+        ok = ok && sb_append(builder, sqlite3_column_int(statement, 4) != 0 ? "true" : "false");
         ok = ok && sb_append(builder, "}");
     }
     sqlite3_finalize(statement);
@@ -691,28 +809,11 @@ static bool append_log_files_json(StringBuilder *builder, sqlite3 *database, con
     return ok && sb_append(builder, "]");
 }
 
-static void send_backends_response(int fd) {
-    StringBuilder builder = {0};
-    char error[512] = "";
-    sqlite3 *database = open_registry_readonly(error, sizeof(error));
-
-    bool ok = sb_append(&builder, "{\"databasePath\":") &&
-              sb_append_json_string(&builder, g_registry_database_path) &&
-              sb_append(&builder, ",\"error\":");
-    if (!database) {
-        ok = ok && sb_append_json_string(&builder, error);
-        ok = ok && sb_append(&builder, ",\"backends\":[]}");
-        if (!ok) {
-            free(builder.data);
-            send_text_response(fd, 500, "out of memory\n");
-            return;
-        }
-        send_response(fd, 200, "OK", "application/json; charset=utf-8", builder.data, builder.length);
-        free(builder.data);
-        return;
-    }
-
-    ok = ok && sb_append_json_string(&builder, "") && sb_append(&builder, ",\"backends\":[");
+static bool append_registered_backends_json(StringBuilder *builder,
+                                            sqlite3 *database,
+                                            bool *first,
+                                            bool *bundled_installed,
+                                            size_t bundled_installed_count) {
     sqlite3_stmt *statement = NULL;
     bool has_launchd_table = sqlite_table_exists(database, "launchd_backends");
     bool has_systemd_table = sqlite_table_exists(database, "systemd_backends");
@@ -729,12 +830,8 @@ static void send_backends_response(int fd) {
              has_systemd_table ? "COALESCE(s.scope, 'user')" : "''",
              has_systemd_table ? "LEFT JOIN systemd_backends s ON s.service_id = b.service_id" : "",
              has_launchd_table ? "LEFT JOIN launchd_backends l ON l.service_id = b.service_id" : "");
-    if (ok && sqlite3_prepare_v2(database, sql, -1, &statement, NULL) != SQLITE_OK) {
-        ok = false;
-    }
+    bool ok = sqlite3_prepare_v2(database, sql, -1, &statement, NULL) == SQLITE_OK;
 
-    bool first = true;
-    bool bundled_installed[sizeof(kBundledApps) / sizeof(kBundledApps[0])] = {0};
     while (ok && sqlite3_step(statement) == SQLITE_ROW) {
         const char *service_id = sqlite_column_text_or_empty(statement, 0);
         const char *display_name = sqlite_column_text_or_empty(statement, 1);
@@ -746,7 +843,7 @@ static void send_backends_response(int fd) {
         bool is_self = strcmp(service_id, kBackendsServiceID) == 0;
         if (bundled_app) {
             size_t bundled_index = (size_t)(bundled_app - kBundledApps);
-            if (bundled_index < sizeof(bundled_installed) / sizeof(bundled_installed[0])) {
+            if (bundled_index < bundled_installed_count) {
                 bundled_installed[bundled_index] = true;
             }
         }
@@ -762,38 +859,77 @@ static void send_backends_response(int fd) {
             systemd_unit_path(service_unit, service_scope, service_unit_path, sizeof(service_unit_path));
         }
 
-        if (!first) ok = sb_append(&builder, ",");
-        first = false;
-        ok = ok && sb_append(&builder, "{\"serviceID\":");
-        ok = ok && sb_append_json_string(&builder, service_id);
-        ok = ok && sb_append(&builder, ",\"displayName\":");
-        ok = ok && sb_append_json_string(&builder, display_name[0] ? display_name : service_id);
-        ok = ok && sb_append(&builder, ",\"serviceUnit\":");
-        ok = ok && sb_append_json_string(&builder, service_unit);
-        ok = ok && sb_append(&builder, ",\"serviceUnitPath\":");
-        ok = ok && sb_append_json_string(&builder, service_unit_path);
-        ok = ok && sb_append(&builder, ",\"serviceScope\":");
-        ok = ok && sb_append_json_string(&builder, service_scope);
-        ok = ok && sb_append(&builder, ",\"status\":");
-        ok = ok && sb_append_json_string(&builder, status);
-        ok = ok && sb_append(&builder, ",\"canControl\":");
-        ok = ok && sb_append(&builder, can_control ? "true" : "false");
-        ok = ok && sb_append(&builder, ",\"canUninstall\":");
-        ok = ok && sb_append(&builder, can_uninstall ? "true" : "false");
-        ok = ok && sb_append(&builder, ",\"isBundled\":");
-        ok = ok && sb_append(&builder, bundled_app ? "true" : "false");
-        ok = ok && sb_append(&builder, ",\"isInstalled\":true");
-        ok = ok && sb_append(&builder, ",\"launchdPlistPath\":");
-        ok = ok && sb_append_json_string(&builder, plist_path);
-        ok = ok && sb_append(&builder, ",\"ownsLaunchdPlist\":");
-        ok = ok && sb_append(&builder, owns_plist ? "true" : "false");
-        ok = ok && sb_append(&builder, ",\"frontends\":");
-        ok = ok && append_frontends_json(&builder, database, service_id);
-        ok = ok && sb_append(&builder, ",\"logFiles\":");
-        ok = ok && append_log_files_json(&builder, database, service_id);
-        ok = ok && sb_append(&builder, "}");
+        if (!*first) ok = sb_append(builder, ",");
+        *first = false;
+        ok = ok && sb_append(builder, "{\"serviceID\":");
+        ok = ok && sb_append_json_string(builder, service_id);
+        ok = ok && sb_append(builder, ",\"displayName\":");
+        ok = ok && sb_append_json_string(builder, display_name[0] ? display_name : service_id);
+        ok = ok && sb_append(builder, ",\"serviceUnit\":");
+        ok = ok && sb_append_json_string(builder, service_unit);
+        ok = ok && sb_append(builder, ",\"serviceUnitPath\":");
+        ok = ok && sb_append_json_string(builder, service_unit_path);
+        ok = ok && sb_append(builder, ",\"serviceScope\":");
+        ok = ok && sb_append_json_string(builder, service_scope);
+        ok = ok && sb_append(builder, ",\"status\":");
+        ok = ok && sb_append_json_string(builder, status);
+        ok = ok && sb_append(builder, ",\"canControl\":");
+        ok = ok && sb_append(builder, can_control ? "true" : "false");
+        ok = ok && sb_append(builder, ",\"canUninstall\":");
+        ok = ok && sb_append(builder, can_uninstall ? "true" : "false");
+        ok = ok && sb_append(builder, ",\"isBundled\":");
+        ok = ok && sb_append(builder, bundled_app ? "true" : "false");
+        ok = ok && sb_append(builder, ",\"isInstalled\":true");
+        ok = ok && sb_append(builder, ",\"launchdPlistPath\":");
+        ok = ok && sb_append_json_string(builder, plist_path);
+        ok = ok && sb_append(builder, ",\"ownsLaunchdPlist\":");
+        ok = ok && sb_append(builder, owns_plist ? "true" : "false");
+        ok = ok && sb_append(builder, ",\"frontends\":");
+        ok = ok && append_frontends_json(builder, database, service_id);
+        ok = ok && sb_append(builder, ",\"logFiles\":");
+        ok = ok && append_log_files_json(builder, database, service_id);
+        ok = ok && sb_append(builder, "}");
     }
     if (statement) sqlite3_finalize(statement);
+    return ok;
+}
+
+static void send_backends_response(int fd) {
+    StringBuilder builder = {0};
+    char user_error[512] = "";
+    char system_error[512] = "";
+    sqlite3 *user_database = open_registry_readonly(user_error, sizeof(user_error));
+    sqlite3 *system_database = open_system_registry_readonly(system_error, sizeof(system_error));
+
+    bool ok = sb_append(&builder, "{\"databasePath\":") &&
+              sb_append_json_string(&builder, g_registry_database_path) &&
+              sb_append(&builder, ",\"systemDatabasePath\":") &&
+              sb_append_json_string(&builder, g_system_registry_database_path) &&
+              sb_append(&builder, ",\"error\":");
+    if (!user_database && !system_database) {
+        ok = ok && sb_append_json_string(&builder, user_error[0] ? user_error : system_error);
+        ok = ok && sb_append(&builder, ",\"backends\":[]}");
+        if (!ok) {
+            free(builder.data);
+            send_text_response(fd, 500, "out of memory\n");
+            return;
+        }
+        send_response(fd, 200, "OK", "application/json; charset=utf-8", builder.data, builder.length);
+        free(builder.data);
+        return;
+    }
+
+    ok = ok && sb_append_json_string(&builder, "") && sb_append(&builder, ",\"backends\":[");
+    bool first = true;
+    bool bundled_installed[sizeof(kBundledApps) / sizeof(kBundledApps[0])] = {0};
+    if (user_database) {
+        ok = ok && append_registered_backends_json(&builder, user_database, &first, bundled_installed,
+                                                   sizeof(bundled_installed) / sizeof(bundled_installed[0]));
+    }
+    if (system_database) {
+        ok = ok && append_registered_backends_json(&builder, system_database, &first, bundled_installed,
+                                                   sizeof(bundled_installed) / sizeof(bundled_installed[0]));
+    }
 
     for (size_t i = 0; ok && i < sizeof(kBundledApps) / sizeof(kBundledApps[0]); i++) {
         if (bundled_installed[i]) continue;
@@ -806,7 +942,8 @@ static void send_backends_response(int fd) {
         ok = ok && sb_append_json_string(&builder, app->display_name);
         ok = ok && sb_append(&builder, ",\"serviceUnit\":\"\",\"serviceUnitPath\":\"\",\"serviceScope\":\"user\",\"status\":\"available\",\"canControl\":true,\"canUninstall\":false,\"isBundled\":true,\"isInstalled\":false,\"launchdPlistPath\":\"\",\"ownsLaunchdPlist\":false,\"frontends\":[],\"logFiles\":[]}");
     }
-    sqlite3_close(database);
+    if (user_database) sqlite3_close(user_database);
+    if (system_database) sqlite3_close(system_database);
 
     ok = ok && sb_append(&builder, "]}");
     if (!ok) {
@@ -836,6 +973,23 @@ static bool resolve_log_path(sqlite3 *database, const char *service_id, int log_
     return found;
 }
 
+static bool resolve_log_path_any(const char *service_id, int log_index, char *path, size_t path_size, char *error, size_t error_size) {
+    sqlite3 *database = open_registry_readonly(error, error_size);
+    if (database) {
+        bool found = resolve_log_path(database, service_id, log_index, path, path_size);
+        sqlite3_close(database);
+        if (found) return true;
+    }
+
+    database = open_system_registry_readonly(error, error_size);
+    if (database) {
+        bool found = resolve_log_path(database, service_id, log_index, path, path_size);
+        sqlite3_close(database);
+        if (found) return true;
+    }
+    return false;
+}
+
 static void send_log_json(int fd, const char *service_id, const char *path, const char *contents,
                           bool truncated, uint64_t file_size, double modified, const char *error) {
     StringBuilder builder = {0};
@@ -862,77 +1016,100 @@ static void send_log_json(int fd, const char *service_id, const char *path, cons
     free(builder.data);
 }
 
-static void send_action_json(int fd, int status, bool ok_value, const char *message) {
+static void send_action_json_ex(int fd, int status, bool ok_value, const char *message, bool needs_password) {
     StringBuilder builder = {0};
     bool ok = sb_append(&builder, "{\"ok\":") &&
               sb_append(&builder, ok_value ? "true" : "false") &&
               sb_append(&builder, ",\"message\":") &&
               sb_append_json_string(&builder, message ? message : "") &&
+              sb_append(&builder, ",\"needsPassword\":") &&
+              sb_append(&builder, needs_password ? "true" : "false") &&
               sb_append(&builder, "}");
     if (!ok) {
         free(builder.data);
         send_text_response(fd, 500, "out of memory\n");
         return;
     }
-    send_response(fd, status, status == 200 ? "OK" : "Error", "application/json; charset=utf-8", builder.data, builder.length);
+    const char *status_text = status == 200 ? "OK" :
+                              status == 401 ? "Unauthorized" :
+                              status == 400 ? "Bad Request" :
+                              status == 404 ? "Not Found" :
+                              status == 500 ? "Internal Server Error" : "Error";
+    send_response(fd, status, status_text, "application/json; charset=utf-8", builder.data, builder.length);
     free(builder.data);
 }
 
-static bool install_bundled_app(const BundledAppDefinition *app, char *message, size_t message_size);
-static bool uninstall_backend(const char *service_id, char *message, size_t message_size);
+static void send_action_json(int fd, int status, bool ok_value, const char *message) {
+    send_action_json_ex(fd, status, ok_value, message, false);
+}
 
-static void send_control_response(int fd, const char *query) {
+static bool install_bundled_app(const BundledAppDefinition *app, const char *scope, const char *sudo_password, bool *needs_password, char *message, size_t message_size);
+static bool uninstall_backend(const char *service_id, const char *sudo_password, bool *needs_password, char *message, size_t message_size);
+
+static void send_control_response(int fd, const char *query, const char *body) {
     char service_id[PATH_MAX] = "";
     char operation[32] = "";
-    if (!query_value(query, "serviceID", service_id, sizeof(service_id)) ||
-        !query_value(query, "operation", operation, sizeof(operation))) {
+    char sudo_password[PATH_MAX] = "";
+    if (!query_value_any(query, body, "serviceID", service_id, sizeof(service_id)) ||
+        !query_value_any(query, body, "operation", operation, sizeof(operation))) {
         send_action_json(fd, 400, false, "Missing serviceID or operation.");
         return;
     }
+    query_value_any(query, body, "sudoPassword", sudo_password, sizeof(sudo_password));
 
     if (strcmp(service_id, kBackendsServiceID) == 0) {
         send_action_json(fd, 400, false, "Backends cannot stop, start, or uninstall itself.");
         return;
     }
 
-    if (strcmp(operation, "run") == 0 || strcmp(operation, "install") == 0) {
+    if (strcmp(operation, "run") == 0 || strcmp(operation, "install") == 0 ||
+        strcmp(operation, "runRoot") == 0 || strcmp(operation, "installRoot") == 0 ||
+        strcmp(operation, "runUser") == 0 || strcmp(operation, "installUser") == 0) {
         const BundledAppDefinition *app = bundled_app_for_service_id(service_id);
         if (!app) {
             send_action_json(fd, 404, false, "This backend is not a bundled app.");
             return;
         }
         char message[4096] = "";
-        bool ok = install_bundled_app(app, message, sizeof(message));
-        send_action_json(fd, ok ? 200 : 500, ok, message);
+        bool needs_password = false;
+        const char *scope = (strcmp(operation, "runRoot") == 0 || strcmp(operation, "installRoot") == 0) ? "system" : "user";
+        if (strcmp(scope, "user") == 0) {
+            char existing_unit[256] = "";
+            char existing_scope[32] = "user";
+            bool found = lookup_systemd_backend_any(service_id, existing_unit, sizeof(existing_unit), existing_scope, sizeof(existing_scope));
+            if (found && strcmp(existing_scope, "system") == 0) {
+                bool removed = uninstall_backend(service_id, sudo_password, &needs_password, message, sizeof(message));
+                if (!removed) {
+                    send_action_json_ex(fd, needs_password ? 401 : 500, false, message, needs_password);
+                    return;
+                }
+            }
+        }
+        bool ok = install_bundled_app(app, scope, sudo_password, &needs_password, message, sizeof(message));
+        send_action_json_ex(fd, ok ? 200 : (needs_password ? 401 : 500), ok, message, needs_password);
         return;
     }
 
     if (strcmp(operation, "uninstall") == 0) {
         char message[4096] = "";
-        bool ok = uninstall_backend(service_id, message, sizeof(message));
-        send_action_json(fd, ok ? 200 : 500, ok, message);
-        return;
-    }
-
-    char error[512] = "";
-    sqlite3 *database = open_registry_readonly(error, sizeof(error));
-    if (!database) {
-        send_action_json(fd, 500, false, error);
+        bool needs_password = false;
+        bool ok = uninstall_backend(service_id, sudo_password, &needs_password, message, sizeof(message));
+        send_action_json_ex(fd, ok ? 200 : (needs_password ? 401 : 500), ok, message, needs_password);
         return;
     }
 
     char unit_name[256] = "";
     char scope[32] = "user";
-    bool found = lookup_systemd_backend(database, service_id, unit_name, sizeof(unit_name), scope, sizeof(scope));
-    sqlite3_close(database);
+    bool found = lookup_systemd_backend_any(service_id, unit_name, sizeof(unit_name), scope, sizeof(scope));
     if (!found) {
         send_action_json(fd, 404, false, "This backend does not have a registered systemd unit.");
         return;
     }
 
     char message[4096] = "";
-    bool ok = run_systemd_operation(unit_name, scope, operation, message, sizeof(message));
-    send_action_json(fd, ok ? 200 : 500, ok, message);
+    bool needs_password = false;
+    bool ok = run_systemd_operation(unit_name, scope, operation, sudo_password, &needs_password, message, sizeof(message));
+    send_action_json_ex(fd, ok ? 200 : (needs_password ? 401 : 500), ok, message, needs_password);
 }
 
 static bool mkdir_p(const char *path) {
@@ -1030,6 +1207,122 @@ static bool copy_file(const char *source, const char *destination, mode_t mode, 
 static void run_shell_ignored(const char *command) {
     int result = system(command);
     (void)result;
+}
+
+static bool contains_case_insensitive(const char *haystack, const char *needle) {
+    if (!haystack || !needle || !needle[0]) return false;
+    size_t needle_len = strlen(needle);
+    for (const char *p = haystack; *p; p++) {
+        size_t i = 0;
+        while (i < needle_len &&
+               p[i] &&
+               tolower((unsigned char)p[i]) == tolower((unsigned char)needle[i])) {
+            i++;
+        }
+        if (i == needle_len) return true;
+    }
+    return false;
+}
+
+static bool sudo_failure_needs_password(const char *output, int exit_status) {
+    if (exit_status == 0) return false;
+    return contains_case_insensitive(output, "password") ||
+           contains_case_insensitive(output, "authentication") ||
+           contains_case_insensitive(output, "try again") ||
+           contains_case_insensitive(output, "sudo:");
+}
+
+static bool run_sudo_shell(const char *command, const char *password, char *output, size_t output_size, int *exit_status) {
+    if (output_size > 0) output[0] = '\0';
+    if (exit_status) *exit_status = -1;
+
+    int stdin_pipe[2] = {-1, -1};
+    int output_pipe[2] = {-1, -1};
+    if (pipe(stdin_pipe) != 0 || pipe(output_pipe) != 0) {
+        if (stdin_pipe[0] >= 0) close(stdin_pipe[0]);
+        if (stdin_pipe[1] >= 0) close(stdin_pipe[1]);
+        if (output_pipe[0] >= 0) close(output_pipe[0]);
+        if (output_pipe[1] >= 0) close(output_pipe[1]);
+        snprintf(output, output_size, "Failed to create sudo pipes: %s", strerror(errno));
+        return false;
+    }
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(stdin_pipe[0]);
+        close(stdin_pipe[1]);
+        close(output_pipe[0]);
+        close(output_pipe[1]);
+        snprintf(output, output_size, "Failed to fork sudo: %s", strerror(errno));
+        return false;
+    }
+
+    bool has_password = password && password[0];
+    if (pid == 0) {
+        dup2(stdin_pipe[0], STDIN_FILENO);
+        dup2(output_pipe[1], STDOUT_FILENO);
+        dup2(output_pipe[1], STDERR_FILENO);
+        close(stdin_pipe[0]);
+        close(stdin_pipe[1]);
+        close(output_pipe[0]);
+        close(output_pipe[1]);
+        if (has_password) {
+            execlp("sudo", "sudo", "-S", "-p", "", "sh", "-c", command, (char *)NULL);
+        } else {
+            execlp("sudo", "sudo", "-n", "sh", "-c", command, (char *)NULL);
+        }
+        _exit(127);
+    }
+
+    close(stdin_pipe[0]);
+    close(output_pipe[1]);
+    if (has_password) {
+        queue_all(stdin_pipe[1], password, strlen(password));
+        queue_all(stdin_pipe[1], "\n", 1);
+    }
+    close(stdin_pipe[1]);
+
+    size_t offset = 0;
+    while (offset + 1 < output_size) {
+        ssize_t got = read(output_pipe[0], output + offset, output_size - offset - 1);
+        if (got < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        if (got == 0) break;
+        offset += (size_t)got;
+    }
+    if (output_size > 0) output[offset] = '\0';
+    close(output_pipe[0]);
+
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+    if (WIFEXITED(status)) {
+        if (exit_status) *exit_status = WEXITSTATUS(status);
+        return WEXITSTATUS(status) == 0;
+    }
+    if (WIFSIGNALED(status)) {
+        if (exit_status) *exit_status = 128 + WTERMSIG(status);
+    }
+    return false;
+}
+
+static bool run_root_script(const char *script_path, const char *sudo_password, bool *needs_password, char *message, size_t message_size) {
+    if (needs_password) *needs_password = false;
+    char quoted_script[PATH_MAX + 8];
+    shell_quote(script_path, quoted_script, sizeof(quoted_script));
+    char command[PATH_MAX + 64];
+    snprintf(command, sizeof(command), "sh %s", quoted_script);
+
+    int exit_status = -1;
+    bool ok = run_sudo_shell(command, sudo_password, message, message_size, &exit_status);
+    if (!ok && sudo_failure_needs_password(message, exit_status)) {
+        if (needs_password) *needs_password = true;
+        snprintf(message, message_size, "Administrator password required.");
+    } else if (!ok && message[0] == '\0') {
+        snprintf(message, message_size, "Privileged operation failed.");
+    }
+    return ok;
 }
 
 static void unit_description_text(const char *value, char *out, size_t out_size) {
@@ -1416,6 +1709,7 @@ static bool bind_and_step(sqlite3 *database, const char *sql, const char *a, con
 static bool upsert_systemd_backend_registry(const char *service_id,
                                             const char *display_name,
                                             const char *unit_name,
+                                            const char *scope,
                                             const char *log_path,
                                             const char *icon_path,
                                             char *error,
@@ -1449,9 +1743,9 @@ static bool upsert_systemd_backend_registry(const char *service_id,
     }
     if (ok) {
         ok = bind_and_step(database,
-                           "INSERT INTO systemd_backends(service_id, unit_name, scope) VALUES(?, ?, 'user') "
-                           "ON CONFLICT(service_id) DO UPDATE SET unit_name=excluded.unit_name, scope='user';",
-                           service_id, unit_name, NULL, NULL, error, error_size);
+                           "INSERT INTO systemd_backends(service_id, unit_name, scope) VALUES(?, ?, ?) "
+                           "ON CONFLICT(service_id) DO UPDATE SET unit_name=excluded.unit_name, scope=excluded.scope;",
+                           service_id, unit_name, scope && scope[0] ? scope : "user", NULL, error, error_size);
     }
     if (ok) {
         ok = bind_and_step(database, "DELETE FROM frontends WHERE service_id = ?;", service_id, NULL, NULL, NULL, error, error_size);
@@ -1500,11 +1794,13 @@ static bool unregister_backend_records(const char *service_id, char *error, size
     return ok;
 }
 
-static bool install_bundled_app(const BundledAppDefinition *app, char *message, size_t message_size) {
+static bool install_bundled_app(const BundledAppDefinition *app, const char *scope, const char *sudo_password, bool *needs_password, char *message, size_t message_size) {
+    if (needs_password) *needs_password = false;
     if (!app) {
         snprintf(message, message_size, "Unknown bundled app.");
         return false;
     }
+    bool install_as_root = scope && strcmp(scope, "system") == 0;
     char architecture[64];
     if (!remote_machine_architecture(architecture, sizeof(architecture))) {
         snprintf(message, message_size, "Unsupported machine architecture.");
@@ -1548,6 +1844,356 @@ static bool install_bundled_app(const BundledAppDefinition *app, char *message, 
     if (source_icon[0] && (stat(source_icon, &st) != 0 || !S_ISREG(st.st_mode))) {
         snprintf(message, message_size, "Missing bundled %s icon at %s.", app->display_name, source_icon);
         return false;
+    }
+
+    if (install_as_root) {
+        char user_name[128] = "";
+        struct passwd *pw = getpwuid(getuid());
+        snprintf(user_name, sizeof(user_name), "%s", pw && pw->pw_name ? pw->pw_name : "");
+
+        char compiled_binary[PATH_MAX] = "";
+        if (has_source_code) {
+            char binary_template[] = "/tmp/backends-bundled-binary-XXXXXX";
+            int binary_fd = mkstemp(binary_template);
+            if (binary_fd < 0) {
+                snprintf(message, message_size, "Failed to create temporary binary path: %s", strerror(errno));
+                return false;
+            }
+            close(binary_fd);
+            snprintf(compiled_binary, sizeof(compiled_binary), "%s", binary_template);
+
+            char quoted_source[PATH_MAX + 8];
+            char quoted_binary_tmp[PATH_MAX + 8];
+            shell_quote(source_code, quoted_source, sizeof(quoted_source));
+            shell_quote(compiled_binary, quoted_binary_tmp, sizeof(quoted_binary_tmp));
+            char compile_command[PATH_MAX * 2 + 256];
+            snprintf(compile_command, sizeof(compile_command),
+                     "cc -std=gnu17 -Wall -Wextra -O2 -o %s %s -lm 2>&1",
+                     quoted_binary_tmp, quoted_source);
+            FILE *pipe = popen(compile_command, "r");
+            if (!pipe) {
+                unlink(compiled_binary);
+                snprintf(message, message_size, "Failed to compile %s: %s", app->display_name, strerror(errno));
+                return false;
+            }
+            size_t offset = 0;
+            while (offset + 1 < message_size) {
+                size_t got = fread(message + offset, 1, message_size - offset - 1, pipe);
+                offset += got;
+                if (got == 0) break;
+            }
+            message[offset] = '\0';
+            int status = pclose(pipe);
+            if (status != 0) {
+                if (!message[0]) snprintf(message, message_size, "Failed to compile %s.", app->display_name);
+                unlink(compiled_binary);
+                return false;
+            }
+            chmod(compiled_binary, 0700);
+        }
+
+        char install_root[PATH_MAX];
+        snprintf(install_root, sizeof(install_root), "/opt/outergroup/%s", app->install_directory_name);
+        char bundles_dir[PATH_MAX];
+        snprintf(bundles_dir, sizeof(bundles_dir), "%s/bundles", install_root);
+        char target_binary[PATH_MAX];
+        snprintf(target_binary, sizeof(target_binary), "%s/%s", install_root, app->binary_name);
+        char target_bundle_arm[PATH_MAX];
+        snprintf(target_bundle_arm, sizeof(target_bundle_arm), "%s/%s.bundle.macos-arm.aar", bundles_dir, app->bundle_prefix);
+        char target_bundle_x86[PATH_MAX];
+        snprintf(target_bundle_x86, sizeof(target_bundle_x86), "%s/%s.bundle.macos-x86.aar", bundles_dir, app->bundle_prefix);
+        char target_icon[PATH_MAX];
+        if (app->icon_name && app->icon_name[0]) {
+            snprintf(target_icon, sizeof(target_icon), "%s/%s", install_root, app->icon_name);
+        } else {
+            target_icon[0] = '\0';
+        }
+        char version_path[PATH_MAX];
+        snprintf(version_path, sizeof(version_path), "%s/version", install_root);
+        char wrapper_path[PATH_MAX];
+        snprintf(wrapper_path, sizeof(wrapper_path), "%s/outerctl-as-user", install_root);
+        char log_path[PATH_MAX];
+        snprintf(log_path, sizeof(log_path), "/var/log/outergroup/%s.log", app->service_id);
+        char unit_path[PATH_MAX];
+        snprintf(unit_path, sizeof(unit_path), "/etc/systemd/system/%s", app->unit_name);
+
+        char user_unit_path[PATH_MAX];
+        snprintf(user_unit_path, sizeof(user_unit_path), "%s/.config/systemd/user/%s", home_directory(), app->unit_name);
+        char quoted_unit[320];
+        shell_quote(app->unit_name, quoted_unit, sizeof(quoted_unit));
+        char stop_user_command[512];
+        snprintf(stop_user_command, sizeof(stop_user_command), "systemctl --user disable --now %s >/dev/null 2>&1 || true", quoted_unit);
+        run_shell_ignored(stop_user_command);
+        unlink(user_unit_path);
+        run_shell_ignored("systemctl --user daemon-reload >/dev/null 2>&1 || true");
+
+        const char *binary_source = has_source_code ? compiled_binary : source_binary;
+        char quoted_binary_source[PATH_MAX + 8];
+        char quoted_source_bundle_arm[PATH_MAX + 8];
+        char quoted_source_bundle_x86[PATH_MAX + 8];
+        char quoted_source_icon[PATH_MAX + 8];
+        char quoted_install_root[PATH_MAX + 8];
+        char quoted_bundles_dir[PATH_MAX + 8];
+        char quoted_target_binary[PATH_MAX + 8];
+        char quoted_target_bundle_arm[PATH_MAX + 8];
+        char quoted_target_bundle_x86[PATH_MAX + 8];
+        char quoted_target_icon[PATH_MAX + 8];
+        char quoted_version_path[PATH_MAX + 8];
+        char quoted_wrapper_path[PATH_MAX + 8];
+        char quoted_log_path[PATH_MAX + 8];
+        char quoted_unit_path[PATH_MAX + 8];
+        shell_quote(binary_source, quoted_binary_source, sizeof(quoted_binary_source));
+        shell_quote(source_bundle_arm, quoted_source_bundle_arm, sizeof(quoted_source_bundle_arm));
+        shell_quote(source_bundle_x86, quoted_source_bundle_x86, sizeof(quoted_source_bundle_x86));
+        if (source_icon[0]) shell_quote(source_icon, quoted_source_icon, sizeof(quoted_source_icon)); else quoted_source_icon[0] = '\0';
+        shell_quote(install_root, quoted_install_root, sizeof(quoted_install_root));
+        shell_quote(bundles_dir, quoted_bundles_dir, sizeof(quoted_bundles_dir));
+        shell_quote(target_binary, quoted_target_binary, sizeof(quoted_target_binary));
+        shell_quote(target_bundle_arm, quoted_target_bundle_arm, sizeof(quoted_target_bundle_arm));
+        shell_quote(target_bundle_x86, quoted_target_bundle_x86, sizeof(quoted_target_bundle_x86));
+        if (target_icon[0]) shell_quote(target_icon, quoted_target_icon, sizeof(quoted_target_icon)); else quoted_target_icon[0] = '\0';
+        shell_quote(version_path, quoted_version_path, sizeof(quoted_version_path));
+        shell_quote(wrapper_path, quoted_wrapper_path, sizeof(quoted_wrapper_path));
+        shell_quote(log_path, quoted_log_path, sizeof(quoted_log_path));
+        shell_quote(unit_path, quoted_unit_path, sizeof(quoted_unit_path));
+
+        char quoted_binary[PATH_MAX + 8];
+        char quoted_bundles[PATH_MAX + 8];
+        char quoted_icon[PATH_MAX + 8];
+        char quoted_log[PATH_MAX + 8];
+        char quoted_service_id[512];
+        char quoted_display_name[512];
+        char quoted_target_icon_for_registry[PATH_MAX + 8];
+        char quoted_socket_path[PATH_MAX + 32];
+        shell_quote(target_binary, quoted_binary, sizeof(quoted_binary));
+        shell_quote(bundles_dir, quoted_bundles, sizeof(quoted_bundles));
+        if (target_icon[0]) shell_quote(target_icon, quoted_icon, sizeof(quoted_icon)); else quoted_icon[0] = '\0';
+        shell_quote(log_path, quoted_log, sizeof(quoted_log));
+        shell_quote(app->service_id, quoted_service_id, sizeof(quoted_service_id));
+        shell_quote(app->display_name, quoted_display_name, sizeof(quoted_display_name));
+        shell_quote(target_icon, quoted_target_icon_for_registry, sizeof(quoted_target_icon_for_registry));
+        if (app->socket_name && app->socket_name[0]) {
+            char socket_path[PATH_MAX];
+            snprintf(socket_path, sizeof(socket_path), "%%t/%s", app->socket_name);
+            shell_quote(socket_path, quoted_socket_path, sizeof(quoted_socket_path));
+        } else {
+            quoted_socket_path[0] = '\0';
+        }
+
+        char run_script[PATH_MAX * 4];
+        if (quoted_icon[0]) {
+            if (quoted_socket_path[0]) {
+                snprintf(run_script, sizeof(run_script),
+                         "exec %s --label %s --socket-path %s --bundles-dir %s --icon-file %s >> %s 2>&1",
+                         quoted_binary, quoted_service_id, quoted_socket_path, quoted_bundles, quoted_icon, quoted_log);
+            } else {
+                snprintf(run_script, sizeof(run_script),
+                         "exec %s --label %s --bundles-dir %s --icon-file %s >> %s 2>&1",
+                         quoted_binary, quoted_service_id, quoted_bundles, quoted_icon, quoted_log);
+            }
+        } else {
+            if (quoted_socket_path[0]) {
+                snprintf(run_script, sizeof(run_script),
+                         "exec %s --label %s --socket-path %s --bundles-dir %s >> %s 2>&1",
+                         quoted_binary, quoted_service_id, quoted_socket_path, quoted_bundles, quoted_log);
+            } else {
+                snprintf(run_script, sizeof(run_script),
+                         "exec %s --label %s --bundles-dir %s >> %s 2>&1",
+                         quoted_binary, quoted_service_id, quoted_bundles, quoted_log);
+            }
+        }
+        char quoted_run_script[sizeof(run_script) + 16];
+        shell_quote(run_script, quoted_run_script, sizeof(quoted_run_script));
+
+        char description[256];
+        unit_description_text(app->display_name, description, sizeof(description));
+        char unit_contents[12000];
+        snprintf(unit_contents, sizeof(unit_contents),
+                 "[Unit]\n"
+                 "Description=%s\n"
+                 "After=network.target\n"
+                 "\n"
+                 "[Service]\n"
+                 "Type=simple\n"
+                 "WorkingDirectory=%s\n"
+                 "Environment=HOME=%s\n"
+                 "Environment=USER=%s\n"
+                 "Environment=LOGNAME=%s\n"
+                 "Environment=OUTERCTL_PATH=%s\n"
+                 "ExecStart=/bin/sh -lc %s\n"
+                 "Restart=on-failure\n"
+                 "KillMode=control-group\n"
+                 "\n"
+                 "[Install]\n"
+                 "WantedBy=multi-user.target\n",
+                 description,
+                 install_root,
+                 home_directory(),
+                 user_name,
+                 user_name,
+                 wrapper_path,
+                 quoted_run_script);
+
+        char quoted_outerctl[PATH_MAX + 8];
+        char quoted_system_outeragent_root[PATH_MAX + 8];
+        char outerctl_path[PATH_MAX];
+        snprintf(outerctl_path, sizeof(outerctl_path), "%s/.outeragent/outerctl", home_directory());
+        shell_quote(outerctl_path, quoted_outerctl, sizeof(quoted_outerctl));
+        shell_quote(kSystemOuterAgentRoot, quoted_system_outeragent_root, sizeof(quoted_system_outeragent_root));
+        char wrapper_contents[4096];
+        snprintf(wrapper_contents, sizeof(wrapper_contents),
+                 "#!/bin/sh\n"
+                 "exec env OUTERAGENT_ROOT=%s %s \"$@\"\n",
+                 quoted_system_outeragent_root,
+                 quoted_outerctl);
+
+        char script_template[] = "/tmp/backends-root-install-XXXXXX";
+        int script_fd = mkstemp(script_template);
+        if (script_fd < 0) {
+            if (compiled_binary[0]) unlink(compiled_binary);
+            snprintf(message, message_size, "Failed to create privileged install script: %s", strerror(errno));
+            return false;
+        }
+        FILE *script = fdopen(script_fd, "w");
+        if (!script) {
+            close(script_fd);
+            unlink(script_template);
+            if (compiled_binary[0]) unlink(compiled_binary);
+            snprintf(message, message_size, "Failed to write privileged install script: %s", strerror(errno));
+            return false;
+        }
+        fprintf(script,
+                "set -eu\n"
+                "systemctl --system stop %s >/dev/null 2>&1 || true\n"
+                "systemctl --system reset-failed %s >/dev/null 2>&1 || true\n"
+                "mkdir -p %s %s /var/log/outergroup %s\n"
+                "chmod 0755 /var/lib/outergroup %s\n"
+                "install -m 0755 %s %s\n"
+                "install -m 0644 %s %s\n"
+                "install -m 0644 %s %s\n",
+                quoted_unit,
+                quoted_unit,
+                quoted_install_root,
+                quoted_bundles_dir,
+                quoted_system_outeragent_root,
+                quoted_system_outeragent_root,
+                quoted_binary_source,
+                quoted_target_binary,
+                quoted_source_bundle_arm,
+                quoted_target_bundle_arm,
+                quoted_source_bundle_x86,
+                quoted_target_bundle_x86);
+        if (quoted_source_icon[0] && quoted_target_icon[0]) {
+            fprintf(script, "install -m 0644 %s %s\n", quoted_source_icon, quoted_target_icon);
+        }
+        fprintf(script,
+                "cat > %s <<'__BACKENDS_VERSION__'\n%s\n__BACKENDS_VERSION__\n"
+                "chmod 0644 %s\n"
+                "cat > %s <<'__BACKENDS_OUTERCTL__'\n%s__BACKENDS_OUTERCTL__\n"
+                "chmod 0755 %s\n"
+                "cat > %s <<'__BACKENDS_UNIT__'\n%s__BACKENDS_UNIT__\n"
+                "chmod 0644 %s\n"
+                "touch %s\n"
+                "chmod 0644 %s\n"
+                "REGISTRY_ROOT=%s SERVICE_ID=%s DISPLAY_NAME=%s UNIT_NAME=%s LOG_PATH=%s ICON_PATH=%s python3 - <<'__BACKENDS_REGISTRY__'\n"
+                "import os, sqlite3\n"
+                "root = os.environ['REGISTRY_ROOT']\n"
+                "service_id = os.environ['SERVICE_ID']\n"
+                "display_name = os.environ['DISPLAY_NAME']\n"
+                "unit_name = os.environ['UNIT_NAME']\n"
+                "log_path = os.environ['LOG_PATH']\n"
+                "icon_path = os.environ.get('ICON_PATH') or None\n"
+                "os.makedirs(root, exist_ok=True)\n"
+                "database_path = os.path.join(root, 'registry.sqlite3')\n"
+                "database = sqlite3.connect(database_path)\n"
+                "database.executescript('''\n"
+                "CREATE TABLE IF NOT EXISTS backends (\n"
+                "service_id TEXT PRIMARY KEY,\n"
+                "display_name TEXT NOT NULL DEFAULT '',\n"
+                "icon TEXT,\n"
+                "service_unit TEXT\n"
+                ");\n"
+                "CREATE TABLE IF NOT EXISTS frontends (\n"
+                "url TEXT PRIMARY KEY,\n"
+                "service_id TEXT,\n"
+                "name TEXT NOT NULL,\n"
+                "port INTEGER NOT NULL DEFAULT 0,\n"
+                "socket_path TEXT NOT NULL DEFAULT '',\n"
+                "icon TEXT,\n"
+                "is_home_screen INTEGER NOT NULL DEFAULT 0\n"
+                ");\n"
+                "CREATE INDEX IF NOT EXISTS frontends_service_id_idx ON frontends(service_id);\n"
+                "CREATE TABLE IF NOT EXISTS log_files (\n"
+                "path TEXT PRIMARY KEY,\n"
+                "service_id TEXT NOT NULL\n"
+                ");\n"
+                "CREATE INDEX IF NOT EXISTS log_files_service_id_idx ON log_files(service_id);\n"
+                "CREATE TABLE IF NOT EXISTS systemd_backends (\n"
+                "service_id TEXT PRIMARY KEY,\n"
+                "unit_name TEXT NOT NULL,\n"
+                "scope TEXT NOT NULL DEFAULT 'user'\n"
+                ");\n"
+                "''')\n"
+                "columns = {row[1] for row in database.execute('PRAGMA table_info(frontends)')}\n"
+                "if 'is_home_screen' not in columns:\n"
+                "    database.execute('ALTER TABLE frontends ADD COLUMN is_home_screen INTEGER NOT NULL DEFAULT 0')\n"
+                "with database:\n"
+                "    database.execute('INSERT INTO backends(service_id, display_name, icon, service_unit) VALUES(?, ?, ?, ?) ON CONFLICT(service_id) DO UPDATE SET display_name=excluded.display_name, icon=excluded.icon, service_unit=excluded.service_unit', (service_id, display_name, icon_path, unit_name))\n"
+                "    database.execute('INSERT INTO systemd_backends(service_id, unit_name, scope) VALUES(?, ?, ?) ON CONFLICT(service_id) DO UPDATE SET unit_name=excluded.unit_name, scope=excluded.scope', (service_id, unit_name, 'system'))\n"
+                "    database.execute('DELETE FROM frontends WHERE service_id = ?', (service_id,))\n"
+                "    database.execute('DELETE FROM log_files WHERE service_id = ?', (service_id,))\n"
+                "    database.execute('INSERT INTO log_files(path, service_id) VALUES(?, ?)', (log_path, service_id))\n"
+                "database.close()\n"
+                "os.chmod(database_path, 0o644)\n"
+                "__BACKENDS_REGISTRY__\n"
+                "chmod 0644 %s/registry.sqlite3 >/dev/null 2>&1 || true\n"
+                "systemctl --system daemon-reload\n"
+                "systemctl --system enable %s >/dev/null 2>&1 || true\n"
+                "systemctl --system restart %s || systemctl --system start %s\n",
+                quoted_version_path,
+                app->version,
+                quoted_version_path,
+                quoted_wrapper_path,
+                wrapper_contents,
+                quoted_wrapper_path,
+                quoted_unit_path,
+                unit_contents,
+                quoted_unit_path,
+                quoted_log_path,
+                quoted_log_path,
+                quoted_system_outeragent_root,
+                quoted_service_id,
+                quoted_display_name,
+                quoted_unit,
+                quoted_log_path,
+                quoted_target_icon_for_registry,
+                quoted_system_outeragent_root,
+                quoted_unit,
+                quoted_unit,
+                quoted_unit);
+        fclose(script);
+        chmod(script_template, 0700);
+
+        bool root_ok = run_root_script(script_template, sudo_password, needs_password, message, message_size);
+        unlink(script_template);
+        if (compiled_binary[0]) unlink(compiled_binary);
+        if (!root_ok) return false;
+
+        if (!unregister_backend_records(app->service_id, error, sizeof(error))) {
+            snprintf(message, message_size, "%s", error);
+            return false;
+        }
+
+        char user_install_root[PATH_MAX];
+        snprintf(user_install_root, sizeof(user_install_root), "%s/.outeragent/%s", home_directory(), app->install_directory_name);
+        char quoted_user_install_root[PATH_MAX + 8];
+        shell_quote(user_install_root, quoted_user_install_root, sizeof(quoted_user_install_root));
+        char remove_user_install_command[PATH_MAX + 64];
+        snprintf(remove_user_install_command, sizeof(remove_user_install_command), "rm -rf -- %s", quoted_user_install_root);
+        run_shell_ignored(remove_user_install_command);
+
+        snprintf(message, message_size, "Installed %s as root.", app->display_name);
+        return true;
     }
 
     char install_root[PATH_MAX];
@@ -1712,7 +2358,7 @@ static bool install_bundled_app(const BundledAppDefinition *app, char *message, 
         snprintf(message, message_size, "%s", error);
         return false;
     }
-    if (!upsert_systemd_backend_registry(app->service_id, app->display_name, app->unit_name, log_path, target_icon, error, sizeof(error))) {
+    if (!upsert_systemd_backend_registry(app->service_id, app->display_name, app->unit_name, "user", log_path, target_icon, error, sizeof(error))) {
         unlink(unit_path);
         snprintf(message, message_size, "%s", error);
         return false;
@@ -1723,9 +2369,9 @@ static bool install_bundled_app(const BundledAppDefinition *app, char *message, 
     snprintf(enable_command, sizeof(enable_command), "systemctl --user enable %s >/dev/null 2>&1 || true", quoted_unit);
     run_shell_ignored(enable_command);
     char systemd_message[4096] = "";
-    bool started = run_systemd_operation(app->unit_name, "user", "restart", systemd_message, sizeof(systemd_message));
+    bool started = run_systemd_operation(app->unit_name, "user", "restart", NULL, NULL, systemd_message, sizeof(systemd_message));
     if (!started) {
-        started = run_systemd_operation(app->unit_name, "user", "start", systemd_message, sizeof(systemd_message));
+        started = run_systemd_operation(app->unit_name, "user", "start", NULL, NULL, systemd_message, sizeof(systemd_message));
     }
     if (!started) {
         snprintf(message, message_size, "Installed %s, but failed to start it: %s", app->display_name, systemd_message);
@@ -1736,25 +2382,118 @@ static bool install_bundled_app(const BundledAppDefinition *app, char *message, 
     return true;
 }
 
-static bool uninstall_backend(const char *service_id, char *message, size_t message_size) {
+static bool uninstall_backend(const char *service_id, const char *sudo_password, bool *needs_password, char *message, size_t message_size) {
+    if (needs_password) *needs_password = false;
     char error[1024] = "";
     char unit_name[256] = "";
     char scope[32] = "user";
-    sqlite3 *database = open_registry_readonly(error, sizeof(error));
-    bool found = false;
-    if (database) {
-        found = lookup_systemd_backend(database, service_id, unit_name, sizeof(unit_name), scope, sizeof(scope));
-        sqlite3_close(database);
-    }
+    bool found = lookup_systemd_backend_any(service_id, unit_name, sizeof(unit_name), scope, sizeof(scope));
 
     if (found && safe_unit_name(unit_name)) {
         char quoted_unit[320];
         shell_quote(unit_name, quoted_unit, sizeof(quoted_unit));
-        char command[768];
-        const char *scope_argument = (strcmp(scope, "system") == 0) ? "--system" : "--user";
-        snprintf(command, sizeof(command), "systemctl %s disable --now %s >/dev/null 2>&1 || true", scope_argument, quoted_unit);
-        run_shell_ignored(command);
-        if (strcmp(scope, "system") != 0) {
+        if (strcmp(scope, "system") == 0) {
+            const BundledAppDefinition *app = bundled_app_for_service_id(service_id);
+            char install_name[PATH_MAX];
+            snprintf(install_name, sizeof(install_name), "%s", app ? app->install_directory_name : service_id);
+            char install_root[PATH_MAX] = "";
+            if (safe_service_directory_name(install_name)) {
+                snprintf(install_root, sizeof(install_root), "/opt/outergroup/%s", install_name);
+            }
+            char log_path[PATH_MAX];
+            snprintf(log_path, sizeof(log_path), "/var/log/outergroup/%s.log", service_id);
+            char unit_path[PATH_MAX];
+            snprintf(unit_path, sizeof(unit_path), "/etc/systemd/system/%s", unit_name);
+            char wrapper_path[PATH_MAX] = "";
+            if (install_root[0]) {
+                snprintf(wrapper_path, sizeof(wrapper_path), "%s/outerctl-as-user", install_root);
+            }
+
+            char quoted_unit_path[PATH_MAX + 8];
+            char quoted_install_root[PATH_MAX + 8];
+            char quoted_log_path[PATH_MAX + 8];
+            char quoted_wrapper_path[PATH_MAX + 8];
+            char quoted_outerctl_path[PATH_MAX + 8];
+            char quoted_system_outeragent_root[PATH_MAX + 8];
+            char quoted_service_id[512];
+            shell_quote(unit_path, quoted_unit_path, sizeof(quoted_unit_path));
+            if (install_root[0]) shell_quote(install_root, quoted_install_root, sizeof(quoted_install_root)); else quoted_install_root[0] = '\0';
+            shell_quote(log_path, quoted_log_path, sizeof(quoted_log_path));
+            if (wrapper_path[0]) shell_quote(wrapper_path, quoted_wrapper_path, sizeof(quoted_wrapper_path)); else quoted_wrapper_path[0] = '\0';
+            char outerctl_path[PATH_MAX];
+            snprintf(outerctl_path, sizeof(outerctl_path), "%s/.outeragent/outerctl", home_directory());
+            shell_quote(outerctl_path, quoted_outerctl_path, sizeof(quoted_outerctl_path));
+            shell_quote(kSystemOuterAgentRoot, quoted_system_outeragent_root, sizeof(quoted_system_outeragent_root));
+            shell_quote(service_id, quoted_service_id, sizeof(quoted_service_id));
+
+            char script_template[] = "/tmp/backends-root-uninstall-XXXXXX";
+            int script_fd = mkstemp(script_template);
+            if (script_fd < 0) {
+                snprintf(message, message_size, "Failed to create privileged uninstall script: %s", strerror(errno));
+                return false;
+            }
+            FILE *script = fdopen(script_fd, "w");
+            if (!script) {
+                close(script_fd);
+                unlink(script_template);
+                snprintf(message, message_size, "Failed to write privileged uninstall script: %s", strerror(errno));
+                return false;
+            }
+            fprintf(script,
+                    "set -eu\n"
+                    "systemctl --system disable --now %s >/dev/null 2>&1 || true\n"
+                    "if [ -x %s ]; then\n"
+                    "  %s app clear --backend %s >/dev/null 2>&1 || true\n"
+                    "  %s log clear --backend %s >/dev/null 2>&1 || true\n"
+                    "  %s systemd clear --backend %s >/dev/null 2>&1 || true\n"
+                    "  %s backend remove --backend %s >/dev/null 2>&1 || true\n"
+                    "elif [ -x %s ]; then\n"
+                    "  env OUTERAGENT_ROOT=%s %s app clear --backend %s >/dev/null 2>&1 || true\n"
+                    "  env OUTERAGENT_ROOT=%s %s log clear --backend %s >/dev/null 2>&1 || true\n"
+                    "  env OUTERAGENT_ROOT=%s %s systemd clear --backend %s >/dev/null 2>&1 || true\n"
+                    "  env OUTERAGENT_ROOT=%s %s backend remove --backend %s >/dev/null 2>&1 || true\n"
+                    "fi\n"
+                    "rm -f -- %s\n",
+                    quoted_unit,
+                    quoted_wrapper_path[0] ? quoted_wrapper_path : "''",
+                    quoted_wrapper_path[0] ? quoted_wrapper_path : "''",
+                    quoted_service_id,
+                    quoted_wrapper_path[0] ? quoted_wrapper_path : "''",
+                    quoted_service_id,
+                    quoted_wrapper_path[0] ? quoted_wrapper_path : "''",
+                    quoted_service_id,
+                    quoted_wrapper_path[0] ? quoted_wrapper_path : "''",
+                    quoted_service_id,
+                    quoted_outerctl_path,
+                    quoted_system_outeragent_root,
+                    quoted_outerctl_path,
+                    quoted_service_id,
+                    quoted_system_outeragent_root,
+                    quoted_outerctl_path,
+                    quoted_service_id,
+                    quoted_system_outeragent_root,
+                    quoted_outerctl_path,
+                    quoted_service_id,
+                    quoted_system_outeragent_root,
+                    quoted_outerctl_path,
+                    quoted_service_id,
+                    quoted_unit_path);
+            if (quoted_install_root[0]) {
+                fprintf(script, "rm -rf -- %s\n", quoted_install_root);
+            }
+            fprintf(script,
+                    "rm -f -- %s\n"
+                    "systemctl --system daemon-reload\n",
+                    quoted_log_path);
+            fclose(script);
+            chmod(script_template, 0700);
+            bool root_ok = run_root_script(script_template, sudo_password, needs_password, message, message_size);
+            unlink(script_template);
+            if (!root_ok) return false;
+        } else {
+            char command[768];
+            snprintf(command, sizeof(command), "systemctl --user disable --now %s >/dev/null 2>&1 || true", quoted_unit);
+            run_shell_ignored(command);
             char unit_path[PATH_MAX];
             snprintf(unit_path, sizeof(unit_path), "%s/.config/systemd/user/%s", home_directory(), unit_name);
             unlink(unit_path);
@@ -2243,7 +2982,7 @@ static void send_create_response(int fd, const char *query) {
     system("systemctl --user daemon-reload >/dev/null 2>&1");
     system(enable_command);
     char message[4096] = "";
-    bool started = run_systemd_operation(unit_name, "user", "start", message, sizeof(message));
+    bool started = run_systemd_operation(unit_name, "user", "start", NULL, NULL, message, sizeof(message));
     if (!started) {
         char response[4600];
         snprintf(response, sizeof(response), "Created %s, but failed to start it: %s", display_name, message);
@@ -2282,13 +3021,7 @@ static void send_logs_response(int fd, const char *query) {
             return;
         }
         char error[512] = "";
-        sqlite3 *database = open_registry_readonly(error, sizeof(error));
-        if (!database) {
-            send_log_json(fd, service_id, "", "", false, 0, 0, error);
-            return;
-        }
-        bool found = resolve_log_path(database, service_id, log_index, raw_path, sizeof(raw_path));
-        sqlite3_close(database);
+        bool found = resolve_log_path_any(service_id, log_index, raw_path, sizeof(raw_path), error, sizeof(error));
         if (!found) {
             send_log_json(fd, service_id, "", "", false, 0, 0, "no registered log file for this backend");
             return;
@@ -2435,6 +3168,28 @@ static void handle_client(int fd) {
     if (n <= 0) return;
     request[n] = '\0';
 
+    char *body = strstr(request, "\r\n\r\n");
+    size_t header_length = body ? (size_t)(body + 4 - request) : (size_t)n;
+    size_t body_length = body ? (size_t)n - header_length : 0;
+    size_t content_length = 0;
+    char *content_length_header = strcasestr(request, "\r\nContent-Length:");
+    if (content_length_header && (!body || content_length_header < body)) {
+        content_length = (size_t)strtoull(content_length_header + 17, NULL, 10);
+    }
+    while (body && body_length < content_length && (size_t)n < sizeof(request) - 1) {
+        ssize_t more = read(fd, request + n, sizeof(request) - 1 - (size_t)n);
+        if (more <= 0) break;
+        n += more;
+        request[n] = '\0';
+        body_length += (size_t)more;
+    }
+    if (body) {
+        *body = '\0';
+        body += 4;
+    } else {
+        body = "";
+    }
+
     char method[16], target[1024], version[16];
     if (sscanf(request, "%15s %1023s %15s", method, target, version) != 3) {
         send_text_response(fd, 400, "bad request\n");
@@ -2453,7 +3208,7 @@ static void handle_client(int fd) {
 
     if (strcasecmp(method, "POST") == 0) {
         if (strcmp(target, "/api/control") == 0) {
-            send_control_response(fd, query);
+            send_control_response(fd, query, body);
         } else if (strcmp(target, "/api/create") == 0) {
             send_create_response(fd, query);
         } else {
@@ -2561,7 +3316,7 @@ static int create_unix_listener(const char *socket_path) {
 }
 
 static void usage(const char *program) {
-    fprintf(stderr, "Usage: %s [--port PORT | --socket-path PATH] [--bundles-dir DIR] [--database PATH]\n", program);
+    fprintf(stderr, "Usage: %s [--port PORT | --socket-path PATH] [--bundles-dir DIR] [--database PATH] [--system-database PATH]\n", program);
 }
 
 int main(int argc, char **argv) {
@@ -2570,6 +3325,7 @@ int main(int argc, char **argv) {
     char socket_path[PATH_MAX] = "";
     const char *bundles_dir = "bundles";
     default_registry_database_path(g_registry_database_path, sizeof(g_registry_database_path));
+    default_system_registry_database_path(g_system_registry_database_path, sizeof(g_system_registry_database_path));
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
@@ -2583,6 +3339,8 @@ int main(int argc, char **argv) {
             bundles_dir = argv[++i];
         } else if (strcmp(argv[i], "--database") == 0 && i + 1 < argc) {
             expand_tilde_path(argv[++i], g_registry_database_path, sizeof(g_registry_database_path));
+        } else if (strcmp(argv[i], "--system-database") == 0 && i + 1 < argc) {
+            expand_tilde_path(argv[++i], g_system_registry_database_path, sizeof(g_system_registry_database_path));
         } else {
             usage(argv[0]);
             return 2;
@@ -2607,6 +3365,9 @@ int main(int argc, char **argv) {
         fprintf(stderr, "BackendsBackend listening on %s/\n", socket_path);
     }
     fprintf(stderr, "Registry database: %s\n", g_registry_database_path);
+    if (g_system_registry_database_path[0]) {
+        fprintf(stderr, "System registry database: %s\n", g_system_registry_database_path);
+    }
 
     while (!g_shutdown_requested) {
         struct sockaddr_storage peer;

@@ -17,7 +17,6 @@ import QuartzCore
 }
 
 private struct BackendsResponse: Decodable {
-    let databasePath: String
     let error: String
     let backends: [BackendRecord]
 }
@@ -98,6 +97,7 @@ private struct LogResponse: Decodable {
 private struct ActionResponse: Decodable {
     let ok: Bool
     let message: String
+    let needsPassword: Bool?
 }
 
 private struct RecipesResponse: Decodable {
@@ -153,6 +153,12 @@ private struct BackendListRow {
     }
 }
 
+private struct PendingPasswordAction {
+    let serviceID: String
+    let operation: String
+    let displayName: String
+}
+
 @MainActor
 private final class BackendsHandler: NSObject, OuterframeHostDelegate {
     private let outerframeHost: OuterframeHost
@@ -169,7 +175,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate {
     private var pollTimer: Timer?
     private var didRegisterLayer = false
 
-    private var databasePath = ""
     private var backends: [BackendRecord] = []
     private var backendError = ""
     private var selectedServiceID: String?
@@ -190,6 +195,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate {
     private var logScroll: CGFloat = 0
     private var createScroll: CGFloat = 0
     private var createContentBottom: CGFloat = 0
+    private var pendingPasswordAction: PendingPasswordAction?
+    private var sudoPasswordInput = ""
+    private var sudoPasswordMessage = ""
 
     private let rootLayer = CALayer()
     private let toolbarLayer = CALayer()
@@ -205,6 +213,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate {
     private let logRowsClipLayer = CALayer()
     private let dividerLayer = CALayer()
     private let createLayer = CALayer()
+    private let passwordOverlayLayer = CALayer()
 
     private var newButtonFrame = CGRect.zero
     private var refreshFrame = CGRect.zero
@@ -217,6 +226,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate {
     private var createSuggestionFrames: [(frame: CGRect, key: String, value: String)] = []
     private var createButtonFrame = CGRect.zero
     private var cancelCreateFrame = CGRect.zero
+    private var passwordFieldFrame = CGRect.zero
+    private var passwordSubmitFrame = CGRect.zero
+    private var passwordCancelFrame = CGRect.zero
+    private var passwordPanelFrame = CGRect.zero
 
     private let toolbarHeight: CGFloat = 48
     private let bottomBarHeight: CGFloat = 54
@@ -278,7 +291,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate {
             handleKeyDown(keyCode: keyCode, characters: characters)
 
         case .textInput(let text, _, _, _):
-            if mode == .create {
+            if pendingPasswordAction != nil {
+                insertPasswordText(text)
+            } else if mode == .create {
                 insertCreateText(text)
             }
 
@@ -389,6 +404,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate {
         rootLayer.masksToBounds = true
         rootLayer.addSublayer(toolbarLayer)
         rootLayer.addSublayer(contentLayer)
+        rootLayer.addSublayer(passwordOverlayLayer)
         toolbarLayer.addSublayer(titleLayer)
         toolbarLayer.addSublayer(statusLayer)
         toolbarLayer.addSublayer(refreshLayer)
@@ -402,6 +418,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate {
         contentLayer.addSublayer(createLayer)
 
         titleLayer.string = "Backends"
+        passwordOverlayLayer.isHidden = true
 
         for layer in [titleLayer, statusLayer] {
             layer.contentsScale = 2
@@ -488,6 +505,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate {
                     renderCreateForm()
                 }
                 updateStatusText()
+                renderPasswordPromptIfNeeded(width: width, height: height)
             }
         }
     }
@@ -601,6 +619,76 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate {
             }
             rowsClipLayer.addSublayer(rowLayer)
         }
+    }
+
+    private func renderPasswordPromptIfNeeded(width: CGFloat, height: CGFloat) {
+        passwordOverlayLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
+        guard let action = pendingPasswordAction else {
+            passwordOverlayLayer.isHidden = true
+            passwordPanelFrame = .zero
+            passwordFieldFrame = .zero
+            passwordSubmitFrame = .zero
+            passwordCancelFrame = .zero
+            return
+        }
+
+        passwordOverlayLayer.isHidden = false
+        passwordOverlayLayer.frame = CGRect(x: 0, y: 0, width: width, height: height)
+        passwordOverlayLayer.backgroundColor = resolvedCGColor(NSColor.black.withAlphaComponent(0.22))
+
+        let panelWidth = min(max(width - 48, 280), 390)
+        let panelHeight: CGFloat = 178
+        let panelFrame = CGRect(x: floor((width - panelWidth) / 2),
+                                y: floor((height - panelHeight) / 2),
+                                width: panelWidth,
+                                height: panelHeight)
+        passwordPanelFrame = panelFrame
+
+        let panel = CALayer()
+        panel.frame = panelFrame
+        panel.cornerRadius = 8
+        panel.borderWidth = 1
+        panel.backgroundColor = resolvedCGColor(.windowBackgroundColor)
+        panel.borderColor = resolvedCGColor(.separatorColor)
+        passwordOverlayLayer.addSublayer(panel)
+
+        let title = makeTextLayer(size: 15, weight: .semibold, color: .labelColor)
+        title.string = "Administrator Password"
+        title.frame = CGRect(x: 18, y: panelHeight - 38, width: panelWidth - 36, height: 20)
+        panel.addSublayer(title)
+
+        let message = makeTextLayer(size: 12, weight: .regular, color: .secondaryLabelColor)
+        message.string = "\(action.displayName): \(sudoPasswordMessage)"
+        message.frame = CGRect(x: 18, y: panelHeight - 62, width: panelWidth - 36, height: 17)
+        panel.addSublayer(message)
+
+        let field = CALayer()
+        let localFieldFrame = CGRect(x: 18, y: 70, width: panelWidth - 36, height: 32)
+        field.frame = localFieldFrame
+        field.cornerRadius = 5
+        field.borderWidth = 1
+        field.backgroundColor = resolvedCGColor(.textBackgroundColor)
+        field.borderColor = resolvedCGColor(.keyboardFocusIndicatorColor)
+        panel.addSublayer(field)
+        passwordFieldFrame = localFieldFrame.offsetBy(dx: panelFrame.minX, dy: panelFrame.minY)
+
+        let bullets = makeTextLayer(size: 14, weight: .regular, color: .labelColor)
+        bullets.string = String(repeating: "•", count: sudoPasswordInput.count)
+        bullets.frame = CGRect(x: 10, y: 8, width: max(localFieldFrame.width - 20, 1), height: 18)
+        field.addSublayer(bullets)
+
+        let cancel = makeButtonLayer(title: "Cancel", emphasized: false)
+        let submit = makeButtonLayer(title: "Continue", emphasized: true)
+        let buttonY: CGFloat = 20
+        let buttonWidth: CGFloat = 86
+        let submitLocal = CGRect(x: panelWidth - 18 - buttonWidth, y: buttonY, width: buttonWidth, height: 30)
+        let cancelLocal = CGRect(x: submitLocal.minX - 10 - 76, y: buttonY, width: 76, height: 30)
+        cancel.frame = cancelLocal
+        submit.frame = submitLocal
+        panel.addSublayer(cancel)
+        panel.addSublayer(submit)
+        passwordCancelFrame = cancelLocal.offsetBy(dx: panelFrame.minX, dy: panelFrame.minY)
+        passwordSubmitFrame = submitLocal.offsetBy(dx: panelFrame.minX, dy: panelFrame.minY)
     }
 
     private func renderLogHeader() {
@@ -851,7 +939,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate {
                 }
                 do {
                     let response = try JSONDecoder().decode(BackendsResponse.self, from: data)
-                    self.databasePath = response.databasePath
                     self.backendError = response.error
                     self.backends = response.backends
                     if let selectedServiceID = self.selectedServiceID,
@@ -954,10 +1041,15 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate {
         }.resume()
     }
 
-    private func performControlAction(for backend: BackendRecord, operation: String) {
+    private func performControlAction(for backend: BackendRecord, operation: String, sudoPassword: String? = nil) {
         guard !isPerformingAction, let controlEndpoint, let urlSession else { return }
         isPerformingAction = true
         backendError = actionProgressText(operation: operation, backend: backend)
+        if sudoPassword != nil {
+            pendingPasswordAction = nil
+            sudoPasswordInput = ""
+            sudoPasswordMessage = ""
+        }
         updateLayout()
 
         var components = URLComponents(url: controlEndpoint, resolvingAgainstBaseURL: false)
@@ -973,6 +1065,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate {
         }
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
+        if let sudoPassword {
+            request.setValue("application/x-www-form-urlencoded; charset=utf-8", forHTTPHeaderField: "Content-Type")
+            request.httpBody = formEncodedBody(["sudoPassword": sudoPassword])
+        }
         urlSession.dataTask(with: request) { [weak self] data, _, error in
             Task { @MainActor in
                 guard let self else { return }
@@ -981,7 +1077,12 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate {
                     self.backendError = error.localizedDescription
                 } else if let data,
                           let response = try? JSONDecoder().decode(ActionResponse.self, from: data) {
-                    self.backendError = response.ok ? "" : response.message
+                    if response.needsPassword == true {
+                        self.showPasswordPrompt(for: backend, operation: operation, message: response.message)
+                        self.backendError = ""
+                    } else {
+                        self.backendError = response.ok ? "" : response.message
+                    }
                 } else {
                     self.backendError = "Control request failed."
                 }
@@ -1143,6 +1244,15 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate {
     }
 
     private func handleMouseDown(at point: CGPoint, modifierFlags: NSEvent.ModifierFlags = []) {
+        if pendingPasswordAction != nil {
+            if passwordSubmitFrame.contains(point) {
+                submitPasswordPrompt()
+            } else if passwordCancelFrame.contains(point) || !passwordPanelFrame.contains(point) {
+                dismissPasswordPrompt()
+            }
+            return
+        }
+
         let toolbarPoint = toolbarLayer.convert(point, from: rootLayer)
         if refreshFrame.contains(toolbarPoint) {
             fetchBackends()
@@ -1229,6 +1339,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate {
     }
 
     private func handleKeyDown(keyCode: UInt16, characters: String?) {
+        if pendingPasswordAction != nil {
+            handlePasswordKeyDown(keyCode: keyCode, characters: characters)
+            return
+        }
         if mode == .create {
             handleCreateKeyDown(keyCode: keyCode, characters: characters)
             return
@@ -1249,6 +1363,56 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate {
         default:
             break
         }
+    }
+
+    private func showPasswordPrompt(for backend: BackendRecord, operation: String, message: String) {
+        pendingPasswordAction = PendingPasswordAction(serviceID: backend.serviceID,
+                                                      operation: operation,
+                                                      displayName: backend.displayName)
+        sudoPasswordInput = ""
+        sudoPasswordMessage = message.isEmpty ? "Administrator password required." : message
+        updateLayout()
+    }
+
+    private func dismissPasswordPrompt() {
+        pendingPasswordAction = nil
+        sudoPasswordInput = ""
+        sudoPasswordMessage = ""
+        updateLayout()
+    }
+
+    private func submitPasswordPrompt() {
+        guard let pendingPasswordAction,
+              let backend = backends.first(where: { $0.serviceID == pendingPasswordAction.serviceID }) else {
+            dismissPasswordPrompt()
+            return
+        }
+        let password = sudoPasswordInput
+        performControlAction(for: backend, operation: pendingPasswordAction.operation, sudoPassword: password)
+    }
+
+    private func handlePasswordKeyDown(keyCode: UInt16, characters: String?) {
+        switch keyCode {
+        case 36, 76:
+            submitPasswordPrompt()
+        case 51, 117:
+            if !sudoPasswordInput.isEmpty {
+                sudoPasswordInput.removeLast()
+                updateLayout()
+            }
+        case 53:
+            dismissPasswordPrompt()
+        default:
+            if let characters, !characters.isEmpty {
+                insertPasswordText(characters)
+            }
+        }
+    }
+
+    private func insertPasswordText(_ text: String) {
+        guard pendingPasswordAction != nil else { return }
+        sudoPasswordInput.append(text)
+        updateLayout()
     }
 
     private func moveSelection(delta: Int) {
@@ -1368,10 +1532,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate {
             statusLayer.string = "Loading..."
         } else if !backendError.isEmpty {
             statusLayer.string = backendError
-        } else if databasePath.isEmpty {
-            statusLayer.string = ""
         } else {
-            statusLayer.string = databasePath
+            statusLayer.string = ""
         }
     }
 
@@ -1482,7 +1644,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate {
             return row.frontend?.hasEndpoint == true ? [("Open", "open")] : []
         }
         if backend.isBundledPlaceholder {
-            return [("Run", "run")]
+            return [("Run", "run"), ("Actions", "menu")]
         }
         var actions: [(title: String, operation: String)] = []
         if row.frontend?.hasEndpoint == true {
@@ -1492,7 +1654,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate {
             actions.append((backend.status == "running" ? "Stop" : "Start",
                             backend.status == "running" ? "stop" : "start"))
         }
-        if backend.canUninstallBackend {
+        if backend.canUninstallBackend || (backend.isBundled ?? false) {
             actions.append(("Actions", "menu"))
         }
         return actions
@@ -1508,15 +1670,33 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate {
     }
 
     private func showBackendActionsMenu(for backend: BackendRecord, at point: CGPoint) {
-        guard backend.canUninstallBackend else { return }
+        guard backend.canUninstallBackend || (backend.isBundled ?? false) else { return }
         let menuID = UUID()
-        pendingMenuActions[menuID] = (backend.serviceID, ["uninstall": "uninstall"])
+        var operationByItemID: [String: String] = [:]
+        var items: [OuterframeContextMenuItem] = []
+        if backend.isBundled ?? false {
+            if backend.serviceScope == "system" {
+                operationByItemID["runUser"] = "runUser"
+                items.append(OuterframeContextMenuItem(id: "runUser",
+                                                       title: "Reinstall as User",
+                                                       isEnabled: true))
+            } else {
+                operationByItemID["runRoot"] = "runRoot"
+                items.append(OuterframeContextMenuItem(id: "runRoot",
+                                                       title: backend.isBundledPlaceholder ? "Run as Root" : "Reinstall as Root",
+                                                       isEnabled: true))
+            }
+        }
+        if backend.canUninstallBackend {
+            operationByItemID["uninstall"] = "uninstall"
+            items.append(OuterframeContextMenuItem(id: "uninstall",
+                                                   title: "Uninstall",
+                                                   isEnabled: true))
+        }
+        guard !items.isEmpty else { return }
+        pendingMenuActions[menuID] = (backend.serviceID, operationByItemID)
         outerframeHost.showContextMenu(menuID: menuID,
-                                       items: [
-                                           OuterframeContextMenuItem(id: "uninstall",
-                                                                     title: "Uninstall",
-                                                                     isEnabled: true)
-                                       ],
+                                       items: items,
                                        at: point)
     }
 
@@ -1597,11 +1777,25 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate {
         switch operation {
         case "run":
             return "Installing \(backend.displayName)..."
+        case "runRoot", "installRoot":
+            return "Installing \(backend.displayName) as root..."
+        case "runUser", "installUser":
+            return "Installing \(backend.displayName) as user..."
         case "uninstall":
             return "Uninstalling \(backend.displayName)..."
         default:
             return "\(operation.capitalized)ing \(backend.displayName)..."
         }
+    }
+
+    private func formEncodedBody(_ values: [String: String]) -> Data {
+        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-._* "))
+        let pairs = values.map { key, value -> String in
+            let encodedKey = key.addingPercentEncoding(withAllowedCharacters: allowed)?.replacingOccurrences(of: " ", with: "+") ?? key
+            let encodedValue = value.addingPercentEncoding(withAllowedCharacters: allowed)?.replacingOccurrences(of: " ", with: "+") ?? value
+            return "\(encodedKey)=\(encodedValue)"
+        }
+        return pairs.joined(separator: "&").data(using: .utf8) ?? Data()
     }
 
     private func suggestedIdentifier(from value: String) -> String {

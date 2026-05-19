@@ -5435,7 +5435,7 @@ static int create_unix_listener(const char *requested_socket_path) {
         close(listen_fd);
         fatal("bind");
     }
-    if (chmod(g_listen_socket_path, 0600) != 0) {
+    if (chmod(g_listen_socket_path, geteuid() == 0 ? 0666 : 0600) != 0) {
         close(listen_fd);
         fatal("chmod");
     }
