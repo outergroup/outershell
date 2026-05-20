@@ -330,6 +330,69 @@ static bool sb_append_base64_file_json_string(StringBuilder *builder, const char
     return ok && sb_append(builder, "\"");
 }
 
+static bool sb_append_base64_bytes(StringBuilder *builder, const unsigned char *bytes, size_t length) {
+    static const char table[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    for (size_t i = 0; i < length; i += 3) {
+        unsigned int value = (unsigned int)bytes[i] << 16;
+        bool has_second = i + 1 < length;
+        bool has_third = i + 2 < length;
+        if (has_second) value |= (unsigned int)bytes[i + 1] << 8;
+        if (has_third) value |= (unsigned int)bytes[i + 2];
+
+        char chunk[4] = {
+            table[(value >> 18) & 0x3f],
+            table[(value >> 12) & 0x3f],
+            has_second ? table[(value >> 6) & 0x3f] : '=',
+            has_third ? table[value & 0x3f] : '='
+        };
+        if (!sb_append_n(builder, chunk, sizeof(chunk))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static char *registry_icon_value(const char *path) {
+    if (!path || !path[0]) {
+        return NULL;
+    }
+    if (strncmp(path, "data:", 5) == 0) {
+        return strdup(path);
+    }
+
+    struct stat st;
+    if (stat(path, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0 || st.st_size > 1024 * 1024) {
+        return strdup(path);
+    }
+
+    FILE *file = fopen(path, "rb");
+    if (!file) {
+        return strdup(path);
+    }
+
+    unsigned char *bytes = malloc((size_t)st.st_size);
+    if (!bytes) {
+        fclose(file);
+        return NULL;
+    }
+    size_t read_count = fread(bytes, 1, (size_t)st.st_size, file);
+    fclose(file);
+    if (read_count != (size_t)st.st_size) {
+        free(bytes);
+        return strdup(path);
+    }
+
+    StringBuilder builder = {0};
+    bool ok = sb_append(&builder, "data:image/png;base64,") &&
+              sb_append_base64_bytes(&builder, bytes, read_count);
+    free(bytes);
+    if (!ok) {
+        free(builder.data);
+        return NULL;
+    }
+    return builder.data;
+}
+
 static bool sb_append_python_string(StringBuilder *builder, const char *text) {
     if (!sb_append(builder, "\"")) return false;
     for (const unsigned char *p = (const unsigned char *)(text ? text : ""); *p; p++) {
@@ -2611,12 +2674,13 @@ static bool upsert_systemd_backend_registry(const char *service_id,
         return false;
     }
 
+    char *icon_value = registry_icon_value(icon_path);
     bool ok = sqlite_exec_ok(database, "BEGIN IMMEDIATE TRANSACTION;", error, error_size);
     if (ok) {
         ok = bind_and_step(database,
                            "INSERT INTO backends(service_id, display_name, icon, service_unit) VALUES(?, ?, ?, ?) "
                            "ON CONFLICT(service_id) DO UPDATE SET display_name=excluded.display_name, icon=excluded.icon, service_unit=excluded.service_unit;",
-                           service_id, display_name, icon_path, unit_name, error, error_size);
+                           service_id, display_name, icon_value, unit_name, error, error_size);
         if (ok) {
             sqlite3_stmt *statement = NULL;
             const char *sql =
@@ -2650,8 +2714,8 @@ static bool upsert_systemd_backend_registry(const char *service_id,
             sqlite3_bind_text(statement, 2, service_id, -1, SQLITE_TRANSIENT);
             sqlite3_bind_text(statement, 3, display_name, -1, SQLITE_TRANSIENT);
             sqlite3_bind_text(statement, 4, socket_path, -1, SQLITE_TRANSIENT);
-            if (icon_path && icon_path[0]) {
-                sqlite3_bind_text(statement, 5, icon_path, -1, SQLITE_TRANSIENT);
+            if (icon_value && icon_value[0]) {
+                sqlite3_bind_text(statement, 5, icon_value, -1, SQLITE_TRANSIENT);
             } else {
                 sqlite3_bind_null(statement, 5);
             }
@@ -2675,6 +2739,7 @@ static bool upsert_systemd_backend_registry(const char *service_id,
         sqlite3_exec(database, "ROLLBACK;", NULL, NULL, NULL);
     }
     sqlite3_close(database);
+    free(icon_value);
     return ok;
 }
 #endif
@@ -2696,12 +2761,13 @@ static bool upsert_launchd_backend_registry_at(const char *database_path,
         return false;
     }
 
+    char *icon_value = registry_icon_value(icon_path);
     bool ok = sqlite_exec_ok(database, "BEGIN IMMEDIATE TRANSACTION;", error, error_size);
     if (ok) {
         ok = bind_and_step(database,
                            "INSERT INTO backends(service_id, display_name, icon, service_unit) VALUES(?, ?, ?, NULL) "
                            "ON CONFLICT(service_id) DO UPDATE SET display_name=excluded.display_name, icon=excluded.icon, service_unit=NULL;",
-                           service_id, display_name, icon_path, NULL, error, error_size);
+                           service_id, display_name, icon_value, NULL, error, error_size);
     }
     if (ok) {
         ok = bind_and_step(database,
@@ -2725,8 +2791,8 @@ static bool upsert_launchd_backend_registry_at(const char *database_path,
             sqlite3_bind_text(statement, 2, service_id, -1, SQLITE_TRANSIENT);
             sqlite3_bind_text(statement, 3, display_name, -1, SQLITE_TRANSIENT);
             sqlite3_bind_text(statement, 4, socket_path, -1, SQLITE_TRANSIENT);
-            if (icon_path && icon_path[0]) {
-                sqlite3_bind_text(statement, 5, icon_path, -1, SQLITE_TRANSIENT);
+            if (icon_value && icon_value[0]) {
+                sqlite3_bind_text(statement, 5, icon_value, -1, SQLITE_TRANSIENT);
             } else {
                 sqlite3_bind_null(statement, 5);
             }
@@ -2750,6 +2816,7 @@ static bool upsert_launchd_backend_registry_at(const char *database_path,
         sqlite3_exec(database, "ROLLBACK;", NULL, NULL, NULL);
     }
     sqlite3_close(database);
+    free(icon_value);
     return ok;
 }
 #endif
@@ -3142,7 +3209,7 @@ static bool install_bundled_app(const BundledAppDefinition *app, const char *sco
                 "touch %s\n"
                 "chmod 0644 %s\n"
                 "REGISTRY_ROOT=%s SERVICE_ID=%s DISPLAY_NAME=%s UNIT_NAME=%s LOG_PATH=%s ICON_PATH=%s SOCKET_PATH=%s python3 - <<'__BACKENDS_REGISTRY__'\n"
-                "import os, sqlite3\n"
+                "import base64, os, sqlite3\n"
                 "root = os.environ['REGISTRY_ROOT']\n"
                 "service_id = os.environ['SERVICE_ID']\n"
                 "display_name = os.environ['DISPLAY_NAME']\n"
@@ -3150,6 +3217,20 @@ static bool install_bundled_app(const BundledAppDefinition *app, const char *sco
                 "log_path = os.environ['LOG_PATH']\n"
                 "icon_path = os.environ.get('ICON_PATH') or None\n"
                 "socket_path = os.environ.get('SOCKET_PATH') or ''\n"
+                "def registry_icon_value(path):\n"
+                "    if not path:\n"
+                "        return None\n"
+                "    if path.startswith('data:'):\n"
+                "        return path\n"
+                "    try:\n"
+                "        with open(path, 'rb') as file:\n"
+                "            data = file.read(1024 * 1024 + 1)\n"
+                "    except OSError:\n"
+                "        return path\n"
+                "    if not data or len(data) > 1024 * 1024:\n"
+                "        return path\n"
+                "    return 'data:image/png;base64,' + base64.b64encode(data).decode('ascii')\n"
+                "icon_value = registry_icon_value(icon_path)\n"
                 "os.makedirs(root, exist_ok=True)\n"
                 "database_path = os.path.join(root, 'registry.sqlite3')\n"
                 "database = sqlite3.connect(database_path)\n"
@@ -3188,11 +3269,11 @@ static bool install_bundled_app(const BundledAppDefinition *app, const char *sco
                 "if 'list' not in columns:\n"
                 "    database.execute('ALTER TABLE frontends ADD COLUMN list TEXT')\n"
                 "with database:\n"
-                "    database.execute('INSERT INTO backends(service_id, display_name, icon, service_unit) VALUES(?, ?, ?, ?) ON CONFLICT(service_id) DO UPDATE SET display_name=excluded.display_name, icon=excluded.icon, service_unit=excluded.service_unit', (service_id, display_name, icon_path, unit_name))\n"
+                "    database.execute('INSERT INTO backends(service_id, display_name, icon, service_unit) VALUES(?, ?, ?, ?) ON CONFLICT(service_id) DO UPDATE SET display_name=excluded.display_name, icon=excluded.icon, service_unit=excluded.service_unit', (service_id, display_name, icon_value, unit_name))\n"
                 "    database.execute('INSERT INTO systemd_backends(service_id, unit_name, scope) VALUES(?, ?, ?) ON CONFLICT(service_id) DO UPDATE SET unit_name=excluded.unit_name, scope=excluded.scope', (service_id, unit_name, 'system'))\n"
                 "    database.execute('DELETE FROM frontends WHERE service_id = ?', (service_id,))\n"
                 "    if socket_path:\n"
-                "        database.execute('INSERT INTO frontends(url, service_id, name, port, socket_path, icon) VALUES(?, ?, ?, 0, ?, ?)', (socket_path, service_id, display_name, socket_path, icon_path))\n"
+                "        database.execute('INSERT INTO frontends(url, service_id, name, port, socket_path, icon) VALUES(?, ?, ?, 0, ?, ?)', (socket_path, service_id, display_name, socket_path, icon_value))\n"
                 "    database.execute('DELETE FROM log_files WHERE service_id = ?', (service_id,))\n"
                 "    database.execute('INSERT INTO log_files(path, service_id) VALUES(?, ?)', (log_path, service_id))\n"
                 "database.close()\n"
@@ -3770,7 +3851,7 @@ static bool install_bundled_app_macos(const BundledAppDefinition *app,
                 "touch %s\n"
                 "chmod 0644 %s\n"
                 "REGISTRY_ROOT=%s SERVICE_ID=%s DISPLAY_NAME=%s PLIST_PATH=%s LOG_PATH=%s ICON_PATH=%s SOCKET_PATH=%s python3 - <<'__BACKENDS_REGISTRY__'\n"
-                "import os, sqlite3\n"
+                "import base64, os, sqlite3\n"
                 "root = os.environ['REGISTRY_ROOT']\n"
                 "service_id = os.environ['SERVICE_ID']\n"
                 "display_name = os.environ['DISPLAY_NAME']\n"
@@ -3778,6 +3859,20 @@ static bool install_bundled_app_macos(const BundledAppDefinition *app,
                 "log_path = os.environ['LOG_PATH']\n"
                 "icon_path = os.environ.get('ICON_PATH') or None\n"
                 "socket_path = os.environ.get('SOCKET_PATH') or ''\n"
+                "def registry_icon_value(path):\n"
+                "    if not path:\n"
+                "        return None\n"
+                "    if path.startswith('data:'):\n"
+                "        return path\n"
+                "    try:\n"
+                "        with open(path, 'rb') as file:\n"
+                "            data = file.read(1024 * 1024 + 1)\n"
+                "    except OSError:\n"
+                "        return path\n"
+                "    if not data or len(data) > 1024 * 1024:\n"
+                "        return path\n"
+                "    return 'data:image/png;base64,' + base64.b64encode(data).decode('ascii')\n"
+                "icon_value = registry_icon_value(icon_path)\n"
                 "os.makedirs(root, exist_ok=True)\n"
                 "database_path = os.path.join(root, 'registry.sqlite3')\n"
                 "database = sqlite3.connect(database_path)\n"
@@ -3796,12 +3891,12 @@ static bool install_bundled_app_macos(const BundledAppDefinition *app,
                 "if 'list' not in columns:\n"
                 "    database.execute('ALTER TABLE frontends ADD COLUMN list TEXT')\n"
                 "with database:\n"
-                "    database.execute('INSERT INTO backends(service_id, display_name, icon, service_unit) VALUES(?, ?, ?, NULL) ON CONFLICT(service_id) DO UPDATE SET display_name=excluded.display_name, icon=excluded.icon, service_unit=NULL', (service_id, display_name, icon_path))\n"
+                "    database.execute('INSERT INTO backends(service_id, display_name, icon, service_unit) VALUES(?, ?, ?, NULL) ON CONFLICT(service_id) DO UPDATE SET display_name=excluded.display_name, icon=excluded.icon, service_unit=NULL', (service_id, display_name, icon_value))\n"
                 "    database.execute('INSERT INTO launchd_backends(service_id, plist_path, owns_plist) VALUES(?, ?, 1) ON CONFLICT(service_id) DO UPDATE SET plist_path=excluded.plist_path, owns_plist=excluded.owns_plist', (service_id, plist_path))\n"
                 "    database.execute('DELETE FROM systemd_backends WHERE service_id = ?', (service_id,))\n"
                 "    database.execute('DELETE FROM frontends WHERE service_id = ?', (service_id,))\n"
                 "    if socket_path:\n"
-                "        database.execute('INSERT INTO frontends(url, service_id, name, port, socket_path, icon) VALUES(?, ?, ?, 0, ?, ?)', (socket_path, service_id, display_name, socket_path, icon_path))\n"
+                "        database.execute('INSERT INTO frontends(url, service_id, name, port, socket_path, icon) VALUES(?, ?, ?, 0, ?, ?)', (socket_path, service_id, display_name, socket_path, icon_value))\n"
                 "    database.execute('DELETE FROM log_files WHERE service_id = ?', (service_id,))\n"
                 "    database.execute('INSERT INTO log_files(path, service_id) VALUES(?, ?)', (log_path, service_id))\n"
                 "database.close()\n"

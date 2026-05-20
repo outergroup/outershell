@@ -232,8 +232,21 @@ private struct TextMatchState {
     let isWrapped: Bool
 }
 
+private struct CreateFieldLayout {
+    let fieldFrame: CGRect
+    let textFrame: CGRect
+    let key: String
+    let monospaced: Bool
+}
+
+private struct PendingCreateTextDrag {
+    let startPoint: CGPoint
+    let cursorIndex: Int
+    let selectedText: String
+}
+
 @MainActor
-private final class BackendsHandler: NSObject, OuterframeHostDelegate {
+private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLineTextInputControllerDelegate {
     private let outerframeHost: OuterframeHost
     private let appConnection: OuterframeAppConnection
     private var retainedSelf: BackendsHandler?
@@ -265,13 +278,51 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate {
     private var selectedRecipeID = "command-port"
     private var createValues: [String: String] = [:]
     private var activeCreateFieldKey: String?
+    private static let createFieldInputID = UUID()
+    private static let createFieldPasteboardTypes = [
+        NSPasteboard.PasteboardType.string.rawValue,
+        NSPasteboard.PasteboardType.rtf.rawValue
+    ]
+    private lazy var createInputController: SingleLineTextInputController<BackendsHandler> = {
+        let controller = SingleLineTextInputController<BackendsHandler>(
+            identifier: Self.createFieldInputID,
+            acceptedPasteboardTypeIdentifiers: Self.createFieldPasteboardTypes
+        )
+        controller.delegate = self
+        controller.onSubmit = { [weak self] in
+            Task { @MainActor in self?.submitCreateForm() }
+        }
+        return controller
+    }()
     private var createMessage = ""
     private var backendScroll: CGFloat = 0
     private var logScroll: CGFloat = 0
     private var appsScroll: CGFloat = 0
     private var createScroll: CGFloat = 0
     private var createContentBottom: CGFloat = 0
+    private var viewHasFocus = true
+    private var windowIsActive = true
+    private var isSynchronizingCreateInput = false
+    private var isSynchronizingPasswordInput = false
+    private var pendingCreateTextDrag: PendingCreateTextDrag?
+    private var currentCursor: PluginCursorType = .arrow
     private var pendingPasswordAction: PendingPasswordAction?
+    private static let passwordFieldInputID = UUID()
+    private static let passwordFieldPasteboardTypes = [
+        NSPasteboard.PasteboardType.string.rawValue,
+        NSPasteboard.PasteboardType.rtf.rawValue
+    ]
+    private lazy var passwordInputController: SingleLineTextInputController<BackendsHandler> = {
+        let controller = SingleLineTextInputController<BackendsHandler>(
+            identifier: Self.passwordFieldInputID,
+            acceptedPasteboardTypeIdentifiers: Self.passwordFieldPasteboardTypes
+        )
+        controller.delegate = self
+        controller.onSubmit = { [weak self] in
+            Task { @MainActor in self?.submitPasswordPrompt() }
+        }
+        return controller
+    }()
     private var sudoPasswordInput = ""
     private var sudoPasswordMessage = ""
 
@@ -309,11 +360,13 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate {
     private var pendingMenuActions: [UUID: (serviceID: String, operationByItemID: [String: String])] = [:]
     private var recipeFrames: [(frame: CGRect, recipeID: String)] = []
     private var createFieldFrames: [(frame: CGRect, key: String)] = []
+    private var createFieldLayouts: [String: CreateFieldLayout] = [:]
     private var createChoiceFrames: [(frame: CGRect, key: String, value: String)] = []
     private var createSuggestionFrames: [(frame: CGRect, key: String, value: String)] = []
     private var createButtonFrame = CGRect.zero
     private var cancelCreateFrame = CGRect.zero
     private var passwordFieldFrame = CGRect.zero
+    private var passwordTextFrame = CGRect.zero
     private var passwordSubmitFrame = CGRect.zero
     private var passwordCancelFrame = CGRect.zero
     private var passwordPanelFrame = CGRect.zero
@@ -352,7 +405,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate {
             updateLayout()
             updateColors()
             registerRootLayerIfNeeded()
-            outerframeHost.setInputMode(.rawKeys)
+            updateInputMode()
+            updateEditingAndPasteboardState()
+            outerframeHost.setPasteboardDropBehaviorHitTest(acceptedTypes: Self.createFieldPasteboardTypes)
             fetchBackends()
             fetchRecipes()
             startPolling()
@@ -369,23 +424,91 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate {
         case .scrollWheelEvent(let point, let delta, _, _, _, let hasPreciseScrollingDeltas):
             handleScroll(at: point, delta: delta, precise: hasPreciseScrollingDeltas)
 
-        case .mouseDown(let point, let modifierFlags, _):
-            handleMouseDown(at: point, modifierFlags: modifierFlags)
+        case .mouseDown(let point, let modifierFlags, let clickCount):
+            handleMouseDown(at: point, modifierFlags: modifierFlags, clickCount: clickCount)
+
+        case .mouseDragged(let point, let modifierFlags):
+            handleMouseDragged(to: point, modifierFlags: modifierFlags)
+
+        case .mouseUp(let point, let modifierFlags):
+            handleMouseUp(at: point, modifierFlags: modifierFlags)
+
+        case .mouseMoved(let point, let modifierFlags):
+            handleMouseMoved(to: point, modifierFlags: modifierFlags)
+
+        case .rightMouseDown(let point, let modifierFlags, let clickCount):
+            handleRightMouseDown(at: point, modifierFlags: modifierFlags, clickCount: clickCount)
 
         case .contextMenuItemSelected(let menuID, let itemID):
             handleContextMenuSelection(menuID: menuID, itemID: itemID)
 
-        case .keyDown(let keyCode, let characters, _, _, _):
-            handleKeyDown(keyCode: keyCode, characters: characters)
+        case .keyDown(let keyCode, let characters, let charactersIgnoringModifiers, let modifierFlags, let isARepeat):
+            handleKeyDown(keyCode: keyCode,
+                          characters: characters,
+                          charactersIgnoringModifiers: charactersIgnoringModifiers,
+                          modifierFlags: modifierFlags,
+                          isARepeat: isARepeat)
 
-        case .textInput(let text, _, _, _):
+        case .textInput(let text, let hasReplacementRange, let replacementLocation, let replacementLength):
             if pendingPasswordAction != nil {
-                insertPasswordText(text)
+                insertPasswordText(text,
+                                   hasReplacementRange: hasReplacementRange,
+                                   replacementLocation: replacementLocation,
+                                   replacementLength: replacementLength)
             } else if mode == .create {
-                insertCreateText(text)
+                insertCreateText(text,
+                                 hasReplacementRange: hasReplacementRange,
+                                 replacementLocation: replacementLocation,
+                                 replacementLength: replacementLength)
             }
 
+        case .textCommand(let command):
+            handleTextCommand(command)
+
+        case .textInputFocus(let fieldID, let hasFocus):
+            handleTextInputFocus(fieldID: fieldID, hasFocus: hasFocus)
+
+        case .setCursorPosition(let fieldID, let position, let modifySelection):
+            handleSetCursorPosition(fieldID: fieldID, position: Int(position), modifySelection: modifySelection)
+
+        case .viewFocusChanged(let isFocused):
+            viewHasFocus = isFocused
+            if !isFocused {
+                blurCreateField()
+                blurPasswordField()
+            }
+            updateEditingAndPasteboardState()
+
+        case .windowActiveUpdate(let isActive):
+            windowIsActive = isActive
+            updateLayout()
+
+        case .selectionToPasteboardCopyRequest(let requestID):
+            outerframeHost.sendCopySelectedPasteboardResponse(requestID: requestID,
+                                                              items: pasteboardItemsForCopy())
+
+        case .selectionToPasteboardCutRequest(let requestID):
+            outerframeHost.sendCopySelectedPasteboardResponse(requestID: requestID,
+                                                              items: pasteboardItemsForCut())
+
+        case .pasteboardContentPasted(let items):
+            handlePasteboardItemsForPaste(items)
+
+        case .pasteboardDropHitTestRequest(let requestID, let point, let pasteboardTypes, let operationMask, _):
+            let accepted = createFieldAcceptsTextDrop(at: point,
+                                                      pasteboardTypes: pasteboardTypes,
+                                                      operationMask: operationMask) ||
+                           passwordFieldAcceptsTextDrop(at: point,
+                                                        pasteboardTypes: pasteboardTypes,
+                                                        operationMask: operationMask)
+            outerframeHost.sendPasteboardDropHitTestResponse(requestID: requestID,
+                                                             operationMask: accepted ? .copy : [])
+
+        case .pasteboardContentDropped(let point, let items):
+            handlePasteboardItemsForDrop(at: point, items: items)
+
         case .historyTraversal(_, let url):
+            blurCreateField()
             applyMode(modeFromURL(url))
 
         case .accessibilitySnapshotRequest(let requestID):
@@ -486,6 +609,12 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate {
     }
 
     private func applyMode(_ nextMode: BackendsViewMode) {
+        if mode == .create && nextMode != .create {
+            blurCreateField()
+        }
+        if nextMode != .create {
+            setCursorIfNeeded(.arrow)
+        }
         mode = nextMode
         if mode == .create || mode == .apps {
             clampScrollOffsets()
@@ -940,6 +1069,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate {
 
                 let contentHeight = contentLayer.bounds.height
                 if mode == .apps {
+                    outerframeHost.sendTextCursorUpdate(cursors: [])
                     appsLayer.isHidden = false
                     bottomBarLayer.isHidden = true
                     tableHeaderLayer.isHidden = true
@@ -951,6 +1081,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate {
                     appsLayer.frame = CGRect(x: 0, y: 0, width: width, height: contentHeight)
                     renderAppsPage()
                 } else if mode == .backends {
+                    outerframeHost.sendTextCursorUpdate(cursors: [])
                     appsLayer.isHidden = true
                     bottomBarLayer.isHidden = false
                     tableHeaderLayer.isHidden = false
@@ -1562,6 +1693,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate {
             passwordOverlayLayer.isHidden = true
             passwordPanelFrame = .zero
             passwordFieldFrame = .zero
+            passwordTextFrame = .zero
             passwordSubmitFrame = .zero
             passwordCancelFrame = .zero
             return
@@ -1600,15 +1732,41 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate {
         let field = CALayer()
         let localFieldFrame = CGRect(x: 18, y: 70, width: panelWidth - 36, height: 32)
         field.frame = localFieldFrame
+        field.masksToBounds = true
         field.cornerRadius = 5
-        field.borderWidth = 1
+        field.borderWidth = passwordInputController.isFocused ? 1.5 : 1
         field.backgroundColor = resolvedCGColor(.textBackgroundColor)
-        field.borderColor = resolvedCGColor(.keyboardFocusIndicatorColor)
+        field.borderColor = passwordInputController.isFocused ? resolvedCGColor(.keyboardFocusIndicatorColor) : resolvedCGColor(.separatorColor)
         panel.addSublayer(field)
         passwordFieldFrame = localFieldFrame.offsetBy(dx: panelFrame.minX, dy: panelFrame.minY)
+        passwordTextFrame = CGRect(x: passwordFieldFrame.minX + 10,
+                                   y: passwordFieldFrame.minY + 8,
+                                   width: max(localFieldFrame.width - 20, 1),
+                                   height: 18)
+
+        let bulletString = String(repeating: "\u{2022}", count: sudoPasswordInput.count)
+        if passwordInputController.isFocused,
+           let selectionRange = passwordInputController.selectionRange,
+           !bulletString.isEmpty {
+            let line = makePasswordFieldLine(for: bulletString)
+            let offsets = selectionOffsets(line: line,
+                                           text: bulletString,
+                                           range: selectionRange,
+                                           maxWidth: passwordTextFrame.width)
+            let selectionWidth = max(0, offsets.end - offsets.start)
+            if selectionWidth > 0.5 {
+                let selection = CALayer()
+                selection.frame = CGRect(x: 10 + offsets.start,
+                                         y: 7,
+                                         width: selectionWidth,
+                                         height: 18)
+                selection.backgroundColor = resolvedCGColor(windowIsActive ? .selectedTextBackgroundColor : .unemphasizedSelectedTextBackgroundColor)
+                field.addSublayer(selection)
+            }
+        }
 
         let bullets = makeTextLayer(size: 14, weight: .regular, color: .labelColor)
-        bullets.string = String(repeating: "•", count: sudoPasswordInput.count)
+        bullets.string = bulletString
         bullets.frame = CGRect(x: 10, y: 8, width: max(localFieldFrame.width - 20, 1), height: 18)
         field.addSublayer(bullets)
 
@@ -1624,6 +1782,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate {
         panel.addSublayer(submit)
         passwordCancelFrame = cancelLocal.offsetBy(dx: panelFrame.minX, dy: panelFrame.minY)
         passwordSubmitFrame = submitLocal.offsetBy(dx: panelFrame.minX, dy: panelFrame.minY)
+        sendPasswordFieldCursorUpdate()
     }
 
     private func renderLogHeader() {
@@ -1688,6 +1847,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate {
         createLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
         recipeFrames.removeAll()
         createFieldFrames.removeAll()
+        createFieldLayouts.removeAll()
         createChoiceFrames.removeAll()
         createSuggestionFrames.removeAll()
 
@@ -1779,6 +1939,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate {
             createLayer.addSublayer(message)
         }
         createContentBottom = !createMessage.isEmpty ? y - 26 : y + 14
+        sendCreateFieldCursorUpdate()
         if clampCreateScrollUsingRenderedContent() {
             renderCreateForm()
         }
@@ -1795,13 +1956,40 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate {
 
         let boxFrame = CGRect(x: frame.minX, y: frame.minY, width: frame.width, height: 30)
         createFieldFrames.append((boxFrame, field.key))
+        let textFrame = CGRect(x: boxFrame.minX + 9, y: boxFrame.minY + 7, width: max(boxFrame.width - 18, 1), height: 16)
+        createFieldLayouts[field.key] = CreateFieldLayout(fieldFrame: boxFrame,
+                                                          textFrame: textFrame,
+                                                          key: field.key,
+                                                          monospaced: monospaced)
         let box = CALayer()
         box.frame = boxFrame
+        box.masksToBounds = true
         box.cornerRadius = 5
-        box.borderWidth = activeCreateFieldKey == field.key ? 1.5 : 1
-        box.borderColor = activeCreateFieldKey == field.key ? resolvedCGColor(.controlAccentColor) : resolvedCGColor(.separatorColor)
+        let focused = createInputController.isFocused && activeCreateFieldKey == field.key
+        box.borderWidth = focused ? 1.5 : 1
+        box.borderColor = focused ? resolvedCGColor(.keyboardFocusIndicatorColor) : resolvedCGColor(.separatorColor)
         box.backgroundColor = resolvedCGColor(.textBackgroundColor)
         createLayer.addSublayer(box)
+
+        if focused,
+           let selectionRange = createInputController.selectionRange,
+           !value.isEmpty {
+            let line = makeCreateFieldLine(for: value, monospaced: monospaced)
+            let offsets = selectionOffsets(line: line,
+                                           text: value,
+                                           range: selectionRange,
+                                           maxWidth: textFrame.width)
+            let selectionWidth = max(0, offsets.end - offsets.start)
+            if selectionWidth > 0.5 {
+                let selection = CALayer()
+                selection.frame = CGRect(x: 9 + offsets.start,
+                                         y: 6,
+                                         width: selectionWidth,
+                                         height: 18)
+                selection.backgroundColor = resolvedCGColor(windowIsActive ? .selectedTextBackgroundColor : .unemphasizedSelectedTextBackgroundColor)
+                box.addSublayer(selection)
+            }
+        }
 
         let text = makeTextLayer(size: 12, weight: .regular, color: value.isEmpty ? .tertiaryLabelColor : .labelColor, monospaced: monospaced)
         text.string = value.isEmpty ? field.placeholder : value
@@ -2003,6 +2191,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate {
         isPerformingAction = true
         backendError = actionProgressText(operation: operation, backend: backend)
         if sudoPassword != nil {
+            blurPasswordField()
             pendingPasswordAction = nil
             sudoPasswordInput = ""
             sudoPasswordMessage = ""
@@ -2187,12 +2376,54 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate {
         }.resume()
     }
 
+    func textInputControllerDidChangeState() {
+        if pendingPasswordAction != nil,
+           passwordInputController.isFocused,
+           !isSynchronizingPasswordInput {
+            sudoPasswordInput = passwordInputController.text
+            sudoPasswordMessage = ""
+            updateInputMode()
+            updateEditingAndPasteboardState()
+            updateLayout()
+            return
+        }
+
+        guard mode == .create,
+              !isSynchronizingCreateInput,
+              let key = activeCreateFieldKey else {
+            updateInputMode()
+            updateEditingAndPasteboardState()
+            sendFocusedTextCursorUpdate()
+            return
+        }
+
+        let oldNameSuggestion = suggestedIdentifier(from: createValues["name", default: ""])
+        createValues[key] = createInputController.text
+        if key == "name" {
+            let identifier = createValues["identifier", default: ""]
+            if identifier.isEmpty || identifier == oldNameSuggestion {
+                createValues["identifier"] = suggestedIdentifier(from: createValues["name", default: ""])
+            }
+        }
+        createMessage = ""
+        updateInputMode()
+        updateEditingAndPasteboardState()
+        updateLayout()
+    }
+
     private func handleCreateKeyDown(keyCode: UInt16, characters: String?) {
+        if createInputController.isFocused {
+            if keyCode == 48 {
+                advanceCreateField()
+            }
+            return
+        }
         switch keyCode {
         case 48:
             advanceCreateField()
         case 51, 117:
-            deleteBackwardInCreateField()
+            focusActiveCreateField()
+            createInputController.deleteBackward()
         case 36, 76:
             submitCreateForm()
         case 53:
@@ -2209,42 +2440,501 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate {
         guard !fields.isEmpty else { return }
         let currentKey = activeCreateFieldKey ?? fields[0].key
         let index = fields.firstIndex(where: { $0.key == currentKey }) ?? 0
-        activeCreateFieldKey = fields[(index + 1) % fields.count].key
+        focusCreateField(fields[(index + 1) % fields.count].key)
         updateLayout()
     }
 
-    private func insertCreateText(_ text: String) {
-        guard !text.isEmpty else { return }
-        let cleaned = text.filter { character in
+    private func insertCreateText(_ text: String,
+                                  hasReplacementRange: Bool = false,
+                                  replacementLocation: UInt64 = 0,
+                                  replacementLength: UInt64 = 0) {
+        guard mode == .create, !text.isEmpty else { return }
+        if !createInputController.isFocused {
+            focusActiveCreateField()
+        }
+        if hasReplacementRange {
+            createInputController.setCursorPosition(Int(replacementLocation), modifySelection: false)
+            let end = Int(replacementLocation + replacementLength)
+            createInputController.setCursorPosition(end, modifySelection: true)
+        }
+        let cleaned = cleanSingleLineText(text)
+        guard !cleaned.isEmpty else { return }
+        createInputController.insertText(cleaned)
+    }
+
+    private func cleanSingleLineText(_ text: String) -> String {
+        text.filter { character in
             !character.isNewline && character.unicodeScalars.allSatisfy { $0.value >= 0x20 && $0.value != 0x7f }
         }
-        guard !cleaned.isEmpty else { return }
-        let key = activeCreateFieldKey ?? selectedRecipe()?.fields.first(where: { $0.fieldType != "choice" })?.key
-        guard let key else { return }
-        createValues[key, default: ""] += cleaned
-        if key == "name" {
-            let identifier = createValues["identifier", default: ""]
-            if identifier.isEmpty {
-                createValues["identifier"] = suggestedIdentifier(from: createValues["name", default: ""])
-            }
-        }
-        createMessage = ""
-        updateLayout()
     }
 
-    private func deleteBackwardInCreateField() {
-        guard let key = activeCreateFieldKey else { return }
-        if key == "name" {
-            let oldSuggestion = suggestedIdentifier(from: createValues["name", default: ""])
-            if !(createValues[key] ?? "").isEmpty { createValues[key]?.removeLast() }
-            let identifier = createValues["identifier", default: ""]
-            if identifier == oldSuggestion || identifier.isEmpty {
-                createValues["identifier"] = suggestedIdentifier(from: createValues["name", default: ""])
-            }
-        } else if !(createValues[key] ?? "").isEmpty {
-            createValues[key]?.removeLast()
+    private func focusActiveCreateField(selectAll: Bool = false) {
+        let key = activeCreateFieldKey ?? selectedRecipe()?.fields.first(where: { $0.fieldType != "choice" })?.key
+        guard let key else { return }
+        focusCreateField(key, selectAll: selectAll)
+    }
+
+    private func focusPasswordField(selectAll: Bool = false, cursorPosition: Int? = nil) {
+        guard pendingPasswordAction != nil else { return }
+        blurCreateField()
+        isSynchronizingPasswordInput = true
+        passwordInputController.setText(sudoPasswordInput)
+        passwordInputController.focus(selectAll: selectAll)
+        if let cursorPosition {
+            passwordInputController.setCursorPosition(cursorPosition, modifySelection: false)
         }
-        updateLayout()
+        isSynchronizingPasswordInput = false
+        updateInputMode()
+        updateEditingAndPasteboardState()
+        sendPasswordFieldCursorUpdate()
+    }
+
+    private func blurPasswordField() {
+        passwordInputController.blur()
+        updateInputMode()
+        updateEditingAndPasteboardState()
+        if !createInputController.isFocused {
+            outerframeHost.sendTextCursorUpdate(cursors: [])
+        }
+    }
+
+    private func focusCreateField(_ key: String, selectAll: Bool = false, cursorPosition: Int? = nil) {
+        blurPasswordField()
+        activeCreateFieldKey = key
+        let value = createValues[key] ?? selectedRecipe()?.fields.first(where: { $0.key == key })?.defaultValue ?? ""
+        isSynchronizingCreateInput = true
+        createInputController.setText(value)
+        createInputController.focus(selectAll: selectAll)
+        if let cursorPosition {
+            createInputController.setCursorPosition(cursorPosition, modifySelection: false)
+        }
+        isSynchronizingCreateInput = false
+        updateInputMode()
+        updateEditingAndPasteboardState()
+        sendCreateFieldCursorUpdate()
+    }
+
+    private func blurCreateField() {
+        createInputController.blur()
+        updateInputMode()
+        updateEditingAndPasteboardState()
+        outerframeHost.sendTextCursorUpdate(cursors: [])
+    }
+
+    private func handleTextCommand(_ command: String) {
+        if pendingPasswordAction != nil, passwordInputController.isFocused {
+            if command == "cancelOperation" {
+                dismissPasswordPrompt()
+                return
+            }
+            passwordInputController.performCommand(command)
+            return
+        }
+
+        guard mode == .create, createInputController.isFocused else { return }
+        if command == "insertTab" || command == "insertBacktab" {
+            advanceCreateField()
+            return
+        }
+        if command == "cancelOperation" {
+            returnToBackendsFromCreate()
+            return
+        }
+        createInputController.performCommand(command)
+    }
+
+    private func handleTextInputFocus(fieldID: UUID, hasFocus: Bool) {
+        if fieldID == Self.passwordFieldInputID {
+            if hasFocus {
+                focusPasswordField()
+            } else {
+                blurPasswordField()
+                updateLayout()
+            }
+            return
+        }
+
+        guard fieldID == Self.createFieldInputID else { return }
+        if hasFocus {
+            focusActiveCreateField()
+        } else {
+            blurCreateField()
+            updateLayout()
+        }
+    }
+
+    private func handleSetCursorPosition(fieldID: UUID, position: Int, modifySelection: Bool) {
+        if fieldID == Self.passwordFieldInputID {
+            focusPasswordField()
+            passwordInputController.setCursorPosition(position, modifySelection: modifySelection)
+            return
+        }
+
+        guard fieldID == Self.createFieldInputID else { return }
+        focusActiveCreateField()
+        createInputController.setCursorPosition(position, modifySelection: modifySelection)
+    }
+
+    private func updateInputMode() {
+        outerframeHost.setInputMode((createInputController.isFocused || passwordInputController.isFocused) ? .textInput : .rawKeys)
+    }
+
+    private func updateEditingAndPasteboardState() {
+        if passwordInputController.isFocused {
+            outerframeHost.setEditingCapabilities(canCopy: false, canCut: false)
+            outerframeHost.setAcceptedPasteboardPasteTypes(Self.passwordFieldPasteboardTypes)
+            return
+        }
+
+        let capabilities = createInputController.currentEditingCapabilities()
+        outerframeHost.setEditingCapabilities(canCopy: capabilities.canCopy, canCut: capabilities.canCut)
+        outerframeHost.setAcceptedPasteboardPasteTypes(createInputController.currentAcceptedPasteboardTypeIdentifiers())
+    }
+
+    private func createInputFont(monospaced: Bool) -> NSFont {
+        monospaced ? NSFont.monospacedSystemFont(ofSize: 12, weight: .regular) : NSFont.systemFont(ofSize: 12, weight: .regular)
+    }
+
+    private func makeCreateFieldLine(for text: String, monospaced: Bool) -> CTLine {
+        let attributed = NSAttributedString(string: text, attributes: [.font: createInputFont(monospaced: monospaced)])
+        return CTLineCreateWithAttributedString(attributed)
+    }
+
+    private func makePasswordFieldLine(for text: String) -> CTLine {
+        let attributed = NSAttributedString(string: text, attributes: [.font: NSFont.systemFont(ofSize: 14, weight: .regular)])
+        return CTLineCreateWithAttributedString(attributed)
+    }
+
+    private func offsetForCreateFieldCharacter(line: CTLine, text: String, index: Int, maxWidth: CGFloat) -> CGFloat {
+        let utf16Index = utf16Offset(forCharacterIndex: index, in: text)
+        var secondaryOffset: CGFloat = 0
+        let primary = CTLineGetOffsetForStringIndex(line, utf16Index, &secondaryOffset)
+        let offset = max(primary, secondaryOffset)
+        return offset.isFinite ? min(max(offset, 0), maxWidth) : 0
+    }
+
+    private func selectionOffsets(line: CTLine, text: String, range: Range<Int>, maxWidth: CGFloat) -> (start: CGFloat, end: CGFloat) {
+        let start = offsetForCreateFieldCharacter(line: line, text: text, index: range.lowerBound, maxWidth: maxWidth)
+        let end = offsetForCreateFieldCharacter(line: line, text: text, index: range.upperBound, maxWidth: maxWidth)
+        return (min(start, maxWidth), min(max(end, start), maxWidth))
+    }
+
+    private func characterIndexForCreateField(key: String, xPosition: CGFloat) -> Int {
+        guard let layout = createFieldLayouts[key] else { return 0 }
+        let text = createValues[key] ?? selectedRecipe()?.fields.first(where: { $0.key == key })?.defaultValue ?? ""
+        let localX = max(0, min(xPosition - layout.textFrame.minX, layout.textFrame.width))
+        guard !text.isEmpty, layout.textFrame.width > 0 else { return 0 }
+        let line = makeCreateFieldLine(for: text, monospaced: layout.monospaced)
+        let utf16Index = CTLineGetStringIndexForPosition(line, CGPoint(x: localX, y: 0))
+        if utf16Index == kCFNotFound { return text.count }
+        return characterIndex(forUTF16: utf16Index, in: text)
+    }
+
+    private func characterIndexForPasswordField(xPosition: CGFloat) -> Int {
+        let bulletString = String(repeating: "\u{2022}", count: sudoPasswordInput.count)
+        let localX = max(0, min(xPosition - passwordTextFrame.minX, passwordTextFrame.width))
+        guard !bulletString.isEmpty, passwordTextFrame.width > 0 else { return 0 }
+        let line = makePasswordFieldLine(for: bulletString)
+        let utf16Index = CTLineGetStringIndexForPosition(line, CGPoint(x: localX, y: 0))
+        if utf16Index == kCFNotFound { return bulletString.count }
+        return characterIndex(forUTF16: utf16Index, in: bulletString)
+    }
+
+    private func utf16Offset(forCharacterIndex index: Int, in text: String) -> Int {
+        let clamped = max(0, min(index, text.count))
+        let stringIndex = text.index(text.startIndex, offsetBy: clamped)
+        return text[text.startIndex..<stringIndex].utf16.count
+    }
+
+    private func characterIndex(forUTF16 offset: Int, in text: String) -> Int {
+        let clamped = max(0, min(offset, text.utf16.count))
+        let stringIndex = String.Index(utf16Offset: clamped, in: text)
+        return text.distance(from: text.startIndex, to: stringIndex)
+    }
+
+    private func createFieldCursorRect(layout: CreateFieldLayout, cachedLine: CTLine?) -> CGRect {
+        let text = createInputController.text
+        let cursorWidth: CGFloat = 1
+        let maxWidth = max(layout.textFrame.width, 0)
+        let offset: CGFloat
+        if let cachedLine, !text.isEmpty && maxWidth > 0 {
+            offset = offsetForCreateFieldCharacter(line: cachedLine,
+                                                   text: text,
+                                                   index: createInputController.cursorPosition,
+                                                   maxWidth: maxWidth)
+        } else {
+            offset = 0
+        }
+        let proposedX = min(max(layout.textFrame.minX + offset, layout.textFrame.minX), layout.textFrame.maxX)
+        let maxCursorX = layout.fieldFrame.maxX - 2 - cursorWidth
+        return CGRect(x: max(layout.textFrame.minX, min(proposedX, maxCursorX)),
+                      y: layout.textFrame.minY - 1,
+                      width: cursorWidth,
+                      height: layout.textFrame.height + 2)
+    }
+
+    private func sendCreateFieldCursorUpdate() {
+        guard mode == .create,
+              createInputController.isFocused,
+              !createInputController.hasSelection,
+              let key = activeCreateFieldKey,
+              let layout = createFieldLayouts[key] else {
+            outerframeHost.sendTextCursorUpdate(cursors: [])
+            return
+        }
+        let line = createInputController.text.isEmpty ? nil : makeCreateFieldLine(for: createInputController.text, monospaced: layout.monospaced)
+        let cursorFrame = createFieldCursorRect(layout: layout, cachedLine: line)
+        let rootPosition = createLayer.convert(cursorFrame.origin, to: rootLayer)
+        let topLeftY = rootLayer.bounds.height - rootPosition.y - cursorFrame.height
+        let cursor = OuterframeContentTextCursorSnapshot(fieldID: Self.createFieldInputID,
+                                                         rect: CGRect(x: rootPosition.x,
+                                                                      y: topLeftY,
+                                                                      width: cursorFrame.width,
+                                                                      height: cursorFrame.height),
+                                                         visible: true)
+        outerframeHost.sendTextCursorUpdate(cursors: [cursor])
+    }
+
+    private func sendPasswordFieldCursorUpdate() {
+        let bulletString = String(repeating: "\u{2022}", count: passwordInputController.text.count)
+        guard pendingPasswordAction != nil,
+              passwordInputController.isFocused,
+              !passwordInputController.hasSelection,
+              passwordFieldFrame != .zero,
+              passwordTextFrame != .zero else {
+            if !createInputController.isFocused {
+                outerframeHost.sendTextCursorUpdate(cursors: [])
+            }
+            return
+        }
+
+        let cursorWidth: CGFloat = 1
+        let maxWidth = max(passwordTextFrame.width, 0)
+        let offset: CGFloat
+        if !bulletString.isEmpty && maxWidth > 0 {
+            let line = makePasswordFieldLine(for: bulletString)
+            offset = offsetForCreateFieldCharacter(line: line,
+                                                   text: bulletString,
+                                                   index: passwordInputController.cursorPosition,
+                                                   maxWidth: maxWidth)
+        } else {
+            offset = 0
+        }
+
+        let proposedX = min(max(passwordTextFrame.minX + offset, passwordTextFrame.minX), passwordTextFrame.maxX)
+        let maxCursorX = passwordFieldFrame.maxX - 2 - cursorWidth
+        let cursorFrame = CGRect(x: max(passwordTextFrame.minX, min(proposedX, maxCursorX)),
+                                 y: passwordTextFrame.minY - 1,
+                                 width: cursorWidth,
+                                 height: passwordTextFrame.height + 2)
+        let topLeftY = rootLayer.bounds.height - cursorFrame.minY - cursorFrame.height
+        let cursor = OuterframeContentTextCursorSnapshot(fieldID: Self.passwordFieldInputID,
+                                                         rect: CGRect(x: cursorFrame.minX,
+                                                                      y: topLeftY,
+                                                                      width: cursorFrame.width,
+                                                                      height: cursorFrame.height),
+                                                         visible: true)
+        outerframeHost.sendTextCursorUpdate(cursors: [cursor])
+    }
+
+    private func sendFocusedTextCursorUpdate() {
+        if passwordInputController.isFocused {
+            sendPasswordFieldCursorUpdate()
+        } else {
+            sendCreateFieldCursorUpdate()
+        }
+    }
+
+    private func pasteboardItemsForCopy() -> [OuterframeContentPasteboardItem] {
+        guard createInputController.isFocused,
+              let selectedText = createInputController.selectedTextContent(),
+              !selectedText.isEmpty else {
+            return []
+        }
+        return [
+            OuterframeContentPasteboardItem(representations: [
+                OuterframeContentPasteboardRepresentation(typeIdentifier: NSPasteboard.PasteboardType.string.rawValue,
+                                                          data: Data(selectedText.utf8))
+            ])
+        ]
+    }
+
+    private func pasteboardItemsForCut() -> [OuterframeContentPasteboardItem] {
+        guard createInputController.isFocused,
+              let selectedText = createInputController.cutSelectedTextContent(),
+              !selectedText.isEmpty else {
+            return []
+        }
+        return [
+            OuterframeContentPasteboardItem(representations: [
+                OuterframeContentPasteboardRepresentation(typeIdentifier: NSPasteboard.PasteboardType.string.rawValue,
+                                                          data: Data(selectedText.utf8))
+            ])
+        ]
+    }
+
+    private func handlePasteboardItemsForPaste(_ items: [OuterframeContentPasteboardItem]) {
+        if pendingPasswordAction != nil, passwordInputController.isFocused {
+            _ = insertPasteboardItemsIntoPasswordField(items)
+            return
+        }
+        guard mode == .create, createInputController.isFocused else { return }
+        _ = insertPasteboardItemsIntoCreateField(items)
+    }
+
+    @discardableResult
+    private func insertPasteboardItemsIntoCreateField(_ items: [OuterframeContentPasteboardItem]) -> Bool {
+        for item in items {
+            if let representation = item.representations.first(where: { $0.typeIdentifier == NSPasteboard.PasteboardType.string.rawValue }),
+               let stringValue = String(data: representation.data, encoding: .utf8) {
+                createInputController.insertText(cleanSingleLineText(stringValue))
+                return true
+            }
+            if let representation = item.representations.first(where: { $0.typeIdentifier == NSPasteboard.PasteboardType.rtf.rawValue }),
+               let attributed = try? NSAttributedString(data: representation.data,
+                                                        options: [.documentType: NSAttributedString.DocumentType.rtf],
+                                                        documentAttributes: nil) {
+                createInputController.insertText(cleanSingleLineText(attributed.string))
+                return true
+            }
+        }
+        return false
+    }
+
+    @discardableResult
+    private func insertPasteboardItemsIntoPasswordField(_ items: [OuterframeContentPasteboardItem]) -> Bool {
+        for item in items {
+            if let representation = item.representations.first(where: { $0.typeIdentifier == NSPasteboard.PasteboardType.string.rawValue }),
+               let stringValue = String(data: representation.data, encoding: .utf8) {
+                passwordInputController.insertText(cleanSingleLineText(stringValue))
+                return true
+            }
+            if let representation = item.representations.first(where: { $0.typeIdentifier == NSPasteboard.PasteboardType.rtf.rawValue }),
+               let attributed = try? NSAttributedString(data: representation.data,
+                                                        options: [.documentType: NSAttributedString.DocumentType.rtf],
+                                                        documentAttributes: nil) {
+                passwordInputController.insertText(cleanSingleLineText(attributed.string))
+                return true
+            }
+        }
+        return false
+    }
+
+    private func createFieldDropPoint(_ point: CGPoint) -> (key: String, point: CGPoint)? {
+        guard mode == .create else { return nil }
+        let contentPoint = contentLayer.convert(point, from: rootLayer)
+        let createPoint = createLayer.convert(contentPoint, from: contentLayer)
+        guard let key = createFieldFrames.first(where: { $0.frame.contains(createPoint) })?.key else { return nil }
+        return (key, createPoint)
+    }
+
+    private func createFieldAcceptsTextDrop(at point: CGPoint,
+                                            pasteboardTypes: [String],
+                                            operationMask: UInt32) -> Bool {
+        let operations = NSDragOperation(rawValue: UInt(operationMask))
+        let types = Set(pasteboardTypes)
+        return operations.contains(.copy) &&
+               Self.createFieldPasteboardTypes.contains { types.contains($0) } &&
+               createFieldDropPoint(point) != nil
+    }
+
+    private func passwordFieldAcceptsTextDrop(at point: CGPoint,
+                                              pasteboardTypes: [String],
+                                              operationMask: UInt32) -> Bool {
+        let operations = NSDragOperation(rawValue: UInt(operationMask))
+        let types = Set(pasteboardTypes)
+        return operations.contains(.copy) &&
+               pendingPasswordAction != nil &&
+               passwordFieldFrame.contains(point) &&
+               Self.passwordFieldPasteboardTypes.contains { types.contains($0) }
+    }
+
+    private func handlePasteboardItemsForDrop(at point: CGPoint, items: [OuterframeContentPasteboardItem]) {
+        if passwordFieldFrame.contains(point), pendingPasswordAction != nil {
+            let index = characterIndexForPasswordField(xPosition: point.x)
+            focusPasswordField(cursorPosition: index)
+            _ = insertPasteboardItemsIntoPasswordField(items)
+            return
+        }
+
+        guard let drop = createFieldDropPoint(point) else { return }
+        let index = characterIndexForCreateField(key: drop.key, xPosition: drop.point.x)
+        focusCreateField(drop.key, cursorPosition: index)
+        _ = insertPasteboardItemsIntoCreateField(items)
+    }
+
+    private func beginDraggingSelectedCreateText(_ text: String) {
+        guard !text.isEmpty else { return }
+        let item = OuterframeContentPasteboardItem(representations: [
+            OuterframeContentPasteboardRepresentation(typeIdentifier: NSPasteboard.PasteboardType.string.rawValue,
+                                                      data: Data(text.utf8))
+        ])
+        outerframeHost.beginDraggingPasteboardItem(item,
+                                                   operationMask: .copy,
+                                                   previewPNGData: nil,
+                                                   previewSize: nil)
+    }
+
+    private func handleMouseDragged(to point: CGPoint, modifierFlags: NSEvent.ModifierFlags) {
+        _ = modifierFlags
+        guard let pendingCreateTextDrag else { return }
+        let dx = point.x - pendingCreateTextDrag.startPoint.x
+        let dy = point.y - pendingCreateTextDrag.startPoint.y
+        guard hypot(dx, dy) >= 3 else { return }
+        self.pendingCreateTextDrag = nil
+        beginDraggingSelectedCreateText(pendingCreateTextDrag.selectedText)
+    }
+
+    private func handleMouseUp(at point: CGPoint, modifierFlags: NSEvent.ModifierFlags) {
+        _ = point
+        _ = modifierFlags
+        guard let pendingCreateTextDrag else { return }
+        self.pendingCreateTextDrag = nil
+        focusActiveCreateField()
+        createInputController.setCursorPosition(pendingCreateTextDrag.cursorIndex, modifySelection: false)
+    }
+
+    private func handleMouseMoved(to point: CGPoint, modifierFlags: NSEvent.ModifierFlags) {
+        _ = modifierFlags
+        let isOverCreateField = pendingPasswordAction == nil && createFieldDropPoint(point) != nil
+        let isOverPasswordField = pendingPasswordAction != nil && passwordFieldFrame.contains(point)
+        setCursorIfNeeded((isOverCreateField || isOverPasswordField) ? .iBeam : .arrow)
+    }
+
+    private func setCursorIfNeeded(_ cursor: PluginCursorType) {
+        guard currentCursor != cursor else { return }
+        currentCursor = cursor
+        outerframeHost.setCursor(cursor)
+    }
+
+    private func handleRightMouseDown(at point: CGPoint,
+                                      modifierFlags: NSEvent.ModifierFlags,
+                                      clickCount: Int) {
+        _ = modifierFlags
+        _ = clickCount
+        if pendingPasswordAction != nil {
+            guard passwordFieldFrame.contains(point) else { return }
+            let index = characterIndexForPasswordField(xPosition: point.x)
+            focusPasswordField(cursorPosition: index)
+            updateEditingAndPasteboardState()
+            outerframeHost.showContextMenu(for: NSAttributedString(string: ""), at: point)
+            return
+        }
+
+        guard pendingPasswordAction == nil, mode == .create else { return }
+        let contentPoint = contentLayer.convert(point, from: rootLayer)
+        let createPoint = createLayer.convert(contentPoint, from: contentLayer)
+        guard let key = createFieldFrames.first(where: { $0.frame.contains(createPoint) })?.key else { return }
+        let index = characterIndexForCreateField(key: key, xPosition: createPoint.x)
+        focusCreateField(key)
+        if !createInputController.hasSelection {
+            createInputController.setCursorPosition(index, modifySelection: false)
+        }
+        updateEditingAndPasteboardState()
+        let selectedText = createInputController.selectedTextContent() ?? ""
+        let attributedText = NSAttributedString(string: selectedText,
+                                                attributes: [.font: createInputFont(monospaced: createFieldLayouts[key]?.monospaced ?? false)])
+        outerframeHost.showContextMenu(for: attributedText, at: point)
     }
 
     private func handleScroll(at point: CGPoint, delta: CGPoint, precise: Bool) {
@@ -2265,10 +2955,27 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate {
         updateLayout()
     }
 
-    private func handleMouseDown(at point: CGPoint, modifierFlags: NSEvent.ModifierFlags = []) {
+    private func handleMouseDown(at point: CGPoint,
+                                 modifierFlags: NSEvent.ModifierFlags = [],
+                                 clickCount: Int = 1) {
+        pendingCreateTextDrag = nil
         if pendingPasswordAction != nil {
             if passwordSubmitFrame.contains(point) {
                 submitPasswordPrompt()
+            } else if passwordFieldFrame.contains(point) {
+                let wasFocused = passwordInputController.isFocused
+                let index = characterIndexForPasswordField(xPosition: point.x)
+                focusPasswordField(selectAll: clickCount >= 3)
+                switch clickCount {
+                case 3...:
+                    passwordInputController.selectAll()
+                case 2:
+                    passwordInputController.selectWord(at: index)
+                default:
+                    passwordInputController.setCursorPosition(index,
+                                                              modifySelection: modifierFlags.contains(.shift) && wasFocused)
+                }
+                updateLayout()
             } else if passwordCancelFrame.contains(point) || !passwordPanelFrame.contains(point) {
                 dismissPasswordPrompt()
             }
@@ -2333,6 +3040,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate {
         } else if mode == .create {
             let createPoint = createLayer.convert(contentPoint, from: contentLayer)
             if let recipeFrame = recipeFrames.first(where: { $0.frame.contains(createPoint) }) {
+                blurCreateField()
                 selectedRecipeID = recipeFrame.recipeID
                 applyRecipeDefaults(overwrite: true)
                 createMessage = ""
@@ -2350,24 +3058,64 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate {
             }
             if let choice = createChoiceFrames.first(where: { $0.frame.contains(createPoint) }) {
                 createValues[choice.key] = choice.value
+                if createInputController.isFocused, activeCreateFieldKey == choice.key {
+                    focusCreateField(choice.key)
+                }
                 createMessage = ""
                 updateLayout()
                 return
             }
             if let suggestion = createSuggestionFrames.first(where: { $0.frame.contains(createPoint) }) {
                 createValues[suggestion.key] = suggestion.value
+                if createInputController.isFocused, activeCreateFieldKey == suggestion.key {
+                    focusCreateField(suggestion.key)
+                }
                 createMessage = ""
                 updateLayout()
                 return
             }
             if let field = createFieldFrames.first(where: { $0.frame.contains(createPoint) })?.key {
-                activeCreateFieldKey = field
+                let wasFocused = createInputController.isFocused && activeCreateFieldKey == field
+                let index = characterIndexForCreateField(key: field, xPosition: createPoint.x)
+                if wasFocused,
+                   clickCount == 1,
+                   !modifierFlags.contains(.shift),
+                   let selection = createInputController.selectionRange,
+                   selection.contains(index),
+                   let selectedText = createInputController.selectedTextContent(),
+                   !selectedText.isEmpty {
+                    pendingCreateTextDrag = PendingCreateTextDrag(startPoint: point,
+                                                                  cursorIndex: index,
+                                                                  selectedText: selectedText)
+                    return
+                }
+                focusCreateField(field, selectAll: clickCount >= 3)
+                switch clickCount {
+                case 3...:
+                    createInputController.selectAll()
+                case 2:
+                    createInputController.selectWord(at: index)
+                default:
+                    createInputController.setCursorPosition(index,
+                                                            modifySelection: modifierFlags.contains(.shift) && wasFocused)
+                }
+                updateLayout()
+                return
+            } else if createInputController.isFocused {
+                blurCreateField()
                 updateLayout()
             }
         }
     }
 
-    private func handleKeyDown(keyCode: UInt16, characters: String?) {
+    private func handleKeyDown(keyCode: UInt16,
+                               characters: String?,
+                               charactersIgnoringModifiers: String?,
+                               modifierFlags: NSEvent.ModifierFlags,
+                               isARepeat: Bool) {
+        _ = charactersIgnoringModifiers
+        _ = modifierFlags
+        _ = isARepeat
         if pendingPasswordAction != nil {
             handlePasswordKeyDown(keyCode: keyCode, characters: characters)
             return
@@ -2399,10 +3147,12 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate {
                                                       displayName: backend.displayName)
         sudoPasswordInput = ""
         sudoPasswordMessage = message.isEmpty ? "Administrator password required." : message
+        focusPasswordField()
         updateLayout()
     }
 
     private func dismissPasswordPrompt() {
+        blurPasswordField()
         pendingPasswordAction = nil
         sudoPasswordInput = ""
         sudoPasswordMessage = ""
@@ -2415,19 +3165,23 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate {
             dismissPasswordPrompt()
             return
         }
-        let password = sudoPasswordInput
+        let password = passwordInputController.isFocused ? passwordInputController.text : sudoPasswordInput
         performControlAction(for: backend, operation: pendingPasswordAction.operation, sudoPassword: password)
     }
 
     private func handlePasswordKeyDown(keyCode: UInt16, characters: String?) {
+        if passwordInputController.isFocused {
+            if keyCode == 53 {
+                dismissPasswordPrompt()
+            }
+            return
+        }
         switch keyCode {
         case 36, 76:
             submitPasswordPrompt()
         case 51, 117:
-            if !sudoPasswordInput.isEmpty {
-                sudoPasswordInput.removeLast()
-                updateLayout()
-            }
+            focusPasswordField()
+            passwordInputController.deleteBackward()
         case 53:
             dismissPasswordPrompt()
         default:
@@ -2437,10 +3191,22 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate {
         }
     }
 
-    private func insertPasswordText(_ text: String) {
-        guard pendingPasswordAction != nil else { return }
-        sudoPasswordInput.append(text)
-        updateLayout()
+    private func insertPasswordText(_ text: String,
+                                    hasReplacementRange: Bool = false,
+                                    replacementLocation: UInt64 = 0,
+                                    replacementLength: UInt64 = 0) {
+        guard pendingPasswordAction != nil, !text.isEmpty else { return }
+        if !passwordInputController.isFocused {
+            focusPasswordField()
+        }
+        if hasReplacementRange {
+            passwordInputController.setCursorPosition(Int(replacementLocation), modifySelection: false)
+            let end = Int(replacementLocation + replacementLength)
+            passwordInputController.setCursorPosition(end, modifySelection: true)
+        }
+        let cleaned = cleanSingleLineText(text)
+        guard !cleaned.isEmpty else { return }
+        passwordInputController.insertText(cleaned)
     }
 
     private func moveSelection(delta: Int) {
@@ -2504,6 +3270,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate {
         }
         if overwrite || activeCreateFieldKey == nil || !recipe.fields.contains(where: { $0.key == activeCreateFieldKey }) {
             activeCreateFieldKey = recipe.fields.first(where: { $0.fieldType != "choice" })?.key
+        }
+        if createInputController.isFocused, let activeCreateFieldKey {
+            focusCreateField(activeCreateFieldKey)
         }
     }
 
