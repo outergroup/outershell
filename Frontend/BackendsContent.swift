@@ -253,6 +253,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate {
     private var isLoadingLog = false
     private var isLoadingRecipes = false
     private var isPerformingAction = false
+    private var backendsRefreshGeneration = 0
     private var mode: BackendsViewMode = .backends
     private var recipes: [RecipeRecord] = []
     private var selectedRecipeID = "command-port"
@@ -410,7 +411,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate {
             recipesEndpoint = URL(string: "/api/recipes", relativeTo: base)?.absoluteURL
         }
         let configuration = URLSessionConfiguration.ephemeral
-        configuration.timeoutIntervalForRequest = 5
+        configuration.timeoutIntervalForRequest = 20
+        configuration.timeoutIntervalForResource = 30
         configuration.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
         outerframeHost.applyProxy(to: configuration)
         urlSession = URLSession(configuration: configuration)
@@ -1714,7 +1716,15 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate {
                 guard let self else { return }
                 self.isLoadingBackends = false
                 if let error {
-                    self.backendError = error.localizedDescription
+                    let nsError = error as NSError
+                    if nsError.domain == NSURLErrorDomain,
+                       nsError.code == NSURLErrorTimedOut,
+                       !self.backends.isEmpty {
+                        self.backendError = ""
+                        self.scheduleBackendsRefreshes()
+                    } else {
+                        self.backendError = error.localizedDescription
+                    }
                     self.updateLayout()
                     return
                 }
@@ -1864,6 +1874,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate {
             Task { @MainActor in
                 guard let self else { return }
                 self.isPerformingAction = false
+                var actionCompleted = false
                 if let error {
                     self.backendError = error.localizedDescription
                 } else if let data,
@@ -1873,13 +1884,61 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate {
                         self.backendError = ""
                     } else {
                         self.backendError = response.ok ? "" : response.message
+                        actionCompleted = response.ok
                     }
                 } else {
                     self.backendError = "Control request failed."
                 }
+                if actionCompleted {
+                    self.applyOptimisticStatus(for: backend.serviceID, operation: operation)
+                    self.scheduleBackendsRefreshes()
+                }
                 self.fetchBackends()
             }
         }.resume()
+    }
+
+    private func scheduleBackendsRefreshes() {
+        backendsRefreshGeneration += 1
+        let generation = backendsRefreshGeneration
+        for delay in [0.6, 1.8, 4.0, 8.0] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                Task { @MainActor in
+                    guard let self, self.backendsRefreshGeneration == generation else { return }
+                    self.fetchBackends()
+                }
+            }
+        }
+    }
+
+    private func applyOptimisticStatus(for serviceID: String, operation: String) {
+        let status: String
+        switch operation {
+        case "stop":
+            status = "stopped"
+        case "start", "restart", "run", "install", "runUser", "installUser", "runRoot", "installRoot":
+            status = "running"
+        default:
+            return
+        }
+        backends = backends.map { backend in
+            guard backend.serviceID == serviceID else { return backend }
+            return BackendRecord(serviceID: backend.serviceID,
+                                 displayName: backend.displayName,
+                                 serviceUnit: backend.serviceUnit,
+                                 serviceUnitPath: backend.serviceUnitPath,
+                                 serviceScope: backend.serviceScope,
+                                 status: status,
+                                 canControl: backend.canControl,
+                                 canUninstall: backend.canUninstall,
+                                 isBundled: backend.isBundled,
+                                 isInstalled: operation == "run" || operation == "install" || operation == "runUser" || operation == "installUser" || operation == "runRoot" || operation == "installRoot" ? true : backend.isInstalled,
+                                 launchdPlistPath: backend.launchdPlistPath,
+                                 ownsLaunchdPlist: backend.ownsLaunchdPlist,
+                                 frontends: backend.frontends,
+                                 logFiles: backend.logFiles)
+        }
+        updateLayout()
     }
 
     private func openFrontend(for row: BackendListRow, opensInNewTab: Bool) {
@@ -2375,7 +2434,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate {
     private func updateStatusText() {
         if isPerformingAction {
             statusLayer.string = mode == .create ? "Creating..." : backendError
-        } else if isLoadingBackends {
+        } else if isLoadingBackends && backends.isEmpty {
             statusLayer.string = "Loading..."
         } else if !backendError.isEmpty {
             statusLayer.string = backendError

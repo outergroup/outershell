@@ -19,8 +19,14 @@
 		};
 /* End PBXCopyFilesBuildPhase section */
 
+/* Begin PBXBuildFile section */
+		37B4F9D12FA1B00100873894 /* main.c in Sources */ = {isa = PBXBuildFile; fileRef = 37B4F9D02FA1B00100873894 /* main.c */; };
+/* End PBXBuildFile section */
+
 /* Begin PBXFileReference section */
 		0F0000000000000000000003 /* Backends.bundle */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = Backends.bundle; sourceTree = BUILT_PRODUCTS_DIR; };
+		37B4F9CF2FA1B00100873894 /* NavigatorBackend */ = {isa = PBXFileReference; explicitFileType = "compiled.mach-o.executable"; includeInIndex = 0; path = NavigatorBackend; sourceTree = BUILT_PRODUCTS_DIR; };
+		37B4F9D02FA1B00100873894 /* main.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = main.c; sourceTree = "<group>"; };
 		0F0000000000000000000007 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		0F0000000000000000000008 /* README.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = README.md; sourceTree = "<group>"; };
 		0F0000000000000000000009 /* build_site.sh */ = {isa = PBXFileReference; lastKnownFileType = text.script.sh; path = build_site.sh; sourceTree = "<group>"; };
@@ -62,6 +68,7 @@
 			isa = PBXGroup;
 			children = (
 				0F0000000000000000000004 /* Frontend */,
+				37B4F9CE2FA1B00100873894 /* Backend */,
 				0F0000000000000000000005 /* Vendor */,
 				0F0000000000000000000006 /* Scripts */,
 				0F0000000000000000000007 /* Info.plist */,
@@ -78,8 +85,17 @@
 			isa = PBXGroup;
 			children = (
 				0F0000000000000000000003 /* Backends.bundle */,
+				37B4F9CF2FA1B00100873894 /* NavigatorBackend */,
 			);
 			name = Products;
+			sourceTree = "<group>";
+		};
+		37B4F9CE2FA1B00100873894 /* Backend */ = {
+			isa = PBXGroup;
+			children = (
+				37B4F9D02FA1B00100873894 /* main.c */,
+			);
+			path = Backend;
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */
@@ -109,6 +125,24 @@
 			productReference = 0F0000000000000000000003 /* Backends.bundle */;
 			productType = "com.apple.product-type.bundle";
 		};
+		37B4F9D22FA1B00100873894 /* NavigatorBackend */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 37B4F9D52FA1B00100873894 /* Build configuration list for PBXNativeTarget "NavigatorBackend" */;
+			buildPhases = (
+				37B4F9D32FA1B00100873894 /* Sources */,
+				37B4F9D42FA1B00100873894 /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = NavigatorBackend;
+			packageProductDependencies = (
+			);
+			productName = NavigatorBackend;
+			productReference = 37B4F9CF2FA1B00100873894 /* NavigatorBackend */;
+			productType = "com.apple.product-type.tool";
+		};
 /* End PBXNativeTarget section */
 
 /* Begin PBXProject section */
@@ -122,6 +156,9 @@
 					0F000000000000000000000B = {
 						CreatedOnToolsVersion = 26.2;
 						LastSwiftMigration = 2620;
+					};
+					37B4F9D22FA1B00100873894 = {
+						CreatedOnToolsVersion = 26.2;
 					};
 				};
 			};
@@ -142,6 +179,7 @@
 			projectRoot = "";
 			targets = (
 				0F000000000000000000000B /* Backends */,
+				37B4F9D22FA1B00100873894 /* NavigatorBackend */,
 			);
 		};
 /* End PBXProject section */
@@ -164,7 +202,25 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		37B4F9D32FA1B00100873894 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				37B4F9D12FA1B00100873894 /* main.c in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXSourcesBuildPhase section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		37B4F9D42FA1B00100873894 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
 
 /* Begin XCBuildConfiguration section */
 		0F0000000000000000000013 /* Debug */ = {
@@ -360,6 +416,49 @@
 			};
 			name = Release;
 		};
+		37B4F9D62FA1B00100873894 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_IDENTITY = "-";
+				CODE_SIGN_STYLE = Manual;
+				CODE_SIGNING_ALLOWED = YES;
+				CURRENT_PROJECT_VERSION = 1;
+				DEAD_CODE_STRIPPING = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 14.6;
+				MARKETING_VERSION = 1.0;
+				OTHER_LDFLAGS = (
+					"$(inherited)",
+					"-lsqlite3",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = dev.outergroup.NavigatorBackend;
+				PRODUCT_NAME = NavigatorBackend;
+				SKIP_INSTALL = YES;
+			};
+			name = Debug;
+		};
+		37B4F9D72FA1B00100873894 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_IDENTITY = "-";
+				CODE_SIGN_STYLE = Manual;
+				CODE_SIGNING_ALLOWED = YES;
+				COPY_PHASE_STRIP = YES;
+				CURRENT_PROJECT_VERSION = 1;
+				DEAD_CODE_STRIPPING = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 14.6;
+				MARKETING_VERSION = 1.0;
+				OTHER_LDFLAGS = (
+					"$(inherited)",
+					"-lsqlite3",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = dev.outergroup.NavigatorBackend;
+				PRODUCT_NAME = NavigatorBackend;
+				SKIP_INSTALL = YES;
+			};
+			name = Release;
+		};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
@@ -377,6 +476,15 @@
 			buildConfigurations = (
 				0F0000000000000000000017 /* Debug */,
 				0F0000000000000000000018 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		37B4F9D52FA1B00100873894 /* Build configuration list for PBXNativeTarget "NavigatorBackend" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				37B4F9D62FA1B00100873894 /* Debug */,
+				37B4F9D72FA1B00100873894 /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;

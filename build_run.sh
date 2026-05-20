@@ -6,6 +6,13 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_ROOT="${BUILD_ROOT:-${SCRIPT_DIR}/build/macos}"
 RUN_ROOT="${RUN_ROOT:-${SCRIPT_DIR}/build/run}"
 CONFIGURATION="${CONFIGURATION:-Release}"
+TOP_PROJECT_DIR="${TOP_PROJECT_DIR:-${SCRIPT_DIR}/../Top}"
+if [[ ! -d "${TOP_PROJECT_DIR}/Top.xcodeproj" && -d "${SCRIPT_DIR}/../outerloop/Top/Top.xcodeproj" ]]; then
+    TOP_PROJECT_DIR="${SCRIPT_DIR}/../outerloop/Top"
+fi
+TOP_BUILD_ROOT="${TOP_BUILD_ROOT:-${RUN_ROOT}/top-build/macos}"
+TOP_OBJ_ROOT="${TOP_OBJ_ROOT:-${RUN_ROOT}/top-build/intermediates}"
+TOP_PAYLOAD_ROOT="${RUN_ROOT}/bundled-apps/Top"
 
 require_tool() {
     if ! command -v "$1" >/dev/null 2>&1; then
@@ -15,12 +22,17 @@ require_tool() {
 }
 
 require_tool /usr/bin/xcodebuild
-require_tool cc
+require_tool install
 require_tool aa
 require_tool lipo
 
+if [[ ! -d "${TOP_PROJECT_DIR}/Top.xcodeproj" ]]; then
+    echo "error: Top.xcodeproj was not found. Set TOP_PROJECT_DIR to the Top checkout." >&2
+    exit 1
+fi
+
 rm -rf "${RUN_ROOT}"
-mkdir -p "${BUILD_ROOT}" "${RUN_ROOT}/bundles"
+mkdir -p "${BUILD_ROOT}" "${RUN_ROOT}/bundles" "${TOP_PAYLOAD_ROOT}/MacOS" "${TOP_PAYLOAD_ROOT}/bundles"
 
 echo "==> Building Backends.bundle"
 /usr/bin/xcodebuild \
@@ -34,22 +46,51 @@ echo "==> Building Backends.bundle"
     CODE_SIGNING_REQUIRED=NO \
     build
 
+echo "==> Building NavigatorBackend"
+/usr/bin/xcodebuild \
+    -project "${SCRIPT_DIR}/Backends.xcodeproj" \
+    -scheme NavigatorBackend \
+    -configuration "${CONFIGURATION}" \
+    SYMROOT="${BUILD_ROOT}" \
+    ONLY_ACTIVE_ARCH=YES \
+    build
+
+echo "==> Building bundled TopBackend"
+/usr/bin/xcodebuild \
+    -project "${TOP_PROJECT_DIR}/Top.xcodeproj" \
+    -scheme TopBackend \
+    -configuration "${CONFIGURATION}" \
+    SYMROOT="${TOP_BUILD_ROOT}" \
+    OBJROOT="${TOP_OBJ_ROOT}" \
+    ONLY_ACTIVE_ARCH=YES \
+    build
+
 echo "==> Archiving BackendsContent bundles"
 "${SCRIPT_DIR}/Scripts/archive_backends_bundle.sh" \
     "${BUILD_ROOT}/${CONFIGURATION}/Backends.bundle" \
     "${RUN_ROOT}/bundles" \
     BackendsContent.bundle
 
-echo "==> Building NavigatorBackend"
-cc -std=gnu17 -Wall -Wextra -O2 \
-    -o "${BUILD_ROOT}/${CONFIGURATION}/NavigatorBackend" \
-    "${SCRIPT_DIR}/Backend/main.c" \
-    -lsqlite3
+echo "==> Staging bundled Top"
+install -m 0755 \
+    "${TOP_BUILD_ROOT}/${CONFIGURATION}/TopBackend" \
+    "${TOP_PAYLOAD_ROOT}/MacOS/TopBackend"
+install -m 0644 \
+    "${SCRIPT_DIR}/bundled-apps/Top/app-icon.png" \
+    "${TOP_PAYLOAD_ROOT}/app-icon.png"
+install -m 0644 \
+    "${SCRIPT_DIR}/bundled-apps/Top/bundles/TopContent.bundle.macos-arm.aar" \
+    "${TOP_PAYLOAD_ROOT}/bundles/TopContent.bundle.macos-arm.aar"
+install -m 0644 \
+    "${SCRIPT_DIR}/bundled-apps/Top/bundles/TopContent.bundle.macos-x86.aar" \
+    "${TOP_PAYLOAD_ROOT}/bundles/TopContent.bundle.macos-x86.aar"
+
 ln -sf NavigatorBackend "${BUILD_ROOT}/${CONFIGURATION}/BackendsBackend"
 
 echo "Built:"
 echo "  ${BUILD_ROOT}/${CONFIGURATION}/NavigatorBackend"
 echo "  ${RUN_ROOT}/bundles"
+echo "  ${TOP_PAYLOAD_ROOT}"
 echo
 echo "Run:"
-echo "  \"${BUILD_ROOT}/${CONFIGURATION}/NavigatorBackend\" --port 7354 --bundles-dir \"${RUN_ROOT}/bundles\""
+echo "  \"${BUILD_ROOT}/${CONFIGURATION}/NavigatorBackend\" --port 7354 --bundles-dir \"${RUN_ROOT}/bundles\" --bundled-apps-dir \"${RUN_ROOT}/bundled-apps\""
