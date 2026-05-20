@@ -46,7 +46,7 @@ private struct BackendRecord: Decodable {
     }
 
     var isBackendsSelf: Bool {
-        serviceID == "dev.outergroup.Navigator" || serviceID == "dev.outergroup.Backends"
+        serviceID == "dev.outergroup.HomeScreen" || serviceID == "dev.outergroup.Navigator" || serviceID == "dev.outergroup.Backends"
     }
 
     var pathText: String {
@@ -71,6 +71,7 @@ private struct FrontendRecord: Decodable {
     let socketPath: String
     let iconPath: String?
     let iconData: String?
+    let list: String?
 
     var hasEndpoint: Bool {
         !socketPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || port > 0 || !url.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -83,6 +84,10 @@ private struct FrontendRecord: Decodable {
             return nil
         }
         return NSImage(data: data)
+    }
+
+    var listName: String {
+        list?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     }
 
     private func base64IconPayload(_ value: String) -> String {
@@ -253,6 +258,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate {
     private var isLoadingLog = false
     private var isLoadingRecipes = false
     private var isPerformingAction = false
+    private var lastBackendsResponseData: Data?
     private var backendsRefreshGeneration = 0
     private var mode: BackendsViewMode = .backends
     private var recipes: [RecipeRecord] = []
@@ -273,7 +279,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate {
     private let toolbarLayer = CALayer()
     private let titleLayer = CATextLayer()
     private let statusLayer = CATextLayer()
-    private let refreshLayer = CenteredButtonLayer(title: "Refresh")
     private let appsToggleLayer = CenteredButtonLayer(title: "Apps")
     private let backendsToggleLayer = CenteredButtonLayer(title: "Backends")
     private let contentLayer = CALayer()
@@ -290,7 +295,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate {
     private let passwordOverlayLayer = CALayer()
 
     private var newButtonFrame = CGRect.zero
-    private var refreshFrame = CGRect.zero
     private var appsToggleFrame = CGRect.zero
     private var backendsToggleFrame = CGRect.zero
     private var appCardFrames: [(frame: CGRect, item: AppLauncherItem)] = []
@@ -845,8 +849,11 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate {
         stopPolling()
         pollTimer = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { [weak self] _ in
             Task { @MainActor in
-                guard let self, self.selectedLog != nil else { return }
-                self.fetchSelectedLog(quiet: true)
+                guard let self else { return }
+                self.fetchBackends(quiet: true)
+                if self.selectedLog != nil {
+                    self.fetchSelectedLog(quiet: true)
+                }
             }
         }
     }
@@ -865,7 +872,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate {
         rootLayer.addSublayer(passwordOverlayLayer)
         toolbarLayer.addSublayer(titleLayer)
         toolbarLayer.addSublayer(statusLayer)
-        toolbarLayer.addSublayer(refreshLayer)
         toolbarLayer.addSublayer(appsToggleLayer)
         toolbarLayer.addSublayer(backendsToggleLayer)
         contentLayer.addSublayer(appsLayer)
@@ -923,8 +929,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate {
                 iconTransitionLayer.frame = rootLayer.bounds
 
                 titleLayer.frame = .zero
-                refreshFrame = CGRect(x: max(width - 96, 8), y: 10, width: 78, height: 28)
-                refreshLayer.frame = refreshFrame
                 let toggleWidth: CGFloat = 184
                 let toggleHeight: CGFloat = 30
                 let toggleX = floor((width - toggleWidth) / 2)
@@ -1006,9 +1010,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate {
 
                 titleLayer.foregroundColor = resolvedCGColor(.labelColor)
                 statusLayer.foregroundColor = resolvedCGColor(.secondaryLabelColor)
-                refreshLayer.applyStyle(textCGColor: resolvedCGColor(.controlAccentColor),
-                                        backgroundCGColor: resolvedCGColor(NSColor.controlAccentColor.withAlphaComponent(0.12)),
-                                        font: NSFont.systemFont(ofSize: 12, weight: .medium))
                 appsToggleLayer.applyStyle(textCGColor: resolvedCGColor(mode == .apps ? .white : .controlAccentColor),
                                            backgroundCGColor: resolvedCGColor(mode == .apps ? .controlAccentColor : NSColor.controlAccentColor.withAlphaComponent(0.12)),
                                            font: NSFont.systemFont(ofSize: 12, weight: .medium))
@@ -1143,6 +1144,11 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate {
         var visibleTextKeys = Set<String>()
 
         let items = appLauncherItems()
+        let iconItems = items.filter { $0.frontend.listName.isEmpty }
+        let listGroups = Dictionary(grouping: items.filter { !$0.frontend.listName.isEmpty },
+                                    by: { $0.frontend.listName })
+            .map { (name: $0.key, items: $0.value.sorted { $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending }) }
+            .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
         let contentWidth = max(appsLayer.bounds.width - horizontalInset * 2, 1)
         let left = horizontalInset
         let top = max(appsLayer.bounds.height - 28, 0) + appsScroll
@@ -1156,19 +1162,67 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate {
             return
         }
 
-        let itemWidth = max(min(floor(contentWidth / 3) - 18, 174), 136)
-        let itemHeight: CGFloat = 148
-        let iconSize: CGFloat = 58
-        let horizontalGap: CGFloat = 18
-        let verticalGap: CGFloat = 20
-        let columns = max(Int((contentWidth + horizontalGap) / (itemWidth + horizontalGap)), 1)
+        let splitGap: CGFloat = 34
+        let usesSplitLayout = contentWidth >= 760 && !iconItems.isEmpty && !listGroups.isEmpty
+        let appArea: CGRect
+        let listArea: CGRect
+        if usesSplitLayout {
+            let columnWidth = floor((contentWidth - splitGap) / 2)
+            appArea = CGRect(x: left, y: 0, width: columnWidth, height: 0)
+            listArea = CGRect(x: left + columnWidth + splitGap, y: 0, width: columnWidth, height: 0)
+            let appBottom = renderAppIconGrid(items: iconItems,
+                                              area: appArea,
+                                              top: top,
+                                              visibleIconKeys: &visibleIconKeys,
+                                              visibleTextKeys: &visibleTextKeys)
+            let listBottom = renderAppListGroups(groups: listGroups,
+                                                 area: listArea,
+                                                 top: top,
+                                                 visibleIconKeys: &visibleIconKeys,
+                                                 visibleTextKeys: &visibleTextKeys)
+            appsContentBottom = min(appBottom, listBottom)
+        } else {
+            let fullArea = CGRect(x: left, y: 0, width: contentWidth, height: 0)
+            let appBottom = renderAppIconGrid(items: iconItems,
+                                              area: fullArea,
+                                              top: top,
+                                              visibleIconKeys: &visibleIconKeys,
+                                              visibleTextKeys: &visibleTextKeys)
+            let listTop = iconItems.isEmpty ? top : appBottom - 28
+            let listBottom = renderAppListGroups(groups: listGroups,
+                                                 area: fullArea,
+                                                 top: listTop,
+                                                 visibleIconKeys: &visibleIconKeys,
+                                                 visibleTextKeys: &visibleTextKeys)
+            appsContentBottom = min(appBottom, listBottom)
+        }
+        hideUnrenderedMatchedLayers(visibleIconKeys: visibleIconKeys, visibleTextKeys: visibleTextKeys)
+        if clampAppsScrollUsingRenderedContent() {
+            renderAppsPage()
+        }
+    }
+
+    private func renderAppIconGrid(items: [AppLauncherItem],
+                                   area: CGRect,
+                                   top: CGFloat,
+                                   visibleIconKeys: inout Set<String>,
+                                   visibleTextKeys: inout Set<String>) -> CGFloat {
+        guard !items.isEmpty else { return top }
+
+        let itemWidth = max(min(floor(area.width / 4) - 10, 112), 86)
+        let itemHeight: CGFloat = 104
+        let iconSize: CGFloat = 46
+        let horizontalGap: CGFloat = 10
+        let verticalGap: CGFloat = 10
+        let columns = max(Int((area.width + horizontalGap) / (itemWidth + horizontalGap)), 1)
         let usedWidth = CGFloat(columns) * itemWidth + CGFloat(max(columns - 1, 0)) * horizontalGap
-        var x = left + max(floor((contentWidth - usedWidth) / 2), 0)
+        let startX = area.minX + max(floor((area.width - usedWidth) / 2), 0)
+        var x = startX
         var y = top - itemHeight
 
         for (index, item) in items.enumerated() {
             if index > 0 && index.isMultiple(of: columns) {
-                x = left + max(floor((contentWidth - usedWidth) / 2), 0)
+                x = startX
                 y -= itemHeight + verticalGap
             }
 
@@ -1177,7 +1231,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate {
 
             recordMatchedIcon(key: item.iconKey,
                               frame: rootLayer.convert(CGRect(x: frame.minX + floor((itemWidth - iconSize) / 2),
-                                                              y: frame.maxY - iconSize - 16,
+                                                              y: frame.maxY - iconSize - 12,
                                                               width: iconSize,
                                                               height: iconSize),
                                                        from: appsLayer),
@@ -1186,7 +1240,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate {
             visibleIconKeys.insert(item.iconKey)
 
             recordMatchedText(key: item.iconKey,
-                              frame: rootLayer.convert(CGRect(x: frame.minX, y: frame.minY + 16, width: itemWidth, height: 48),
+                              frame: rootLayer.convert(CGRect(x: frame.minX, y: frame.minY + 10, width: itemWidth, height: 28),
                                                        from: appsLayer),
                               title: item.displayName,
                               fontSize: 12,
@@ -1198,10 +1252,98 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate {
             x += itemWidth + horizontalGap
         }
 
-        appsContentBottom = y
-        hideUnrenderedMatchedLayers(visibleIconKeys: visibleIconKeys, visibleTextKeys: visibleTextKeys)
-        if clampAppsScrollUsingRenderedContent() {
-            renderAppsPage()
+        return y
+    }
+
+    private func renderAppListGroups(groups: [(name: String, items: [AppLauncherItem])],
+                                     area: CGRect,
+                                     top: CGFloat,
+                                     visibleIconKeys: inout Set<String>,
+                                     visibleTextKeys: inout Set<String>) -> CGFloat {
+        guard !groups.isEmpty else { return top }
+
+        let rowHeight: CGFloat = 52
+        let labelHeight: CGFloat = 20
+        let widgetTopPadding: CGFloat = 10
+        let widgetBottomPadding: CGFloat = 10
+        var y = top
+
+        for group in groups {
+            let rowCount = max(group.items.count, 1)
+            let widgetHeight = widgetTopPadding + CGFloat(rowCount) * rowHeight + widgetBottomPadding
+            y -= widgetHeight
+            let widgetFrame = CGRect(x: area.minX, y: y, width: area.width, height: widgetHeight)
+            renderAppListWidget(name: group.name,
+                                items: group.items,
+                                frame: widgetFrame,
+                                rowHeight: rowHeight,
+                                visibleIconKeys: &visibleIconKeys,
+                                visibleTextKeys: &visibleTextKeys)
+
+            let label = makeTextLayer(size: 12, weight: .medium, color: .secondaryLabelColor, alignment: .center)
+            label.string = group.name
+            label.frame = CGRect(x: widgetFrame.minX, y: widgetFrame.minY - labelHeight, width: widgetFrame.width, height: 16)
+            appsLayer.addSublayer(label)
+            y -= labelHeight + 22
+        }
+
+        return y
+    }
+
+    private func renderAppListWidget(name: String,
+                                     items: [AppLauncherItem],
+                                     frame: CGRect,
+                                     rowHeight: CGFloat,
+                                     visibleIconKeys: inout Set<String>,
+                                     visibleTextKeys: inout Set<String>) {
+        let background = CALayer()
+        background.frame = frame
+        background.cornerRadius = 14
+        background.backgroundColor = resolvedCGColor(NSColor.controlBackgroundColor.withAlphaComponent(0.86))
+        background.borderWidth = 0.5
+        background.borderColor = resolvedCGColor(NSColor.separatorColor.withAlphaComponent(0.55))
+        appsLayer.addSublayer(background)
+
+        let iconSize: CGFloat = 30
+        let rowInset: CGFloat = 12
+        var y = frame.maxY - 10 - rowHeight
+        for (index, item) in items.enumerated() {
+            let rowFrame = CGRect(x: frame.minX + 8, y: y, width: frame.width - 16, height: rowHeight)
+            appCardFrames.append((rowFrame, item))
+
+            if index > 0 {
+                let separator = CALayer()
+                separator.backgroundColor = resolvedCGColor(.separatorColor)
+                separator.frame = CGRect(x: rowFrame.minX + rowInset + iconSize + 10,
+                                         y: rowFrame.maxY - 0.5,
+                                         width: max(rowFrame.width - rowInset - iconSize - 22, 1),
+                                         height: 0.5)
+                appsLayer.addSublayer(separator)
+            }
+
+            let iconFrame = CGRect(x: rowFrame.minX + rowInset,
+                                   y: rowFrame.midY - iconSize / 2,
+                                   width: iconSize,
+                                   height: iconSize)
+            recordMatchedIcon(key: item.iconKey,
+                              frame: rootLayer.convert(iconFrame, from: appsLayer),
+                              image: item.iconImage,
+                              title: item.displayName)
+            visibleIconKeys.insert(item.iconKey)
+
+            let textFrame = CGRect(x: iconFrame.maxX + 12,
+                                   y: rowFrame.midY - 10,
+                                   width: max(rowFrame.maxX - iconFrame.maxX - 28, 1),
+                                   height: 20)
+            recordMatchedText(key: item.iconKey,
+                              frame: rootLayer.convert(textFrame, from: appsLayer),
+                              title: item.displayName,
+                              fontSize: 13,
+                              weight: .medium,
+                              alignment: .left,
+                              isWrapped: false)
+            visibleTextKeys.insert(item.iconKey)
+            y -= rowHeight
         }
     }
 
@@ -1616,7 +1758,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate {
                 addCreateField(field,
                                value: createValue(for: field),
                                frame: CGRect(x: left, y: y, width: formWidth, height: field.suggestions.isEmpty ? 46 : 68),
-                               monospaced: field.key == "command" || field.key == "executablePath" || field.key == "python")
+                               monospaced: field.key == "command" || field.key == "executablePath" || field.key == "python" || field.key == "scriptPath")
                 y -= field.suggestions.isEmpty ? 62 : 84
             }
         }
@@ -1705,12 +1847,14 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate {
         }
     }
 
-    private func fetchBackends() {
+    private func fetchBackends(quiet: Bool = false) {
         guard !isLoadingBackends, let backendsEndpoint, let urlSession else { return }
         isLoadingBackends = true
-        backendError = ""
-        updateStatusText()
-        renderBackendsRows()
+        if !quiet {
+            backendError = ""
+            updateStatusText()
+            renderBackendsRows()
+        }
         urlSession.dataTask(with: backendsEndpoint) { [weak self] data, response, error in
             Task { @MainActor in
                 guard let self else { return }
@@ -1723,23 +1867,35 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate {
                         self.backendError = ""
                         self.scheduleBackendsRefreshes()
                     } else {
-                        self.backendError = error.localizedDescription
+                        if !quiet || self.backends.isEmpty {
+                            self.backendError = error.localizedDescription
+                        }
                     }
-                    self.updateLayout()
+                    if !quiet || self.backends.isEmpty {
+                        self.updateLayout()
+                    }
                     return
                 }
                 if let http = response as? HTTPURLResponse, http.statusCode >= 400 {
-                    self.backendError = "Backends API returned HTTP \(http.statusCode)."
-                    self.updateLayout()
+                    if !quiet || self.backends.isEmpty {
+                        self.backendError = "Backends API returned HTTP \(http.statusCode)."
+                        self.updateLayout()
+                    }
                     return
                 }
                 guard let data else {
-                    self.backendError = "Backends API returned no data."
-                    self.updateLayout()
+                    if !quiet || self.backends.isEmpty {
+                        self.backendError = "Backends API returned no data."
+                        self.updateLayout()
+                    }
+                    return
+                }
+                if quiet, self.lastBackendsResponseData == data {
                     return
                 }
                 do {
                     let response = try JSONDecoder().decode(BackendsResponse.self, from: data)
+                    self.lastBackendsResponseData = data
                     self.backendError = response.error
                     self.backends = response.backends
                     if let selectedServiceID = self.selectedServiceID,
@@ -2126,13 +2282,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate {
         }
         if backendsToggleFrame.contains(toolbarPoint) {
             navigateToMode(.backends, pushHistory: true)
-            return
-        }
-        if refreshFrame.contains(toolbarPoint) {
-            fetchBackends()
-            if selectedLog != nil {
-                fetchSelectedLog()
-            }
             return
         }
 

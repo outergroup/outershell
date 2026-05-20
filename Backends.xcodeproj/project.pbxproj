@@ -25,7 +25,7 @@
 
 /* Begin PBXFileReference section */
 		0F0000000000000000000003 /* Backends.bundle */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = Backends.bundle; sourceTree = BUILT_PRODUCTS_DIR; };
-		37B4F9CF2FA1B00100873894 /* NavigatorBackend */ = {isa = PBXFileReference; explicitFileType = "compiled.mach-o.executable"; includeInIndex = 0; path = NavigatorBackend; sourceTree = BUILT_PRODUCTS_DIR; };
+		37B4F9CF2FA1B00100873894 /* HomeScreenBackend */ = {isa = PBXFileReference; explicitFileType = "compiled.mach-o.executable"; includeInIndex = 0; path = HomeScreenBackend; sourceTree = BUILT_PRODUCTS_DIR; };
 		37B4F9D02FA1B00100873894 /* main.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = main.c; sourceTree = "<group>"; };
 		0F0000000000000000000007 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		0F0000000000000000000008 /* README.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = README.md; sourceTree = "<group>"; };
@@ -85,7 +85,7 @@
 			isa = PBXGroup;
 			children = (
 				0F0000000000000000000003 /* Backends.bundle */,
-				37B4F9CF2FA1B00100873894 /* NavigatorBackend */,
+				37B4F9CF2FA1B00100873894 /* HomeScreenBackend */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -125,9 +125,9 @@
 			productReference = 0F0000000000000000000003 /* Backends.bundle */;
 			productType = "com.apple.product-type.bundle";
 		};
-		37B4F9D22FA1B00100873894 /* NavigatorBackend */ = {
+		37B4F9D22FA1B00100873894 /* HomeScreenBackend */ = {
 			isa = PBXNativeTarget;
-			buildConfigurationList = 37B4F9D52FA1B00100873894 /* Build configuration list for PBXNativeTarget "NavigatorBackend" */;
+			buildConfigurationList = 37B4F9D52FA1B00100873894 /* Build configuration list for PBXNativeTarget "HomeScreenBackend" */;
 			buildPhases = (
 				37B4F9D32FA1B00100873894 /* Sources */,
 				37B4F9D42FA1B00100873894 /* Frameworks */,
@@ -136,11 +136,11 @@
 			);
 			dependencies = (
 			);
-			name = NavigatorBackend;
+			name = HomeScreenBackend;
 			packageProductDependencies = (
 			);
-			productName = NavigatorBackend;
-			productReference = 37B4F9CF2FA1B00100873894 /* NavigatorBackend */;
+			productName = HomeScreenBackend;
+			productReference = 37B4F9CF2FA1B00100873894 /* HomeScreenBackend */;
 			productType = "com.apple.product-type.tool";
 		};
 /* End PBXNativeTarget section */
@@ -179,7 +179,7 @@
 			projectRoot = "";
 			targets = (
 				0F000000000000000000000B /* Backends */,
-				37B4F9D22FA1B00100873894 /* NavigatorBackend */,
+				37B4F9D22FA1B00100873894 /* HomeScreenBackend */,
 			);
 		};
 /* End PBXProject section */
@@ -369,7 +369,7 @@
 				INSTALL_PATH = "$(LOCAL_LIBRARY_DIR)/Bundles";
 				MACOSX_DEPLOYMENT_TARGET = 14.6;
 				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = dev.outergroup.Navigator;
+				PRODUCT_BUNDLE_IDENTIFIER = dev.outergroup.HomeScreen;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				RUNTIME_EXCEPTION_DISABLE_LIBRARY_VALIDATION = YES;
 				SKIP_INSTALL = YES;
@@ -404,7 +404,7 @@
 				INSTALL_PATH = "$(LOCAL_LIBRARY_DIR)/Bundles";
 				MACOSX_DEPLOYMENT_TARGET = 14.6;
 				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = dev.outergroup.Navigator;
+				PRODUCT_BUNDLE_IDENTIFIER = dev.outergroup.HomeScreen;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				RUNTIME_EXCEPTION_DISABLE_LIBRARY_VALIDATION = YES;
 				SKIP_INSTALL = YES;
@@ -431,8 +431,8 @@
 					"$(inherited)",
 					"-lsqlite3",
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = dev.outergroup.NavigatorBackend;
-				PRODUCT_NAME = NavigatorBackend;
+				PRODUCT_BUNDLE_IDENTIFIER = dev.outergroup.HomeScreenBackend;
+				PRODUCT_NAME = HomeScreenBackend;
 				SKIP_INSTALL = YES;
 			};
 			name = Debug;
@@ -453,8 +453,8 @@
 					"$(inherited)",
 					"-lsqlite3",
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = dev.outergroup.NavigatorBackend;
-				PRODUCT_NAME = NavigatorBackend;
+				PRODUCT_BUNDLE_IDENTIFIER = dev.outergroup.HomeScreenBackend;
+				PRODUCT_NAME = HomeScreenBackend;
 				SKIP_INSTALL = YES;
 			};
 			name = Release;
@@ -480,7 +480,7 @@
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
 		};
-		37B4F9D52FA1B00100873894 /* Build configuration list for PBXNativeTarget "NavigatorBackend" */ = {
+		37B4F9D52FA1B00100873894 /* Build configuration list for PBXNativeTarget "HomeScreenBackend" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
 				37B4F9D62FA1B00100873894 /* Debug */,

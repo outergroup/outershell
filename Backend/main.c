@@ -43,7 +43,8 @@ extern int launch_activate_socket(const char *name, int **fds, size_t *cnt);
 #define SYSTEMD_STATUS_CACHE_TTL_MS 1500
 #define MAX_SYSTEMD_STATUS_ENTRIES 512
 
-static const char *kNavigatorServiceID = "dev.outergroup.Navigator";
+static const char *kHomeScreenServiceID = "dev.outergroup.HomeScreen";
+static const char *kLegacyNavigatorServiceID = "dev.outergroup.Navigator";
 static const char *kLegacyBackendsServiceID = "dev.outergroup.Backends";
 static const char *kBundleUrlPath = "/bundles/BackendsContent";
 static const char *kBundleUrlPathMacosArm = "/bundles/BackendsContent/macos-arm";
@@ -126,7 +127,7 @@ static const BundledAppDefinition kBundledApps[] = {
         .install_directory_name = "dev.outergroup.Files",
         .binary_name = "FilesBackend",
         .bundle_prefix = "FilesContent",
-        .icon_name = "",
+        .icon_name = "app-icon.png",
         .source_name = "FilesBackend.c",
         .socket_name = "dev.outergroup.Files",
         .socket_activated = true,
@@ -134,9 +135,10 @@ static const BundledAppDefinition kBundledApps[] = {
     }
 };
 
-static bool is_navigator_service_id(const char *service_id) {
+static bool is_home_screen_service_id(const char *service_id) {
     return service_id &&
-           (strcmp(service_id, kNavigatorServiceID) == 0 ||
+           (strcmp(service_id, kHomeScreenServiceID) == 0 ||
+            strcmp(service_id, kLegacyNavigatorServiceID) == 0 ||
             strcmp(service_id, kLegacyBackendsServiceID) == 0);
 }
 
@@ -498,6 +500,21 @@ static void append_path_component(char *out, size_t out_size, const char *base, 
     snprintf(out, out_size, "%s/%s", base && base[0] ? base : "", component && component[0] ? component : "");
 }
 
+static bool resolve_user_script_path(const char *raw_path,
+                                     const char *working_directory,
+                                     char *out,
+                                     size_t out_size) {
+    char expanded[PATH_MAX];
+    expand_tilde_path(raw_path, expanded, sizeof(expanded));
+    if (!expanded[0]) return false;
+    if (expanded[0] == '/') {
+        snprintf(out, out_size, "%s", expanded);
+    } else {
+        append_path_component(out, out_size, working_directory && working_directory[0] ? working_directory : home_directory(), expanded);
+    }
+    return out[0] != '\0';
+}
+
 static bool sudo_failure_needs_password(const char *output, int exit_status);
 static bool run_sudo_shell(const char *command, const char *password, char *output, size_t output_size, int *exit_status);
 
@@ -834,7 +851,8 @@ static bool ensure_registry_schema(sqlite3 *database, char *error, size_t error_
                         "port INTEGER NOT NULL DEFAULT 0,"
                         "socket_path TEXT NOT NULL DEFAULT '',"
                         "icon TEXT,"
-                        "is_home_screen INTEGER NOT NULL DEFAULT 0"
+                        "is_home_screen INTEGER NOT NULL DEFAULT 0,"
+                        "list TEXT"
                         ");"
                         "CREATE INDEX IF NOT EXISTS frontends_service_id_idx ON frontends(service_id);"
                         "CREATE TABLE IF NOT EXISTS log_files ("
@@ -857,12 +875,31 @@ static bool ensure_registry_schema(sqlite3 *database, char *error, size_t error_
         return false;
     }
     if (!frontends_has_column(database, "is_home_screen", error, error_size)) {
-        return sqlite_exec_ok(database,
-                              "ALTER TABLE frontends ADD COLUMN is_home_screen INTEGER NOT NULL DEFAULT 0;",
-                              error,
-                              error_size);
+        if (!sqlite_exec_ok(database,
+                            "ALTER TABLE frontends ADD COLUMN is_home_screen INTEGER NOT NULL DEFAULT 0;",
+                            error,
+                            error_size)) {
+            return false;
+        }
+    }
+    if (!frontends_has_column(database, "list", error, error_size)) {
+        if (!sqlite_exec_ok(database,
+                            "ALTER TABLE frontends ADD COLUMN list TEXT;",
+                            error,
+                            error_size)) {
+            return false;
+        }
     }
     return true;
+}
+
+static void migrate_registry_schema_if_writable(const char *path) {
+    if (!path || !path[0] || access(path, W_OK) != 0) return;
+    char error[512] = "";
+    sqlite3 *database = open_registry_readwrite_at(path, error, sizeof(error));
+    if (!database) return;
+    (void)ensure_registry_schema(database, error, sizeof(error));
+    sqlite3_close(database);
 }
 
 static const char *sqlite_column_text_or_empty(sqlite3_stmt *statement, int column) {
@@ -1366,11 +1403,20 @@ static bool append_frontends_json(StringBuilder *builder, sqlite3 *database, con
     sqlite3_stmt *statement = NULL;
     char column_error[256] = "";
     bool has_home_screen_column = frontends_has_column(database, "is_home_screen", column_error, sizeof(column_error));
-    const char *sql = has_home_screen_column ?
-        "SELECT f.name, COALESCE(f.url, ''), COALESCE(f.port, 0), COALESCE(f.socket_path, ''), COALESCE(f.is_home_screen, 0), COALESCE(NULLIF(f.icon, ''), COALESCE(b.icon, '')) "
+    bool has_list_column = frontends_has_column(database, "list", column_error, sizeof(column_error));
+    const char *sql = has_home_screen_column && has_list_column ?
+        "SELECT f.name, COALESCE(f.url, ''), COALESCE(f.port, 0), COALESCE(f.socket_path, ''), COALESCE(f.is_home_screen, 0), COALESCE(NULLIF(f.icon, ''), COALESCE(b.icon, '')), COALESCE(f.list, '') "
+        "FROM frontends f LEFT JOIN backends b ON b.service_id = f.service_id WHERE f.service_id = ? "
+        "ORDER BY COALESCE(f.list, ''), f.name, f.url;" :
+        has_home_screen_column ?
+        "SELECT f.name, COALESCE(f.url, ''), COALESCE(f.port, 0), COALESCE(f.socket_path, ''), COALESCE(f.is_home_screen, 0), COALESCE(NULLIF(f.icon, ''), COALESCE(b.icon, '')), '' "
         "FROM frontends f LEFT JOIN backends b ON b.service_id = f.service_id WHERE f.service_id = ? "
         "ORDER BY f.name, f.url;" :
-        "SELECT f.name, COALESCE(f.url, ''), COALESCE(f.port, 0), COALESCE(f.socket_path, ''), 0, COALESCE(NULLIF(f.icon, ''), COALESCE(b.icon, '')) "
+        has_list_column ?
+        "SELECT f.name, COALESCE(f.url, ''), COALESCE(f.port, 0), COALESCE(f.socket_path, ''), 0, COALESCE(NULLIF(f.icon, ''), COALESCE(b.icon, '')), COALESCE(f.list, '') "
+        "FROM frontends f LEFT JOIN backends b ON b.service_id = f.service_id WHERE f.service_id = ? "
+        "ORDER BY COALESCE(f.list, ''), f.name, f.url;" :
+        "SELECT f.name, COALESCE(f.url, ''), COALESCE(f.port, 0), COALESCE(f.socket_path, ''), 0, COALESCE(NULLIF(f.icon, ''), COALESCE(b.icon, '')), '' "
         "FROM frontends f LEFT JOIN backends b ON b.service_id = f.service_id WHERE f.service_id = ? "
         "ORDER BY f.name, f.url;";
     if (sqlite3_prepare_v2(database, sql, -1, &statement, NULL) != SQLITE_OK) {
@@ -1398,6 +1444,8 @@ static bool append_frontends_json(StringBuilder *builder, sqlite3 *database, con
         ok = ok && sb_append_json_string(builder, sqlite_column_text_or_empty(statement, 5));
         ok = ok && sb_append(builder, ",\"iconData\":");
         ok = ok && sb_append_base64_file_json_string(builder, sqlite_column_text_or_empty(statement, 5));
+        ok = ok && sb_append(builder, ",\"list\":");
+        ok = ok && sb_append_json_string(builder, sqlite_column_text_or_empty(statement, 6));
         ok = ok && sb_append(builder, "}");
     }
     sqlite3_finalize(statement);
@@ -1480,7 +1528,7 @@ static bool append_registered_backends_json(StringBuilder *builder,
         char effective_service_scope[32];
         snprintf(effective_service_scope, sizeof(effective_service_scope), "%s", service_scope);
         const BundledAppDefinition *bundled_app = bundled_app_for_service_id(service_id);
-        bool is_self = is_navigator_service_id(service_id);
+        bool is_self = is_home_screen_service_id(service_id);
         if (bundled_app) {
             size_t bundled_index = (size_t)(bundled_app - kBundledApps);
             if (bundled_index < bundled_installed_count) {
@@ -1553,6 +1601,8 @@ static void send_backends_response(int fd) {
     StringBuilder builder = {0};
     char user_error[512] = "";
     char system_error[512] = "";
+    migrate_registry_schema_if_writable(g_registry_database_path);
+    migrate_registry_schema_if_writable(g_system_registry_database_path);
     sqlite3 *user_database = open_registry_readonly(user_error, sizeof(user_error));
     sqlite3 *system_database = open_system_registry_readonly(system_error, sizeof(system_error));
 
@@ -1702,6 +1752,75 @@ static void send_action_json(int fd, int status, bool ok_value, const char *mess
 static bool install_bundled_app(const BundledAppDefinition *app, const char *scope, const char *sudo_password, bool *needs_password, char *message, size_t message_size);
 static bool uninstall_backend(const char *service_id, const char *sudo_password, bool *needs_password, char *message, size_t message_size);
 
+static bool clear_frontends_in_registry_at(const char *database_path, const char *service_id, char *error, size_t error_size) {
+    sqlite3 *database = open_registry_readwrite_at(database_path, error, error_size);
+    if (!database) return false;
+    if (!ensure_registry_schema(database, error, error_size)) {
+        sqlite3_close(database);
+        return false;
+    }
+
+    bool ok = sqlite_exec_ok(database, "BEGIN IMMEDIATE TRANSACTION;", error, error_size);
+    sqlite3_stmt *statement = NULL;
+    if (ok) {
+        ok = sqlite3_prepare_v2(database, "DELETE FROM frontends WHERE service_id = ?;", -1, &statement, NULL) == SQLITE_OK;
+        if (ok) {
+            sqlite3_bind_text(statement, 1, service_id, -1, SQLITE_TRANSIENT);
+            ok = sqlite3_step(statement) == SQLITE_DONE;
+        }
+        if (!ok) snprintf(error, error_size, "%s", sqlite3_errmsg(database));
+        if (statement) sqlite3_finalize(statement);
+    }
+
+    if (ok) {
+        ok = sqlite_exec_ok(database, "COMMIT;", error, error_size);
+    } else {
+        sqlite3_exec(database, "ROLLBACK;", NULL, NULL, NULL);
+    }
+    sqlite3_close(database);
+    return ok;
+}
+
+static void clear_frontends_in_system_registry_as_root(const char *service_id, const char *sudo_password) {
+    char quoted_system_root[PATH_MAX + 8];
+    char quoted_service_id[512];
+    shell_quote(kSystemOuterAgentRoot, quoted_system_root, sizeof(quoted_system_root));
+    shell_quote(service_id, quoted_service_id, sizeof(quoted_service_id));
+
+    char command[8192];
+    snprintf(command,
+             sizeof(command),
+             "REGISTRY_ROOT=%s SERVICE_ID=%s python3 - <<'__HOMESCREEN_CLEAR_FRONTENDS__'\n"
+             "import os, sqlite3\n"
+             "database_path = os.path.join(os.environ['REGISTRY_ROOT'], 'registry.sqlite3')\n"
+             "if os.path.exists(database_path):\n"
+             "    database = sqlite3.connect(database_path)\n"
+             "    with database:\n"
+             "        try:\n"
+             "            database.execute('DELETE FROM frontends WHERE service_id = ?', (os.environ['SERVICE_ID'],))\n"
+             "        except sqlite3.OperationalError:\n"
+             "            pass\n"
+             "    database.close()\n"
+             "__HOMESCREEN_CLEAR_FRONTENDS__\n",
+             quoted_system_root,
+             quoted_service_id);
+
+    char output[1024] = "";
+    int exit_status = -1;
+    (void)run_sudo_shell(command, sudo_password, output, sizeof(output), &exit_status);
+}
+
+static void clear_frontends_after_successful_stop(const char *service_id, bool system_scope, const char *sudo_password) {
+    char error[512] = "";
+    (void)clear_frontends_in_registry_at(g_registry_database_path, service_id, error, sizeof(error));
+    error[0] = '\0';
+    if (g_system_registry_database_path[0] && access(g_system_registry_database_path, W_OK) == 0) {
+        (void)clear_frontends_in_registry_at(g_system_registry_database_path, service_id, error, sizeof(error));
+    } else if (system_scope) {
+        clear_frontends_in_system_registry_as_root(service_id, sudo_password);
+    }
+}
+
 static void send_control_response(int fd, const char *query, const char *body) {
     char service_id[PATH_MAX] = "";
     char operation[32] = "";
@@ -1713,8 +1832,8 @@ static void send_control_response(int fd, const char *query, const char *body) {
     }
     query_value_any(query, body, "sudoPassword", sudo_password, sizeof(sudo_password));
 
-    if (is_navigator_service_id(service_id)) {
-        send_action_json(fd, 400, false, "Navigator cannot stop, start, or uninstall itself.");
+    if (is_home_screen_service_id(service_id)) {
+        send_action_json(fd, 400, false, "Home Screen cannot stop, start, or uninstall itself.");
         return;
     }
 
@@ -1780,6 +1899,11 @@ static void send_control_response(int fd, const char *query, const char *body) {
                                                    &needs_password,
                                                    message,
                                                    sizeof(message));
+        if (ok && strcmp(operation, "stop") == 0) {
+            clear_frontends_after_successful_stop(service_id,
+                                                  strncmp(plist_path, "/Library/LaunchDaemons/", 23) == 0,
+                                                  sudo_password);
+        }
         send_action_json_ex(fd, ok ? 200 : (needs_password ? 401 : 500), ok, message, needs_password);
         return;
     }
@@ -1796,6 +1920,9 @@ static void send_control_response(int fd, const char *query, const char *body) {
     char message[4096] = "";
     bool needs_password = false;
     bool ok = run_systemd_operation(unit_name, scope, operation, sudo_password, &needs_password, message, sizeof(message));
+    if (ok && strcmp(operation, "stop") == 0) {
+        clear_frontends_after_successful_stop(service_id, strcmp(scope, "system") == 0, sudo_password);
+    }
     send_action_json_ex(fd, ok ? 200 : (needs_password ? 401 : 500), ok, message, needs_password);
 }
 
@@ -2183,7 +2310,7 @@ static bool make_jupyter_script(const char *service_id,
         "import signal\n"
         "import subprocess\n"
         "import time\n"
-        "from urllib.parse import urlencode, urljoin, urlsplit\n"
+        "from urllib.parse import urlencode, urlsplit\n"
         "\n"
         "OUTERCTL_ENV_VAR = \"OUTERCTL_PATH\"\n"
         "BACKEND_ID = ");
@@ -2202,11 +2329,18 @@ static bool make_jupyter_script(const char *service_id,
         "\n"
         "child = None\n"
         "\n"
+        "def log(message):\n"
+        "    print(f\"[HomeScreen Jupyter] {message}\", flush=True)\n"
+        "\n"
         "def run_outerctl(*args: str) -> None:\n"
         "    outerctl_path = os.environ.get(OUTERCTL_ENV_VAR, \"\").strip()\n"
         "    if not outerctl_path or not os.access(outerctl_path, os.X_OK):\n"
+        "        log(\"outerctl is unavailable; frontend metadata will not be announced\")\n"
         "        return\n"
-        "    subprocess.run([outerctl_path, *args], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+        "    result = subprocess.run([outerctl_path, *args], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)\n"
+        "    if result.returncode != 0:\n"
+        "        detail = result.stderr.strip()\n"
+        "        log(f\"outerctl failed ({result.returncode})\" + (f\": {detail}\" if detail else \"\"))\n"
         "\n"
         "def build_command() -> list[str]:\n"
         "    command = list(BASE_COMMAND)\n"
@@ -2218,6 +2352,52 @@ static bool make_jupyter_script(const char *service_id,
         "            \"--ServerApp.password=\",\n"
         "        ])\n"
         "    return command\n"
+        "\n"
+        "def resource_python_path():\n"
+        "    if BASE_COMMAND and BASE_COMMAND[0].endswith(\"jupyter-lab\"):\n"
+        "        candidate = os.path.join(os.path.dirname(BASE_COMMAND[0]), \"python\")\n"
+        "        if os.path.exists(candidate):\n"
+        "            return candidate\n"
+        "    if BASE_COMMAND:\n"
+        "        return BASE_COMMAND[0]\n"
+        "    return None\n"
+        "\n"
+        "def jupyter_icon_path():\n"
+        "    python_path = resource_python_path()\n"
+        "    if not python_path:\n"
+        "        return None\n"
+        "    code = \"\"\"\n"
+        "from importlib import resources\n"
+        "candidates = [\n"
+        "    ('jupyter_server', ('static', 'favicon.ico')),\n"
+        "    ('jupyter_server', ('static', 'favicons', 'favicon.ico')),\n"
+        "    ('jupyter_server', ('static', 'logo', 'logo.png')),\n"
+        "    ('ipykernel', ('resources', 'logo-64x64.png')),\n"
+        "]\n"
+        "for package, parts in candidates:\n"
+        "    try:\n"
+        "        item = resources.files(package).joinpath(*parts)\n"
+        "        if item.is_file():\n"
+        "            print(str(item))\n"
+        "            raise SystemExit(0)\n"
+        "    except Exception:\n"
+        "        pass\n"
+        "raise SystemExit(1)\n"
+        "\"\"\"\n"
+        "    try:\n"
+        "        result = subprocess.run([python_path, \"-c\", code], capture_output=True, text=True, timeout=2.0)\n"
+        "    except Exception as error:\n"
+        "        log(f\"failed to resolve package favicon using {python_path}: {error}\")\n"
+        "        return None\n"
+        "    if result.returncode != 0:\n"
+        "        detail = result.stderr.strip()\n"
+        "        log(\"could not find Jupyter package favicon\" + (f\": {detail}\" if detail else \"\"))\n"
+        "        return None\n"
+        "    path = result.stdout.strip().splitlines()[0] if result.stdout.strip() else \"\"\n"
+        "    if path and os.path.exists(path) and os.path.getsize(path) > 0:\n"
+        "        log(f\"using Jupyter package favicon at {path}\")\n"
+        "        return path\n"
+        "    return None\n"
         "\n"
         "def probe_frontend():\n"
         "    probe_result = subprocess.run(PROBE_COMMAND, capture_output=True, text=True)\n"
@@ -2233,7 +2413,7 @@ static bool make_jupyter_script(const char *service_id,
         "        token = entry.get(\"token\")\n"
         "        if not isinstance(server_url, str) or not server_url:\n"
         "            continue\n"
-        "        frontend_url = urljoin(server_url if server_url.endswith(\"/\") else server_url + \"/\", \"lab\")\n"
+        "        frontend_url = (server_url if server_url.endswith(\"/\") else server_url + \"/\") + \"lab\"\n"
         "        if not USE_UNIX_SOCKET and isinstance(token, str) and token:\n"
         "            separator = \"&\" if \"?\" in frontend_url else \"?\"\n"
         "            frontend_url = frontend_url + separator + urlencode({\"token\": token})\n"
@@ -2241,14 +2421,15 @@ static bool make_jupyter_script(const char *service_id,
         "        app_url = parsed_frontend.path or \"/\"\n"
         "        if parsed_frontend.query:\n"
         "            app_url += \"?\" + parsed_frontend.query\n"
+        "        icon_path = jupyter_icon_path()\n"
         "        if USE_UNIX_SOCKET:\n"
-        "            return app_url\n"
+        "            return app_url, icon_path\n"
         "        port = entry.get(\"port\")\n"
         "        try:\n"
         "            port = int(port)\n"
         "        except (TypeError, ValueError):\n"
         "            continue\n"
-        "        return str(port), app_url\n"
+        "        return str(port), app_url, icon_path\n"
         "    return None\n"
         "\n"
         "def handle_signal(signum, _frame):\n"
@@ -2276,11 +2457,15 @@ static bool make_jupyter_script(const char *service_id,
         "            discovered = probe_frontend()\n"
         "            if discovered is not None:\n"
         "                if USE_UNIX_SOCKET:\n"
-        "                    app_url = discovered\n"
-        "                    run_outerctl(\"app\", \"add\", \"--backend\", BACKEND_ID, \"--socket-path\", SOCKET_PATH, \"--name\", DISPLAY_NAME, \"--url\", app_url)\n"
+        "                    app_url, icon_path = discovered\n"
+        "                    add_args = [\"app\", \"add\", \"--backend\", BACKEND_ID, \"--socket-path\", SOCKET_PATH, \"--name\", DISPLAY_NAME, \"--url\", app_url]\n"
         "                else:\n"
-        "                    port, app_url = discovered\n"
-        "                    run_outerctl(\"app\", \"add\", \"--backend\", BACKEND_ID, \"--port\", port, \"--name\", DISPLAY_NAME, \"--url\", app_url)\n"
+        "                    port, app_url, icon_path = discovered\n"
+        "                    add_args = [\"app\", \"add\", \"--backend\", BACKEND_ID, \"--port\", port, \"--name\", DISPLAY_NAME, \"--url\", app_url]\n"
+        "                add_args.extend([\"--list\", \"Jupyter\"])\n"
+        "                if icon_path:\n"
+        "                    add_args.extend([\"--icon-file\", icon_path])\n"
+        "                run_outerctl(*add_args)\n"
         "                announced = True\n"
         "        time.sleep(0.25 if not announced and probe_attempts < 20 else 1.0)\n"
         "        probe_attempts += 1\n"
@@ -2982,7 +3167,8 @@ static bool install_bundled_app(const BundledAppDefinition *app, const char *sco
                 "port INTEGER NOT NULL DEFAULT 0,\n"
                 "socket_path TEXT NOT NULL DEFAULT '',\n"
                 "icon TEXT,\n"
-                "is_home_screen INTEGER NOT NULL DEFAULT 0\n"
+                "is_home_screen INTEGER NOT NULL DEFAULT 0,\n"
+                "list TEXT\n"
                 ");\n"
                 "CREATE INDEX IF NOT EXISTS frontends_service_id_idx ON frontends(service_id);\n"
                 "CREATE TABLE IF NOT EXISTS log_files (\n"
@@ -2999,6 +3185,8 @@ static bool install_bundled_app(const BundledAppDefinition *app, const char *sco
                 "columns = {row[1] for row in database.execute('PRAGMA table_info(frontends)')}\n"
                 "if 'is_home_screen' not in columns:\n"
                 "    database.execute('ALTER TABLE frontends ADD COLUMN is_home_screen INTEGER NOT NULL DEFAULT 0')\n"
+                "if 'list' not in columns:\n"
+                "    database.execute('ALTER TABLE frontends ADD COLUMN list TEXT')\n"
                 "with database:\n"
                 "    database.execute('INSERT INTO backends(service_id, display_name, icon, service_unit) VALUES(?, ?, ?, ?) ON CONFLICT(service_id) DO UPDATE SET display_name=excluded.display_name, icon=excluded.icon, service_unit=excluded.service_unit', (service_id, display_name, icon_path, unit_name))\n"
                 "    database.execute('INSERT INTO systemd_backends(service_id, unit_name, scope) VALUES(?, ?, ?) ON CONFLICT(service_id) DO UPDATE SET unit_name=excluded.unit_name, scope=excluded.scope', (service_id, unit_name, 'system'))\n"
@@ -3595,7 +3783,7 @@ static bool install_bundled_app_macos(const BundledAppDefinition *app,
                 "database = sqlite3.connect(database_path)\n"
                 "database.executescript('''\n"
                 "CREATE TABLE IF NOT EXISTS backends (service_id TEXT PRIMARY KEY, display_name TEXT NOT NULL DEFAULT '', icon TEXT, service_unit TEXT);\n"
-                "CREATE TABLE IF NOT EXISTS frontends (url TEXT PRIMARY KEY, service_id TEXT, name TEXT NOT NULL, port INTEGER NOT NULL DEFAULT 0, socket_path TEXT NOT NULL DEFAULT '', icon TEXT, is_home_screen INTEGER NOT NULL DEFAULT 0);\n"
+                "CREATE TABLE IF NOT EXISTS frontends (url TEXT PRIMARY KEY, service_id TEXT, name TEXT NOT NULL, port INTEGER NOT NULL DEFAULT 0, socket_path TEXT NOT NULL DEFAULT '', icon TEXT, is_home_screen INTEGER NOT NULL DEFAULT 0, list TEXT);\n"
                 "CREATE INDEX IF NOT EXISTS frontends_service_id_idx ON frontends(service_id);\n"
                 "CREATE TABLE IF NOT EXISTS log_files (path TEXT PRIMARY KEY, service_id TEXT NOT NULL);\n"
                 "CREATE INDEX IF NOT EXISTS log_files_service_id_idx ON log_files(service_id);\n"
@@ -3605,6 +3793,8 @@ static bool install_bundled_app_macos(const BundledAppDefinition *app,
                 "columns = {row[1] for row in database.execute('PRAGMA table_info(frontends)')}\n"
                 "if 'is_home_screen' not in columns:\n"
                 "    database.execute('ALTER TABLE frontends ADD COLUMN is_home_screen INTEGER NOT NULL DEFAULT 0')\n"
+                "if 'list' not in columns:\n"
+                "    database.execute('ALTER TABLE frontends ADD COLUMN list TEXT')\n"
                 "with database:\n"
                 "    database.execute('INSERT INTO backends(service_id, display_name, icon, service_unit) VALUES(?, ?, ?, NULL) ON CONFLICT(service_id) DO UPDATE SET display_name=excluded.display_name, icon=excluded.icon, service_unit=NULL', (service_id, display_name, icon_path))\n"
                 "    database.execute('INSERT INTO launchd_backends(service_id, plist_path, owns_plist) VALUES(?, ?, 1) ON CONFLICT(service_id) DO UPDATE SET plist_path=excluded.plist_path, owns_plist=excluded.owns_plist', (service_id, plist_path))\n"
@@ -4177,6 +4367,7 @@ static bool append_command_recipe_fields(StringBuilder *builder, const char *pyt
     (void)python_suggestions_json;
     bool ok = append_field_json(builder, "command", "Command", "", "text", "bundle exec jekyll serve --host 0.0.0.0", NULL, NULL);
     ok = ok && sb_append(builder, ",") && append_field_json(builder, "workdir", "Working Dir", "~", "directory", "~", NULL, NULL);
+    ok = ok && sb_append(builder, ",") && append_field_json(builder, "scriptPath", "Script Path", "", "file", "~/dev/run-service.sh", NULL, NULL);
     ok = ok && sb_append(builder, ",") && append_field_json(builder, "port", "Port", "", "text", "4000", NULL, NULL);
     ok = ok && sb_append(builder, ",") && append_field_json(builder, "name", "Display Name", "", "text", "My Service", NULL, NULL);
     ok = ok && sb_append(builder, ",") && append_field_json(builder, "identifier", "Identifier", "", "text", "my-service", NULL, NULL);
@@ -4186,6 +4377,7 @@ static bool append_command_recipe_fields(StringBuilder *builder, const char *pyt
 static bool append_blank_recipe_fields(StringBuilder *builder, const char *python_suggestions_json) {
     (void)python_suggestions_json;
     bool ok = append_field_json(builder, "workdir", "Working Dir", "~", "directory", "~", NULL, NULL);
+    ok = ok && sb_append(builder, ",") && append_field_json(builder, "scriptPath", "Script Path", "", "file", "~/dev/run-service.sh", NULL, NULL);
     ok = ok && sb_append(builder, ",") && append_field_json(builder, "name", "Display Name", "", "text", "My Service", NULL, NULL);
     ok = ok && sb_append(builder, ",") && append_field_json(builder, "identifier", "Identifier", "", "text", "my-service", NULL, NULL);
     return ok;
@@ -4195,6 +4387,7 @@ static bool append_jupyter_recipe_fields(StringBuilder *builder, const char *pyt
     const char *choices = "[{\"title\":\"Port\",\"value\":\"port\"},{\"title\":\"Unix Socket\",\"value\":\"unixSocket\"}]";
     bool ok = append_field_json(builder, "python", "Python", "/usr/bin/python3", "file", "/usr/bin/python3", python_suggestions_json, NULL);
     ok = ok && sb_append(builder, ",") && append_field_json(builder, "workdir", "Working Dir", "~/dev", "directory", "~/dev", NULL, NULL);
+    ok = ok && sb_append(builder, ",") && append_field_json(builder, "scriptPath", "Script Path", "", "file", "~/dev/run-jupyter.py", NULL, NULL);
     ok = ok && sb_append(builder, ",") && append_field_json(builder, "frontendTransport", "Connection", "port", "choice", "", NULL, choices);
     ok = ok && sb_append(builder, ",") && append_field_json(builder, "port", "Port", "", "text", "Auto", NULL, NULL);
     ok = ok && sb_append(builder, ",") && append_field_json(builder, "name", "Display Name", "Jupyter Lab", "text", "Jupyter Lab", NULL, NULL);
@@ -4206,6 +4399,7 @@ static bool append_jupyter_uv_recipe_fields(StringBuilder *builder, const char *
     (void)python_suggestions_json;
     const char *choices = "[{\"title\":\"Port\",\"value\":\"port\"},{\"title\":\"Unix Socket\",\"value\":\"unixSocket\"}]";
     bool ok = append_field_json(builder, "projectDir", "Project Dir", "~", "directory", "~/dev/my-project", NULL, NULL);
+    ok = ok && sb_append(builder, ",") && append_field_json(builder, "scriptPath", "Script Path", "", "file", "~/dev/my-project/run-jupyter.py", NULL, NULL);
     ok = ok && sb_append(builder, ",") && append_field_json(builder, "frontendTransport", "Connection", "port", "choice", "", NULL, choices);
     ok = ok && sb_append(builder, ",") && append_field_json(builder, "port", "Port", "", "text", "Auto", NULL, NULL);
     ok = ok && sb_append(builder, ",") && append_field_json(builder, "name", "Display Name", "Jupyter Lab", "text", "Jupyter Lab", NULL, NULL);
@@ -4421,6 +4615,20 @@ static void send_create_response(int fd, const char *query) {
         }
         expand_tilde_path(workdir_raw[0] ? workdir_raw : "~", working_directory, sizeof(working_directory));
 
+        char script_path[PATH_MAX] = "";
+        bool generated_script_recipe = strcmp(recipe, "command-port") == 0 ||
+                                       strcmp(recipe, "custom") == 0 ||
+                                       strcmp(recipe, "jupyter") == 0 ||
+                                       strcmp(recipe, "jupyter-uv") == 0;
+        if (generated_script_recipe) {
+            char script_path_raw[PATH_MAX] = "";
+            query_value(query, "scriptPath", script_path_raw, sizeof(script_path_raw));
+            if (!resolve_user_script_path(script_path_raw, working_directory, script_path, sizeof(script_path))) {
+                send_action_json(fd, 400, false, "Script Path is required.");
+                return;
+            }
+        }
+
         if (strcmp(recipe, "command-port") == 0) {
             char port[32] = "";
             query_value(query, "command", command, sizeof(command));
@@ -4435,8 +4643,6 @@ static void send_create_response(int fd, const char *query) {
                 send_action_json(fd, 500, false, "Failed to generate script.");
                 return;
             }
-            char script_path[PATH_MAX];
-            snprintf(script_path, sizeof(script_path), "%s/run.sh", backend_dir);
             if (!write_text_file(script_path, script.data, error, sizeof(error))) {
                 free(script.data);
                 send_action_json(fd, 500, false, error);
@@ -4456,8 +4662,6 @@ static void send_create_response(int fd, const char *query) {
                 send_action_json(fd, 500, false, "Failed to generate script.");
                 return;
             }
-            char script_path[PATH_MAX];
-            snprintf(script_path, sizeof(script_path), "%s/run.sh", backend_dir);
             if (!write_text_file(script_path, script.data, error, sizeof(error))) {
                 free(script.data);
                 send_action_json(fd, 500, false, error);
@@ -4490,8 +4694,6 @@ static void send_create_response(int fd, const char *query) {
                 send_action_json(fd, 500, false, "Failed to generate Jupyter script.");
                 return;
             }
-            char script_path[PATH_MAX];
-            snprintf(script_path, sizeof(script_path), "%s/run.py", backend_dir);
             if (!write_text_file(script_path, script.data, error, sizeof(error))) {
                 free(script.data);
                 send_action_json(fd, 500, false, error);
@@ -5298,9 +5500,9 @@ int main(int argc, char **argv) {
     if (listener < 0) return 1;
     g_listener_fd = listener;
     if (use_port) {
-        fprintf(stderr, "NavigatorBackend listening on http://127.0.0.1:%d/\n", port);
+        fprintf(stderr, "HomeScreenBackend listening on http://127.0.0.1:%d/\n", port);
     } else {
-        fprintf(stderr, "NavigatorBackend listening on %s/\n", socket_path);
+        fprintf(stderr, "HomeScreenBackend listening on %s/\n", socket_path);
     }
     fprintf(stderr, "Registry database: %s\n", g_registry_database_path);
     if (g_system_registry_database_path[0]) {

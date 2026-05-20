@@ -46,10 +46,10 @@ echo "==> Building Backends.bundle"
     CODE_SIGNING_REQUIRED=NO \
     build
 
-echo "==> Building NavigatorBackend"
+echo "==> Building HomeScreenBackend"
 /usr/bin/xcodebuild \
     -project "${SCRIPT_DIR}/Backends.xcodeproj" \
-    -scheme NavigatorBackend \
+    -scheme HomeScreenBackend \
     -configuration "${CONFIGURATION}" \
     SYMROOT="${BUILD_ROOT}" \
     ONLY_ACTIVE_ARCH=YES \
@@ -85,12 +85,13 @@ install -m 0644 \
     "${SCRIPT_DIR}/bundled-apps/Top/bundles/TopContent.bundle.macos-x86.aar" \
     "${TOP_PAYLOAD_ROOT}/bundles/TopContent.bundle.macos-x86.aar"
 
-ln -sf NavigatorBackend "${BUILD_ROOT}/${CONFIGURATION}/BackendsBackend"
+ln -sf HomeScreenBackend "${BUILD_ROOT}/${CONFIGURATION}/BackendsBackend"
+ln -sf HomeScreenBackend "${BUILD_ROOT}/${CONFIGURATION}/NavigatorBackend"
 
 echo "Built:"
-echo "  ${BUILD_ROOT}/${CONFIGURATION}/NavigatorBackend"
+echo "  ${BUILD_ROOT}/${CONFIGURATION}/HomeScreenBackend"
 echo "  ${RUN_ROOT}/bundles"
 echo "  ${TOP_PAYLOAD_ROOT}"
 echo
 echo "Run:"
-echo "  \"${BUILD_ROOT}/${CONFIGURATION}/NavigatorBackend\" --port 7354 --bundles-dir \"${RUN_ROOT}/bundles\" --bundled-apps-dir \"${RUN_ROOT}/bundled-apps\""
+echo "  \"${BUILD_ROOT}/${CONFIGURATION}/HomeScreenBackend\" --port 7354 --bundles-dir \"${RUN_ROOT}/bundles\" --bundled-apps-dir \"${RUN_ROOT}/bundled-apps\""

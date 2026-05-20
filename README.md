@@ -1,6 +1,6 @@
-# Navigator
+# Home Screen
 
-Navigator is an outerframe app for launching apps and viewing the backends registered on the machine where the app is running. It reads the Outer Loop registry SQLite database directly and tails registered log files in place, so logs do not need to be synced back to Outer Loop.
+Home Screen is an outerframe app for launching apps and viewing the backends registered on the machine where the app is running. It reads the Outer Loop registry SQLite database directly and tails registered log files in place, so logs do not need to be synced back to Outer Loop.
 
 This app will replace the old Outer Loop Services UI and the built-in log viewer. It currently includes:
 
@@ -20,7 +20,7 @@ This app will replace the old Outer Loop Services UI and the built-in log viewer
 
 ```bash
 PORT=7354
-./build/macos/Release/NavigatorBackend --port "$PORT" --bundles-dir ./build/run/bundles
+./build/macos/Release/HomeScreenBackend --port "$PORT" --bundles-dir ./build/run/bundles
 ```
 
 Open this URL in Outer Loop or Outerframe:
@@ -32,22 +32,22 @@ http://127.0.0.1:7354/
 For ad hoc Unix socket testing:
 
 ```bash
-SOCKET_PATH="$(getconf DARWIN_USER_TEMP_DIR)dev.outergroup.Navigator"
-./build/macos/Release/NavigatorBackend \
+SOCKET_PATH="$(getconf DARWIN_USER_TEMP_DIR)dev.outergroup.HomeScreen"
+./build/macos/Release/HomeScreenBackend \
   --socket-path "$SOCKET_PATH" \
   --bundles-dir ./build/run/bundles
 ```
 
 For a macOS LaunchAgent, prefer launchd-owned socket activation. Use the
 per-user Darwin temp directory as the closest macOS analogue to
-`XDG_RUNTIME_DIR`, and use `dev.outergroup.Navigator` as the socket filename:
+`XDG_RUNTIME_DIR`, and use `dev.outergroup.HomeScreen` as the socket filename:
 
 ```xml
 <key>ProgramArguments</key>
 <array>
-  <string>/path/to/NavigatorBackend</string>
+  <string>/path/to/HomeScreenBackend</string>
   <string>--socket-path</string>
-  <string>/var/folders/.../T/dev.outergroup.Navigator</string>
+  <string>/var/folders/.../T/dev.outergroup.HomeScreen</string>
   <string>--bundles-dir</string>
   <string>/path/to/bundles</string>
 </array>
@@ -56,7 +56,7 @@ per-user Darwin temp directory as the closest macOS analogue to
   <key>Listener</key>
   <dict>
     <key>SockPathName</key>
-    <string>/var/folders/.../T/dev.outergroup.Navigator</string>
+    <string>/var/folders/.../T/dev.outergroup.HomeScreen</string>
     <key>SockPathMode</key>
     <integer>384</integer>
   </dict>
@@ -66,21 +66,22 @@ per-user Darwin temp directory as the closest macOS analogue to
 Then register the socket with `outerctl`:
 
 ```bash
-outerctl app add --backend dev.outergroup.Navigator \
+outerctl app add --backend dev.outergroup.HomeScreen \
   --socket-path "$SOCKET_PATH" \
-  --name Navigator \
+  --name "Home Screen" \
   --url http+unix://$SOCKET_PATH/ \
+  --icon-file /path/to/app-icon.png \
   --home-screen
 ```
 
-Navigator uses `/` for Apps, `/backends` for the backend table, and `/new` for
+Home Screen uses `/` for Apps, `/backends` for the backend table, and `/new` for
 the create flow.
 
 For a user systemd unit, use `%t` for the socket root so systemd resolves it to
 the user's `XDG_RUNTIME_DIR`:
 
 ```ini
-ExecStart=/path/to/NavigatorBackend --socket-path %t/dev.outergroup.Navigator --bundles-dir /path/to/bundles
+ExecStart=/path/to/HomeScreenBackend --socket-path %t/dev.outergroup.HomeScreen --bundles-dir /path/to/bundles
 ```
 
 By default the backend reads the user registry:
@@ -98,7 +99,7 @@ On Linux it also reads the system/root registry:
 Override the user registry path with either `--database`, `BACKENDS_REGISTRY_DB`, or `OUTERLOOP_REGISTRY_DB`. Override the system registry path with `--system-database`, `BACKENDS_SYSTEM_REGISTRY_DB`, or `OUTERLOOP_SYSTEM_REGISTRY_DB`.
 
 ```bash
-./build/macos/Release/NavigatorBackend \
+./build/macos/Release/HomeScreenBackend \
   --port 7354 \
   --bundles-dir ./build/run/bundles \
   --database ~/Library/dev.outergroup.OuterLoop/registry.sqlite3
