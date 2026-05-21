@@ -124,7 +124,7 @@ bundled-apps/<AppName>/
   app-icon.png
 ```
 
-Backends currently bundles Top and Files on Linux/SSH, and Top on localhost macOS. `build_run.sh` builds and stages the macOS Top backend with Xcode ahead of time; install-time code only copies that prebuilt payload.
+Backends currently bundles Top, Files, Network Inspector, and Firehose on Linux/SSH, and Top on localhost macOS. `build_run.sh` builds and stages the macOS Top backend with Xcode ahead of time; install-time code only copies that prebuilt payload.
 
 On Linux, when a bundled app is installed for the current user, Backends copies the payload into `~/.outeragent/<service id>`, writes its user systemd unit, records the backend/log metadata in the registry, and starts the service. On macOS, localhost installs copy the payload into `~/Library/dev.outergroup.OuterLoop/backends/<service id>`, write a LaunchAgent, record metadata in the registry, and start the service.
 

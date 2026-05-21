@@ -132,6 +132,34 @@ static const BundledAppDefinition kBundledApps[] = {
         .socket_name = "dev.outergroup.Files",
         .socket_activated = true,
         .version = "1"
+    },
+    {
+        .service_id = "dev.outergroup.NetworkInspector",
+        .display_name = "Network Inspector",
+        .unit_name = "dev.outergroup.NetworkInspector.service",
+        .stage_directory_name = "NetworkInspector",
+        .install_directory_name = "dev.outergroup.NetworkInspector",
+        .binary_name = "NetworkInspectorBackend",
+        .bundle_prefix = "NetworkInspectorContent",
+        .icon_name = "app-icon.png",
+        .source_name = "NetworkInspectorBackend.c",
+        .socket_name = "dev.outergroup.NetworkInspector",
+        .socket_activated = true,
+        .version = "1"
+    },
+    {
+        .service_id = "dev.outergroup.Firehose",
+        .display_name = "Firehose",
+        .unit_name = "dev.outergroup.Firehose.service",
+        .stage_directory_name = "Firehose",
+        .install_directory_name = "dev.outergroup.Firehose",
+        .binary_name = "FirehoseBackend",
+        .bundle_prefix = "TraceContent",
+        .icon_name = "app-icon.png",
+        .source_name = "TraceBackend.c",
+        .socket_name = "dev.outergroup.Firehose",
+        .socket_activated = true,
+        .version = "1"
     }
 };
 
@@ -3137,7 +3165,7 @@ static bool install_bundled_app(const BundledAppDefinition *app, const char *sco
                      "WantedBy=sockets.target\n",
                      description,
                      systemd_socket_path,
-                     strcmp(app->service_id, "dev.outergroup.Files") == 0 ? "0666" : "0600");
+                     "0666");
         }
 
         char quoted_outerctl[PATH_MAX + 8];
