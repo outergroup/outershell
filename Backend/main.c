@@ -14,6 +14,7 @@
 #include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -62,6 +63,7 @@ static char g_bundle_file_path_macos_x86[PATH_MAX] = "";
 static char g_registry_database_path[PATH_MAX] = "";
 static char g_system_registry_database_path[PATH_MAX] = "";
 static char g_bundled_apps_directory[PATH_MAX] = "";
+static char g_bundled_apps_base_url[2048] = "";
 static char g_listen_socket_path[PATH_MAX] = "";
 static bool g_systemd_socket_activation = false;
 static bool g_launchd_socket_activation = false;
@@ -101,8 +103,11 @@ typedef struct {
     const char *source_name;
     const char *socket_name;
     bool socket_activated;
+    const char *archive_name;
     const char *version;
 } BundledAppDefinition;
+
+static bool mkdir_p(const char *path);
 
 static const BundledAppDefinition kBundledApps[] = {
     {
@@ -117,6 +122,7 @@ static const BundledAppDefinition kBundledApps[] = {
         .source_name = "TopBackend.c",
         .socket_name = "dev.outergroup.Top",
         .socket_activated = false,
+        .archive_name = "Top.tar.gz",
         .version = "1"
     },
     {
@@ -131,6 +137,7 @@ static const BundledAppDefinition kBundledApps[] = {
         .source_name = "FilesBackend.c",
         .socket_name = "dev.outergroup.Files",
         .socket_activated = true,
+        .archive_name = "Files.tar.gz",
         .version = "1"
     },
     {
@@ -145,6 +152,7 @@ static const BundledAppDefinition kBundledApps[] = {
         .source_name = "NetworkInspectorBackend.c",
         .socket_name = "dev.outergroup.NetworkInspector",
         .socket_activated = true,
+        .archive_name = "NetworkInspector.tar.gz",
         .version = "1"
     },
     {
@@ -159,6 +167,7 @@ static const BundledAppDefinition kBundledApps[] = {
         .source_name = "TraceBackend.c",
         .socket_name = "dev.outergroup.Firehose",
         .socket_activated = true,
+        .archive_name = "Firehose.tar.gz",
         .version = "1"
     }
 };
@@ -212,6 +221,32 @@ static bool set_fd_nonblocking(int fd, bool nonblocking) {
     int new_flags = nonblocking ? (flags | O_NONBLOCK) : (flags & ~O_NONBLOCK);
     if (new_flags == flags) return true;
     return fcntl(fd, F_SETFL, new_flags) == 0;
+}
+
+static void log_event(const char *format, ...) {
+    time_t now = time(NULL);
+    struct tm local_time;
+    char timestamp[32];
+#if defined(_POSIX_THREAD_SAFE_FUNCTIONS) || !defined(__APPLE__)
+    localtime_r(&now, &local_time);
+#else
+    struct tm *resolved_time = localtime(&now);
+    if (resolved_time) {
+        local_time = *resolved_time;
+    } else {
+        memset(&local_time, 0, sizeof(local_time));
+    }
+#endif
+    strftime(timestamp, sizeof(timestamp), "%Y-%m-%dT%H:%M:%S%z", &local_time);
+    fprintf(stderr, "[%s] ", timestamp);
+
+    va_list args;
+    va_start(args, format);
+    vfprintf(stderr, format, args);
+    va_end(args);
+
+    fputc('\n', stderr);
+    fflush(stderr);
 }
 
 static void write_uint32_le(unsigned char *dst, uint32_t value) {
@@ -469,6 +504,18 @@ static void shell_quote(const char *value, char *out, size_t out_size) {
         out[offset++] = '\'';
     }
     out[offset] = '\0';
+}
+
+static void join_url_path(char *out, size_t out_size, const char *base_url, const char *path) {
+    if (!out_size) return;
+    out[0] = '\0';
+    if (!base_url || !base_url[0] || !path || !path[0]) return;
+
+    size_t base_length = strlen(base_url);
+    while (base_length > 0 && base_url[base_length - 1] == '/') {
+        base_length--;
+    }
+    snprintf(out, out_size, "%.*s/%s", (int)base_length, base_url, path);
 }
 
 static bool sb_append_xml_escaped(StringBuilder *builder, const char *text) {
@@ -820,6 +867,133 @@ static void bundled_app_stage_root(const BundledAppDefinition *app, char *out, s
     char root[PATH_MAX];
     bundled_apps_root(root, sizeof(root));
     append_path_component(out, out_size, root, app->stage_directory_name);
+}
+
+static bool bundled_app_stage_has_expected_files(const BundledAppDefinition *app, const char *stage_root) {
+    if (!app || !stage_root || !stage_root[0]) return false;
+    struct stat st;
+
+    char bundle_arm[PATH_MAX];
+    snprintf(bundle_arm, sizeof(bundle_arm), "%s/bundles/%s.bundle.macos-arm.aar", stage_root, app->bundle_prefix);
+    if (stat(bundle_arm, &st) != 0 || !S_ISREG(st.st_mode)) return false;
+
+    char bundle_x86[PATH_MAX];
+    snprintf(bundle_x86, sizeof(bundle_x86), "%s/bundles/%s.bundle.macos-x86.aar", stage_root, app->bundle_prefix);
+    if (stat(bundle_x86, &st) != 0 || !S_ISREG(st.st_mode)) return false;
+
+    if (app->icon_name && app->icon_name[0]) {
+        char icon_path[PATH_MAX];
+        snprintf(icon_path, sizeof(icon_path), "%s/%s", stage_root, app->icon_name);
+        if (stat(icon_path, &st) != 0 || !S_ISREG(st.st_mode)) return false;
+    }
+
+#ifdef __APPLE__
+    char macos_binary[PATH_MAX];
+    snprintf(macos_binary, sizeof(macos_binary), "%s/MacOS/%s", stage_root, app->binary_name);
+    return stat(macos_binary, &st) == 0 && S_ISREG(st.st_mode);
+#else
+    if (app->source_name && app->source_name[0]) {
+        char source_path[PATH_MAX];
+        snprintf(source_path, sizeof(source_path), "%s/Source/%s", stage_root, app->source_name);
+        if (stat(source_path, &st) == 0 && S_ISREG(st.st_mode)) return true;
+    }
+
+    char architecture[64];
+    if (!remote_machine_architecture(architecture, sizeof(architecture))) return false;
+    char linux_binary[PATH_MAX];
+    snprintf(linux_binary, sizeof(linux_binary), "%s/RemoteLinuxBinaries/%s/%s", stage_root, architecture, app->binary_name);
+    return stat(linux_binary, &st) == 0 && S_ISREG(st.st_mode);
+#endif
+}
+
+static bool download_bundled_app_stage(const BundledAppDefinition *app,
+                                       char *out_stage_root,
+                                       size_t out_stage_root_size,
+                                       char *message,
+                                       size_t message_size) {
+    char archive_url[2048];
+    join_url_path(archive_url, sizeof(archive_url), g_bundled_apps_base_url, app->archive_name);
+    if (!archive_url[0]) {
+        snprintf(message, message_size,
+                 "No bundled app download URL is configured for %s. Pass --app-base-url or set HOME_SCREEN_APP_BASE_URL.",
+                 app->display_name);
+        return false;
+    }
+
+    log_event("Downloading bundled app %s from %s.",
+              app->display_name,
+              archive_url);
+
+    const char *cache_home = getenv("XDG_CACHE_HOME");
+    char cache_root[PATH_MAX];
+    if (cache_home && cache_home[0]) {
+        snprintf(cache_root, sizeof(cache_root), "%s/outerloop/home-screen/bundled-apps", cache_home);
+    } else {
+        snprintf(cache_root, sizeof(cache_root), "%s/.cache/outerloop/home-screen/bundled-apps", home_directory());
+    }
+    if (!mkdir_p(cache_root)) {
+        snprintf(message, message_size, "Failed to create bundled app cache at %s: %s", cache_root, strerror(errno));
+        return false;
+    }
+
+    char archive_path[PATH_MAX];
+    snprintf(archive_path, sizeof(archive_path), "%s/%s.tar.gz", cache_root, app->stage_directory_name);
+
+    char quoted_archive_path[PATH_MAX + 8];
+    char quoted_cache_root[PATH_MAX + 8];
+    char quoted_archive_url[2048];
+    shell_quote(archive_path, quoted_archive_path, sizeof(quoted_archive_path));
+    shell_quote(cache_root, quoted_cache_root, sizeof(quoted_cache_root));
+    shell_quote(archive_url, quoted_archive_url, sizeof(quoted_archive_url));
+
+    char command[4096];
+    snprintf(command, sizeof(command),
+             "set -eu; "
+             "if command -v curl >/dev/null 2>&1; then "
+             "curl -fsSL -o %s %s; "
+             "elif command -v wget >/dev/null 2>&1; then "
+             "wget -qO %s %s; "
+             "else echo 'curl or wget is required' >&2; exit 127; fi; "
+             "tar -xzf %s -C %s",
+             quoted_archive_path, quoted_archive_url,
+             quoted_archive_path, quoted_archive_url,
+             quoted_archive_path, quoted_cache_root);
+
+    int status = system(command);
+    if (status != 0) {
+        log_event("Failed to download bundled app %s.", app->display_name);
+        snprintf(message, message_size, "Failed to download bundled %s from %s.",
+                 app->display_name, archive_url);
+        return false;
+    }
+
+    snprintf(out_stage_root, out_stage_root_size, "%s/%s", cache_root, app->stage_directory_name);
+    if (!bundled_app_stage_has_expected_files(app, out_stage_root)) {
+        log_event("Downloaded bundled app %s, but its payload is incomplete.", app->display_name);
+        snprintf(message, message_size, "Downloaded bundled %s, but its payload is incomplete.", app->display_name);
+        return false;
+    }
+    log_event("Downloaded bundled app %s to %s.", app->display_name, out_stage_root);
+    return true;
+}
+
+static bool resolve_bundled_app_stage_root(const BundledAppDefinition *app,
+                                           char *out_stage_root,
+                                           size_t out_stage_root_size,
+                                           char *message,
+                                           size_t message_size) {
+    bundled_app_stage_root(app, out_stage_root, out_stage_root_size);
+    if (bundled_app_stage_has_expected_files(app, out_stage_root)) {
+        return true;
+    }
+
+    const char *disable_download = getenv("BACKENDS_DISABLE_BUNDLED_APP_DOWNLOADS");
+    if (disable_download && disable_download[0]) {
+        snprintf(message, message_size, "Missing bundled %s payload at %s.", app->display_name, out_stage_root);
+        return false;
+    }
+
+    return download_bundled_app_stage(app, out_stage_root, out_stage_root_size, message, message_size);
 }
 
 static void default_registry_database_path(char *out, size_t out_size) {
@@ -1922,8 +2096,10 @@ static void send_control_response(int fd, const char *query, const char *body) {
         return;
     }
     query_value_any(query, body, "sudoPassword", sudo_password, sizeof(sudo_password));
+    log_event("Control request operation=%s serviceID=%s.", operation, service_id);
 
     if (is_home_screen_service_id(service_id)) {
+        log_event("Rejected control request for Home Screen itself: operation=%s.", operation);
         send_action_json(fd, 400, false, "Home Screen cannot stop, start, or uninstall itself.");
         return;
     }
@@ -1946,6 +2122,7 @@ static void send_control_response(int fd, const char *query, const char *body) {
             if (found && strcmp(existing_scope, "system") == 0) {
                 bool removed = uninstall_backend(service_id, sudo_password, &needs_password, message, sizeof(message));
                 if (!removed) {
+                    log_event("Failed to uninstall existing root install before reinstalling %s as user: %s", service_id, message);
                     send_action_json_ex(fd, needs_password ? 401 : 500, false, message, needs_password);
                     return;
                 }
@@ -1957,6 +2134,7 @@ static void send_control_response(int fd, const char *query, const char *body) {
                 strncmp(existing_plist, "/Library/LaunchDaemons/", 23) == 0) {
                 bool removed = uninstall_backend(service_id, sudo_password, &needs_password, message, sizeof(message));
                 if (!removed) {
+                    log_event("Failed to uninstall existing root launchd install before reinstalling %s as user: %s", service_id, message);
                     send_action_json_ex(fd, needs_password ? 401 : 500, false, message, needs_password);
                     return;
                 }
@@ -1964,6 +2142,11 @@ static void send_control_response(int fd, const char *query, const char *body) {
 #endif
         }
         bool ok = install_bundled_app(app, scope, sudo_password, &needs_password, message, sizeof(message));
+        log_event("%s bundled app %s as %s: %s",
+                  ok ? "Installed" : "Failed to install",
+                  app->service_id,
+                  scope,
+                  message);
         send_action_json_ex(fd, ok ? 200 : (needs_password ? 401 : 500), ok, message, needs_password);
         return;
     }
@@ -1972,6 +2155,7 @@ static void send_control_response(int fd, const char *query, const char *body) {
         char message[4096] = "";
         bool needs_password = false;
         bool ok = uninstall_backend(service_id, sudo_password, &needs_password, message, sizeof(message));
+        log_event("%s backend %s: %s", ok ? "Uninstalled" : "Failed to uninstall", service_id, message);
         send_action_json_ex(fd, ok ? 200 : (needs_password ? 401 : 500), ok, message, needs_password);
         return;
     }
@@ -1995,6 +2179,11 @@ static void send_control_response(int fd, const char *query, const char *body) {
                                                   strncmp(plist_path, "/Library/LaunchDaemons/", 23) == 0,
                                                   sudo_password);
         }
+        log_event("%s launchd operation %s for %s: %s",
+                  ok ? "Completed" : "Failed",
+                  operation,
+                  service_id,
+                  message);
         send_action_json_ex(fd, ok ? 200 : (needs_password ? 401 : 500), ok, message, needs_password);
         return;
     }
@@ -2014,6 +2203,12 @@ static void send_control_response(int fd, const char *query, const char *body) {
     if (ok && strcmp(operation, "stop") == 0) {
         clear_frontends_after_successful_stop(service_id, strcmp(scope, "system") == 0, sudo_password);
     }
+    log_event("%s systemd operation %s for %s (%s): %s",
+              ok ? "Completed" : "Failed",
+              operation,
+              service_id,
+              scope,
+              message);
     send_action_json_ex(fd, ok ? 200 : (needs_password ? 401 : 500), ok, message, needs_password);
 }
 
@@ -2899,7 +3094,9 @@ static bool install_bundled_app(const BundledAppDefinition *app, const char *sco
     }
 
     char stage_root[PATH_MAX];
-    bundled_app_stage_root(app, stage_root, sizeof(stage_root));
+    if (!resolve_bundled_app_stage_root(app, stage_root, sizeof(stage_root), message, message_size)) {
+        return false;
+    }
     char source_binary[PATH_MAX];
     snprintf(source_binary, sizeof(source_binary), "%s/RemoteLinuxBinaries/%s/%s", stage_root, architecture, app->binary_name);
     char source_code[PATH_MAX];
@@ -2921,8 +3118,8 @@ static bool install_bundled_app(const BundledAppDefinition *app, const char *sco
 
     char error[1024] = "";
     struct stat st;
-    bool has_source_code = source_code[0] && stat(source_code, &st) == 0 && S_ISREG(st.st_mode);
-    bool has_source_binary = !has_source_code && stat(source_binary, &st) == 0 && S_ISREG(st.st_mode);
+    bool has_source_binary = stat(source_binary, &st) == 0 && S_ISREG(st.st_mode);
+    bool has_source_code = !has_source_binary && source_code[0] && stat(source_code, &st) == 0 && S_ISREG(st.st_mode);
     if (!has_source_binary && !has_source_code) {
         snprintf(message, message_size, "Missing bundled %s binary for %s at %s.", app->display_name, architecture, source_binary);
         return false;
@@ -3713,7 +3910,9 @@ static bool install_bundled_app_macos(const BundledAppDefinition *app,
 
     bool install_as_root = scope && strcmp(scope, "system") == 0;
     char stage_root[PATH_MAX];
-    bundled_app_stage_root(app, stage_root, sizeof(stage_root));
+    if (!resolve_bundled_app_stage_root(app, stage_root, sizeof(stage_root), message, message_size)) {
+        return false;
+    }
     char source_binary[PATH_MAX];
     snprintf(source_binary, sizeof(source_binary), "%s/MacOS/%s", stage_root, app->binary_name);
     char source_bundle_arm[PATH_MAX];
@@ -4696,6 +4895,10 @@ static void send_create_response(int fd, const char *query) {
         sanitize_identifier_component(service_id, sanitized, sizeof(sanitized));
         snprintf(service_id, sizeof(service_id), "%s", sanitized);
     }
+    log_event("Create request recipe=%s serviceID=%s displayName=%s.",
+              recipe[0] ? recipe : "command",
+              service_id,
+              display_name);
 
     char unit_stem[256];
     sanitize_identifier_component(service_id, unit_stem, sizeof(unit_stem));
@@ -4976,12 +5179,14 @@ static void send_create_response(int fd, const char *query) {
     if (!started) {
         char response[4600];
         snprintf(response, sizeof(response), "Created %s, but failed to start it: %s", display_name, message);
+        log_event("Created backend %s but failed to start it: %s", service_id, message);
         send_action_json(fd, 500, false, response);
         return;
     }
 
     char response[512];
     snprintf(response, sizeof(response), "Created %s.", display_name);
+    log_event("Created and started backend %s.", service_id);
     send_action_json(fd, 200, true, response);
 }
 
@@ -5566,7 +5771,7 @@ static void run_reactor(int listener) {
 }
 
 static void usage(const char *program) {
-    fprintf(stderr, "Usage: %s [--port PORT | --socket-path PATH] [--launchd-socket-name NAME] [--bundles-dir DIR] [--bundled-apps-dir DIR] [--database PATH] [--system-database PATH]\n", program);
+    fprintf(stderr, "Usage: %s [--port PORT | --socket-path PATH] [--launchd-socket-name NAME] [--bundles-dir DIR] [--bundled-apps-dir DIR] [--app-base-url URL] [--database PATH] [--system-database PATH]\n", program);
 }
 
 int main(int argc, char **argv) {
@@ -5575,6 +5780,10 @@ int main(int argc, char **argv) {
     char socket_path[PATH_MAX] = "";
     char launchd_socket_name[128] = "Listener";
     const char *bundles_dir = "bundles";
+    const char *app_base_url = getenv("HOME_SCREEN_APP_BASE_URL");
+    if (app_base_url && app_base_url[0]) {
+        snprintf(g_bundled_apps_base_url, sizeof(g_bundled_apps_base_url), "%s", app_base_url);
+    }
     default_registry_database_path(g_registry_database_path, sizeof(g_registry_database_path));
     default_system_registry_database_path(g_system_registry_database_path, sizeof(g_system_registry_database_path));
 
@@ -5592,6 +5801,8 @@ int main(int argc, char **argv) {
             bundles_dir = argv[++i];
         } else if (strcmp(argv[i], "--bundled-apps-dir") == 0 && i + 1 < argc) {
             expand_tilde_path(argv[++i], g_bundled_apps_directory, sizeof(g_bundled_apps_directory));
+        } else if (strcmp(argv[i], "--app-base-url") == 0 && i + 1 < argc) {
+            snprintf(g_bundled_apps_base_url, sizeof(g_bundled_apps_base_url), "%s", argv[++i]);
         } else if (strcmp(argv[i], "--database") == 0 && i + 1 < argc) {
             expand_tilde_path(argv[++i], g_registry_database_path, sizeof(g_registry_database_path));
         } else if (strcmp(argv[i], "--system-database") == 0 && i + 1 < argc) {
@@ -5634,6 +5845,9 @@ int main(int argc, char **argv) {
     char resolved_bundled_apps_root[PATH_MAX];
     bundled_apps_root(resolved_bundled_apps_root, sizeof(resolved_bundled_apps_root));
     fprintf(stderr, "Bundled apps directory: %s\n", resolved_bundled_apps_root);
+    if (g_bundled_apps_base_url[0]) {
+        fprintf(stderr, "Bundled apps base URL: %s\n", g_bundled_apps_base_url);
+    }
 
     run_reactor(listener);
 

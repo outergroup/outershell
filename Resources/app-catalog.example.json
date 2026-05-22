@@ -1,0 +1,24 @@
+{
+  "apps": [
+    {
+      "serviceID": "dev.outergroup.Top",
+      "name": "Top",
+      "archiveURL": "https://example.com/home-screen/apps/Top.tar.gz"
+    },
+    {
+      "serviceID": "dev.outergroup.Files",
+      "name": "Files",
+      "archiveURL": "https://example.com/home-screen/apps/Files.tar.gz"
+    },
+    {
+      "serviceID": "dev.outergroup.NetworkInspector",
+      "name": "Network Inspector",
+      "archiveURL": "https://example.com/home-screen/apps/NetworkInspector.tar.gz"
+    },
+    {
+      "serviceID": "dev.outergroup.Firehose",
+      "name": "Firehose",
+      "archiveURL": "https://example.com/home-screen/apps/Firehose.tar.gz"
+    }
+  ]
+}

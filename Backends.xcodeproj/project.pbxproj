@@ -6,6 +6,10 @@
 	objectVersion = 77;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		37B4F9D12FA1B00100873894 /* main.c in Sources */ = {isa = PBXBuildFile; fileRef = 37B4F9D02FA1B00100873894 /* main.c */; };
+/* End PBXBuildFile section */
+
 /* Begin PBXCopyFilesBuildPhase section */
 		0F0000000000000000000011 /* Embed Frameworks */ = {
 			isa = PBXCopyFilesBuildPhase;
@@ -19,20 +23,16 @@
 		};
 /* End PBXCopyFilesBuildPhase section */
 
-/* Begin PBXBuildFile section */
-		37B4F9D12FA1B00100873894 /* main.c in Sources */ = {isa = PBXBuildFile; fileRef = 37B4F9D02FA1B00100873894 /* main.c */; };
-/* End PBXBuildFile section */
-
 /* Begin PBXFileReference section */
 		0F0000000000000000000003 /* Backends.bundle */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = Backends.bundle; sourceTree = BUILT_PRODUCTS_DIR; };
-		37B4F9CF2FA1B00100873894 /* HomeScreenBackend */ = {isa = PBXFileReference; explicitFileType = "compiled.mach-o.executable"; includeInIndex = 0; path = HomeScreenBackend; sourceTree = BUILT_PRODUCTS_DIR; };
-		37B4F9D02FA1B00100873894 /* main.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = main.c; sourceTree = "<group>"; };
 		0F0000000000000000000007 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		0F0000000000000000000008 /* README.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = README.md; sourceTree = "<group>"; };
 		0F0000000000000000000009 /* build_site.sh */ = {isa = PBXFileReference; lastKnownFileType = text.script.sh; path = build_site.sh; sourceTree = "<group>"; };
 		0F000000000000000000000A /* .gitignore */ = {isa = PBXFileReference; lastKnownFileType = text; path = .gitignore; sourceTree = "<group>"; };
 		37B4F9C12FA189AB00873894 /* AGENTS.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = AGENTS.md; sourceTree = "<group>"; };
 		37B4F9C22FA18C1E00873894 /* LICENSE */ = {isa = PBXFileReference; lastKnownFileType = text; path = LICENSE; sourceTree = "<group>"; };
+		37B4F9CF2FA1B00100873894 /* HomeScreenBackend */ = {isa = PBXFileReference; explicitFileType = "compiled.mach-o.executable"; includeInIndex = 0; path = HomeScreenBackend; sourceTree = BUILT_PRODUCTS_DIR; };
+		37B4F9D02FA1B00100873894 /* main.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = main.c; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -55,6 +55,13 @@
 
 /* Begin PBXFrameworksBuildPhase section */
 		0F0000000000000000000010 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		37B4F9D42FA1B00100873894 /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -211,16 +218,6 @@
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXSourcesBuildPhase section */
-
-/* Begin PBXFrameworksBuildPhase section */
-		37B4F9D42FA1B00100873894 /* Frameworks */ = {
-			isa = PBXFrameworksBuildPhase;
-			buildActionMask = 2147483647;
-			files = (
-			);
-			runOnlyForDeploymentPostprocessing = 0;
-		};
-/* End PBXFrameworksBuildPhase section */
 
 /* Begin XCBuildConfiguration section */
 		0F0000000000000000000013 /* Debug */ = {
@@ -419,9 +416,9 @@
 		37B4F9D62FA1B00100873894 /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
+				CODE_SIGNING_ALLOWED = YES;
 				CODE_SIGN_IDENTITY = "-";
 				CODE_SIGN_STYLE = Manual;
-				CODE_SIGNING_ALLOWED = YES;
 				CURRENT_PROJECT_VERSION = 1;
 				DEAD_CODE_STRIPPING = YES;
 				GENERATE_INFOPLIST_FILE = YES;
@@ -440,9 +437,9 @@
 		37B4F9D72FA1B00100873894 /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
+				CODE_SIGNING_ALLOWED = YES;
 				CODE_SIGN_IDENTITY = "-";
 				CODE_SIGN_STYLE = Manual;
-				CODE_SIGNING_ALLOWED = YES;
 				COPY_PHASE_STRIP = YES;
 				CURRENT_PROJECT_VERSION = 1;
 				DEAD_CODE_STRIPPING = YES;

@@ -8,7 +8,7 @@ This app will replace the old Outer Loop Services UI and the built-in log viewer
 - An inline log viewer for the selected backend
 - Start, stop, uninstall, and create flows for systemd-managed backends
 - User or root installation for bundled systemd backends
-- Bundled app installation, starting with Top
+- Starter app installation from the Home Screen app catalog
 
 ## Build
 
@@ -105,14 +105,24 @@ Override the user registry path with either `--database`, `BACKENDS_REGISTRY_DB`
   --database ~/Library/dev.outergroup.OuterLoop/registry.sqlite3
 ```
 
-## Bundled Apps
+## Starter App Catalog
 
-Backends looks for bundled app payloads in `build/run/bundled-apps` next to a local build, then in `./bundled-apps` relative to its working directory. You can override that with `--bundled-apps-dir` or `BACKENDS_BUNDLED_APPS_DIR`.
+Home Screen keeps only the starter app catalog in this repo. The catalog is
+[Resources/app-catalog.json](/Users/mrcslws/dev/src/Backends/Resources/app-catalog.json);
+each listed app owns its backend/frontend build and publishes its tarball from
+its own repo.
 
-Bundled apps use this layout:
+At runtime, Home Screen looks for app payloads in `build/run/bundled-apps` next
+to a local build, then in the directory passed with `--bundled-apps-dir` or
+`BACKENDS_BUNDLED_APPS_DIR`. If a Linux starter app payload is not present
+locally, Home Screen downloads it from the catalog URL into
+`$XDG_CACHE_HOME/outerloop/home-screen/bundled-apps` or
+`~/.cache/outerloop/home-screen/bundled-apps`.
+
+Starter app tarballs use this layout:
 
 ```text
-bundled-apps/<AppName>/
+<AppName>/
   MacOS/
     <BackendBinary>
   RemoteLinuxBinaries/
@@ -124,13 +134,35 @@ bundled-apps/<AppName>/
   app-icon.png
 ```
 
-Backends currently bundles Top, Files, Network Inspector, and Firehose on Linux/SSH, and Top on localhost macOS. `build_run.sh` builds and stages the macOS Top backend with Xcode ahead of time; install-time code only copies that prebuilt payload.
+Home Screen currently offers Top, Files, Network Inspector, and Firehose on
+Linux/SSH, and Top on localhost macOS. `build_run.sh` builds and stages the
+macOS Top payload from the `~/dev/src/Top` checkout for local testing;
+install-time code only copies that prebuilt payload.
 
 On Linux, when a bundled app is installed for the current user, Backends copies the payload into `~/.outeragent/<service id>`, writes its user systemd unit, records the backend/log metadata in the registry, and starts the service. On macOS, localhost installs copy the payload into `~/Library/dev.outergroup.OuterLoop/backends/<service id>`, write a LaunchAgent, record metadata in the registry, and start the service.
 
 Bundled apps can also be installed as root from the action menu. Root installs use a system systemd unit, copy the payload into `/opt/outergroup/<service id>`, write logs under `/var/log/outergroup`, write registry metadata to `/var/lib/outergroup/outeragent/registry.sqlite3`, and put Unix sockets under the system runtime directory, such as `/run/dev.outergroup.Top`. These operations use `sudo`; if sudo needs a password, the Backends UI prompts and retries the operation.
 
 Bundled apps register their own frontend with `outerctl` after they start. Root-installed bundled apps run `outerctl` through a small wrapper that sets `OUTERAGENT_ROOT=/var/lib/outergroup/outeragent`, so frontend and log metadata are recorded in the system registry.
+
+## Remote Distribution
+
+Home Screen can be published as a small Linux installer plus per-architecture
+archives. The generated installer installs a user systemd socket at:
+
+```text
+$XDG_RUNTIME_DIR/dev.outergroup.HomeScreen
+```
+
+and expands the matching architecture payload under:
+
+```text
+~/.outerloop/home-screen
+```
+
+See [Resources/README.md](/Users/mrcslws/dev/src/Backends/Resources/README.md)
+for the generic release asset layout. Public hosting, bucket paths, cache
+invalidations, and app catalog generation should live outside this repository.
 
 ## API
 

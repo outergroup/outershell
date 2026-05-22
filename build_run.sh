@@ -13,6 +13,7 @@ fi
 TOP_BUILD_ROOT="${TOP_BUILD_ROOT:-${RUN_ROOT}/top-build/macos}"
 TOP_OBJ_ROOT="${TOP_OBJ_ROOT:-${RUN_ROOT}/top-build/intermediates}"
 TOP_PAYLOAD_ROOT="${RUN_ROOT}/bundled-apps/Top"
+TOP_ICON_PATH="${TOP_ICON_PATH:-${TOP_PROJECT_DIR}/app-icon.png}"
 
 require_tool() {
     if ! command -v "$1" >/dev/null 2>&1; then
@@ -65,6 +66,19 @@ echo "==> Building bundled TopBackend"
     ONLY_ACTIVE_ARCH=YES \
     build
 
+echo "==> Building bundled Top content"
+/usr/bin/xcodebuild \
+    -project "${TOP_PROJECT_DIR}/Top.xcodeproj" \
+    -scheme Top \
+    -configuration "${CONFIGURATION}" \
+    SYMROOT="${TOP_BUILD_ROOT}" \
+    OBJROOT="${TOP_OBJ_ROOT}" \
+    ARCHS="arm64 x86_64" \
+    ONLY_ACTIVE_ARCH=NO \
+    CODE_SIGNING_ALLOWED=NO \
+    CODE_SIGNING_REQUIRED=NO \
+    build
+
 echo "==> Archiving BackendsContent bundles"
 "${SCRIPT_DIR}/Scripts/archive_backends_bundle.sh" \
     "${BUILD_ROOT}/${CONFIGURATION}/Backends.bundle" \
@@ -72,18 +86,20 @@ echo "==> Archiving BackendsContent bundles"
     BackendsContent.bundle
 
 echo "==> Staging bundled Top"
+if [[ ! -f "${TOP_ICON_PATH}" ]]; then
+    echo "error: Top app icon was not found at ${TOP_ICON_PATH}. Set TOP_ICON_PATH to the owning Top repo icon." >&2
+    exit 1
+fi
 install -m 0755 \
     "${TOP_BUILD_ROOT}/${CONFIGURATION}/TopBackend" \
     "${TOP_PAYLOAD_ROOT}/MacOS/TopBackend"
 install -m 0644 \
-    "${SCRIPT_DIR}/bundled-apps/Top/app-icon.png" \
+    "${TOP_ICON_PATH}" \
     "${TOP_PAYLOAD_ROOT}/app-icon.png"
-install -m 0644 \
-    "${SCRIPT_DIR}/bundled-apps/Top/bundles/TopContent.bundle.macos-arm.aar" \
-    "${TOP_PAYLOAD_ROOT}/bundles/TopContent.bundle.macos-arm.aar"
-install -m 0644 \
-    "${SCRIPT_DIR}/bundled-apps/Top/bundles/TopContent.bundle.macos-x86.aar" \
-    "${TOP_PAYLOAD_ROOT}/bundles/TopContent.bundle.macos-x86.aar"
+"${TOP_PROJECT_DIR}/Scripts/archive_top_bundle.sh" \
+    "${TOP_BUILD_ROOT}/${CONFIGURATION}/Top.bundle" \
+    "${TOP_PAYLOAD_ROOT}/bundles" \
+    TopContent.bundle
 
 ln -sf HomeScreenBackend "${BUILD_ROOT}/${CONFIGURATION}/BackendsBackend"
 ln -sf HomeScreenBackend "${BUILD_ROOT}/${CONFIGURATION}/NavigatorBackend"

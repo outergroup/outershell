@@ -36,6 +36,7 @@ BackendsBackend.*
 *.log
 *.pid
 outerloop-backends/
+Resources/RemoteLinuxBinaries/
 
 # Local config/secrets
 .env
