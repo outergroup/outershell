@@ -99,6 +99,7 @@ typedef struct {
     const char *install_directory_name;
     const char *binary_name;
     const char *bundle_prefix;
+    const char *icon_symbol_name;
     const char *icon_name;
     const char *source_name;
     const char *socket_name;
@@ -118,6 +119,7 @@ static const BundledAppDefinition kBundledApps[] = {
         .install_directory_name = "dev.outergroup.Top",
         .binary_name = "TopBackend",
         .bundle_prefix = "TopContent",
+        .icon_symbol_name = "chart.bar.xaxis",
         .icon_name = "app-icon.png",
         .source_name = "TopBackend.c",
         .socket_name = "dev.outergroup.Top",
@@ -133,6 +135,7 @@ static const BundledAppDefinition kBundledApps[] = {
         .install_directory_name = "dev.outergroup.Files",
         .binary_name = "FilesBackend",
         .bundle_prefix = "FilesContent",
+        .icon_symbol_name = "folder",
         .icon_name = "app-icon.png",
         .source_name = "FilesBackend.c",
         .socket_name = "dev.outergroup.Files",
@@ -148,6 +151,7 @@ static const BundledAppDefinition kBundledApps[] = {
         .install_directory_name = "dev.outergroup.NetworkInspector",
         .binary_name = "NetworkInspectorBackend",
         .bundle_prefix = "NetworkInspectorContent",
+        .icon_symbol_name = "network",
         .icon_name = "app-icon.png",
         .source_name = "NetworkInspectorBackend.c",
         .socket_name = "dev.outergroup.NetworkInspector",
@@ -163,6 +167,7 @@ static const BundledAppDefinition kBundledApps[] = {
         .install_directory_name = "dev.outergroup.Firehose",
         .binary_name = "FirehoseBackend",
         .bundle_prefix = "TraceContent",
+        .icon_symbol_name = "text.line.last.and.arrowtriangle.forward",
         .icon_name = "app-icon.png",
         .source_name = "TraceBackend.c",
         .socket_name = "dev.outergroup.Firehose",
@@ -915,12 +920,12 @@ static bool download_bundled_app_stage(const BundledAppDefinition *app,
     join_url_path(archive_url, sizeof(archive_url), g_bundled_apps_base_url, app->archive_name);
     if (!archive_url[0]) {
         snprintf(message, message_size,
-                 "No bundled app download URL is configured for %s. Pass --app-base-url or set HOME_SCREEN_APP_BASE_URL.",
+                 "No app download URL is configured for %s. Pass --app-base-url or set HOME_SCREEN_APP_BASE_URL.",
                  app->display_name);
         return false;
     }
 
-    log_event("Downloading bundled app %s from %s.",
+    log_event("Downloading app %s from %s.",
               app->display_name,
               archive_url);
 
@@ -932,7 +937,7 @@ static bool download_bundled_app_stage(const BundledAppDefinition *app,
         snprintf(cache_root, sizeof(cache_root), "%s/.cache/outerloop/home-screen/bundled-apps", home_directory());
     }
     if (!mkdir_p(cache_root)) {
-        snprintf(message, message_size, "Failed to create bundled app cache at %s: %s", cache_root, strerror(errno));
+        snprintf(message, message_size, "Failed to create app download cache at %s: %s", cache_root, strerror(errno));
         return false;
     }
 
@@ -961,19 +966,19 @@ static bool download_bundled_app_stage(const BundledAppDefinition *app,
 
     int status = system(command);
     if (status != 0) {
-        log_event("Failed to download bundled app %s.", app->display_name);
-        snprintf(message, message_size, "Failed to download bundled %s from %s.",
+        log_event("Failed to download app %s.", app->display_name);
+        snprintf(message, message_size, "Failed to download %s from %s.",
                  app->display_name, archive_url);
         return false;
     }
 
     snprintf(out_stage_root, out_stage_root_size, "%s/%s", cache_root, app->stage_directory_name);
     if (!bundled_app_stage_has_expected_files(app, out_stage_root)) {
-        log_event("Downloaded bundled app %s, but its payload is incomplete.", app->display_name);
-        snprintf(message, message_size, "Downloaded bundled %s, but its payload is incomplete.", app->display_name);
+        log_event("Downloaded app %s, but its payload is incomplete.", app->display_name);
+        snprintf(message, message_size, "Downloaded %s, but its payload is incomplete.", app->display_name);
         return false;
     }
-    log_event("Downloaded bundled app %s to %s.", app->display_name, out_stage_root);
+    log_event("Downloaded app %s to %s.", app->display_name, out_stage_root);
     return true;
 }
 
@@ -989,7 +994,7 @@ static bool resolve_bundled_app_stage_root(const BundledAppDefinition *app,
 
     const char *disable_download = getenv("BACKENDS_DISABLE_BUNDLED_APP_DOWNLOADS");
     if (disable_download && disable_download[0]) {
-        snprintf(message, message_size, "Missing bundled %s payload at %s.", app->display_name, out_stage_root);
+        snprintf(message, message_size, "Missing %s payload at %s.", app->display_name, out_stage_root);
         return false;
     }
 
@@ -1911,6 +1916,8 @@ static void send_backends_response(int fd) {
         ok = ok && sb_append_json_string(&builder, app->service_id);
         ok = ok && sb_append(&builder, ",\"displayName\":");
         ok = ok && sb_append_json_string(&builder, app->display_name);
+        ok = ok && sb_append(&builder, ",\"iconSymbolName\":");
+        ok = ok && sb_append_json_string(&builder, app->icon_symbol_name ? app->icon_symbol_name : "");
         ok = ok && sb_append(&builder, ",\"serviceUnit\":\"\",\"serviceUnitPath\":\"\",\"serviceScope\":\"user\",\"status\":\"available\",\"canControl\":true,\"canUninstall\":false,\"isBundled\":true,\"isInstalled\":false,\"launchdPlistPath\":\"\",\"ownsLaunchdPlist\":false,\"frontends\":[],\"logFiles\":[]}");
     }
     if (user_database) sqlite3_close(user_database);
@@ -2109,7 +2116,7 @@ static void send_control_response(int fd, const char *query, const char *body) {
         strcmp(operation, "runUser") == 0 || strcmp(operation, "installUser") == 0) {
         const BundledAppDefinition *app = bundled_app_for_service_id(service_id);
         if (!app) {
-            send_action_json(fd, 404, false, "This backend is not a bundled app.");
+            send_action_json(fd, 404, false, "This app cannot be installed by Home Screen.");
             return;
         }
         char message[4096] = "";
@@ -2142,7 +2149,7 @@ static void send_control_response(int fd, const char *query, const char *body) {
 #endif
         }
         bool ok = install_bundled_app(app, scope, sudo_password, &needs_password, message, sizeof(message));
-        log_event("%s bundled app %s as %s: %s",
+        log_event("%s app %s as %s: %s",
                   ok ? "Installed" : "Failed to install",
                   app->service_id,
                   scope,
@@ -3083,7 +3090,7 @@ static bool install_bundled_app(const BundledAppDefinition *app, const char *sco
 #else
     if (needs_password) *needs_password = false;
     if (!app) {
-        snprintf(message, message_size, "Unknown bundled app.");
+        snprintf(message, message_size, "Unknown app.");
         return false;
     }
     bool install_as_root = scope && strcmp(scope, "system") == 0;
@@ -3121,16 +3128,16 @@ static bool install_bundled_app(const BundledAppDefinition *app, const char *sco
     bool has_source_binary = stat(source_binary, &st) == 0 && S_ISREG(st.st_mode);
     bool has_source_code = !has_source_binary && source_code[0] && stat(source_code, &st) == 0 && S_ISREG(st.st_mode);
     if (!has_source_binary && !has_source_code) {
-        snprintf(message, message_size, "Missing bundled %s binary for %s at %s.", app->display_name, architecture, source_binary);
+        snprintf(message, message_size, "Missing %s binary for %s at %s.", app->display_name, architecture, source_binary);
         return false;
     }
     if (stat(source_bundle_arm, &st) != 0 || !S_ISREG(st.st_mode) ||
         stat(source_bundle_x86, &st) != 0 || !S_ISREG(st.st_mode)) {
-        snprintf(message, message_size, "Missing bundled %s content archives under %s/bundles.", app->display_name, stage_root);
+        snprintf(message, message_size, "Missing %s content archives under %s/bundles.", app->display_name, stage_root);
         return false;
     }
     if (source_icon[0] && (stat(source_icon, &st) != 0 || !S_ISREG(st.st_mode))) {
-        snprintf(message, message_size, "Missing bundled %s icon at %s.", app->display_name, source_icon);
+        snprintf(message, message_size, "Missing %s icon at %s.", app->display_name, source_icon);
         return false;
     }
 
@@ -3904,7 +3911,7 @@ static bool install_bundled_app_macos(const BundledAppDefinition *app,
                                       size_t message_size) {
     if (needs_password) *needs_password = false;
     if (!bundled_app_is_available_on_platform(app)) {
-        snprintf(message, message_size, "This bundled app is not available on localhost.");
+        snprintf(message, message_size, "This app is not available on localhost.");
         return false;
     }
 
@@ -3926,16 +3933,16 @@ static bool install_bundled_app_macos(const BundledAppDefinition *app,
 
     struct stat st;
     if (stat(source_binary, &st) != 0 || !S_ISREG(st.st_mode)) {
-        snprintf(message, message_size, "Missing bundled %s backend at %s.", app->display_name, source_binary);
+        snprintf(message, message_size, "Missing %s backend at %s.", app->display_name, source_binary);
         return false;
     }
     if (stat(source_bundle_arm, &st) != 0 || !S_ISREG(st.st_mode) ||
         stat(source_bundle_x86, &st) != 0 || !S_ISREG(st.st_mode)) {
-        snprintf(message, message_size, "Missing bundled %s content archives under %s/bundles.", app->display_name, stage_root);
+        snprintf(message, message_size, "Missing %s content archives under %s/bundles.", app->display_name, stage_root);
         return false;
     }
     if (source_icon[0] && (stat(source_icon, &st) != 0 || !S_ISREG(st.st_mode))) {
-        snprintf(message, message_size, "Missing bundled %s icon at %s.", app->display_name, source_icon);
+        snprintf(message, message_size, "Missing %s icon at %s.", app->display_name, source_icon);
         return false;
     }
 
@@ -5844,9 +5851,9 @@ int main(int argc, char **argv) {
     }
     char resolved_bundled_apps_root[PATH_MAX];
     bundled_apps_root(resolved_bundled_apps_root, sizeof(resolved_bundled_apps_root));
-    fprintf(stderr, "Bundled apps directory: %s\n", resolved_bundled_apps_root);
+    fprintf(stderr, "App payloads directory: %s\n", resolved_bundled_apps_root);
     if (g_bundled_apps_base_url[0]) {
-        fprintf(stderr, "Bundled apps base URL: %s\n", g_bundled_apps_base_url);
+        fprintf(stderr, "App payloads base URL: %s\n", g_bundled_apps_base_url);
     }
 
     run_reactor(listener);

@@ -32,6 +32,7 @@ private struct BackendRecord: Decodable {
     let canUninstall: Bool?
     let isBundled: Bool?
     let isInstalled: Bool?
+    let iconSymbolName: String?
     let launchdPlistPath: String
     let ownsLaunchdPlist: Bool
     let frontends: [FrontendRecord]
@@ -343,12 +344,14 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private let dividerLayer = CALayer()
     private let createLayer = CALayer()
     private let iconTransitionLayer = CALayer()
+    private let installOverlayLayer = CALayer()
     private let passwordOverlayLayer = CALayer()
 
     private var newButtonFrame = CGRect.zero
     private var appsToggleFrame = CGRect.zero
     private var backendsToggleFrame = CGRect.zero
     private var appCardFrames: [(frame: CGRect, item: AppLauncherItem)] = []
+    private var addAppFrame = CGRect.zero
     private var appsContentBottom: CGFloat = 0
     private var backendRowFrames: [(frame: CGRect, row: BackendListRow)] = []
     private var backendActionFrames: [(frame: CGRect, row: BackendListRow, operation: String)] = []
@@ -359,6 +362,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private var isRecordingTransitionTargets = false
     private var pendingMenuActions: [UUID: (serviceID: String, operationByItemID: [String: String])] = [:]
     private var recipeFrames: [(frame: CGRect, recipeID: String)] = []
+    private var bundledAppInstallFrames: [(frame: CGRect, backend: BackendRecord)] = []
+    private var bundledAppMenuFrames: [(frame: CGRect, backend: BackendRecord)] = []
     private var createFieldFrames: [(frame: CGRect, key: String)] = []
     private var createFieldLayouts: [String: CreateFieldLayout] = [:]
     private var createChoiceFrames: [(frame: CGRect, key: String, value: String)] = []
@@ -370,6 +375,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private var passwordSubmitFrame = CGRect.zero
     private var passwordCancelFrame = CGRect.zero
     private var passwordPanelFrame = CGRect.zero
+    private var pendingInstallBackend: BackendRecord?
+    private var installPanelFrame = CGRect.zero
+    private var installConfirmFrame = CGRect.zero
+    private var installCancelFrame = CGRect.zero
 
     private let toolbarHeight: CGFloat = 48
     private let bottomBarHeight: CGFloat = 54
@@ -689,7 +698,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             group.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
             layer.position = CGPoint(x: end.frame.midX, y: end.frame.midY)
             layer.bounds = CGRect(origin: .zero, size: end.frame.size)
-            configureLauncherIconLayer(layer, image: end.image, title: end.title, iconSize: end.frame.width)
+            configureLauncherIconLayer(layer, image: end.image, symbolName: nil, title: end.title, iconSize: end.frame.width)
             layer.cornerRadius = iconCornerRadius(for: end.frame.width)
             layer.add(group, forKey: "matchedIconTransition")
         }
@@ -998,6 +1007,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         rootLayer.addSublayer(toolbarLayer)
         rootLayer.addSublayer(contentLayer)
         rootLayer.addSublayer(iconTransitionLayer)
+        rootLayer.addSublayer(installOverlayLayer)
         rootLayer.addSublayer(passwordOverlayLayer)
         toolbarLayer.addSublayer(titleLayer)
         toolbarLayer.addSublayer(statusLayer)
@@ -1014,6 +1024,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         contentLayer.addSublayer(createLayer)
 
         titleLayer.string = ""
+        installOverlayLayer.isHidden = true
         passwordOverlayLayer.isHidden = true
 
         for layer in [titleLayer, statusLayer] {
@@ -1061,10 +1072,15 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 let toggleWidth: CGFloat = 184
                 let toggleHeight: CGFloat = 30
                 let toggleX = floor((width - toggleWidth) / 2)
-                appsToggleFrame = CGRect(x: toggleX, y: 9, width: 84, height: toggleHeight)
-                backendsToggleFrame = CGRect(x: toggleX + 86, y: 9, width: 98, height: toggleHeight)
+                let showsModeToggle = mode != .create
+                appsToggleFrame = showsModeToggle ? CGRect(x: toggleX, y: 9, width: 84, height: toggleHeight) : .zero
+                backendsToggleFrame = showsModeToggle ? CGRect(x: toggleX + 86, y: 9, width: 98, height: toggleHeight) : .zero
                 appsToggleLayer.frame = appsToggleFrame
                 backendsToggleLayer.frame = backendsToggleFrame
+                appsToggleLayer.isHidden = !showsModeToggle
+                backendsToggleLayer.isHidden = !showsModeToggle
+                appsToggleLayer.opacity = showsModeToggle ? 1 : 0
+                backendsToggleLayer.opacity = showsModeToggle ? 1 : 0
                 statusLayer.frame = CGRect(x: 152, y: 14, width: max(toggleX - 170, 1), height: 18)
 
                 let contentHeight = contentLayer.bounds.height
@@ -1123,6 +1139,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                     renderCreateForm()
                 }
                 updateStatusText()
+                renderInstallPromptIfNeeded(width: width, height: height)
                 renderPasswordPromptIfNeeded(width: width, height: height)
             }
         }
@@ -1141,12 +1158,14 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
                 titleLayer.foregroundColor = resolvedCGColor(.labelColor)
                 statusLayer.foregroundColor = resolvedCGColor(.secondaryLabelColor)
-                appsToggleLayer.applyStyle(textCGColor: resolvedCGColor(mode == .apps ? .white : .controlAccentColor),
-                                           backgroundCGColor: resolvedCGColor(mode == .apps ? .controlAccentColor : NSColor.controlAccentColor.withAlphaComponent(0.12)),
-                                           font: NSFont.systemFont(ofSize: 12, weight: .medium))
-                backendsToggleLayer.applyStyle(textCGColor: resolvedCGColor(mode == .backends || mode == .create ? .white : .controlAccentColor),
-                                               backgroundCGColor: resolvedCGColor(mode == .backends || mode == .create ? .controlAccentColor : NSColor.controlAccentColor.withAlphaComponent(0.12)),
+                if mode != .create {
+                    appsToggleLayer.applyStyle(textCGColor: resolvedCGColor(mode == .apps ? .white : .controlAccentColor),
+                                               backgroundCGColor: resolvedCGColor(mode == .apps ? .controlAccentColor : NSColor.controlAccentColor.withAlphaComponent(0.12)),
                                                font: NSFont.systemFont(ofSize: 12, weight: .medium))
+                    backendsToggleLayer.applyStyle(textCGColor: resolvedCGColor(mode == .backends ? .white : .controlAccentColor),
+                                                   backgroundCGColor: resolvedCGColor(mode == .backends ? .controlAccentColor : NSColor.controlAccentColor.withAlphaComponent(0.12)),
+                                                   font: NSFont.systemFont(ofSize: 12, weight: .medium))
+                }
                 newButtonLayer.applyStyle(textCGColor: resolvedCGColor(.white),
                                           backgroundCGColor: resolvedCGColor(.controlAccentColor),
                                           font: NSFont.systemFont(ofSize: 12, weight: .medium))
@@ -1269,6 +1288,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private func renderAppsPage() {
         appsLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
         appCardFrames.removeAll()
+        addAppFrame = .zero
         iconMatchStates.removeAll()
         textMatchStates.removeAll()
         var visibleIconKeys = Set<String>()
@@ -1284,17 +1304,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         let left = horizontalInset
         let top = max(appsLayer.bounds.height - 28, 0) + appsScroll
 
-        if items.isEmpty {
-            appsContentBottom = top
-            hideUnrenderedMatchedLayers(visibleIconKeys: visibleIconKeys, visibleTextKeys: visibleTextKeys)
-            if clampAppsScrollUsingRenderedContent() {
-                renderAppsPage()
-            }
-            return
-        }
-
         let splitGap: CGFloat = 34
-        let usesSplitLayout = contentWidth >= 760 && !iconItems.isEmpty && !listGroups.isEmpty
+        let usesSplitLayout = contentWidth >= 760 && !listGroups.isEmpty
         let appArea: CGRect
         let listArea: CGRect
         if usesSplitLayout {
@@ -1304,6 +1315,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             let appBottom = renderAppIconGrid(items: iconItems,
                                               area: appArea,
                                               top: top,
+                                              includesAddTile: true,
                                               visibleIconKeys: &visibleIconKeys,
                                               visibleTextKeys: &visibleTextKeys)
             let listBottom = renderAppListGroups(groups: listGroups,
@@ -1317,9 +1329,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             let appBottom = renderAppIconGrid(items: iconItems,
                                               area: fullArea,
                                               top: top,
+                                              includesAddTile: true,
                                               visibleIconKeys: &visibleIconKeys,
                                               visibleTextKeys: &visibleTextKeys)
-            let listTop = iconItems.isEmpty ? top : appBottom - 28
+            let listTop = listGroups.isEmpty ? appBottom : appBottom - 28
             let listBottom = renderAppListGroups(groups: listGroups,
                                                  area: fullArea,
                                                  top: listTop,
@@ -1336,9 +1349,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private func renderAppIconGrid(items: [AppLauncherItem],
                                    area: CGRect,
                                    top: CGFloat,
+                                   includesAddTile: Bool,
                                    visibleIconKeys: inout Set<String>,
                                    visibleTextKeys: inout Set<String>) -> CGFloat {
-        guard !items.isEmpty else { return top }
+        guard !items.isEmpty || includesAddTile else { return top }
 
         let itemWidth = max(min(floor(area.width / 4) - 10, 112), 86)
         let itemHeight: CGFloat = 104
@@ -1383,7 +1397,98 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             x += itemWidth + horizontalGap
         }
 
+        if includesAddTile {
+            let index = items.count
+            if index > 0 && index.isMultiple(of: columns) {
+                x = startX
+                y -= itemHeight + verticalGap
+            }
+            let frame = CGRect(x: x, y: y, width: itemWidth, height: itemHeight)
+            addAppFrame = frame
+            renderAddAppTile(frame: frame, iconSize: iconSize)
+        }
+
         return y
+    }
+
+    private func renderAddAppTile(frame: CGRect, iconSize: CGFloat) {
+        let iconFrame = CGRect(x: frame.minX + floor((frame.width - iconSize) / 2),
+                               y: frame.maxY - iconSize - 12,
+                               width: iconSize,
+                               height: iconSize)
+        let icon = CALayer()
+        icon.frame = iconFrame
+        icon.contentsGravity = .resizeAspect
+        icon.contentsScale = 2
+        icon.contents = symbolCGImage(named: "plus.square", pointSize: iconSize)
+        appsLayer.addSublayer(icon)
+
+        let title = makeTextLayer(size: 12, weight: .medium, color: .labelColor, alignment: .center, italic: true)
+        title.string = "Add app"
+        title.frame = CGRect(x: frame.minX, y: frame.minY + 10, width: frame.width, height: 28)
+        appsLayer.addSublayer(title)
+    }
+
+    private func renderAddableAppsSection(apps: [BackendRecord],
+                                          left: CGFloat,
+                                          top: CGFloat,
+                                          width: CGFloat) -> CGFloat {
+        let title = makeTextLayer(size: 13, weight: .semibold, color: .secondaryLabelColor)
+        title.string = "App Catalog"
+        title.frame = CGRect(x: left, y: top, width: width, height: 18)
+        createLayer.addSublayer(title)
+
+        let itemHeight: CGFloat = 104
+        let itemGap: CGFloat = 12
+        let itemWidth: CGFloat = 112
+        let columns = max(Int((width + itemGap) / (itemWidth + itemGap)), 1)
+        let usedWidth = CGFloat(columns) * itemWidth + CGFloat(max(columns - 1, 0)) * itemGap
+        let startX = left + max(floor((width - usedWidth) / 2), 0)
+        var x = left
+        var y = top - itemHeight - 32
+
+        for (index, app) in apps.enumerated() {
+            if index == 0 {
+                x = startX
+            } else if index.isMultiple(of: columns) {
+                x = startX
+                y -= itemHeight + itemGap
+            }
+            let frame = CGRect(x: x, y: y, width: itemWidth, height: itemHeight)
+            renderAddableAppTile(app, frame: frame)
+            x += itemWidth + itemGap
+        }
+
+        return y - 54
+    }
+
+    private func renderAddableAppTile(_ backend: BackendRecord, frame: CGRect) {
+        let iconSize: CGFloat = 50
+        let iconFrame = CGRect(x: frame.minX + floor((frame.width - iconSize) / 2),
+                               y: frame.maxY - iconSize - 12,
+                               width: iconSize,
+                               height: iconSize)
+        let icon = CALayer()
+        icon.frame = iconFrame
+        icon.cornerRadius = iconCornerRadius(for: iconSize)
+        icon.masksToBounds = true
+        icon.contentsGravity = .resizeAspect
+        icon.contentsScale = 2
+        configureLauncherIconLayer(icon,
+                                   image: nil,
+                                   symbolName: backend.iconSymbolName,
+                                   title: backend.displayName,
+                                   iconSize: iconSize)
+        createLayer.addSublayer(icon)
+
+        let name = makeTextLayer(size: 12, weight: .medium, color: .labelColor, alignment: .center)
+        name.string = backend.displayName
+        name.isWrapped = true
+        name.truncationMode = .none
+        name.frame = CGRect(x: frame.minX, y: frame.minY + 10, width: frame.width, height: 34)
+        createLayer.addSublayer(name)
+
+        bundledAppInstallFrames.append((frame, backend))
     }
 
     private func renderAppListGroups(groups: [(name: String, items: [AppLauncherItem])],
@@ -1506,14 +1611,23 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         icon.masksToBounds = true
         icon.contentsGravity = .resizeAspect
         icon.contentsScale = 2
-        configureLauncherIconLayer(icon, image: image, title: title, iconSize: iconSize)
+        configureLauncherIconLayer(icon, image: image, symbolName: nil, title: title, iconSize: iconSize)
         return icon
     }
 
-    private func configureLauncherIconLayer(_ icon: CALayer, image: NSImage?, title: String, iconSize: CGFloat) {
+    private func configureLauncherIconLayer(_ icon: CALayer,
+                                            image: NSImage?,
+                                            symbolName: String?,
+                                            title: String,
+                                            iconSize: CGFloat) {
         icon.cornerRadius = iconCornerRadius(for: iconSize)
         if let image,
            let cgImage = cgImage(for: image) {
+            icon.contents = cgImage
+            icon.backgroundColor = resolvedCGColor(.clear)
+        } else if let symbolName,
+                  !symbolName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  let cgImage = symbolAppIconCGImage(named: symbolName) {
             icon.contents = cgImage
             icon.backgroundColor = resolvedCGColor(.clear)
         } else {
@@ -1561,6 +1675,33 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         return cgImage(for: image)
     }
 
+    private func symbolAppIconCGImage(named symbolName: String) -> CGImage? {
+        let imageSize: CGFloat = 96
+        let image = NSImage(size: NSSize(width: imageSize, height: imageSize))
+        image.lockFocus()
+        withEffectiveAppearance {
+            NSColor.controlAccentColor.withAlphaComponent(0.18).setFill()
+            NSBezierPath(roundedRect: NSRect(x: 0, y: 0, width: imageSize, height: imageSize),
+                         xRadius: 22,
+                         yRadius: 22).fill()
+
+            if let symbol = NSImage(systemSymbolName: symbolName, accessibilityDescription: nil)?
+                .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 42, weight: .regular)
+                    .applying(NSImage.SymbolConfiguration(hierarchicalColor: .controlAccentColor))) {
+                let drawSize = symbol.size
+                symbol.draw(in: NSRect(x: floor((imageSize - drawSize.width) / 2),
+                                       y: floor((imageSize - drawSize.height) / 2),
+                                       width: drawSize.width,
+                                       height: drawSize.height),
+                            from: .zero,
+                            operation: .sourceOver,
+                            fraction: 1)
+            }
+        }
+        image.unlockFocus()
+        return cgImage(for: image)
+    }
+
     private func iconCornerRadius(for iconSize: CGFloat) -> CGFloat {
         iconSize >= 44 ? 13 : 5
     }
@@ -1572,7 +1713,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             iconTransitionLayer.addSublayer(layer)
         }
         if !isRecordingTransitionTargets || existingLayer == nil {
-            configureLauncherIconLayer(layer, image: image, title: title, iconSize: frame.width)
+            configureLauncherIconLayer(layer, image: image, symbolName: nil, title: title, iconSize: frame.width)
             layer.frame = frame
         }
         layer.isHidden = false
@@ -1685,6 +1826,84 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         hideUnrenderedMatchedLayers(visibleIconKeys: [], visibleTextKeys: [])
         iconMatchStates.removeAll()
         textMatchStates.removeAll()
+    }
+
+    private func renderInstallPromptIfNeeded(width: CGFloat, height: CGFloat) {
+        installOverlayLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
+        guard let backend = pendingInstallBackend else {
+            installOverlayLayer.isHidden = true
+            installPanelFrame = .zero
+            installConfirmFrame = .zero
+            installCancelFrame = .zero
+            return
+        }
+
+        installOverlayLayer.isHidden = false
+        installOverlayLayer.frame = CGRect(x: 0, y: 0, width: width, height: height)
+        installOverlayLayer.backgroundColor = resolvedCGColor(NSColor.black.withAlphaComponent(0.18))
+
+        let panelWidth = min(max(width - 48, 280), 390)
+        let panelHeight: CGFloat = 170
+        let panelFrame = CGRect(x: floor((width - panelWidth) / 2),
+                                y: floor((height - panelHeight) / 2),
+                                width: panelWidth,
+                                height: panelHeight)
+        installPanelFrame = panelFrame
+
+        let panel = CALayer()
+        panel.frame = panelFrame
+        panel.cornerRadius = 8
+        panel.borderWidth = 1
+        panel.backgroundColor = resolvedCGColor(.windowBackgroundColor)
+        panel.borderColor = resolvedCGColor(.separatorColor)
+        installOverlayLayer.addSublayer(panel)
+
+        let iconSize: CGFloat = 42
+        let icon = CALayer()
+        icon.frame = CGRect(x: 18, y: panelHeight - iconSize - 22, width: iconSize, height: iconSize)
+        icon.cornerRadius = iconCornerRadius(for: iconSize)
+        icon.masksToBounds = true
+        icon.contentsGravity = .resizeAspect
+        icon.contentsScale = 2
+        configureLauncherIconLayer(icon,
+                                   image: nil,
+                                   symbolName: backend.iconSymbolName,
+                                   title: backend.displayName,
+                                   iconSize: iconSize)
+        panel.addSublayer(icon)
+
+        let title = makeTextLayer(size: 15, weight: .semibold, color: .labelColor)
+        title.string = "Install \(backend.displayName)?"
+        title.frame = CGRect(x: 72, y: panelHeight - 42, width: panelWidth - 90, height: 20)
+        panel.addSublayer(title)
+
+        let message = makeTextLayer(size: 12, weight: .regular, color: .secondaryLabelColor)
+        message.string = "Home Screen will download, install, and start this app."
+        message.isWrapped = true
+        message.frame = CGRect(x: 72, y: panelHeight - 82, width: panelWidth - 90, height: 34)
+        panel.addSublayer(message)
+
+        let buttonY: CGFloat = 18
+        let installButtonWidth: CGFloat = 74
+        let cancelButtonWidth: CGFloat = 70
+        let installLocalFrame = CGRect(x: panelWidth - installButtonWidth - 18,
+                                       y: buttonY,
+                                       width: installButtonWidth,
+                                       height: 30)
+        let cancelLocalFrame = CGRect(x: installLocalFrame.minX - cancelButtonWidth - 8,
+                                      y: buttonY,
+                                      width: cancelButtonWidth,
+                                      height: 30)
+        installConfirmFrame = installLocalFrame.offsetBy(dx: panelFrame.minX, dy: panelFrame.minY)
+        installCancelFrame = cancelLocalFrame.offsetBy(dx: panelFrame.minX, dy: panelFrame.minY)
+
+        let cancelButton = makeButtonLayer(title: "Cancel", emphasized: false)
+        cancelButton.frame = cancelLocalFrame
+        panel.addSublayer(cancelButton)
+
+        let installButton = makeButtonLayer(title: "Install", emphasized: true)
+        installButton.frame = installLocalFrame
+        panel.addSublayer(installButton)
     }
 
     private func renderPasswordPromptIfNeeded(width: CGFloat, height: CGFloat) {
@@ -1846,42 +2065,66 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private func renderCreateForm() {
         createLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
         recipeFrames.removeAll()
+        bundledAppInstallFrames.removeAll()
+        bundledAppMenuFrames.removeAll()
         createFieldFrames.removeAll()
         createFieldLayouts.removeAll()
         createChoiceFrames.removeAll()
         createSuggestionFrames.removeAll()
 
-        let formWidth = min(max(createLayer.bounds.width - horizontalInset * 2, 1), 920)
-        let left = horizontalInset
-        let top = max(createLayer.bounds.height - 54, 0) + createScroll
+        let availableWidth = max(createLayer.bounds.width - horizontalInset * 2, 1)
+        let pageWidth = min(availableWidth, 980)
+        let left = horizontalInset + floor((availableWidth - pageWidth) / 2)
+        let top = max(createLayer.bounds.height - 58, 0) + createScroll
 
-        let title = makeTextLayer(size: 18, weight: .semibold, color: .labelColor)
-        title.string = "New Backend"
-        title.frame = CGRect(x: left, y: top, width: formWidth, height: 24)
+        let pageTitle = makeTextLayer(size: 22, weight: .semibold, color: .labelColor)
+        pageTitle.string = "Add Apps"
+        pageTitle.frame = CGRect(x: left, y: top, width: pageWidth, height: 28)
+        createLayer.addSublayer(pageTitle)
+
+        var contentTop = top - 50
+        let addableApps = bundledPlaceholderBackends()
+        if !addableApps.isEmpty {
+            contentTop = renderAddableAppsSection(apps: addableApps,
+                                                  left: left,
+                                                  top: contentTop,
+                                                  width: pageWidth)
+        }
+
+        let title = makeTextLayer(size: 13, weight: .semibold, color: .secondaryLabelColor)
+        title.string = "Command Recipes"
+        title.frame = CGRect(x: left, y: contentTop, width: pageWidth, height: 18)
         createLayer.addSublayer(title)
+
+        let subtitle = makeTextLayer(size: 12, weight: .regular, color: .secondaryLabelColor)
+        subtitle.string = "Run something that is already on this device."
+        subtitle.frame = CGRect(x: left, y: contentTop - 24, width: pageWidth, height: 18)
+        createLayer.addSublayer(subtitle)
 
         if recipes.isEmpty {
             let empty = makeTextLayer(size: 13, weight: .regular, color: .secondaryLabelColor)
             empty.string = isLoadingRecipes ? "Loading recipes..." : "No recipes loaded."
-            empty.frame = CGRect(x: left, y: top - 40, width: formWidth, height: 20)
+            empty.frame = CGRect(x: left, y: contentTop - 58, width: pageWidth, height: 20)
             createLayer.addSublayer(empty)
-            createContentBottom = top - 40
+            createContentBottom = contentTop - 58
             if clampCreateScrollUsingRenderedContent() {
                 renderCreateForm()
             }
             return
         }
 
-        let cardWidth = min((formWidth - 16) / 2, 310)
-        let cardHeight: CGFloat = 54
-        var cardX = left
-        var cardY = top - 74
+        let usesTwoPaneLayout = pageWidth >= 760
+        let paneGap: CGFloat = 22
+        let selectorWidth: CGFloat = usesTwoPaneLayout ? min(300, floor(pageWidth * 0.34)) : pageWidth
+        let detailLeft = usesTwoPaneLayout ? left + selectorWidth + paneGap : left
+        let detailWidth = usesTwoPaneLayout ? pageWidth - selectorWidth - paneGap : pageWidth
+
+        let cardHeight: CGFloat = 58
+        let listTop = contentTop - 58
+        var cardY = listTop - cardHeight
+        let cardWidth = selectorWidth
         for recipe in recipes {
-            if cardX + cardWidth > left + formWidth {
-                cardX = left
-                cardY -= cardHeight + 10
-            }
-            let frame = CGRect(x: cardX, y: cardY, width: cardWidth, height: cardHeight)
+            let frame = CGRect(x: left, y: cardY, width: cardWidth, height: cardHeight)
             recipeFrames.append((frame, recipe.identifier))
             let selected = recipe.identifier == selectedRecipeID
             let card = CALayer()
@@ -1894,37 +2137,39 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
             let name = makeTextLayer(size: 12, weight: .semibold, color: .labelColor)
             name.string = recipe.displayName
-            name.frame = CGRect(x: 10, y: 30, width: cardWidth - 20, height: 16)
+            name.frame = CGRect(x: 11, y: 33, width: cardWidth - 22, height: 16)
             card.addSublayer(name)
             let summary = makeTextLayer(size: 10, weight: .regular, color: .secondaryLabelColor)
             summary.string = recipe.summary
-            summary.frame = CGRect(x: 10, y: 10, width: cardWidth - 20, height: 14)
+            summary.frame = CGRect(x: 11, y: 12, width: cardWidth - 22, height: 14)
             card.addSublayer(summary)
-            cardX += cardWidth + 16
+            cardY -= cardHeight + 10
         }
+        let recipeListBottom = cardY + cardHeight + 10
 
         guard let recipe = selectedRecipe() else { return }
         let summary = makeTextLayer(size: 12, weight: .regular, color: .secondaryLabelColor)
         summary.string = recipe.summary
-        summary.frame = CGRect(x: left, y: cardY - 34, width: formWidth, height: 18)
+        let formTop = usesTwoPaneLayout ? listTop - 18 : recipeListBottom - 34
+        summary.frame = CGRect(x: detailLeft, y: formTop, width: detailWidth, height: 18)
         createLayer.addSublayer(summary)
 
-        var y = cardY - 92
+        var y = formTop - 58
         for field in recipe.fields {
             if field.fieldType == "choice" {
-                addCreateChoiceField(field, frame: CGRect(x: left, y: y, width: formWidth, height: 50))
+                addCreateChoiceField(field, frame: CGRect(x: detailLeft, y: y, width: detailWidth, height: 50))
                 y -= 62
             } else {
                 addCreateField(field,
                                value: createValue(for: field),
-                               frame: CGRect(x: left, y: y, width: formWidth, height: field.suggestions.isEmpty ? 46 : 68),
+                               frame: CGRect(x: detailLeft, y: y, width: detailWidth, height: field.suggestions.isEmpty ? 46 : 68),
                                monospaced: field.key == "command" || field.key == "executablePath" || field.key == "python" || field.key == "scriptPath")
                 y -= field.suggestions.isEmpty ? 62 : 84
             }
         }
 
-        createButtonFrame = CGRect(x: left, y: y + 14, width: 96, height: 30)
-        cancelCreateFrame = CGRect(x: left + 106, y: y + 14, width: 78, height: 30)
+        createButtonFrame = CGRect(x: detailLeft, y: y + 14, width: 96, height: 30)
+        cancelCreateFrame = CGRect(x: detailLeft + 106, y: y + 14, width: 78, height: 30)
         let createButton = makeButtonLayer(title: isPerformingAction ? "Creating..." : "Create", emphasized: true)
         createButton.frame = createButtonFrame
         createLayer.addSublayer(createButton)
@@ -1935,10 +2180,11 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         if !createMessage.isEmpty {
             let message = makeTextLayer(size: 12, weight: .regular, color: createMessage.hasPrefix("Created") ? .secondaryLabelColor : .systemRed)
             message.string = createMessage
-            message.frame = CGRect(x: left, y: y - 26, width: formWidth, height: 18)
+            message.frame = CGRect(x: detailLeft, y: y - 26, width: detailWidth, height: 18)
             createLayer.addSublayer(message)
         }
-        createContentBottom = !createMessage.isEmpty ? y - 26 : y + 14
+        let formBottom = !createMessage.isEmpty ? y - 26 : y + 14
+        createContentBottom = min(recipeListBottom, formBottom)
         sendCreateFieldCursorUpdate()
         if clampCreateScrollUsingRenderedContent() {
             renderCreateForm()
@@ -2278,6 +2524,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                  canUninstall: backend.canUninstall,
                                  isBundled: backend.isBundled,
                                  isInstalled: operation == "run" || operation == "install" || operation == "runUser" || operation == "installUser" || operation == "runRoot" || operation == "installRoot" ? true : backend.isInstalled,
+                                 iconSymbolName: backend.iconSymbolName,
                                  launchdPlistPath: backend.launchdPlistPath,
                                  ownsLaunchdPlist: backend.ownsLaunchdPlist,
                                  frontends: backend.frontends,
@@ -2896,9 +3143,25 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
     private func handleMouseMoved(to point: CGPoint, modifierFlags: NSEvent.ModifierFlags) {
         _ = modifierFlags
+        if pendingInstallBackend != nil {
+            setCursorIfNeeded((installConfirmFrame.contains(point) || installCancelFrame.contains(point)) ? .pointingHand : .arrow)
+            return
+        }
         let isOverCreateField = pendingPasswordAction == nil && createFieldDropPoint(point) != nil
         let isOverPasswordField = pendingPasswordAction != nil && passwordFieldFrame.contains(point)
-        setCursorIfNeeded((isOverCreateField || isOverPasswordField) ? .iBeam : .arrow)
+        var isOverBundledApp = false
+        if pendingPasswordAction == nil, mode == .create {
+            let contentPoint = contentLayer.convert(point, from: rootLayer)
+            let createPoint = createLayer.convert(contentPoint, from: contentLayer)
+            isOverBundledApp = bundledAppInstallFrames.contains { $0.frame.contains(createPoint) }
+        }
+        if isOverCreateField || isOverPasswordField {
+            setCursorIfNeeded(.iBeam)
+        } else if isOverBundledApp {
+            setCursorIfNeeded(.pointingHand)
+        } else {
+            setCursorIfNeeded(.arrow)
+        }
     }
 
     private func setCursorIfNeeded(_ cursor: PluginCursorType) {
@@ -2959,6 +3222,14 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                  modifierFlags: NSEvent.ModifierFlags = [],
                                  clickCount: Int = 1) {
         pendingCreateTextDrag = nil
+        if pendingInstallBackend != nil {
+            if installConfirmFrame.contains(point) {
+                confirmPendingInstall()
+            } else if installCancelFrame.contains(point) || !installPanelFrame.contains(point) {
+                dismissInstallPrompt()
+            }
+            return
+        }
         if pendingPasswordAction != nil {
             if passwordSubmitFrame.contains(point) {
                 submitPasswordPrompt()
@@ -2983,11 +3254,11 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         }
 
         let toolbarPoint = toolbarLayer.convert(point, from: rootLayer)
-        if appsToggleFrame.contains(toolbarPoint) {
+        if mode != .create, appsToggleFrame.contains(toolbarPoint) {
             navigateToMode(.apps, pushHistory: true)
             return
         }
-        if backendsToggleFrame.contains(toolbarPoint) {
+        if mode != .create, backendsToggleFrame.contains(toolbarPoint) {
             navigateToMode(.backends, pushHistory: true)
             return
         }
@@ -2995,6 +3266,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         let contentPoint = contentLayer.convert(point, from: rootLayer)
         if mode == .apps {
             let appsPoint = appsLayer.convert(contentPoint, from: contentLayer)
+            if addAppFrame.contains(appsPoint) {
+                navigateToMode(.create, pushHistory: true)
+                return
+            }
             if let card = appCardFrames.first(where: { $0.frame.contains(appsPoint) }) {
                 openLauncherItem(card.item, opensInNewTab: modifierFlags.contains(.command))
                 return
@@ -3039,6 +3314,14 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             }
         } else if mode == .create {
             let createPoint = createLayer.convert(contentPoint, from: contentLayer)
+            if let menu = bundledAppMenuFrames.first(where: { $0.frame.contains(createPoint) }) {
+                showBackendActionsMenu(for: menu.backend, at: point)
+                return
+            }
+            if let install = bundledAppInstallFrames.first(where: { $0.frame.contains(createPoint) }) {
+                showInstallPrompt(for: install.backend)
+                return
+            }
             if let recipeFrame = recipeFrames.first(where: { $0.frame.contains(createPoint) }) {
                 blurCreateField()
                 selectedRecipeID = recipeFrame.recipeID
@@ -3116,6 +3399,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         _ = charactersIgnoringModifiers
         _ = modifierFlags
         _ = isARepeat
+        if pendingInstallBackend != nil {
+            handleInstallPromptKeyDown(keyCode: keyCode)
+            return
+        }
         if pendingPasswordAction != nil {
             handlePasswordKeyDown(keyCode: keyCode, characters: characters)
             return
@@ -3136,6 +3423,34 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             moveSelection(delta: 1)
         case 126:
             moveSelection(delta: -1)
+        default:
+            break
+        }
+    }
+
+    private func showInstallPrompt(for backend: BackendRecord) {
+        blurCreateField()
+        pendingInstallBackend = backend
+        updateLayout()
+    }
+
+    private func dismissInstallPrompt() {
+        pendingInstallBackend = nil
+        updateLayout()
+    }
+
+    private func confirmPendingInstall() {
+        guard let backend = pendingInstallBackend else { return }
+        pendingInstallBackend = nil
+        performControlAction(for: backend, operation: "run")
+    }
+
+    private func handleInstallPromptKeyDown(keyCode: UInt16) {
+        switch keyCode {
+        case 36, 76:
+            confirmPendingInstall()
+        case 53:
+            dismissInstallPrompt()
         default:
             break
         }
@@ -3281,6 +3596,12 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         return backends.first { $0.serviceID == selectedServiceID }
     }
 
+    private func bundledPlaceholderBackends() -> [BackendRecord] {
+        backends
+            .filter { $0.isBundledPlaceholder }
+            .sorted { $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending }
+    }
+
     private func appLauncherItems() -> [AppLauncherItem] {
         backends.flatMap { backend -> [AppLauncherItem] in
             guard !backend.isBackendsSelf else { return [] }
@@ -3299,6 +3620,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
     private func backendListRows() -> [BackendListRow] {
         backends.flatMap { backend -> [BackendListRow] in
+            guard !backend.isBundledPlaceholder else { return [] }
             let parent = BackendListRow(backend: backend,
                                         frontend: nil,
                                         frontendIndex: nil,
@@ -3745,6 +4067,29 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private func cgImage(for image: NSImage) -> CGImage? {
         var rect = NSRect(origin: .zero, size: image.size)
         return image.cgImage(forProposedRect: &rect, context: nil, hints: nil)
+    }
+
+    private func symbolCGImage(named symbolName: String, pointSize: CGFloat) -> CGImage? {
+        var output: CGImage?
+        withEffectiveAppearance {
+            let scale: CGFloat = 2
+            let pixelSize = pointSize * scale
+            guard let image = NSImage(systemSymbolName: symbolName, accessibilityDescription: nil)?
+                    .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: pixelSize, weight: .regular)) else {
+                return
+            }
+            let canvas = NSImage(size: NSSize(width: pixelSize, height: pixelSize))
+            canvas.lockFocus()
+            NSColor.controlAccentColor.setFill()
+            NSRect(origin: .zero, size: canvas.size).fill()
+            image.draw(in: NSRect(origin: .zero, size: canvas.size),
+                       from: .zero,
+                       operation: .destinationIn,
+                       fraction: 1)
+            canvas.unlockFocus()
+            output = cgImage(for: canvas)
+        }
+        return output
     }
 
     private func alternatingRowColors() -> (even: CGColor, odd: CGColor) {
