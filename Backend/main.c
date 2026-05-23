@@ -84,6 +84,15 @@ typedef struct {
 } SystemdStatusEntry;
 
 typedef struct {
+    char name[NAME_MAX + 1];
+    char path[PATH_MAX];
+    bool is_directory;
+    uint64_t size;
+    double modified;
+    mode_t mode;
+} FilePickerEntry;
+
+typedef struct {
     SystemdStatusEntry entries[MAX_SYSTEMD_STATUS_ENTRIES];
     size_t count;
     int64_t refreshed_at_ms;
@@ -2444,6 +2453,184 @@ static bool query_value_or_default(const char *query, const char *name, const ch
     if (query_value(query, name, dst, dst_size)) return true;
     snprintf(dst, dst_size, "%s", default_value ? default_value : "");
     return false;
+}
+
+static void parent_path_for(const char *path, char *parent, size_t parent_size) {
+    char copy[PATH_MAX];
+    snprintf(copy, sizeof(copy), "%s", path && path[0] ? path : "/");
+    size_t len = strlen(copy);
+    while (len > 1 && copy[len - 1] == '/') {
+        copy[--len] = '\0';
+    }
+    char *slash = strrchr(copy, '/');
+    if (!slash || slash == copy) {
+        snprintf(parent, parent_size, "/");
+        return;
+    }
+    *slash = '\0';
+    snprintf(parent, parent_size, "%s", copy);
+}
+
+static bool join_child_path(const char *directory, const char *name, char *out, size_t out_size) {
+    int written;
+    if (strcmp(directory, "/") == 0) {
+        written = snprintf(out, out_size, "/%s", name);
+    } else {
+        written = snprintf(out, out_size, "%s/%s", directory, name);
+    }
+    return written >= 0 && (size_t)written < out_size;
+}
+
+static bool path_has_extension(const char *name, const char *extension) {
+    if (!extension || !extension[0]) return true;
+    char expected[64];
+    const char *dot_extension = extension;
+    if (extension[0] != '.') {
+        snprintf(expected, sizeof(expected), ".%s", extension);
+        dot_extension = expected;
+    }
+    size_t name_len = strlen(name);
+    size_t extension_len = strlen(dot_extension);
+    return name_len >= extension_len && strcasecmp(name + name_len - extension_len, dot_extension) == 0;
+}
+
+static int compare_file_picker_entries(const void *lhs, const void *rhs) {
+    const FilePickerEntry *a = (const FilePickerEntry *)lhs;
+    const FilePickerEntry *b = (const FilePickerEntry *)rhs;
+    if (a->is_directory != b->is_directory) {
+        return a->is_directory ? -1 : 1;
+    }
+    return strcasecmp(a->name, b->name);
+}
+
+static bool append_file_picker_entry_json(StringBuilder *builder, const FilePickerEntry *entry) {
+    char number[64];
+    if (!sb_append(builder, "{\"name\":")) return false;
+    if (!sb_append_json_string(builder, entry->name)) return false;
+    if (!sb_append(builder, ",\"path\":")) return false;
+    if (!sb_append_json_string(builder, entry->path)) return false;
+    if (!sb_append(builder, ",\"isDirectory\":")) return false;
+    if (!sb_append(builder, entry->is_directory ? "true" : "false")) return false;
+    snprintf(number, sizeof(number), ",\"size\":%llu", (unsigned long long)entry->size);
+    if (!sb_append(builder, number)) return false;
+    snprintf(number, sizeof(number), ",\"modified\":%.3f", entry->modified);
+    if (!sb_append(builder, number)) return false;
+    return sb_append(builder, "}");
+}
+
+static void send_file_picker_response(int fd, const char *query) {
+    char requested[PATH_MAX] = "";
+    char extension[64] = "";
+    char directories_only_raw[16] = "";
+    char path[PATH_MAX];
+    query_value(query, "path", requested, sizeof(requested));
+    query_value(query, "extension", extension, sizeof(extension));
+    query_value(query, "directoriesOnly", directories_only_raw, sizeof(directories_only_raw));
+    bool directories_only = strcmp(directories_only_raw, "1") == 0 ||
+                            strcasecmp(directories_only_raw, "true") == 0;
+    expand_tilde_path(requested[0] ? requested : "~", path, sizeof(path));
+
+    DIR *dir = opendir(path);
+    if (!dir && directories_only) {
+        char candidate[PATH_MAX];
+        snprintf(candidate, sizeof(candidate), "%s", path);
+        while (strcmp(candidate, "/") != 0) {
+            char parent[PATH_MAX];
+            parent_path_for(candidate, parent, sizeof(parent));
+            if (strcmp(parent, candidate) == 0) {
+                break;
+            }
+            DIR *parent_dir = opendir(parent);
+            if (parent_dir) {
+                snprintf(path, sizeof(path), "%s", parent);
+                dir = parent_dir;
+                break;
+            }
+            snprintf(candidate, sizeof(candidate), "%s", parent);
+        }
+    }
+    if (!dir) {
+        char message[PATH_MAX + 64];
+        snprintf(message, sizeof(message), "failed to open %s: %s\n", path, strerror(errno));
+        send_text_response(fd, 404, message);
+        return;
+    }
+
+    FilePickerEntry *entries = NULL;
+    size_t count = 0;
+    size_t capacity = 0;
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
+            continue;
+        }
+
+        char child_path[PATH_MAX];
+        if (!join_child_path(path, entry->d_name, child_path, sizeof(child_path))) {
+            continue;
+        }
+
+        struct stat st;
+        if (stat(child_path, &st) != 0 && lstat(child_path, &st) != 0) {
+            continue;
+        }
+        bool is_directory = S_ISDIR(st.st_mode);
+        if (directories_only && !is_directory) {
+            continue;
+        }
+        if (!is_directory && !path_has_extension(entry->d_name, extension)) {
+            continue;
+        }
+
+        if (count == capacity) {
+            size_t new_capacity = capacity ? capacity * 2 : 64;
+            FilePickerEntry *new_entries = realloc(entries, new_capacity * sizeof(FilePickerEntry));
+            if (!new_entries) {
+                free(entries);
+                closedir(dir);
+                send_text_response(fd, 500, "out of memory\n");
+                return;
+            }
+            entries = new_entries;
+            capacity = new_capacity;
+        }
+
+        FilePickerEntry *file = &entries[count++];
+        memset(file, 0, sizeof(*file));
+        snprintf(file->name, sizeof(file->name), "%s", entry->d_name);
+        snprintf(file->path, sizeof(file->path), "%s", child_path);
+        file->is_directory = is_directory;
+        file->size = (uint64_t)st.st_size;
+        file->modified = (double)st.st_mtime;
+        file->mode = st.st_mode;
+    }
+    closedir(dir);
+
+    qsort(entries, count, sizeof(FilePickerEntry), compare_file_picker_entries);
+
+    char parent[PATH_MAX];
+    parent_path_for(path, parent, sizeof(parent));
+
+    StringBuilder builder = {0};
+    bool ok = sb_append(&builder, "{\"path\":") &&
+              sb_append_json_string(&builder, path) &&
+              sb_append(&builder, ",\"parent\":") &&
+              sb_append_json_string(&builder, parent) &&
+              sb_append(&builder, ",\"entries\":[");
+    for (size_t i = 0; ok && i < count; i++) {
+        if (i > 0) ok = sb_append(&builder, ",");
+        if (ok) ok = append_file_picker_entry_json(&builder, &entries[i]);
+    }
+    ok = ok && sb_append(&builder, "]}");
+    free(entries);
+
+    if (!ok) {
+        free(builder.data);
+        send_text_response(fd, 500, "out of memory\n");
+        return;
+    }
+    send_response(fd, 200, "OK", "application/json; charset=utf-8", builder.data, builder.length);
+    free(builder.data);
 }
 
 static bool valid_port_text(const char *value) {
@@ -5284,7 +5471,7 @@ static void send_logs_response(int fd, const char *query) {
 }
 
 static void send_outer_descriptor(int fd) {
-    const char *plugin_json = "{\"backendsAPIPath\":\"/api/backends\",\"logsAPIPath\":\"/api/logs\",\"controlAPIPath\":\"/api/control\",\"createAPIPath\":\"/api/create\",\"recipesAPIPath\":\"/api/recipes\"}";
+    const char *plugin_json = "{\"backendsAPIPath\":\"/api/backends\",\"logsAPIPath\":\"/api/logs\",\"controlAPIPath\":\"/api/control\",\"createAPIPath\":\"/api/create\",\"recipesAPIPath\":\"/api/recipes\",\"filePickerAPIPath\":\"/api/file-picker\"}";
     size_t path_len = strlen(kBundleUrlPath);
     size_t plugin_len = strlen(plugin_json);
     size_t header_len = 40;
@@ -5475,6 +5662,8 @@ static void process_client_request(int fd, char *request, size_t n) {
         send_logs_response(fd, query);
     } else if (strcmp(target, "/api/recipes") == 0) {
         send_recipes_response(fd);
+    } else if (strcmp(target, "/api/file-picker") == 0) {
+        send_file_picker_response(fd, query);
     } else {
         send_text_response(fd, 404, "not found\n");
     }

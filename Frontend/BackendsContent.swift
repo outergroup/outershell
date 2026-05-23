@@ -152,6 +152,20 @@ private struct RecipeChoiceRecord: Decodable {
     let value: String
 }
 
+private struct FilePickerResponse: Decodable {
+    let path: String
+    let parent: String
+    let entries: [FilePickerEntryRecord]
+}
+
+private struct FilePickerEntryRecord: Decodable {
+    let name: String
+    let path: String
+    let isDirectory: Bool
+    let size: UInt64
+    let modified: Double
+}
+
 private struct LogSelection: Equatable {
     let serviceID: String
     let logIndex: Int
@@ -246,6 +260,24 @@ private struct PendingCreateTextDrag {
     let selectedText: String
 }
 
+private enum FilePickerMode {
+    case saveFile
+    case chooseDirectory
+}
+
+private struct PendingFilePicker {
+    let mode: FilePickerMode
+    let recipeID: String?
+    let targetFieldKey: String?
+    let fileExtension: String
+    var directory: String
+    var parent: String
+    var filename: String
+    var entries: [FilePickerEntryRecord]
+    var isLoading: Bool
+    var error: String
+}
+
 @MainActor
 private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLineTextInputControllerDelegate {
     private let outerframeHost: OuterframeHost
@@ -259,6 +291,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private var controlEndpoint: URL?
     private var createEndpoint: URL?
     private var recipesEndpoint: URL?
+    private var filePickerEndpoint: URL?
     private var pollTimer: Timer?
     private var didRegisterLayer = false
 
@@ -291,7 +324,13 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         )
         controller.delegate = self
         controller.onSubmit = { [weak self] in
-            Task { @MainActor in self?.submitCreateForm() }
+            Task { @MainActor in
+                if self?.pendingFilePicker != nil {
+                    self?.confirmFilePickerSave()
+                } else {
+                    self?.submitCreateForm()
+                }
+            }
         }
         return controller
     }()
@@ -326,6 +365,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }()
     private var sudoPasswordInput = ""
     private var sudoPasswordMessage = ""
+    private var pendingFilePicker: PendingFilePicker?
+    private static let filePickerFilenameKey = "__filePickerFilename"
 
     private let rootLayer = CALayer()
     private let toolbarLayer = CALayer()
@@ -346,6 +387,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private let iconTransitionLayer = CALayer()
     private let installOverlayLayer = CALayer()
     private let passwordOverlayLayer = CALayer()
+    private let filePickerOverlayLayer = CALayer()
 
     private var newButtonFrame = CGRect.zero
     private var appsToggleFrame = CGRect.zero
@@ -368,6 +410,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private var createFieldLayouts: [String: CreateFieldLayout] = [:]
     private var createChoiceFrames: [(frame: CGRect, key: String, value: String)] = []
     private var createSuggestionFrames: [(frame: CGRect, key: String, value: String)] = []
+    private var createDirectorySelectFrames: [(frame: CGRect, key: String)] = []
     private var createButtonFrame = CGRect.zero
     private var cancelCreateFrame = CGRect.zero
     private var passwordFieldFrame = CGRect.zero
@@ -379,6 +422,14 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private var installPanelFrame = CGRect.zero
     private var installConfirmFrame = CGRect.zero
     private var installCancelFrame = CGRect.zero
+    private var filePickerPanelFrame = CGRect.zero
+    private var filePickerEntryFrames: [(frame: CGRect, entry: FilePickerEntryRecord)] = []
+    private var filePickerFilenameFrame = CGRect.zero
+    private var filePickerSaveFrame = CGRect.zero
+    private var filePickerCancelFrame = CGRect.zero
+    private var filePickerListFrame = CGRect.zero
+    private var filePickerContentHeight: CGFloat = 0
+    private var filePickerScroll: CGFloat = 0
 
     private let toolbarHeight: CGFloat = 48
     private let bottomBarHeight: CGFloat = 54
@@ -545,6 +596,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             controlEndpoint = URL(string: "/api/control", relativeTo: base)?.absoluteURL
             createEndpoint = URL(string: "/api/create", relativeTo: base)?.absoluteURL
             recipesEndpoint = URL(string: "/api/recipes", relativeTo: base)?.absoluteURL
+            filePickerEndpoint = URL(string: "/api/file-picker", relativeTo: base)?.absoluteURL
         }
         let configuration = URLSessionConfiguration.ephemeral
         configuration.timeoutIntervalForRequest = 20
@@ -1022,10 +1074,12 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         contentLayer.addSublayer(logHeaderLayer)
         contentLayer.addSublayer(logRowsClipLayer)
         contentLayer.addSublayer(createLayer)
+        createLayer.addSublayer(filePickerOverlayLayer)
 
         titleLayer.string = ""
         installOverlayLayer.isHidden = true
         passwordOverlayLayer.isHidden = true
+        filePickerOverlayLayer.isHidden = true
 
         for layer in [titleLayer, statusLayer] {
             layer.contentsScale = 2
@@ -1438,14 +1492,14 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         title.frame = CGRect(x: left, y: top, width: width, height: 18)
         createLayer.addSublayer(title)
 
-        let itemHeight: CGFloat = 104
+        let itemHeight: CGFloat = 94
         let itemGap: CGFloat = 12
         let itemWidth: CGFloat = 112
         let columns = max(Int((width + itemGap) / (itemWidth + itemGap)), 1)
         let usedWidth = CGFloat(columns) * itemWidth + CGFloat(max(columns - 1, 0)) * itemGap
         let startX = left + max(floor((width - usedWidth) / 2), 0)
         var x = left
-        var y = top - itemHeight - 32
+        var y = top - itemHeight - 22
 
         for (index, app) in apps.enumerated() {
             if index == 0 {
@@ -1459,33 +1513,32 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             x += itemWidth + itemGap
         }
 
-        return y - 54
+        return y - 34
     }
 
     private func renderAddableAppTile(_ backend: BackendRecord, frame: CGRect) {
-        let iconSize: CGFloat = 50
+        let iconSize: CGFloat = 46
         let iconFrame = CGRect(x: frame.minX + floor((frame.width - iconSize) / 2),
-                               y: frame.maxY - iconSize - 12,
+                               y: frame.maxY - iconSize - 8,
                                width: iconSize,
                                height: iconSize)
         let icon = CALayer()
         icon.frame = iconFrame
-        icon.cornerRadius = iconCornerRadius(for: iconSize)
-        icon.masksToBounds = true
         icon.contentsGravity = .resizeAspect
         icon.contentsScale = 2
-        configureLauncherIconLayer(icon,
-                                   image: nil,
-                                   symbolName: backend.iconSymbolName,
-                                   title: backend.displayName,
-                                   iconSize: iconSize)
+        if let symbolName = backend.iconSymbolName,
+           !symbolName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            icon.contents = symbolCGImage(named: symbolName, pointSize: iconSize)
+        } else {
+            icon.contents = letterIconCGImage(for: backend.displayName)
+        }
         createLayer.addSublayer(icon)
 
         let name = makeTextLayer(size: 12, weight: .medium, color: .labelColor, alignment: .center)
         name.string = backend.displayName
         name.isWrapped = true
         name.truncationMode = .none
-        name.frame = CGRect(x: frame.minX, y: frame.minY + 10, width: frame.width, height: 34)
+        name.frame = CGRect(x: frame.minX, y: frame.minY + 6, width: frame.width, height: 32)
         createLayer.addSublayer(name)
 
         bundledAppInstallFrames.append((frame, backend))
@@ -1878,7 +1931,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         panel.addSublayer(title)
 
         let message = makeTextLayer(size: 12, weight: .regular, color: .secondaryLabelColor)
-        message.string = "Home Screen will download, install, and start this app."
+        message.string = "Home Screen will download this app and run it as a service."
         message.isWrapped = true
         message.frame = CGRect(x: 72, y: panelHeight - 82, width: panelWidth - 90, height: 34)
         panel.addSublayer(message)
@@ -2004,6 +2057,189 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         sendPasswordFieldCursorUpdate()
     }
 
+    private func renderFilePickerIfNeeded(width: CGFloat, height: CGFloat) {
+        filePickerOverlayLayer.removeFromSuperlayer()
+        createLayer.addSublayer(filePickerOverlayLayer)
+        filePickerOverlayLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
+        filePickerEntryFrames.removeAll()
+        guard let picker = pendingFilePicker else {
+            filePickerOverlayLayer.isHidden = true
+            filePickerPanelFrame = .zero
+            filePickerFilenameFrame = .zero
+            filePickerSaveFrame = .zero
+            filePickerCancelFrame = .zero
+            filePickerListFrame = .zero
+            filePickerContentHeight = 0
+            return
+        }
+
+        filePickerOverlayLayer.isHidden = false
+        filePickerOverlayLayer.frame = CGRect(x: 0, y: 0, width: width, height: height)
+        filePickerOverlayLayer.backgroundColor = resolvedCGColor(NSColor.black.withAlphaComponent(0.18))
+
+        let panelWidth = min(max(width - 48, 460), 760)
+        let panelHeight = min(max(height - 48, 340), 540)
+        let panelFrame = CGRect(x: floor((width - panelWidth) / 2),
+                                y: floor((height - panelHeight) / 2),
+                                width: panelWidth,
+                                height: panelHeight)
+        filePickerPanelFrame = panelFrame
+
+        let isSaveFile = picker.mode == .saveFile
+        let bottomControlsHeight: CGFloat = isSaveFile ? 86 : 52
+        let buttonTitle = isSaveFile ? "Save" : "Choose"
+        let panel = CALayer()
+        panel.frame = panelFrame
+        panel.cornerRadius = 8
+        panel.borderWidth = 1
+        panel.backgroundColor = resolvedCGColor(.windowBackgroundColor)
+        panel.borderColor = resolvedCGColor(.separatorColor)
+        filePickerOverlayLayer.addSublayer(panel)
+
+        let title = makeTextLayer(size: 15, weight: .semibold, color: .labelColor)
+        title.string = isSaveFile ? "Save Script" : "Choose Folder"
+        title.frame = CGRect(x: 18, y: panelHeight - 38, width: panelWidth - 36, height: 20)
+        panel.addSublayer(title)
+
+        let path = makeTextLayer(size: 12, weight: .regular, color: .secondaryLabelColor, monospaced: true)
+        path.string = picker.directory
+        path.frame = CGRect(x: 18, y: panelHeight - 62, width: panelWidth - 36, height: 17)
+        panel.addSublayer(path)
+
+        let listFrame = CGRect(x: 18, y: bottomControlsHeight, width: panelWidth - 36, height: max(panelHeight - bottomControlsHeight - 84, 80))
+        filePickerListFrame = listFrame.offsetBy(dx: panelFrame.minX, dy: panelFrame.minY)
+        let list = CALayer()
+        list.frame = listFrame
+        list.cornerRadius = 6
+        list.borderWidth = 1
+        list.borderColor = resolvedCGColor(.separatorColor)
+        list.backgroundColor = resolvedCGColor(NSColor.controlBackgroundColor.withAlphaComponent(0.35))
+        list.masksToBounds = true
+        panel.addSublayer(list)
+
+        let rowHeight: CGFloat = 28
+        let parentEntry = FilePickerEntryRecord(name: "..", path: picker.parent, isDirectory: true, size: 0, modified: 0)
+        let allEntries = [parentEntry] + picker.entries
+        filePickerContentHeight = CGFloat(allEntries.count) * rowHeight
+        let maxPickerScroll = max(filePickerContentHeight - listFrame.height, 0)
+        filePickerScroll = min(max(filePickerScroll, 0), maxPickerScroll)
+
+        if picker.isLoading {
+            let loading = makeTextLayer(size: 12, weight: .regular, color: .secondaryLabelColor, alignment: .center)
+            loading.string = "Loading..."
+            loading.frame = CGRect(x: 0, y: max((listFrame.height - 18) / 2, 0), width: listFrame.width, height: 18)
+            list.addSublayer(loading)
+        } else if !picker.error.isEmpty {
+            let error = makeTextLayer(size: 12, weight: .regular, color: .systemRed, alignment: .center)
+            error.string = picker.error
+            error.frame = CGRect(x: 10, y: max((listFrame.height - 18) / 2, 0), width: listFrame.width - 20, height: 18)
+            list.addSublayer(error)
+        } else {
+            let visibleStart = max(Int(floor(filePickerScroll / rowHeight)), 0)
+            let visibleEnd = min(allEntries.count, visibleStart + Int(ceil(listFrame.height / rowHeight)) + 2)
+            for index in visibleStart..<visibleEnd {
+                let entry = allEntries[index]
+                let rowY = listFrame.height - CGFloat(index) * rowHeight + filePickerScroll - rowHeight
+                renderFilePickerRow(entry, in: list, localFrame: CGRect(x: 0, y: rowY, width: listFrame.width, height: rowHeight), panelFrame: panelFrame, listFrame: listFrame)
+            }
+        }
+
+        if isSaveFile {
+            let filenameLabel = makeTextLayer(size: 11, weight: .medium, color: .secondaryLabelColor)
+            filenameLabel.string = "Filename"
+            filenameLabel.frame = CGRect(x: 18, y: 62, width: panelWidth - 36, height: 14)
+            panel.addSublayer(filenameLabel)
+
+            let fieldFrame = CGRect(x: 18, y: 28, width: max(panelWidth - 18 - 18 - 156, 120), height: 30)
+            filePickerFilenameFrame = fieldFrame.offsetBy(dx: panelFrame.minX, dy: panelFrame.minY)
+            createFieldFrames.append((filePickerFilenameFrame, Self.filePickerFilenameKey))
+            let textFrame = CGRect(x: filePickerFilenameFrame.minX + 9,
+                                   y: filePickerFilenameFrame.minY + 7,
+                                   width: max(filePickerFilenameFrame.width - 18, 1),
+                                   height: 16)
+            createFieldLayouts[Self.filePickerFilenameKey] = CreateFieldLayout(fieldFrame: filePickerFilenameFrame,
+                                                                               textFrame: textFrame,
+                                                                               key: Self.filePickerFilenameKey,
+                                                                               monospaced: true)
+
+            let field = CALayer()
+            field.frame = fieldFrame
+            field.cornerRadius = 5
+            field.masksToBounds = true
+            let focused = createInputController.isFocused && activeCreateFieldKey == Self.filePickerFilenameKey
+            field.borderWidth = focused ? 1.5 : 1
+            field.borderColor = focused ? resolvedCGColor(.keyboardFocusIndicatorColor) : resolvedCGColor(.separatorColor)
+            field.backgroundColor = resolvedCGColor(.textBackgroundColor)
+            panel.addSublayer(field)
+
+            let filenameValue = picker.filename
+            if focused,
+               let selectionRange = createInputController.selectionRange,
+               !filenameValue.isEmpty {
+                let line = makeCreateFieldLine(for: filenameValue, monospaced: true)
+                let offsets = selectionOffsets(line: line,
+                                               text: filenameValue,
+                                               range: selectionRange,
+                                               maxWidth: max(fieldFrame.width - 18, 1))
+                let selectionWidth = max(0, offsets.end - offsets.start)
+                if selectionWidth > 0.5 {
+                    let selection = CALayer()
+                    selection.frame = CGRect(x: 9 + offsets.start,
+                                             y: 6,
+                                             width: selectionWidth,
+                                             height: 18)
+                    selection.backgroundColor = resolvedCGColor(windowIsActive ? .selectedTextBackgroundColor : .unemphasizedSelectedTextBackgroundColor)
+                    field.addSublayer(selection)
+                }
+            }
+
+            let filenameText = makeTextLayer(size: 12, weight: .regular, color: picker.filename.isEmpty ? .tertiaryLabelColor : .labelColor, monospaced: true)
+            filenameText.string = picker.filename.isEmpty ? defaultScriptFilename(for: picker.recipeID ?? "", extension: picker.fileExtension) : picker.filename
+            filenameText.frame = CGRect(x: 9, y: 7, width: max(fieldFrame.width - 18, 1), height: 16)
+            field.addSublayer(filenameText)
+        } else {
+            filePickerFilenameFrame = .zero
+        }
+
+        let saveLocal = CGRect(x: panelWidth - 18 - 66, y: 28, width: 66, height: 30)
+        let cancelLocal = CGRect(x: saveLocal.minX - 78, y: 28, width: 70, height: 30)
+        filePickerSaveFrame = saveLocal.offsetBy(dx: panelFrame.minX, dy: panelFrame.minY)
+        filePickerCancelFrame = cancelLocal.offsetBy(dx: panelFrame.minX, dy: panelFrame.minY)
+
+        let cancel = makeButtonLayer(title: "Cancel", emphasized: false)
+        cancel.frame = cancelLocal
+        panel.addSublayer(cancel)
+        let save = makeButtonLayer(title: buttonTitle, emphasized: true)
+        save.frame = saveLocal
+        panel.addSublayer(save)
+        sendCreateFieldCursorUpdate()
+    }
+
+    private func renderFilePickerRow(_ entry: FilePickerEntryRecord,
+                                     in list: CALayer,
+                                     localFrame: CGRect,
+                                     panelFrame: CGRect,
+                                     listFrame: CGRect) {
+        filePickerEntryFrames.append((localFrame.offsetBy(dx: panelFrame.minX + listFrame.minX,
+                                                          dy: panelFrame.minY + listFrame.minY),
+                                      entry))
+        let row = CALayer()
+        row.frame = localFrame
+        list.addSublayer(row)
+
+        let icon = CALayer()
+        icon.frame = CGRect(x: 22, y: 6, width: 16, height: 16)
+        icon.contentsGravity = .resizeAspect
+        icon.contentsScale = 2
+        icon.contents = symbolCGImage(named: entry.isDirectory ? "folder" : "doc", pointSize: 15)
+        row.addSublayer(icon)
+
+        let name = makeTextLayer(size: 12, weight: .regular, color: .labelColor)
+        name.string = entry.name
+        name.frame = CGRect(x: 58, y: 6, width: max(localFrame.width - 70, 1), height: 16)
+        row.addSublayer(name)
+    }
+
     private func renderLogHeader() {
         logHeaderLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
         let backend = selectedBackend()
@@ -2071,6 +2307,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         createFieldLayouts.removeAll()
         createChoiceFrames.removeAll()
         createSuggestionFrames.removeAll()
+        createDirectorySelectFrames.removeAll()
 
         let availableWidth = max(createLayer.bounds.width - horizontalInset * 2, 1)
         let pageWidth = min(availableWidth, 980)
@@ -2155,7 +2392,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         createLayer.addSublayer(summary)
 
         var y = formTop - 58
-        for field in recipe.fields {
+        for field in visibleCreateFields(for: recipe) {
             if field.fieldType == "choice" {
                 addCreateChoiceField(field, frame: CGRect(x: detailLeft, y: y, width: detailWidth, height: 50))
                 y -= 62
@@ -2163,7 +2400,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 addCreateField(field,
                                value: createValue(for: field),
                                frame: CGRect(x: detailLeft, y: y, width: detailWidth, height: field.suggestions.isEmpty ? 46 : 68),
-                               monospaced: field.key == "command" || field.key == "executablePath" || field.key == "python" || field.key == "scriptPath")
+                               monospaced: field.key == "command" || field.key == "executablePath" || field.key == "python")
                 y -= field.suggestions.isEmpty ? 62 : 84
             }
         }
@@ -2189,6 +2426,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         if clampCreateScrollUsingRenderedContent() {
             renderCreateForm()
         }
+        renderFilePickerIfNeeded(width: createLayer.bounds.width, height: createLayer.bounds.height)
     }
 
     private func addCreateField(_ field: RecipeFieldRecord,
@@ -2200,7 +2438,11 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         labelLayer.frame = CGRect(x: frame.minX, y: frame.maxY - 16, width: frame.width, height: 14)
         createLayer.addSublayer(labelLayer)
 
-        let boxFrame = CGRect(x: frame.minX, y: frame.minY, width: frame.width, height: 30)
+        let hasDirectoryPicker = field.fieldType == "directory"
+        let selectButtonWidth: CGFloat = 68
+        let selectGap: CGFloat = 8
+        let boxWidth = hasDirectoryPicker ? max(frame.width - selectButtonWidth - selectGap, 120) : frame.width
+        let boxFrame = CGRect(x: frame.minX, y: frame.minY, width: boxWidth, height: 30)
         createFieldFrames.append((boxFrame, field.key))
         let textFrame = CGRect(x: boxFrame.minX + 9, y: boxFrame.minY + 7, width: max(boxFrame.width - 18, 1), height: 16)
         createFieldLayouts[field.key] = CreateFieldLayout(fieldFrame: boxFrame,
@@ -2241,6 +2483,17 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         text.string = value.isEmpty ? field.placeholder : value
         text.frame = CGRect(x: 9, y: 7, width: max(boxFrame.width - 18, 1), height: 16)
         box.addSublayer(text)
+
+        if hasDirectoryPicker {
+            let selectFrame = CGRect(x: boxFrame.maxX + selectGap,
+                                     y: frame.minY,
+                                     width: min(selectButtonWidth, max(frame.maxX - boxFrame.maxX - selectGap, 1)),
+                                     height: 30)
+            createDirectorySelectFrames.append((selectFrame, field.key))
+            let selectButton = makeButtonLayer(title: "Select", emphasized: false)
+            selectButton.frame = selectFrame
+            createLayer.addSublayer(selectButton)
+        }
 
         if !field.suggestions.isEmpty {
             var chipX = frame.minX
@@ -2572,7 +2825,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             updateLayout()
             return
         }
-        let missing = recipe.fields.first { field in
+        let missing = visibleCreateFields(for: recipe).first { field in
             let value = createValue(for: field).trimmingCharacters(in: .whitespacesAndNewlines)
             if field.key == "port" { return false }
             return value.isEmpty && field.defaultValue.isEmpty
@@ -2582,7 +2835,15 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             updateLayout()
             return
         }
+        if needsScriptPathPicker(for: recipe),
+           createValues["scriptPath", default: ""].trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            showFilePicker(for: recipe)
+            return
+        }
+        performCreateRequest(recipe: recipe, createEndpoint: createEndpoint, urlSession: urlSession)
+    }
 
+    private func performCreateRequest(recipe: RecipeRecord, createEndpoint: URL, urlSession: URLSession) {
         isPerformingAction = true
         createMessage = "Creating..."
         updateLayout()
@@ -2612,6 +2873,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                         if response.ok {
                             self.createValues.removeAll()
                             self.applyRecipeDefaults(overwrite: true)
+                            self.pendingFilePicker = nil
                             self.navigateToMode(.backends, pushHistory: false)
                             self.fetchBackends()
                         }
@@ -2621,6 +2883,150 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 self.updateColors()
             }
         }.resume()
+    }
+
+    private func showFilePicker(for recipe: RecipeRecord) {
+        blurCreateField()
+        let defaultPath = recipe.fields.first(where: { $0.key == "scriptPath" })?.placeholder ?? ""
+        let fileExtension = scriptFileExtension(for: recipe)
+        var split = splitScriptPath(defaultPath.isEmpty ? "~/dev/run-service\(fileExtension)" : defaultPath)
+        let typedIdentifier = createValues["identifier", default: ""].trimmingCharacters(in: .whitespacesAndNewlines)
+        split.filename = defaultScriptFilename(for: typedIdentifier.isEmpty ? recipe.identifier : typedIdentifier,
+                                               extension: fileExtension)
+        let preferredDirectory = createValues["projectDir"] ?? createValues["workdir"] ?? ""
+        if !preferredDirectory.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            split.directory = preferredDirectory
+        }
+        filePickerScroll = 0
+        pendingFilePicker = PendingFilePicker(mode: .saveFile,
+                                              recipeID: recipe.identifier,
+                                              targetFieldKey: nil,
+                                              fileExtension: fileExtension,
+                                              directory: split.directory,
+                                              parent: split.directory,
+                                              filename: split.filename,
+                                              entries: [],
+                                              isLoading: true,
+                                              error: "")
+        createValues[Self.filePickerFilenameKey] = split.filename
+        focusCreateField(Self.filePickerFilenameKey)
+        fetchFilePickerDirectory(path: split.directory)
+        updateLayout()
+    }
+
+    private func showDirectoryPicker(for key: String) {
+        blurCreateField()
+        let currentDirectory = createValues[key] ?? selectedRecipe()?.fields.first(where: { $0.key == key })?.defaultValue ?? "~"
+        let directory = currentDirectory.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "~" : currentDirectory
+        filePickerScroll = 0
+        pendingFilePicker = PendingFilePicker(mode: .chooseDirectory,
+                                              recipeID: nil,
+                                              targetFieldKey: key,
+                                              fileExtension: "",
+                                              directory: directory,
+                                              parent: directory,
+                                              filename: "",
+                                              entries: [],
+                                              isLoading: true,
+                                              error: "")
+        fetchFilePickerDirectory(path: directory)
+        updateLayout()
+    }
+
+    private func fetchFilePickerDirectory(path: String) {
+        guard let filePickerEndpoint, let urlSession else { return }
+        if pendingFilePicker != nil {
+            pendingFilePicker?.directory = path
+            pendingFilePicker?.entries = []
+            pendingFilePicker?.isLoading = true
+            pendingFilePicker?.error = ""
+            filePickerScroll = 0
+            updateLayout()
+        }
+        var components = URLComponents(url: filePickerEndpoint, resolvingAgainstBaseURL: false)
+        components?.queryItems = [
+            URLQueryItem(name: "path", value: path),
+            URLQueryItem(name: "extension", value: pendingFilePicker?.fileExtension ?? ""),
+            URLQueryItem(name: "directoriesOnly", value: pendingFilePicker?.mode == .chooseDirectory ? "true" : "false")
+        ]
+        guard let url = components?.url else {
+            pendingFilePicker?.isLoading = false
+            pendingFilePicker?.error = "Could not build file request."
+            updateLayout()
+            return
+        }
+        urlSession.dataTask(with: url) { [weak self] data, _, error in
+            Task { @MainActor in
+                guard let self, self.pendingFilePicker != nil else { return }
+                self.pendingFilePicker?.isLoading = false
+                if let error {
+                    self.pendingFilePicker?.error = error.localizedDescription
+                    self.updateLayout()
+                    return
+                }
+                guard let data else {
+                    self.pendingFilePicker?.error = "No directory response."
+                    self.updateLayout()
+                    return
+                }
+                do {
+                    let response = try JSONDecoder().decode(FilePickerResponse.self, from: data)
+                    self.pendingFilePicker?.directory = response.path
+                    self.pendingFilePicker?.parent = response.parent
+                    self.pendingFilePicker?.entries = response.entries
+                } catch {
+                    self.pendingFilePicker?.error = "Could not decode directory."
+                }
+                self.updateLayout()
+            }
+        }.resume()
+    }
+
+    private func confirmFilePickerSave() {
+        guard var picker = pendingFilePicker else { return }
+        if picker.mode == .chooseDirectory {
+            guard let targetFieldKey = picker.targetFieldKey else { return }
+            createValues[targetFieldKey] = picker.directory
+            createValues.removeValue(forKey: Self.filePickerFilenameKey)
+            pendingFilePicker = nil
+            filePickerScroll = 0
+            focusCreateField(targetFieldKey, cursorPosition: picker.directory.count)
+            createMessage = ""
+            updateLayout()
+            return
+        }
+        guard let recipeID = picker.recipeID,
+              let recipe = recipes.first(where: { $0.identifier == recipeID }),
+              let createEndpoint,
+              let urlSession else { return }
+        var filename = picker.filename.trimmingCharacters(in: .whitespacesAndNewlines)
+        if filename.isEmpty {
+            pendingFilePicker?.error = "Enter a filename."
+            updateLayout()
+            return
+        }
+        if !filename.lowercased().hasSuffix(picker.fileExtension.lowercased()) {
+            if filename.contains(".") {
+                pendingFilePicker?.error = "Use a \(picker.fileExtension) filename."
+                updateLayout()
+                return
+            }
+            filename += picker.fileExtension
+        }
+        picker.filename = filename
+        createValues["scriptPath"] = joinPath(directory: picker.directory, filename: filename)
+        createValues.removeValue(forKey: Self.filePickerFilenameKey)
+        pendingFilePicker = nil
+        blurCreateField()
+        performCreateRequest(recipe: recipe, createEndpoint: createEndpoint, urlSession: urlSession)
+    }
+
+    private func dismissFilePicker() {
+        pendingFilePicker = nil
+        createValues.removeValue(forKey: Self.filePickerFilenameKey)
+        filePickerScroll = 0
+        blurCreateField()
+        updateLayout()
     }
 
     func textInputControllerDidChangeState() {
@@ -2646,6 +3052,13 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
         let oldNameSuggestion = suggestedIdentifier(from: createValues["name", default: ""])
         createValues[key] = createInputController.text
+        if key == Self.filePickerFilenameKey {
+            pendingFilePicker?.filename = createInputController.text
+            updateInputMode()
+            updateEditingAndPasteboardState()
+            updateLayout()
+            return
+        }
         if key == "name" {
             let identifier = createValues["identifier", default: ""]
             if identifier.isEmpty || identifier == oldNameSuggestion {
@@ -2659,6 +3072,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func handleCreateKeyDown(keyCode: UInt16, characters: String?) {
+        if pendingFilePicker != nil {
+            handleFilePickerKeyDown(keyCode: keyCode, characters: characters)
+            return
+        }
         if createInputController.isFocused {
             if keyCode == 48 {
                 advanceCreateField()
@@ -2682,8 +3099,35 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         }
     }
 
+    private func handleFilePickerKeyDown(keyCode: UInt16, characters: String?) {
+        if createInputController.isFocused {
+            if keyCode == 53 {
+                dismissFilePicker()
+            }
+            return
+        }
+        switch keyCode {
+        case 36, 76:
+            confirmFilePickerSave()
+        case 51, 117:
+            focusCreateField(Self.filePickerFilenameKey)
+            createInputController.deleteBackward()
+        case 53:
+            dismissFilePicker()
+        default:
+            if let characters, !characters.isEmpty {
+                insertCreateText(characters)
+            }
+        }
+    }
+
     private func advanceCreateField() {
-        let fields = selectedRecipe()?.fields.filter { $0.fieldType != "choice" } ?? []
+        if pendingFilePicker != nil {
+            focusCreateField(Self.filePickerFilenameKey)
+            updateLayout()
+            return
+        }
+        let fields = selectedRecipe().map { visibleCreateFields(for: $0).filter { $0.fieldType != "choice" } } ?? []
         guard !fields.isEmpty else { return }
         let currentKey = activeCreateFieldKey ?? fields[0].key
         let index = fields.firstIndex(where: { $0.key == currentKey }) ?? 0
@@ -2716,7 +3160,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func focusActiveCreateField(selectAll: Bool = false) {
-        let key = activeCreateFieldKey ?? selectedRecipe()?.fields.first(where: { $0.fieldType != "choice" })?.key
+        let firstVisibleKey = selectedRecipe().flatMap { recipe in
+            visibleCreateFields(for: recipe).first(where: { $0.fieldType != "choice" })?.key
+        }
+        let key = pendingFilePicker != nil ? Self.filePickerFilenameKey : activeCreateFieldKey ?? firstVisibleKey
         guard let key else { return }
         focusCreateField(key, selectAll: selectAll)
     }
@@ -2748,7 +3195,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private func focusCreateField(_ key: String, selectAll: Bool = false, cursorPosition: Int? = nil) {
         blurPasswordField()
         activeCreateFieldKey = key
-        let value = createValues[key] ?? selectedRecipe()?.fields.first(where: { $0.key == key })?.defaultValue ?? ""
+        let value = createValues[key] ?? (key == Self.filePickerFilenameKey ? pendingFilePicker?.filename : nil) ?? selectedRecipe()?.fields.first(where: { $0.key == key })?.defaultValue ?? ""
         isSynchronizingCreateInput = true
         createInputController.setText(value)
         createInputController.focus(selectAll: selectAll)
@@ -2784,7 +3231,11 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             return
         }
         if command == "cancelOperation" {
-            returnToBackendsFromCreate()
+            if pendingFilePicker != nil {
+                dismissFilePicker()
+            } else {
+                returnToBackendsFromCreate()
+            }
             return
         }
         createInputController.performCommand(command)
@@ -3071,6 +3522,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         guard mode == .create else { return nil }
         let contentPoint = contentLayer.convert(point, from: rootLayer)
         let createPoint = createLayer.convert(contentPoint, from: contentLayer)
+        if pendingFilePicker != nil {
+            guard filePickerFilenameFrame.contains(createPoint) else { return nil }
+            return (Self.filePickerFilenameKey, createPoint)
+        }
         guard let key = createFieldFrames.first(where: { $0.frame.contains(createPoint) })?.key else { return nil }
         return (key, createPoint)
     }
@@ -3147,17 +3602,33 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             setCursorIfNeeded((installConfirmFrame.contains(point) || installCancelFrame.contains(point)) ? .pointingHand : .arrow)
             return
         }
+        if pendingFilePicker != nil, mode == .create {
+            let contentPoint = contentLayer.convert(point, from: rootLayer)
+            let createPoint = createLayer.convert(contentPoint, from: contentLayer)
+            if filePickerFilenameFrame.contains(createPoint) {
+                setCursorIfNeeded(.iBeam)
+            } else if filePickerSaveFrame.contains(createPoint) ||
+                        filePickerCancelFrame.contains(createPoint) ||
+                        filePickerEntryFrames.contains(where: { $0.frame.contains(createPoint) }) {
+                setCursorIfNeeded(.pointingHand)
+            } else {
+                setCursorIfNeeded(.arrow)
+            }
+            return
+        }
         let isOverCreateField = pendingPasswordAction == nil && createFieldDropPoint(point) != nil
         let isOverPasswordField = pendingPasswordAction != nil && passwordFieldFrame.contains(point)
         var isOverBundledApp = false
+        var isOverDirectorySelect = false
         if pendingPasswordAction == nil, mode == .create {
             let contentPoint = contentLayer.convert(point, from: rootLayer)
             let createPoint = createLayer.convert(contentPoint, from: contentLayer)
             isOverBundledApp = bundledAppInstallFrames.contains { $0.frame.contains(createPoint) }
+            isOverDirectorySelect = createDirectorySelectFrames.contains { $0.frame.contains(createPoint) }
         }
         if isOverCreateField || isOverPasswordField {
             setCursorIfNeeded(.iBeam)
-        } else if isOverBundledApp {
+        } else if isOverBundledApp || isOverDirectorySelect {
             setCursorIfNeeded(.pointingHand)
         } else {
             setCursorIfNeeded(.arrow)
@@ -3181,6 +3652,23 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             focusPasswordField(cursorPosition: index)
             updateEditingAndPasteboardState()
             outerframeHost.showContextMenu(for: NSAttributedString(string: ""), at: point)
+            return
+        }
+
+        if pendingFilePicker != nil, mode == .create {
+            let contentPoint = contentLayer.convert(point, from: rootLayer)
+            let createPoint = createLayer.convert(contentPoint, from: contentLayer)
+            guard filePickerFilenameFrame.contains(createPoint) else { return }
+            let index = characterIndexForCreateField(key: Self.filePickerFilenameKey, xPosition: createPoint.x)
+            focusCreateField(Self.filePickerFilenameKey)
+            if !createInputController.hasSelection {
+                createInputController.setCursorPosition(index, modifySelection: false)
+            }
+            updateEditingAndPasteboardState()
+            let selectedText = createInputController.selectedTextContent() ?? ""
+            let attributedText = NSAttributedString(string: selectedText,
+                                                    attributes: [.font: createInputFont(monospaced: true)])
+            outerframeHost.showContextMenu(for: attributedText, at: point)
             return
         }
 
@@ -3212,7 +3700,17 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 backendScroll -= delta.y * multiplier
             }
         } else if mode == .create {
-            createScroll -= delta.y * multiplier
+            if pendingFilePicker != nil {
+                let contentPoint = contentLayer.convert(point, from: rootLayer)
+                let createPoint = createLayer.convert(contentPoint, from: contentLayer)
+                if filePickerListFrame.contains(createPoint) {
+                    filePickerScroll -= delta.y * multiplier
+                    let maxPickerScroll = max(filePickerContentHeight - filePickerListFrame.height, 0)
+                    filePickerScroll = min(max(filePickerScroll, 0), maxPickerScroll)
+                }
+            } else {
+                createScroll -= delta.y * multiplier
+            }
         }
         clampScrollOffsets()
         updateLayout()
@@ -3250,6 +3748,13 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             } else if passwordCancelFrame.contains(point) || !passwordPanelFrame.contains(point) {
                 dismissPasswordPrompt()
             }
+            return
+        }
+
+        if pendingFilePicker != nil, mode == .create {
+            let contentPoint = contentLayer.convert(point, from: rootLayer)
+            let createPoint = createLayer.convert(contentPoint, from: contentLayer)
+            handleFilePickerMouseDown(at: createPoint, modifierFlags: modifierFlags, clickCount: clickCount)
             return
         }
 
@@ -3322,12 +3827,15 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 showInstallPrompt(for: install.backend)
                 return
             }
+            if let select = createDirectorySelectFrames.first(where: { $0.frame.contains(createPoint) }) {
+                showDirectoryPicker(for: select.key)
+                return
+            }
             if let recipeFrame = recipeFrames.first(where: { $0.frame.contains(createPoint) }) {
                 blurCreateField()
                 selectedRecipeID = recipeFrame.recipeID
                 applyRecipeDefaults(overwrite: true)
                 createMessage = ""
-                createScroll = 0
                 updateLayout()
                 return
             }
@@ -3388,6 +3896,51 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 blurCreateField()
                 updateLayout()
             }
+        }
+    }
+
+    private func handleFilePickerMouseDown(at createPoint: CGPoint,
+                                           modifierFlags: NSEvent.ModifierFlags,
+                                           clickCount: Int) {
+        if filePickerSaveFrame.contains(createPoint) {
+            confirmFilePickerSave()
+            return
+        }
+        if filePickerCancelFrame.contains(createPoint) {
+            dismissFilePicker()
+            return
+        }
+        if filePickerFilenameFrame.contains(createPoint) {
+            let wasFocused = createInputController.isFocused && activeCreateFieldKey == Self.filePickerFilenameKey
+            let index = characterIndexForCreateField(key: Self.filePickerFilenameKey, xPosition: createPoint.x)
+            focusCreateField(Self.filePickerFilenameKey, selectAll: clickCount >= 3)
+            switch clickCount {
+            case 3...:
+                createInputController.selectAll()
+            case 2:
+                createInputController.selectWord(at: index)
+            default:
+                createInputController.setCursorPosition(index,
+                                                        modifySelection: modifierFlags.contains(.shift) && wasFocused)
+            }
+            updateLayout()
+            return
+        }
+        if let hit = filePickerEntryFrames.first(where: { $0.frame.contains(createPoint) }) {
+            blurCreateField()
+            if hit.entry.isDirectory {
+                fetchFilePickerDirectory(path: hit.entry.path)
+            } else {
+                pendingFilePicker?.filename = hit.entry.name
+                createValues[Self.filePickerFilenameKey] = hit.entry.name
+                focusCreateField(Self.filePickerFilenameKey, cursorPosition: hit.entry.name.count)
+                updateLayout()
+            }
+            return
+        }
+        if !filePickerPanelFrame.contains(createPoint), createInputController.isFocused {
+            blurCreateField()
+            updateLayout()
         }
     }
 
@@ -3572,6 +4125,55 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         recipes.first { $0.identifier == selectedRecipeID } ?? recipes.first
     }
 
+    private func visibleCreateFields(for recipe: RecipeRecord) -> [RecipeFieldRecord] {
+        recipe.fields.filter { $0.key != "scriptPath" }
+    }
+
+    private func needsScriptPathPicker(for recipe: RecipeRecord) -> Bool {
+        recipe.fields.contains { $0.key == "scriptPath" }
+    }
+
+    private func scriptFileExtension(for recipe: RecipeRecord) -> String {
+        switch recipe.identifier {
+        case "jupyter", "jupyter-uv":
+            return ".py"
+        default:
+            return ".sh"
+        }
+    }
+
+    private func defaultScriptFilename(for recipeIdentifier: String, extension fileExtension: String) -> String {
+        let normalizedExtension = fileExtension.hasPrefix(".") ? String(fileExtension.dropFirst()) : fileExtension
+        let fallbackIdentifier = recipeIdentifier.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "script" : recipeIdentifier
+        return normalizedExtension.isEmpty ? fallbackIdentifier : "\(fallbackIdentifier).\(normalizedExtension)"
+    }
+
+    private func splitScriptPath(_ path: String) -> (directory: String, filename: String) {
+        let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return ("~", "run-service.sh") }
+        let ns = trimmed as NSString
+        let filename = ns.lastPathComponent
+        let directory = ns.deletingLastPathComponent
+        if directory.isEmpty || directory == "." {
+            return ("~", filename.isEmpty ? "run-service.sh" : filename)
+        }
+        return (directory, filename.isEmpty ? "run-service.sh" : filename)
+    }
+
+    private func joinPath(directory: String, filename: String) -> String {
+        var trimmedDirectory = directory.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmedDirectory.isEmpty {
+            return filename
+        }
+        if trimmedDirectory == "/" {
+            return "/" + filename
+        }
+        while trimmedDirectory.count > 1 && trimmedDirectory.hasSuffix("/") {
+            trimmedDirectory.removeLast()
+        }
+        return "\(trimmedDirectory)/\(filename)"
+    }
+
     private func createValue(for field: RecipeFieldRecord) -> String {
         createValues[field.key] ?? field.defaultValue
     }
@@ -3583,8 +4185,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 createValues[field.key] = field.defaultValue
             }
         }
-        if overwrite || activeCreateFieldKey == nil || !recipe.fields.contains(where: { $0.key == activeCreateFieldKey }) {
-            activeCreateFieldKey = recipe.fields.first(where: { $0.fieldType != "choice" })?.key
+        let visibleFields = visibleCreateFields(for: recipe)
+        if overwrite || activeCreateFieldKey == nil || !visibleFields.contains(where: { $0.key == activeCreateFieldKey }) {
+            activeCreateFieldKey = visibleFields.first(where: { $0.fieldType != "choice" })?.key
         }
         if createInputController.isFocused, let activeCreateFieldKey {
             focusCreateField(activeCreateFieldKey)
