@@ -32,6 +32,7 @@ private struct BackendRecord: Decodable {
     let canUninstall: Bool?
     let isBundled: Bool?
     let isInstalled: Bool?
+    let isMigration: Bool?
     let iconSymbolName: String?
     let launchdPlistPath: String
     let ownsLaunchdPlist: Bool
@@ -48,6 +49,10 @@ private struct BackendRecord: Decodable {
 
     var isBackendsSelf: Bool {
         serviceID == "dev.outergroup.HomeScreen" || serviceID == "dev.outergroup.Navigator" || serviceID == "dev.outergroup.Backends"
+    }
+
+    var isMigrationAction: Bool {
+        isMigration ?? false
     }
 
     var pathText: String {
@@ -2777,6 +2782,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                  canUninstall: backend.canUninstall,
                                  isBundled: backend.isBundled,
                                  isInstalled: operation == "run" || operation == "install" || operation == "runUser" || operation == "installUser" || operation == "runRoot" || operation == "installRoot" ? true : backend.isInstalled,
+                                 isMigration: backend.isMigration,
                                  iconSymbolName: backend.iconSymbolName,
                                  launchdPlistPath: backend.launchdPlistPath,
                                  ownsLaunchdPlist: backend.ownsLaunchdPlist,
@@ -4392,6 +4398,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         if backend.isBackendsSelf {
             return row.frontend?.hasEndpoint == true ? [("Open", "open")] : []
         }
+        if backend.isMigrationAction {
+            return [("Migrate", "migrateRoot")]
+        }
         if backend.isBundledPlaceholder {
             return [("Run", "run"), ("Actions", "menu")]
         }
@@ -4532,6 +4541,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             return "Installing \(backend.displayName) as user..."
         case "uninstall":
             return "Uninstalling \(backend.displayName)..."
+        case "migrateRoot":
+            return "Migrating \(backend.displayName)..."
         default:
             return "\(operation.capitalized)ing \(backend.displayName)..."
         }

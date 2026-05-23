@@ -27,6 +27,8 @@ require_file() {
 
 require_file "${PACKAGE_ROOT}/RemoteLinuxBinaries/aarch64/HomeScreenBackend"
 require_file "${PACKAGE_ROOT}/RemoteLinuxBinaries/x86_64/HomeScreenBackend"
+require_file "${PACKAGE_ROOT}/RemoteLinuxBinaries/aarch64/outerctl"
+require_file "${PACKAGE_ROOT}/RemoteLinuxBinaries/x86_64/outerctl"
 require_file "${RUN_ROOT}/bundles/BackendsContent.bundle.macos-arm.aar"
 require_file "${RUN_ROOT}/bundles/BackendsContent.bundle.macos-x86.aar"
 require_file "${REPO_ROOT}/app-icon.png"
@@ -46,8 +48,9 @@ trap 'rm -rf "${STAGING_ROOT}"' EXIT
 stage_home_screen() {
     local arch="$1"
     local root="${STAGING_ROOT}/home-screen-${arch}/HomeScreen"
-    mkdir -p "${root}/bundles"
+    mkdir -p "${root}/bin" "${root}/bundles"
     install -m 0755 "${PACKAGE_ROOT}/RemoteLinuxBinaries/${arch}/HomeScreenBackend" "${root}/HomeScreenBackend"
+    install -m 0755 "${PACKAGE_ROOT}/RemoteLinuxBinaries/${arch}/outerctl" "${root}/bin/outerctl"
     install -m 0644 "${REPO_ROOT}/app-icon.png" "${root}/app-icon.png"
     install -m 0644 "${RUN_ROOT}/bundles/BackendsContent.bundle.macos-arm.aar" "${root}/bundles/BackendsContent.bundle.macos-arm.aar"
     install -m 0644 "${RUN_ROOT}/bundles/BackendsContent.bundle.macos-x86.aar" "${root}/bundles/BackendsContent.bundle.macos-x86.aar"
@@ -82,7 +85,10 @@ download() {
 }
 
 runtime_dir="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
-install_root="$HOME/.outerloop/home-screen"
+state_home="${XDG_STATE_HOME:-$HOME/.local/state}"
+outerwebapps_home="${OUTERWEBAPPS_HOME:-$state_home/outerwebapps}"
+install_root="$outerwebapps_home/home-screen"
+outerctl_path="$outerwebapps_home/bin/outerctl"
 unit_dir="$HOME/.config/systemd/user"
 socket_path="$runtime_dir/dev.outergroup.HomeScreen"
 log_dir="$install_root/logs"
@@ -90,13 +96,15 @@ log_path="$log_dir/HomeScreenBackend.log"
 runner_path="$install_root/run-home-screen.sh"
 archive_path="$(mktemp)"
 
-mkdir -p "$install_root" "$unit_dir" "$log_dir"
+mkdir -p "$install_root" "$outerwebapps_home/bin" "$unit_dir" "$log_dir"
 public_base_url="__PUBLIC_BASE_URL__"
 app_base_url="${public_base_url%/}/apps"
 download "${public_base_url%/}/latest/home-screen-${arch}.tar.gz?v=__ASSET_VERSION__" "$archive_path"
 tar -xzf "$archive_path" -C "$install_root" --strip-components=1
 rm -f "$archive_path"
 chmod 0755 "$install_root/HomeScreenBackend"
+chmod 0755 "$install_root/bin/outerctl"
+install -m 0755 "$install_root/bin/outerctl" "$outerctl_path"
 touch "$log_path"
 
 cat > "$runner_path" <<EOF
@@ -110,6 +118,7 @@ cat > "$unit_dir/dev.outergroup.HomeScreen.service" <<EOF
 Description=Outer Group Home Screen
 
 [Service]
+Environment=OUTERWEBAPPS_HOME=$outerwebapps_home
 ExecStart=$runner_path %t/dev.outergroup.HomeScreen
 Restart=no
 EOF
@@ -129,7 +138,7 @@ EOF
 printf '[%s] Installed Home Screen package from %s.\n' "$(date -Is)" "$public_base_url" >> "$log_path"
 
 if command -v python3 >/dev/null 2>&1; then
-    HOME_SCREEN_REGISTRY="$HOME/.outeragent/registry.sqlite3" \
+    HOME_SCREEN_REGISTRY="$outerwebapps_home/registry.sqlite3" \
     HOME_SCREEN_SERVICE_ID="dev.outergroup.HomeScreen" \
     HOME_SCREEN_DISPLAY_NAME="Home Screen" \
     HOME_SCREEN_UNIT_NAME="dev.outergroup.HomeScreen.service" \

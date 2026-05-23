@@ -47,15 +47,16 @@ extern int launch_activate_socket(const char *name, int **fds, size_t *cnt);
 static const char *kHomeScreenServiceID = "dev.outergroup.HomeScreen";
 static const char *kLegacyNavigatorServiceID = "dev.outergroup.Navigator";
 static const char *kLegacyBackendsServiceID = "dev.outergroup.Backends";
+static const char *kMigrationServiceID = "dev.outergroup.OuterwebappsMigration";
 static const char *kBundleUrlPath = "/bundles/BackendsContent";
 static const char *kBundleUrlPathMacosArm = "/bundles/BackendsContent/macos-arm";
 static const char *kBundleUrlPathMacosX86 = "/bundles/BackendsContent/macos-x86";
 static const char *kBundleFilePathMacosArm = "bundles/BackendsContent.bundle.macos-arm.aar";
 static const char *kBundleFilePathMacosX86 = "bundles/BackendsContent.bundle.macos-x86.aar";
 #ifdef __APPLE__
-static const char *kSystemOuterAgentRoot = "/Library/dev.outergroup.OuterLoop";
+static const char *kSystemOuterWebappsRoot = "/Library/Application Support/outerwebapps";
 #else
-static const char *kSystemOuterAgentRoot = "/var/lib/outergroup/outeragent";
+static const char *kSystemOuterWebappsRoot = "/var/lib/outerwebapps";
 #endif
 
 static char g_bundle_file_path_macos_arm[PATH_MAX] = "";
@@ -117,7 +118,18 @@ typedef struct {
     const char *version;
 } BundledAppDefinition;
 
+typedef struct {
+    const char *old_text;
+    const char *new_text;
+} TextReplacement;
+
 static bool mkdir_p(const char *path);
+static void run_shell_ignored(const char *command);
+static char *read_text_file_alloc(const char *path, size_t *out_size);
+static void rewrite_files_in_directory_replacing_text(const char *directory,
+                                                      const TextReplacement *replacements,
+                                                      size_t replacement_count,
+                                                      bool recursive);
 
 static const BundledAppDefinition kBundledApps[] = {
     {
@@ -636,6 +648,82 @@ static const char *home_directory(void) {
     return pw ? pw->pw_dir : "/";
 }
 
+static void default_user_outerwebapps_root(char *out, size_t out_size) {
+    if (!out || out_size == 0) return;
+    const char *override_root = getenv("OUTERWEBAPPS_HOME");
+    if (override_root && override_root[0]) {
+        if (strcmp(override_root, "~") == 0) {
+            snprintf(out, out_size, "%s", home_directory());
+        } else if (override_root[0] == '~' && override_root[1] == '/') {
+            snprintf(out, out_size, "%s/%s", home_directory(), override_root + 2);
+        } else {
+            snprintf(out, out_size, "%s", override_root);
+        }
+        return;
+    }
+#ifdef __APPLE__
+    snprintf(out, out_size, "%s/Library/Application Support/outerwebapps", home_directory());
+#else
+    const char *state_home = getenv("XDG_STATE_HOME");
+    if (state_home && state_home[0]) {
+        snprintf(out, out_size, "%s/outerwebapps", state_home);
+    } else {
+        snprintf(out, out_size, "%s/.local/state/outerwebapps", home_directory());
+    }
+#endif
+}
+
+static void default_user_outerctl_path(char *out, size_t out_size) {
+    if (!out || out_size == 0) return;
+    char root[PATH_MAX];
+    default_user_outerwebapps_root(root, sizeof(root));
+    snprintf(out, out_size, "%s/bin/outerctl", root);
+}
+
+static void default_user_outerwebapps_app_root(const char *install_name, char *out, size_t out_size) {
+    char root[PATH_MAX];
+    default_user_outerwebapps_root(root, sizeof(root));
+    snprintf(out, out_size, "%s/apps/%s", root, install_name && install_name[0] ? install_name : "");
+}
+
+static void default_user_outerwebapps_apps_root(char *out, size_t out_size) {
+    char root[PATH_MAX];
+    default_user_outerwebapps_root(root, sizeof(root));
+    snprintf(out, out_size, "%s/apps", root);
+}
+
+static void legacy_user_registry_database_path(char *out, size_t out_size) {
+#ifdef __APPLE__
+    snprintf(out, out_size, "%s/Library/dev.outergroup.OuterLoop/registry.sqlite3", home_directory());
+#else
+    snprintf(out, out_size, "%s/.outeragent/registry.sqlite3", home_directory());
+#endif
+}
+
+static void legacy_user_apps_root(char *out, size_t out_size) {
+#ifdef __APPLE__
+    snprintf(out, out_size, "%s/Library/dev.outergroup.OuterLoop/backends", home_directory());
+#else
+    snprintf(out, out_size, "%s/.outeragent", home_directory());
+#endif
+}
+
+static void legacy_user_outerctl_path(char *out, size_t out_size) {
+#ifdef __APPLE__
+    snprintf(out, out_size, "%s/Library/dev.outergroup.OuterLoop/outerctl", home_directory());
+#else
+    snprintf(out, out_size, "%s/.outeragent/outerctl", home_directory());
+#endif
+}
+
+static void legacy_home_screen_outerctl_path(char *out, size_t out_size) {
+#ifdef __APPLE__
+    snprintf(out, out_size, "%s/Library/dev.outergroup.OuterLoop/outerctl", home_directory());
+#else
+    snprintf(out, out_size, "%s/.outerloop/home-screen/bin/outerctl", home_directory());
+#endif
+}
+
 static void expand_tilde_path(const char *path, char *out, size_t out_size) {
     if (!path || !path[0]) {
         out[0] = '\0';
@@ -941,9 +1029,9 @@ static bool download_bundled_app_stage(const BundledAppDefinition *app,
     const char *cache_home = getenv("XDG_CACHE_HOME");
     char cache_root[PATH_MAX];
     if (cache_home && cache_home[0]) {
-        snprintf(cache_root, sizeof(cache_root), "%s/outerloop/home-screen/bundled-apps", cache_home);
+        snprintf(cache_root, sizeof(cache_root), "%s/outerwebapps/home-screen/bundled-apps", cache_home);
     } else {
-        snprintf(cache_root, sizeof(cache_root), "%s/.cache/outerloop/home-screen/bundled-apps", home_directory());
+        snprintf(cache_root, sizeof(cache_root), "%s/.cache/outerwebapps/home-screen/bundled-apps", home_directory());
     }
     if (!mkdir_p(cache_root)) {
         snprintf(message, message_size, "Failed to create app download cache at %s: %s", cache_root, strerror(errno));
@@ -1011,35 +1099,29 @@ static bool resolve_bundled_app_stage_root(const BundledAppDefinition *app,
 }
 
 static void default_registry_database_path(char *out, size_t out_size) {
-    const char *env_path = getenv("BACKENDS_REGISTRY_DB");
+    const char *env_path = getenv("OUTERWEBAPPS_REGISTRY");
     if (!env_path || !env_path[0]) {
-        env_path = getenv("OUTERLOOP_REGISTRY_DB");
+        env_path = getenv("BACKENDS_REGISTRY_DB");
     }
     if (env_path && env_path[0]) {
         expand_tilde_path(env_path, out, out_size);
         return;
     }
-#ifdef __APPLE__
-    snprintf(out, out_size, "%s/Library/dev.outergroup.OuterLoop/registry.sqlite3", home_directory());
-#else
-    snprintf(out, out_size, "%s/.outeragent/registry.sqlite3", home_directory());
-#endif
+    char root[PATH_MAX];
+    default_user_outerwebapps_root(root, sizeof(root));
+    snprintf(out, out_size, "%s/registry.sqlite3", root);
 }
 
 static void default_system_registry_database_path(char *out, size_t out_size) {
-    const char *env_path = getenv("BACKENDS_SYSTEM_REGISTRY_DB");
+    const char *env_path = getenv("OUTERWEBAPPS_SYSTEM_REGISTRY");
     if (!env_path || !env_path[0]) {
-        env_path = getenv("OUTERLOOP_SYSTEM_REGISTRY_DB");
+        env_path = getenv("BACKENDS_SYSTEM_REGISTRY_DB");
     }
     if (env_path && env_path[0]) {
         expand_tilde_path(env_path, out, out_size);
         return;
     }
-#ifdef __APPLE__
-    snprintf(out, out_size, "%s/registry.sqlite3", kSystemOuterAgentRoot);
-#else
-    snprintf(out, out_size, "%s/registry.sqlite3", kSystemOuterAgentRoot);
-#endif
+    snprintf(out, out_size, "%s/registry.sqlite3", kSystemOuterWebappsRoot);
 }
 
 static sqlite3 *open_registry_readonly_at(const char *path, char *error, size_t error_size) {
@@ -1179,6 +1261,224 @@ static void migrate_registry_schema_if_writable(const char *path) {
     if (!database) return;
     (void)ensure_registry_schema(database, error, sizeof(error));
     sqlite3_close(database);
+}
+
+static bool sqlite_exec_formatted(sqlite3 *database, char *error, size_t error_size, const char *format, ...) {
+    va_list args;
+    va_start(args, format);
+    char *sql = sqlite3_vmprintf(format, args);
+    va_end(args);
+    if (!sql) {
+        snprintf(error, error_size, "Out of memory.");
+        return false;
+    }
+    bool ok = sqlite_exec_ok(database, sql, error, error_size);
+    sqlite3_free(sql);
+    return ok;
+}
+
+static bool sqlite_file_uri_for_readonly_immutable_path(const char *path, char *out, size_t out_size) {
+    if (!path || !out || out_size == 0) return false;
+    size_t offset = 0;
+    int written = snprintf(out, out_size, "file:");
+    if (written < 0 || (size_t)written >= out_size) return false;
+    offset = (size_t)written;
+    static const char hex[] = "0123456789ABCDEF";
+    for (const unsigned char *p = (const unsigned char *)path; *p; p++) {
+        unsigned char c = *p;
+        bool literal = (c >= 'A' && c <= 'Z') ||
+                       (c >= 'a' && c <= 'z') ||
+                       (c >= '0' && c <= '9') ||
+                       c == '/' || c == '.' || c == '_' || c == '-' || c == '~';
+        if (literal) {
+            if (offset + 1 >= out_size) return false;
+            out[offset++] = (char)c;
+        } else {
+            if (offset + 3 >= out_size) return false;
+            out[offset++] = '%';
+            out[offset++] = hex[(c >> 4) & 0xF];
+            out[offset++] = hex[c & 0xF];
+        }
+    }
+    written = snprintf(out + offset, out_size - offset, "?mode=ro&immutable=1");
+    return written >= 0 && (size_t)written < out_size - offset;
+}
+
+static bool merge_registry_database(const char *old_path,
+                                    const char *new_path,
+                                    const TextReplacement *replacements,
+                                    size_t replacement_count,
+                                    char *error,
+                                    size_t error_size) {
+    if (!old_path || !new_path || strcmp(old_path, new_path) == 0 || access(old_path, R_OK) != 0) {
+        return true;
+    }
+    char old_uri[PATH_MAX * 3 + 64];
+    if (!sqlite_file_uri_for_readonly_immutable_path(old_path, old_uri, sizeof(old_uri))) {
+        snprintf(error, error_size, "Could not build read-only SQLite URI for %s.", old_path);
+        return false;
+    }
+    sqlite3 *database = open_registry_readwrite_at(new_path, error, error_size);
+    if (!database) return false;
+    bool ok = ensure_registry_schema(database, error, error_size);
+    if (ok) ok = sqlite_exec_ok(database, "BEGIN IMMEDIATE TRANSACTION;", error, error_size);
+    if (ok) ok = sqlite_exec_formatted(database, error, error_size, "ATTACH DATABASE %Q AS old_registry;", old_uri);
+    if (ok) {
+        ok = sqlite_exec_ok(database,
+                            "INSERT OR REPLACE INTO backends(service_id, display_name, icon, service_unit) "
+                            "SELECT service_id, COALESCE(display_name, ''), icon, service_unit FROM old_registry.backends;",
+                            error,
+                            error_size);
+    }
+    if (ok) {
+        ok = sqlite_exec_ok(database,
+                            "INSERT OR REPLACE INTO frontends(url, service_id, name, port, socket_path, icon, is_home_screen, list) "
+                            "SELECT url, service_id, COALESCE(name, ''), COALESCE(port, 0), COALESCE(socket_path, ''), icon, COALESCE(is_home_screen, 0), list FROM old_registry.frontends;",
+                            error,
+                            error_size);
+    }
+    if (ok) {
+        ok = sqlite_exec_ok(database,
+                            "INSERT OR REPLACE INTO log_files(path, service_id) "
+                            "SELECT path, service_id FROM old_registry.log_files;",
+                            error,
+                            error_size);
+    }
+    if (ok) {
+        ok = sqlite_exec_ok(database,
+                            "INSERT OR REPLACE INTO systemd_backends(service_id, unit_name, scope) "
+                            "SELECT service_id, unit_name, COALESCE(scope, 'user') FROM old_registry.systemd_backends;",
+                            error,
+                            error_size);
+    }
+    if (ok) {
+        ok = sqlite_exec_ok(database,
+                            "INSERT OR REPLACE INTO launchd_backends(service_id, plist_path, owns_plist) "
+                            "SELECT service_id, plist_path, COALESCE(owns_plist, 0) FROM old_registry.launchd_backends;",
+                            error,
+                            error_size);
+    }
+    if (ok) {
+        ok = sqlite_exec_ok(database, "DETACH DATABASE old_registry;", error, error_size);
+    } else {
+        sqlite3_exec(database, "DETACH DATABASE old_registry;", NULL, NULL, NULL);
+    }
+    for (size_t i = 0; ok && i < replacement_count; i++) {
+        const char *old_text = replacements[i].old_text;
+        const char *new_text = replacements[i].new_text ? replacements[i].new_text : "";
+        if (!old_text || !old_text[0]) continue;
+        ok = sqlite_exec_formatted(database, error, error_size,
+                                   "UPDATE log_files SET path = replace(path, %Q, %Q);"
+                                   "UPDATE frontends SET url = replace(url, %Q, %Q), socket_path = replace(socket_path, %Q, %Q);"
+                                   "UPDATE launchd_backends SET plist_path = replace(plist_path, %Q, %Q);",
+                                   old_text, new_text,
+                                   old_text, new_text,
+                                   old_text, new_text,
+                                   old_text, new_text);
+    }
+    if (ok) {
+        ok = sqlite_exec_ok(database, "COMMIT;", error, error_size);
+    } else {
+        sqlite3_exec(database, "ROLLBACK;", NULL, NULL, NULL);
+    }
+    sqlite3_close(database);
+    return ok;
+}
+
+static void rename_if_possible(const char *old_path, const char *new_path) {
+    if (!old_path || !new_path || access(old_path, F_OK) != 0 || access(new_path, F_OK) == 0) return;
+    char directory[PATH_MAX];
+    snprintf(directory, sizeof(directory), "%s", new_path);
+    char *slash = strrchr(directory, '/');
+    if (slash) {
+        *slash = '\0';
+        (void)mkdir_p(directory);
+    }
+    (void)rename(old_path, new_path);
+}
+
+static void migrate_user_app_directories(const char *old_apps_root, const char *new_apps_root) {
+    DIR *dir = opendir(old_apps_root);
+    if (!dir) return;
+    (void)mkdir_p(new_apps_root);
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
+        if (strcmp(entry->d_name, "registry.sqlite3") == 0 ||
+            strcmp(entry->d_name, "registry.lock") == 0 ||
+            strcmp(entry->d_name, "registry.bin") == 0 ||
+            strcmp(entry->d_name, "outerctl") == 0) {
+            continue;
+        }
+        char old_path[PATH_MAX];
+        snprintf(old_path, sizeof(old_path), "%s/%s", old_apps_root, entry->d_name);
+        struct stat st;
+        if (lstat(old_path, &st) != 0 || !S_ISDIR(st.st_mode)) continue;
+        char new_path[PATH_MAX];
+        snprintf(new_path, sizeof(new_path), "%s/%s", new_apps_root, entry->d_name);
+        rename_if_possible(old_path, new_path);
+        char old_log[PATH_MAX];
+        char new_log[PATH_MAX];
+        snprintf(old_log, sizeof(old_log), "%s/outeragent.log", access(new_path, F_OK) == 0 ? new_path : old_path);
+        snprintf(new_log, sizeof(new_log), "%s/backend.log", access(new_path, F_OK) == 0 ? new_path : old_path);
+        rename_if_possible(old_log, new_log);
+    }
+    closedir(dir);
+}
+
+static void migrate_user_outerwebapps_state(void) {
+    char old_registry[PATH_MAX];
+    char old_apps_root[PATH_MAX];
+    char new_apps_root[PATH_MAX];
+    char old_outerctl[PATH_MAX];
+    char old_home_screen_outerctl[PATH_MAX];
+    char new_outerctl[PATH_MAX];
+    legacy_user_registry_database_path(old_registry, sizeof(old_registry));
+    legacy_user_apps_root(old_apps_root, sizeof(old_apps_root));
+    default_user_outerwebapps_apps_root(new_apps_root, sizeof(new_apps_root));
+    legacy_user_outerctl_path(old_outerctl, sizeof(old_outerctl));
+    legacy_home_screen_outerctl_path(old_home_screen_outerctl, sizeof(old_home_screen_outerctl));
+    default_user_outerctl_path(new_outerctl, sizeof(new_outerctl));
+    char new_root[PATH_MAX];
+    default_user_outerwebapps_root(new_root, sizeof(new_root));
+    (void)mkdir_p(new_root);
+    (void)mkdir_p(new_apps_root);
+
+    TextReplacement replacements[] = {
+        {old_home_screen_outerctl, new_outerctl},
+        {old_outerctl, new_outerctl},
+        {old_apps_root, new_apps_root},
+        {"outeragent.log", "backend.log"},
+        {"OUTERAGENT_ROOT", "OUTERWEBAPPS_HOME"},
+        {"/var/lib/outergroup/outeragent", kSystemOuterWebappsRoot}
+    };
+
+    char error[1024] = "";
+    if (access(old_registry, R_OK) == 0) {
+        if (merge_registry_database(old_registry,
+                                    g_registry_database_path,
+                                    replacements,
+                                    sizeof(replacements) / sizeof(replacements[0]),
+                                    error,
+                                    sizeof(error))) {
+            log_event("Migrated user outerwebapps registry from %s to %s.", old_registry, g_registry_database_path);
+        } else {
+            log_event("Failed to migrate user registry from %s: %s", old_registry, error);
+        }
+    }
+
+    migrate_user_app_directories(old_apps_root, new_apps_root);
+
+#ifndef __APPLE__
+    char user_units_dir[PATH_MAX];
+    snprintf(user_units_dir, sizeof(user_units_dir), "%s/.config/systemd/user", home_directory());
+    rewrite_files_in_directory_replacing_text(user_units_dir, replacements, sizeof(replacements) / sizeof(replacements[0]), false);
+    run_shell_ignored("systemctl --user daemon-reload >/dev/null 2>&1 || true");
+#else
+    char launch_agents_dir[PATH_MAX];
+    snprintf(launch_agents_dir, sizeof(launch_agents_dir), "%s/Library/LaunchAgents", home_directory());
+    rewrite_files_in_directory_replacing_text(launch_agents_dir, replacements, sizeof(replacements) / sizeof(replacements[0]), false);
+#endif
 }
 
 static const char *sqlite_column_text_or_empty(sqlite3_stmt *statement, int column) {
@@ -1876,6 +2176,84 @@ static bool append_registered_backends_json(StringBuilder *builder,
     return ok;
 }
 
+static bool file_contains_any_legacy_outerwebapps_text(const char *path) {
+    size_t size = 0;
+    char *contents = read_text_file_alloc(path, &size);
+    (void)size;
+    if (!contents) return false;
+    bool found = strstr(contents, "OUTERAGENT_ROOT") ||
+                 strstr(contents, ".outeragent/outerctl") ||
+                 strstr(contents, ".outerloop/home-screen/bin/outerctl") ||
+                 strstr(contents, "/var/lib/outergroup/outeragent") ||
+                 strstr(contents, "outeragent.log");
+    free(contents);
+    return found;
+}
+
+static bool directory_contains_legacy_outerwebapps_text(const char *directory, bool recursive) {
+    DIR *dir = opendir(directory);
+    if (!dir) return false;
+    bool found = false;
+    struct dirent *entry;
+    while (!found && (entry = readdir(dir)) != NULL) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
+        char path[PATH_MAX];
+        snprintf(path, sizeof(path), "%s/%s", directory, entry->d_name);
+        struct stat st;
+        if (lstat(path, &st) != 0) continue;
+        if (S_ISDIR(st.st_mode)) {
+            found = recursive && directory_contains_legacy_outerwebapps_text(path, true);
+        } else if (S_ISREG(st.st_mode)) {
+            found = file_contains_any_legacy_outerwebapps_text(path);
+        }
+    }
+    closedir(dir);
+    return found;
+}
+
+static bool root_outerwebapps_migration_pending(void) {
+#ifdef __APPLE__
+    struct stat st;
+    return stat("/Library/dev.outergroup.OuterLoop/registry.sqlite3", &st) == 0 ||
+           stat("/Library/dev.outergroup.OuterLoop", &st) == 0 ||
+           directory_contains_legacy_outerwebapps_text("/Library/LaunchDaemons", false);
+#else
+    struct stat st;
+    return stat("/var/lib/outergroup/outeragent/registry.sqlite3", &st) == 0 ||
+           stat("/var/lib/outergroup/outeragent", &st) == 0 ||
+           directory_contains_legacy_outerwebapps_text("/opt/outergroup", true) ||
+           directory_contains_legacy_outerwebapps_text("/etc/systemd/system", false);
+#endif
+}
+
+static bool append_root_migration_backend_json(StringBuilder *builder, bool *first) {
+    if (!root_outerwebapps_migration_pending()) return true;
+    if (!*first && !sb_append(builder, ",")) return false;
+    *first = false;
+    bool ok = sb_append(builder, "{\"serviceID\":") &&
+              sb_append_json_string(builder, kMigrationServiceID) &&
+              sb_append(builder, ",\"displayName\":\"Migrate old root services\"") &&
+              sb_append(builder, ",\"serviceUnit\":\"\"") &&
+              sb_append(builder, ",\"serviceUnitPath\":") &&
+#ifdef __APPLE__
+              sb_append_json_string(builder, "/Library/dev.outergroup.OuterLoop") &&
+#else
+              sb_append_json_string(builder, "/var/lib/outergroup/outeragent") &&
+#endif
+              sb_append(builder, ",\"serviceScope\":\"system\"") &&
+              sb_append(builder, ",\"status\":\"pending\"") &&
+              sb_append(builder, ",\"canControl\":true") &&
+              sb_append(builder, ",\"canUninstall\":false") &&
+              sb_append(builder, ",\"isBundled\":false") &&
+              sb_append(builder, ",\"isInstalled\":true") &&
+              sb_append(builder, ",\"isMigration\":true") &&
+              sb_append(builder, ",\"launchdPlistPath\":\"\"") &&
+              sb_append(builder, ",\"ownsLaunchdPlist\":false") &&
+              sb_append(builder, ",\"frontends\":[]") &&
+              sb_append(builder, ",\"logFiles\":[]}");
+    return ok;
+}
+
 static void send_backends_response(int fd) {
     StringBuilder builder = {0};
     char user_error[512] = "";
@@ -1914,6 +2292,7 @@ static void send_backends_response(int fd) {
         ok = ok && append_registered_backends_json(&builder, system_database, &first, bundled_installed,
                                                    sizeof(bundled_installed) / sizeof(bundled_installed[0]));
     }
+    ok = ok && append_root_migration_backend_json(&builder, &first);
 
     for (size_t i = 0; ok && i < sizeof(kBundledApps) / sizeof(kBundledApps[0]); i++) {
         if (!bundled_app_is_available_on_platform(&kBundledApps[i])) continue;
@@ -2032,6 +2411,7 @@ static void send_action_json(int fd, int status, bool ok_value, const char *mess
 
 static bool install_bundled_app(const BundledAppDefinition *app, const char *scope, const char *sudo_password, bool *needs_password, char *message, size_t message_size);
 static bool uninstall_backend(const char *service_id, const char *sudo_password, bool *needs_password, char *message, size_t message_size);
+static bool run_root_outerwebapps_migration(const char *sudo_password, bool *needs_password, char *message, size_t message_size);
 
 static bool clear_frontends_in_registry_at(const char *database_path, const char *service_id, char *error, size_t error_size) {
     sqlite3 *database = open_registry_readwrite_at(database_path, error, error_size);
@@ -2065,7 +2445,7 @@ static bool clear_frontends_in_registry_at(const char *database_path, const char
 static void clear_frontends_in_system_registry_as_root(const char *service_id, const char *sudo_password) {
     char quoted_system_root[PATH_MAX + 8];
     char quoted_service_id[512];
-    shell_quote(kSystemOuterAgentRoot, quoted_system_root, sizeof(quoted_system_root));
+    shell_quote(kSystemOuterWebappsRoot, quoted_system_root, sizeof(quoted_system_root));
     shell_quote(service_id, quoted_service_id, sizeof(quoted_service_id));
 
     char command[8192];
@@ -2113,6 +2493,19 @@ static void send_control_response(int fd, const char *query, const char *body) {
     }
     query_value_any(query, body, "sudoPassword", sudo_password, sizeof(sudo_password));
     log_event("Control request operation=%s serviceID=%s.", operation, service_id);
+
+    if (strcmp(service_id, kMigrationServiceID) == 0) {
+        if (strcmp(operation, "migrateRoot") != 0 && strcmp(operation, "start") != 0) {
+            send_action_json(fd, 400, false, "Unsupported migration operation.");
+            return;
+        }
+        char message[4096] = "";
+        bool needs_password = false;
+        bool ok = run_root_outerwebapps_migration(sudo_password, &needs_password, message, sizeof(message));
+        log_event("%s root outerwebapps migration: %s", ok ? "Completed" : "Failed", message);
+        send_action_json_ex(fd, ok ? 200 : (needs_password ? 401 : 500), ok, message, needs_password);
+        return;
+    }
 
     if (is_home_screen_service_id(service_id)) {
         log_event("Rejected control request for Home Screen itself: operation=%s.", operation);
@@ -2320,6 +2713,103 @@ static bool copy_file(const char *source, const char *destination, mode_t mode, 
     return ok;
 }
 
+static char *read_text_file_alloc(const char *path, size_t *out_size) {
+    if (out_size) *out_size = 0;
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return NULL;
+    struct stat st;
+    if (fstat(fd, &st) != 0 || st.st_size < 0 || st.st_size > 1024 * 1024 * 8) {
+        close(fd);
+        return NULL;
+    }
+    size_t size = (size_t)st.st_size;
+    char *data = malloc(size + 1);
+    if (!data) {
+        close(fd);
+        return NULL;
+    }
+    size_t offset = 0;
+    while (offset < size) {
+        ssize_t got = read(fd, data + offset, size - offset);
+        if (got < 0) {
+            if (errno == EINTR) continue;
+            free(data);
+            close(fd);
+            return NULL;
+        }
+        if (got == 0) break;
+        offset += (size_t)got;
+    }
+    close(fd);
+    data[offset] = '\0';
+    if (out_size) *out_size = offset;
+    return data;
+}
+
+static bool append_replaced_text(StringBuilder *builder, const char *text, const TextReplacement *replacements, size_t replacement_count, bool *changed) {
+    const char *cursor = text ? text : "";
+    while (*cursor) {
+        size_t best_index = replacement_count;
+        size_t best_length = 0;
+        for (size_t i = 0; i < replacement_count; i++) {
+            const char *old_text = replacements[i].old_text;
+            if (!old_text || !old_text[0]) continue;
+            size_t old_length = strlen(old_text);
+            if (strncmp(cursor, old_text, old_length) == 0 && old_length > best_length) {
+                best_index = i;
+                best_length = old_length;
+            }
+        }
+        if (best_index < replacement_count) {
+            if (!sb_append(builder, replacements[best_index].new_text ? replacements[best_index].new_text : "")) return false;
+            cursor += best_length;
+            if (changed) *changed = true;
+        } else {
+            if (!sb_append_n(builder, cursor, 1)) return false;
+            cursor++;
+        }
+    }
+    return true;
+}
+
+static bool rewrite_file_replacing_text(const char *path, const TextReplacement *replacements, size_t replacement_count) {
+    size_t size = 0;
+    char *contents = read_text_file_alloc(path, &size);
+    if (!contents) return false;
+    bool changed = false;
+    StringBuilder builder = {0};
+    bool ok = append_replaced_text(&builder, contents, replacements, replacement_count, &changed);
+    free(contents);
+    if (ok && changed) {
+        char error[512] = "";
+        ok = write_text_file(path, builder.data ? builder.data : "", error, sizeof(error));
+    }
+    free(builder.data);
+    return ok;
+}
+
+static void rewrite_files_in_directory_replacing_text(const char *directory,
+                                                      const TextReplacement *replacements,
+                                                      size_t replacement_count,
+                                                      bool recursive) {
+    DIR *dir = opendir(directory);
+    if (!dir) return;
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
+        char path[PATH_MAX];
+        snprintf(path, sizeof(path), "%s/%s", directory, entry->d_name);
+        struct stat st;
+        if (lstat(path, &st) != 0) continue;
+        if (S_ISDIR(st.st_mode)) {
+            if (recursive) rewrite_files_in_directory_replacing_text(path, replacements, replacement_count, true);
+        } else if (S_ISREG(st.st_mode)) {
+            (void)rewrite_file_replacing_text(path, replacements, replacement_count);
+        }
+    }
+    closedir(dir);
+}
+
 static void run_shell_ignored(const char *command) {
     int result = system(command);
     (void)result;
@@ -2437,6 +2927,168 @@ static bool run_root_script(const char *script_path, const char *sudo_password, 
         snprintf(message, message_size, "Administrator password required.");
     } else if (!ok && message[0] == '\0') {
         snprintf(message, message_size, "Privileged operation failed.");
+    }
+    return ok;
+}
+
+static bool run_root_outerwebapps_migration(const char *sudo_password, bool *needs_password, char *message, size_t message_size) {
+    if (needs_password) *needs_password = false;
+    char old_outerctl[PATH_MAX];
+    char old_home_screen_outerctl[PATH_MAX];
+    char new_outerctl[PATH_MAX];
+    char old_user_apps[PATH_MAX];
+    char new_user_apps[PATH_MAX];
+    legacy_user_outerctl_path(old_outerctl, sizeof(old_outerctl));
+    legacy_home_screen_outerctl_path(old_home_screen_outerctl, sizeof(old_home_screen_outerctl));
+    default_user_outerctl_path(new_outerctl, sizeof(new_outerctl));
+    legacy_user_apps_root(old_user_apps, sizeof(old_user_apps));
+    default_user_outerwebapps_apps_root(new_user_apps, sizeof(new_user_apps));
+
+    char quoted_old_outerctl[PATH_MAX + 8];
+    char quoted_old_home_screen_outerctl[PATH_MAX + 8];
+    char quoted_new_outerctl[PATH_MAX + 8];
+    char quoted_old_user_apps[PATH_MAX + 8];
+    char quoted_new_user_apps[PATH_MAX + 8];
+    char quoted_new_root[PATH_MAX + 8];
+    shell_quote(old_outerctl, quoted_old_outerctl, sizeof(quoted_old_outerctl));
+    shell_quote(old_home_screen_outerctl, quoted_old_home_screen_outerctl, sizeof(quoted_old_home_screen_outerctl));
+    shell_quote(new_outerctl, quoted_new_outerctl, sizeof(quoted_new_outerctl));
+    shell_quote(old_user_apps, quoted_old_user_apps, sizeof(quoted_old_user_apps));
+    shell_quote(new_user_apps, quoted_new_user_apps, sizeof(quoted_new_user_apps));
+    shell_quote(kSystemOuterWebappsRoot, quoted_new_root, sizeof(quoted_new_root));
+
+    char script_template[] = "/tmp/homescreen-root-migration-XXXXXX";
+    int script_fd = mkstemp(script_template);
+    if (script_fd < 0) {
+        snprintf(message, message_size, "Failed to create privileged migration script: %s", strerror(errno));
+        return false;
+    }
+    FILE *script = fdopen(script_fd, "w");
+    if (!script) {
+        close(script_fd);
+        unlink(script_template);
+        snprintf(message, message_size, "Failed to write privileged migration script: %s", strerror(errno));
+        return false;
+    }
+    fprintf(script,
+            "set -eu\n"
+            "mkdir -p %s\n"
+            "OLD_ROOT='/var/lib/outergroup/outeragent'\n"
+            "NEW_ROOT=%s\n"
+            "OLD_DB=\"$OLD_ROOT/registry.sqlite3\"\n"
+            "NEW_DB=\"$NEW_ROOT/registry.sqlite3\"\n"
+            "OLD_OUTERCTL=%s\n"
+            "OLD_HOME_SCREEN_OUTERCTL=%s\n"
+            "NEW_OUTERCTL=%s\n"
+            "OLD_USER_APPS=%s\n"
+            "NEW_USER_APPS=%s\n"
+            "export OLD_DB NEW_DB OLD_OUTERCTL OLD_HOME_SCREEN_OUTERCTL NEW_OUTERCTL OLD_USER_APPS NEW_USER_APPS\n"
+            "python3 - <<'__HOMESCREEN_ROOT_MIGRATION__'\n"
+            "import os, sqlite3, urllib.parse\n"
+            "old_db = os.environ['OLD_DB']\n"
+            "new_db = os.environ['NEW_DB']\n"
+            "replacements = [\n"
+            "    (os.environ['OLD_OUTERCTL'], os.environ['NEW_OUTERCTL']),\n"
+            "    (os.environ['OLD_HOME_SCREEN_OUTERCTL'], os.environ['NEW_OUTERCTL']),\n"
+            "    (os.environ['OLD_USER_APPS'], os.environ['NEW_USER_APPS']),\n"
+            "    ('/var/lib/outergroup/outeragent', '/var/lib/outerwebapps'),\n"
+            "    ('OUTERAGENT_ROOT', 'OUTERWEBAPPS_HOME'),\n"
+            "    ('outeragent.log', 'backend.log'),\n"
+            "]\n"
+            "os.makedirs(os.path.dirname(new_db), exist_ok=True)\n"
+            "db = sqlite3.connect(new_db)\n"
+            "db.executescript('''\n"
+            "CREATE TABLE IF NOT EXISTS backends (service_id TEXT PRIMARY KEY, display_name TEXT NOT NULL DEFAULT '', icon TEXT, service_unit TEXT);\n"
+            "CREATE TABLE IF NOT EXISTS frontends (url TEXT PRIMARY KEY, service_id TEXT, name TEXT NOT NULL, port INTEGER NOT NULL DEFAULT 0, socket_path TEXT NOT NULL DEFAULT '', icon TEXT, is_home_screen INTEGER NOT NULL DEFAULT 0, list TEXT);\n"
+            "CREATE INDEX IF NOT EXISTS frontends_service_id_idx ON frontends(service_id);\n"
+            "CREATE TABLE IF NOT EXISTS log_files (path TEXT PRIMARY KEY, service_id TEXT NOT NULL);\n"
+            "CREATE INDEX IF NOT EXISTS log_files_service_id_idx ON log_files(service_id);\n"
+            "CREATE TABLE IF NOT EXISTS systemd_backends (service_id TEXT PRIMARY KEY, unit_name TEXT NOT NULL, scope TEXT NOT NULL DEFAULT 'user');\n"
+            "CREATE TABLE IF NOT EXISTS launchd_backends (service_id TEXT PRIMARY KEY, plist_path TEXT NOT NULL, owns_plist INTEGER NOT NULL DEFAULT 0);\n"
+            "''')\n"
+            "def open_old_registry(path):\n"
+            "    uri = 'file:' + urllib.parse.quote(path) + '?mode=ro&immutable=1'\n"
+            "    old = sqlite3.connect(uri, uri=True)\n"
+            "    old.row_factory = sqlite3.Row\n"
+            "    return old\n"
+            "def old_columns(old, table):\n"
+            "    try:\n"
+            "        return {row['name'] for row in old.execute(f'PRAGMA table_info({table})')}\n"
+            "    except sqlite3.OperationalError:\n"
+            "        return set()\n"
+            "def old_rows(old, table):\n"
+            "    try:\n"
+            "        return old.execute(f'SELECT * FROM {table}')\n"
+            "    except sqlite3.OperationalError:\n"
+            "        return []\n"
+            "if os.path.exists(old_db):\n"
+            "    old = open_old_registry(old_db)\n"
+            "    try:\n"
+            "        for row in old_rows(old, 'backends'):\n"
+            "            db.execute('INSERT OR REPLACE INTO backends(service_id, display_name, icon, service_unit) VALUES (?, ?, ?, ?)',\n"
+            "                       (row['service_id'], row['display_name'] if 'display_name' in row.keys() and row['display_name'] is not None else '', row['icon'] if 'icon' in row.keys() else None, row['service_unit'] if 'service_unit' in row.keys() else None))\n"
+            "        for row in old_rows(old, 'frontends'):\n"
+            "            db.execute('INSERT OR REPLACE INTO frontends(url, service_id, name, port, socket_path, icon, is_home_screen, list) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',\n"
+            "                       (row['url'], row['service_id'] if 'service_id' in row.keys() else None, row['name'] if 'name' in row.keys() and row['name'] is not None else '', row['port'] if 'port' in row.keys() and row['port'] is not None else 0, row['socket_path'] if 'socket_path' in row.keys() and row['socket_path'] is not None else '', row['icon'] if 'icon' in row.keys() else None, row['is_home_screen'] if 'is_home_screen' in row.keys() and row['is_home_screen'] is not None else 0, row['list'] if 'list' in row.keys() else None))\n"
+            "        for row in old_rows(old, 'log_files'):\n"
+            "            db.execute('INSERT OR REPLACE INTO log_files(path, service_id) VALUES (?, ?)', (row['path'], row['service_id']))\n"
+            "        for row in old_rows(old, 'systemd_backends'):\n"
+            "            db.execute('INSERT OR REPLACE INTO systemd_backends(service_id, unit_name, scope) VALUES (?, ?, ?)',\n"
+            "                       (row['service_id'], row['unit_name'], row['scope'] if 'scope' in row.keys() and row['scope'] is not None else 'system'))\n"
+            "    finally:\n"
+            "        old.close()\n"
+            "for old, new in replacements:\n"
+            "    if not old:\n"
+            "        continue\n"
+            "    for sql in [\n"
+            "        'UPDATE log_files SET path = replace(path, ?, ?)',\n"
+            "        'UPDATE frontends SET url = replace(url, ?, ?), socket_path = replace(socket_path, ?, ?)',\n"
+            "        'UPDATE launchd_backends SET plist_path = replace(plist_path, ?, ?)',\n"
+            "    ]:\n"
+            "        try:\n"
+            "            if sql.count('?') == 2:\n"
+            "                db.execute(sql, (old, new))\n"
+            "            else:\n"
+            "                db.execute(sql, (old, new, old, new))\n"
+            "        except sqlite3.OperationalError:\n"
+            "            pass\n"
+            "db.commit()\n"
+            "db.close()\n"
+            "for root in ('/opt/outergroup', '/etc/systemd/system'):\n"
+            "    if not os.path.isdir(root):\n"
+            "        continue\n"
+            "    for dirpath, _, filenames in os.walk(root):\n"
+            "        for filename in filenames:\n"
+            "            path = os.path.join(dirpath, filename)\n"
+            "            try:\n"
+            "                with open(path, 'r', encoding='utf-8') as f:\n"
+            "                    text = f.read()\n"
+            "            except (OSError, UnicodeDecodeError):\n"
+            "                continue\n"
+            "            new_text = text\n"
+            "            for old, new in replacements:\n"
+            "                if old:\n"
+            "                    new_text = new_text.replace(old, new)\n"
+            "            if new_text != text:\n"
+            "                with open(path, 'w', encoding='utf-8') as f:\n"
+            "                    f.write(new_text)\n"
+            "__HOMESCREEN_ROOT_MIGRATION__\n"
+            "if [ -d \"$OLD_ROOT\" ]; then mv \"$OLD_ROOT\" \"$OLD_ROOT.migrated.$(date +%%s)\" >/dev/null 2>&1 || true; fi\n"
+            "chmod 0644 \"$NEW_DB\" >/dev/null 2>&1 || true\n"
+            "systemctl --system daemon-reload >/dev/null 2>&1 || true\n",
+            quoted_new_root,
+            quoted_new_root,
+            quoted_old_outerctl,
+            quoted_old_home_screen_outerctl,
+            quoted_new_outerctl,
+            quoted_old_user_apps,
+            quoted_new_user_apps);
+    fclose(script);
+    chmod(script_template, 0700);
+    bool ok = run_root_script(script_template, sudo_password, needs_password, message, message_size);
+    unlink(script_template);
+    if (ok) {
+        snprintf(message, message_size, "Migrated old root registry and wrappers.");
     }
     return ok;
 }
@@ -2804,7 +3456,7 @@ static bool make_jupyter_script(const char *service_id,
     ok = ok && sb_append(builder, "\nUSE_UNIX_SOCKET = ");
     ok = ok && sb_append(builder, use_unix_socket ? "True" : "False");
     ok = ok && sb_append(builder,
-        "\nSOCKET_DIRECTORY = os.path.join(os.path.expanduser(\"~\"), \".outerloop\", \"run\")\n"
+        "\nSOCKET_DIRECTORY = os.path.join(os.environ.get(\"XDG_RUNTIME_DIR\", f\"/tmp/outerwebapps-{os.getuid()}\"), \"outerwebapps\")\n"
         "SOCKET_PATH = os.path.join(SOCKET_DIRECTORY, f\"{BACKEND_ID}.sock\")\n"
         "\n"
         "child = None\n"
@@ -3560,16 +4212,16 @@ static bool install_bundled_app(const BundledAppDefinition *app, const char *sco
         }
 
         char quoted_outerctl[PATH_MAX + 8];
-        char quoted_system_outeragent_root[PATH_MAX + 8];
+        char quoted_system_outerwebapps_root[PATH_MAX + 8];
         char outerctl_path[PATH_MAX];
-        snprintf(outerctl_path, sizeof(outerctl_path), "%s/.outeragent/outerctl", home_directory());
+        default_user_outerctl_path(outerctl_path, sizeof(outerctl_path));
         shell_quote(outerctl_path, quoted_outerctl, sizeof(quoted_outerctl));
-        shell_quote(kSystemOuterAgentRoot, quoted_system_outeragent_root, sizeof(quoted_system_outeragent_root));
+        shell_quote(kSystemOuterWebappsRoot, quoted_system_outerwebapps_root, sizeof(quoted_system_outerwebapps_root));
         char wrapper_contents[4096];
         snprintf(wrapper_contents, sizeof(wrapper_contents),
                  "#!/bin/sh\n"
-                 "exec env OUTERAGENT_ROOT=%s %s \"$@\"\n",
-                 quoted_system_outeragent_root,
+                 "exec env OUTERWEBAPPS_HOME=%s %s \"$@\"\n",
+                 quoted_system_outerwebapps_root,
                  quoted_outerctl);
 
         char script_template[] = "/tmp/backends-root-install-XXXXXX";
@@ -3592,7 +4244,7 @@ static bool install_bundled_app(const BundledAppDefinition *app, const char *sco
                 "systemctl --system stop %s >/dev/null 2>&1 || true\n"
                 "systemctl --system reset-failed %s >/dev/null 2>&1 || true\n"
                 "mkdir -p %s %s /var/log/outergroup %s\n"
-                "chmod 0755 /var/lib/outergroup %s\n"
+                "chmod 0755 %s\n"
                 "install -m 0755 %s %s\n"
                 "install -m 0644 %s %s\n"
                 "install -m 0644 %s %s\n",
@@ -3600,8 +4252,8 @@ static bool install_bundled_app(const BundledAppDefinition *app, const char *sco
                 quoted_unit,
                 quoted_install_root,
                 quoted_bundles_dir,
-                quoted_system_outeragent_root,
-                quoted_system_outeragent_root,
+                quoted_system_outerwebapps_root,
+                quoted_system_outerwebapps_root,
                 quoted_binary_source,
                 quoted_target_binary,
                 quoted_source_bundle_arm,
@@ -3711,14 +4363,14 @@ static bool install_bundled_app(const BundledAppDefinition *app, const char *sco
                 quoted_unit_path,
                 quoted_log_path,
                 quoted_log_path,
-                quoted_system_outeragent_root,
+                quoted_system_outerwebapps_root,
                 quoted_service_id,
                 quoted_display_name,
                 quoted_unit,
                 quoted_log_path,
                 quoted_target_icon_for_registry,
                 quoted_actual_socket_path,
-                quoted_system_outeragent_root);
+                quoted_system_outerwebapps_root);
         if (quoted_socket_unit[0] && quoted_socket_unit_path[0]) {
             fprintf(script,
                     "cat > %s <<'__BACKENDS_SOCKET__'\n%s__BACKENDS_SOCKET__\n"
@@ -3750,7 +4402,7 @@ static bool install_bundled_app(const BundledAppDefinition *app, const char *sco
         }
 
         char user_install_root[PATH_MAX];
-        snprintf(user_install_root, sizeof(user_install_root), "%s/.outeragent/%s", home_directory(), app->install_directory_name);
+        default_user_outerwebapps_app_root(app->install_directory_name, user_install_root, sizeof(user_install_root));
         char quoted_user_install_root[PATH_MAX + 8];
         shell_quote(user_install_root, quoted_user_install_root, sizeof(quoted_user_install_root));
         char remove_user_install_command[PATH_MAX + 64];
@@ -3762,7 +4414,7 @@ static bool install_bundled_app(const BundledAppDefinition *app, const char *sco
     }
 
     char install_root[PATH_MAX];
-    snprintf(install_root, sizeof(install_root), "%s/.outeragent/%s", home_directory(), app->install_directory_name);
+    default_user_outerwebapps_app_root(app->install_directory_name, install_root, sizeof(install_root));
     char bundles_dir[PATH_MAX];
     snprintf(bundles_dir, sizeof(bundles_dir), "%s/bundles", install_root);
     char target_binary[PATH_MAX];
@@ -3780,7 +4432,7 @@ static bool install_bundled_app(const BundledAppDefinition *app, const char *sco
     char version_path[PATH_MAX];
     snprintf(version_path, sizeof(version_path), "%s/version", install_root);
     char log_path[PATH_MAX];
-    snprintf(log_path, sizeof(log_path), "%s/outeragent.log", install_root);
+    snprintf(log_path, sizeof(log_path), "%s/backend.log", install_root);
     char unit_path[PATH_MAX];
     snprintf(unit_path, sizeof(unit_path), "%s/.config/systemd/user/%s", home_directory(), app->unit_name);
     char socket_unit_name[256] = "";
@@ -3909,6 +4561,8 @@ static bool install_bundled_app(const BundledAppDefinition *app, const char *sco
 
     char description[256];
     unit_description_text(app->display_name, description, sizeof(description));
+    char outerctl_path[PATH_MAX];
+    default_user_outerctl_path(outerctl_path, sizeof(outerctl_path));
     char unit_contents[12000];
     snprintf(unit_contents, sizeof(unit_contents),
              "[Unit]\n"
@@ -3921,7 +4575,7 @@ static bool install_bundled_app(const BundledAppDefinition *app, const char *sco
              "Environment=HOME=%s\n"
              "Environment=USER=%s\n"
              "Environment=LOGNAME=%s\n"
-             "Environment=OUTERCTL_PATH=%s/.outeragent/outerctl\n"
+             "Environment=OUTERCTL_PATH=%s\n"
              "ExecStart=/bin/sh -lc %s\n"
              "Restart=on-failure\n"
              "KillMode=control-group\n"
@@ -3933,7 +4587,7 @@ static bool install_bundled_app(const BundledAppDefinition *app, const char *sco
              home_directory(),
              user_name,
              user_name,
-             home_directory(),
+             outerctl_path,
              quoted_run_script);
     char socket_contents[2048] = "";
     if (app->socket_activated && quoted_socket_path[0]) {
@@ -4138,7 +4792,7 @@ static bool install_bundled_app_macos(const BundledAppDefinition *app,
 
     if (install_as_root) {
         char install_root[PATH_MAX];
-        snprintf(install_root, sizeof(install_root), "/Library/Application Support/OuterLoopServerTools/%s", app->install_directory_name);
+        snprintf(install_root, sizeof(install_root), "%s/apps/%s", kSystemOuterWebappsRoot, app->install_directory_name);
         char bundles_dir[PATH_MAX];
         snprintf(bundles_dir, sizeof(bundles_dir), "%s/bundles", install_root);
         char target_binary[PATH_MAX];
@@ -4157,15 +4811,15 @@ static bool install_bundled_app_macos(const BundledAppDefinition *app,
         snprintf(plist_path, sizeof(plist_path), "/Library/LaunchDaemons/%s.plist", app->service_id);
 
         char outerctl_path[PATH_MAX];
-        snprintf(outerctl_path, sizeof(outerctl_path), "%s/Library/dev.outergroup.OuterLoop/outerctl", home_directory());
+        default_user_outerctl_path(outerctl_path, sizeof(outerctl_path));
         char quoted_system_root[PATH_MAX + 8];
         char quoted_outerctl[PATH_MAX + 8];
-        shell_quote(kSystemOuterAgentRoot, quoted_system_root, sizeof(quoted_system_root));
+        shell_quote(kSystemOuterWebappsRoot, quoted_system_root, sizeof(quoted_system_root));
         shell_quote(outerctl_path, quoted_outerctl, sizeof(quoted_outerctl));
         char wrapper_contents[4096];
         snprintf(wrapper_contents, sizeof(wrapper_contents),
                  "#!/bin/sh\n"
-                 "exec env OUTERAGENT_ROOT=%s %s \"$@\"\n",
+                 "exec env OUTERWEBAPPS_HOME=%s %s \"$@\"\n",
                  quoted_system_root,
                  quoted_outerctl);
 
@@ -4221,7 +4875,7 @@ static bool install_bundled_app_macos(const BundledAppDefinition *app,
         char user_plist_path[PATH_MAX];
         snprintf(user_plist_path, sizeof(user_plist_path), "%s/Library/LaunchAgents/%s.plist", home_directory(), app->service_id);
         char user_install_root[PATH_MAX];
-        snprintf(user_install_root, sizeof(user_install_root), "%s/Library/dev.outergroup.OuterLoop/backends/%s", home_directory(), app->install_directory_name);
+        default_user_outerwebapps_app_root(app->install_directory_name, user_install_root, sizeof(user_install_root));
         char quoted_user_plist_path[PATH_MAX + 8];
         char quoted_user_install_root[PATH_MAX + 8];
         shell_quote(user_plist_path, quoted_user_plist_path, sizeof(quoted_user_plist_path));
@@ -4375,7 +5029,7 @@ static bool install_bundled_app_macos(const BundledAppDefinition *app,
     }
 
     char install_root[PATH_MAX];
-    snprintf(install_root, sizeof(install_root), "%s/Library/dev.outergroup.OuterLoop/backends/%s", home_directory(), app->install_directory_name);
+    default_user_outerwebapps_app_root(app->install_directory_name, install_root, sizeof(install_root));
     char bundles_dir[PATH_MAX];
     snprintf(bundles_dir, sizeof(bundles_dir), "%s/bundles", install_root);
     char target_binary[PATH_MAX];
@@ -4391,7 +5045,7 @@ static bool install_bundled_app_macos(const BundledAppDefinition *app,
     char plist_path[PATH_MAX];
     snprintf(plist_path, sizeof(plist_path), "%s/Library/LaunchAgents/%s.plist", home_directory(), app->service_id);
     char outerctl_path[PATH_MAX];
-    snprintf(outerctl_path, sizeof(outerctl_path), "%s/Library/dev.outergroup.OuterLoop/outerctl", home_directory());
+    default_user_outerctl_path(outerctl_path, sizeof(outerctl_path));
 
     char error[1024] = "";
     if (!mkdir_p(bundles_dir)) {
@@ -4496,7 +5150,7 @@ static bool uninstall_backend(const char *service_id, const char *sudo_password,
             snprintf(install_name, sizeof(install_name), "%s", app ? app->install_directory_name : service_id);
             char install_root[PATH_MAX] = "";
             if (safe_service_directory_name(install_name)) {
-                snprintf(install_root, sizeof(install_root), "/Library/Application Support/OuterLoopServerTools/%s", install_name);
+                snprintf(install_root, sizeof(install_root), "%s/apps/%s", kSystemOuterWebappsRoot, install_name);
             }
             char log_path[PATH_MAX];
             snprintf(log_path, sizeof(log_path), "/Library/Logs/%s.log", service_id);
@@ -4515,7 +5169,7 @@ static bool uninstall_backend(const char *service_id, const char *sudo_password,
             if (install_root[0]) shell_quote(install_root, quoted_install_root, sizeof(quoted_install_root));
             shell_quote(log_path, quoted_log_path, sizeof(quoted_log_path));
             if (socket_path[0]) shell_quote(socket_path, quoted_socket_path, sizeof(quoted_socket_path));
-            shell_quote(kSystemOuterAgentRoot, quoted_system_root, sizeof(quoted_system_root));
+            shell_quote(kSystemOuterWebappsRoot, quoted_system_root, sizeof(quoted_system_root));
             shell_quote(service_id, quoted_service_id, sizeof(quoted_service_id));
 
             char script_template[] = "/tmp/backends-root-uninstall-XXXXXX";
@@ -4608,7 +5262,7 @@ static bool uninstall_backend(const char *service_id, const char *sudo_password,
             char quoted_log_path[PATH_MAX + 8];
             char quoted_wrapper_path[PATH_MAX + 8];
             char quoted_outerctl_path[PATH_MAX + 8];
-            char quoted_system_outeragent_root[PATH_MAX + 8];
+            char quoted_system_outerwebapps_root[PATH_MAX + 8];
             char quoted_service_id[512];
             shell_quote(unit_path, quoted_unit_path, sizeof(quoted_unit_path));
             if (socket_unit_name[0]) shell_quote(socket_unit_name, quoted_socket_unit, sizeof(quoted_socket_unit)); else quoted_socket_unit[0] = '\0';
@@ -4617,9 +5271,9 @@ static bool uninstall_backend(const char *service_id, const char *sudo_password,
             shell_quote(log_path, quoted_log_path, sizeof(quoted_log_path));
             if (wrapper_path[0]) shell_quote(wrapper_path, quoted_wrapper_path, sizeof(quoted_wrapper_path)); else quoted_wrapper_path[0] = '\0';
             char outerctl_path[PATH_MAX];
-            snprintf(outerctl_path, sizeof(outerctl_path), "%s/.outeragent/outerctl", home_directory());
+            default_user_outerctl_path(outerctl_path, sizeof(outerctl_path));
             shell_quote(outerctl_path, quoted_outerctl_path, sizeof(quoted_outerctl_path));
-            shell_quote(kSystemOuterAgentRoot, quoted_system_outeragent_root, sizeof(quoted_system_outeragent_root));
+            shell_quote(kSystemOuterWebappsRoot, quoted_system_outerwebapps_root, sizeof(quoted_system_outerwebapps_root));
             shell_quote(service_id, quoted_service_id, sizeof(quoted_service_id));
 
             char script_template[] = "/tmp/backends-root-uninstall-XXXXXX";
@@ -4645,10 +5299,10 @@ static bool uninstall_backend(const char *service_id, const char *sudo_password,
                     "  %s systemd clear --backend %s >/dev/null 2>&1 || true\n"
                     "  %s backend remove --backend %s >/dev/null 2>&1 || true\n"
                     "elif [ -x %s ]; then\n"
-                    "  env OUTERAGENT_ROOT=%s %s app clear --backend %s >/dev/null 2>&1 || true\n"
-                    "  env OUTERAGENT_ROOT=%s %s log clear --backend %s >/dev/null 2>&1 || true\n"
-                    "  env OUTERAGENT_ROOT=%s %s systemd clear --backend %s >/dev/null 2>&1 || true\n"
-                    "  env OUTERAGENT_ROOT=%s %s backend remove --backend %s >/dev/null 2>&1 || true\n"
+                    "  env OUTERWEBAPPS_HOME=%s %s app clear --backend %s >/dev/null 2>&1 || true\n"
+                    "  env OUTERWEBAPPS_HOME=%s %s log clear --backend %s >/dev/null 2>&1 || true\n"
+                    "  env OUTERWEBAPPS_HOME=%s %s systemd clear --backend %s >/dev/null 2>&1 || true\n"
+                    "  env OUTERWEBAPPS_HOME=%s %s backend remove --backend %s >/dev/null 2>&1 || true\n"
                     "fi\n"
                     "rm -f -- %s %s\n",
                     quoted_unit,
@@ -4665,16 +5319,16 @@ static bool uninstall_backend(const char *service_id, const char *sudo_password,
                     quoted_wrapper_path[0] ? quoted_wrapper_path : "''",
                     quoted_service_id,
                     quoted_outerctl_path,
-                    quoted_system_outeragent_root,
+                    quoted_system_outerwebapps_root,
                     quoted_outerctl_path,
                     quoted_service_id,
-                    quoted_system_outeragent_root,
+                    quoted_system_outerwebapps_root,
                     quoted_outerctl_path,
                     quoted_service_id,
-                    quoted_system_outeragent_root,
+                    quoted_system_outerwebapps_root,
                     quoted_outerctl_path,
                     quoted_service_id,
-                    quoted_system_outeragent_root,
+                    quoted_system_outerwebapps_root,
                     quoted_outerctl_path,
                     quoted_service_id,
                     quoted_unit_path,
@@ -4727,11 +5381,7 @@ static bool uninstall_backend(const char *service_id, const char *sudo_password,
         snprintf(install_name, sizeof(install_name), "%s", app ? app->install_directory_name : service_id);
         if (safe_service_directory_name(install_name)) {
             char install_root[PATH_MAX];
-#ifdef __APPLE__
-            snprintf(install_root, sizeof(install_root), "%s/Library/dev.outergroup.OuterLoop/backends/%s", home_directory(), install_name);
-#else
-            snprintf(install_root, sizeof(install_root), "%s/.outeragent/%s", home_directory(), install_name);
-#endif
+            default_user_outerwebapps_app_root(install_name, install_root, sizeof(install_root));
             char quoted_root[PATH_MAX + 8];
             shell_quote(install_root, quoted_root, sizeof(quoted_root));
             char command[PATH_MAX + 64];
@@ -5114,12 +5764,11 @@ static void send_create_response(int fd, const char *query) {
     char backend_dir[PATH_MAX];
     char log_path[PATH_MAX];
     char unit_path[PATH_MAX];
+    default_user_outerwebapps_app_root(service_id, backend_dir, sizeof(backend_dir));
 #ifdef __APPLE__
-    snprintf(backend_dir, sizeof(backend_dir), "%s/Library/dev.outergroup.OuterLoop/backends/%s", home_directory(), service_id);
     snprintf(log_path, sizeof(log_path), "%s/Library/Logs/%s/output.log", home_directory(), service_id);
     snprintf(unit_path, sizeof(unit_path), "%s/Library/LaunchAgents/%s.plist", home_directory(), unit_name);
 #else
-    snprintf(backend_dir, sizeof(backend_dir), "%s/.outeragent/%s", home_directory(), service_id);
     snprintf(log_path, sizeof(log_path), "%s/output.log", backend_dir);
     snprintf(unit_path, sizeof(unit_path), "%s/.config/systemd/user/%s", home_directory(), unit_name);
 #endif
@@ -5274,6 +5923,8 @@ static void send_create_response(int fd, const char *query) {
     }
     char description[512];
     unit_description_text(display_name, description, sizeof(description));
+    char outerctl_path[PATH_MAX];
+    default_user_outerctl_path(outerctl_path, sizeof(outerctl_path));
     char unit_contents[12000];
     snprintf(unit_contents, sizeof(unit_contents),
              "[Unit]\n"
@@ -5283,7 +5934,7 @@ static void send_create_response(int fd, const char *query) {
              "[Service]\n"
              "Type=simple\n"
              "WorkingDirectory=%s\n"
-             "Environment=OUTERCTL_PATH=%s/.outeragent/outerctl\n"
+             "Environment=OUTERCTL_PATH=%s\n"
              "ExecStart=/bin/sh -lc %s\n"
              "Restart=on-failure\n"
              "RestartSec=2\n"
@@ -5295,7 +5946,7 @@ static void send_create_response(int fd, const char *query) {
              "WantedBy=default.target\n",
              description,
              working_directory,
-             home_directory(),
+             outerctl_path,
              quoted_command,
              log_path,
              log_path);
@@ -5325,8 +5976,6 @@ static void send_create_response(int fd, const char *query) {
         send_action_json(fd, 500, false, error);
         return;
     }
-    char outerctl_path[PATH_MAX];
-    snprintf(outerctl_path, sizeof(outerctl_path), "%s/Library/dev.outergroup.OuterLoop/outerctl", home_directory());
     StringBuilder plist = {0};
     if (!make_launchd_plist(unit_name, command, working_directory, outerctl_path, log_path, &plist)) {
         free(plist.data);
@@ -6013,6 +6662,8 @@ int main(int argc, char **argv) {
              "%s/BackendsContent.bundle.macos-arm.aar", bundles_dir);
     snprintf(g_bundle_file_path_macos_x86, sizeof(g_bundle_file_path_macos_x86),
              "%s/BackendsContent.bundle.macos-x86.aar", bundles_dir);
+
+    migrate_user_outerwebapps_state();
 
     signal(SIGINT, handle_shutdown_signal);
     signal(SIGTERM, handle_shutdown_signal);

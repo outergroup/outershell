@@ -13,6 +13,8 @@ Each architecture-specific Home Screen tarball expands to:
 HomeScreen/
   HomeScreenBackend
   app-icon.png
+  bin/
+    outerctl
   bundles/
     BackendsContent.bundle.macos-arm.aar
     BackendsContent.bundle.macos-x86.aar
@@ -48,6 +50,7 @@ The script writes binaries to:
 
 ```text
 build/linux-package/RemoteLinuxBinaries/<arch>/HomeScreenBackend
+build/linux-package/RemoteLinuxBinaries/<arch>/outerctl
 ```
 
 Then run the macOS build from the host to refresh the outerframe bundles:
