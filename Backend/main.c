@@ -68,6 +68,7 @@ static char g_bundled_apps_base_url[2048] = "";
 static char g_listen_socket_path[PATH_MAX] = "";
 static bool g_systemd_socket_activation = false;
 static bool g_launchd_socket_activation = false;
+static bool g_stay_alive_when_socket_idle = false;
 static volatile sig_atomic_t g_shutdown_requested = 0;
 static volatile sig_atomic_t g_listener_fd = -1;
 
@@ -217,6 +218,10 @@ static void handle_shutdown_signal(int signal_number) {
     if (g_listener_fd >= 0) {
         close((int)g_listener_fd);
     }
+}
+
+void HomeScreenBackendRequestShutdown(void) {
+    handle_shutdown_signal(SIGTERM);
 }
 
 static bool queue_all(int fd, const void *data, size_t len) {
@@ -1131,7 +1136,7 @@ static sqlite3 *open_registry_readonly_at(const char *path, char *error, size_t 
     }
     sqlite3 *database = NULL;
     int result = sqlite3_open_v2(path, &database,
-                                 SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX, NULL);
+                                 SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX | SQLITE_OPEN_URI, NULL);
     if (result != SQLITE_OK) {
         snprintf(error, error_size, "%s", database ? sqlite3_errmsg(database) : "failed to open registry database");
         if (database) sqlite3_close(database);
@@ -1156,7 +1161,7 @@ static sqlite3 *open_registry_readwrite_at(const char *path, char *error, size_t
     }
     sqlite3 *database = NULL;
     int result = sqlite3_open_v2(path, &database,
-                                 SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX, NULL);
+                                 SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX | SQLITE_OPEN_URI, NULL);
     if (result != SQLITE_OK) {
         snprintf(error, error_size, "%s", database ? sqlite3_errmsg(database) : "failed to open registry database");
         if (database) sqlite3_close(database);
@@ -1304,6 +1309,67 @@ static bool sqlite_file_uri_for_readonly_immutable_path(const char *path, char *
     return written >= 0 && (size_t)written < out_size - offset;
 }
 
+static sqlite3 *open_readonly_immutable_sqlite_database(const char *path, char *error, size_t error_size) {
+    char uri[PATH_MAX * 3 + 64];
+    if (!sqlite_file_uri_for_readonly_immutable_path(path, uri, sizeof(uri))) {
+        snprintf(error, error_size, "Could not build read-only SQLite URI for %s.", path);
+        return NULL;
+    }
+    sqlite3 *database = NULL;
+    int result = sqlite3_open_v2(uri,
+                                 &database,
+                                 SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX | SQLITE_OPEN_URI,
+                                 NULL);
+    if (result != SQLITE_OK) {
+        snprintf(error, error_size, "%s", database ? sqlite3_errmsg(database) : "failed to open source registry database");
+        if (database) sqlite3_close(database);
+        return NULL;
+    }
+    return database;
+}
+
+static bool copy_registry_rows(sqlite3 *source,
+                               sqlite3 *destination,
+                               const char *select_sql,
+                               const char *insert_sql,
+                               char *error,
+                               size_t error_size) {
+    sqlite3_stmt *select_statement = NULL;
+    int result = sqlite3_prepare_v2(source, select_sql, -1, &select_statement, NULL);
+    if (result != SQLITE_OK) {
+        return true;
+    }
+    sqlite3_stmt *insert_statement = NULL;
+    result = sqlite3_prepare_v2(destination, insert_sql, -1, &insert_statement, NULL);
+    if (result != SQLITE_OK) {
+        snprintf(error, error_size, "%s", sqlite3_errmsg(destination));
+        sqlite3_finalize(select_statement);
+        return false;
+    }
+    bool ok = true;
+    int column_count = sqlite3_column_count(select_statement);
+    while ((result = sqlite3_step(select_statement)) == SQLITE_ROW) {
+        sqlite3_reset(insert_statement);
+        sqlite3_clear_bindings(insert_statement);
+        for (int i = 0; i < column_count; i++) {
+            sqlite3_bind_value(insert_statement, i + 1, sqlite3_column_value(select_statement, i));
+        }
+        int insert_result = sqlite3_step(insert_statement);
+        if (insert_result != SQLITE_DONE) {
+            snprintf(error, error_size, "%s", sqlite3_errmsg(destination));
+            ok = false;
+            break;
+        }
+    }
+    if (ok && result != SQLITE_DONE) {
+        snprintf(error, error_size, "%s", sqlite3_errmsg(source));
+        ok = false;
+    }
+    sqlite3_finalize(insert_statement);
+    sqlite3_finalize(select_statement);
+    return ok;
+}
+
 static bool merge_registry_database(const char *old_path,
                                     const char *new_path,
                                     const TextReplacement *replacements,
@@ -1313,56 +1379,35 @@ static bool merge_registry_database(const char *old_path,
     if (!old_path || !new_path || strcmp(old_path, new_path) == 0 || access(old_path, R_OK) != 0) {
         return true;
     }
-    char old_uri[PATH_MAX * 3 + 64];
-    if (!sqlite_file_uri_for_readonly_immutable_path(old_path, old_uri, sizeof(old_uri))) {
-        snprintf(error, error_size, "Could not build read-only SQLite URI for %s.", old_path);
-        return false;
-    }
     sqlite3 *database = open_registry_readwrite_at(new_path, error, error_size);
     if (!database) return false;
+    sqlite3 *old_database = open_readonly_immutable_sqlite_database(old_path, error, error_size);
+    if (!old_database) {
+        sqlite3_close(database);
+        return false;
+    }
     bool ok = ensure_registry_schema(database, error, error_size);
     if (ok) ok = sqlite_exec_ok(database, "BEGIN IMMEDIATE TRANSACTION;", error, error_size);
-    if (ok) ok = sqlite_exec_formatted(database, error, error_size, "ATTACH DATABASE %Q AS old_registry;", old_uri);
-    if (ok) {
-        ok = sqlite_exec_ok(database,
-                            "INSERT OR REPLACE INTO backends(service_id, display_name, icon, service_unit) "
-                            "SELECT service_id, COALESCE(display_name, ''), icon, service_unit FROM old_registry.backends;",
-                            error,
-                            error_size);
-    }
-    if (ok) {
-        ok = sqlite_exec_ok(database,
-                            "INSERT OR REPLACE INTO frontends(url, service_id, name, port, socket_path, icon, is_home_screen, list) "
-                            "SELECT url, service_id, COALESCE(name, ''), COALESCE(port, 0), COALESCE(socket_path, ''), icon, COALESCE(is_home_screen, 0), list FROM old_registry.frontends;",
-                            error,
-                            error_size);
-    }
-    if (ok) {
-        ok = sqlite_exec_ok(database,
-                            "INSERT OR REPLACE INTO log_files(path, service_id) "
-                            "SELECT path, service_id FROM old_registry.log_files;",
-                            error,
-                            error_size);
-    }
-    if (ok) {
-        ok = sqlite_exec_ok(database,
-                            "INSERT OR REPLACE INTO systemd_backends(service_id, unit_name, scope) "
-                            "SELECT service_id, unit_name, COALESCE(scope, 'user') FROM old_registry.systemd_backends;",
-                            error,
-                            error_size);
-    }
-    if (ok) {
-        ok = sqlite_exec_ok(database,
-                            "INSERT OR REPLACE INTO launchd_backends(service_id, plist_path, owns_plist) "
-                            "SELECT service_id, plist_path, COALESCE(owns_plist, 0) FROM old_registry.launchd_backends;",
-                            error,
-                            error_size);
-    }
-    if (ok) {
-        ok = sqlite_exec_ok(database, "DETACH DATABASE old_registry;", error, error_size);
-    } else {
-        sqlite3_exec(database, "DETACH DATABASE old_registry;", NULL, NULL, NULL);
-    }
+    if (ok) ok = copy_registry_rows(old_database, database,
+                                    "SELECT service_id, COALESCE(display_name, ''), icon, service_unit FROM backends;",
+                                    "INSERT OR REPLACE INTO backends(service_id, display_name, icon, service_unit) VALUES (?, ?, ?, ?);",
+                                    error, error_size);
+    if (ok) ok = copy_registry_rows(old_database, database,
+                                    "SELECT url, service_id, COALESCE(name, ''), COALESCE(port, 0), COALESCE(socket_path, ''), icon, COALESCE(is_home_screen, 0), list FROM frontends;",
+                                    "INSERT OR REPLACE INTO frontends(url, service_id, name, port, socket_path, icon, is_home_screen, list) VALUES (?, ?, ?, ?, ?, ?, ?, ?);",
+                                    error, error_size);
+    if (ok) ok = copy_registry_rows(old_database, database,
+                                    "SELECT path, service_id FROM log_files;",
+                                    "INSERT OR REPLACE INTO log_files(path, service_id) VALUES (?, ?);",
+                                    error, error_size);
+    if (ok) ok = copy_registry_rows(old_database, database,
+                                    "SELECT service_id, unit_name, COALESCE(scope, 'user') FROM systemd_backends;",
+                                    "INSERT OR REPLACE INTO systemd_backends(service_id, unit_name, scope) VALUES (?, ?, ?);",
+                                    error, error_size);
+    if (ok) ok = copy_registry_rows(old_database, database,
+                                    "SELECT service_id, plist_path, COALESCE(owns_plist, 0) FROM launchd_backends;",
+                                    "INSERT OR REPLACE INTO launchd_backends(service_id, plist_path, owns_plist) VALUES (?, ?, ?);",
+                                    error, error_size);
     for (size_t i = 0; ok && i < replacement_count; i++) {
         const char *old_text = replacements[i].old_text;
         const char *new_text = replacements[i].new_text ? replacements[i].new_text : "";
@@ -1381,6 +1426,7 @@ static bool merge_registry_database(const char *old_path,
     } else {
         sqlite3_exec(database, "ROLLBACK;", NULL, NULL, NULL);
     }
+    sqlite3_close(old_database);
     sqlite3_close(database);
     return ok;
 }
@@ -2944,18 +2990,40 @@ static bool run_root_outerwebapps_migration(const char *sudo_password, bool *nee
     legacy_user_apps_root(old_user_apps, sizeof(old_user_apps));
     default_user_outerwebapps_apps_root(new_user_apps, sizeof(new_user_apps));
 
+    const char *legacy_system_root =
+#ifdef __APPLE__
+        "/Library/dev.outergroup.OuterLoop";
+#else
+        "/var/lib/outergroup/outeragent";
+#endif
+
+    char legacy_system_apps_root[PATH_MAX];
+    char new_system_apps_root[PATH_MAX];
+#ifdef __APPLE__
+    snprintf(legacy_system_apps_root, sizeof(legacy_system_apps_root), "%s/backends", legacy_system_root);
+#else
+    snprintf(legacy_system_apps_root, sizeof(legacy_system_apps_root), "%s", legacy_system_root);
+#endif
+    snprintf(new_system_apps_root, sizeof(new_system_apps_root), "%s/apps", kSystemOuterWebappsRoot);
+
     char quoted_old_outerctl[PATH_MAX + 8];
     char quoted_old_home_screen_outerctl[PATH_MAX + 8];
     char quoted_new_outerctl[PATH_MAX + 8];
     char quoted_old_user_apps[PATH_MAX + 8];
     char quoted_new_user_apps[PATH_MAX + 8];
+    char quoted_legacy_system_root[PATH_MAX + 8];
+    char quoted_legacy_system_apps_root[PATH_MAX + 8];
     char quoted_new_root[PATH_MAX + 8];
+    char quoted_new_system_apps_root[PATH_MAX + 8];
     shell_quote(old_outerctl, quoted_old_outerctl, sizeof(quoted_old_outerctl));
     shell_quote(old_home_screen_outerctl, quoted_old_home_screen_outerctl, sizeof(quoted_old_home_screen_outerctl));
     shell_quote(new_outerctl, quoted_new_outerctl, sizeof(quoted_new_outerctl));
     shell_quote(old_user_apps, quoted_old_user_apps, sizeof(quoted_old_user_apps));
     shell_quote(new_user_apps, quoted_new_user_apps, sizeof(quoted_new_user_apps));
+    shell_quote(legacy_system_root, quoted_legacy_system_root, sizeof(quoted_legacy_system_root));
+    shell_quote(legacy_system_apps_root, quoted_legacy_system_apps_root, sizeof(quoted_legacy_system_apps_root));
     shell_quote(kSystemOuterWebappsRoot, quoted_new_root, sizeof(quoted_new_root));
+    shell_quote(new_system_apps_root, quoted_new_system_apps_root, sizeof(quoted_new_system_apps_root));
 
     char script_template[] = "/tmp/homescreen-root-migration-XXXXXX";
     int script_fd = mkstemp(script_template);
@@ -2973,8 +3041,10 @@ static bool run_root_outerwebapps_migration(const char *sudo_password, bool *nee
     fprintf(script,
             "set -eu\n"
             "mkdir -p %s\n"
-            "OLD_ROOT='/var/lib/outergroup/outeragent'\n"
+            "OLD_ROOT=%s\n"
             "NEW_ROOT=%s\n"
+            "OLD_SYSTEM_APPS=%s\n"
+            "NEW_SYSTEM_APPS=%s\n"
             "OLD_DB=\"$OLD_ROOT/registry.sqlite3\"\n"
             "NEW_DB=\"$NEW_ROOT/registry.sqlite3\"\n"
             "OLD_OUTERCTL=%s\n"
@@ -2982,7 +3052,16 @@ static bool run_root_outerwebapps_migration(const char *sudo_password, bool *nee
             "NEW_OUTERCTL=%s\n"
             "OLD_USER_APPS=%s\n"
             "NEW_USER_APPS=%s\n"
-            "export OLD_DB NEW_DB OLD_OUTERCTL OLD_HOME_SCREEN_OUTERCTL NEW_OUTERCTL OLD_USER_APPS NEW_USER_APPS\n"
+            "mkdir -p \"$NEW_SYSTEM_APPS\"\n"
+            "if [ -d \"$OLD_SYSTEM_APPS\" ]; then\n"
+            "  for child in \"$OLD_SYSTEM_APPS\"/*; do\n"
+            "    [ -e \"$child\" ] || continue\n"
+            "    name=$(basename \"$child\")\n"
+            "    if [ ! -e \"$NEW_SYSTEM_APPS/$name\" ]; then mv \"$child\" \"$NEW_SYSTEM_APPS/$name\"; fi\n"
+            "  done\n"
+            "fi\n"
+            "find \"$NEW_SYSTEM_APPS\" -name outeragent.log -type f -exec sh -c 'for path do mv \"$path\" \"$(dirname \"$path\")/backend.log\" 2>/dev/null || true; done' sh {} + 2>/dev/null || true\n"
+            "export OLD_DB NEW_DB OLD_ROOT NEW_ROOT OLD_SYSTEM_APPS NEW_SYSTEM_APPS OLD_OUTERCTL OLD_HOME_SCREEN_OUTERCTL NEW_OUTERCTL OLD_USER_APPS NEW_USER_APPS\n"
             "python3 - <<'__HOMESCREEN_ROOT_MIGRATION__'\n"
             "import os, sqlite3, urllib.parse\n"
             "old_db = os.environ['OLD_DB']\n"
@@ -2991,7 +3070,8 @@ static bool run_root_outerwebapps_migration(const char *sudo_password, bool *nee
             "    (os.environ['OLD_OUTERCTL'], os.environ['NEW_OUTERCTL']),\n"
             "    (os.environ['OLD_HOME_SCREEN_OUTERCTL'], os.environ['NEW_OUTERCTL']),\n"
             "    (os.environ['OLD_USER_APPS'], os.environ['NEW_USER_APPS']),\n"
-            "    ('/var/lib/outergroup/outeragent', '/var/lib/outerwebapps'),\n"
+            "    (os.environ['OLD_SYSTEM_APPS'], os.environ['NEW_SYSTEM_APPS']),\n"
+            "    (os.environ['OLD_ROOT'], os.environ['NEW_ROOT']),\n"
             "    ('OUTERAGENT_ROOT', 'OUTERWEBAPPS_HOME'),\n"
             "    ('outeragent.log', 'backend.log'),\n"
             "]\n"
@@ -3035,6 +3115,9 @@ static bool run_root_outerwebapps_migration(const char *sudo_password, bool *nee
             "        for row in old_rows(old, 'systemd_backends'):\n"
             "            db.execute('INSERT OR REPLACE INTO systemd_backends(service_id, unit_name, scope) VALUES (?, ?, ?)',\n"
             "                       (row['service_id'], row['unit_name'], row['scope'] if 'scope' in row.keys() and row['scope'] is not None else 'system'))\n"
+            "        for row in old_rows(old, 'launchd_backends'):\n"
+            "            db.execute('INSERT OR REPLACE INTO launchd_backends(service_id, plist_path, owns_plist) VALUES (?, ?, ?)',\n"
+            "                       (row['service_id'], row['plist_path'], row['owns_plist'] if 'owns_plist' in row.keys() and row['owns_plist'] is not None else 1))\n"
             "    finally:\n"
             "        old.close()\n"
             "for old, new in replacements:\n"
@@ -3054,7 +3137,7 @@ static bool run_root_outerwebapps_migration(const char *sudo_password, bool *nee
             "            pass\n"
             "db.commit()\n"
             "db.close()\n"
-            "for root in ('/opt/outergroup', '/etc/systemd/system'):\n"
+            "for root in (os.environ['NEW_SYSTEM_APPS'], '/opt/outergroup', '/etc/systemd/system', '/Library/LaunchDaemons'):\n"
             "    if not os.path.isdir(root):\n"
             "        continue\n"
             "    for dirpath, _, filenames in os.walk(root):\n"
@@ -3073,11 +3156,27 @@ static bool run_root_outerwebapps_migration(const char *sudo_password, bool *nee
             "                with open(path, 'w', encoding='utf-8') as f:\n"
             "                    f.write(new_text)\n"
             "__HOMESCREEN_ROOT_MIGRATION__\n"
+            "chmod 0755 \"$NEW_ROOT\" >/dev/null 2>&1 || true\n"
             "if [ -d \"$OLD_ROOT\" ]; then mv \"$OLD_ROOT\" \"$OLD_ROOT.migrated.$(date +%%s)\" >/dev/null 2>&1 || true; fi\n"
             "chmod 0644 \"$NEW_DB\" >/dev/null 2>&1 || true\n"
+            "if command -v launchctl >/dev/null 2>&1; then\n"
+            "  for plist in /Library/LaunchDaemons/*.plist; do\n"
+            "    [ -f \"$plist\" ] || continue\n"
+            "    if grep -E -q 'outerwebapps|dev[.]outergroup|outergroup' \"$plist\" 2>/dev/null; then\n"
+            "      label=$(/usr/libexec/PlistBuddy -c 'Print :Label' \"$plist\" 2>/dev/null || true)\n"
+            "      [ -n \"$label\" ] || continue\n"
+            "      launchctl bootout \"system/$label\" >/dev/null 2>&1 || true\n"
+            "      launchctl bootstrap system \"$plist\" >/dev/null 2>&1 || true\n"
+            "      launchctl kickstart -k \"system/$label\" >/dev/null 2>&1 || true\n"
+            "    fi\n"
+            "  done\n"
+            "fi\n"
             "systemctl --system daemon-reload >/dev/null 2>&1 || true\n",
             quoted_new_root,
+            quoted_legacy_system_root,
             quoted_new_root,
+            quoted_legacy_system_apps_root,
+            quoted_new_system_apps_root,
             quoted_old_outerctl,
             quoted_old_home_screen_outerctl,
             quoted_new_outerctl,
@@ -6552,13 +6651,13 @@ static void run_reactor(int listener) {
         }
 
         int timeout_ms = 1000;
-        if (socket_activation_enabled() && polled_client_count == 0) {
+        if (socket_activation_enabled() && !g_stay_alive_when_socket_idle && polled_client_count == 0) {
             timeout_ms = 60000;
         }
 
         int poll_result = poll(poll_fds, (nfds_t)(polled_client_count + 1), timeout_ms);
         if (poll_result == 0) {
-            if (socket_activation_enabled() && client_count == 0) {
+            if (socket_activation_enabled() && !g_stay_alive_when_socket_idle && client_count == 0) {
                 break;
             }
         } else if (poll_result < 0) {
@@ -6616,10 +6715,10 @@ static void run_reactor(int listener) {
 }
 
 static void usage(const char *program) {
-    fprintf(stderr, "Usage: %s [--port PORT | --socket-path PATH] [--launchd-socket-name NAME] [--bundles-dir DIR] [--bundled-apps-dir DIR] [--app-base-url URL] [--database PATH] [--system-database PATH]\n", program);
+    fprintf(stderr, "Usage: %s [--port PORT | --socket-path PATH] [--launchd-socket-name NAME] [--bundles-dir DIR] [--bundled-apps-dir DIR] [--app-base-url URL] [--database PATH] [--system-database PATH] [--stay-alive]\n", program);
 }
 
-int main(int argc, char **argv) {
+int HomeScreenBackendMain(int argc, char **argv) {
     int port = DEFAULT_PORT;
     bool use_port = true;
     char socket_path[PATH_MAX] = "";
@@ -6652,6 +6751,8 @@ int main(int argc, char **argv) {
             expand_tilde_path(argv[++i], g_registry_database_path, sizeof(g_registry_database_path));
         } else if (strcmp(argv[i], "--system-database") == 0 && i + 1 < argc) {
             expand_tilde_path(argv[++i], g_system_registry_database_path, sizeof(g_system_registry_database_path));
+        } else if (strcmp(argv[i], "--stay-alive") == 0) {
+            g_stay_alive_when_socket_idle = true;
         } else {
             usage(argv[0]);
             return 2;
@@ -6705,3 +6806,9 @@ int main(int argc, char **argv) {
     }
     return 0;
 }
+
+#ifndef HOME_SCREEN_BACKEND_LIBRARY
+int main(int argc, char **argv) {
+    return HomeScreenBackendMain(argc, argv);
+}
+#endif

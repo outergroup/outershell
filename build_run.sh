@@ -56,6 +56,15 @@ echo "==> Building HomeScreenBackend"
     ONLY_ACTIVE_ARCH=YES \
     build
 
+echo "==> Building Home Screen agent"
+/usr/bin/xcodebuild \
+    -project "${SCRIPT_DIR}/Backends.xcodeproj" \
+    -target HomeScreenAgent \
+    -configuration "${CONFIGURATION}" \
+    SYMROOT="${BUILD_ROOT}" \
+    ONLY_ACTIVE_ARCH=YES \
+    build
+
 echo "==> Building bundled TopBackend"
 /usr/bin/xcodebuild \
     -project "${TOP_PROJECT_DIR}/Top.xcodeproj" \
@@ -84,6 +93,9 @@ echo "==> Archiving BackendsContent bundles"
     "${BUILD_ROOT}/${CONFIGURATION}/Backends.bundle" \
     "${RUN_ROOT}/bundles" \
     BackendsContent.bundle
+mkdir -p "${BUILD_ROOT}/${CONFIGURATION}/Home Screen.app/Contents/Resources/bundles"
+cp "${RUN_ROOT}/bundles"/BackendsContent.bundle.*.aar \
+    "${BUILD_ROOT}/${CONFIGURATION}/Home Screen.app/Contents/Resources/bundles/"
 
 echo "==> Staging bundled Top"
 if [[ ! -f "${TOP_ICON_PATH}" ]]; then
@@ -100,14 +112,20 @@ install -m 0644 \
     "${TOP_BUILD_ROOT}/${CONFIGURATION}/Top.bundle" \
     "${TOP_PAYLOAD_ROOT}/bundles" \
     TopContent.bundle
+mkdir -p "${BUILD_ROOT}/${CONFIGURATION}/Home Screen.app/Contents/Resources"
+rm -rf "${BUILD_ROOT}/${CONFIGURATION}/Home Screen.app/Contents/Resources/bundled-apps"
+cp -R "${RUN_ROOT}/bundled-apps" \
+    "${BUILD_ROOT}/${CONFIGURATION}/Home Screen.app/Contents/Resources/bundled-apps"
 
 ln -sf HomeScreenBackend "${BUILD_ROOT}/${CONFIGURATION}/BackendsBackend"
 ln -sf HomeScreenBackend "${BUILD_ROOT}/${CONFIGURATION}/NavigatorBackend"
 
 echo "Built:"
 echo "  ${BUILD_ROOT}/${CONFIGURATION}/HomeScreenBackend"
+echo "  ${BUILD_ROOT}/${CONFIGURATION}/Home Screen.app"
 echo "  ${RUN_ROOT}/bundles"
 echo "  ${TOP_PAYLOAD_ROOT}"
 echo
 echo "Run:"
 echo "  \"${BUILD_ROOT}/${CONFIGURATION}/HomeScreenBackend\" --port 7354 --bundles-dir \"${RUN_ROOT}/bundles\" --bundled-apps-dir \"${RUN_ROOT}/bundled-apps\""
+echo "  \"${BUILD_ROOT}/${CONFIGURATION}/Home Screen.app/Contents/MacOS/Home Screen\" --socket-path \"$(getconf DARWIN_USER_TEMP_DIR)dev.outergroup.HomeScreen\" --bundles-dir \"${RUN_ROOT}/bundles\" --bundled-apps-dir \"${RUN_ROOT}/bundled-apps\""

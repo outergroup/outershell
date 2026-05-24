@@ -18,6 +18,19 @@ This app will replace the old Outer Loop Services UI and the built-in log viewer
 
 ## Run
 
+For localhost on macOS, use the Home Screen agent app. It hosts the Home Screen
+socket and owns the menu bar service-list item from one process:
+
+```bash
+SOCKET_PATH="$(getconf DARWIN_USER_TEMP_DIR)dev.outergroup.HomeScreen"
+"./build/macos/Release/Home Screen.app/Contents/MacOS/Home Screen" \
+  --socket-path "$SOCKET_PATH" \
+  --bundles-dir ./build/run/bundles \
+  --bundled-apps-dir ./build/run/bundled-apps
+```
+
+For backend-only development:
+
 ```bash
 PORT=7354
 ./build/macos/Release/HomeScreenBackend --port "$PORT" --bundles-dir ./build/run/bundles
@@ -38,19 +51,27 @@ SOCKET_PATH="$(getconf DARWIN_USER_TEMP_DIR)dev.outergroup.HomeScreen"
   --bundles-dir ./build/run/bundles
 ```
 
-For a macOS LaunchAgent, prefer launchd-owned socket activation. Use the
-per-user Darwin temp directory as the closest macOS analogue to
-`XDG_RUNTIME_DIR`, and use `dev.outergroup.HomeScreen` as the socket filename:
+For a macOS LaunchAgent, prefer the Home Screen agent app with launchd-owned
+socket activation. Use the per-user Darwin temp directory as the closest macOS
+analogue to `XDG_RUNTIME_DIR`, and use `dev.outergroup.HomeScreen` as the
+socket filename. `RunAtLoad` keeps the menu bar item available at login, while
+the same process also receives socket-activation traffic:
 
 ```xml
 <key>ProgramArguments</key>
 <array>
-  <string>/path/to/HomeScreenBackend</string>
+  <string>/path/to/Home Screen.app/Contents/MacOS/Home Screen</string>
   <string>--socket-path</string>
   <string>/var/folders/.../T/dev.outergroup.HomeScreen</string>
   <string>--bundles-dir</string>
   <string>/path/to/bundles</string>
 </array>
+<key>RunAtLoad</key>
+<true/>
+<key>ProcessType</key>
+<string>Interactive</string>
+<key>LimitLoadToSessionType</key>
+<string>Aqua</string>
 <key>Sockets</key>
 <dict>
   <key>Listener</key>
