@@ -4,8 +4,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-OUTERLOOP_RESOURCES_DIR="${OUTERLOOP_RESOURCES_DIR:-${REPO_ROOT}/../outerloop/OuterLoop/Resources}"
-SQLITE_DIR="${OUTERLOOP_RESOURCES_DIR}/ThirdParty/sqlite"
+RESOURCES_DIR="${REPO_ROOT}/Resources"
+SQLITE_DIR="${RESOURCES_DIR}/ThirdParty/sqlite"
 
 case "$(uname -m)" in
     aarch64|arm64)
@@ -29,7 +29,7 @@ require_file() {
 
 require_file "${SQLITE_DIR}/sqlite3.c"
 require_file "${SQLITE_DIR}/sqlite3.h"
-require_file "${OUTERLOOP_RESOURCES_DIR}/outerctl.cpp"
+require_file "${RESOURCES_DIR}/outerctl.cpp"
 
 OUTPUT_DIR="${REPO_ROOT}/build/linux-package/RemoteLinuxBinaries/${ARCH}"
 mkdir -p "${OUTPUT_DIR}"
@@ -48,7 +48,7 @@ cc -std=gnu17 -Os -ffunction-sections -fdata-sections -flto \
 c++ -std=c++17 -Os -ffunction-sections -fdata-sections -flto \
     -I"${SQLITE_DIR}" \
     -o "${OUTPUT_DIR}/outerctl" \
-    "${OUTERLOOP_RESOURCES_DIR}/outerctl.cpp" \
+    "${RESOURCES_DIR}/outerctl.cpp" \
     "${OUTPUT_DIR}/sqlite3.o" \
     -ldl -lpthread -lm
 

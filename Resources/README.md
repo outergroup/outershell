@@ -53,6 +53,18 @@ build/linux-package/RemoteLinuxBinaries/<arch>/HomeScreenBackend
 build/linux-package/RemoteLinuxBinaries/<arch>/outerctl
 ```
 
+`outerctl` and the SQLite amalgamation used to build it live in this repository
+under:
+
+```text
+Resources/outerctl.cpp
+Resources/ThirdParty/sqlite/sqlite3.c
+Resources/ThirdParty/sqlite/sqlite3.h
+```
+
+Those files are Home Screen resources because `outerctl` is part of the
+outerwebapps/Home Screen install surface, not part of the Outer Loop browser.
+
 Then run the macOS build from the host to refresh the outerframe bundles:
 
 ```bash
