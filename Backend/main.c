@@ -4918,6 +4918,8 @@ static bool make_jupyter_script(const char *service_id,
         "import os\n"
         "import signal\n"
         "import subprocess\n"
+        "import sys\n"
+        "import tempfile\n"
         "import time\n"
         "from urllib.parse import urlencode, urlsplit\n"
         "\n"
@@ -4933,8 +4935,19 @@ static bool make_jupyter_script(const char *service_id,
     ok = ok && sb_append(builder, "\nUSE_UNIX_SOCKET = ");
     ok = ok && sb_append(builder, use_unix_socket ? "True" : "False");
     ok = ok && sb_append(builder,
-        "\nSOCKET_DIRECTORY = os.path.join(os.environ.get(\"XDG_RUNTIME_DIR\", f\"/tmp/outerwebapps-{os.getuid()}\"), \"outerwebapps\")\n"
-        "SOCKET_PATH = os.path.join(SOCKET_DIRECTORY, f\"{BACKEND_ID}.sock\")\n"
+        "\n"
+        "def runtime_socket_directory():\n"
+        "    if sys.platform == \"darwin\":\n"
+        "        return tempfile.gettempdir()\n"
+        "    runtime_dir = os.environ.get(\"XDG_RUNTIME_DIR\", \"\").strip()\n"
+        "    if runtime_dir:\n"
+        "        return runtime_dir\n"
+        "    if sys.platform.startswith(\"linux\"):\n"
+        "        return f\"/run/user/{os.getuid()}\"\n"
+        "    return tempfile.gettempdir()\n"
+        "\n"
+        "SOCKET_DIRECTORY = runtime_socket_directory()\n"
+        "SOCKET_PATH = os.path.join(SOCKET_DIRECTORY, BACKEND_ID)\n"
         "\n"
         "child = None\n"
         "\n"
@@ -7302,13 +7315,14 @@ static void send_create_response(int fd, const char *query) {
             query_value_or_default(query, "python", "/usr/bin/python3", python, sizeof(python));
             query_value(query, "port", port, sizeof(port));
             query_value_or_default(query, "frontendTransport", "port", transport, sizeof(transport));
-            if (port[0] && !valid_port_text(port)) {
+            bool use_unix_socket = strcmp(transport, "unixSocket") == 0;
+            if (!use_unix_socket && port[0] && !valid_port_text(port)) {
                 send_action_response(fd, 400, false, "Port must be empty or a valid TCP port.");
                 return;
             }
             StringBuilder script = {0};
-            if (!make_jupyter_script(service_id, display_name, python, port,
-                                     strcmp(transport, "unixSocket") == 0,
+            if (!make_jupyter_script(service_id, display_name, python, use_unix_socket ? "" : port,
+                                     use_unix_socket,
                                      strcmp(recipe, "jupyter-uv") == 0,
                                      &script)) {
                 free(script.data);

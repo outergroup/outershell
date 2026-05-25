@@ -3245,7 +3245,13 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         var components = URLComponents(url: createEndpoint, resolvingAgainstBaseURL: false)
         var queryItems = [URLQueryItem(name: "recipe", value: recipe.identifier)]
         for field in recipe.fields {
+            if isCreateFieldHidden(field, in: recipe) {
+                continue
+            }
             queryItems.append(URLQueryItem(name: field.key, value: createValue(for: field).trimmingCharacters(in: .whitespacesAndNewlines)))
+        }
+        if recipe.fields.contains(where: { $0.key == "scriptPath" }) {
+            queryItems.append(URLQueryItem(name: "scriptPath", value: createValues["scriptPath", default: ""].trimmingCharacters(in: .whitespacesAndNewlines)))
         }
         components?.queryItems = queryItems
         guard let url = components?.url else {
@@ -4559,7 +4565,19 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func visibleCreateFields(for recipe: RecipeRecord) -> [RecipeFieldRecord] {
-        recipe.fields.filter { $0.key != "scriptPath" }
+        recipe.fields.filter { !isCreateFieldHidden($0, in: recipe) }
+    }
+
+    private func isCreateFieldHidden(_ field: RecipeFieldRecord, in recipe: RecipeRecord) -> Bool {
+        if field.key == "scriptPath" {
+            return true
+        }
+        if field.key == "port",
+           recipe.fields.contains(where: { $0.key == "frontendTransport" }),
+           createValues["frontendTransport", default: "port"] == "unixSocket" {
+            return true
+        }
+        return false
     }
 
     private func needsScriptPathPicker(for recipe: RecipeRecord) -> Bool {
