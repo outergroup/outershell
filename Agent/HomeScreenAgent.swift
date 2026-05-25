@@ -189,7 +189,7 @@ private enum HomeScreenRegistry {
         try query(database,
                   """
                   SELECT COALESCE(service_id, ''),
-                         COALESCE(name, ''),
+                         COALESCE(display_name, ''),
                          COALESCE(port, 0),
                          COALESCE(socket_path, ''),
                          COALESCE(url, '')

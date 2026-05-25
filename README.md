@@ -91,8 +91,7 @@ outerctl app add --backend dev.outergroup.HomeScreen \
   --socket-path "$SOCKET_PATH" \
   --name "Home Screen" \
   --url http+unix://$SOCKET_PATH/ \
-  --icon-file /path/to/app-icon.png \
-  --home-screen
+  --icon-path /path/to/app-icon.png
 ```
 
 Home Screen uses `/` for Apps, `/backends` for the backend table, and `/new` for
@@ -124,6 +123,10 @@ On Linux it also reads the system/root registry:
 ```
 
 Override the user registry path with either `--database`, `OUTERWEBAPPS_REGISTRY`, or `BACKENDS_REGISTRY_DB`. Override the system registry path with `--system-database`, `OUTERWEBAPPS_SYSTEM_REGISTRY`, or `BACKENDS_SYSTEM_REGISTRY_DB`.
+
+Writable SQLite registries are also exported to the experimental binary
+`registry.orwa` format documented in `outerwebapps-registry.md`. SQLite remains
+the authoritative registry until the read/write paths are switched over.
 
 ```bash
 ./build/macos/Release/HomeScreenBackend \

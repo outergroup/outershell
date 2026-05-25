@@ -20,6 +20,7 @@
 #include <string.h>
 #include <strings.h>
 #include <sqlite3.h>
+#include <sys/file.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/time.h>
@@ -71,6 +72,8 @@ static bool g_launchd_socket_activation = false;
 static bool g_stay_alive_when_socket_idle = false;
 static volatile sig_atomic_t g_shutdown_requested = 0;
 static volatile sig_atomic_t g_listener_fd = -1;
+static int g_registry_write_lock_fd = -1;
+static char g_registry_write_lock_path[PATH_MAX] = "";
 
 typedef struct {
     int fd;
@@ -127,6 +130,11 @@ typedef struct {
 static bool mkdir_p(const char *path);
 static void run_shell_ignored(const char *command);
 static char *read_text_file_alloc(const char *path, size_t *out_size);
+static bool ensure_registry_schema(sqlite3 *database, char *error, size_t error_size);
+static bool export_registry_binary_from_sqlite(sqlite3 *database, const char *sqlite_path, char *error, size_t error_size);
+static bool import_registry_binary_into_sqlite(sqlite3 *database, const char *sqlite_path, char *error, size_t error_size);
+static bool registry_binary_output_path(const char *sqlite_path, char *out, size_t out_size);
+static int registry_binary_lock(const char *registry_path, int operation, char *error, size_t error_size);
 static void rewrite_files_in_directory_replacing_text(const char *directory,
                                                       const TextReplacement *replacements,
                                                       size_t replacement_count,
@@ -293,6 +301,21 @@ static void write_uint64_le(unsigned char *dst, uint64_t value) {
     }
 }
 
+static uint32_t read_uint32_le(const unsigned char *src) {
+    return ((uint32_t)src[0]) |
+           ((uint32_t)src[1] << 8) |
+           ((uint32_t)src[2] << 16) |
+           ((uint32_t)src[3] << 24);
+}
+
+static uint64_t read_uint64_le(const unsigned char *src) {
+    uint64_t value = 0;
+    for (int i = 7; i >= 0; i--) {
+        value = (value << 8) | (uint64_t)src[i];
+    }
+    return value;
+}
+
 static void send_response(int fd, int status, const char *status_text, const char *content_type,
                           const void *body, size_t body_len) {
     char header[512];
@@ -345,53 +368,64 @@ static bool sb_append(StringBuilder *builder, const char *text) {
     return sb_append_n(builder, text, strlen(text));
 }
 
-static bool sb_append_json_string(StringBuilder *builder, const char *text) {
-    if (!sb_append(builder, "\"")) return false;
-    for (const unsigned char *p = (const unsigned char *)(text ? text : ""); *p; p++) {
-        char escaped[8];
-        switch (*p) {
-        case '\\': if (!sb_append(builder, "\\\\")) return false; break;
-        case '"': if (!sb_append(builder, "\\\"")) return false; break;
-        case '\n': if (!sb_append(builder, "\\n")) return false; break;
-        case '\r': if (!sb_append(builder, "\\r")) return false; break;
-        case '\t': if (!sb_append(builder, "\\t")) return false; break;
-        default:
-            if (*p < 0x20) {
-                snprintf(escaped, sizeof(escaped), "\\u%04x", *p);
-                if (!sb_append(builder, escaped)) return false;
-            } else if (!sb_append_n(builder, (const char *)p, 1)) {
-                return false;
-            }
-            break;
-        }
-    }
-    return sb_append(builder, "\"");
+static bool binary_reserve(StringBuilder *builder, size_t additional) {
+    return sb_reserve(builder, additional);
 }
 
-static bool sb_append_base64_file_json_string(StringBuilder *builder, const char *path) {
-    static const char table[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    if (!path || !path[0]) {
-        return sb_append_json_string(builder, "");
-    }
+static bool binary_append_zero(StringBuilder *builder, size_t length) {
+    if (!binary_reserve(builder, length)) return false;
+    memset(builder->data + builder->length, 0, length);
+    builder->length += length;
+    return true;
+}
 
-    if (strncmp(path, "data:", 5) == 0) {
-        const char *comma = strchr(path, ',');
-        if (comma && strstr(path, ";base64")) {
-            return sb_append_json_string(builder, comma + 1);
-        }
-        return sb_append_json_string(builder, "");
-    }
+static bool binary_write_u32_at(StringBuilder *builder, size_t offset, uint32_t value) {
+    if (!builder || offset + 4 > builder->length) return false;
+    write_uint32_le((unsigned char *)builder->data + offset, value);
+    return true;
+}
 
+static bool binary_write_u64_at(StringBuilder *builder, size_t offset, uint64_t value) {
+    if (!builder || offset + 8 > builder->length) return false;
+    write_uint64_le((unsigned char *)builder->data + offset, value);
+    return true;
+}
+
+static bool binary_write_f64_at(StringBuilder *builder, size_t offset, double value) {
+    uint64_t bits = 0;
+    memcpy(&bits, &value, sizeof(bits));
+    return binary_write_u64_at(builder, offset, bits);
+}
+
+static bool binary_write_ref32_at(StringBuilder *builder, size_t ref_offset, size_t data_offset, size_t data_length) {
+    if (data_offset > UINT32_MAX || data_length > UINT32_MAX) return false;
+    return binary_write_u32_at(builder, ref_offset, (uint32_t)data_offset) &&
+           binary_write_u32_at(builder, ref_offset + 4, (uint32_t)data_length);
+}
+
+static bool binary_append_data_ref_at(StringBuilder *builder, size_t ref_offset, const void *data, size_t data_length) {
+    size_t data_offset = builder->length;
+    if (data_length > 0 && !sb_append_n(builder, (const char *)data, data_length)) return false;
+    return binary_write_ref32_at(builder, ref_offset, data_offset, data_length);
+}
+
+static bool binary_append_string_ref_at(StringBuilder *builder, size_t ref_offset, const char *text) {
+    const char *safe_text = text ? text : "";
+    return binary_append_data_ref_at(builder, ref_offset, safe_text, strlen(safe_text));
+}
+
+static bool binary_append_child_ref_at(StringBuilder *builder, size_t ref_offset, StringBuilder *child) {
+    return binary_append_data_ref_at(builder, ref_offset, child && child->data ? child->data : NULL, child ? child->length : 0);
+}
+
+static bool binary_append_file_ref_at(StringBuilder *builder, size_t ref_offset, const char *path) {
+    if (!path || !path[0]) return binary_write_ref32_at(builder, ref_offset, builder->length, 0);
     struct stat st;
     if (stat(path, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0 || st.st_size > 1024 * 1024) {
-        return sb_append_json_string(builder, "");
+        return binary_write_ref32_at(builder, ref_offset, builder->length, 0);
     }
-
     FILE *file = fopen(path, "rb");
-    if (!file) {
-        return sb_append_json_string(builder, "");
-    }
-
+    if (!file) return binary_write_ref32_at(builder, ref_offset, builder->length, 0);
     unsigned char *bytes = malloc((size_t)st.st_size);
     if (!bytes) {
         fclose(file);
@@ -399,92 +433,71 @@ static bool sb_append_base64_file_json_string(StringBuilder *builder, const char
     }
     size_t read_count = fread(bytes, 1, (size_t)st.st_size, file);
     fclose(file);
+    bool ok = read_count == (size_t)st.st_size &&
+              binary_append_data_ref_at(builder, ref_offset, bytes, read_count);
     if (read_count != (size_t)st.st_size) {
-        free(bytes);
-        return sb_append_json_string(builder, "");
-    }
-
-    bool ok = sb_append(builder, "\"");
-    for (size_t i = 0; ok && i < read_count; i += 3) {
-        unsigned int value = (unsigned int)bytes[i] << 16;
-        bool has_second = i + 1 < read_count;
-        bool has_third = i + 2 < read_count;
-        if (has_second) value |= (unsigned int)bytes[i + 1] << 8;
-        if (has_third) value |= (unsigned int)bytes[i + 2];
-
-        char chunk[4] = {
-            table[(value >> 18) & 0x3f],
-            table[(value >> 12) & 0x3f],
-            has_second ? table[(value >> 6) & 0x3f] : '=',
-            has_third ? table[value & 0x3f] : '='
-        };
-        ok = sb_append_n(builder, chunk, sizeof(chunk));
+        ok = binary_write_ref32_at(builder, ref_offset, builder->length, 0);
     }
     free(bytes);
-    return ok && sb_append(builder, "\"");
+    return ok;
 }
 
-static bool sb_append_base64_bytes(StringBuilder *builder, const unsigned char *bytes, size_t length) {
-    static const char table[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    for (size_t i = 0; i < length; i += 3) {
-        unsigned int value = (unsigned int)bytes[i] << 16;
-        bool has_second = i + 1 < length;
-        bool has_third = i + 2 < length;
-        if (has_second) value |= (unsigned int)bytes[i + 1] << 8;
-        if (has_third) value |= (unsigned int)bytes[i + 2];
+typedef struct {
+    StringBuilder *items;
+    size_t count;
+    size_t capacity;
+} BinaryPayloadList;
 
-        char chunk[4] = {
-            table[(value >> 18) & 0x3f],
-            table[(value >> 12) & 0x3f],
-            has_second ? table[(value >> 6) & 0x3f] : '=',
-            has_third ? table[value & 0x3f] : '='
-        };
-        if (!sb_append_n(builder, chunk, sizeof(chunk))) {
-            return false;
-        }
+static void binary_payload_list_free(BinaryPayloadList *list) {
+    if (!list) return;
+    for (size_t i = 0; i < list->count; i++) {
+        free(list->items[i].data);
+    }
+    free(list->items);
+    list->items = NULL;
+    list->count = 0;
+    list->capacity = 0;
+}
+
+static bool binary_payload_list_append(BinaryPayloadList *list, StringBuilder *payload) {
+    if (list->count == list->capacity) {
+        size_t new_capacity = list->capacity ? list->capacity * 2 : 16;
+        StringBuilder *new_items = realloc(list->items, new_capacity * sizeof(StringBuilder));
+        if (!new_items) return false;
+        list->items = new_items;
+        list->capacity = new_capacity;
+    }
+    list->items[list->count++] = *payload;
+    payload->data = NULL;
+    payload->length = 0;
+    payload->capacity = 0;
+    return true;
+}
+
+static bool binary_build_payload_array(BinaryPayloadList *list, StringBuilder *out) {
+    size_t fixed_size = 4 + list->count * 8;
+    if (!binary_append_zero(out, fixed_size)) return false;
+    if (!binary_write_u32_at(out, 0, (uint32_t)list->count)) return false;
+    for (size_t i = 0; i < list->count; i++) {
+        if (!binary_append_child_ref_at(out, 4 + i * 8, &list->items[i])) return false;
     }
     return true;
 }
 
-static char *registry_icon_value(const char *path) {
+static void send_binary_response(int fd, int status, StringBuilder *builder) {
+    const char *status_text = status == 200 ? "OK" :
+                              status == 401 ? "Unauthorized" :
+                              status == 400 ? "Bad Request" :
+                              status == 404 ? "Not Found" :
+                              status == 500 ? "Internal Server Error" : "Error";
+    send_response(fd, status, status_text, "application/octet-stream", builder->data, builder->length);
+}
+
+static char *registry_icon_path_value(const char *path) {
     if (!path || !path[0]) {
         return NULL;
     }
-    if (strncmp(path, "data:", 5) == 0) {
-        return strdup(path);
-    }
-
-    struct stat st;
-    if (stat(path, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0 || st.st_size > 1024 * 1024) {
-        return strdup(path);
-    }
-
-    FILE *file = fopen(path, "rb");
-    if (!file) {
-        return strdup(path);
-    }
-
-    unsigned char *bytes = malloc((size_t)st.st_size);
-    if (!bytes) {
-        fclose(file);
-        return NULL;
-    }
-    size_t read_count = fread(bytes, 1, (size_t)st.st_size, file);
-    fclose(file);
-    if (read_count != (size_t)st.st_size) {
-        free(bytes);
-        return strdup(path);
-    }
-
-    StringBuilder builder = {0};
-    bool ok = sb_append(&builder, "data:image/png;base64,") &&
-              sb_append_base64_bytes(&builder, bytes, read_count);
-    free(bytes);
-    if (!ok) {
-        free(builder.data);
-        return NULL;
-    }
-    return builder.data;
+    return strncmp(path, "data:", 5) == 0 ? NULL : strdup(path);
 }
 
 static bool sb_append_python_string(StringBuilder *builder, const char *text) {
@@ -1129,32 +1142,28 @@ static void default_system_registry_database_path(char *out, size_t out_size) {
     snprintf(out, out_size, "%s/registry.sqlite3", kSystemOuterWebappsRoot);
 }
 
-static sqlite3 *open_registry_readonly_at(const char *path, char *error, size_t error_size) {
+static bool ensure_parent_directory(const char *path, char *error, size_t error_size) {
+    char directory[PATH_MAX];
     if (!path || !path[0]) {
-        snprintf(error, error_size, "registry database path is empty");
-        return NULL;
+        snprintf(error, error_size, "path is empty");
+        return false;
     }
-    sqlite3 *database = NULL;
-    int result = sqlite3_open_v2(path, &database,
-                                 SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX | SQLITE_OPEN_URI, NULL);
-    if (result != SQLITE_OK) {
-        snprintf(error, error_size, "%s", database ? sqlite3_errmsg(database) : "failed to open registry database");
-        if (database) sqlite3_close(database);
-        return NULL;
+    snprintf(directory, sizeof(directory), "%s", path);
+    char *slash = strrchr(directory, '/');
+    if (!slash) return true;
+    if (slash == directory) {
+        slash[1] = '\0';
+    } else {
+        *slash = '\0';
     }
-    sqlite3_busy_timeout(database, 5000);
-    return database;
+    if (!mkdir_p(directory)) {
+        snprintf(error, error_size, "failed to create %s: %s", directory, strerror(errno));
+        return false;
+    }
+    return true;
 }
 
-static sqlite3 *open_registry_readonly(char *error, size_t error_size) {
-    return open_registry_readonly_at(g_registry_database_path, error, error_size);
-}
-
-static sqlite3 *open_system_registry_readonly(char *error, size_t error_size) {
-    return open_registry_readonly_at(g_system_registry_database_path, error, error_size);
-}
-
-static sqlite3 *open_registry_readwrite_at(const char *path, char *error, size_t error_size) {
+static sqlite3 *open_legacy_sqlite_registry_at(const char *path, char *error, size_t error_size) {
     if (!path || !path[0]) {
         snprintf(error, error_size, "registry database path is empty");
         return NULL;
@@ -1171,6 +1180,154 @@ static sqlite3 *open_registry_readwrite_at(const char *path, char *error, size_t
     return database;
 }
 
+static bool migrate_sqlite_registry_to_binary_if_needed(const char *sqlite_path, const char *binary_path, char *error, size_t error_size) {
+    struct stat binary_stat;
+    if (stat(binary_path, &binary_stat) == 0 && S_ISREG(binary_stat.st_mode)) {
+        return true;
+    }
+    if (errno != ENOENT) {
+        snprintf(error, error_size, "failed to inspect %s: %s", binary_path, strerror(errno));
+        return false;
+    }
+    struct stat sqlite_stat;
+    if (stat(sqlite_path, &sqlite_stat) != 0) {
+        if (errno == ENOENT) return true;
+        snprintf(error, error_size, "failed to inspect %s: %s", sqlite_path, strerror(errno));
+        return false;
+    }
+    if (!S_ISREG(sqlite_stat.st_mode)) return true;
+
+    sqlite3 *database = open_legacy_sqlite_registry_at(sqlite_path, error, error_size);
+    if (!database) return false;
+    bool ok = ensure_registry_schema(database, error, error_size) &&
+              export_registry_binary_from_sqlite(database, sqlite_path, error, error_size);
+    sqlite3_close(database);
+    if (ok) {
+        log_event("Migrated registry.sqlite3 to registry.orwa at %s.", binary_path);
+    }
+    return ok;
+}
+
+static sqlite3 *open_registry_memory_at(const char *path, bool writable, char *error, size_t error_size) {
+    if (!path || !path[0]) {
+        snprintf(error, error_size, "registry database path is empty");
+        return NULL;
+    }
+    char binary_path[PATH_MAX];
+    if (!registry_binary_output_path(path, binary_path, sizeof(binary_path))) {
+        snprintf(error, error_size, "registry path is too long");
+        return NULL;
+    }
+    struct stat binary_stat;
+    struct stat sqlite_stat;
+    bool have_binary = stat(binary_path, &binary_stat) == 0 && S_ISREG(binary_stat.st_mode);
+    bool have_sqlite = stat(path, &sqlite_stat) == 0 && S_ISREG(sqlite_stat.st_mode);
+    if (!writable && !have_binary && !have_sqlite) {
+        sqlite3 *database = NULL;
+        int result = sqlite3_open_v2(":memory:", &database,
+                                     SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX, NULL);
+        if (result != SQLITE_OK) {
+            snprintf(error, error_size, "%s", database ? sqlite3_errmsg(database) : "failed to open in-memory registry database");
+            if (database) sqlite3_close(database);
+            return NULL;
+        }
+        if (!ensure_registry_schema(database, error, error_size)) {
+            sqlite3_close(database);
+            return NULL;
+        }
+        return database;
+    }
+    if ((writable || have_sqlite) && !ensure_parent_directory(binary_path, error, error_size)) {
+        return NULL;
+    }
+    if (!migrate_sqlite_registry_to_binary_if_needed(path, binary_path, error, error_size)) {
+        return NULL;
+    }
+
+    int lock_fd = -1;
+    if (writable) {
+        lock_fd = registry_binary_lock(binary_path, LOCK_EX, error, error_size);
+        if (lock_fd < 0) return NULL;
+    }
+
+    sqlite3 *database = NULL;
+    int result = sqlite3_open_v2(":memory:", &database,
+                                 SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX, NULL);
+    if (result != SQLITE_OK) {
+        snprintf(error, error_size, "%s", database ? sqlite3_errmsg(database) : "failed to open in-memory registry database");
+        if (database) sqlite3_close(database);
+        if (lock_fd >= 0) {
+            flock(lock_fd, LOCK_UN);
+            close(lock_fd);
+        }
+        return NULL;
+    }
+    sqlite3_busy_timeout(database, 5000);
+    bool ok = ensure_registry_schema(database, error, error_size) &&
+              import_registry_binary_into_sqlite(database, path, error, error_size);
+    if (!ok) {
+        sqlite3_close(database);
+        if (lock_fd >= 0) {
+            flock(lock_fd, LOCK_UN);
+            close(lock_fd);
+        }
+        return NULL;
+    }
+
+    if (writable) {
+        if (g_registry_write_lock_fd >= 0) {
+            snprintf(error, error_size, "registry writer lock is already held");
+            sqlite3_close(database);
+            if (lock_fd >= 0) {
+                flock(lock_fd, LOCK_UN);
+                close(lock_fd);
+            }
+            return NULL;
+        }
+        g_registry_write_lock_fd = lock_fd;
+        snprintf(g_registry_write_lock_path, sizeof(g_registry_write_lock_path), "%s", binary_path);
+    }
+    return database;
+}
+
+static bool close_registry_readwrite_at(sqlite3 *database, const char *path, bool commit, char *error, size_t error_size) {
+    bool ok = true;
+    if (database && commit) {
+        ok = export_registry_binary_from_sqlite(database, path, error, error_size);
+    }
+    if (database && sqlite3_close(database) != SQLITE_OK && ok) {
+        snprintf(error, error_size, "failed to close registry database");
+        ok = false;
+    }
+    if (g_registry_write_lock_fd >= 0) {
+        flock(g_registry_write_lock_fd, LOCK_UN);
+        close(g_registry_write_lock_fd);
+        g_registry_write_lock_fd = -1;
+        g_registry_write_lock_path[0] = '\0';
+    }
+    return ok;
+}
+
+static bool close_registry_readwrite(sqlite3 *database, bool commit, char *error, size_t error_size) {
+    return close_registry_readwrite_at(database, g_registry_database_path, commit, error, error_size);
+}
+
+static sqlite3 *open_registry_readonly_at(const char *path, char *error, size_t error_size) {
+    return open_registry_memory_at(path, false, error, error_size);
+}
+
+static sqlite3 *open_registry_readonly(char *error, size_t error_size) {
+    return open_registry_readonly_at(g_registry_database_path, error, error_size);
+}
+
+static sqlite3 *open_system_registry_readonly(char *error, size_t error_size) {
+    return open_registry_readonly_at(g_system_registry_database_path, error, error_size);
+}
+
+static sqlite3 *open_registry_readwrite_at(const char *path, char *error, size_t error_size) {
+    return open_registry_memory_at(path, true, error, error_size);
+}
+
 static sqlite3 *open_registry_readwrite(char *error, size_t error_size) {
     return open_registry_readwrite_at(g_registry_database_path, error, error_size);
 }
@@ -1184,9 +1341,11 @@ static bool sqlite_exec_ok(sqlite3 *database, const char *sql, char *error, size
     return false;
 }
 
-static bool frontends_has_column(sqlite3 *database, const char *name, char *error, size_t error_size) {
+static bool table_has_column(sqlite3 *database, const char *table_name, const char *name, char *error, size_t error_size) {
     sqlite3_stmt *statement = NULL;
-    if (sqlite3_prepare_v2(database, "PRAGMA table_info(frontends);", -1, &statement, NULL) != SQLITE_OK) {
+    char sql[160];
+    snprintf(sql, sizeof(sql), "PRAGMA table_info(%s);", table_name);
+    if (sqlite3_prepare_v2(database, sql, -1, &statement, NULL) != SQLITE_OK) {
         snprintf(error, error_size, "%s", sqlite3_errmsg(database));
         return false;
     }
@@ -1202,22 +1361,29 @@ static bool frontends_has_column(sqlite3 *database, const char *name, char *erro
     return has_column;
 }
 
+static bool frontends_has_column(sqlite3 *database, const char *name, char *error, size_t error_size) {
+    return table_has_column(database, "frontends", name, error, error_size);
+}
+
+static bool sqlite_table_exists(sqlite3 *database, const char *table_name);
+
 static bool ensure_registry_schema(sqlite3 *database, char *error, size_t error_size) {
     if (!sqlite_exec_ok(database,
                         "CREATE TABLE IF NOT EXISTS backends ("
                         "service_id TEXT PRIMARY KEY,"
                         "display_name TEXT NOT NULL DEFAULT '',"
                         "icon TEXT,"
+                        "icon_path TEXT,"
                         "service_unit TEXT"
                         ");"
                         "CREATE TABLE IF NOT EXISTS frontends ("
                         "url TEXT PRIMARY KEY,"
                         "service_id TEXT,"
-                        "name TEXT NOT NULL,"
+                        "display_name TEXT NOT NULL DEFAULT '',"
                         "port INTEGER NOT NULL DEFAULT 0,"
                         "socket_path TEXT NOT NULL DEFAULT '',"
                         "icon TEXT,"
-                        "is_home_screen INTEGER NOT NULL DEFAULT 0,"
+                        "icon_path TEXT,"
                         "list TEXT"
                         ");"
                         "CREATE INDEX IF NOT EXISTS frontends_service_id_idx ON frontends(service_id);"
@@ -1240,13 +1406,56 @@ static bool ensure_registry_schema(sqlite3 *database, char *error, size_t error_
                         error_size)) {
         return false;
     }
-    if (!frontends_has_column(database, "is_home_screen", error, error_size)) {
+    if (!table_has_column(database, "backends", "icon_path", error, error_size)) {
         if (!sqlite_exec_ok(database,
-                            "ALTER TABLE frontends ADD COLUMN is_home_screen INTEGER NOT NULL DEFAULT 0;",
+                            "ALTER TABLE backends ADD COLUMN icon_path TEXT;",
                             error,
                             error_size)) {
             return false;
         }
+    }
+    if (!sqlite_exec_ok(database,
+                        "UPDATE backends SET icon_path = icon "
+                        "WHERE (icon_path IS NULL OR icon_path = '') "
+                        "AND icon IS NOT NULL AND icon != '' AND substr(icon, 1, 5) != 'data:';",
+                        error,
+                        error_size)) {
+        return false;
+    }
+    bool has_frontend_display_name_column = frontends_has_column(database, "display_name", error, error_size);
+    bool has_frontend_name_column = frontends_has_column(database, "name", error, error_size);
+    bool had_frontend_layouts_table = sqlite_table_exists(database, "frontend_layouts");
+    if (!has_frontend_display_name_column) {
+        if (!sqlite_exec_ok(database,
+                            "ALTER TABLE frontends ADD COLUMN display_name TEXT NOT NULL DEFAULT '';",
+                            error,
+                            error_size)) {
+            return false;
+        }
+    }
+    if (has_frontend_name_column) {
+        if (!sqlite_exec_ok(database,
+                            "UPDATE frontends SET display_name = name WHERE display_name = '';",
+                            error,
+                            error_size)) {
+            return false;
+        }
+    }
+    if (!frontends_has_column(database, "icon_path", error, error_size)) {
+        if (!sqlite_exec_ok(database,
+                            "ALTER TABLE frontends ADD COLUMN icon_path TEXT;",
+                            error,
+                            error_size)) {
+            return false;
+        }
+    }
+    if (!sqlite_exec_ok(database,
+                        "UPDATE frontends SET icon_path = icon "
+                        "WHERE (icon_path IS NULL OR icon_path = '') "
+                        "AND icon IS NOT NULL AND icon != '' AND substr(icon, 1, 5) != 'data:';",
+                        error,
+                        error_size)) {
+        return false;
     }
     if (!frontends_has_column(database, "list", error, error_size)) {
         if (!sqlite_exec_ok(database,
@@ -1256,16 +1465,95 @@ static bool ensure_registry_schema(sqlite3 *database, char *error, size_t error_
             return false;
         }
     }
+    if (has_frontend_name_column) {
+        if (!sqlite_exec_ok(database,
+                            "DROP INDEX IF EXISTS frontends_service_id_idx;"
+                            "CREATE TABLE frontends_new ("
+                            "url TEXT PRIMARY KEY,"
+                            "service_id TEXT,"
+                            "display_name TEXT NOT NULL DEFAULT '',"
+                            "port INTEGER NOT NULL DEFAULT 0,"
+                            "socket_path TEXT NOT NULL DEFAULT '',"
+                            "icon TEXT,"
+                            "icon_path TEXT,"
+                            "list TEXT"
+                            ");"
+                            "INSERT OR REPLACE INTO frontends_new(url, service_id, display_name, port, socket_path, icon, icon_path, list) "
+                            "SELECT url, service_id, COALESCE(NULLIF(display_name, ''), name, ''), COALESCE(port, 0), COALESCE(socket_path, ''), icon, icon_path, list FROM frontends;"
+                            "DROP TABLE frontends;"
+                            "ALTER TABLE frontends_new RENAME TO frontends;"
+                            "CREATE INDEX IF NOT EXISTS frontends_service_id_idx ON frontends(service_id);",
+                            error,
+                            error_size)) {
+            return false;
+        }
+    }
+    if (!sqlite_exec_ok(database,
+                        "CREATE TABLE IF NOT EXISTS frontend_layouts ("
+                        "url TEXT PRIMARY KEY,"
+                        "list TEXT NOT NULL DEFAULT ''"
+                        ");",
+                        error,
+                        error_size)) {
+        return false;
+    }
+    if (!had_frontend_layouts_table) {
+        if (!sqlite_exec_ok(database,
+                            "INSERT OR IGNORE INTO frontend_layouts(url, list) "
+                            "SELECT url, COALESCE(list, '') FROM frontends;",
+                            error,
+                            error_size)) {
+            return false;
+        }
+    }
+    if (!sqlite_exec_ok(database,
+                        "DELETE FROM frontend_layouts "
+                        "WHERE url IN ("
+                        "  SELECT raw.url FROM frontends raw "
+                        "  JOIN frontends canonical "
+                        "    ON canonical.service_id = raw.service_id "
+                        "   AND canonical.socket_path = raw.socket_path "
+                        "   AND canonical.url = raw.url || '/' "
+                        "  WHERE raw.socket_path != '' AND raw.url = raw.socket_path"
+                        ");"
+                        "UPDATE frontend_layouts "
+                        "SET url = url || '/' "
+                        "WHERE EXISTS ("
+                        "  SELECT 1 FROM frontends f "
+                        "  WHERE f.url = frontend_layouts.url "
+                        "    AND f.socket_path != '' "
+                        "    AND f.url = f.socket_path"
+                        ") "
+                        "AND NOT EXISTS ("
+                        "  SELECT 1 FROM frontend_layouts existing "
+                        "  WHERE existing.url = frontend_layouts.url || '/'"
+                        ");"
+                        "DELETE FROM frontends "
+                        "WHERE socket_path != '' "
+                        "AND url = socket_path "
+                        "AND EXISTS ("
+                        "  SELECT 1 FROM frontends canonical "
+                        "  WHERE canonical.service_id = frontends.service_id "
+                        "    AND canonical.socket_path = frontends.socket_path "
+                        "    AND canonical.url = frontends.url || '/'"
+                        ");"
+                        "UPDATE frontends "
+                        "SET url = url || '/' "
+                        "WHERE socket_path != '' AND url = socket_path;",
+                        error,
+                        error_size)) {
+        return false;
+    }
     return true;
 }
 
 static void migrate_registry_schema_if_writable(const char *path) {
-    if (!path || !path[0] || access(path, W_OK) != 0) return;
+    if (!path || !path[0]) return;
     char error[512] = "";
     sqlite3 *database = open_registry_readwrite_at(path, error, sizeof(error));
     if (!database) return;
-    (void)ensure_registry_schema(database, error, sizeof(error));
-    sqlite3_close(database);
+    bool ok = ensure_registry_schema(database, error, sizeof(error));
+    (void)close_registry_readwrite_at(database, path, ok, error, sizeof(error));
 }
 
 static bool sqlite_exec_formatted(sqlite3 *database, char *error, size_t error_size, const char *format, ...) {
@@ -1383,19 +1671,37 @@ static bool merge_registry_database(const char *old_path,
     if (!database) return false;
     sqlite3 *old_database = open_readonly_immutable_sqlite_database(old_path, error, error_size);
     if (!old_database) {
-        sqlite3_close(database);
+        close_registry_readwrite_at(database, new_path, false, error, error_size);
+        return false;
+    }
+    bool old_frontends_have_display_name = frontends_has_column(old_database, "display_name", error, error_size);
+    bool old_frontends_have_name = frontends_has_column(old_database, "name", error, error_size);
+    const char *old_frontend_display_name_expression = old_frontends_have_display_name
+        ? (old_frontends_have_name ? "COALESCE(NULLIF(display_name, ''), name, '')" : "COALESCE(display_name, '')")
+        : (old_frontends_have_name ? "COALESCE(name, '')" : "''");
+    char *old_frontends_sql = sqlite3_mprintf("SELECT url, service_id, %s, COALESCE(port, 0), COALESCE(socket_path, ''), icon, CASE WHEN icon IS NOT NULL AND substr(icon, 1, 5) != 'data:' THEN icon ELSE NULL END, list FROM frontends;",
+                                             old_frontend_display_name_expression);
+    if (!old_frontends_sql) {
+        snprintf(error, error_size, "Out of memory.");
+        sqlite3_close(old_database);
+        close_registry_readwrite_at(database, new_path, false, error, error_size);
         return false;
     }
     bool ok = ensure_registry_schema(database, error, error_size);
     if (ok) ok = sqlite_exec_ok(database, "BEGIN IMMEDIATE TRANSACTION;", error, error_size);
     if (ok) ok = copy_registry_rows(old_database, database,
-                                    "SELECT service_id, COALESCE(display_name, ''), icon, service_unit FROM backends;",
-                                    "INSERT OR REPLACE INTO backends(service_id, display_name, icon, service_unit) VALUES (?, ?, ?, ?);",
+                                    "SELECT service_id, COALESCE(display_name, ''), icon, CASE WHEN icon IS NOT NULL AND substr(icon, 1, 5) != 'data:' THEN icon ELSE NULL END, service_unit FROM backends;",
+                                    "INSERT OR REPLACE INTO backends(service_id, display_name, icon, icon_path, service_unit) VALUES (?, ?, ?, ?, ?);",
                                     error, error_size);
     if (ok) ok = copy_registry_rows(old_database, database,
-                                    "SELECT url, service_id, COALESCE(name, ''), COALESCE(port, 0), COALESCE(socket_path, ''), icon, COALESCE(is_home_screen, 0), list FROM frontends;",
-                                    "INSERT OR REPLACE INTO frontends(url, service_id, name, port, socket_path, icon, is_home_screen, list) VALUES (?, ?, ?, ?, ?, ?, ?, ?);",
+                                    old_frontends_sql,
+                                    "INSERT OR REPLACE INTO frontends(url, service_id, display_name, port, socket_path, icon, icon_path, list) VALUES (?, ?, ?, ?, ?, ?, ?, ?);",
                                     error, error_size);
+    if (ok) ok = sqlite_exec_ok(database,
+                                "INSERT OR REPLACE INTO frontend_layouts(url, list) "
+                                "SELECT url, COALESCE(list, '') FROM frontends;",
+                                error,
+                                error_size);
     if (ok) ok = copy_registry_rows(old_database, database,
                                     "SELECT path, service_id FROM log_files;",
                                     "INSERT OR REPLACE INTO log_files(path, service_id) VALUES (?, ?);",
@@ -1426,9 +1732,9 @@ static bool merge_registry_database(const char *old_path,
     } else {
         sqlite3_exec(database, "ROLLBACK;", NULL, NULL, NULL);
     }
+    sqlite3_free(old_frontends_sql);
     sqlite3_close(old_database);
-    sqlite3_close(database);
-    return ok;
+    return close_registry_readwrite_at(database, new_path, ok, error, error_size) && ok;
 }
 
 static void rename_if_possible(const char *old_path, const char *new_path) {
@@ -1543,6 +1849,849 @@ static bool sqlite_table_exists(sqlite3 *database, const char *table_name) {
     bool exists = sqlite3_step(statement) == SQLITE_ROW;
     sqlite3_finalize(statement);
     return exists;
+}
+
+enum {
+    ORWA_TABLE_BACKENDS = 0,
+    ORWA_TABLE_FRONTENDS = 1,
+    ORWA_TABLE_FRONTEND_LAYOUTS = 2,
+    ORWA_TABLE_LOG_FILES = 3,
+    ORWA_TABLE_COUNT = 4,
+    ORWA_LEGACY_THREE_TABLE_COUNT = 3,
+    ORWA_TABLE_DESCRIPTOR_SIZE = 20,
+    ORWA_HEADER_SIZE = 8 + ORWA_TABLE_COUNT * ORWA_TABLE_DESCRIPTOR_SIZE,
+    ORWA_LEGACY_THREE_TABLE_HEADER_SIZE = 8 + ORWA_LEGACY_THREE_TABLE_COUNT * ORWA_TABLE_DESCRIPTOR_SIZE,
+    ORWA_BACKENDS_ROW_SIZE = 84,
+    ORWA_FRONTENDS_ROW_SIZE = 97,
+    ORWA_FRONTEND_LAYOUTS_ROW_SIZE = 32,
+    ORWA_LOG_FILES_ROW_SIZE = 32
+};
+
+typedef struct {
+    char *bytes;
+    size_t length;
+    uint64_t offset;
+} RegistryBinaryStringEntry;
+
+typedef struct {
+    RegistryBinaryStringEntry *entries;
+    size_t count;
+    size_t capacity;
+    uint64_t variable_base_offset;
+} RegistryBinaryStringPool;
+
+typedef struct {
+    uint64_t offset;
+    uint64_t row_count;
+    uint32_t row_size;
+} RegistryBinaryTableDescriptor;
+
+static bool binary_append_u32(StringBuilder *builder, uint32_t value) {
+    unsigned char bytes[4];
+    write_uint32_le(bytes, value);
+    return sb_append_n(builder, (const char *)bytes, sizeof(bytes));
+}
+
+static bool binary_append_u64(StringBuilder *builder, uint64_t value) {
+    unsigned char bytes[8];
+    write_uint64_le(bytes, value);
+    return sb_append_n(builder, (const char *)bytes, sizeof(bytes));
+}
+
+static bool binary_append_string_ref(StringBuilder *builder, uint64_t offset, uint64_t length) {
+    return binary_append_u64(builder, offset) && binary_append_u64(builder, length);
+}
+
+static void registry_binary_string_pool_free(RegistryBinaryStringPool *pool) {
+    if (!pool) return;
+    for (size_t i = 0; i < pool->count; i++) {
+        free(pool->entries[i].bytes);
+    }
+    free(pool->entries);
+    pool->entries = NULL;
+    pool->count = 0;
+    pool->capacity = 0;
+}
+
+static bool registry_binary_string_ref(RegistryBinaryStringPool *pool,
+                                       StringBuilder *variable_region,
+                                       const char *text,
+                                       uint64_t *offset,
+                                       uint64_t *length) {
+    if (offset) *offset = 0;
+    if (length) *length = 0;
+    if (!text || !text[0]) return true;
+
+    size_t text_length = strlen(text);
+    for (size_t i = 0; i < pool->count; i++) {
+        RegistryBinaryStringEntry *entry = &pool->entries[i];
+        if (entry->length == text_length && memcmp(entry->bytes, text, text_length) == 0) {
+            if (offset) *offset = entry->offset;
+            if (length) *length = (uint64_t)entry->length;
+            return true;
+        }
+    }
+
+    if (pool->count == pool->capacity) {
+        size_t new_capacity = pool->capacity ? pool->capacity * 2 : 128;
+        RegistryBinaryStringEntry *new_entries = realloc(pool->entries, new_capacity * sizeof(*new_entries));
+        if (!new_entries) return false;
+        pool->entries = new_entries;
+        pool->capacity = new_capacity;
+    }
+
+    char *copy = malloc(text_length);
+    if (!copy) return false;
+    memcpy(copy, text, text_length);
+
+    uint64_t absolute_offset = pool->variable_base_offset + (uint64_t)variable_region->length;
+    if (!sb_append_n(variable_region, text, text_length)) {
+        free(copy);
+        return false;
+    }
+
+    RegistryBinaryStringEntry *entry = &pool->entries[pool->count++];
+    entry->bytes = copy;
+    entry->length = text_length;
+    entry->offset = absolute_offset;
+    if (offset) *offset = absolute_offset;
+    if (length) *length = (uint64_t)text_length;
+    return true;
+}
+
+static bool registry_binary_append_string_ref(RegistryBinaryStringPool *pool,
+                                              StringBuilder *variable_region,
+                                              StringBuilder *rows,
+                                              const char *text) {
+    uint64_t offset = 0;
+    uint64_t length = 0;
+    return registry_binary_string_ref(pool, variable_region, text, &offset, &length) &&
+           binary_append_string_ref(rows, offset, length);
+}
+
+static uint64_t registry_binary_count_rows(sqlite3 *database, const char *table_name) {
+    if (!sqlite_table_exists(database, table_name)) return 0;
+    char sql[160];
+    snprintf(sql, sizeof(sql), "SELECT COUNT(*) FROM %s;", table_name);
+    sqlite3_stmt *statement = NULL;
+    if (sqlite3_prepare_v2(database, sql, -1, &statement, NULL) != SQLITE_OK) {
+        return 0;
+    }
+    uint64_t count = 0;
+    if (sqlite3_step(statement) == SQLITE_ROW) {
+        sqlite3_int64 value = sqlite3_column_int64(statement, 0);
+        count = value > 0 ? (uint64_t)value : 0;
+    }
+    sqlite3_finalize(statement);
+    return count;
+}
+
+static bool registry_binary_output_path(const char *sqlite_path, char *out, size_t out_size) {
+    if (!sqlite_path || !sqlite_path[0]) return false;
+    char directory[PATH_MAX];
+    snprintf(directory, sizeof(directory), "%s", sqlite_path);
+    char *slash = strrchr(directory, '/');
+    if (!slash) {
+        return snprintf(out, out_size, "registry.orwa") > 0;
+    }
+    if (slash == directory) {
+        slash[1] = '\0';
+    } else {
+        *slash = '\0';
+    }
+    int written = snprintf(out, out_size, "%s/registry.orwa", directory);
+    return written >= 0 && (size_t)written < out_size;
+}
+
+static bool registry_binary_lock_path(const char *registry_path, char *out, size_t out_size) {
+    int written = snprintf(out, out_size, "%s.lock", registry_path);
+    return written >= 0 && (size_t)written < out_size;
+}
+
+static int registry_binary_lock(const char *registry_path, int operation, char *error, size_t error_size) {
+    char lock_path[PATH_MAX];
+    if (!registry_binary_lock_path(registry_path, lock_path, sizeof(lock_path))) {
+        snprintf(error, error_size, "Registry lock path is too long.");
+        return -1;
+    }
+    int fd = open(lock_path, O_CREAT | O_RDWR, 0666);
+    if (fd < 0) {
+        snprintf(error, error_size, "Failed to open %s: %s", lock_path, strerror(errno));
+        return -1;
+    }
+    (void)fchmod(fd, 0666);
+    if (flock(fd, operation) != 0) {
+        snprintf(error, error_size, "Failed to lock %s: %s", lock_path, strerror(errno));
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+static bool registry_binary_append_query(sqlite3 *database,
+                                         const char *sql,
+                                         int expected_columns,
+                                         bool (*append_row)(sqlite3_stmt *,
+                                                            RegistryBinaryStringPool *,
+                                                            StringBuilder *,
+                                                            StringBuilder *),
+                                         RegistryBinaryStringPool *pool,
+                                         StringBuilder *variable_region,
+                                         StringBuilder *rows,
+                                         char *error,
+                                         size_t error_size) {
+    sqlite3_stmt *statement = NULL;
+    if (sqlite3_prepare_v2(database, sql, -1, &statement, NULL) != SQLITE_OK) {
+        snprintf(error, error_size, "%s", sqlite3_errmsg(database));
+        return false;
+    }
+    if (sqlite3_column_count(statement) != expected_columns) {
+        sqlite3_finalize(statement);
+        snprintf(error, error_size, "Unexpected column count while exporting registry.");
+        return false;
+    }
+    bool ok = true;
+    int step_result = SQLITE_ROW;
+    while ((step_result = sqlite3_step(statement)) == SQLITE_ROW) {
+        if (!append_row(statement, pool, variable_region, rows)) {
+            snprintf(error, error_size, "Out of memory while exporting registry.");
+            ok = false;
+            break;
+        }
+    }
+    if (ok && step_result != SQLITE_DONE) {
+        snprintf(error, error_size, "%s", sqlite3_errmsg(database));
+        ok = false;
+    }
+    sqlite3_finalize(statement);
+    return ok;
+}
+
+static bool registry_binary_append_backend_row(sqlite3_stmt *statement,
+                                               RegistryBinaryStringPool *pool,
+                                               StringBuilder *variable_region,
+                                               StringBuilder *rows) {
+    uint32_t flags = sqlite3_column_int(statement, 5) != 0 ? 1u : 0u;
+    return registry_binary_append_string_ref(pool, variable_region, rows, sqlite_column_text_or_empty(statement, 0)) &&
+           registry_binary_append_string_ref(pool, variable_region, rows, sqlite_column_text_or_empty(statement, 1)) &&
+           registry_binary_append_string_ref(pool, variable_region, rows, sqlite_column_text_or_empty(statement, 2)) &&
+           registry_binary_append_string_ref(pool, variable_region, rows, sqlite_column_text_or_empty(statement, 3)) &&
+           registry_binary_append_string_ref(pool, variable_region, rows, sqlite_column_text_or_empty(statement, 4)) &&
+           binary_append_u32(rows, flags);
+}
+
+static bool registry_binary_append_frontend_row(sqlite3_stmt *statement,
+                                                RegistryBinaryStringPool *pool,
+                                                StringBuilder *variable_region,
+                                                StringBuilder *rows) {
+    const char *socket_path = sqlite_column_text_or_empty(statement, 4);
+    uint32_t port = (uint32_t)sqlite3_column_int(statement, 3);
+    unsigned char endpoint_kind = socket_path[0] ? 2u : (port ? 1u : 0u);
+    unsigned char zero_padding[12] = {0};
+    unsigned char empty_payload[16] = {0};
+    bool ok = registry_binary_append_string_ref(pool, variable_region, rows, sqlite_column_text_or_empty(statement, 0)) &&
+              registry_binary_append_string_ref(pool, variable_region, rows, sqlite_column_text_or_empty(statement, 1)) &&
+              registry_binary_append_string_ref(pool, variable_region, rows, sqlite_column_text_or_empty(statement, 2)) &&
+              registry_binary_append_string_ref(pool, variable_region, rows, sqlite_column_text_or_empty(statement, 5)) &&
+              registry_binary_append_string_ref(pool, variable_region, rows, sqlite_column_text_or_empty(statement, 6)) &&
+              sb_append_n(rows, (const char *)&endpoint_kind, sizeof(endpoint_kind));
+    if (!ok) return false;
+    if (endpoint_kind == 2u) {
+        return registry_binary_append_string_ref(pool, variable_region, rows, socket_path);
+    }
+    if (endpoint_kind == 1u) {
+        return binary_append_u32(rows, port) &&
+               sb_append_n(rows, (const char *)zero_padding, sizeof(zero_padding));
+    }
+    return sb_append_n(rows, (const char *)empty_payload, sizeof(empty_payload));
+}
+
+static bool registry_binary_append_frontend_layout_row(sqlite3_stmt *statement,
+                                                       RegistryBinaryStringPool *pool,
+                                                       StringBuilder *variable_region,
+                                                       StringBuilder *rows) {
+    return registry_binary_append_string_ref(pool, variable_region, rows, sqlite_column_text_or_empty(statement, 0)) &&
+           registry_binary_append_string_ref(pool, variable_region, rows, sqlite_column_text_or_empty(statement, 1));
+}
+
+static bool registry_binary_append_log_file_row(sqlite3_stmt *statement,
+                                                RegistryBinaryStringPool *pool,
+                                                StringBuilder *variable_region,
+                                                StringBuilder *rows) {
+    return registry_binary_append_string_ref(pool, variable_region, rows, sqlite_column_text_or_empty(statement, 0)) &&
+           registry_binary_append_string_ref(pool, variable_region, rows, sqlite_column_text_or_empty(statement, 1));
+}
+
+static bool registry_binary_write_file(const char *path, const void *data, size_t length, char *error, size_t error_size) {
+    char temp_path[PATH_MAX];
+    bool owns_lock = false;
+    int lock_fd = -1;
+    if (g_registry_write_lock_fd >= 0 && strcmp(g_registry_write_lock_path, path) == 0) {
+        lock_fd = g_registry_write_lock_fd;
+    } else {
+        lock_fd = registry_binary_lock(path, LOCK_EX, error, error_size);
+        if (lock_fd < 0) return false;
+        owns_lock = true;
+    }
+
+    int written = snprintf(temp_path, sizeof(temp_path), "%s.tmp.XXXXXX", path);
+    if (written < 0 || (size_t)written >= sizeof(temp_path)) {
+        snprintf(error, error_size, "Registry binary path is too long.");
+        if (owns_lock) {
+            flock(lock_fd, LOCK_UN);
+            close(lock_fd);
+        }
+        return false;
+    }
+    int fd = mkstemp(temp_path);
+    if (fd < 0) {
+        snprintf(error, error_size, "Failed to open %s: %s", temp_path, strerror(errno));
+        if (owns_lock) {
+            flock(lock_fd, LOCK_UN);
+            close(lock_fd);
+        }
+        return false;
+    }
+    if (fchmod(fd, 0644) != 0) {
+        snprintf(error, error_size, "Failed to chmod %s: %s", temp_path, strerror(errno));
+        close(fd);
+        unlink(temp_path);
+        if (owns_lock) {
+            flock(lock_fd, LOCK_UN);
+            close(lock_fd);
+        }
+        return false;
+    }
+    bool ok = queue_all(fd, data, length);
+    if (ok && fsync(fd) != 0) ok = false;
+    if (close(fd) != 0) ok = false;
+    if (!ok) {
+        snprintf(error, error_size, "Failed to write %s: %s", temp_path, strerror(errno));
+        unlink(temp_path);
+        if (owns_lock) {
+            flock(lock_fd, LOCK_UN);
+            close(lock_fd);
+        }
+        return false;
+    }
+    if (rename(temp_path, path) != 0) {
+        snprintf(error, error_size, "Failed to rename %s to %s: %s", temp_path, path, strerror(errno));
+        unlink(temp_path);
+        if (owns_lock) {
+            flock(lock_fd, LOCK_UN);
+            close(lock_fd);
+        }
+        return false;
+    }
+    char directory_path[PATH_MAX];
+    snprintf(directory_path, sizeof(directory_path), "%s", path);
+    char *slash = strrchr(directory_path, '/');
+    if (slash) {
+        if (slash == directory_path) {
+            slash[1] = '\0';
+        } else {
+            *slash = '\0';
+        }
+        int dir_fd = open(directory_path, O_RDONLY);
+        if (dir_fd >= 0) {
+            (void)fsync(dir_fd);
+            close(dir_fd);
+        }
+    }
+    if (owns_lock) {
+        flock(lock_fd, LOCK_UN);
+        close(lock_fd);
+    }
+    return true;
+}
+
+static bool registry_binary_read_string(const unsigned char *file,
+                                        size_t file_size,
+                                        uint64_t variable_offset,
+                                        uint64_t offset,
+                                        uint64_t length,
+                                        char **out,
+                                        char *error,
+                                        size_t error_size) {
+    *out = NULL;
+    if (offset == 0 && length == 0) {
+        *out = strdup("");
+        if (!*out) snprintf(error, error_size, "Out of memory.");
+        return *out != NULL;
+    }
+    if (offset < variable_offset ||
+        offset > (uint64_t)file_size ||
+        length > (uint64_t)file_size - offset ||
+        length > SIZE_MAX - 1) {
+        snprintf(error, error_size, "Registry binary string reference is out of bounds.");
+        return false;
+    }
+    char *value = malloc((size_t)length + 1);
+    if (!value) {
+        snprintf(error, error_size, "Out of memory.");
+        return false;
+    }
+    memcpy(value, file + offset, (size_t)length);
+    value[length] = '\0';
+    *out = value;
+    return true;
+}
+
+static bool registry_binary_step(sqlite3 *database, sqlite3_stmt *statement, char *error, size_t error_size) {
+    int result = sqlite3_step(statement);
+    if (result == SQLITE_DONE) return true;
+    snprintf(error, error_size, "%s", sqlite3_errmsg(database));
+    return false;
+}
+
+static bool registry_binary_import_backend(sqlite3 *database,
+                                           const char *service_id,
+                                           const char *display_name,
+                                           const char *icon_path,
+                                           const char *unit_name,
+                                           const char *unit_path,
+                                           bool owns_unit,
+                                           char *error,
+                                           size_t error_size) {
+    sqlite3_stmt *statement = NULL;
+    bool ok = sqlite3_prepare_v2(database,
+                                 "INSERT INTO backends(service_id, display_name, icon_path, service_unit) VALUES(?, ?, NULLIF(?, ''), NULLIF(?, '')) "
+                                 "ON CONFLICT(service_id) DO UPDATE SET display_name=excluded.display_name, icon_path=excluded.icon_path, service_unit=excluded.service_unit;",
+                                 -1,
+                                 &statement,
+                                 NULL) == SQLITE_OK;
+    if (ok) {
+        sqlite3_bind_text(statement, 1, service_id, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(statement, 2, display_name, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(statement, 3, icon_path, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(statement, 4, unit_name, -1, SQLITE_TRANSIENT);
+        ok = registry_binary_step(database, statement, error, error_size);
+    } else {
+        snprintf(error, error_size, "%s", sqlite3_errmsg(database));
+    }
+    if (statement) sqlite3_finalize(statement);
+    if (!ok) return false;
+
+    if (unit_path && unit_path[0]) {
+        ok = sqlite3_prepare_v2(database,
+                                "INSERT INTO launchd_backends(service_id, plist_path, owns_plist) VALUES(?, ?, ?) "
+                                "ON CONFLICT(service_id) DO UPDATE SET plist_path=excluded.plist_path, owns_plist=excluded.owns_plist;",
+                                -1,
+                                &statement,
+                                NULL) == SQLITE_OK;
+        if (ok) {
+            sqlite3_bind_text(statement, 1, service_id, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(statement, 2, unit_path, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_int(statement, 3, owns_unit ? 1 : 0);
+            ok = registry_binary_step(database, statement, error, error_size);
+        } else {
+            snprintf(error, error_size, "%s", sqlite3_errmsg(database));
+        }
+        if (statement) sqlite3_finalize(statement);
+        return ok;
+    }
+    if (unit_name && unit_name[0]) {
+        ok = sqlite3_prepare_v2(database,
+                                "INSERT INTO systemd_backends(service_id, unit_name, scope) VALUES(?, ?, 'user') "
+                                "ON CONFLICT(service_id) DO UPDATE SET unit_name=excluded.unit_name;",
+                                -1,
+                                &statement,
+                                NULL) == SQLITE_OK;
+        if (ok) {
+            sqlite3_bind_text(statement, 1, service_id, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(statement, 2, unit_name, -1, SQLITE_TRANSIENT);
+            ok = registry_binary_step(database, statement, error, error_size);
+        } else {
+            snprintf(error, error_size, "%s", sqlite3_errmsg(database));
+        }
+        if (statement) sqlite3_finalize(statement);
+    }
+    return ok;
+}
+
+static bool registry_binary_import_frontend(sqlite3 *database,
+                                            const char *url,
+                                            const char *service_id,
+                                            const char *display_name,
+                                            uint32_t port,
+                                            const char *socket_path,
+                                            const char *icon_path,
+                                            const char *list,
+                                            char *error,
+                                            size_t error_size) {
+    sqlite3_stmt *statement = NULL;
+    bool ok = sqlite3_prepare_v2(database,
+                                 "INSERT OR REPLACE INTO frontends(url, service_id, display_name, port, socket_path, icon_path, list) VALUES(?, ?, ?, ?, ?, NULLIF(?, ''), NULLIF(?, ''));",
+                                 -1,
+                                 &statement,
+                                 NULL) == SQLITE_OK;
+    if (ok) {
+        sqlite3_bind_text(statement, 1, url, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(statement, 2, service_id, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(statement, 3, display_name, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int(statement, 4, (int)port);
+        sqlite3_bind_text(statement, 5, socket_path, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(statement, 6, icon_path, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(statement, 7, list, -1, SQLITE_TRANSIENT);
+        ok = registry_binary_step(database, statement, error, error_size);
+    } else {
+        snprintf(error, error_size, "%s", sqlite3_errmsg(database));
+    }
+    if (statement) sqlite3_finalize(statement);
+    return ok;
+}
+
+static bool registry_binary_import_frontend_layout(sqlite3 *database,
+                                                   const char *url,
+                                                   const char *list,
+                                                   char *error,
+                                                   size_t error_size) {
+    sqlite3_stmt *statement = NULL;
+    bool ok = sqlite3_prepare_v2(database,
+                                 "INSERT OR REPLACE INTO frontend_layouts(url, list) VALUES(?, ?);",
+                                 -1,
+                                 &statement,
+                                 NULL) == SQLITE_OK;
+    if (ok) {
+        sqlite3_bind_text(statement, 1, url, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(statement, 2, list ? list : "", -1, SQLITE_TRANSIENT);
+        ok = registry_binary_step(database, statement, error, error_size);
+    } else {
+        snprintf(error, error_size, "%s", sqlite3_errmsg(database));
+    }
+    if (statement) sqlite3_finalize(statement);
+    return ok;
+}
+
+static bool registry_binary_import_log_file(sqlite3 *database,
+                                            const char *path,
+                                            const char *service_id,
+                                            char *error,
+                                            size_t error_size) {
+    sqlite3_stmt *statement = NULL;
+    bool ok = sqlite3_prepare_v2(database,
+                                 "INSERT OR REPLACE INTO log_files(path, service_id) VALUES(?, ?);",
+                                 -1,
+                                 &statement,
+                                 NULL) == SQLITE_OK;
+    if (ok) {
+        sqlite3_bind_text(statement, 1, path, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(statement, 2, service_id, -1, SQLITE_TRANSIENT);
+        ok = registry_binary_step(database, statement, error, error_size);
+    } else {
+        snprintf(error, error_size, "%s", sqlite3_errmsg(database));
+    }
+    if (statement) sqlite3_finalize(statement);
+    return ok;
+}
+
+static bool import_registry_binary_into_sqlite(sqlite3 *database, const char *sqlite_path, char *error, size_t error_size) {
+    char path[PATH_MAX];
+    if (!registry_binary_output_path(sqlite_path, path, sizeof(path))) {
+        snprintf(error, error_size, "Could not build registry.orwa path.");
+        return false;
+    }
+    struct stat st;
+    if (stat(path, &st) != 0) {
+        if (errno == ENOENT) return true;
+        snprintf(error, error_size, "Failed to inspect %s: %s", path, strerror(errno));
+        return false;
+    }
+    if (!S_ISREG(st.st_mode)) return true;
+
+    size_t file_size = 0;
+    char *file_data = read_text_file_alloc(path, &file_size);
+    if (!file_data) {
+        snprintf(error, error_size, "Failed to read %s.", path);
+        return false;
+    }
+    const unsigned char *bytes = (const unsigned char *)file_data;
+    if (file_size < ORWA_LEGACY_THREE_TABLE_HEADER_SIZE ||
+        memcmp(file_data, "ORWA", 4) != 0 ||
+        read_uint32_le(bytes + 4) != 1) {
+        free(file_data);
+        snprintf(error, error_size, "Registry binary has an unsupported header.");
+        return false;
+    }
+
+    RegistryBinaryTableDescriptor descriptors[ORWA_TABLE_COUNT] = {0};
+    uint64_t first_table_offset = read_uint64_le(bytes + 8);
+    size_t table_count = first_table_offset == ORWA_HEADER_SIZE ? ORWA_TABLE_COUNT :
+                         first_table_offset == ORWA_LEGACY_THREE_TABLE_HEADER_SIZE ? ORWA_LEGACY_THREE_TABLE_COUNT :
+                         0;
+    if (table_count == 0) {
+        free(file_data);
+        snprintf(error, error_size, "Registry binary has an unsupported table layout.");
+        return false;
+    }
+    if (file_size < 8 + table_count * ORWA_TABLE_DESCRIPTOR_SIZE) {
+        free(file_data);
+        snprintf(error, error_size, "Registry binary table descriptors are truncated.");
+        return false;
+    }
+    uint64_t variable_offset = 0;
+    for (size_t i = 0; i < table_count; i++) {
+        size_t descriptor_offset = 8 + i * ORWA_TABLE_DESCRIPTOR_SIZE;
+        descriptors[i].offset = read_uint64_le(bytes + descriptor_offset);
+        descriptors[i].row_count = read_uint64_le(bytes + descriptor_offset + 8);
+        descriptors[i].row_size = read_uint32_le(bytes + descriptor_offset + 16);
+        uint32_t expected_row_size = i == ORWA_TABLE_BACKENDS ? ORWA_BACKENDS_ROW_SIZE :
+                                     i == ORWA_TABLE_FRONTENDS ? ORWA_FRONTENDS_ROW_SIZE :
+                                     i == ORWA_TABLE_FRONTEND_LAYOUTS && table_count == ORWA_TABLE_COUNT ? ORWA_FRONTEND_LAYOUTS_ROW_SIZE :
+                                     ORWA_LOG_FILES_ROW_SIZE;
+        if (descriptors[i].row_size != expected_row_size ||
+            descriptors[i].offset > (uint64_t)file_size ||
+            descriptors[i].row_count > UINT64_MAX / descriptors[i].row_size ||
+            descriptors[i].row_count * descriptors[i].row_size > (uint64_t)file_size - descriptors[i].offset) {
+            free(file_data);
+            snprintf(error, error_size, "Registry binary table descriptor is invalid.");
+            return false;
+        }
+        uint64_t table_end = descriptors[i].offset + descriptors[i].row_count * descriptors[i].row_size;
+        if (table_end > variable_offset) variable_offset = table_end;
+    }
+
+    bool ok = sqlite_exec_ok(database, "BEGIN IMMEDIATE TRANSACTION;", error, error_size) &&
+              sqlite_exec_ok(database, "DELETE FROM frontend_layouts; DELETE FROM frontends; DELETE FROM log_files; DELETE FROM systemd_backends; DELETE FROM launchd_backends; DELETE FROM backends;", error, error_size);
+
+    for (uint64_t row = 0; ok && row < descriptors[ORWA_TABLE_BACKENDS].row_count; row++) {
+        const unsigned char *row_bytes = bytes + descriptors[ORWA_TABLE_BACKENDS].offset + row * ORWA_BACKENDS_ROW_SIZE;
+        char *service_id = NULL, *display_name = NULL, *icon_path = NULL, *unit_name = NULL, *unit_path = NULL;
+        ok = registry_binary_read_string(bytes, file_size, variable_offset, read_uint64_le(row_bytes), read_uint64_le(row_bytes + 8), &service_id, error, error_size) &&
+             registry_binary_read_string(bytes, file_size, variable_offset, read_uint64_le(row_bytes + 16), read_uint64_le(row_bytes + 24), &display_name, error, error_size) &&
+             registry_binary_read_string(bytes, file_size, variable_offset, read_uint64_le(row_bytes + 32), read_uint64_le(row_bytes + 40), &icon_path, error, error_size) &&
+             registry_binary_read_string(bytes, file_size, variable_offset, read_uint64_le(row_bytes + 48), read_uint64_le(row_bytes + 56), &unit_name, error, error_size) &&
+             registry_binary_read_string(bytes, file_size, variable_offset, read_uint64_le(row_bytes + 64), read_uint64_le(row_bytes + 72), &unit_path, error, error_size);
+        if (ok) {
+            bool owns_unit = (read_uint32_le(row_bytes + 80) & 1u) != 0;
+            ok = registry_binary_import_backend(database, service_id, display_name, icon_path, unit_name, unit_path, owns_unit, error, error_size);
+        }
+        free(service_id);
+        free(display_name);
+        free(icon_path);
+        free(unit_name);
+        free(unit_path);
+    }
+
+    for (uint64_t row = 0; ok && row < descriptors[ORWA_TABLE_FRONTENDS].row_count; row++) {
+        const unsigned char *row_bytes = bytes + descriptors[ORWA_TABLE_FRONTENDS].offset + row * ORWA_FRONTENDS_ROW_SIZE;
+        char *url = NULL, *service_id = NULL, *display_name = NULL, *icon_path = NULL, *list = NULL, *socket_path = NULL;
+        uint32_t port = 0;
+        ok = registry_binary_read_string(bytes, file_size, variable_offset, read_uint64_le(row_bytes), read_uint64_le(row_bytes + 8), &url, error, error_size) &&
+             registry_binary_read_string(bytes, file_size, variable_offset, read_uint64_le(row_bytes + 16), read_uint64_le(row_bytes + 24), &service_id, error, error_size) &&
+             registry_binary_read_string(bytes, file_size, variable_offset, read_uint64_le(row_bytes + 32), read_uint64_le(row_bytes + 40), &display_name, error, error_size) &&
+             registry_binary_read_string(bytes, file_size, variable_offset, read_uint64_le(row_bytes + 48), read_uint64_le(row_bytes + 56), &icon_path, error, error_size) &&
+             registry_binary_read_string(bytes, file_size, variable_offset, read_uint64_le(row_bytes + 64), read_uint64_le(row_bytes + 72), &list, error, error_size);
+        if (ok) {
+            uint8_t endpoint_kind = row_bytes[80];
+            if (endpoint_kind == 1u) {
+                port = read_uint32_le(row_bytes + 81);
+                socket_path = strdup("");
+                if (!socket_path) {
+                    snprintf(error, error_size, "Out of memory.");
+                    ok = false;
+                }
+            } else if (endpoint_kind == 2u) {
+                ok = registry_binary_read_string(bytes, file_size, variable_offset, read_uint64_le(row_bytes + 81), read_uint64_le(row_bytes + 89), &socket_path, error, error_size);
+            } else if (endpoint_kind == 0u) {
+                socket_path = strdup("");
+                if (!socket_path) {
+                    snprintf(error, error_size, "Out of memory.");
+                    ok = false;
+                }
+            } else {
+                snprintf(error, error_size, "Registry binary frontend endpoint kind is unsupported.");
+                ok = false;
+            }
+        }
+        if (ok) {
+            ok = registry_binary_import_frontend(database, url, service_id, display_name, port, socket_path, icon_path, list, error, error_size);
+        }
+        if (ok && table_count == ORWA_LEGACY_THREE_TABLE_COUNT) {
+            ok = registry_binary_import_frontend_layout(database, url, list, error, error_size);
+        }
+        free(url);
+        free(service_id);
+        free(display_name);
+        free(icon_path);
+        free(list);
+        free(socket_path);
+    }
+
+    if (table_count == ORWA_TABLE_COUNT) {
+        for (uint64_t row = 0; ok && row < descriptors[ORWA_TABLE_FRONTEND_LAYOUTS].row_count; row++) {
+            const unsigned char *row_bytes = bytes + descriptors[ORWA_TABLE_FRONTEND_LAYOUTS].offset + row * ORWA_FRONTEND_LAYOUTS_ROW_SIZE;
+            char *url = NULL, *list = NULL;
+            ok = registry_binary_read_string(bytes, file_size, variable_offset, read_uint64_le(row_bytes), read_uint64_le(row_bytes + 8), &url, error, error_size) &&
+                 registry_binary_read_string(bytes, file_size, variable_offset, read_uint64_le(row_bytes + 16), read_uint64_le(row_bytes + 24), &list, error, error_size);
+            if (ok) {
+                ok = registry_binary_import_frontend_layout(database, url, list, error, error_size);
+            }
+            free(url);
+            free(list);
+        }
+    }
+
+    size_t log_table_index = table_count == ORWA_LEGACY_THREE_TABLE_COUNT ? 2 : ORWA_TABLE_LOG_FILES;
+    for (uint64_t row = 0; ok && row < descriptors[log_table_index].row_count; row++) {
+        const unsigned char *row_bytes = bytes + descriptors[log_table_index].offset + row * ORWA_LOG_FILES_ROW_SIZE;
+        char *path_value = NULL, *service_id = NULL;
+        ok = registry_binary_read_string(bytes, file_size, variable_offset, read_uint64_le(row_bytes), read_uint64_le(row_bytes + 8), &path_value, error, error_size) &&
+             registry_binary_read_string(bytes, file_size, variable_offset, read_uint64_le(row_bytes + 16), read_uint64_le(row_bytes + 24), &service_id, error, error_size);
+        if (ok) {
+            ok = registry_binary_import_log_file(database, path_value, service_id, error, error_size);
+        }
+        free(path_value);
+        free(service_id);
+    }
+
+    if (ok) {
+        ok = sqlite_exec_ok(database, "COMMIT;", error, error_size);
+    } else {
+        sqlite3_exec(database, "ROLLBACK;", NULL, NULL, NULL);
+    }
+    free(file_data);
+    return ok;
+}
+
+static bool export_registry_binary_from_sqlite(sqlite3 *database, const char *sqlite_path, char *error, size_t error_size) {
+    if (!database || !sqlite_path || !sqlite_path[0]) return false;
+
+    RegistryBinaryTableDescriptor descriptors[ORWA_TABLE_COUNT] = {
+        {.row_count = registry_binary_count_rows(database, "backends"), .row_size = ORWA_BACKENDS_ROW_SIZE},
+        {.row_count = registry_binary_count_rows(database, "frontends"), .row_size = ORWA_FRONTENDS_ROW_SIZE},
+        {.row_count = registry_binary_count_rows(database, "frontend_layouts"), .row_size = ORWA_FRONTEND_LAYOUTS_ROW_SIZE},
+        {.row_count = registry_binary_count_rows(database, "log_files"), .row_size = ORWA_LOG_FILES_ROW_SIZE},
+    };
+
+    uint64_t offset = ORWA_HEADER_SIZE;
+    for (size_t i = 0; i < ORWA_TABLE_COUNT; i++) {
+        descriptors[i].offset = offset;
+        offset += descriptors[i].row_count * descriptors[i].row_size;
+    }
+    uint64_t variable_region_offset = offset;
+
+    StringBuilder rows = {0};
+    StringBuilder variable_region = {0};
+    RegistryBinaryStringPool pool = {.variable_base_offset = variable_region_offset};
+    bool ok = true;
+
+    if (ok && descriptors[ORWA_TABLE_BACKENDS].row_count > 0) {
+        bool has_systemd_table = sqlite_table_exists(database, "systemd_backends");
+        bool has_launchd_table = sqlite_table_exists(database, "launchd_backends");
+        const char *systemd_join = has_systemd_table ? "LEFT JOIN systemd_backends s ON s.service_id = b.service_id" : "";
+        const char *launchd_join = has_launchd_table ? "LEFT JOIN launchd_backends l ON l.service_id = b.service_id" : "";
+        const char *unit_name_expression = "COALESCE(NULLIF(b.service_unit, ''), '')";
+        const char *unit_path_expression = "''";
+        const char *owns_unit_expression = "CASE WHEN COALESCE(b.service_unit, '') != '' THEN 1 ELSE 0 END";
+        if (has_systemd_table && has_launchd_table) {
+            unit_name_expression = "CASE WHEN COALESCE(l.plist_path, '') != '' THEN b.service_id ELSE COALESCE(NULLIF(s.unit_name, ''), NULLIF(b.service_unit, ''), '') END";
+            unit_path_expression = "COALESCE(l.plist_path, '')";
+            owns_unit_expression = "CASE WHEN COALESCE(l.plist_path, '') != '' THEN COALESCE(l.owns_plist, 0) WHEN COALESCE(s.unit_name, '') != '' OR COALESCE(b.service_unit, '') != '' THEN 1 ELSE 0 END";
+        } else if (has_systemd_table) {
+            unit_name_expression = "COALESCE(NULLIF(s.unit_name, ''), NULLIF(b.service_unit, ''), '')";
+            owns_unit_expression = "CASE WHEN COALESCE(s.unit_name, '') != '' OR COALESCE(b.service_unit, '') != '' THEN 1 ELSE 0 END";
+        } else if (has_launchd_table) {
+            unit_name_expression = "CASE WHEN COALESCE(l.plist_path, '') != '' THEN b.service_id ELSE COALESCE(NULLIF(b.service_unit, ''), '') END";
+            unit_path_expression = "COALESCE(l.plist_path, '')";
+            owns_unit_expression = "CASE WHEN COALESCE(l.plist_path, '') != '' THEN COALESCE(l.owns_plist, 0) WHEN COALESCE(b.service_unit, '') != '' THEN 1 ELSE 0 END";
+        }
+        char *sql = sqlite3_mprintf("SELECT b.service_id, COALESCE(b.display_name, ''), COALESCE(b.icon_path, ''), %s, %s, %s FROM backends b %s %s ORDER BY b.service_id;",
+                                    unit_name_expression,
+                                    unit_path_expression,
+                                    owns_unit_expression,
+                                    systemd_join,
+                                    launchd_join);
+        if (!sql) {
+            snprintf(error, error_size, "Out of memory while exporting registry.");
+            ok = false;
+        }
+        if (ok) {
+            ok = registry_binary_append_query(database,
+                                              sql,
+                                              6,
+                                              registry_binary_append_backend_row,
+                                              &pool,
+                                              &variable_region,
+                                              &rows,
+                                              error,
+                                              error_size);
+        }
+        sqlite3_free(sql);
+    }
+    if (ok && descriptors[ORWA_TABLE_FRONTENDS].row_count > 0) {
+        ok = registry_binary_append_query(database,
+                                          "SELECT url, COALESCE(service_id, ''), COALESCE(display_name, ''), COALESCE(port, 0), COALESCE(socket_path, ''), COALESCE(icon_path, ''), COALESCE(list, '') FROM frontends ORDER BY service_id, COALESCE(list, ''), display_name, url;",
+                                          7,
+                                          registry_binary_append_frontend_row,
+                                          &pool,
+                                          &variable_region,
+                                          &rows,
+                                          error,
+                                          error_size);
+    }
+    if (ok && descriptors[ORWA_TABLE_FRONTEND_LAYOUTS].row_count > 0) {
+        ok = registry_binary_append_query(database,
+                                          "SELECT url, COALESCE(list, '') FROM frontend_layouts ORDER BY url;",
+                                          2,
+                                          registry_binary_append_frontend_layout_row,
+                                          &pool,
+                                          &variable_region,
+                                          &rows,
+                                          error,
+                                          error_size);
+    }
+    if (ok && descriptors[ORWA_TABLE_LOG_FILES].row_count > 0) {
+        ok = registry_binary_append_query(database,
+                                          "SELECT path, service_id FROM log_files ORDER BY service_id, path;",
+                                          2,
+                                          registry_binary_append_log_file_row,
+                                          &pool,
+                                          &variable_region,
+                                          &rows,
+                                          error,
+                                          error_size);
+    }
+    uint64_t expected_rows_length = variable_region_offset - ORWA_HEADER_SIZE;
+    if (ok && rows.length != expected_rows_length) {
+        snprintf(error, error_size, "Registry binary row length mismatch.");
+        ok = false;
+    }
+
+    StringBuilder file = {0};
+    if (ok) {
+        ok = sb_append_n(&file, "ORWA", 4) &&
+             binary_append_u32(&file, 1);
+    }
+    for (size_t i = 0; ok && i < ORWA_TABLE_COUNT; i++) {
+        ok = binary_append_u64(&file, descriptors[i].offset) &&
+             binary_append_u64(&file, descriptors[i].row_count) &&
+             binary_append_u32(&file, descriptors[i].row_size);
+    }
+    if (ok && file.length != ORWA_HEADER_SIZE) {
+        snprintf(error, error_size, "Registry binary header length mismatch.");
+        ok = false;
+    }
+    if (ok) {
+        ok = sb_append_n(&file, rows.data ? rows.data : "", rows.length) &&
+             sb_append_n(&file, variable_region.data ? variable_region.data : "", variable_region.length);
+    }
+
+    if (ok) {
+        char output_path[PATH_MAX];
+        ok = registry_binary_output_path(sqlite_path, output_path, sizeof(output_path));
+        if (!ok) {
+            snprintf(error, error_size, "Could not build registry.orwa path.");
+        } else {
+            ok = registry_binary_write_file(output_path, file.data, file.length, error, error_size);
+        }
+    }
+
+    registry_binary_string_pool_free(&pool);
+    free(rows.data);
+    free(variable_region.data);
+    free(file.data);
+    return ok;
 }
 
 static void append_systemd_status_scope(const char *scope) {
@@ -2024,107 +3173,211 @@ static bool lookup_launchd_backend_any(const char *service_id,
 }
 #endif
 
-static bool append_frontends_json(StringBuilder *builder, sqlite3 *database, const char *service_id) {
-    sqlite3_stmt *statement = NULL;
-    char column_error[256] = "";
-    bool has_home_screen_column = frontends_has_column(database, "is_home_screen", column_error, sizeof(column_error));
-    bool has_list_column = frontends_has_column(database, "list", column_error, sizeof(column_error));
-    const char *sql = has_home_screen_column && has_list_column ?
-        "SELECT f.name, COALESCE(f.url, ''), COALESCE(f.port, 0), COALESCE(f.socket_path, ''), COALESCE(f.is_home_screen, 0), COALESCE(NULLIF(f.icon, ''), COALESCE(b.icon, '')), COALESCE(f.list, '') "
-        "FROM frontends f LEFT JOIN backends b ON b.service_id = f.service_id WHERE f.service_id = ? "
-        "ORDER BY COALESCE(f.list, ''), f.name, f.url;" :
-        has_home_screen_column ?
-        "SELECT f.name, COALESCE(f.url, ''), COALESCE(f.port, 0), COALESCE(f.socket_path, ''), COALESCE(f.is_home_screen, 0), COALESCE(NULLIF(f.icon, ''), COALESCE(b.icon, '')), '' "
-        "FROM frontends f LEFT JOIN backends b ON b.service_id = f.service_id WHERE f.service_id = ? "
-        "ORDER BY f.name, f.url;" :
-        has_list_column ?
-        "SELECT f.name, COALESCE(f.url, ''), COALESCE(f.port, 0), COALESCE(f.socket_path, ''), 0, COALESCE(NULLIF(f.icon, ''), COALESCE(b.icon, '')), COALESCE(f.list, '') "
-        "FROM frontends f LEFT JOIN backends b ON b.service_id = f.service_id WHERE f.service_id = ? "
-        "ORDER BY COALESCE(f.list, ''), f.name, f.url;" :
-        "SELECT f.name, COALESCE(f.url, ''), COALESCE(f.port, 0), COALESCE(f.socket_path, ''), 0, COALESCE(NULLIF(f.icon, ''), COALESCE(b.icon, '')), '' "
-        "FROM frontends f LEFT JOIN backends b ON b.service_id = f.service_id WHERE f.service_id = ? "
-        "ORDER BY f.name, f.url;";
-    if (sqlite3_prepare_v2(database, sql, -1, &statement, NULL) != SQLITE_OK) {
-        return false;
-    }
-    sqlite3_bind_text(statement, 1, service_id, -1, SQLITE_TRANSIENT);
+#define BACKEND_FLAG_CAN_CONTROL 0x01u
+#define BACKEND_FLAG_CAN_UNINSTALL 0x02u
+#define BACKEND_FLAG_IS_BUNDLED 0x04u
+#define BACKEND_FLAG_IS_INSTALLED 0x08u
+#define BACKEND_FLAG_IS_MIGRATION 0x10u
+#define BACKEND_FLAG_OWNS_LAUNCHD_PLIST 0x20u
+#define LOG_FILE_FLAG_READABLE 0x01u
+#define FILE_PICKER_FLAG_IS_DIRECTORY 0x01u
+#define ACTION_FLAG_OK 0x01u
+#define ACTION_FLAG_NEEDS_PASSWORD 0x02u
 
-    bool ok = sb_append(builder, "[");
-    bool first = true;
-    while (ok && sqlite3_step(statement) == SQLITE_ROW) {
-        if (!first) ok = sb_append(builder, ",");
-        first = false;
-        char number[64];
-        ok = ok && sb_append(builder, "{\"name\":");
-        ok = ok && sb_append_json_string(builder, sqlite_column_text_or_empty(statement, 0));
-        ok = ok && sb_append(builder, ",\"url\":");
-        ok = ok && sb_append_json_string(builder, sqlite_column_text_or_empty(statement, 1));
-        snprintf(number, sizeof(number), ",\"port\":%d", sqlite3_column_int(statement, 2));
-        ok = ok && sb_append(builder, number);
-        ok = ok && sb_append(builder, ",\"socketPath\":");
-        ok = ok && sb_append_json_string(builder, sqlite_column_text_or_empty(statement, 3));
-        ok = ok && sb_append(builder, ",\"isHomeScreen\":");
-        ok = ok && sb_append(builder, sqlite3_column_int(statement, 4) != 0 ? "true" : "false");
-        ok = ok && sb_append(builder, ",\"iconPath\":");
-        ok = ok && sb_append_json_string(builder, sqlite_column_text_or_empty(statement, 5));
-        ok = ok && sb_append(builder, ",\"iconData\":");
-        ok = ok && sb_append_base64_file_json_string(builder, sqlite_column_text_or_empty(statement, 5));
-        ok = ok && sb_append(builder, ",\"list\":");
-        ok = ok && sb_append_json_string(builder, sqlite_column_text_or_empty(statement, 6));
-        ok = ok && sb_append(builder, "}");
-    }
-    sqlite3_finalize(statement);
-    return ok && sb_append(builder, "]");
+static bool root_outerwebapps_migration_pending(void);
+
+static bool build_frontend_payload(const char *name,
+                                   const char *url,
+                                   int port,
+                                   const char *socket_path,
+                                   const char *icon_path,
+                                   const char *list,
+                                   StringBuilder *payload) {
+    if (!binary_append_zero(payload, 52)) return false;
+    return binary_append_string_ref_at(payload, 0, name) &&
+           binary_append_string_ref_at(payload, 8, url) &&
+           binary_append_string_ref_at(payload, 16, socket_path) &&
+           binary_append_string_ref_at(payload, 24, icon_path) &&
+           binary_append_file_ref_at(payload, 32, icon_path) &&
+           binary_append_string_ref_at(payload, 40, list) &&
+           binary_write_u32_at(payload, 48, (uint32_t)(port < 0 ? 0 : port));
 }
 
-static bool append_log_files_json(StringBuilder *builder, sqlite3 *database, const char *service_id) {
+static bool build_log_file_payload(const char *service_id,
+                                   const char *path,
+                                   int index,
+                                   StringBuilder *payload) {
+    char expanded[PATH_MAX];
+    expand_tilde_path(path, expanded, sizeof(expanded));
+    struct stat st;
+    bool has_stat = stat(expanded, &st) == 0;
+
+    char identifier[PATH_MAX + 80];
+    snprintf(identifier, sizeof(identifier), "backend-log-file:%s:%d", service_id, index);
+    const char *last_slash = strrchr(path, '/');
+    const char *display_name = last_slash && last_slash[1] ? last_slash + 1 : path;
+
+    if (!binary_append_zero(payload, 44)) return false;
+    return binary_append_string_ref_at(payload, 0, identifier) &&
+           binary_append_string_ref_at(payload, 8, display_name) &&
+           binary_append_string_ref_at(payload, 16, path) &&
+           binary_write_u64_at(payload, 24, has_stat ? (uint64_t)st.st_size : 0) &&
+           binary_write_f64_at(payload, 32, has_stat ? (double)st.st_mtime : 0.0) &&
+           binary_write_u32_at(payload, 40, has_stat ? LOG_FILE_FLAG_READABLE : 0);
+}
+
+static bool lookup_frontend_layout(sqlite3 *database,
+                                   const char *url,
+                                   char *list,
+                                   size_t list_size,
+                                   bool *found) {
+    if (found) *found = false;
+    if (list && list_size) list[0] = '\0';
+    if (!database || !url || !url[0] || !sqlite_table_exists(database, "frontend_layouts")) return true;
     sqlite3_stmt *statement = NULL;
-    const char *sql =
-        "SELECT path FROM log_files WHERE service_id = ? ORDER BY path;";
+    const char *sql = "SELECT list FROM frontend_layouts WHERE url = ? LIMIT 1;";
+    if (sqlite3_prepare_v2(database, sql, -1, &statement, NULL) != SQLITE_OK) {
+        return false;
+    }
+    sqlite3_bind_text(statement, 1, url, -1, SQLITE_TRANSIENT);
+    bool has_row = sqlite3_step(statement) == SQLITE_ROW;
+    if (has_row) {
+        if (found) *found = true;
+        snprintf(list, list_size, "%s", sqlite_column_text_or_empty(statement, 0));
+    }
+    sqlite3_finalize(statement);
+    if (!has_row && url[0]) {
+        size_t length = strlen(url);
+        if (length > 1 && url[length - 1] == '/') {
+            char without_trailing_slash[PATH_MAX];
+            if (length < sizeof(without_trailing_slash)) {
+                memcpy(without_trailing_slash, url, length - 1);
+                without_trailing_slash[length - 1] = '\0';
+                statement = NULL;
+                if (sqlite3_prepare_v2(database, sql, -1, &statement, NULL) != SQLITE_OK) {
+                    return false;
+                }
+                sqlite3_bind_text(statement, 1, without_trailing_slash, -1, SQLITE_TRANSIENT);
+                has_row = sqlite3_step(statement) == SQLITE_ROW;
+                if (has_row) {
+                    if (found) *found = true;
+                    snprintf(list, list_size, "%s", sqlite_column_text_or_empty(statement, 0));
+                }
+                sqlite3_finalize(statement);
+            }
+        }
+    }
+    return true;
+}
+
+static bool build_frontends_array_payload(sqlite3 *database, sqlite3 *layout_database, const char *service_id, StringBuilder *out) {
+    BinaryPayloadList list = {0};
+    sqlite3_stmt *statement = NULL;
+    char column_error[256] = "";
+    bool has_list_column = frontends_has_column(database, "list", column_error, sizeof(column_error));
+    const char *sql = has_list_column ?
+        "SELECT f.display_name, COALESCE(f.url, ''), COALESCE(f.port, 0), COALESCE(f.socket_path, ''), COALESCE(NULLIF(f.icon_path, ''), COALESCE(b.icon_path, '')), COALESCE(f.list, '') "
+        "FROM frontends f LEFT JOIN backends b ON b.service_id = f.service_id WHERE f.service_id = ? "
+        "ORDER BY COALESCE(f.list, ''), f.display_name, f.url;" :
+        "SELECT f.display_name, COALESCE(f.url, ''), COALESCE(f.port, 0), COALESCE(f.socket_path, ''), COALESCE(NULLIF(f.icon_path, ''), COALESCE(b.icon_path, '')), '' "
+        "FROM frontends f LEFT JOIN backends b ON b.service_id = f.service_id WHERE f.service_id = ? "
+        "ORDER BY f.display_name, f.url;";
     if (sqlite3_prepare_v2(database, sql, -1, &statement, NULL) != SQLITE_OK) {
         return false;
     }
     sqlite3_bind_text(statement, 1, service_id, -1, SQLITE_TRANSIENT);
 
-    bool ok = sb_append(builder, "[");
-    bool first = true;
+    bool ok = true;
+    while (ok && sqlite3_step(statement) == SQLITE_ROW) {
+        StringBuilder payload = {0};
+        const char *url = sqlite_column_text_or_empty(statement, 1);
+        const char *suggested_list = sqlite_column_text_or_empty(statement, 5);
+        char layout_list[PATH_MAX] = "";
+        bool has_layout = false;
+        ok = lookup_frontend_layout(layout_database ? layout_database : database,
+                                    url,
+                                    layout_list,
+                                    sizeof(layout_list),
+                                    &has_layout);
+        if (!ok) {
+            free(payload.data);
+            break;
+        }
+        ok = build_frontend_payload(sqlite_column_text_or_empty(statement, 0),
+                                    url,
+                                    sqlite3_column_int(statement, 2),
+                                    sqlite_column_text_or_empty(statement, 3),
+                                    sqlite_column_text_or_empty(statement, 4),
+                                    has_layout ? layout_list : suggested_list,
+                                    &payload) &&
+             binary_payload_list_append(&list, &payload);
+        if (!ok) free(payload.data);
+    }
+    sqlite3_finalize(statement);
+    if (ok) ok = binary_build_payload_array(&list, out);
+    binary_payload_list_free(&list);
+    return ok;
+}
+
+static bool build_log_files_array_payload(sqlite3 *database, const char *service_id, StringBuilder *out) {
+    BinaryPayloadList list = {0};
+    sqlite3_stmt *statement = NULL;
+    const char *sql = "SELECT path FROM log_files WHERE service_id = ? ORDER BY path;";
+    if (sqlite3_prepare_v2(database, sql, -1, &statement, NULL) != SQLITE_OK) {
+        return false;
+    }
+    sqlite3_bind_text(statement, 1, service_id, -1, SQLITE_TRANSIENT);
+
+    bool ok = true;
     int index = 0;
     while (ok && sqlite3_step(statement) == SQLITE_ROW) {
-        const char *path = sqlite_column_text_or_empty(statement, 0);
-        char expanded[PATH_MAX];
-        expand_tilde_path(path, expanded, sizeof(expanded));
-        struct stat st;
-        bool has_stat = stat(expanded, &st) == 0;
-
-        if (!first) ok = sb_append(builder, ",");
-        first = false;
-        char number[128];
-        ok = ok && sb_append(builder, "{\"identifier\":");
-        char identifier[PATH_MAX + 80];
-        snprintf(identifier, sizeof(identifier), "backend-log-file:%s:%d", service_id, index);
-        ok = ok && sb_append_json_string(builder, identifier);
-        ok = ok && sb_append(builder, ",\"displayName\":");
-        const char *last_slash = strrchr(path, '/');
-        ok = ok && sb_append_json_string(builder, last_slash && last_slash[1] ? last_slash + 1 : path);
-        ok = ok && sb_append(builder, ",\"path\":");
-        ok = ok && sb_append_json_string(builder, path);
-        snprintf(number, sizeof(number), ",\"size\":%llu,\"modified\":%.3f,\"readable\":%s",
-                 has_stat ? (unsigned long long)st.st_size : 0ULL,
-                 has_stat ? (double)st.st_mtime : 0.0,
-                 has_stat ? "true" : "false");
-        ok = ok && sb_append(builder, number);
-        ok = ok && sb_append(builder, "}");
+        StringBuilder payload = {0};
+        ok = build_log_file_payload(service_id, sqlite_column_text_or_empty(statement, 0), index, &payload) &&
+             binary_payload_list_append(&list, &payload);
+        if (!ok) free(payload.data);
         index++;
     }
     sqlite3_finalize(statement);
-    return ok && sb_append(builder, "]");
+    if (ok) ok = binary_build_payload_array(&list, out);
+    binary_payload_list_free(&list);
+    return ok;
 }
 
-static bool append_registered_backends_json(StringBuilder *builder,
-                                            sqlite3 *database,
-                                            bool *first,
-                                            bool *bundled_installed,
-                                            size_t bundled_installed_count) {
+static bool build_empty_array_payload(StringBuilder *out) {
+    return binary_append_zero(out, 4) && binary_write_u32_at(out, 0, 0);
+}
+
+static bool build_backend_payload(const char *service_id,
+                                  const char *display_name,
+                                  const char *service_unit,
+                                  const char *service_unit_path,
+                                  const char *service_scope,
+                                  const char *status,
+                                  uint32_t flags,
+                                  const char *icon_symbol_name,
+                                  const char *launchd_plist_path,
+                                  StringBuilder *frontends_array,
+                                  StringBuilder *log_files_array,
+                                  StringBuilder *payload) {
+    if (!binary_append_zero(payload, 84)) return false;
+    return binary_append_string_ref_at(payload, 0, service_id) &&
+           binary_append_string_ref_at(payload, 8, display_name && display_name[0] ? display_name : service_id) &&
+           binary_append_string_ref_at(payload, 16, service_unit) &&
+           binary_append_string_ref_at(payload, 24, service_unit_path) &&
+           binary_append_string_ref_at(payload, 32, service_scope) &&
+           binary_append_string_ref_at(payload, 40, status) &&
+           binary_append_string_ref_at(payload, 48, icon_symbol_name) &&
+           binary_append_string_ref_at(payload, 56, launchd_plist_path) &&
+           binary_write_u32_at(payload, 64, flags) &&
+           binary_append_child_ref_at(payload, 68, frontends_array) &&
+           binary_append_child_ref_at(payload, 76, log_files_array);
+}
+
+static bool append_registered_backend_payloads(sqlite3 *database,
+                                               sqlite3 *layout_database,
+                                               BinaryPayloadList *payloads,
+                                               bool *bundled_installed,
+                                               size_t bundled_installed_count) {
     sqlite3_stmt *statement = NULL;
     bool has_launchd_table = sqlite_table_exists(database, "launchd_backends");
     bool has_systemd_table = sqlite_table_exists(database, "systemd_backends");
@@ -2156,69 +3409,113 @@ static bool append_registered_backends_json(StringBuilder *builder,
         bool is_self = is_home_screen_service_id(service_id);
         if (bundled_app) {
             size_t bundled_index = (size_t)(bundled_app - kBundledApps);
-            if (bundled_index < bundled_installed_count) {
-                bundled_installed[bundled_index] = true;
-            }
+            if (bundled_index < bundled_installed_count) bundled_installed[bundled_index] = true;
         }
+
         char status[32] = "unknown";
-        bool has_systemd_unit = service_unit[0] && has_systemd_table;
         bool has_launchd_unit = plist_path[0] && has_launchd_table;
-        bool can_control = (has_systemd_unit || has_launchd_unit) && !is_self;
-        bool can_uninstall = (has_systemd_unit || has_launchd_unit) && !is_self;
+        bool has_systemd_unit = service_unit[0] && has_systemd_table;
 #ifdef __APPLE__
+        if (has_launchd_unit) has_systemd_unit = false;
         if (has_launchd_unit) {
             snprintf(effective_service_scope,
                      sizeof(effective_service_scope),
                      "%s",
                      strncmp(plist_path, "/Library/LaunchDaemons/", 23) == 0 ? "system" : "user");
-        }
+            launchd_status(service_id, plist_path, status, sizeof(status));
+        } else
 #endif
         if (has_systemd_unit) {
             systemd_status(service_unit, effective_service_scope, status, sizeof(status));
-#ifdef __APPLE__
-        } else if (has_launchd_unit) {
-            launchd_status(service_id, plist_path, status, sizeof(status));
-#endif
         }
+
         char service_unit_path[PATH_MAX] = "";
+#ifdef __APPLE__
+        if (plist_path[0]) {
+            snprintf(service_unit_path, sizeof(service_unit_path), "%s", plist_path);
+        } else
+#endif
         if (service_unit[0]) {
             systemd_unit_path(service_unit, effective_service_scope, service_unit_path, sizeof(service_unit_path));
         } else if (plist_path[0]) {
             snprintf(service_unit_path, sizeof(service_unit_path), "%s", plist_path);
         }
 
-        if (!*first) ok = sb_append(builder, ",");
-        *first = false;
-        ok = ok && sb_append(builder, "{\"serviceID\":");
-        ok = ok && sb_append_json_string(builder, service_id);
-        ok = ok && sb_append(builder, ",\"displayName\":");
-        ok = ok && sb_append_json_string(builder, display_name[0] ? display_name : service_id);
-        ok = ok && sb_append(builder, ",\"serviceUnit\":");
-        ok = ok && sb_append_json_string(builder, service_unit);
-        ok = ok && sb_append(builder, ",\"serviceUnitPath\":");
-        ok = ok && sb_append_json_string(builder, service_unit_path);
-        ok = ok && sb_append(builder, ",\"serviceScope\":");
-        ok = ok && sb_append_json_string(builder, effective_service_scope);
-        ok = ok && sb_append(builder, ",\"status\":");
-        ok = ok && sb_append_json_string(builder, status);
-        ok = ok && sb_append(builder, ",\"canControl\":");
-        ok = ok && sb_append(builder, can_control ? "true" : "false");
-        ok = ok && sb_append(builder, ",\"canUninstall\":");
-        ok = ok && sb_append(builder, can_uninstall ? "true" : "false");
-        ok = ok && sb_append(builder, ",\"isBundled\":");
-        ok = ok && sb_append(builder, bundled_app ? "true" : "false");
-        ok = ok && sb_append(builder, ",\"isInstalled\":true");
-        ok = ok && sb_append(builder, ",\"launchdPlistPath\":");
-        ok = ok && sb_append_json_string(builder, plist_path);
-        ok = ok && sb_append(builder, ",\"ownsLaunchdPlist\":");
-        ok = ok && sb_append(builder, owns_plist ? "true" : "false");
-        ok = ok && sb_append(builder, ",\"frontends\":");
-        ok = ok && append_frontends_json(builder, database, service_id);
-        ok = ok && sb_append(builder, ",\"logFiles\":");
-        ok = ok && append_log_files_json(builder, database, service_id);
-        ok = ok && sb_append(builder, "}");
+        uint32_t flags = BACKEND_FLAG_IS_INSTALLED;
+        if ((has_systemd_unit || has_launchd_unit) && !is_self) flags |= BACKEND_FLAG_CAN_CONTROL | BACKEND_FLAG_CAN_UNINSTALL;
+        if (bundled_app) flags |= BACKEND_FLAG_IS_BUNDLED;
+        if (owns_plist) flags |= BACKEND_FLAG_OWNS_LAUNCHD_PLIST;
+
+        StringBuilder frontends = {0};
+        StringBuilder logs = {0};
+        StringBuilder payload = {0};
+        ok = build_frontends_array_payload(database, layout_database ? layout_database : database, service_id, &frontends) &&
+             build_log_files_array_payload(database, service_id, &logs) &&
+             build_backend_payload(service_id, display_name, service_unit, service_unit_path,
+                                   effective_service_scope, status, flags, "",
+                                   plist_path, &frontends, &logs, &payload) &&
+             binary_payload_list_append(payloads, &payload);
+        free(frontends.data);
+        free(logs.data);
+        if (!ok) free(payload.data);
     }
     if (statement) sqlite3_finalize(statement);
+    return ok;
+}
+
+static bool append_root_migration_backend_payload(BinaryPayloadList *payloads) {
+    if (!root_outerwebapps_migration_pending()) return true;
+    StringBuilder frontends = {0};
+    StringBuilder logs = {0};
+    StringBuilder payload = {0};
+#ifdef __APPLE__
+    const char *path = "/Library/dev.outergroup.OuterLoop";
+#else
+    const char *path = "/var/lib/outergroup/outeragent";
+#endif
+    bool ok = build_empty_array_payload(&frontends) &&
+              build_empty_array_payload(&logs) &&
+              build_backend_payload(kMigrationServiceID,
+                                    "Migrate old root services",
+                                    "",
+                                    path,
+                                    "system",
+                                    "pending",
+                                    BACKEND_FLAG_CAN_CONTROL | BACKEND_FLAG_IS_INSTALLED | BACKEND_FLAG_IS_MIGRATION,
+                                    "",
+                                    "",
+                                    &frontends,
+                                    &logs,
+                                    &payload) &&
+              binary_payload_list_append(payloads, &payload);
+    free(frontends.data);
+    free(logs.data);
+    if (!ok) free(payload.data);
+    return ok;
+}
+
+static bool append_bundled_backend_placeholder_payload(BinaryPayloadList *payloads, const BundledAppDefinition *app) {
+    StringBuilder frontends = {0};
+    StringBuilder logs = {0};
+    StringBuilder payload = {0};
+    bool ok = build_empty_array_payload(&frontends) &&
+              build_empty_array_payload(&logs) &&
+              build_backend_payload(app->service_id,
+                                    app->display_name,
+                                    "",
+                                    "",
+                                    "user",
+                                    "available",
+                                    BACKEND_FLAG_CAN_CONTROL | BACKEND_FLAG_IS_BUNDLED,
+                                    app->icon_symbol_name ? app->icon_symbol_name : "",
+                                    "",
+                                    &frontends,
+                                    &logs,
+                                    &payload) &&
+              binary_payload_list_append(payloads, &payload);
+    free(frontends.data);
+    free(logs.data);
+    if (!ok) free(payload.data);
     return ok;
 }
 
@@ -2272,36 +3569,8 @@ static bool root_outerwebapps_migration_pending(void) {
 #endif
 }
 
-static bool append_root_migration_backend_json(StringBuilder *builder, bool *first) {
-    if (!root_outerwebapps_migration_pending()) return true;
-    if (!*first && !sb_append(builder, ",")) return false;
-    *first = false;
-    bool ok = sb_append(builder, "{\"serviceID\":") &&
-              sb_append_json_string(builder, kMigrationServiceID) &&
-              sb_append(builder, ",\"displayName\":\"Migrate old root services\"") &&
-              sb_append(builder, ",\"serviceUnit\":\"\"") &&
-              sb_append(builder, ",\"serviceUnitPath\":") &&
-#ifdef __APPLE__
-              sb_append_json_string(builder, "/Library/dev.outergroup.OuterLoop") &&
-#else
-              sb_append_json_string(builder, "/var/lib/outergroup/outeragent") &&
-#endif
-              sb_append(builder, ",\"serviceScope\":\"system\"") &&
-              sb_append(builder, ",\"status\":\"pending\"") &&
-              sb_append(builder, ",\"canControl\":true") &&
-              sb_append(builder, ",\"canUninstall\":false") &&
-              sb_append(builder, ",\"isBundled\":false") &&
-              sb_append(builder, ",\"isInstalled\":true") &&
-              sb_append(builder, ",\"isMigration\":true") &&
-              sb_append(builder, ",\"launchdPlistPath\":\"\"") &&
-              sb_append(builder, ",\"ownsLaunchdPlist\":false") &&
-              sb_append(builder, ",\"frontends\":[]") &&
-              sb_append(builder, ",\"logFiles\":[]}");
-    return ok;
-}
-
 static void send_backends_response(int fd) {
-    StringBuilder builder = {0};
+    BinaryPayloadList payloads = {0};
     char user_error[512] = "";
     char system_error[512] = "";
     migrate_registry_schema_if_writable(g_registry_database_path);
@@ -2309,62 +3578,47 @@ static void send_backends_response(int fd) {
     sqlite3 *user_database = open_registry_readonly(user_error, sizeof(user_error));
     sqlite3 *system_database = open_system_registry_readonly(system_error, sizeof(system_error));
 
-    bool ok = sb_append(&builder, "{\"databasePath\":") &&
-              sb_append_json_string(&builder, g_registry_database_path) &&
-              sb_append(&builder, ",\"systemDatabasePath\":") &&
-              sb_append_json_string(&builder, g_system_registry_database_path) &&
-              sb_append(&builder, ",\"error\":");
+    bool ok = true;
+    const char *error = "";
     if (!user_database && !system_database) {
-        ok = ok && sb_append_json_string(&builder, user_error[0] ? user_error : system_error);
-        ok = ok && sb_append(&builder, ",\"backends\":[]}");
-        if (!ok) {
-            free(builder.data);
-            send_text_response(fd, 500, "out of memory\n");
-            return;
-        }
-        send_response(fd, 200, "OK", "application/json; charset=utf-8", builder.data, builder.length);
-        free(builder.data);
-        return;
+        error = user_error[0] ? user_error : system_error;
     }
-
-    ok = ok && sb_append_json_string(&builder, "") && sb_append(&builder, ",\"backends\":[");
-    bool first = true;
     bool bundled_installed[sizeof(kBundledApps) / sizeof(kBundledApps[0])] = {0};
     if (user_database) {
-        ok = ok && append_registered_backends_json(&builder, user_database, &first, bundled_installed,
-                                                   sizeof(bundled_installed) / sizeof(bundled_installed[0]));
+        ok = ok && append_registered_backend_payloads(user_database, user_database, &payloads, bundled_installed,
+                                                       sizeof(bundled_installed) / sizeof(bundled_installed[0]));
     }
     if (system_database) {
-        ok = ok && append_registered_backends_json(&builder, system_database, &first, bundled_installed,
-                                                   sizeof(bundled_installed) / sizeof(bundled_installed[0]));
+        ok = ok && append_registered_backend_payloads(system_database, user_database, &payloads, bundled_installed,
+                                                       sizeof(bundled_installed) / sizeof(bundled_installed[0]));
     }
-    ok = ok && append_root_migration_backend_json(&builder, &first);
+    ok = ok && append_root_migration_backend_payload(&payloads);
 
     for (size_t i = 0; ok && i < sizeof(kBundledApps) / sizeof(kBundledApps[0]); i++) {
         if (!bundled_app_is_available_on_platform(&kBundledApps[i])) continue;
         if (bundled_installed[i]) continue;
-        const BundledAppDefinition *app = &kBundledApps[i];
-        if (!first) ok = sb_append(&builder, ",");
-        first = false;
-        ok = ok && sb_append(&builder, "{\"serviceID\":");
-        ok = ok && sb_append_json_string(&builder, app->service_id);
-        ok = ok && sb_append(&builder, ",\"displayName\":");
-        ok = ok && sb_append_json_string(&builder, app->display_name);
-        ok = ok && sb_append(&builder, ",\"iconSymbolName\":");
-        ok = ok && sb_append_json_string(&builder, app->icon_symbol_name ? app->icon_symbol_name : "");
-        ok = ok && sb_append(&builder, ",\"serviceUnit\":\"\",\"serviceUnitPath\":\"\",\"serviceScope\":\"user\",\"status\":\"available\",\"canControl\":true,\"canUninstall\":false,\"isBundled\":true,\"isInstalled\":false,\"launchdPlistPath\":\"\",\"ownsLaunchdPlist\":false,\"frontends\":[],\"logFiles\":[]}");
+        ok = ok && append_bundled_backend_placeholder_payload(&payloads, &kBundledApps[i]);
     }
     if (user_database) sqlite3_close(user_database);
     if (system_database) sqlite3_close(system_database);
 
-    ok = ok && sb_append(&builder, "]}");
+    StringBuilder builder = {0};
+    size_t fixed_size = 12 + payloads.count * 8;
+    ok = ok && binary_append_zero(&builder, fixed_size) &&
+         binary_write_u32_at(&builder, 8, (uint32_t)payloads.count) &&
+         binary_append_string_ref_at(&builder, 0, error);
+    for (size_t i = 0; ok && i < payloads.count; i++) {
+        ok = binary_append_child_ref_at(&builder, 12 + i * 8, &payloads.items[i]);
+    }
     if (!ok) {
         free(builder.data);
+        binary_payload_list_free(&payloads);
         send_text_response(fd, 500, "failed to read registry database\n");
         return;
     }
-    send_response(fd, 200, "OK", "application/json; charset=utf-8", builder.data, builder.length);
+    send_binary_response(fd, 200, &builder);
     free(builder.data);
+    binary_payload_list_free(&payloads);
 }
 
 static bool resolve_log_path(sqlite3 *database, const char *service_id, int log_index,
@@ -2402,68 +3656,169 @@ static bool resolve_log_path_any(const char *service_id, int log_index, char *pa
     return false;
 }
 
-static void send_log_json(int fd, const char *service_id, const char *path, const char *contents,
+static void send_log_response(int fd, const char *service_id, const char *path, const char *contents,
                           bool truncated, uint64_t file_size, double modified, const char *error) {
     StringBuilder builder = {0};
-    char number[160];
-    bool ok = sb_append(&builder, "{\"serviceID\":") &&
-              sb_append_json_string(&builder, service_id ? service_id : "") &&
-              sb_append(&builder, ",\"path\":") &&
-              sb_append_json_string(&builder, path ? path : "") &&
-              sb_append(&builder, ",\"contents\":") &&
-              sb_append_json_string(&builder, contents ? contents : "") &&
-              sb_append(&builder, ",\"isTruncated\":") &&
-              sb_append(&builder, truncated ? "true" : "false");
-    snprintf(number, sizeof(number), ",\"fileSize\":%llu,\"modified\":%.3f,\"error\":",
-             (unsigned long long)file_size, modified);
-    ok = ok && sb_append(&builder, number) &&
-         sb_append_json_string(&builder, error ? error : "") &&
-         sb_append(&builder, "}");
+    bool ok = binary_append_zero(&builder, 52) &&
+              binary_append_string_ref_at(&builder, 0, service_id ? service_id : "") &&
+              binary_append_string_ref_at(&builder, 8, path ? path : "") &&
+              binary_append_string_ref_at(&builder, 16, contents ? contents : "") &&
+              binary_write_u32_at(&builder, 24, truncated ? 1u : 0u) &&
+              binary_write_u64_at(&builder, 28, file_size) &&
+              binary_write_f64_at(&builder, 36, modified) &&
+              binary_append_string_ref_at(&builder, 44, error ? error : "");
     if (!ok) {
         free(builder.data);
         send_text_response(fd, 500, "out of memory\n");
         return;
     }
-    send_response(fd, 200, "OK", "application/json; charset=utf-8", builder.data, builder.length);
+    send_binary_response(fd, 200, &builder);
     free(builder.data);
 }
 
-static void send_action_json_ex(int fd, int status, bool ok_value, const char *message, bool needs_password) {
+static void send_action_response_ex(int fd, int status, bool ok_value, const char *message, bool needs_password) {
     StringBuilder builder = {0};
-    bool ok = sb_append(&builder, "{\"ok\":") &&
-              sb_append(&builder, ok_value ? "true" : "false") &&
-              sb_append(&builder, ",\"message\":") &&
-              sb_append_json_string(&builder, message ? message : "") &&
-              sb_append(&builder, ",\"needsPassword\":") &&
-              sb_append(&builder, needs_password ? "true" : "false") &&
-              sb_append(&builder, "}");
+    uint32_t flags = (ok_value ? ACTION_FLAG_OK : 0) |
+                     (needs_password ? ACTION_FLAG_NEEDS_PASSWORD : 0);
+    bool ok = binary_append_zero(&builder, 12) &&
+              binary_write_u32_at(&builder, 0, flags) &&
+              binary_append_string_ref_at(&builder, 4, message ? message : "");
     if (!ok) {
         free(builder.data);
         send_text_response(fd, 500, "out of memory\n");
         return;
     }
-    const char *status_text = status == 200 ? "OK" :
-                              status == 401 ? "Unauthorized" :
-                              status == 400 ? "Bad Request" :
-                              status == 404 ? "Not Found" :
-                              status == 500 ? "Internal Server Error" : "Error";
-    send_response(fd, status, status_text, "application/json; charset=utf-8", builder.data, builder.length);
+    send_binary_response(fd, status, &builder);
     free(builder.data);
 }
 
-static void send_action_json(int fd, int status, bool ok_value, const char *message) {
-    send_action_json_ex(fd, status, ok_value, message, false);
+static void send_action_response(int fd, int status, bool ok_value, const char *message) {
+    send_action_response_ex(fd, status, ok_value, message, false);
 }
 
 static bool install_bundled_app(const BundledAppDefinition *app, const char *scope, const char *sudo_password, bool *needs_password, char *message, size_t message_size);
 static bool uninstall_backend(const char *service_id, const char *sudo_password, bool *needs_password, char *message, size_t message_size);
 static bool run_root_outerwebapps_migration(const char *sudo_password, bool *needs_password, char *message, size_t message_size);
 
+static bool registry_storage_exists_at(const char *database_path) {
+    struct stat st;
+    if (database_path && database_path[0] && stat(database_path, &st) == 0 && S_ISREG(st.st_mode)) {
+        return true;
+    }
+    char binary_path[PATH_MAX];
+    return database_path &&
+           registry_binary_output_path(database_path, binary_path, sizeof(binary_path)) &&
+           stat(binary_path, &st) == 0 &&
+           S_ISREG(st.st_mode);
+}
+
+static bool frontend_exists_in_registry_at(const char *database_path,
+                                           const char *service_id,
+                                           const char *frontend_url,
+                                           bool *found,
+                                           char *error,
+                                           size_t error_size) {
+    if (found) *found = false;
+    sqlite3 *database = open_registry_readonly_at(database_path, error, error_size);
+    if (!database) return false;
+    sqlite3_stmt *statement = NULL;
+    bool ok = sqlite3_prepare_v2(database,
+                                 "SELECT 1 FROM frontends WHERE service_id = ? AND url = ? LIMIT 1;",
+                                 -1,
+                                 &statement,
+                                 NULL) == SQLITE_OK;
+    if (ok) {
+        sqlite3_bind_text(statement, 1, service_id, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(statement, 2, frontend_url, -1, SQLITE_TRANSIENT);
+        int step = sqlite3_step(statement);
+        if (step == SQLITE_ROW) {
+            if (found) *found = true;
+        } else if (step != SQLITE_DONE) {
+            ok = false;
+        }
+    }
+    if (!ok) snprintf(error, error_size, "%s", sqlite3_errmsg(database));
+    if (statement) sqlite3_finalize(statement);
+    sqlite3_close(database);
+    return ok;
+}
+
+static bool update_frontend_layout_in_user_registry(const char *frontend_url,
+                                                    const char *list_name,
+                                                    char *error,
+                                                    size_t error_size) {
+    sqlite3 *database = open_registry_readwrite(error, error_size);
+    if (!database) return false;
+    if (!ensure_registry_schema(database, error, error_size)) {
+        close_registry_readwrite(database, false, error, error_size);
+        return false;
+    }
+    sqlite3_stmt *statement = NULL;
+    bool ok = sqlite3_prepare_v2(database,
+                                 "INSERT INTO frontend_layouts(url, list) VALUES(?, ?) "
+                                 "ON CONFLICT(url) DO UPDATE SET list = excluded.list;",
+                                 -1,
+                                 &statement,
+                                 NULL) == SQLITE_OK;
+    if (ok) {
+        sqlite3_bind_text(statement, 1, frontend_url, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(statement, 2, list_name ? list_name : "", -1, SQLITE_TRANSIENT);
+        ok = registry_binary_step(database, statement, error, error_size);
+    } else {
+        snprintf(error, error_size, "%s", sqlite3_errmsg(database));
+    }
+    if (statement) sqlite3_finalize(statement);
+    return close_registry_readwrite(database, ok, error, error_size) && ok;
+}
+
+static bool update_frontend_list_any_registry(const char *service_id,
+                                              const char *frontend_url,
+                                              const char *list_name,
+                                              char *message,
+                                              size_t message_size) {
+    bool found = false;
+    char error[512] = "";
+    if (!frontend_exists_in_registry_at(g_registry_database_path,
+                                        service_id,
+                                        frontend_url,
+                                        &found,
+                                        error,
+                                        sizeof(error))) {
+        snprintf(message, message_size, "Could not read user registry: %s", error);
+        return false;
+    }
+
+    if (!found && g_system_registry_database_path[0] && registry_storage_exists_at(g_system_registry_database_path)) {
+        error[0] = '\0';
+        if (!frontend_exists_in_registry_at(g_system_registry_database_path,
+                                            service_id,
+                                            frontend_url,
+                                            &found,
+                                            error,
+                                            sizeof(error))) {
+            snprintf(message, message_size, "Could not read system registry: %s", error);
+            return false;
+        }
+    }
+
+    if (found) {
+        if (update_frontend_layout_in_user_registry(frontend_url, list_name, error, sizeof(error))) {
+            snprintf(message, message_size, "Updated app list.");
+            return true;
+        }
+        snprintf(message, message_size, "Could not update app layout: %s", error);
+        return false;
+    }
+
+    snprintf(message, message_size, "Frontend was not found.");
+    return false;
+}
+
 static bool clear_frontends_in_registry_at(const char *database_path, const char *service_id, char *error, size_t error_size) {
     sqlite3 *database = open_registry_readwrite_at(database_path, error, error_size);
     if (!database) return false;
     if (!ensure_registry_schema(database, error, error_size)) {
-        sqlite3_close(database);
+        close_registry_readwrite_at(database, database_path, false, error, error_size);
         return false;
     }
 
@@ -2484,32 +3839,25 @@ static bool clear_frontends_in_registry_at(const char *database_path, const char
     } else {
         sqlite3_exec(database, "ROLLBACK;", NULL, NULL, NULL);
     }
-    sqlite3_close(database);
-    return ok;
+    return close_registry_readwrite_at(database, database_path, ok, error, error_size) && ok;
 }
 
 static void clear_frontends_in_system_registry_as_root(const char *service_id, const char *sudo_password) {
     char quoted_system_root[PATH_MAX + 8];
     char quoted_service_id[512];
+    char outerctl_path[PATH_MAX];
+    char quoted_outerctl[PATH_MAX + 8];
+    default_user_outerctl_path(outerctl_path, sizeof(outerctl_path));
+    shell_quote(outerctl_path, quoted_outerctl, sizeof(quoted_outerctl));
     shell_quote(kSystemOuterWebappsRoot, quoted_system_root, sizeof(quoted_system_root));
     shell_quote(service_id, quoted_service_id, sizeof(quoted_service_id));
 
     char command[8192];
     snprintf(command,
              sizeof(command),
-             "REGISTRY_ROOT=%s SERVICE_ID=%s python3 - <<'__HOMESCREEN_CLEAR_FRONTENDS__'\n"
-             "import os, sqlite3\n"
-             "database_path = os.path.join(os.environ['REGISTRY_ROOT'], 'registry.sqlite3')\n"
-             "if os.path.exists(database_path):\n"
-             "    database = sqlite3.connect(database_path)\n"
-             "    with database:\n"
-             "        try:\n"
-             "            database.execute('DELETE FROM frontends WHERE service_id = ?', (os.environ['SERVICE_ID'],))\n"
-             "        except sqlite3.OperationalError:\n"
-             "            pass\n"
-             "    database.close()\n"
-             "__HOMESCREEN_CLEAR_FRONTENDS__\n",
+             "OUTERWEBAPPS_HOME=%s %s app clear --backend %s >/dev/null 2>&1 || true\n",
              quoted_system_root,
+             quoted_outerctl,
              quoted_service_id);
 
     char output[1024] = "";
@@ -2534,28 +3882,48 @@ static void send_control_response(int fd, const char *query, const char *body) {
     char sudo_password[PATH_MAX] = "";
     if (!query_value_any(query, body, "serviceID", service_id, sizeof(service_id)) ||
         !query_value_any(query, body, "operation", operation, sizeof(operation))) {
-        send_action_json(fd, 400, false, "Missing serviceID or operation.");
+        send_action_response(fd, 400, false, "Missing serviceID or operation.");
         return;
     }
     query_value_any(query, body, "sudoPassword", sudo_password, sizeof(sudo_password));
     log_event("Control request operation=%s serviceID=%s.", operation, service_id);
 
+    if (strcmp(operation, "setFrontendList") == 0) {
+        char frontend_url[PATH_MAX] = "";
+        char list_name[PATH_MAX] = "";
+        if (!query_value_any(query, body, "frontendURL", frontend_url, sizeof(frontend_url))) {
+            send_action_response(fd, 400, false, "Missing frontend URL.");
+            return;
+        }
+        query_value_any(query, body, "list", list_name, sizeof(list_name));
+        char message[1024] = "";
+        bool ok = update_frontend_list_any_registry(service_id, frontend_url, list_name, message, sizeof(message));
+        log_event("%s frontend list update for %s url=%s list=%s: %s",
+                  ok ? "Completed" : "Failed",
+                  service_id,
+                  frontend_url,
+                  list_name,
+                  message);
+        send_action_response(fd, ok ? 200 : 500, ok, message);
+        return;
+    }
+
     if (strcmp(service_id, kMigrationServiceID) == 0) {
         if (strcmp(operation, "migrateRoot") != 0 && strcmp(operation, "start") != 0) {
-            send_action_json(fd, 400, false, "Unsupported migration operation.");
+            send_action_response(fd, 400, false, "Unsupported migration operation.");
             return;
         }
         char message[4096] = "";
         bool needs_password = false;
         bool ok = run_root_outerwebapps_migration(sudo_password, &needs_password, message, sizeof(message));
         log_event("%s root outerwebapps migration: %s", ok ? "Completed" : "Failed", message);
-        send_action_json_ex(fd, ok ? 200 : (needs_password ? 401 : 500), ok, message, needs_password);
+        send_action_response_ex(fd, ok ? 200 : (needs_password ? 401 : 500), ok, message, needs_password);
         return;
     }
 
     if (is_home_screen_service_id(service_id)) {
         log_event("Rejected control request for Home Screen itself: operation=%s.", operation);
-        send_action_json(fd, 400, false, "Home Screen cannot stop, start, or uninstall itself.");
+        send_action_response(fd, 400, false, "Home Screen cannot stop, start, or uninstall itself.");
         return;
     }
 
@@ -2564,7 +3932,7 @@ static void send_control_response(int fd, const char *query, const char *body) {
         strcmp(operation, "runUser") == 0 || strcmp(operation, "installUser") == 0) {
         const BundledAppDefinition *app = bundled_app_for_service_id(service_id);
         if (!app) {
-            send_action_json(fd, 404, false, "This app cannot be installed by Home Screen.");
+            send_action_response(fd, 404, false, "This app cannot be installed by Home Screen.");
             return;
         }
         char message[4096] = "";
@@ -2578,7 +3946,7 @@ static void send_control_response(int fd, const char *query, const char *body) {
                 bool removed = uninstall_backend(service_id, sudo_password, &needs_password, message, sizeof(message));
                 if (!removed) {
                     log_event("Failed to uninstall existing root install before reinstalling %s as user: %s", service_id, message);
-                    send_action_json_ex(fd, needs_password ? 401 : 500, false, message, needs_password);
+                    send_action_response_ex(fd, needs_password ? 401 : 500, false, message, needs_password);
                     return;
                 }
             }
@@ -2590,7 +3958,7 @@ static void send_control_response(int fd, const char *query, const char *body) {
                 bool removed = uninstall_backend(service_id, sudo_password, &needs_password, message, sizeof(message));
                 if (!removed) {
                     log_event("Failed to uninstall existing root launchd install before reinstalling %s as user: %s", service_id, message);
-                    send_action_json_ex(fd, needs_password ? 401 : 500, false, message, needs_password);
+                    send_action_response_ex(fd, needs_password ? 401 : 500, false, message, needs_password);
                     return;
                 }
             }
@@ -2602,7 +3970,7 @@ static void send_control_response(int fd, const char *query, const char *body) {
                   app->service_id,
                   scope,
                   message);
-        send_action_json_ex(fd, ok ? 200 : (needs_password ? 401 : 500), ok, message, needs_password);
+        send_action_response_ex(fd, ok ? 200 : (needs_password ? 401 : 500), ok, message, needs_password);
         return;
     }
 
@@ -2611,7 +3979,7 @@ static void send_control_response(int fd, const char *query, const char *body) {
         bool needs_password = false;
         bool ok = uninstall_backend(service_id, sudo_password, &needs_password, message, sizeof(message));
         log_event("%s backend %s: %s", ok ? "Uninstalled" : "Failed to uninstall", service_id, message);
-        send_action_json_ex(fd, ok ? 200 : (needs_password ? 401 : 500), ok, message, needs_password);
+        send_action_response_ex(fd, ok ? 200 : (needs_password ? 401 : 500), ok, message, needs_password);
         return;
     }
 
@@ -2639,7 +4007,7 @@ static void send_control_response(int fd, const char *query, const char *body) {
                   operation,
                   service_id,
                   message);
-        send_action_json_ex(fd, ok ? 200 : (needs_password ? 401 : 500), ok, message, needs_password);
+        send_action_response_ex(fd, ok ? 200 : (needs_password ? 401 : 500), ok, message, needs_password);
         return;
     }
 #endif
@@ -2648,7 +4016,7 @@ static void send_control_response(int fd, const char *query, const char *body) {
     char scope[32] = "user";
     bool found = lookup_systemd_backend_any(service_id, unit_name, sizeof(unit_name), scope, sizeof(scope));
     if (!found) {
-        send_action_json(fd, 404, false, "This backend does not have a registered systemd unit.");
+        send_action_response(fd, 404, false, "This backend does not have a registered systemd unit.");
         return;
     }
 
@@ -2664,7 +4032,7 @@ static void send_control_response(int fd, const char *query, const char *body) {
               service_id,
               scope,
               message);
-    send_action_json_ex(fd, ok ? 200 : (needs_password ? 401 : 500), ok, message, needs_password);
+    send_action_response_ex(fd, ok ? 200 : (needs_password ? 401 : 500), ok, message, needs_password);
 }
 
 static bool mkdir_p(const char *path) {
@@ -3078,9 +4446,10 @@ static bool run_root_outerwebapps_migration(const char *sudo_password, bool *nee
             "os.makedirs(os.path.dirname(new_db), exist_ok=True)\n"
             "db = sqlite3.connect(new_db)\n"
             "db.executescript('''\n"
-            "CREATE TABLE IF NOT EXISTS backends (service_id TEXT PRIMARY KEY, display_name TEXT NOT NULL DEFAULT '', icon TEXT, service_unit TEXT);\n"
-            "CREATE TABLE IF NOT EXISTS frontends (url TEXT PRIMARY KEY, service_id TEXT, name TEXT NOT NULL, port INTEGER NOT NULL DEFAULT 0, socket_path TEXT NOT NULL DEFAULT '', icon TEXT, is_home_screen INTEGER NOT NULL DEFAULT 0, list TEXT);\n"
+            "CREATE TABLE IF NOT EXISTS backends (service_id TEXT PRIMARY KEY, display_name TEXT NOT NULL DEFAULT '', icon TEXT, icon_path TEXT, service_unit TEXT);\n"
+            "CREATE TABLE IF NOT EXISTS frontends (url TEXT PRIMARY KEY, service_id TEXT, display_name TEXT NOT NULL DEFAULT '', port INTEGER NOT NULL DEFAULT 0, socket_path TEXT NOT NULL DEFAULT '', icon TEXT, icon_path TEXT, list TEXT);\n"
             "CREATE INDEX IF NOT EXISTS frontends_service_id_idx ON frontends(service_id);\n"
+            "CREATE TABLE IF NOT EXISTS frontend_layouts (url TEXT PRIMARY KEY, list TEXT NOT NULL DEFAULT '');\n"
             "CREATE TABLE IF NOT EXISTS log_files (path TEXT PRIMARY KEY, service_id TEXT NOT NULL);\n"
             "CREATE INDEX IF NOT EXISTS log_files_service_id_idx ON log_files(service_id);\n"
             "CREATE TABLE IF NOT EXISTS systemd_backends (service_id TEXT PRIMARY KEY, unit_name TEXT NOT NULL, scope TEXT NOT NULL DEFAULT 'user');\n"
@@ -3105,11 +4474,18 @@ static bool run_root_outerwebapps_migration(const char *sudo_password, bool *nee
             "    old = open_old_registry(old_db)\n"
             "    try:\n"
             "        for row in old_rows(old, 'backends'):\n"
-            "            db.execute('INSERT OR REPLACE INTO backends(service_id, display_name, icon, service_unit) VALUES (?, ?, ?, ?)',\n"
-            "                       (row['service_id'], row['display_name'] if 'display_name' in row.keys() and row['display_name'] is not None else '', row['icon'] if 'icon' in row.keys() else None, row['service_unit'] if 'service_unit' in row.keys() else None))\n"
+            "            icon = row['icon'] if 'icon' in row.keys() and row['icon'] is not None else None\n"
+            "            icon_path = icon if icon and not str(icon).startswith('data:') else None\n"
+            "            db.execute('INSERT OR REPLACE INTO backends(service_id, display_name, icon, icon_path, service_unit) VALUES (?, ?, ?, ?, ?)',\n"
+            "                       (row['service_id'], row['display_name'] if 'display_name' in row.keys() and row['display_name'] is not None else '', icon, icon_path, row['service_unit'] if 'service_unit' in row.keys() else None))\n"
             "        for row in old_rows(old, 'frontends'):\n"
-            "            db.execute('INSERT OR REPLACE INTO frontends(url, service_id, name, port, socket_path, icon, is_home_screen, list) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',\n"
-            "                       (row['url'], row['service_id'] if 'service_id' in row.keys() else None, row['name'] if 'name' in row.keys() and row['name'] is not None else '', row['port'] if 'port' in row.keys() and row['port'] is not None else 0, row['socket_path'] if 'socket_path' in row.keys() and row['socket_path'] is not None else '', row['icon'] if 'icon' in row.keys() else None, row['is_home_screen'] if 'is_home_screen' in row.keys() and row['is_home_screen'] is not None else 0, row['list'] if 'list' in row.keys() else None))\n"
+            "            icon = row['icon'] if 'icon' in row.keys() and row['icon'] is not None else None\n"
+            "            icon_path = icon if icon and not str(icon).startswith('data:') else None\n"
+            "            display_name = row['display_name'] if 'display_name' in row.keys() and row['display_name'] is not None else (row['name'] if 'name' in row.keys() and row['name'] is not None else '')\n"
+            "            db.execute('INSERT OR REPLACE INTO frontends(url, service_id, display_name, port, socket_path, icon, icon_path, list) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',\n"
+            "                       (row['url'], row['service_id'] if 'service_id' in row.keys() else None, display_name, row['port'] if 'port' in row.keys() and row['port'] is not None else 0, row['socket_path'] if 'socket_path' in row.keys() and row['socket_path'] is not None else '', icon, icon_path, row['list'] if 'list' in row.keys() else None))\n"
+            "            db.execute('INSERT OR REPLACE INTO frontend_layouts(url, list) VALUES (?, ?)',\n"
+            "                       (row['url'], row['list'] if 'list' in row.keys() and row['list'] is not None else ''))\n"
             "        for row in old_rows(old, 'log_files'):\n"
             "            db.execute('INSERT OR REPLACE INTO log_files(path, service_id) VALUES (?, ?)', (row['path'], row['service_id']))\n"
             "        for row in old_rows(old, 'systemd_backends'):\n"
@@ -3254,19 +4630,13 @@ static int compare_file_picker_entries(const void *lhs, const void *rhs) {
     return strcasecmp(a->name, b->name);
 }
 
-static bool append_file_picker_entry_json(StringBuilder *builder, const FilePickerEntry *entry) {
-    char number[64];
-    if (!sb_append(builder, "{\"name\":")) return false;
-    if (!sb_append_json_string(builder, entry->name)) return false;
-    if (!sb_append(builder, ",\"path\":")) return false;
-    if (!sb_append_json_string(builder, entry->path)) return false;
-    if (!sb_append(builder, ",\"isDirectory\":")) return false;
-    if (!sb_append(builder, entry->is_directory ? "true" : "false")) return false;
-    snprintf(number, sizeof(number), ",\"size\":%llu", (unsigned long long)entry->size);
-    if (!sb_append(builder, number)) return false;
-    snprintf(number, sizeof(number), ",\"modified\":%.3f", entry->modified);
-    if (!sb_append(builder, number)) return false;
-    return sb_append(builder, "}");
+static bool build_file_picker_entry_payload(const FilePickerEntry *entry, StringBuilder *payload) {
+    if (!binary_append_zero(payload, 40)) return false;
+    return binary_append_string_ref_at(payload, 0, entry->name) &&
+           binary_append_string_ref_at(payload, 8, entry->path) &&
+           binary_write_u32_at(payload, 16, entry->is_directory ? FILE_PICKER_FLAG_IS_DIRECTORY : 0) &&
+           binary_write_u64_at(payload, 20, entry->size) &&
+           binary_write_f64_at(payload, 28, entry->modified);
 }
 
 static void send_file_picker_response(int fd, const char *query) {
@@ -3362,26 +4732,34 @@ static void send_file_picker_response(int fd, const char *query) {
     char parent[PATH_MAX];
     parent_path_for(path, parent, sizeof(parent));
 
-    StringBuilder builder = {0};
-    bool ok = sb_append(&builder, "{\"path\":") &&
-              sb_append_json_string(&builder, path) &&
-              sb_append(&builder, ",\"parent\":") &&
-              sb_append_json_string(&builder, parent) &&
-              sb_append(&builder, ",\"entries\":[");
+    BinaryPayloadList entry_payloads = {0};
+    bool ok = true;
     for (size_t i = 0; ok && i < count; i++) {
-        if (i > 0) ok = sb_append(&builder, ",");
-        if (ok) ok = append_file_picker_entry_json(&builder, &entries[i]);
+        StringBuilder payload = {0};
+        ok = build_file_picker_entry_payload(&entries[i], &payload) &&
+             binary_payload_list_append(&entry_payloads, &payload);
+        if (!ok) free(payload.data);
     }
-    ok = ok && sb_append(&builder, "]}");
     free(entries);
 
+    StringBuilder builder = {0};
+    size_t fixed_size = 20 + entry_payloads.count * 8;
+    ok = ok && binary_append_zero(&builder, fixed_size) &&
+         binary_write_u32_at(&builder, 16, (uint32_t)entry_payloads.count) &&
+         binary_append_string_ref_at(&builder, 0, path) &&
+         binary_append_string_ref_at(&builder, 8, parent);
+    for (size_t i = 0; ok && i < entry_payloads.count; i++) {
+        ok = binary_append_child_ref_at(&builder, 20 + i * 8, &entry_payloads.items[i]);
+    }
     if (!ok) {
         free(builder.data);
+        binary_payload_list_free(&entry_payloads);
         send_text_response(fd, 500, "out of memory\n");
         return;
     }
-    send_response(fd, 200, "OK", "application/json; charset=utf-8", builder.data, builder.length);
+    send_binary_response(fd, 200, &builder);
     free(builder.data);
+    binary_payload_list_free(&entry_payloads);
 }
 
 static bool valid_port_text(const char *value) {
@@ -3695,7 +5073,7 @@ static bool make_jupyter_script(const char *service_id,
         "                    add_args = [\"app\", \"add\", \"--backend\", BACKEND_ID, \"--port\", port, \"--name\", DISPLAY_NAME, \"--url\", app_url]\n"
         "                add_args.extend([\"--list\", \"Jupyter\"])\n"
         "                if icon_path:\n"
-        "                    add_args.extend([\"--icon-file\", icon_path])\n"
+        "                    add_args.extend([\"--icon-path\", icon_path])\n"
         "                run_outerctl(*add_args)\n"
         "                announced = True\n"
         "        time.sleep(0.25 if not announced and probe_attempts < 20 else 1.0)\n"
@@ -3726,7 +5104,7 @@ static bool register_created_backend(const char *service_id,
     sqlite3 *database = open_registry_readwrite(error, error_size);
     if (!database) return false;
     if (!ensure_registry_schema(database, error, error_size)) {
-        sqlite3_close(database);
+        close_registry_readwrite(database, false, error, error_size);
         return false;
     }
 
@@ -3748,7 +5126,7 @@ static bool register_created_backend(const char *service_id,
     }
     if (ok) {
         const char *sql =
-            "INSERT INTO backends(service_id, display_name, icon, service_unit) VALUES(?, ?, NULL, ?);";
+            "INSERT INTO backends(service_id, display_name, icon_path, service_unit) VALUES(?, ?, NULL, ?);";
         ok = sqlite3_prepare_v2(database, sql, -1, &statement, NULL) == SQLITE_OK;
         if (ok) {
             sqlite3_bind_text(statement, 1, service_id, -1, SQLITE_TRANSIENT);
@@ -3807,8 +5185,7 @@ static bool register_created_backend(const char *service_id,
     } else {
         sqlite3_exec(database, "ROLLBACK;", NULL, NULL, NULL);
     }
-    sqlite3_close(database);
-    return ok;
+    return close_registry_readwrite(database, ok, error, error_size) && ok;
 }
 
 static bool bind_and_step(sqlite3 *database, const char *sql, const char *a, const char *b, const char *c, const char *d,
@@ -3838,16 +5215,16 @@ static bool upsert_systemd_backend_registry(const char *service_id,
     sqlite3 *database = open_registry_readwrite(error, error_size);
     if (!database) return false;
     if (!ensure_registry_schema(database, error, error_size)) {
-        sqlite3_close(database);
+        close_registry_readwrite(database, false, error, error_size);
         return false;
     }
 
-    char *icon_value = registry_icon_value(icon_path);
+    char *icon_value = registry_icon_path_value(icon_path);
     bool ok = sqlite_exec_ok(database, "BEGIN IMMEDIATE TRANSACTION;", error, error_size);
     if (ok) {
         ok = bind_and_step(database,
-                           "INSERT INTO backends(service_id, display_name, icon, service_unit) VALUES(?, ?, ?, ?) "
-                           "ON CONFLICT(service_id) DO UPDATE SET display_name=excluded.display_name, icon=excluded.icon, service_unit=excluded.service_unit;",
+                           "INSERT INTO backends(service_id, display_name, icon_path, service_unit) VALUES(?, ?, ?, ?) "
+                           "ON CONFLICT(service_id) DO UPDATE SET display_name=excluded.display_name, icon_path=excluded.icon_path, service_unit=excluded.service_unit;",
                            service_id, display_name, icon_value, unit_name, error, error_size);
         if (ok) {
             sqlite3_stmt *statement = NULL;
@@ -3875,7 +5252,7 @@ static bool upsert_systemd_backend_registry(const char *service_id,
     if (ok && socket_path && socket_path[0]) {
         sqlite3_stmt *statement = NULL;
         const char *sql =
-            "INSERT INTO frontends(url, service_id, name, port, socket_path, icon) VALUES(?, ?, ?, 0, ?, ?);";
+            "INSERT INTO frontends(url, service_id, display_name, port, socket_path, icon_path) VALUES(?, ?, ?, 0, ?, ?);";
         ok = sqlite3_prepare_v2(database, sql, -1, &statement, NULL) == SQLITE_OK;
         if (ok) {
             sqlite3_bind_text(statement, 1, socket_path, -1, SQLITE_TRANSIENT);
@@ -3906,9 +5283,8 @@ static bool upsert_systemd_backend_registry(const char *service_id,
     } else {
         sqlite3_exec(database, "ROLLBACK;", NULL, NULL, NULL);
     }
-    sqlite3_close(database);
     free(icon_value);
-    return ok;
+    return close_registry_readwrite(database, ok, error, error_size) && ok;
 }
 #endif
 
@@ -3925,16 +5301,16 @@ static bool upsert_launchd_backend_registry_at(const char *database_path,
     sqlite3 *database = open_registry_readwrite_at(database_path, error, error_size);
     if (!database) return false;
     if (!ensure_registry_schema(database, error, error_size)) {
-        sqlite3_close(database);
+        close_registry_readwrite_at(database, database_path, false, error, error_size);
         return false;
     }
 
-    char *icon_value = registry_icon_value(icon_path);
+    char *icon_value = registry_icon_path_value(icon_path);
     bool ok = sqlite_exec_ok(database, "BEGIN IMMEDIATE TRANSACTION;", error, error_size);
     if (ok) {
         ok = bind_and_step(database,
-                           "INSERT INTO backends(service_id, display_name, icon, service_unit) VALUES(?, ?, ?, NULL) "
-                           "ON CONFLICT(service_id) DO UPDATE SET display_name=excluded.display_name, icon=excluded.icon, service_unit=NULL;",
+                           "INSERT INTO backends(service_id, display_name, icon_path, service_unit) VALUES(?, ?, ?, NULL) "
+                           "ON CONFLICT(service_id) DO UPDATE SET display_name=excluded.display_name, icon_path=excluded.icon_path, service_unit=NULL;",
                            service_id, display_name, icon_value, NULL, error, error_size);
     }
     if (ok) {
@@ -3952,7 +5328,7 @@ static bool upsert_launchd_backend_registry_at(const char *database_path,
     if (ok && socket_path && socket_path[0]) {
         sqlite3_stmt *statement = NULL;
         const char *sql =
-            "INSERT INTO frontends(url, service_id, name, port, socket_path, icon) VALUES(?, ?, ?, 0, ?, ?);";
+            "INSERT INTO frontends(url, service_id, display_name, port, socket_path, icon_path) VALUES(?, ?, ?, 0, ?, ?);";
         ok = sqlite3_prepare_v2(database, sql, -1, &statement, NULL) == SQLITE_OK;
         if (ok) {
             sqlite3_bind_text(statement, 1, socket_path, -1, SQLITE_TRANSIENT);
@@ -3983,9 +5359,8 @@ static bool upsert_launchd_backend_registry_at(const char *database_path,
     } else {
         sqlite3_exec(database, "ROLLBACK;", NULL, NULL, NULL);
     }
-    sqlite3_close(database);
     free(icon_value);
-    return ok;
+    return close_registry_readwrite_at(database, database_path, ok, error, error_size) && ok;
 }
 #endif
 
@@ -3993,7 +5368,7 @@ static bool unregister_backend_records(const char *service_id, char *error, size
     sqlite3 *database = open_registry_readwrite(error, error_size);
     if (!database) return false;
     if (!ensure_registry_schema(database, error, error_size)) {
-        sqlite3_close(database);
+        close_registry_readwrite(database, false, error, error_size);
         return false;
     }
 
@@ -4011,8 +5386,7 @@ static bool unregister_backend_records(const char *service_id, char *error, size
     } else {
         sqlite3_exec(database, "ROLLBACK;", NULL, NULL, NULL);
     }
-    sqlite3_close(database);
-    return ok;
+    return close_registry_readwrite(database, ok, error, error_size) && ok;
 }
 
 static bool install_bundled_app_macos(const BundledAppDefinition *app,
@@ -4378,78 +5752,13 @@ static bool install_bundled_app(const BundledAppDefinition *app, const char *sco
                 "chmod 0644 %s\n"
                 "touch %s\n"
                 "chmod 0644 %s\n"
-                "REGISTRY_ROOT=%s SERVICE_ID=%s DISPLAY_NAME=%s UNIT_NAME=%s LOG_PATH=%s ICON_PATH=%s SOCKET_PATH=%s python3 - <<'__BACKENDS_REGISTRY__'\n"
-                "import base64, os, sqlite3\n"
-                "root = os.environ['REGISTRY_ROOT']\n"
-                "service_id = os.environ['SERVICE_ID']\n"
-                "display_name = os.environ['DISPLAY_NAME']\n"
-                "unit_name = os.environ['UNIT_NAME']\n"
-                "log_path = os.environ['LOG_PATH']\n"
-                "icon_path = os.environ.get('ICON_PATH') or None\n"
-                "socket_path = os.environ.get('SOCKET_PATH') or ''\n"
-                "def registry_icon_value(path):\n"
-                "    if not path:\n"
-                "        return None\n"
-                "    if path.startswith('data:'):\n"
-                "        return path\n"
-                "    try:\n"
-                "        with open(path, 'rb') as file:\n"
-                "            data = file.read(1024 * 1024 + 1)\n"
-                "    except OSError:\n"
-                "        return path\n"
-                "    if not data or len(data) > 1024 * 1024:\n"
-                "        return path\n"
-                "    return 'data:image/png;base64,' + base64.b64encode(data).decode('ascii')\n"
-                "icon_value = registry_icon_value(icon_path)\n"
-                "os.makedirs(root, exist_ok=True)\n"
-                "database_path = os.path.join(root, 'registry.sqlite3')\n"
-                "database = sqlite3.connect(database_path)\n"
-                "database.executescript('''\n"
-                "CREATE TABLE IF NOT EXISTS backends (\n"
-                "service_id TEXT PRIMARY KEY,\n"
-                "display_name TEXT NOT NULL DEFAULT '',\n"
-                "icon TEXT,\n"
-                "service_unit TEXT\n"
-                ");\n"
-                "CREATE TABLE IF NOT EXISTS frontends (\n"
-                "url TEXT PRIMARY KEY,\n"
-                "service_id TEXT,\n"
-                "name TEXT NOT NULL,\n"
-                "port INTEGER NOT NULL DEFAULT 0,\n"
-                "socket_path TEXT NOT NULL DEFAULT '',\n"
-                "icon TEXT,\n"
-                "is_home_screen INTEGER NOT NULL DEFAULT 0,\n"
-                "list TEXT\n"
-                ");\n"
-                "CREATE INDEX IF NOT EXISTS frontends_service_id_idx ON frontends(service_id);\n"
-                "CREATE TABLE IF NOT EXISTS log_files (\n"
-                "path TEXT PRIMARY KEY,\n"
-                "service_id TEXT NOT NULL\n"
-                ");\n"
-                "CREATE INDEX IF NOT EXISTS log_files_service_id_idx ON log_files(service_id);\n"
-                "CREATE TABLE IF NOT EXISTS systemd_backends (\n"
-                "service_id TEXT PRIMARY KEY,\n"
-                "unit_name TEXT NOT NULL,\n"
-                "scope TEXT NOT NULL DEFAULT 'user'\n"
-                ");\n"
-                "''')\n"
-                "columns = {row[1] for row in database.execute('PRAGMA table_info(frontends)')}\n"
-                "if 'is_home_screen' not in columns:\n"
-                "    database.execute('ALTER TABLE frontends ADD COLUMN is_home_screen INTEGER NOT NULL DEFAULT 0')\n"
-                "if 'list' not in columns:\n"
-                "    database.execute('ALTER TABLE frontends ADD COLUMN list TEXT')\n"
-                "with database:\n"
-                "    database.execute('INSERT INTO backends(service_id, display_name, icon, service_unit) VALUES(?, ?, ?, ?) ON CONFLICT(service_id) DO UPDATE SET display_name=excluded.display_name, icon=excluded.icon, service_unit=excluded.service_unit', (service_id, display_name, icon_value, unit_name))\n"
-                "    database.execute('INSERT INTO systemd_backends(service_id, unit_name, scope) VALUES(?, ?, ?) ON CONFLICT(service_id) DO UPDATE SET unit_name=excluded.unit_name, scope=excluded.scope', (service_id, unit_name, 'system'))\n"
-                "    database.execute('DELETE FROM frontends WHERE service_id = ?', (service_id,))\n"
-                "    if socket_path:\n"
-                "        database.execute('INSERT INTO frontends(url, service_id, name, port, socket_path, icon) VALUES(?, ?, ?, 0, ?, ?)', (socket_path, service_id, display_name, socket_path, icon_value))\n"
-                "    database.execute('DELETE FROM log_files WHERE service_id = ?', (service_id,))\n"
-                "    database.execute('INSERT INTO log_files(path, service_id) VALUES(?, ?)', (log_path, service_id))\n"
-                "database.close()\n"
-                "os.chmod(database_path, 0o644)\n"
-                "__BACKENDS_REGISTRY__\n"
-                "chmod 0644 %s/registry.sqlite3 >/dev/null 2>&1 || true\n"
+                "OUTERWEBAPPS_HOME=%s %s backend upsert --backend %s --name %s --icon-path %s\n"
+                "OUTERWEBAPPS_HOME=%s %s systemd set --backend %s --unit %s\n"
+                "OUTERWEBAPPS_HOME=%s %s app clear --backend %s\n"
+                "if [ -n %s ]; then OUTERWEBAPPS_HOME=%s %s app add --backend %s --socket-path %s --name %s --icon-path %s; fi\n"
+                "OUTERWEBAPPS_HOME=%s %s log clear --backend %s\n"
+                "OUTERWEBAPPS_HOME=%s %s log add --backend %s --path %s\n"
+                "chmod 0666 %s/registry.orwa.lock 2>/dev/null || true\n"
                 "systemctl --system daemon-reload\n",
                 quoted_version_path,
                 app->version,
@@ -4463,12 +5772,31 @@ static bool install_bundled_app(const BundledAppDefinition *app, const char *sco
                 quoted_log_path,
                 quoted_log_path,
                 quoted_system_outerwebapps_root,
+                quoted_wrapper_path,
                 quoted_service_id,
                 quoted_display_name,
-                quoted_unit,
-                quoted_log_path,
                 quoted_target_icon_for_registry,
+                quoted_system_outerwebapps_root,
+                quoted_wrapper_path,
+                quoted_service_id,
+                quoted_unit,
+                quoted_system_outerwebapps_root,
+                quoted_wrapper_path,
+                quoted_service_id,
                 quoted_actual_socket_path,
+                quoted_system_outerwebapps_root,
+                quoted_wrapper_path,
+                quoted_service_id,
+                quoted_actual_socket_path,
+                quoted_display_name,
+                quoted_target_icon_for_registry,
+                quoted_system_outerwebapps_root,
+                quoted_wrapper_path,
+                quoted_service_id,
+                quoted_system_outerwebapps_root,
+                quoted_wrapper_path,
+                quoted_service_id,
+                quoted_log_path,
                 quoted_system_outerwebapps_root);
         if (quoted_socket_unit[0] && quoted_socket_unit_path[0]) {
             fprintf(script,
@@ -5024,59 +6352,13 @@ static bool install_bundled_app_macos(const BundledAppDefinition *app,
                 "chmod 0644 %s\n"
                 "touch %s\n"
                 "chmod 0644 %s\n"
-                "REGISTRY_ROOT=%s SERVICE_ID=%s DISPLAY_NAME=%s PLIST_PATH=%s LOG_PATH=%s ICON_PATH=%s SOCKET_PATH=%s python3 - <<'__BACKENDS_REGISTRY__'\n"
-                "import base64, os, sqlite3\n"
-                "root = os.environ['REGISTRY_ROOT']\n"
-                "service_id = os.environ['SERVICE_ID']\n"
-                "display_name = os.environ['DISPLAY_NAME']\n"
-                "plist_path = os.environ['PLIST_PATH']\n"
-                "log_path = os.environ['LOG_PATH']\n"
-                "icon_path = os.environ.get('ICON_PATH') or None\n"
-                "socket_path = os.environ.get('SOCKET_PATH') or ''\n"
-                "def registry_icon_value(path):\n"
-                "    if not path:\n"
-                "        return None\n"
-                "    if path.startswith('data:'):\n"
-                "        return path\n"
-                "    try:\n"
-                "        with open(path, 'rb') as file:\n"
-                "            data = file.read(1024 * 1024 + 1)\n"
-                "    except OSError:\n"
-                "        return path\n"
-                "    if not data or len(data) > 1024 * 1024:\n"
-                "        return path\n"
-                "    return 'data:image/png;base64,' + base64.b64encode(data).decode('ascii')\n"
-                "icon_value = registry_icon_value(icon_path)\n"
-                "os.makedirs(root, exist_ok=True)\n"
-                "database_path = os.path.join(root, 'registry.sqlite3')\n"
-                "database = sqlite3.connect(database_path)\n"
-                "database.executescript('''\n"
-                "CREATE TABLE IF NOT EXISTS backends (service_id TEXT PRIMARY KEY, display_name TEXT NOT NULL DEFAULT '', icon TEXT, service_unit TEXT);\n"
-                "CREATE TABLE IF NOT EXISTS frontends (url TEXT PRIMARY KEY, service_id TEXT, name TEXT NOT NULL, port INTEGER NOT NULL DEFAULT 0, socket_path TEXT NOT NULL DEFAULT '', icon TEXT, is_home_screen INTEGER NOT NULL DEFAULT 0, list TEXT);\n"
-                "CREATE INDEX IF NOT EXISTS frontends_service_id_idx ON frontends(service_id);\n"
-                "CREATE TABLE IF NOT EXISTS log_files (path TEXT PRIMARY KEY, service_id TEXT NOT NULL);\n"
-                "CREATE INDEX IF NOT EXISTS log_files_service_id_idx ON log_files(service_id);\n"
-                "CREATE TABLE IF NOT EXISTS launchd_backends (service_id TEXT PRIMARY KEY, plist_path TEXT NOT NULL, owns_plist INTEGER NOT NULL DEFAULT 0);\n"
-                "CREATE TABLE IF NOT EXISTS systemd_backends (service_id TEXT PRIMARY KEY, unit_name TEXT NOT NULL, scope TEXT NOT NULL DEFAULT 'user');\n"
-                "''')\n"
-                "columns = {row[1] for row in database.execute('PRAGMA table_info(frontends)')}\n"
-                "if 'is_home_screen' not in columns:\n"
-                "    database.execute('ALTER TABLE frontends ADD COLUMN is_home_screen INTEGER NOT NULL DEFAULT 0')\n"
-                "if 'list' not in columns:\n"
-                "    database.execute('ALTER TABLE frontends ADD COLUMN list TEXT')\n"
-                "with database:\n"
-                "    database.execute('INSERT INTO backends(service_id, display_name, icon, service_unit) VALUES(?, ?, ?, NULL) ON CONFLICT(service_id) DO UPDATE SET display_name=excluded.display_name, icon=excluded.icon, service_unit=NULL', (service_id, display_name, icon_value))\n"
-                "    database.execute('INSERT INTO launchd_backends(service_id, plist_path, owns_plist) VALUES(?, ?, 1) ON CONFLICT(service_id) DO UPDATE SET plist_path=excluded.plist_path, owns_plist=excluded.owns_plist', (service_id, plist_path))\n"
-                "    database.execute('DELETE FROM systemd_backends WHERE service_id = ?', (service_id,))\n"
-                "    database.execute('DELETE FROM frontends WHERE service_id = ?', (service_id,))\n"
-                "    if socket_path:\n"
-                "        database.execute('INSERT INTO frontends(url, service_id, name, port, socket_path, icon) VALUES(?, ?, ?, 0, ?, ?)', (socket_path, service_id, display_name, socket_path, icon_value))\n"
-                "    database.execute('DELETE FROM log_files WHERE service_id = ?', (service_id,))\n"
-                "    database.execute('INSERT INTO log_files(path, service_id) VALUES(?, ?)', (log_path, service_id))\n"
-                "database.close()\n"
-                "os.chmod(database_path, 0o644)\n"
-                "__BACKENDS_REGISTRY__\n"
-                "chmod 0644 %s/registry.sqlite3 >/dev/null 2>&1 || true\n"
+                "OUTERWEBAPPS_HOME=%s %s backend upsert --backend %s --name %s --icon-path %s\n"
+                "OUTERWEBAPPS_HOME=%s %s launchd set --backend %s --plist %s --owns-plist true\n"
+                "OUTERWEBAPPS_HOME=%s %s app clear --backend %s\n"
+                "if [ -n %s ]; then OUTERWEBAPPS_HOME=%s %s app add --backend %s --socket-path %s --name %s --icon-path %s; fi\n"
+                "OUTERWEBAPPS_HOME=%s %s log clear --backend %s\n"
+                "OUTERWEBAPPS_HOME=%s %s log add --backend %s --path %s\n"
+                "chmod 0666 %s/registry.orwa.lock 2>/dev/null || true\n"
                 "launchctl bootstrap system %s\n"
                 "launchctl kickstart -k system/%s\n",
                 quoted_wrapper_path,
@@ -5088,12 +6370,31 @@ static bool install_bundled_app_macos(const BundledAppDefinition *app,
                 quoted_log_path,
                 quoted_log_path,
                 quoted_system_root,
+                quoted_wrapper_path,
                 quoted_service_id,
                 quoted_display_name,
-                quoted_plist_path,
-                quoted_log_path,
                 quoted_target_icon[0] ? quoted_target_icon : "''",
+                quoted_system_root,
+                quoted_wrapper_path,
+                quoted_service_id,
+                quoted_plist_path,
+                quoted_system_root,
+                quoted_wrapper_path,
+                quoted_service_id,
                 quoted_socket_path,
+                quoted_system_root,
+                quoted_wrapper_path,
+                quoted_service_id,
+                quoted_socket_path,
+                quoted_display_name,
+                quoted_target_icon[0] ? quoted_target_icon : "''",
+                quoted_system_root,
+                quoted_wrapper_path,
+                quoted_service_id,
+                quoted_system_root,
+                quoted_wrapper_path,
+                quoted_service_id,
+                quoted_log_path,
                 quoted_system_root,
                 quoted_plist_path,
                 app->service_id);
@@ -5264,12 +6565,16 @@ static bool uninstall_backend(const char *service_id, const char *sudo_password,
             char quoted_socket_path[PATH_MAX + 8] = "";
             char quoted_system_root[PATH_MAX + 8];
             char quoted_service_id[512];
+            char outerctl_path[PATH_MAX];
+            char quoted_outerctl_path[PATH_MAX + 8];
             shell_quote(plist_path, quoted_plist_path, sizeof(quoted_plist_path));
             if (install_root[0]) shell_quote(install_root, quoted_install_root, sizeof(quoted_install_root));
             shell_quote(log_path, quoted_log_path, sizeof(quoted_log_path));
             if (socket_path[0]) shell_quote(socket_path, quoted_socket_path, sizeof(quoted_socket_path));
             shell_quote(kSystemOuterWebappsRoot, quoted_system_root, sizeof(quoted_system_root));
             shell_quote(service_id, quoted_service_id, sizeof(quoted_service_id));
+            default_user_outerctl_path(outerctl_path, sizeof(outerctl_path));
+            shell_quote(outerctl_path, quoted_outerctl_path, sizeof(quoted_outerctl_path));
 
             char script_template[] = "/tmp/backends-root-uninstall-XXXXXX";
             int script_fd = mkstemp(script_template);
@@ -5288,26 +6593,24 @@ static bool uninstall_backend(const char *service_id, const char *sudo_password,
                     "set -eu\n"
                     "launchctl bootout system/%s >/dev/null 2>&1 || true\n"
                     "rm -f -- %s %s\n"
-                    "REGISTRY_ROOT=%s SERVICE_ID=%s python3 - <<'__BACKENDS_REGISTRY__'\n"
-                    "import os, sqlite3\n"
-                    "root = os.environ['REGISTRY_ROOT']\n"
-                    "service_id = os.environ['SERVICE_ID']\n"
-                    "database_path = os.path.join(root, 'registry.sqlite3')\n"
-                    "if os.path.exists(database_path):\n"
-                    "    database = sqlite3.connect(database_path)\n"
-                    "    with database:\n"
-                    "        for table in ('frontends', 'log_files', 'launchd_backends', 'systemd_backends', 'backends'):\n"
-                    "            try:\n"
-                    "                key = 'service_id'\n"
-                    "                database.execute(f'DELETE FROM {table} WHERE {key} = ?', (service_id,))\n"
-                    "            except sqlite3.OperationalError:\n"
-                    "                pass\n"
-                    "    database.close()\n"
-                    "__BACKENDS_REGISTRY__\n",
+                    "OUTERWEBAPPS_HOME=%s %s app clear --backend %s >/dev/null 2>&1 || true\n"
+                    "OUTERWEBAPPS_HOME=%s %s log clear --backend %s >/dev/null 2>&1 || true\n"
+                    "OUTERWEBAPPS_HOME=%s %s launchd clear --backend %s >/dev/null 2>&1 || true\n"
+                    "OUTERWEBAPPS_HOME=%s %s backend remove --backend %s >/dev/null 2>&1 || true\n",
                     service_id,
                     owns_plist && plist_path[0] ? quoted_plist_path : "''",
                     quoted_socket_path[0] ? quoted_socket_path : "''",
                     quoted_system_root,
+                    quoted_outerctl_path,
+                    quoted_service_id,
+                    quoted_system_root,
+                    quoted_outerctl_path,
+                    quoted_service_id,
+                    quoted_system_root,
+                    quoted_outerctl_path,
+                    quoted_service_id,
+                    quoted_system_root,
+                    quoted_outerctl_path,
                     quoted_service_id);
             if (quoted_install_root[0]) {
                 fprintf(script, "rm -rf -- %s\n", quoted_install_root);
@@ -5519,20 +6822,28 @@ static bool path_set_insert(PathSet *set, const char *path) {
     return true;
 }
 
-static bool append_python_suggestion(StringBuilder *builder, const char *path, bool *first, PathSet *seen) {
+static bool collect_python_suggestion(const char *path, PathSet *seen) {
     if (!path_is_executable_file(path)) return true;
     char canonical[PATH_MAX];
     const char *display_path = path;
     if (realpath(path, canonical)) {
         display_path = canonical;
     }
-    if (!path_set_insert(seen, display_path)) return true;
-    if (!*first && !sb_append(builder, ",")) return false;
-    *first = false;
-    return sb_append_json_string(builder, display_path);
+    path_set_insert(seen, display_path);
+    return true;
 }
 
-static bool append_python_env_suggestions(StringBuilder *builder, const char *base, bool *first, PathSet *seen) {
+static bool binary_build_string_array_from_paths(PathSet *paths, StringBuilder *out) {
+    size_t fixed_size = 4 + paths->count * 8;
+    if (!binary_append_zero(out, fixed_size)) return false;
+    if (!binary_write_u32_at(out, 0, (uint32_t)paths->count)) return false;
+    for (size_t i = 0; i < paths->count; i++) {
+        if (!binary_append_string_ref_at(out, 4 + i * 8, paths->paths[i])) return false;
+    }
+    return true;
+}
+
+static bool collect_python_env_suggestions(const char *base, PathSet *seen) {
     char envs_dir[PATH_MAX];
     append_path_component(envs_dir, sizeof(envs_dir), base, "envs");
     DIR *dir = opendir(envs_dir);
@@ -5543,13 +6854,13 @@ static bool append_python_env_suggestions(StringBuilder *builder, const char *ba
         if (entry->d_name[0] == '.') continue;
         char path[PATH_MAX];
         snprintf(path, sizeof(path), "%s/%s/bin/python", envs_dir, entry->d_name);
-        ok = append_python_suggestion(builder, path, first, seen);
+        ok = collect_python_suggestion(path, seen);
     }
     closedir(dir);
     return ok;
 }
 
-static bool append_pyenv_suggestions(StringBuilder *builder, bool *first, PathSet *seen) {
+static bool collect_pyenv_suggestions(PathSet *seen) {
     char versions_dir[PATH_MAX];
     snprintf(versions_dir, sizeof(versions_dir), "%s/.pyenv/versions", home_directory());
     DIR *dir = opendir(versions_dir);
@@ -5560,13 +6871,13 @@ static bool append_pyenv_suggestions(StringBuilder *builder, bool *first, PathSe
         if (entry->d_name[0] == '.') continue;
         char path[PATH_MAX];
         snprintf(path, sizeof(path), "%s/%s/bin/python", versions_dir, entry->d_name);
-        ok = append_python_suggestion(builder, path, first, seen);
+        ok = collect_python_suggestion(path, seen);
     }
     closedir(dir);
     return ok;
 }
 
-static bool append_path_python_suggestions(StringBuilder *builder, bool *first, PathSet *seen) {
+static bool collect_path_python_suggestions(PathSet *seen) {
     const char *path_env = getenv("PATH");
     if (!path_env || !path_env[0]) return true;
     char copy[8192];
@@ -5575,166 +6886,208 @@ static bool append_path_python_suggestions(StringBuilder *builder, bool *first, 
     for (char *dir = strtok(copy, ":"); ok && dir; dir = strtok(NULL, ":")) {
         char candidate[PATH_MAX];
         snprintf(candidate, sizeof(candidate), "%s/python3", dir);
-        ok = append_python_suggestion(builder, candidate, first, seen);
+        ok = collect_python_suggestion(candidate, seen);
         snprintf(candidate, sizeof(candidate), "%s/python", dir);
-        ok = ok && append_python_suggestion(builder, candidate, first, seen);
+        ok = ok && collect_python_suggestion(candidate, seen);
     }
     return ok;
 }
 
-static bool append_field_json(StringBuilder *builder,
-                              const char *key,
-                              const char *label,
-                              const char *default_value,
-                              const char *field_type,
-                              const char *placeholder,
-                              const char *suggestions_json,
-                              const char *choices_json) {
-    bool ok = sb_append(builder, "{\"key\":") &&
-              sb_append_json_string(builder, key) &&
-              sb_append(builder, ",\"label\":") &&
-              sb_append_json_string(builder, label) &&
-              sb_append(builder, ",\"defaultValue\":") &&
-              sb_append_json_string(builder, default_value) &&
-              sb_append(builder, ",\"fieldType\":") &&
-              sb_append_json_string(builder, field_type) &&
-              sb_append(builder, ",\"placeholder\":") &&
-              sb_append_json_string(builder, placeholder) &&
-              sb_append(builder, ",\"suggestions\":") &&
-              sb_append(builder, suggestions_json ? suggestions_json : "[]") &&
-              sb_append(builder, ",\"choices\":") &&
-              sb_append(builder, choices_json ? choices_json : "[]") &&
-              sb_append(builder, "}");
+typedef struct {
+    const char *title;
+    const char *value;
+} BinaryChoiceSpec;
+
+static bool build_choice_payload(const char *title, const char *value, StringBuilder *payload) {
+    if (!binary_append_zero(payload, 16)) return false;
+    return binary_append_string_ref_at(payload, 0, title) &&
+           binary_append_string_ref_at(payload, 8, value);
+}
+
+static bool build_choices_array(const BinaryChoiceSpec *choices, size_t choice_count, StringBuilder *out) {
+    BinaryPayloadList list = {0};
+    bool ok = true;
+    for (size_t i = 0; ok && i < choice_count; i++) {
+        StringBuilder payload = {0};
+        ok = build_choice_payload(choices[i].title, choices[i].value, &payload) &&
+             binary_payload_list_append(&list, &payload);
+        if (!ok) free(payload.data);
+    }
+    if (ok) ok = binary_build_payload_array(&list, out);
+    binary_payload_list_free(&list);
     return ok;
 }
 
-static bool append_recipe_json(StringBuilder *builder,
-                               const char *identifier,
-                               const char *display_name,
-                               const char *summary,
-                               bool *first_recipe,
-                               bool (*append_fields)(StringBuilder *builder, const char *python_suggestions_json),
-                               const char *python_suggestions_json) {
-    if (!*first_recipe && !sb_append(builder, ",")) return false;
-    *first_recipe = false;
-    bool ok = sb_append(builder, "{\"identifier\":") &&
-              sb_append_json_string(builder, identifier) &&
-              sb_append(builder, ",\"displayName\":") &&
-              sb_append_json_string(builder, display_name) &&
-              sb_append(builder, ",\"summary\":") &&
-              sb_append_json_string(builder, summary) &&
-              sb_append(builder, ",\"fields\":[");
-    ok = ok && append_fields(builder, python_suggestions_json);
-    return ok && sb_append(builder, "]}");
-}
-
-static bool append_command_recipe_fields(StringBuilder *builder, const char *python_suggestions_json) {
-    (void)python_suggestions_json;
-    bool ok = append_field_json(builder, "command", "Command", "", "text", "bundle exec jekyll serve --host 0.0.0.0", NULL, NULL);
-    ok = ok && sb_append(builder, ",") && append_field_json(builder, "workdir", "Working Dir", "~", "directory", "~", NULL, NULL);
-    ok = ok && sb_append(builder, ",") && append_field_json(builder, "scriptPath", "Script Path", "", "file", "~/dev/run-service.sh", NULL, NULL);
-    ok = ok && sb_append(builder, ",") && append_field_json(builder, "port", "Port", "", "text", "4000", NULL, NULL);
-    ok = ok && sb_append(builder, ",") && append_field_json(builder, "name", "Display Name", "", "text", "My Service", NULL, NULL);
-    ok = ok && sb_append(builder, ",") && append_field_json(builder, "identifier", "Identifier", "", "text", "my-service", NULL, NULL);
+static bool build_field_payload(const char *key,
+                                const char *label,
+                                const char *default_value,
+                                const char *field_type,
+                                const char *placeholder,
+                                PathSet *suggestions,
+                                const BinaryChoiceSpec *choices,
+                                size_t choice_count,
+                                StringBuilder *payload) {
+    StringBuilder suggestion_array = {0};
+    StringBuilder choice_array = {0};
+    bool ok = suggestions ? binary_build_string_array_from_paths(suggestions, &suggestion_array)
+                          : build_empty_array_payload(&suggestion_array);
+    ok = ok && build_choices_array(choices, choice_count, &choice_array);
+    ok = ok && binary_append_zero(payload, 56) &&
+         binary_append_string_ref_at(payload, 0, key) &&
+         binary_append_string_ref_at(payload, 8, label) &&
+         binary_append_string_ref_at(payload, 16, default_value) &&
+         binary_append_string_ref_at(payload, 24, field_type) &&
+         binary_append_string_ref_at(payload, 32, placeholder) &&
+         binary_append_child_ref_at(payload, 40, &suggestion_array) &&
+         binary_append_child_ref_at(payload, 48, &choice_array);
+    free(suggestion_array.data);
+    free(choice_array.data);
     return ok;
 }
 
-static bool append_blank_recipe_fields(StringBuilder *builder, const char *python_suggestions_json) {
-    (void)python_suggestions_json;
-    bool ok = append_field_json(builder, "workdir", "Working Dir", "~", "directory", "~", NULL, NULL);
-    ok = ok && sb_append(builder, ",") && append_field_json(builder, "scriptPath", "Script Path", "", "file", "~/dev/run-service.sh", NULL, NULL);
-    ok = ok && sb_append(builder, ",") && append_field_json(builder, "name", "Display Name", "", "text", "My Service", NULL, NULL);
-    ok = ok && sb_append(builder, ",") && append_field_json(builder, "identifier", "Identifier", "", "text", "my-service", NULL, NULL);
+static bool append_field_payload(BinaryPayloadList *fields,
+                                 const char *key,
+                                 const char *label,
+                                 const char *default_value,
+                                 const char *field_type,
+                                 const char *placeholder,
+                                 PathSet *suggestions,
+                                 const BinaryChoiceSpec *choices,
+                                 size_t choice_count) {
+    StringBuilder payload = {0};
+    bool ok = build_field_payload(key, label, default_value, field_type, placeholder,
+                                  suggestions, choices, choice_count, &payload) &&
+              binary_payload_list_append(fields, &payload);
+    if (!ok) free(payload.data);
     return ok;
 }
 
-static bool append_jupyter_recipe_fields(StringBuilder *builder, const char *python_suggestions_json) {
-    const char *choices = "[{\"title\":\"Port\",\"value\":\"port\"},{\"title\":\"Unix Socket\",\"value\":\"unixSocket\"}]";
-    bool ok = append_field_json(builder, "python", "Python", "/usr/bin/python3", "file", "/usr/bin/python3", python_suggestions_json, NULL);
-    ok = ok && sb_append(builder, ",") && append_field_json(builder, "workdir", "Working Dir", "~/dev", "directory", "~/dev", NULL, NULL);
-    ok = ok && sb_append(builder, ",") && append_field_json(builder, "scriptPath", "Script Path", "", "file", "~/dev/run-jupyter.py", NULL, NULL);
-    ok = ok && sb_append(builder, ",") && append_field_json(builder, "frontendTransport", "Connection", "port", "choice", "", NULL, choices);
-    ok = ok && sb_append(builder, ",") && append_field_json(builder, "port", "Port", "", "text", "Auto", NULL, NULL);
-    ok = ok && sb_append(builder, ",") && append_field_json(builder, "name", "Display Name", "Jupyter Lab", "text", "Jupyter Lab", NULL, NULL);
-    ok = ok && sb_append(builder, ",") && append_field_json(builder, "identifier", "Identifier", "jupyter", "text", "jupyter", NULL, NULL);
+static bool build_recipe_payload(const char *identifier,
+                                 const char *display_name,
+                                 const char *summary,
+                                 BinaryPayloadList *fields,
+                                 StringBuilder *payload) {
+    StringBuilder field_array = {0};
+    bool ok = binary_build_payload_array(fields, &field_array) &&
+              binary_append_zero(payload, 32) &&
+              binary_append_string_ref_at(payload, 0, identifier) &&
+              binary_append_string_ref_at(payload, 8, display_name) &&
+              binary_append_string_ref_at(payload, 16, summary) &&
+              binary_append_child_ref_at(payload, 24, &field_array);
+    free(field_array.data);
     return ok;
 }
 
-static bool append_jupyter_uv_recipe_fields(StringBuilder *builder, const char *python_suggestions_json) {
-    (void)python_suggestions_json;
-    const char *choices = "[{\"title\":\"Port\",\"value\":\"port\"},{\"title\":\"Unix Socket\",\"value\":\"unixSocket\"}]";
-    bool ok = append_field_json(builder, "projectDir", "Project Dir", "~", "directory", "~/dev/my-project", NULL, NULL);
-    ok = ok && sb_append(builder, ",") && append_field_json(builder, "scriptPath", "Script Path", "", "file", "~/dev/my-project/run-jupyter.py", NULL, NULL);
-    ok = ok && sb_append(builder, ",") && append_field_json(builder, "frontendTransport", "Connection", "port", "choice", "", NULL, choices);
-    ok = ok && sb_append(builder, ",") && append_field_json(builder, "port", "Port", "", "text", "Auto", NULL, NULL);
-    ok = ok && sb_append(builder, ",") && append_field_json(builder, "name", "Display Name", "Jupyter Lab", "text", "Jupyter Lab", NULL, NULL);
-    ok = ok && sb_append(builder, ",") && append_field_json(builder, "identifier", "Identifier", "jupyter-uv", "text", "jupyter-uv", NULL, NULL);
-    return ok;
-}
-
-static bool append_existing_recipe_fields(StringBuilder *builder, const char *python_suggestions_json) {
-    (void)python_suggestions_json;
-    bool ok = append_field_json(builder, "executablePath", "Executable", "", "file", "~/path/to/executable.sh", NULL, NULL);
-    ok = ok && sb_append(builder, ",") && append_field_json(builder, "workdir", "Working Dir", "~", "directory", "~", NULL, NULL);
-    ok = ok && sb_append(builder, ",") && append_field_json(builder, "name", "Display Name", "", "text", "My Service", NULL, NULL);
-    ok = ok && sb_append(builder, ",") && append_field_json(builder, "identifier", "Identifier", "", "text", "my-service", NULL, NULL);
+static bool append_recipe_payload(BinaryPayloadList *recipes,
+                                  const char *identifier,
+                                  const char *display_name,
+                                  const char *summary,
+                                  BinaryPayloadList *fields) {
+    StringBuilder payload = {0};
+    bool ok = build_recipe_payload(identifier, display_name, summary, fields, &payload) &&
+              binary_payload_list_append(recipes, &payload);
+    if (!ok) free(payload.data);
     return ok;
 }
 
 static void send_recipes_response(int fd) {
-    StringBuilder suggestions = {0};
-    bool first = true;
     PathSet seen = {0};
-    bool ok = sb_append(&suggestions, "[");
+    bool ok = true;
     char path[PATH_MAX];
     const char *conda_dirs[] = {"miniforge3", "mambaforge", "miniconda3", "anaconda3"};
     for (size_t i = 0; ok && i < sizeof(conda_dirs) / sizeof(conda_dirs[0]); i++) {
         snprintf(path, sizeof(path), "%s/%s/bin/python", home_directory(), conda_dirs[i]);
-        ok = append_python_suggestion(&suggestions, path, &first, &seen);
+        ok = collect_python_suggestion(path, &seen);
         char base[PATH_MAX];
         snprintf(base, sizeof(base), "%s/%s", home_directory(), conda_dirs[i]);
-        ok = ok && append_python_env_suggestions(&suggestions, base, &first, &seen);
+        ok = ok && collect_python_env_suggestions(base, &seen);
     }
-    ok = ok && append_pyenv_suggestions(&suggestions, &first, &seen);
-    ok = ok && append_python_suggestion(&suggestions, "/opt/homebrew/bin/python3", &first, &seen);
-    ok = ok && append_python_suggestion(&suggestions, "/usr/local/bin/python3", &first, &seen);
-    ok = ok && append_python_suggestion(&suggestions, "/usr/bin/python3", &first, &seen);
-    ok = ok && append_path_python_suggestions(&suggestions, &first, &seen);
-    ok = ok && sb_append(&suggestions, "]");
-    if (!ok) {
-        free(suggestions.data);
-        send_text_response(fd, 500, "out of memory\n");
-        return;
-    }
+    ok = ok && collect_pyenv_suggestions(&seen);
+    ok = ok && collect_python_suggestion("/opt/homebrew/bin/python3", &seen);
+    ok = ok && collect_python_suggestion("/usr/local/bin/python3", &seen);
+    ok = ok && collect_python_suggestion("/usr/bin/python3", &seen);
+    ok = ok && collect_path_python_suggestions(&seen);
 
+    BinaryPayloadList recipes = {0};
+    BinaryChoiceSpec connection_choices[] = {
+        {.title = "Port", .value = "port"},
+        {.title = "Unix Socket", .value = "unixSocket"},
+    };
+    BinaryPayloadList fields = {0};
+    ok = ok &&
+         append_field_payload(&fields, "command", "Command", "", "text", "bundle exec jekyll serve --host 0.0.0.0", NULL, NULL, 0) &&
+         append_field_payload(&fields, "workdir", "Working Dir", "~", "directory", "~", NULL, NULL, 0) &&
+         append_field_payload(&fields, "scriptPath", "Script Path", "", "file", "~/dev/run-service.sh", NULL, NULL, 0) &&
+         append_field_payload(&fields, "port", "Port", "", "text", "4000", NULL, NULL, 0) &&
+         append_field_payload(&fields, "name", "Display Name", "", "text", "My Service", NULL, NULL, 0) &&
+         append_field_payload(&fields, "identifier", "Identifier", "", "text", "my-service", NULL, NULL, 0) &&
+         append_recipe_payload(&recipes, "command-port", "Run a command, use a hardcoded port number",
+                               "Create a script that runs a command you choose and registers a frontend on a hardcoded port number.",
+                               &fields);
+    binary_payload_list_free(&fields);
+    fields = (BinaryPayloadList){0};
+    ok = ok &&
+         append_field_payload(&fields, "workdir", "Working Dir", "~", "directory", "~", NULL, NULL, 0) &&
+         append_field_payload(&fields, "scriptPath", "Script Path", "", "file", "~/dev/run-service.sh", NULL, NULL, 0) &&
+         append_field_payload(&fields, "name", "Display Name", "", "text", "My Service", NULL, NULL, 0) &&
+         append_field_payload(&fields, "identifier", "Identifier", "", "text", "my-service", NULL, NULL, 0) &&
+         append_recipe_payload(&recipes, "custom", "Blank Script",
+                               "Create a minimal script that shows how to use OUTERCTL_PATH yourself.",
+                               &fields);
+    binary_payload_list_free(&fields);
+    fields = (BinaryPayloadList){0};
+    ok = ok &&
+         append_field_payload(&fields, "python", "Python", "/usr/bin/python3", "file", "/usr/bin/python3", &seen, NULL, 0) &&
+         append_field_payload(&fields, "workdir", "Working Dir", "~/dev", "directory", "~/dev", NULL, NULL, 0) &&
+         append_field_payload(&fields, "scriptPath", "Script Path", "", "file", "~/dev/run-jupyter.py", NULL, NULL, 0) &&
+         append_field_payload(&fields, "frontendTransport", "Connection", "port", "choice", "", NULL, connection_choices, 2) &&
+         append_field_payload(&fields, "port", "Port", "", "text", "Auto", NULL, NULL, 0) &&
+         append_field_payload(&fields, "name", "Display Name", "Jupyter Lab", "text", "Jupyter Lab", NULL, NULL, 0) &&
+         append_field_payload(&fields, "identifier", "Identifier", "jupyter", "text", "jupyter", NULL, NULL, 0) &&
+         append_recipe_payload(&recipes, "jupyter", "Jupyter Lab",
+                               "Create a script that launches Jupyter Lab and finds its browser URL with jupyter server list.",
+                               &fields);
+    binary_payload_list_free(&fields);
+    fields = (BinaryPayloadList){0};
+    ok = ok &&
+         append_field_payload(&fields, "projectDir", "Project Dir", "~", "directory", "~/dev/my-project", NULL, NULL, 0) &&
+         append_field_payload(&fields, "scriptPath", "Script Path", "", "file", "~/dev/my-project/run-jupyter.py", NULL, NULL, 0) &&
+         append_field_payload(&fields, "frontendTransport", "Connection", "port", "choice", "", NULL, connection_choices, 2) &&
+         append_field_payload(&fields, "port", "Port", "", "text", "Auto", NULL, NULL, 0) &&
+         append_field_payload(&fields, "name", "Display Name", "Jupyter Lab", "text", "Jupyter Lab", NULL, NULL, 0) &&
+         append_field_payload(&fields, "identifier", "Identifier", "jupyter-uv", "text", "jupyter-uv", NULL, NULL, 0) &&
+         append_recipe_payload(&recipes, "jupyter-uv", "Jupyter Lab (uv or .venv)",
+                               "Create a script that launches Jupyter Lab from .venv and finds its browser URL with jupyter server list.",
+                               &fields);
+    binary_payload_list_free(&fields);
+    fields = (BinaryPayloadList){0};
+    ok = ok &&
+         append_field_payload(&fields, "executablePath", "Executable", "", "file", "~/path/to/executable.sh", NULL, NULL, 0) &&
+         append_field_payload(&fields, "workdir", "Working Dir", "~", "directory", "~", NULL, NULL, 0) &&
+         append_field_payload(&fields, "name", "Display Name", "", "text", "My Service", NULL, NULL, 0) &&
+         append_field_payload(&fields, "identifier", "Identifier", "", "text", "my-service", NULL, NULL, 0) &&
+         append_recipe_payload(&recipes, "existing-executable", "Use Existing Executable",
+                               "Choose a script or executable you already keep in your own folders.",
+                               &fields);
+    binary_payload_list_free(&fields);
+
+    StringBuilder suggestion_array = {0};
+    StringBuilder recipe_array = {0};
+    ok = ok && binary_build_string_array_from_paths(&seen, &suggestion_array) &&
+         binary_build_payload_array(&recipes, &recipe_array);
     StringBuilder builder = {0};
-    bool first_recipe = true;
-    ok = sb_append(&builder, "{\"pythonSuggestions\":") &&
-         sb_append(&builder, suggestions.data) &&
-         sb_append(&builder, ",\"recipes\":[");
-    ok = ok && append_recipe_json(&builder, "command-port", "Run a command, use a hardcoded port number",
-                                  "Create a script that runs a command you choose and registers a frontend on a hardcoded port number.",
-                                  &first_recipe, append_command_recipe_fields, suggestions.data);
-    ok = ok && append_recipe_json(&builder, "custom", "Blank Script",
-                                  "Create a minimal script that shows how to use OUTERCTL_PATH yourself.",
-                                  &first_recipe, append_blank_recipe_fields, suggestions.data);
-    ok = ok && append_recipe_json(&builder, "jupyter", "Jupyter Lab",
-                                  "Create a script that launches Jupyter Lab and finds its browser URL with jupyter server list.",
-                                  &first_recipe, append_jupyter_recipe_fields, suggestions.data);
-    ok = ok && append_recipe_json(&builder, "jupyter-uv", "Jupyter Lab (uv or .venv)",
-                                  "Create a script that launches Jupyter Lab from .venv and finds its browser URL with jupyter server list.",
-                                  &first_recipe, append_jupyter_uv_recipe_fields, suggestions.data);
-    ok = ok && append_recipe_json(&builder, "existing-executable", "Use Existing Executable",
-                                  "Choose a script or executable you already keep in your own folders.",
-                                  &first_recipe, append_existing_recipe_fields, suggestions.data);
-    ok = ok && sb_append(&builder, "]}");
-    free(suggestions.data);
+    ok = ok && binary_append_zero(&builder, 16) &&
+         binary_append_child_ref_at(&builder, 0, &suggestion_array) &&
+         binary_append_child_ref_at(&builder, 8, &recipe_array);
+    free(suggestion_array.data);
+    free(recipe_array.data);
+    binary_payload_list_free(&recipes);
     if (!ok) {
         free(builder.data);
         send_text_response(fd, 500, "out of memory\n");
         return;
     }
-    send_response(fd, 200, "OK", "application/json; charset=utf-8", builder.data, builder.length);
+    send_binary_response(fd, 200, &builder);
     free(builder.data);
 }
 
@@ -5822,12 +7175,12 @@ static void send_create_response(int fd, const char *query) {
     }
 
     if (!recipe[0] && (!display_name[0] || !command[0])) {
-        send_action_json(fd, 400, false, "Missing displayName or command.");
+        send_action_response(fd, 400, false, "Missing displayName or command.");
         return;
     }
     if (!display_name[0] || !command[0]) {
         if (!recipe[0]) {
-            send_action_json(fd, 400, false, "Display name and command are required.");
+            send_action_response(fd, 400, false, "Display name and command are required.");
             return;
         }
     }
@@ -5849,13 +7202,13 @@ static void send_create_response(int fd, const char *query) {
 #ifdef __APPLE__
     snprintf(unit_name, sizeof(unit_name), "%s", unit_stem);
     if (!launchd_label_is_safe(unit_name)) {
-        send_action_json(fd, 400, false, "Could not construct a safe launchd label.");
+        send_action_response(fd, 400, false, "Could not construct a safe launchd label.");
         return;
     }
 #else
     snprintf(unit_name, sizeof(unit_name), "%s.service", unit_stem);
     if (!safe_unit_name(unit_name)) {
-        send_action_json(fd, 400, false, "Could not construct a safe systemd unit name.");
+        send_action_response(fd, 400, false, "Could not construct a safe systemd unit name.");
         return;
     }
 #endif
@@ -5892,7 +7245,7 @@ static void send_create_response(int fd, const char *query) {
             char script_path_raw[PATH_MAX] = "";
             query_value(query, "scriptPath", script_path_raw, sizeof(script_path_raw));
             if (!resolve_user_script_path(script_path_raw, working_directory, script_path, sizeof(script_path))) {
-                send_action_json(fd, 400, false, "Script Path is required.");
+                send_action_response(fd, 400, false, "Script Path is required.");
                 return;
             }
         }
@@ -5902,18 +7255,18 @@ static void send_create_response(int fd, const char *query) {
             query_value(query, "command", command, sizeof(command));
             query_value(query, "port", port, sizeof(port));
             if (!command[0] || !valid_port_text(port)) {
-                send_action_json(fd, 400, false, "Command and a valid port are required.");
+                send_action_response(fd, 400, false, "Command and a valid port are required.");
                 return;
             }
             StringBuilder script = {0};
             if (!make_fixed_port_script(service_id, display_name, port, command, &script)) {
                 free(script.data);
-                send_action_json(fd, 500, false, "Failed to generate script.");
+                send_action_response(fd, 500, false, "Failed to generate script.");
                 return;
             }
             if (!write_text_file(script_path, script.data, error, sizeof(error))) {
                 free(script.data);
-                send_action_json(fd, 500, false, error);
+                send_action_response(fd, 500, false, error);
                 return;
             }
             free(script.data);
@@ -5927,12 +7280,12 @@ static void send_create_response(int fd, const char *query) {
             StringBuilder script = {0};
             if (!make_blank_script(service_id, display_name, &script)) {
                 free(script.data);
-                send_action_json(fd, 500, false, "Failed to generate script.");
+                send_action_response(fd, 500, false, "Failed to generate script.");
                 return;
             }
             if (!write_text_file(script_path, script.data, error, sizeof(error))) {
                 free(script.data);
-                send_action_json(fd, 500, false, error);
+                send_action_response(fd, 500, false, error);
                 return;
             }
             free(script.data);
@@ -5950,7 +7303,7 @@ static void send_create_response(int fd, const char *query) {
             query_value(query, "port", port, sizeof(port));
             query_value_or_default(query, "frontendTransport", "port", transport, sizeof(transport));
             if (port[0] && !valid_port_text(port)) {
-                send_action_json(fd, 400, false, "Port must be empty or a valid TCP port.");
+                send_action_response(fd, 400, false, "Port must be empty or a valid TCP port.");
                 return;
             }
             StringBuilder script = {0};
@@ -5959,12 +7312,12 @@ static void send_create_response(int fd, const char *query) {
                                      strcmp(recipe, "jupyter-uv") == 0,
                                      &script)) {
                 free(script.data);
-                send_action_json(fd, 500, false, "Failed to generate Jupyter script.");
+                send_action_response(fd, 500, false, "Failed to generate Jupyter script.");
                 return;
             }
             if (!write_text_file(script_path, script.data, error, sizeof(error))) {
                 free(script.data);
-                send_action_json(fd, 500, false, error);
+                send_action_response(fd, 500, false, error);
                 return;
             }
             free(script.data);
@@ -5978,7 +7331,7 @@ static void send_create_response(int fd, const char *query) {
             char executable[PATH_MAX] = "";
             query_value(query, "executablePath", executable, sizeof(executable));
             if (!executable[0]) {
-                send_action_json(fd, 400, false, "Executable is required.");
+                send_action_response(fd, 400, false, "Executable is required.");
                 return;
             }
             char expanded_executable[PATH_MAX];
@@ -5989,7 +7342,7 @@ static void send_create_response(int fd, const char *query) {
             shell_quote(expanded_executable, command, sizeof(command));
 #endif
         } else {
-            send_action_json(fd, 400, false, "Unknown recipe.");
+            send_action_response(fd, 400, false, "Unknown recipe.");
             return;
         }
     }
@@ -6005,7 +7358,7 @@ static void send_create_response(int fd, const char *query) {
         script_ok = script_ok && sb_append(&script, quoted_raw_command) && sb_append(&script, "\n");
         if (!script_ok || !write_text_file(script_path, script.data ? script.data : "", error, sizeof(error))) {
             free(script.data);
-            send_action_json(fd, 500, false, error[0] ? error : "Failed to generate script.");
+            send_action_response(fd, 500, false, error[0] ? error : "Failed to generate script.");
             return;
         }
         free(script.data);
@@ -6052,7 +7405,7 @@ static void send_create_response(int fd, const char *query) {
 
     if (!mkdir_p(backend_dir)) {
         snprintf(error, sizeof(error), "Failed to create %s: %s", backend_dir, strerror(errno));
-        send_action_json(fd, 500, false, error);
+        send_action_response(fd, 500, false, error);
         return;
     }
 
@@ -6064,7 +7417,7 @@ static void send_create_response(int fd, const char *query) {
         *log_slash = '\0';
         if (!mkdir_p(log_dir)) {
             snprintf(error, sizeof(error), "Failed to create %s: %s", log_dir, strerror(errno));
-            send_action_json(fd, 500, false, error);
+            send_action_response(fd, 500, false, error);
             return;
         }
     }
@@ -6072,24 +7425,24 @@ static void send_create_response(int fd, const char *query) {
     snprintf(launch_agents_dir, sizeof(launch_agents_dir), "%s/Library/LaunchAgents", home_directory());
     if (!mkdir_p(launch_agents_dir)) {
         snprintf(error, sizeof(error), "Failed to create %s: %s", launch_agents_dir, strerror(errno));
-        send_action_json(fd, 500, false, error);
+        send_action_response(fd, 500, false, error);
         return;
     }
     StringBuilder plist = {0};
     if (!make_launchd_plist(unit_name, command, working_directory, outerctl_path, log_path, &plist)) {
         free(plist.data);
-        send_action_json(fd, 500, false, "Failed to generate LaunchAgent plist.");
+        send_action_response(fd, 500, false, "Failed to generate LaunchAgent plist.");
         return;
     }
     if (!write_text_file(unit_path, plist.data, error, sizeof(error))) {
         free(plist.data);
-        send_action_json(fd, 500, false, error);
+        send_action_response(fd, 500, false, error);
         return;
     }
     free(plist.data);
 #else
     if (!write_text_file(unit_path, unit_contents, error, sizeof(error))) {
-        send_action_json(fd, 500, false, error);
+        send_action_response(fd, 500, false, error);
         return;
     }
 #endif
@@ -6101,7 +7454,7 @@ static void send_create_response(int fd, const char *query) {
 #endif
                                   log_path, error, sizeof(error))) {
         unlink(unit_path);
-        send_action_json(fd, 500, false, error);
+        send_action_response(fd, 500, false, error);
         return;
     }
 
@@ -6122,14 +7475,14 @@ static void send_create_response(int fd, const char *query) {
         char response[4600];
         snprintf(response, sizeof(response), "Created %s, but failed to start it: %s", display_name, message);
         log_event("Created backend %s but failed to start it: %s", service_id, message);
-        send_action_json(fd, 500, false, response);
+        send_action_response(fd, 500, false, response);
         return;
     }
 
     char response[512];
     snprintf(response, sizeof(response), "Created %s.", display_name);
     log_event("Created and started backend %s.", service_id);
-    send_action_json(fd, 200, true, response);
+    send_action_response(fd, 200, true, response);
 }
 
 static void send_logs_response(int fd, const char *query) {
@@ -6154,13 +7507,13 @@ static void send_logs_response(int fd, const char *query) {
 
     if (!raw_path[0]) {
         if (!service_id[0]) {
-            send_log_json(fd, "", "", "", false, 0, 0, "missing serviceID or path");
+            send_log_response(fd, "", "", "", false, 0, 0, "missing serviceID or path");
             return;
         }
         char error[512] = "";
         bool found = resolve_log_path_any(service_id, log_index, raw_path, sizeof(raw_path), error, sizeof(error));
         if (!found) {
-            send_log_json(fd, service_id, "", "", false, 0, 0, "no registered log file for this backend");
+            send_log_response(fd, service_id, "", "", false, 0, 0, "no registered log file for this backend");
             return;
         }
     }
@@ -6171,11 +7524,11 @@ static void send_logs_response(int fd, const char *query) {
     if (stat(path, &st) != 0) {
         char message[PATH_MAX + 80];
         snprintf(message, sizeof(message), "failed to stat log file: %s", strerror(errno));
-        send_log_json(fd, service_id, raw_path, "", false, 0, 0, message);
+        send_log_response(fd, service_id, raw_path, "", false, 0, 0, message);
         return;
     }
     if (!S_ISREG(st.st_mode)) {
-        send_log_json(fd, service_id, raw_path, "", false, 0, 0, "log path is not a regular file");
+        send_log_response(fd, service_id, raw_path, "", false, 0, 0, "log path is not a regular file");
         return;
     }
 
@@ -6184,12 +7537,12 @@ static void send_logs_response(int fd, const char *query) {
     uint64_t start_offset = file_size > bytes_to_read ? file_size - bytes_to_read : 0;
     int file_fd = open(path, O_RDONLY);
     if (file_fd < 0) {
-        send_log_json(fd, service_id, raw_path, "", false, file_size, (double)st.st_mtime, strerror(errno));
+        send_log_response(fd, service_id, raw_path, "", false, file_size, (double)st.st_mtime, strerror(errno));
         return;
     }
     if (start_offset > 0 && lseek(file_fd, (off_t)start_offset, SEEK_SET) < 0) {
         close(file_fd);
-        send_log_json(fd, service_id, raw_path, "", false, file_size, (double)st.st_mtime, strerror(errno));
+        send_log_response(fd, service_id, raw_path, "", false, file_size, (double)st.st_mtime, strerror(errno));
         return;
     }
 
@@ -6206,7 +7559,7 @@ static void send_logs_response(int fd, const char *query) {
             if (errno == EINTR) continue;
             free(buffer);
             close(file_fd);
-            send_log_json(fd, service_id, raw_path, "", false, file_size, (double)st.st_mtime, strerror(errno));
+            send_log_response(fd, service_id, raw_path, "", false, file_size, (double)st.st_mtime, strerror(errno));
             return;
         }
         if (got == 0) break;
@@ -6214,7 +7567,7 @@ static void send_logs_response(int fd, const char *query) {
     }
     close(file_fd);
     buffer[offset] = '\0';
-    send_log_json(fd, service_id, raw_path, buffer, start_offset > 0, file_size, (double)st.st_mtime, "");
+    send_log_response(fd, service_id, raw_path, buffer, start_offset > 0, file_size, (double)st.st_mtime, "");
     free(buffer);
 }
 

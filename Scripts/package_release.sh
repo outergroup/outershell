@@ -180,7 +180,7 @@ service_unit TEXT
 CREATE TABLE IF NOT EXISTS frontends (
 url TEXT PRIMARY KEY,
 service_id TEXT,
-name TEXT NOT NULL,
+display_name TEXT NOT NULL DEFAULT '',
 port INTEGER NOT NULL DEFAULT 0,
 socket_path TEXT NOT NULL DEFAULT '',
 icon TEXT,
@@ -207,9 +207,31 @@ def ensure_column(table, name, definition):
 
 ensure_column("backends", "icon", "TEXT")
 ensure_column("backends", "service_unit", "TEXT")
+ensure_column("frontends", "display_name", "TEXT NOT NULL DEFAULT ''")
 ensure_column("frontends", "icon", "TEXT")
 ensure_column("frontends", "is_home_screen", "INTEGER NOT NULL DEFAULT 0")
 ensure_column("frontends", "list", "TEXT")
+frontend_columns = {row[1] for row in database.execute("PRAGMA table_info(frontends)")}
+if "name" in frontend_columns:
+    database.execute("UPDATE frontends SET display_name = name WHERE display_name = ''")
+    database.executescript("""
+DROP INDEX IF EXISTS frontends_service_id_idx;
+CREATE TABLE frontends_new (
+url TEXT PRIMARY KEY,
+service_id TEXT,
+display_name TEXT NOT NULL DEFAULT '',
+port INTEGER NOT NULL DEFAULT 0,
+socket_path TEXT NOT NULL DEFAULT '',
+icon TEXT,
+is_home_screen INTEGER NOT NULL DEFAULT 0,
+list TEXT
+);
+INSERT OR REPLACE INTO frontends_new(url, service_id, display_name, port, socket_path, icon, is_home_screen, list)
+SELECT url, service_id, COALESCE(NULLIF(display_name, ''), name, ''), COALESCE(port, 0), COALESCE(socket_path, ''), icon, COALESCE(is_home_screen, 0), list FROM frontends;
+DROP TABLE frontends;
+ALTER TABLE frontends_new RENAME TO frontends;
+CREATE INDEX IF NOT EXISTS frontends_service_id_idx ON frontends(service_id);
+""")
 
 icon_value = registry_icon_value(icon_path)
 with database:
@@ -225,7 +247,7 @@ with database:
     )
     database.execute("DELETE FROM frontends WHERE service_id = ?", (service_id,))
     database.execute(
-        "INSERT INTO frontends(url, service_id, name, port, socket_path, icon, is_home_screen) VALUES(?, ?, ?, 0, ?, ?, 1)",
+        "INSERT INTO frontends(url, service_id, display_name, port, socket_path, icon, is_home_screen) VALUES(?, ?, ?, 0, ?, ?, 1)",
         (socket_path, service_id, display_name, socket_path, icon_value),
     )
     database.execute("DELETE FROM log_files WHERE service_id = ?", (service_id,))

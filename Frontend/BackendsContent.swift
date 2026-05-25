@@ -76,7 +76,7 @@ private struct FrontendRecord: Decodable {
     let port: Int
     let socketPath: String
     let iconPath: String?
-    let iconData: String?
+    let iconData: Data?
     let list: String?
 
     var hasEndpoint: Bool {
@@ -85,24 +85,16 @@ private struct FrontendRecord: Decodable {
 
     var iconImage: NSImage? {
         guard let iconData,
-              let data = Data(base64Encoded: base64IconPayload(iconData)),
-              !data.isEmpty else {
+              !iconData.isEmpty else {
             return nil
         }
-        return NSImage(data: data)
+        return NSImage(data: iconData)
     }
 
     var listName: String {
         list?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     }
 
-    private func base64IconPayload(_ value: String) -> String {
-        guard value.hasPrefix("data:"),
-              let commaIndex = value.firstIndex(of: ",") else {
-            return value
-        }
-        return String(value[value.index(after: commaIndex)...])
-    }
 }
 
 private struct LogFileRecord: Decodable {
@@ -169,6 +161,226 @@ private struct FilePickerEntryRecord: Decodable {
     let isDirectory: Bool
     let size: UInt64
     let modified: Double
+}
+
+private enum BinaryPayloadError: Error {
+    case outOfBounds
+    case invalidString
+}
+
+private struct BinaryPayloadReader {
+    let data: Data
+
+    func uint32(at offset: Int) throws -> UInt32 {
+        guard offset >= 0, offset + 4 <= data.count else { throw BinaryPayloadError.outOfBounds }
+        return UInt32(data[offset]) |
+               (UInt32(data[offset + 1]) << 8) |
+               (UInt32(data[offset + 2]) << 16) |
+               (UInt32(data[offset + 3]) << 24)
+    }
+
+    func uint64(at offset: Int) throws -> UInt64 {
+        guard offset >= 0, offset + 8 <= data.count else { throw BinaryPayloadError.outOfBounds }
+        var value: UInt64 = 0
+        for index in stride(from: 7, through: 0, by: -1) {
+            value = (value << 8) | UInt64(data[offset + index])
+        }
+        return value
+    }
+
+    func double(at offset: Int) throws -> Double {
+        Double(bitPattern: try uint64(at: offset))
+    }
+
+    func dataRef(at offset: Int) throws -> Data {
+        let start = Int(try uint32(at: offset))
+        let length = Int(try uint32(at: offset + 4))
+        guard start >= 0, length >= 0, start <= data.count, length <= data.count - start else {
+            throw BinaryPayloadError.outOfBounds
+        }
+        return Data(data[start..<(start + length)])
+    }
+
+    func stringRef(at offset: Int) throws -> String {
+        let bytes = try dataRef(at: offset)
+        guard !bytes.isEmpty else { return "" }
+        guard let string = String(data: bytes, encoding: .utf8) else {
+            throw BinaryPayloadError.invalidString
+        }
+        return string
+    }
+
+    func child(at offset: Int) throws -> BinaryPayloadReader {
+        BinaryPayloadReader(data: try dataRef(at: offset))
+    }
+
+    func payloadArray() throws -> [BinaryPayloadReader] {
+        let count = Int(try uint32(at: 0))
+        var children: [BinaryPayloadReader] = []
+        children.reserveCapacity(count)
+        for index in 0..<count {
+            children.append(try child(at: 4 + index * 8))
+        }
+        return children
+    }
+
+    func stringArray() throws -> [String] {
+        let count = Int(try uint32(at: 0))
+        var strings: [String] = []
+        strings.reserveCapacity(count)
+        for index in 0..<count {
+            strings.append(try stringRef(at: 4 + index * 8))
+        }
+        return strings
+    }
+}
+
+private extension BackendsResponse {
+    static func decodeBinary(_ data: Data) throws -> BackendsResponse {
+        let reader = BinaryPayloadReader(data: data)
+        let count = Int(try reader.uint32(at: 8))
+        var backends: [BackendRecord] = []
+        backends.reserveCapacity(count)
+        for index in 0..<count {
+            backends.append(try BackendRecord.decodeBinary(try reader.child(at: 12 + index * 8)))
+        }
+        return BackendsResponse(error: try reader.stringRef(at: 0), backends: backends)
+    }
+}
+
+private extension BackendRecord {
+    static func decodeBinary(_ reader: BinaryPayloadReader) throws -> BackendRecord {
+        let flags = try reader.uint32(at: 64)
+        let serviceUnitPath = try reader.stringRef(at: 24)
+        return BackendRecord(serviceID: try reader.stringRef(at: 0),
+                             displayName: try reader.stringRef(at: 8),
+                             serviceUnit: try reader.stringRef(at: 16),
+                             serviceUnitPath: serviceUnitPath.isEmpty ? nil : serviceUnitPath,
+                             serviceScope: try reader.stringRef(at: 32),
+                             status: try reader.stringRef(at: 40),
+                             canControl: (flags & 0x01) != 0,
+                             canUninstall: (flags & 0x02) != 0,
+                             isBundled: (flags & 0x04) != 0,
+                             isInstalled: (flags & 0x08) != 0,
+                             isMigration: (flags & 0x10) != 0,
+                             iconSymbolName: emptyToNil(try reader.stringRef(at: 48)),
+                             launchdPlistPath: try reader.stringRef(at: 56),
+                             ownsLaunchdPlist: (flags & 0x20) != 0,
+                             frontends: try reader.child(at: 68).payloadArray().map(FrontendRecord.decodeBinary),
+                             logFiles: try reader.child(at: 76).payloadArray().map(LogFileRecord.decodeBinary))
+    }
+}
+
+private extension FrontendRecord {
+    static func decodeBinary(_ reader: BinaryPayloadReader) throws -> FrontendRecord {
+        let iconData = try reader.dataRef(at: 32)
+        return FrontendRecord(name: try reader.stringRef(at: 0),
+                              url: try reader.stringRef(at: 8),
+                              port: Int(try reader.uint32(at: 48)),
+                              socketPath: try reader.stringRef(at: 16),
+                              iconPath: emptyToNil(try reader.stringRef(at: 24)),
+                              iconData: iconData.isEmpty ? nil : iconData,
+                              list: emptyToNil(try reader.stringRef(at: 40)))
+    }
+}
+
+private extension LogFileRecord {
+    static func decodeBinary(_ reader: BinaryPayloadReader) throws -> LogFileRecord {
+        LogFileRecord(identifier: try reader.stringRef(at: 0),
+                      displayName: try reader.stringRef(at: 8),
+                      path: try reader.stringRef(at: 16),
+                      size: try reader.uint64(at: 24),
+                      modified: try reader.double(at: 32),
+                      readable: (try reader.uint32(at: 40) & 0x01) != 0)
+    }
+}
+
+private extension LogResponse {
+    static func decodeBinary(_ data: Data) throws -> LogResponse {
+        let reader = BinaryPayloadReader(data: data)
+        return LogResponse(serviceID: try reader.stringRef(at: 0),
+                           path: try reader.stringRef(at: 8),
+                           contents: try reader.stringRef(at: 16),
+                           isTruncated: (try reader.uint32(at: 24) & 0x01) != 0,
+                           fileSize: try reader.uint64(at: 28),
+                           modified: try reader.double(at: 36),
+                           error: try reader.stringRef(at: 44))
+    }
+}
+
+private extension ActionResponse {
+    static func decodeBinary(_ data: Data) throws -> ActionResponse {
+        let reader = BinaryPayloadReader(data: data)
+        let flags = try reader.uint32(at: 0)
+        return ActionResponse(ok: (flags & 0x01) != 0,
+                              message: try reader.stringRef(at: 4),
+                              needsPassword: (flags & 0x02) != 0)
+    }
+}
+
+private extension RecipesResponse {
+    static func decodeBinary(_ data: Data) throws -> RecipesResponse {
+        let reader = BinaryPayloadReader(data: data)
+        return RecipesResponse(pythonSuggestions: try reader.child(at: 0).stringArray(),
+                               recipes: try reader.child(at: 8).payloadArray().map(RecipeRecord.decodeBinary))
+    }
+}
+
+private extension RecipeRecord {
+    static func decodeBinary(_ reader: BinaryPayloadReader) throws -> RecipeRecord {
+        RecipeRecord(identifier: try reader.stringRef(at: 0),
+                     displayName: try reader.stringRef(at: 8),
+                     summary: try reader.stringRef(at: 16),
+                     fields: try reader.child(at: 24).payloadArray().map(RecipeFieldRecord.decodeBinary))
+    }
+}
+
+private extension RecipeFieldRecord {
+    static func decodeBinary(_ reader: BinaryPayloadReader) throws -> RecipeFieldRecord {
+        RecipeFieldRecord(key: try reader.stringRef(at: 0),
+                          label: try reader.stringRef(at: 8),
+                          defaultValue: try reader.stringRef(at: 16),
+                          fieldType: try reader.stringRef(at: 24),
+                          placeholder: try reader.stringRef(at: 32),
+                          suggestions: try reader.child(at: 40).stringArray(),
+                          choices: try reader.child(at: 48).payloadArray().map(RecipeChoiceRecord.decodeBinary))
+    }
+}
+
+private extension RecipeChoiceRecord {
+    static func decodeBinary(_ reader: BinaryPayloadReader) throws -> RecipeChoiceRecord {
+        RecipeChoiceRecord(title: try reader.stringRef(at: 0),
+                           value: try reader.stringRef(at: 8))
+    }
+}
+
+private extension FilePickerResponse {
+    static func decodeBinary(_ data: Data) throws -> FilePickerResponse {
+        let reader = BinaryPayloadReader(data: data)
+        let count = Int(try reader.uint32(at: 16))
+        var entries: [FilePickerEntryRecord] = []
+        entries.reserveCapacity(count)
+        for index in 0..<count {
+            entries.append(try FilePickerEntryRecord.decodeBinary(try reader.child(at: 20 + index * 8)))
+        }
+        return FilePickerResponse(path: try reader.stringRef(at: 0),
+                                  parent: try reader.stringRef(at: 8),
+                                  entries: entries)
+    }
+}
+
+private extension FilePickerEntryRecord {
+    static func decodeBinary(_ reader: BinaryPayloadReader) throws -> FilePickerEntryRecord {
+        FilePickerEntryRecord(name: try reader.stringRef(at: 0),
+                              path: try reader.stringRef(at: 8),
+                              isDirectory: (try reader.uint32(at: 16) & 0x01) != 0,
+                              size: try reader.uint64(at: 20),
+                              modified: try reader.double(at: 28))
+    }
+}
+
+private func emptyToNil(_ value: String) -> String? {
+    value.isEmpty ? nil : value
 }
 
 private struct LogSelection: Equatable {
@@ -263,6 +475,27 @@ private struct PendingCreateTextDrag {
     let startPoint: CGPoint
     let cursorIndex: Int
     let selectedText: String
+}
+
+private enum AppDropTarget: Equatable {
+    case unlisted
+    case list(String)
+
+    var listName: String {
+        switch self {
+        case .unlisted:
+            return ""
+        case .list(let name):
+            return name
+        }
+    }
+}
+
+private struct PendingAppDrag {
+    let item: AppLauncherItem
+    let startPoint: CGPoint
+    var currentPoint: CGPoint
+    var isDragging: Bool
 }
 
 private enum FilePickerMode {
@@ -398,8 +631,11 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private var appsToggleFrame = CGRect.zero
     private var backendsToggleFrame = CGRect.zero
     private var appCardFrames: [(frame: CGRect, item: AppLauncherItem)] = []
+    private var appListDropFrames: [(frame: CGRect, listName: String)] = []
+    private var appUnlistedDropFrames: [CGRect] = []
     private var addAppFrame = CGRect.zero
     private var appsContentBottom: CGFloat = 0
+    private var pendingAppDrag: PendingAppDrag?
     private var backendRowFrames: [(frame: CGRect, row: BackendListRow)] = []
     private var backendActionFrames: [(frame: CGRect, row: BackendListRow, operation: String)] = []
     private var iconMatchStates: [String: IconMatchState] = [:]
@@ -1347,6 +1583,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private func renderAppsPage() {
         appsLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
         appCardFrames.removeAll()
+        appListDropFrames.removeAll()
+        appUnlistedDropFrames.removeAll()
         addAppFrame = .zero
         iconMatchStates.removeAll()
         textMatchStates.removeAll()
@@ -1399,6 +1637,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                                  visibleTextKeys: &visibleTextKeys)
             appsContentBottom = min(appBottom, listBottom)
         }
+        renderAppDragOverlayIfNeeded()
         hideUnrenderedMatchedLayers(visibleIconKeys: visibleIconKeys, visibleTextKeys: visibleTextKeys)
         if clampAppsScrollUsingRenderedContent() {
             renderAppsPage()
@@ -1467,6 +1706,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             renderAddAppTile(frame: frame, iconSize: iconSize)
         }
 
+        appUnlistedDropFrames.append(CGRect(x: area.minX,
+                                            y: min(y, top),
+                                            width: area.width,
+                                            height: max(top - min(y, top), itemHeight)))
         return y
     }
 
@@ -1567,6 +1810,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             let widgetHeight = widgetTopPadding + CGFloat(rowCount) * rowHeight + widgetBottomPadding
             y -= widgetHeight
             let widgetFrame = CGRect(x: area.minX, y: y, width: area.width, height: widgetHeight)
+            appListDropFrames.append((widgetFrame, group.name))
             renderAppListWidget(name: group.name,
                                 items: group.items,
                                 frame: widgetFrame,
@@ -1638,6 +1882,64 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                               isWrapped: false)
             visibleTextKeys.insert(item.iconKey)
             y -= rowHeight
+        }
+    }
+
+    private func renderAppDragOverlayIfNeeded() {
+        guard let drag = pendingAppDrag, drag.isDragging else { return }
+        let appsPoint = appsLayer.convert(drag.currentPoint, from: rootLayer)
+        if let target = appDropTarget(at: appsPoint, for: drag.item),
+           target.listName != drag.item.frontend.listName,
+           let highlightFrame = appDropHighlightFrame(for: target) {
+            let highlight = CALayer()
+            highlight.frame = highlightFrame.insetBy(dx: -4, dy: -4)
+            highlight.cornerRadius = target == .unlisted ? 18 : 16
+            highlight.borderWidth = 2
+            highlight.borderColor = resolvedCGColor(.controlAccentColor)
+            highlight.backgroundColor = resolvedCGColor(NSColor.controlAccentColor.withAlphaComponent(0.08))
+            appsLayer.addSublayer(highlight)
+        }
+
+        let iconSize: CGFloat = 46
+        let iconFrame = CGRect(x: appsPoint.x - iconSize / 2,
+                               y: appsPoint.y - iconSize / 2 + 12,
+                               width: iconSize,
+                               height: iconSize)
+        let icon = makeLauncherIconLayer(image: drag.item.iconImage,
+                                         title: drag.item.displayName,
+                                         iconSize: iconSize)
+        icon.frame = iconFrame
+        icon.opacity = 0.82
+        appsLayer.addSublayer(icon)
+
+        let title = makeTextLayer(size: 12, weight: .medium, color: .labelColor, alignment: .center)
+        title.string = drag.item.displayName
+        title.isWrapped = true
+        title.truncationMode = .none
+        title.frame = CGRect(x: appsPoint.x - 70, y: iconFrame.minY - 32, width: 140, height: 30)
+        title.opacity = 0.82
+        appsLayer.addSublayer(title)
+    }
+
+    private func appDropTarget(at appsPoint: CGPoint, for _: AppLauncherItem) -> AppDropTarget? {
+        if let frame = appListDropFrames.first(where: { $0.frame.contains(appsPoint) }) {
+            return .list(frame.listName)
+        }
+        if appUnlistedDropFrames.contains(where: { $0.contains(appsPoint) }) {
+            return .unlisted
+        }
+        return nil
+    }
+
+    private func appDropHighlightFrame(for target: AppDropTarget) -> CGRect? {
+        switch target {
+        case .unlisted:
+            return appUnlistedDropFrames.reduce(nil) { partial, frame in
+                guard let partial else { return frame }
+                return partial.union(frame)
+            }
+        case .list(let name):
+            return appListDropFrames.first(where: { $0.listName == name })?.frame
         }
     }
 
@@ -2586,7 +2888,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                     return
                 }
                 do {
-                    let response = try JSONDecoder().decode(BackendsResponse.self, from: data)
+                    let response = try BackendsResponse.decodeBinary(data)
+                    let previousAppsSignature = self.appLauncherSignature(for: self.backends)
+                    let nextAppsSignature = self.appLauncherSignature(for: response.backends)
                     self.lastBackendsResponseData = data
                     self.backendError = response.error
                     self.backends = response.backends
@@ -2598,7 +2902,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                         self.ensureLogSelection()
                     }
                     self.clampScrollOffsets()
-                    self.updateLayout()
+                    if !(quiet && self.mode == .apps && previousAppsSignature == nextAppsSignature) {
+                        self.updateLayout()
+                    }
                     if self.selectedLog != nil {
                         self.fetchSelectedLog()
                     }
@@ -2626,7 +2932,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                     return
                 }
                 do {
-                    let response = try JSONDecoder().decode(RecipesResponse.self, from: data)
+                    let response = try RecipesResponse.decodeBinary(data)
                     self.recipes = response.recipes
                     if !self.recipes.contains(where: { $0.identifier == self.selectedRecipeID }) {
                         self.selectedRecipeID = self.recipes.first?.identifier ?? "command-port"
@@ -2677,7 +2983,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                     return
                 }
                 do {
-                    let snapshot = try JSONDecoder().decode(LogResponse.self, from: data)
+                    let snapshot = try LogResponse.decodeBinary(data)
                     self.logSnapshot = snapshot
                     self.logError = snapshot.error
                     self.clampScrollOffsets()
@@ -2727,7 +3033,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 if let error {
                     self.backendError = error.localizedDescription
                 } else if let data,
-                          let response = try? JSONDecoder().decode(ActionResponse.self, from: data) {
+                          let response = try? ActionResponse.decodeBinary(data) {
                     if response.needsPassword == true {
                         self.showPasswordPrompt(for: backend, operation: operation, message: response.message)
                         self.backendError = ""
@@ -2747,6 +3053,56 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         }.resume()
     }
 
+    private func setFrontendList(for item: AppLauncherItem, listName: String) {
+        guard !isPerformingAction, let controlEndpoint, let urlSession else { return }
+        isPerformingAction = true
+        backendsRefreshGeneration += 1
+        backendError = listName.isEmpty ? "Moving \(item.displayName) to Apps..." : "Moving \(item.displayName) to \(listName)..."
+        updateLayout()
+
+        var components = URLComponents(url: controlEndpoint, resolvingAgainstBaseURL: false)
+        components?.queryItems = [
+            URLQueryItem(name: "serviceID", value: item.backend.serviceID),
+            URLQueryItem(name: "operation", value: "setFrontendList")
+        ]
+        guard let url = components?.url else {
+            isPerformingAction = false
+            backendError = "Could not build list update request."
+            updateLayout()
+            return
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/x-www-form-urlencoded; charset=utf-8", forHTTPHeaderField: "Content-Type")
+        request.httpBody = formEncodedBody([
+            "frontendURL": item.frontend.url,
+            "list": listName
+        ])
+        urlSession.dataTask(with: request) { [weak self] data, _, error in
+            Task { @MainActor in
+                guard let self else { return }
+                self.isPerformingAction = false
+                if let error {
+                    self.backendError = error.localizedDescription
+                } else if let data,
+                          let response = try? ActionResponse.decodeBinary(data) {
+                    self.backendError = response.ok ? "" : response.message
+                    if response.ok {
+                        self.applyOptimisticFrontendList(serviceID: item.backend.serviceID,
+                                                         frontendURL: item.frontend.url,
+                                                         listName: listName)
+                    } else {
+                        self.updateLayout()
+                    }
+                } else {
+                    self.backendError = "List update request failed."
+                    self.updateLayout()
+                }
+            }
+        }.resume()
+    }
+
     private func scheduleBackendsRefreshes() {
         backendsRefreshGeneration += 1
         let generation = backendsRefreshGeneration
@@ -2754,7 +3110,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
                 Task { @MainActor in
                     guard let self, self.backendsRefreshGeneration == generation else { return }
-                    self.fetchBackends()
+                    self.fetchBackends(quiet: true)
                 }
             }
         }
@@ -2787,6 +3143,39 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                  launchdPlistPath: backend.launchdPlistPath,
                                  ownsLaunchdPlist: backend.ownsLaunchdPlist,
                                  frontends: backend.frontends,
+                                 logFiles: backend.logFiles)
+        }
+        updateLayout()
+    }
+
+    private func applyOptimisticFrontendList(serviceID: String, frontendURL: String, listName: String) {
+        backends = backends.map { backend in
+            guard backend.serviceID == serviceID else { return backend }
+            let frontends = backend.frontends.map { frontend in
+                guard frontend.url == frontendURL else { return frontend }
+                return FrontendRecord(name: frontend.name,
+                                      url: frontend.url,
+                                      port: frontend.port,
+                                      socketPath: frontend.socketPath,
+                                      iconPath: frontend.iconPath,
+                                      iconData: frontend.iconData,
+                                      list: listName.isEmpty ? nil : listName)
+            }
+            return BackendRecord(serviceID: backend.serviceID,
+                                 displayName: backend.displayName,
+                                 serviceUnit: backend.serviceUnit,
+                                 serviceUnitPath: backend.serviceUnitPath,
+                                 serviceScope: backend.serviceScope,
+                                 status: backend.status,
+                                 canControl: backend.canControl,
+                                 canUninstall: backend.canUninstall,
+                                 isBundled: backend.isBundled,
+                                 isInstalled: backend.isInstalled,
+                                 isMigration: backend.isMigration,
+                                 iconSymbolName: backend.iconSymbolName,
+                                 launchdPlistPath: backend.launchdPlistPath,
+                                 ownsLaunchdPlist: backend.ownsLaunchdPlist,
+                                 frontends: frontends,
                                  logFiles: backend.logFiles)
         }
         updateLayout()
@@ -2874,7 +3263,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 if let error {
                     self.createMessage = error.localizedDescription
                 } else if let data,
-                          let response = try? JSONDecoder().decode(ActionResponse.self, from: data) {
+                          let response = try? ActionResponse.decodeBinary(data) {
                         self.createMessage = response.message
                         if response.ok {
                             self.createValues.removeAll()
@@ -2976,7 +3365,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                     return
                 }
                 do {
-                    let response = try JSONDecoder().decode(FilePickerResponse.self, from: data)
+                    let response = try FilePickerResponse.decodeBinary(data)
                     self.pendingFilePicker?.directory = response.path
                     self.pendingFilePicker?.parent = response.parent
                     self.pendingFilePicker?.entries = response.entries
@@ -3585,6 +3974,20 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
     private func handleMouseDragged(to point: CGPoint, modifierFlags: NSEvent.ModifierFlags) {
         _ = modifierFlags
+        if var pendingAppDrag {
+            pendingAppDrag.currentPoint = point
+            let dx = point.x - pendingAppDrag.startPoint.x
+            let dy = point.y - pendingAppDrag.startPoint.y
+            if hypot(dx, dy) >= 4 {
+                pendingAppDrag.isDragging = true
+                setCursorIfNeeded(.closedHand)
+            }
+            self.pendingAppDrag = pendingAppDrag
+            if pendingAppDrag.isDragging {
+                updateLayout()
+            }
+            return
+        }
         guard let pendingCreateTextDrag else { return }
         let dx = point.x - pendingCreateTextDrag.startPoint.x
         let dy = point.y - pendingCreateTextDrag.startPoint.y
@@ -3594,8 +3997,23 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func handleMouseUp(at point: CGPoint, modifierFlags: NSEvent.ModifierFlags) {
-        _ = point
-        _ = modifierFlags
+        if let pendingAppDrag {
+            self.pendingAppDrag = nil
+            if pendingAppDrag.isDragging {
+                let contentPoint = contentLayer.convert(point, from: rootLayer)
+                let appsPoint = appsLayer.convert(contentPoint, from: contentLayer)
+                if let target = appDropTarget(at: appsPoint, for: pendingAppDrag.item),
+                   target.listName != pendingAppDrag.item.frontend.listName {
+                    setFrontendList(for: pendingAppDrag.item, listName: target.listName)
+                } else {
+                    updateLayout()
+                }
+            } else {
+                openLauncherItem(pendingAppDrag.item, opensInNewTab: modifierFlags.contains(.command))
+            }
+            setCursorIfNeeded(.arrow)
+            return
+        }
         guard let pendingCreateTextDrag else { return }
         self.pendingCreateTextDrag = nil
         focusActiveCreateField()
@@ -3626,15 +4044,21 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         let isOverPasswordField = pendingPasswordAction != nil && passwordFieldFrame.contains(point)
         var isOverBundledApp = false
         var isOverDirectorySelect = false
+        var isOverAppTile = false
         if pendingPasswordAction == nil, mode == .create {
             let contentPoint = contentLayer.convert(point, from: rootLayer)
             let createPoint = createLayer.convert(contentPoint, from: contentLayer)
             isOverBundledApp = bundledAppInstallFrames.contains { $0.frame.contains(createPoint) }
             isOverDirectorySelect = createDirectorySelectFrames.contains { $0.frame.contains(createPoint) }
+        } else if pendingPasswordAction == nil, mode == .apps {
+            let contentPoint = contentLayer.convert(point, from: rootLayer)
+            let appsPoint = appsLayer.convert(contentPoint, from: contentLayer)
+            isOverAppTile = appCardFrames.contains { $0.frame.contains(appsPoint) } ||
+                            addAppFrame.contains(appsPoint)
         }
         if isOverCreateField || isOverPasswordField {
             setCursorIfNeeded(.iBeam)
-        } else if isOverBundledApp || isOverDirectorySelect {
+        } else if isOverBundledApp || isOverDirectorySelect || isOverAppTile {
             setCursorIfNeeded(.pointingHand)
         } else {
             setCursorIfNeeded(.arrow)
@@ -3782,7 +4206,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 return
             }
             if let card = appCardFrames.first(where: { $0.frame.contains(appsPoint) }) {
-                openLauncherItem(card.item, opensInNewTab: modifierFlags.contains(.command))
+                pendingAppDrag = PendingAppDrag(item: card.item,
+                                                startPoint: point,
+                                                currentPoint: point,
+                                                isDragging: false)
                 return
             }
         } else if mode == .backends {
@@ -4219,6 +4646,29 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 return AppLauncherItem(backend: backend, frontend: frontend, frontendIndex: index)
             }
         }
+    }
+
+    private func appLauncherSignature(for backends: [BackendRecord]) -> String {
+        backends.flatMap { backend -> [String] in
+            guard !backend.isBackendsSelf else { return [] }
+            return backend.frontends.compactMap { frontend in
+                guard frontend.hasEndpoint else { return nil }
+                let iconBytes = frontend.iconData?.count ?? 0
+                return [
+                    backend.serviceID,
+                    backend.displayName,
+                    frontend.url,
+                    frontend.name,
+                    frontend.socketPath,
+                    String(frontend.port),
+                    frontend.iconPath ?? "",
+                    String(iconBytes),
+                    frontend.listName
+                ].joined(separator: "\u{1f}")
+            }
+        }
+        .sorted()
+        .joined(separator: "\u{1e}")
     }
 
     private func appInitial(for name: String) -> String {
