@@ -292,9 +292,7 @@ log_path="$log_dir/HomeScreenBackend.log"
 runner_path="$install_root/run-home-screen.sh"
 
 if [ "$command" = "uninstall" ]; then
-    systemctl --user disable --now dev.outergroup.HomeScreen.socket >/dev/null 2>&1 || true
-    rm -f "$unit_dir/dev.outergroup.HomeScreen.service" "$unit_dir/dev.outergroup.HomeScreen.socket"
-    systemctl --user daemon-reload >/dev/null 2>&1 || true
+    systemctl --user disable dev.outergroup.HomeScreen.socket >/dev/null 2>&1 || true
     if command -v python3 >/dev/null 2>&1; then
         HOME_SCREEN_REGISTRY="$outerwebapps_home/registry.sqlite3" \
         HOME_SCREEN_SERVICE_ID="dev.outergroup.HomeScreen" \
@@ -317,7 +315,22 @@ with database:
 database.close()
 PY
     fi
-    rm -rf "$install_root"
+    cleanup_script="$(mktemp)"
+    cat > "$cleanup_script" <<EOF
+#!/bin/sh
+sleep 0.25
+systemctl --user stop dev.outergroup.HomeScreen.socket dev.outergroup.HomeScreen.service >/dev/null 2>&1 || true
+rm -f "$unit_dir/dev.outergroup.HomeScreen.service" "$unit_dir/dev.outergroup.HomeScreen.socket" "$socket_path"
+systemctl --user daemon-reload >/dev/null 2>&1 || true
+rm -rf "$install_root"
+rm -f "$cleanup_script"
+EOF
+    chmod 0755 "$cleanup_script"
+    if command -v systemd-run >/dev/null 2>&1; then
+        systemd-run --user --unit=dev.outergroup.HomeScreen-uninstall --collect "$cleanup_script" >/dev/null 2>&1 || (nohup "$cleanup_script" >/dev/null 2>&1 &)
+    else
+        nohup "$cleanup_script" >/dev/null 2>&1 &
+    fi
     printf 'Home Screen has been uninstalled. Outer Loop will offer to install it again the next time it connects.\n'
     exit 0
 fi
