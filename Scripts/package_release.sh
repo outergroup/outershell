@@ -5,16 +5,16 @@ export COPYFILE_DISABLE=1
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-OUTPUT_ROOT="${OUTPUT_ROOT:-${REPO_ROOT}/build/release/home-screen}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-${REPO_ROOT}/build/release/outer-shell}"
 RUN_ROOT="${RUN_ROOT:-${REPO_ROOT}/build/run}"
 PACKAGE_ROOT="${PACKAGE_ROOT:-${REPO_ROOT}/build/linux-package}"
 MACOS_BUILD_ROOT="${MACOS_BUILD_ROOT:-${REPO_ROOT}/build/macos/Release}"
 PUBLIC_BASE_URL="${PUBLIC_BASE_URL:-}"
 APP_CATALOG_PATH="${APP_CATALOG_PATH:-}"
-HOME_SCREEN_VERSION="${HOME_SCREEN_VERSION:-0.0.0.DEV}"
+OUTER_SHELL_VERSION="${OUTER_SHELL_VERSION:-0.0.0.DEV}"
 
 if [[ -z "${PUBLIC_BASE_URL}" ]]; then
-    echo "error: set PUBLIC_BASE_URL to the public Home Screen asset base URL" >&2
+    echo "error: set PUBLIC_BASE_URL to the public Outer Shell asset base URL" >&2
     exit 1
 fi
 PUBLIC_BASE_URL="${PUBLIC_BASE_URL%/}"
@@ -26,13 +26,13 @@ require_file() {
     fi
 }
 
-require_file "${PACKAGE_ROOT}/RemoteLinuxBinaries/aarch64/HomeScreenBackend"
-require_file "${PACKAGE_ROOT}/RemoteLinuxBinaries/x86_64/HomeScreenBackend"
+require_file "${PACKAGE_ROOT}/RemoteLinuxBinaries/aarch64/OuterShellBackend"
+require_file "${PACKAGE_ROOT}/RemoteLinuxBinaries/x86_64/OuterShellBackend"
 require_file "${PACKAGE_ROOT}/RemoteLinuxBinaries/aarch64/outerctl"
 require_file "${PACKAGE_ROOT}/RemoteLinuxBinaries/x86_64/outerctl"
 require_file "${RUN_ROOT}/bundles/BackendsContent.bundle.macos-arm.aar"
 require_file "${RUN_ROOT}/bundles/BackendsContent.bundle.macos-x86.aar"
-require_file "${MACOS_BUILD_ROOT}/Home Screen.app/Contents/MacOS/Home Screen"
+require_file "${MACOS_BUILD_ROOT}/Outer Shell.app/Contents/MacOS/Outer Shell"
 require_file "${REPO_ROOT}/app-icon.png"
 if [[ -n "${APP_CATALOG_PATH}" ]]; then
     require_file "${APP_CATALOG_PATH}"
@@ -49,20 +49,20 @@ trap 'rm -rf "${STAGING_ROOT}"' EXIT
 
 stage_home_screen() {
     local arch="$1"
-    local root="${STAGING_ROOT}/home-screen-${arch}/HomeScreen"
+    local root="${STAGING_ROOT}/outer-shell-${arch}/OuterShell"
     mkdir -p "${root}/bin" "${root}/bundles"
-    install -m 0755 "${PACKAGE_ROOT}/RemoteLinuxBinaries/${arch}/HomeScreenBackend" "${root}/HomeScreenBackend"
+    install -m 0755 "${PACKAGE_ROOT}/RemoteLinuxBinaries/${arch}/OuterShellBackend" "${root}/OuterShellBackend"
     install -m 0755 "${PACKAGE_ROOT}/RemoteLinuxBinaries/${arch}/outerctl" "${root}/bin/outerctl"
     install -m 0644 "${REPO_ROOT}/app-icon.png" "${root}/app-icon.png"
     install -m 0644 "${RUN_ROOT}/bundles/BackendsContent.bundle.macos-arm.aar" "${root}/bundles/BackendsContent.bundle.macos-arm.aar"
     install -m 0644 "${RUN_ROOT}/bundles/BackendsContent.bundle.macos-x86.aar" "${root}/bundles/BackendsContent.bundle.macos-x86.aar"
-    tar --format ustar --no-xattrs -C "${STAGING_ROOT}/home-screen-${arch}" -czf "${OUTPUT_ROOT}/latest/home-screen-${arch}.tar.gz" HomeScreen
+    tar --format ustar --no-xattrs -C "${STAGING_ROOT}/outer-shell-${arch}" -czf "${OUTPUT_ROOT}/latest/outer-shell-${arch}.tar.gz" OuterShell
 }
 
 stage_home_screen_macos() {
-    local root="${STAGING_ROOT}/home-screen-macos/HomeScreen"
+    local root="${STAGING_ROOT}/outer-shell-macos/OuterShell"
     mkdir -p "${root}/bin" "${root}/bundles"
-    ditto "${MACOS_BUILD_ROOT}/Home Screen.app" "${root}/Home Screen.app"
+    ditto "${MACOS_BUILD_ROOT}/Outer Shell.app" "${root}/Outer Shell.app"
     install -m 0644 "${REPO_ROOT}/app-icon.png" "${root}/app-icon.png"
     install -m 0644 "${RUN_ROOT}/bundles/BackendsContent.bundle.macos-arm.aar" "${root}/bundles/BackendsContent.bundle.macos-arm.aar"
     install -m 0644 "${RUN_ROOT}/bundles/BackendsContent.bundle.macos-x86.aar" "${root}/bundles/BackendsContent.bundle.macos-x86.aar"
@@ -72,7 +72,7 @@ stage_home_screen_macos() {
     clang++ -std=c++17 "${REPO_ROOT}/Resources/outerctl.cpp" \
         -lsqlite3 -framework CoreFoundation -o "${root}/bin/outerctl"
     chmod 0755 "${root}/bin/outerctl"
-    tar --format ustar --no-xattrs -C "${STAGING_ROOT}/home-screen-macos" -czf "${OUTPUT_ROOT}/latest/home-screen-macos.tar.gz" HomeScreen
+    tar --format ustar --no-xattrs -C "${STAGING_ROOT}/outer-shell-macos" -czf "${OUTPUT_ROOT}/latest/outer-shell-macos.tar.gz" OuterShell
 }
 
 stage_home_screen aarch64
@@ -80,7 +80,7 @@ stage_home_screen x86_64
 stage_home_screen_macos
 
 ASSET_VERSION="$(date -u +%Y%m%d%H%M%S)"
-printf '%s\n' "${HOME_SCREEN_VERSION}" > "${OUTPUT_ROOT}/latest/version.txt"
+printf '%s\n' "${OUTER_SHELL_VERSION}" > "${OUTPUT_ROOT}/latest/version.txt"
 cat > "${OUTPUT_ROOT}/latest/install.sh" <<'INSTALL_SH'
 #!/bin/sh
 set -eu
@@ -88,7 +88,7 @@ set -eu
 command="${1:-install}"
 case "$command" in
     install|update|uninstall) ;;
-    *) echo "Unsupported Home Screen installer command: $command" >&2; exit 2 ;;
+    *) echo "Unsupported Outer Shell installer command: $command" >&2; exit 2 ;;
 esac
 
 case "$(uname -m)" in
@@ -105,7 +105,7 @@ download() {
     elif command -v wget >/dev/null 2>&1; then
         wget -qO "$out" "$url"
     else
-        echo "curl or wget is required to install Home Screen." >&2
+        echo "curl or wget is required to install Outer Shell." >&2
         exit 127
     fi
 }
@@ -128,17 +128,17 @@ app_base_url="${public_base_url%/}/apps"
 
 if [ "$os_name" = "Darwin" ]; then
     outerwebapps_home="${OUTERWEBAPPS_HOME:-$HOME/Library/Application Support/outerwebapps}"
-    install_root="$outerwebapps_home/home-screen"
+    install_root="$outerwebapps_home/outer-shell"
     outerctl_path="$outerwebapps_home/bin/outerctl"
     launch_agent_dir="$HOME/Library/LaunchAgents"
-    plist_path="$launch_agent_dir/dev.outergroup.HomeScreen.plist"
-    socket_path="$(getconf DARWIN_USER_TEMP_DIR)dev.outergroup.HomeScreen"
-    log_dir="$HOME/Library/Logs/dev.outergroup.HomeScreen"
+    plist_path="$launch_agent_dir/org.outershell.OuterShell.plist"
+    socket_path="$(getconf DARWIN_USER_TEMP_DIR)org.outershell.OuterShell"
+    log_dir="$HOME/Library/Logs/org.outershell.OuterShell"
     log_path="$log_dir/output.log"
-    service_id="dev.outergroup.HomeScreen"
-    display_name="Home Screen"
+    service_id="org.outershell.OuterShell"
+    display_name="Outer Shell"
 
-    unload_home_screen() {
+    unload_outer_shell() {
         launchctl bootout "gui/$(id -u)/$service_id" >/dev/null 2>&1 || launchctl remove "$service_id" >/dev/null 2>&1 || true
         attempts=20
         while [ "$attempts" -gt 0 ]; do
@@ -151,12 +151,28 @@ if [ "$os_name" = "Darwin" ]; then
         return 0
     }
 
-    bootstrap_home_screen() {
+    cleanup_legacy_home_screen() {
+        legacy_service_id="dev.outergroup.HomeScreen"
+        legacy_plist_path="$launch_agent_dir/dev.outergroup.HomeScreen.plist"
+        legacy_socket_path="$(getconf DARWIN_USER_TEMP_DIR)dev.outergroup.HomeScreen"
+        legacy_install_root="$outerwebapps_home/home-screen"
+        launchctl bootout "gui/$(id -u)/$legacy_service_id" >/dev/null 2>&1 || launchctl remove "$legacy_service_id" >/dev/null 2>&1 || true
+        rm -f "$legacy_plist_path" "$legacy_socket_path"
+        rm -rf "$legacy_install_root"
+        if [ -x "$outerctl_path" ]; then
+            OUTERWEBAPPS_HOME="$outerwebapps_home" "$outerctl_path" app clear --backend "$legacy_service_id" >/dev/null 2>&1 || true
+            OUTERWEBAPPS_HOME="$outerwebapps_home" "$outerctl_path" log clear --backend "$legacy_service_id" >/dev/null 2>&1 || true
+            OUTERWEBAPPS_HOME="$outerwebapps_home" "$outerctl_path" launchd clear --backend "$legacy_service_id" >/dev/null 2>&1 || true
+            OUTERWEBAPPS_HOME="$outerwebapps_home" "$outerctl_path" backend remove --backend "$legacy_service_id" >/dev/null 2>&1 || true
+        fi
+    }
+
+    bootstrap_outer_shell() {
         if launchctl bootstrap "gui/$(id -u)" "$plist_path"; then
             return 0
         fi
         first_error="$(launchctl bootstrap "gui/$(id -u)" "$plist_path" 2>&1 >/dev/null || true)"
-        unload_home_screen
+        unload_outer_shell
         rm -f "$socket_path"
         if launchctl bootstrap "gui/$(id -u)" "$plist_path"; then
             return 0
@@ -172,7 +188,7 @@ if [ "$os_name" = "Darwin" ]; then
     }
 
     if [ "$command" = "uninstall" ]; then
-        unload_home_screen
+        unload_outer_shell
         rm -f "$plist_path" "$socket_path"
         if [ -x "$outerctl_path" ]; then
             OUTERWEBAPPS_HOME="$outerwebapps_home" "$outerctl_path" app clear --backend "$service_id" >/dev/null 2>&1 || true
@@ -181,27 +197,28 @@ if [ "$os_name" = "Darwin" ]; then
             OUTERWEBAPPS_HOME="$outerwebapps_home" "$outerctl_path" backend remove --backend "$service_id" >/dev/null 2>&1 || true
         fi
         rm -rf "$install_root"
-        printf 'Home Screen has been uninstalled. Outer Loop will offer to install it again the next time it connects.\n'
+        cleanup_legacy_home_screen
+        printf 'Outer Shell has been uninstalled. Outer Loop will offer to install it again the next time it connects.\n'
         exit 0
     fi
 
     mkdir -p "$install_root" "$outerwebapps_home/bin" "$launch_agent_dir" "$log_dir"
     archive_path="$(mktemp)"
-    download "${public_base_url%/}/latest/home-screen-macos.tar.gz?v=__ASSET_VERSION__" "$archive_path"
+    download "${public_base_url%/}/latest/outer-shell-macos.tar.gz?v=__ASSET_VERSION__" "$archive_path"
     rm -rf "$install_root"
     mkdir -p "$install_root" "$outerwebapps_home/bin" "$log_dir"
     tar -xzf "$archive_path" -C "$install_root" --strip-components=1
     rm -f "$archive_path"
-    chmod 0755 "$install_root/Home Screen.app/Contents/MacOS/Home Screen"
+    chmod 0755 "$install_root/Outer Shell.app/Contents/MacOS/Outer Shell"
     chmod 0755 "$install_root/bin/outerctl"
     install -m 0755 "$install_root/bin/outerctl" "$outerctl_path"
-    printf '%s\n' "__HOME_SCREEN_VERSION__" > "$install_root/version"
+    printf '%s\n' "__OUTER_SHELL_VERSION__" > "$install_root/version"
     touch "$log_path"
 
-    unload_home_screen
+    unload_outer_shell
     rm -f "$socket_path"
 
-    app_executable="$install_root/Home Screen.app/Contents/MacOS/Home Screen"
+    app_executable="$install_root/Outer Shell.app/Contents/MacOS/Outer Shell"
     bundles_dir="$install_root/bundles"
     bundled_apps_dir="$install_root/bundled-apps"
     app_executable_xml="$(xml_escape "$app_executable")"
@@ -217,7 +234,7 @@ if [ "$os_name" = "Darwin" ]; then
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>dev.outergroup.HomeScreen</string>
+  <string>org.outershell.OuterShell</string>
   <key>ProgramArguments</key>
   <array>
     <string>$app_executable_xml</string>
@@ -258,11 +275,12 @@ EOF
     OUTERWEBAPPS_HOME="$outerwebapps_home" "$outerctl_path" app add --backend "$service_id" --socket-path "$socket_path" --name "$display_name" --url "$socket_path" --icon-path "$install_root/app-icon.png"
     OUTERWEBAPPS_HOME="$outerwebapps_home" "$outerctl_path" log clear --backend "$service_id"
     OUTERWEBAPPS_HOME="$outerwebapps_home" "$outerctl_path" log add --backend "$service_id" --path "$log_path"
-    printf '[%s] %s Home Screen package %s from %s.\n' "$(timestamp)" "$command" "__HOME_SCREEN_VERSION__" "$public_base_url" >> "$log_path"
+    printf '[%s] %s Outer Shell package %s from %s.\n' "$(timestamp)" "$command" "__OUTER_SHELL_VERSION__" "$public_base_url" >> "$log_path"
 
-    bootstrap_home_screen
+    cleanup_legacy_home_screen
+    bootstrap_outer_shell
     if [ "$command" = "update" ]; then
-        printf 'Home Screen updated to %s. The new version will run the next time Home Screen starts.\n' "__HOME_SCREEN_VERSION__"
+        printf 'Outer Shell updated to %s. The new version will run the next time Outer Shell starts.\n' "__OUTER_SHELL_VERSION__"
         exit 0
     fi
 
@@ -276,32 +294,63 @@ EOF
         attempts=$((attempts - 1))
     done
 
-    echo "Home Screen installed, but $socket_path did not appear." >&2
+    echo "Outer Shell installed, but $socket_path did not appear." >&2
     exit 1
 fi
 
 runtime_dir="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 state_home="${XDG_STATE_HOME:-$HOME/.local/state}"
 outerwebapps_home="${OUTERWEBAPPS_HOME:-$state_home/outerwebapps}"
-install_root="$outerwebapps_home/home-screen"
+install_root="$outerwebapps_home/outer-shell"
 outerctl_path="$outerwebapps_home/bin/outerctl"
 unit_dir="$HOME/.config/systemd/user"
-socket_path="$runtime_dir/dev.outergroup.HomeScreen"
+socket_path="$runtime_dir/org.outershell.OuterShell"
 log_dir="$install_root/logs"
-log_path="$log_dir/HomeScreenBackend.log"
-runner_path="$install_root/run-home-screen.sh"
+log_path="$log_dir/OuterShellBackend.log"
+runner_path="$install_root/run-outer-shell.sh"
 
-if [ "$command" = "uninstall" ]; then
-    systemctl --user disable dev.outergroup.HomeScreen.socket >/dev/null 2>&1 || true
+cleanup_legacy_home_screen() {
+    legacy_install_root="$outerwebapps_home/home-screen"
+    legacy_socket_path="$runtime_dir/dev.outergroup.HomeScreen"
+    systemctl --user disable --now dev.outergroup.HomeScreen.socket dev.outergroup.HomeScreen.service >/dev/null 2>&1 || true
+    rm -f "$unit_dir/dev.outergroup.HomeScreen.service" "$unit_dir/dev.outergroup.HomeScreen.socket" "$legacy_socket_path"
+    systemctl --user daemon-reload >/dev/null 2>&1 || true
+    rm -rf "$legacy_install_root"
     if command -v python3 >/dev/null 2>&1; then
-        HOME_SCREEN_REGISTRY="$outerwebapps_home/registry.sqlite3" \
-        HOME_SCREEN_SERVICE_ID="dev.outergroup.HomeScreen" \
+        OUTER_SHELL_REGISTRY="$outerwebapps_home/registry.sqlite3" \
+        LEGACY_HOME_SCREEN_SERVICE_ID="dev.outergroup.HomeScreen" \
         python3 - <<'PY' || true
 import os
 import sqlite3
 
-database_path = os.environ["HOME_SCREEN_REGISTRY"]
-service_id = os.environ["HOME_SCREEN_SERVICE_ID"]
+database_path = os.environ["OUTER_SHELL_REGISTRY"]
+service_id = os.environ["LEGACY_HOME_SCREEN_SERVICE_ID"]
+try:
+    database = sqlite3.connect(database_path)
+except sqlite3.Error:
+    raise SystemExit(0)
+with database:
+    for table in ("frontends", "log_files", "systemd_backends", "backends"):
+        try:
+            database.execute(f"DELETE FROM {table} WHERE service_id = ?", (service_id,))
+        except sqlite3.Error:
+            pass
+database.close()
+PY
+    fi
+}
+
+if [ "$command" = "uninstall" ]; then
+    systemctl --user disable org.outershell.OuterShell.socket >/dev/null 2>&1 || true
+    if command -v python3 >/dev/null 2>&1; then
+        OUTER_SHELL_REGISTRY="$outerwebapps_home/registry.sqlite3" \
+        OUTER_SHELL_SERVICE_ID="org.outershell.OuterShell" \
+        python3 - <<'PY' || true
+import os
+import sqlite3
+
+database_path = os.environ["OUTER_SHELL_REGISTRY"]
+service_id = os.environ["OUTER_SHELL_SERVICE_ID"]
 try:
     database = sqlite3.connect(database_path)
 except sqlite3.Error:
@@ -319,83 +368,85 @@ PY
     cat > "$cleanup_script" <<EOF
 #!/bin/sh
 sleep 0.25
-systemctl --user stop dev.outergroup.HomeScreen.socket dev.outergroup.HomeScreen.service >/dev/null 2>&1 || true
-rm -f "$unit_dir/dev.outergroup.HomeScreen.service" "$unit_dir/dev.outergroup.HomeScreen.socket" "$socket_path"
+systemctl --user stop org.outershell.OuterShell.socket org.outershell.OuterShell.service >/dev/null 2>&1 || true
+rm -f "$unit_dir/org.outershell.OuterShell.service" "$unit_dir/org.outershell.OuterShell.socket" "$socket_path"
 systemctl --user daemon-reload >/dev/null 2>&1 || true
 rm -rf "$install_root"
 rm -f "$cleanup_script"
 EOF
     chmod 0755 "$cleanup_script"
     if command -v systemd-run >/dev/null 2>&1; then
-        systemd-run --user --unit=dev.outergroup.HomeScreen-uninstall --collect "$cleanup_script" >/dev/null 2>&1 || (nohup "$cleanup_script" >/dev/null 2>&1 &)
+        systemd-run --user --unit=org.outershell.OuterShell-uninstall --collect "$cleanup_script" >/dev/null 2>&1 || (nohup "$cleanup_script" >/dev/null 2>&1 &)
     else
         nohup "$cleanup_script" >/dev/null 2>&1 &
     fi
-    printf 'Home Screen has been uninstalled. Outer Loop will offer to install it again the next time it connects.\n'
+    cleanup_legacy_home_screen
+    printf 'Outer Shell has been uninstalled. Outer Loop will offer to install it again the next time it connects.\n'
     exit 0
 fi
 
 mkdir -p "$install_root" "$outerwebapps_home/bin" "$unit_dir" "$log_dir"
+cleanup_legacy_home_screen
 archive_path="$(mktemp)"
-download "${public_base_url%/}/latest/home-screen-${arch}.tar.gz?v=__ASSET_VERSION__" "$archive_path"
+download "${public_base_url%/}/latest/outer-shell-${arch}.tar.gz?v=__ASSET_VERSION__" "$archive_path"
 tar -xzf "$archive_path" -C "$install_root" --strip-components=1
 rm -f "$archive_path"
-chmod 0755 "$install_root/HomeScreenBackend"
+chmod 0755 "$install_root/OuterShellBackend"
 chmod 0755 "$install_root/bin/outerctl"
 install -m 0755 "$install_root/bin/outerctl" "$outerctl_path"
-printf '%s\n' "__HOME_SCREEN_VERSION__" > "$install_root/version"
+printf '%s\n' "__OUTER_SHELL_VERSION__" > "$install_root/version"
 touch "$log_path"
 
 cat > "$runner_path" <<EOF
 #!/bin/sh
-exec "$install_root/HomeScreenBackend" --socket-path "\${1:-$socket_path}" --bundles-dir "$install_root/bundles" --bundled-apps-dir "$install_root/bundled-apps" --app-base-url "$app_base_url" --public-base-url "$public_base_url" >> "$log_path" 2>&1
+exec "$install_root/OuterShellBackend" --socket-path "\${1:-$socket_path}" --bundles-dir "$install_root/bundles" --bundled-apps-dir "$install_root/bundled-apps" --app-base-url "$app_base_url" --public-base-url "$public_base_url" >> "$log_path" 2>&1
 EOF
 chmod 0755 "$runner_path"
 
-cat > "$unit_dir/dev.outergroup.HomeScreen.service" <<EOF
+cat > "$unit_dir/org.outershell.OuterShell.service" <<EOF
 [Unit]
-Description=Outer Group Home Screen
+Description=Outer Group Outer Shell
 
 [Service]
 Environment=OUTERWEBAPPS_HOME=$outerwebapps_home
-ExecStart=$runner_path %t/dev.outergroup.HomeScreen
+ExecStart=$runner_path %t/org.outershell.OuterShell
 Restart=no
 EOF
 
-cat > "$unit_dir/dev.outergroup.HomeScreen.socket" <<EOF
+cat > "$unit_dir/org.outershell.OuterShell.socket" <<EOF
 [Unit]
-Description=Outer Group Home Screen Socket
+Description=Outer Group Outer Shell Socket
 
 [Socket]
-ListenStream=%t/dev.outergroup.HomeScreen
+ListenStream=%t/org.outershell.OuterShell
 SocketMode=0600
 
 [Install]
 WantedBy=sockets.target
 EOF
 
-printf '[%s] %s Home Screen package %s from %s.\n' "$(timestamp)" "$command" "__HOME_SCREEN_VERSION__" "$public_base_url" >> "$log_path"
+printf '[%s] %s Outer Shell package %s from %s.\n' "$(timestamp)" "$command" "__OUTER_SHELL_VERSION__" "$public_base_url" >> "$log_path"
 
 if command -v python3 >/dev/null 2>&1; then
-    HOME_SCREEN_REGISTRY="$outerwebapps_home/registry.sqlite3" \
-    HOME_SCREEN_SERVICE_ID="dev.outergroup.HomeScreen" \
-    HOME_SCREEN_DISPLAY_NAME="Home Screen" \
-    HOME_SCREEN_UNIT_NAME="dev.outergroup.HomeScreen.service" \
-    HOME_SCREEN_SOCKET_PATH="$socket_path" \
-    HOME_SCREEN_LOG_PATH="$log_path" \
-    HOME_SCREEN_ICON_PATH="$install_root/app-icon.png" \
+    OUTER_SHELL_REGISTRY="$outerwebapps_home/registry.sqlite3" \
+    OUTER_SHELL_SERVICE_ID="org.outershell.OuterShell" \
+    OUTER_SHELL_DISPLAY_NAME="Outer Shell" \
+    OUTER_SHELL_UNIT_NAME="org.outershell.OuterShell.service" \
+    OUTER_SHELL_SOCKET_PATH="$socket_path" \
+    OUTER_SHELL_LOG_PATH="$log_path" \
+    OUTER_SHELL_ICON_PATH="$install_root/app-icon.png" \
     python3 - <<'PY'
 import base64
 import os
 import sqlite3
 
-database_path = os.environ["HOME_SCREEN_REGISTRY"]
-service_id = os.environ["HOME_SCREEN_SERVICE_ID"]
-display_name = os.environ["HOME_SCREEN_DISPLAY_NAME"]
-unit_name = os.environ["HOME_SCREEN_UNIT_NAME"]
-socket_path = os.environ["HOME_SCREEN_SOCKET_PATH"]
-log_path = os.environ["HOME_SCREEN_LOG_PATH"]
-icon_path = os.environ["HOME_SCREEN_ICON_PATH"]
+database_path = os.environ["OUTER_SHELL_REGISTRY"]
+service_id = os.environ["OUTER_SHELL_SERVICE_ID"]
+display_name = os.environ["OUTER_SHELL_DISPLAY_NAME"]
+unit_name = os.environ["OUTER_SHELL_UNIT_NAME"]
+socket_path = os.environ["OUTER_SHELL_SOCKET_PATH"]
+log_path = os.environ["OUTER_SHELL_LOG_PATH"]
+icon_path = os.environ["OUTER_SHELL_ICON_PATH"]
 
 def registry_icon_value(path):
     try:
@@ -494,17 +545,17 @@ with database:
 database.close()
 PY
 else
-    printf '[%s] python3 is unavailable; skipped registry update for Home Screen logs.\n' "$(timestamp)" >> "$log_path"
+    printf '[%s] python3 is unavailable; skipped registry update for Outer Shell logs.\n' "$(timestamp)" >> "$log_path"
 fi
 
 if [ "$command" = "install" ]; then
-    systemctl --user stop dev.outergroup.HomeScreen.service >/dev/null 2>&1 || true
+    systemctl --user stop org.outershell.OuterShell.service >/dev/null 2>&1 || true
 fi
 systemctl --user daemon-reload
-systemctl --user enable --now dev.outergroup.HomeScreen.socket
+systemctl --user enable --now org.outershell.OuterShell.socket
 
 if [ "$command" = "update" ]; then
-    printf 'Home Screen updated to %s. The new version will run the next time Home Screen starts.\n' "__HOME_SCREEN_VERSION__"
+    printf 'Outer Shell updated to %s. The new version will run the next time Outer Shell starts.\n' "__OUTER_SHELL_VERSION__"
     exit 0
 fi
 
@@ -518,7 +569,7 @@ while [ "$attempts" -gt 0 ]; do
     attempts=$((attempts - 1))
 done
 
-echo "Home Screen installed, but $socket_path did not appear." >&2
+echo "Outer Shell installed, but $socket_path did not appear." >&2
 exit 1
 INSTALL_SH
 python3 - "${OUTPUT_ROOT}/latest/install.sh" "${ASSET_VERSION}" "${PUBLIC_BASE_URL}" <<'PY'
@@ -529,16 +580,16 @@ path = Path(sys.argv[1])
 text = path.read_text()
 text = text.replace("__ASSET_VERSION__", sys.argv[2])
 text = text.replace("__PUBLIC_BASE_URL__", sys.argv[3])
-text = text.replace("__HOME_SCREEN_VERSION__", "__HOME_SCREEN_VERSION_REPLACE__")
+text = text.replace("__OUTER_SHELL_VERSION__", "__OUTER_SHELL_VERSION_REPLACE__")
 path.write_text(text)
 PY
-python3 - "${OUTPUT_ROOT}/latest/install.sh" "${HOME_SCREEN_VERSION}" <<'PY'
+python3 - "${OUTPUT_ROOT}/latest/install.sh" "${OUTER_SHELL_VERSION}" <<'PY'
 import sys
 from pathlib import Path
 
 path = Path(sys.argv[1])
 text = path.read_text()
-text = text.replace("__HOME_SCREEN_VERSION_REPLACE__", sys.argv[2])
+text = text.replace("__OUTER_SHELL_VERSION_REPLACE__", sys.argv[2])
 path.write_text(text)
 PY
 chmod 0755 "${OUTPUT_ROOT}/latest/install.sh"

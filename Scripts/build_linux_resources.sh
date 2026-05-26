@@ -35,7 +35,7 @@ OUTPUT_DIR="${REPO_ROOT}/build/linux-package/RemoteLinuxBinaries/${ARCH}"
 mkdir -p "${OUTPUT_DIR}"
 cc -std=gnu17 -Os -ffunction-sections -fdata-sections -flto \
     -I"${SQLITE_DIR}" \
-    -o "${OUTPUT_DIR}/HomeScreenBackend" \
+    -o "${OUTPUT_DIR}/OuterShellBackend" \
     "${REPO_ROOT}/Backend/main.c" \
     "${SQLITE_DIR}/sqlite3.c" \
     -ldl -lpthread -lm
@@ -53,8 +53,8 @@ c++ -std=c++17 -Os -ffunction-sections -fdata-sections -flto \
     -ldl -lpthread -lm
 
 if command -v strip >/dev/null 2>&1; then
-    strip --strip-unneeded "${OUTPUT_DIR}/HomeScreenBackend" || true
+    strip --strip-unneeded "${OUTPUT_DIR}/OuterShellBackend" || true
     strip --strip-unneeded "${OUTPUT_DIR}/outerctl" || true
 fi
 
-echo "Built Home Screen Linux resource for ${ARCH}"
+echo "Built Outer Shell Linux resource for ${ARCH}"

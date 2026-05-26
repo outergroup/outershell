@@ -1,6 +1,6 @@
-# Home Screen
+# Outer Shell
 
-Home Screen is an outerframe app for launching apps and viewing the backends registered on the machine where the app is running. It reads the Outer Loop registry SQLite database directly and tails registered log files in place, so logs do not need to be synced back to Outer Loop.
+Outer Shell is an outerframe app for launching apps and viewing the backends registered on the machine where the app is running. It reads the Outer Loop registry SQLite database directly and tails registered log files in place, so logs do not need to be synced back to Outer Loop.
 
 This app will replace the old Outer Loop Services UI and the built-in log viewer. It currently includes:
 
@@ -8,7 +8,7 @@ This app will replace the old Outer Loop Services UI and the built-in log viewer
 - An inline log viewer for the selected backend
 - Start, stop, uninstall, and create flows for systemd-managed backends
 - User or root installation for bundled systemd backends
-- Starter app installation from the Home Screen app catalog
+- Starter app installation from the Outer Shell app catalog
 
 ## Build
 
@@ -18,12 +18,12 @@ This app will replace the old Outer Loop Services UI and the built-in log viewer
 
 ## Run
 
-For localhost on macOS, use the Home Screen agent app. It hosts the Home Screen
+For localhost on macOS, use the Outer Shell agent app. It hosts the Outer Shell
 socket and owns the menu bar service-list item from one process:
 
 ```bash
-SOCKET_PATH="$(getconf DARWIN_USER_TEMP_DIR)dev.outergroup.HomeScreen"
-"./build/macos/Release/Home Screen.app/Contents/MacOS/Home Screen" \
+SOCKET_PATH="$(getconf DARWIN_USER_TEMP_DIR)org.outershell.OuterShell"
+"./build/macos/Release/Outer Shell.app/Contents/MacOS/Outer Shell" \
   --socket-path "$SOCKET_PATH" \
   --bundles-dir ./build/run/bundles \
   --bundled-apps-dir ./build/run/bundled-apps
@@ -33,7 +33,7 @@ For backend-only development:
 
 ```bash
 PORT=7354
-./build/macos/Release/HomeScreenBackend --port "$PORT" --bundles-dir ./build/run/bundles
+./build/macos/Release/OuterShellBackend --port "$PORT" --bundles-dir ./build/run/bundles
 ```
 
 Open this URL in Outer Loop or Outerframe:
@@ -45,24 +45,24 @@ http://127.0.0.1:7354/
 For ad hoc Unix socket testing:
 
 ```bash
-SOCKET_PATH="$(getconf DARWIN_USER_TEMP_DIR)dev.outergroup.HomeScreen"
-./build/macos/Release/HomeScreenBackend \
+SOCKET_PATH="$(getconf DARWIN_USER_TEMP_DIR)org.outershell.OuterShell"
+./build/macos/Release/OuterShellBackend \
   --socket-path "$SOCKET_PATH" \
   --bundles-dir ./build/run/bundles
 ```
 
-For a macOS LaunchAgent, prefer the Home Screen agent app with launchd-owned
+For a macOS LaunchAgent, prefer the Outer Shell agent app with launchd-owned
 socket activation. Use the per-user Darwin temp directory as the closest macOS
-analogue to `XDG_RUNTIME_DIR`, and use `dev.outergroup.HomeScreen` as the
+analogue to `XDG_RUNTIME_DIR`, and use `org.outershell.OuterShell` as the
 socket filename. `RunAtLoad` keeps the menu bar item available at login, while
 the same process also receives socket-activation traffic:
 
 ```xml
 <key>ProgramArguments</key>
 <array>
-  <string>/path/to/Home Screen.app/Contents/MacOS/Home Screen</string>
+  <string>/path/to/Outer Shell.app/Contents/MacOS/Outer Shell</string>
   <string>--socket-path</string>
-  <string>/var/folders/.../T/dev.outergroup.HomeScreen</string>
+  <string>/var/folders/.../T/org.outershell.OuterShell</string>
   <string>--bundles-dir</string>
   <string>/path/to/bundles</string>
 </array>
@@ -77,7 +77,7 @@ the same process also receives socket-activation traffic:
   <key>Listener</key>
   <dict>
     <key>SockPathName</key>
-    <string>/var/folders/.../T/dev.outergroup.HomeScreen</string>
+    <string>/var/folders/.../T/org.outershell.OuterShell</string>
     <key>SockPathMode</key>
     <integer>384</integer>
   </dict>
@@ -87,21 +87,21 @@ the same process also receives socket-activation traffic:
 Then register the socket with `outerctl`:
 
 ```bash
-outerctl app add --backend dev.outergroup.HomeScreen \
+outerctl app add --backend org.outershell.OuterShell \
   --socket-path "$SOCKET_PATH" \
-  --name "Home Screen" \
+  --name "Outer Shell" \
   --url http+unix://$SOCKET_PATH/ \
   --icon-path /path/to/app-icon.png
 ```
 
-Home Screen uses `/` for Apps, `/backends` for the backend table, and `/new` for
+Outer Shell uses `/` for Apps, `/backends` for the backend table, and `/new` for
 the create flow.
 
 For a user systemd unit, use `%t` for the socket root so systemd resolves it to
 the user's `XDG_RUNTIME_DIR`:
 
 ```ini
-ExecStart=/path/to/HomeScreenBackend --socket-path %t/dev.outergroup.HomeScreen --bundles-dir /path/to/bundles
+ExecStart=/path/to/OuterShellBackend --socket-path %t/org.outershell.OuterShell --bundles-dir /path/to/bundles
 ```
 
 By default the backend reads the user registry. On Linux:
@@ -129,7 +129,7 @@ Writable SQLite registries are also exported to the experimental binary
 the authoritative registry until the read/write paths are switched over.
 
 ```bash
-./build/macos/Release/HomeScreenBackend \
+./build/macos/Release/OuterShellBackend \
   --port 7354 \
   --bundles-dir ./build/run/bundles \
   --database ~/.local/state/outerwebapps/registry.sqlite3
@@ -137,17 +137,17 @@ the authoritative registry until the read/write paths are switched over.
 
 ## Starter App Catalog
 
-Home Screen keeps only the starter app catalog in this repo. The catalog is
+Outer Shell keeps only the starter app catalog in this repo. The catalog is
 [Resources/app-catalog.json](/Users/mrcslws/dev/src/Backends/Resources/app-catalog.json);
 each listed app owns its backend/frontend build and publishes its tarball from
 its own repo.
 
-At runtime, Home Screen looks for app payloads in `build/run/bundled-apps` next
+At runtime, Outer Shell looks for app payloads in `build/run/bundled-apps` next
 to a local build, then in the directory passed with `--bundled-apps-dir` or
 `BACKENDS_BUNDLED_APPS_DIR`. If a Linux starter app payload is not present
-locally, Home Screen downloads it from the catalog URL into
-`$XDG_CACHE_HOME/outerwebapps/home-screen/bundled-apps` or
-`~/.cache/outerwebapps/home-screen/bundled-apps`.
+locally, Outer Shell downloads it from the catalog URL into
+`$XDG_CACHE_HOME/outerwebapps/outer-shell/bundled-apps` or
+`~/.cache/outerwebapps/outer-shell/bundled-apps`.
 
 Starter app tarballs use this layout:
 
@@ -164,7 +164,7 @@ Starter app tarballs use this layout:
   app-icon.png
 ```
 
-Home Screen currently offers Top, Files, Network Inspector, and Firehose on
+Outer Shell currently offers Top, Files, Network Inspector, and Firehose on
 Linux/SSH, and Top on localhost macOS. `build_run.sh` builds and stages the
 macOS Top payload from the `~/dev/src/Top` checkout for local testing;
 install-time code only copies that prebuilt payload.
@@ -173,21 +173,21 @@ On Linux, when a bundled app is installed for the current user, Backends copies 
 
 Bundled apps can also be installed as root from the action menu. Root installs use a system systemd unit, copy the payload into `/opt/outergroup/<service id>`, write logs under `/var/log/outergroup`, write registry metadata to `/var/lib/outerwebapps/registry.sqlite3`, and put Unix sockets under the system runtime directory, such as `/run/dev.outergroup.Top`. These operations use `sudo`; if sudo needs a password, the Backends UI prompts and retries the operation.
 
-Bundled apps register their own frontend with the `outerctl` installed by Home Screen. On Linux, the public Home Screen installer places it at `${XDG_STATE_HOME:-~/.local/state}/outerwebapps/bin/outerctl`; generated user systemd units use that path. Root-installed bundled apps run it through a small wrapper that sets `OUTERWEBAPPS_HOME=/var/lib/outerwebapps`, so frontend and log metadata are recorded in the system registry.
+Bundled apps register their own frontend with the `outerctl` installed by Outer Shell. On Linux, the public Outer Shell installer places it at `${XDG_STATE_HOME:-~/.local/state}/outerwebapps/bin/outerctl`; generated user systemd units use that path. Root-installed bundled apps run it through a small wrapper that sets `OUTERWEBAPPS_HOME=/var/lib/outerwebapps`, so frontend and log metadata are recorded in the system registry.
 
 ## Remote Distribution
 
-Home Screen can be published as a small Linux installer plus per-architecture
+Outer Shell can be published as a small Linux installer plus per-architecture
 archives. The generated installer installs a user systemd socket at:
 
 ```text
-$XDG_RUNTIME_DIR/dev.outergroup.HomeScreen
+$XDG_RUNTIME_DIR/org.outershell.OuterShell
 ```
 
 and expands the matching architecture payload under:
 
 ```text
-${XDG_STATE_HOME:-~/.local/state}/outerwebapps/home-screen
+${XDG_STATE_HOME:-~/.local/state}/outerwebapps/outer-shell
 ```
 
 See [Resources/README.md](/Users/mrcslws/dev/src/Backends/Resources/README.md)

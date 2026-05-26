@@ -3,11 +3,11 @@ import Darwin
 import Foundation
 import SQLite3
 
-@_silgen_name("HomeScreenBackendMain")
-private func HomeScreenBackendMain(_ argc: Int32, _ argv: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?) -> Int32
+@_silgen_name("OuterShellBackendMain")
+private func OuterShellBackendMain(_ argc: Int32, _ argv: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?) -> Int32
 
-@_silgen_name("HomeScreenBackendRequestShutdown")
-private func HomeScreenBackendRequestShutdown()
+@_silgen_name("OuterShellBackendRequestShutdown")
+private func OuterShellBackendRequestShutdown()
 
 private struct HostedFrontend: Equatable {
     let serviceID: String
@@ -96,14 +96,14 @@ private enum RefreshMode {
     case background
 }
 
-private enum HomeScreenRegistry {
+private enum OuterShellRegistry {
     static func loadBackends() throws -> [ManagedBackend] {
         var merged: [String: PartialBackend] = [:]
         for path in registryPaths() where FileManager.default.isReadableFile(atPath: path) {
             try loadRegistry(at: path, into: &merged)
         }
         return merged.values
-            .filter { !isHomeScreenServiceID($0.serviceID) }
+            .filter { !isOuterShellServiceID($0.serviceID) }
             .map { partial in
                 let state = launchdState(serviceID: partial.serviceID, plistPath: partial.plistPath)
                 return ManagedBackend(serviceID: partial.serviceID,
@@ -148,9 +148,9 @@ private enum HomeScreenRegistry {
         return Array(Set(paths))
     }
 
-    private static func isHomeScreenServiceID(_ serviceID: String) -> Bool {
+    private static func isOuterShellServiceID(_ serviceID: String) -> Bool {
         let value = serviceID.trimmingCharacters(in: .whitespacesAndNewlines)
-        return value == "dev.outergroup.HomeScreen" ||
+        return value == "org.outershell.OuterShell" ||
             value == "dev.outergroup.Navigator" ||
             value == "dev.outergroup.Backends"
     }
@@ -609,7 +609,7 @@ private final class ServiceActionMenuItemView: NSView {
 }
 
 @MainActor
-private final class HomeScreenAgentDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
+private final class OuterShellAgentDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem?
     private let menu = NSMenu()
     private var services: [ManagedBackend] = []
@@ -636,7 +636,7 @@ private final class HomeScreenAgentDelegate: NSObject, NSApplicationDelegate, NS
         refreshTimer?.invalidate()
         followUpRefreshTask?.cancel()
         cancelAllServiceExitMonitors()
-        HomeScreenBackendRequestShutdown()
+        OuterShellBackendRequestShutdown()
     }
 
     func menuWillOpen(_ menu: NSMenu) {
@@ -648,7 +648,7 @@ private final class HomeScreenAgentDelegate: NSObject, NSApplicationDelegate, NS
         backendThread = Thread {
             _ = runBackend(arguments: arguments)
         }
-        backendThread?.name = "HomeScreenBackend"
+        backendThread?.name = "OuterShellBackend"
         backendThread?.start()
     }
 
@@ -681,7 +681,7 @@ private final class HomeScreenAgentDelegate: NSObject, NSApplicationDelegate, NS
         item.menu = menu
         statusItem = item
         if let button = item.button {
-            let image = NSImage(systemSymbolName: "server.rack", accessibilityDescription: "Home Screen")
+            let image = NSImage(systemSymbolName: "server.rack", accessibilityDescription: "Outer Shell")
             image?.isTemplate = true
             button.image = image
             button.imagePosition = .imageLeading
@@ -695,7 +695,7 @@ private final class HomeScreenAgentDelegate: NSObject, NSApplicationDelegate, NS
         let previousError = lastError
         let previousPendingActions = pendingLifecycleActions
         do {
-            services = mergePendingLifecycleActions(into: try HomeScreenRegistry.loadBackends())
+            services = mergePendingLifecycleActions(into: try OuterShellRegistry.loadBackends())
             lastError = nil
             reconcileServiceExitMonitors()
         } catch {
@@ -735,8 +735,8 @@ private final class HomeScreenAgentDelegate: NSObject, NSApplicationDelegate, NS
             }
         }
         menu.addItem(.separator())
-        let manage = NSMenuItem(title: "Open Home Screen in Outer Loop",
-                                action: #selector(openHomeScreen(_:)),
+        let manage = NSMenuItem(title: "Open Outer Shell in Outer Loop",
+                                action: #selector(openOuterShell(_:)),
                                 keyEquivalent: "")
         manage.target = self
         menu.addItem(manage)
@@ -1027,15 +1027,15 @@ private final class HomeScreenAgentDelegate: NSObject, NSApplicationDelegate, NS
         return displayNameOrder == .orderedAscending
     }
 
-    @objc private func openHomeScreen(_ sender: Any?) {
-        var frontend = HostedFrontend(serviceID: "dev.outergroup.HomeScreen",
-                                      name: "Home Screen",
+    @objc private func openOuterShell(_ sender: Any?) {
+        var frontend = HostedFrontend(serviceID: "org.outershell.OuterShell",
+                                      name: "Outer Shell",
                                       port: 0,
                                       socketPath: defaultSocketPath(),
                                       url: "/")
-        if let registered = try? HomeScreenRegistry.loadBackends()
+        if let registered = try? OuterShellRegistry.loadBackends()
             .flatMap(\.frontends)
-            .first(where: { $0.serviceID == "dev.outergroup.HomeScreen" }) {
+            .first(where: { $0.serviceID == "org.outershell.OuterShell" }) {
             frontend = registered
         }
         if let url = outerLoopHostedAppURL(frontend) {
@@ -1071,7 +1071,7 @@ private func runBackend(arguments: [String]) -> Int32 {
         }
     }
     return cStrings.withUnsafeMutableBufferPointer { buffer in
-        HomeScreenBackendMain(Int32(arguments.count), buffer.baseAddress)
+        OuterShellBackendMain(Int32(arguments.count), buffer.baseAddress)
     }
 }
 
@@ -1080,15 +1080,15 @@ private func runLifecycleCommand(for service: ManagedBackend) -> Bool {
         return false
     }
     if service.state.isRunning {
-        return HomeScreenRegistry.runProcess("/bin/launchctl", ["bootout", "\(service.launchdDomain)/\(service.serviceID)"])?.status == 0
+        return OuterShellRegistry.runProcess("/bin/launchctl", ["bootout", "\(service.launchdDomain)/\(service.serviceID)"])?.status == 0
     }
 
-    _ = HomeScreenRegistry.runProcess("/bin/launchctl", ["bootout", "\(service.launchdDomain)/\(service.serviceID)"])
-    _ = HomeScreenRegistry.runProcess("/bin/launchctl", ["remove", service.serviceID])
-    guard HomeScreenRegistry.runProcess("/bin/launchctl", ["bootstrap", "gui/\(getuid())", service.plistPath])?.status == 0 else {
+    _ = OuterShellRegistry.runProcess("/bin/launchctl", ["bootout", "\(service.launchdDomain)/\(service.serviceID)"])
+    _ = OuterShellRegistry.runProcess("/bin/launchctl", ["remove", service.serviceID])
+    guard OuterShellRegistry.runProcess("/bin/launchctl", ["bootstrap", "gui/\(getuid())", service.plistPath])?.status == 0 else {
         return false
     }
-    return HomeScreenRegistry.runProcess("/bin/launchctl", ["kickstart", "-k", "\(service.launchdDomain)/\(service.serviceID)"])?.status == 0
+    return OuterShellRegistry.runProcess("/bin/launchctl", ["kickstart", "-k", "\(service.launchdDomain)/\(service.serviceID)"])?.status == 0
 }
 
 private func containsOption(_ args: [String], _ option: String) -> Bool {
@@ -1104,7 +1104,7 @@ private func defaultSocketPath() -> String {
     } else {
         directory = NSTemporaryDirectory()
     }
-    return (directory as NSString).appendingPathComponent("dev.outergroup.HomeScreen")
+    return (directory as NSString).appendingPathComponent("org.outershell.OuterShell")
 }
 
 private func defaultBundlesPath() -> String {
@@ -1124,11 +1124,11 @@ private func defaultBundledAppsPath() -> String {
 }
 
 @main
-private enum HomeScreenAgentMain {
+private enum OuterShellAgentMain {
     @MainActor
     static func main() {
         let app = NSApplication.shared
-        let delegate = HomeScreenAgentDelegate()
+        let delegate = OuterShellAgentDelegate()
         app.delegate = delegate
         app.run()
     }

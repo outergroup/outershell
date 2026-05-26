@@ -45,7 +45,7 @@ extern int launch_activate_socket(const char *name, int **fds, size_t *cnt);
 #define SYSTEMD_STATUS_CACHE_TTL_MS 1500
 #define MAX_SYSTEMD_STATUS_ENTRIES 512
 
-static const char *kHomeScreenServiceID = "dev.outergroup.HomeScreen";
+static const char *kOuterShellServiceID = "org.outershell.OuterShell";
 static const char *kLegacyNavigatorServiceID = "dev.outergroup.Navigator";
 static const char *kLegacyBackendsServiceID = "dev.outergroup.Backends";
 static const char *kMigrationServiceID = "dev.outergroup.OuterwebappsMigration";
@@ -210,7 +210,7 @@ static const BundledAppDefinition kBundledApps[] = {
 
 static bool is_home_screen_service_id(const char *service_id) {
     return service_id &&
-           (strcmp(service_id, kHomeScreenServiceID) == 0 ||
+           (strcmp(service_id, kOuterShellServiceID) == 0 ||
             strcmp(service_id, kLegacyNavigatorServiceID) == 0 ||
             strcmp(service_id, kLegacyBackendsServiceID) == 0);
 }
@@ -229,7 +229,7 @@ static void handle_shutdown_signal(int signal_number) {
     }
 }
 
-void HomeScreenBackendRequestShutdown(void) {
+void OuterShellBackendRequestShutdown(void) {
     handle_shutdown_signal(SIGTERM);
 }
 
@@ -703,7 +703,7 @@ static void default_user_home_screen_install_root(char *out, size_t out_size) {
     if (!out || out_size == 0) return;
     char root[PATH_MAX];
     default_user_outerwebapps_root(root, sizeof(root));
-    snprintf(out, out_size, "%s/home-screen", root);
+    snprintf(out, out_size, "%s/outer-shell", root);
 }
 
 static void default_user_outerwebapps_app_root(const char *install_name, char *out, size_t out_size) {
@@ -746,7 +746,7 @@ static void legacy_home_screen_outerctl_path(char *out, size_t out_size) {
 #ifdef __APPLE__
     snprintf(out, out_size, "%s/Library/dev.outergroup.OuterLoop/outerctl", home_directory());
 #else
-    snprintf(out, out_size, "%s/.outerloop/home-screen/bin/outerctl", home_directory());
+    snprintf(out, out_size, "%s/.outerloop/outer-shell/bin/outerctl", home_directory());
 #endif
 }
 
@@ -1043,7 +1043,7 @@ static bool download_bundled_app_stage(const BundledAppDefinition *app,
     join_url_path(archive_url, sizeof(archive_url), g_bundled_apps_base_url, app->archive_name);
     if (!archive_url[0]) {
         snprintf(message, message_size,
-                 "No app download URL is configured for %s. Pass --app-base-url or set HOME_SCREEN_APP_BASE_URL.",
+                 "No app download URL is configured for %s. Pass --app-base-url or set OUTER_SHELL_APP_BASE_URL.",
                  app->display_name);
         return false;
     }
@@ -1055,9 +1055,9 @@ static bool download_bundled_app_stage(const BundledAppDefinition *app,
     const char *cache_home = getenv("XDG_CACHE_HOME");
     char cache_root[PATH_MAX];
     if (cache_home && cache_home[0]) {
-        snprintf(cache_root, sizeof(cache_root), "%s/outerwebapps/home-screen/bundled-apps", cache_home);
+        snprintf(cache_root, sizeof(cache_root), "%s/outerwebapps/outer-shell/bundled-apps", cache_home);
     } else {
-        snprintf(cache_root, sizeof(cache_root), "%s/.cache/outerwebapps/home-screen/bundled-apps", home_directory());
+        snprintf(cache_root, sizeof(cache_root), "%s/.cache/outerwebapps/outer-shell/bundled-apps", home_directory());
     }
     if (!mkdir_p(cache_root)) {
         snprintf(message, message_size, "Failed to create app download cache at %s: %s", cache_root, strerror(errno));
@@ -3550,7 +3550,7 @@ static bool file_contains_any_legacy_outerwebapps_text(const char *path) {
     if (!contents) return false;
     bool found = strstr(contents, "OUTERAGENT_ROOT") ||
                  strstr(contents, ".outeragent/outerctl") ||
-                 strstr(contents, ".outerloop/home-screen/bin/outerctl") ||
+                 strstr(contents, ".outerloop/outer-shell/bin/outerctl") ||
                  strstr(contents, "/var/lib/outergroup/outeragent") ||
                  strstr(contents, "outeragent.log");
     free(contents);
@@ -3949,7 +3949,7 @@ static void send_control_response(int fd, const char *query, const char *body) {
 
     if (is_home_screen_service_id(service_id)) {
         char message[4096] = "";
-        if (strcmp(operation, "checkUpdate") == 0 || strcmp(operation, "checkHomeScreenUpdate") == 0) {
+        if (strcmp(operation, "checkUpdate") == 0 || strcmp(operation, "checkOuterShellUpdate") == 0) {
             char installed[128] = "";
             char latest[128] = "";
             installed_home_screen_version(installed, sizeof(installed));
@@ -3958,21 +3958,21 @@ static void send_control_response(int fd, const char *query, const char *body) {
                 mark_update_check_completed();
                 if (compare_versions(installed, latest) < 0) {
                     snprintf(message, sizeof(message),
-                             "Home Screen %s is available. Installed version: %s.",
+                             "Outer Shell %s is available. Installed version: %s.",
                              latest,
                              installed[0] ? installed : "unknown");
                 } else {
                     snprintf(message, sizeof(message),
-                             "Home Screen is up to date. Installed version: %s.",
+                             "Outer Shell is up to date. Installed version: %s.",
                              installed[0] ? installed : latest);
                 }
             }
-            log_event("%s Home Screen update check: %s", ok ? "Completed" : "Failed", message);
+            log_event("%s Outer Shell update check: %s", ok ? "Completed" : "Failed", message);
             send_action_response(fd, ok ? 200 : 500, ok, message);
             return;
         }
-        if (strcmp(operation, "update") == 0 || strcmp(operation, "updateHomeScreen") == 0 ||
-            strcmp(operation, "uninstall") == 0 || strcmp(operation, "uninstallHomeScreen") == 0) {
+        if (strcmp(operation, "update") == 0 || strcmp(operation, "updateOuterShell") == 0 ||
+            strcmp(operation, "uninstall") == 0 || strcmp(operation, "uninstallOuterShell") == 0) {
             const char *installer_command = (strncmp(operation, "uninstall", 9) == 0) ? "uninstall" : "update";
             bool ok = false;
 #ifdef __APPLE__
@@ -3985,12 +3985,12 @@ static void send_control_response(int fd, const char *query, const char *body) {
             {
                 ok = run_home_screen_install_script(installer_command, message, sizeof(message));
             }
-            log_event("%s Home Screen %s: %s", ok ? "Completed" : "Failed", installer_command, message);
+            log_event("%s Outer Shell %s: %s", ok ? "Completed" : "Failed", installer_command, message);
             send_action_response(fd, ok ? 200 : 500, ok, message);
             return;
         }
-        log_event("Rejected control request for Home Screen itself: operation=%s.", operation);
-        send_action_response(fd, 400, false, "Home Screen cannot start or stop itself.");
+        log_event("Rejected control request for Outer Shell itself: operation=%s.", operation);
+        send_action_response(fd, 400, false, "Outer Shell cannot start or stop itself.");
         return;
     }
 
@@ -3999,7 +3999,7 @@ static void send_control_response(int fd, const char *query, const char *body) {
         strcmp(operation, "runUser") == 0 || strcmp(operation, "installUser") == 0) {
         const BundledAppDefinition *app = bundled_app_for_service_id(service_id);
         if (!app) {
-            send_action_response(fd, 404, false, "This app cannot be installed by Home Screen.");
+            send_action_response(fd, 404, false, "This app cannot be installed by Outer Shell.");
             return;
         }
         char message[4096] = "";
@@ -4362,7 +4362,7 @@ static void append_url_encoded(StringBuilder *builder, const char *value) {
 
 static bool home_screen_base_url(char *out, size_t out_size) {
     if (!out || out_size == 0) return false;
-    const char *env = getenv("HOME_SCREEN_PUBLIC_BASE_URL");
+    const char *env = getenv("OUTER_SHELL_PUBLIC_BASE_URL");
     const char *value = env && env[0] ? env : g_home_screen_public_base_url;
     if (!value || !value[0]) {
         out[0] = '\0';
@@ -4477,7 +4477,7 @@ static bool fetch_home_screen_available_version(const char *heartbeat, char *out
     if (out && out_size > 0) out[0] = '\0';
     char base_url[2048];
     if (!home_screen_base_url(base_url, sizeof(base_url))) {
-        snprintf(message, message_size, "No Home Screen update URL is configured.");
+        snprintf(message, message_size, "No Outer Shell update URL is configured.");
         return false;
     }
     StringBuilder url = {0};
@@ -4512,12 +4512,12 @@ static bool fetch_home_screen_available_version(const char *heartbeat, char *out
     bool got = fgets(buffer, sizeof(buffer), pipe) != NULL;
     int status = pclose(pipe);
     if (status != 0 || !got) {
-        snprintf(message, message_size, "Could not fetch Home Screen version.");
+        snprintf(message, message_size, "Could not fetch Outer Shell version.");
         return false;
     }
     trim_whitespace_in_place(buffer);
     if (!buffer[0]) {
-        snprintf(message, message_size, "Home Screen version file was empty.");
+        snprintf(message, message_size, "Outer Shell version file was empty.");
         return false;
     }
     snprintf(out, out_size, "%s", buffer);
@@ -4533,7 +4533,7 @@ static bool home_screen_update_available(char *available, size_t available_size)
     char message[256] = "";
     if (!installed_home_screen_version(installed, sizeof(installed))) return false;
     if (!fetch_home_screen_available_version("daily", latest, sizeof(latest), message, sizeof(message))) {
-        log_event("Home Screen update check failed: %s", message);
+        log_event("Outer Shell update check failed: %s", message);
         return false;
     }
     mark_update_check_completed();
@@ -4547,7 +4547,7 @@ static bool home_screen_update_available(char *available, size_t available_size)
 static bool run_home_screen_install_script(const char *subcommand, char *message, size_t message_size) {
     char base_url[2048];
     if (!home_screen_base_url(base_url, sizeof(base_url))) {
-        snprintf(message, message_size, "No Home Screen update URL is configured.");
+        snprintf(message, message_size, "No Outer Shell update URL is configured.");
         return false;
     }
     char script_url[4096];
@@ -4570,7 +4570,7 @@ static bool run_home_screen_install_script(const char *subcommand, char *message
              quoted_subcommand);
     FILE *pipe = popen(command, "r");
     if (!pipe) {
-        snprintf(message, message_size, "Failed to run Home Screen %s: %s", subcommand, strerror(errno));
+        snprintf(message, message_size, "Failed to run Outer Shell %s: %s", subcommand, strerror(errno));
         return false;
     }
     size_t offset = 0;
@@ -4583,10 +4583,10 @@ static bool run_home_screen_install_script(const char *subcommand, char *message
     trim_whitespace_in_place(message);
     int status = pclose(pipe);
     if (status == 0) {
-        if (!message[0]) snprintf(message, message_size, "Home Screen %s completed.", subcommand);
+        if (!message[0]) snprintf(message, message_size, "Outer Shell %s completed.", subcommand);
         return true;
     }
-    if (!message[0]) snprintf(message, message_size, "Home Screen %s failed.", subcommand);
+    if (!message[0]) snprintf(message, message_size, "Outer Shell %s failed.", subcommand);
     return false;
 }
 
@@ -4762,7 +4762,7 @@ static bool run_root_outerwebapps_migration(const char *sudo_password, bool *nee
             "OLD_DB=\"$OLD_ROOT/registry.sqlite3\"\n"
             "NEW_DB=\"$NEW_ROOT/registry.sqlite3\"\n"
             "OLD_OUTERCTL=%s\n"
-            "OLD_HOME_SCREEN_OUTERCTL=%s\n"
+            "OLD_OUTER_SHELL_OUTERCTL=%s\n"
             "NEW_OUTERCTL=%s\n"
             "OLD_USER_APPS=%s\n"
             "NEW_USER_APPS=%s\n"
@@ -4775,14 +4775,14 @@ static bool run_root_outerwebapps_migration(const char *sudo_password, bool *nee
             "  done\n"
             "fi\n"
             "find \"$NEW_SYSTEM_APPS\" -name outeragent.log -type f -exec sh -c 'for path do mv \"$path\" \"$(dirname \"$path\")/backend.log\" 2>/dev/null || true; done' sh {} + 2>/dev/null || true\n"
-            "export OLD_DB NEW_DB OLD_ROOT NEW_ROOT OLD_SYSTEM_APPS NEW_SYSTEM_APPS OLD_OUTERCTL OLD_HOME_SCREEN_OUTERCTL NEW_OUTERCTL OLD_USER_APPS NEW_USER_APPS\n"
+            "export OLD_DB NEW_DB OLD_ROOT NEW_ROOT OLD_SYSTEM_APPS NEW_SYSTEM_APPS OLD_OUTERCTL OLD_OUTER_SHELL_OUTERCTL NEW_OUTERCTL OLD_USER_APPS NEW_USER_APPS\n"
             "python3 - <<'__HOMESCREEN_ROOT_MIGRATION__'\n"
             "import os, sqlite3, urllib.parse\n"
             "old_db = os.environ['OLD_DB']\n"
             "new_db = os.environ['NEW_DB']\n"
             "replacements = [\n"
             "    (os.environ['OLD_OUTERCTL'], os.environ['NEW_OUTERCTL']),\n"
-            "    (os.environ['OLD_HOME_SCREEN_OUTERCTL'], os.environ['NEW_OUTERCTL']),\n"
+            "    (os.environ['OLD_OUTER_SHELL_OUTERCTL'], os.environ['NEW_OUTERCTL']),\n"
             "    (os.environ['OLD_USER_APPS'], os.environ['NEW_USER_APPS']),\n"
             "    (os.environ['OLD_SYSTEM_APPS'], os.environ['NEW_SYSTEM_APPS']),\n"
             "    (os.environ['OLD_ROOT'], os.environ['NEW_ROOT']),\n"
@@ -5298,7 +5298,7 @@ static bool make_jupyter_script(const char *service_id,
         "child = None\n"
         "\n"
         "def log(message):\n"
-        "    print(f\"[HomeScreen Jupyter] {message}\", flush=True)\n"
+        "    print(f\"[OuterShell Jupyter] {message}\", flush=True)\n"
         "\n"
         "def run_outerctl(*args: str) -> None:\n"
         "    outerctl_path = os.environ.get(OUTERCTL_ENV_VAR, \"\").strip()\n"
@@ -5751,12 +5751,12 @@ static bool unregister_backend_records(const char *service_id, char *error, size
 static bool uninstall_local_home_screen(char *message, size_t message_size) {
 #ifdef __APPLE__
     char error[1024] = "";
-    bool registry_ok = unregister_backend_records(kHomeScreenServiceID, error, sizeof(error));
+    bool registry_ok = unregister_backend_records(kOuterShellServiceID, error, sizeof(error));
 
     const char *home = getenv("HOME");
     char plist_path[PATH_MAX] = "";
     if (home && home[0]) {
-        snprintf(plist_path, sizeof(plist_path), "%s/Library/LaunchAgents/dev.outergroup.HomeScreen.plist", home);
+        snprintf(plist_path, sizeof(plist_path), "%s/Library/LaunchAgents/org.outershell.OuterShell.plist", home);
         unlink(plist_path);
     }
     char socket_path[PATH_MAX] = "";
@@ -5768,7 +5768,7 @@ static bool uninstall_local_home_screen(char *message, size_t message_size) {
         setsid();
         usleep(300000);
         char service_target[128];
-        snprintf(service_target, sizeof(service_target), "gui/%ld/dev.outergroup.HomeScreen", (long)getuid());
+        snprintf(service_target, sizeof(service_target), "gui/%ld/org.outershell.OuterShell", (long)getuid());
         pid_t bootout_child = fork();
         if (bootout_child == 0) {
             execlp("launchctl", "launchctl", "bootout", service_target, (char *)NULL);
@@ -5780,7 +5780,7 @@ static bool uninstall_local_home_screen(char *message, size_t message_size) {
             if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
                 pid_t remove_child = fork();
                 if (remove_child == 0) {
-                    execlp("launchctl", "launchctl", "remove", "dev.outergroup.HomeScreen", (char *)NULL);
+                    execlp("launchctl", "launchctl", "remove", "org.outershell.OuterShell", (char *)NULL);
                     _exit(127);
                 }
                 if (remove_child > 0) {
@@ -5806,14 +5806,14 @@ static bool uninstall_local_home_screen(char *message, size_t message_size) {
     if (!registry_ok) {
         snprintf(message,
                  message_size,
-                 "Removed the Home Screen LaunchAgent. Registry cleanup failed: %s",
+                 "Removed the Outer Shell LaunchAgent. Registry cleanup failed: %s",
                  error[0] ? error : "unknown error");
         return true;
     }
-    snprintf(message, message_size, "Home Screen LaunchAgent removed. The app will stop momentarily.");
+    snprintf(message, message_size, "Outer Shell LaunchAgent removed. The app will stop momentarily.");
     return true;
 #else
-    snprintf(message, message_size, "Local Home Screen uninstall is only implemented for macOS.");
+    snprintf(message, message_size, "Local Outer Shell uninstall is only implemented for macOS.");
     return false;
 #endif
 }
@@ -8501,14 +8501,14 @@ static void usage(const char *program) {
     fprintf(stderr, "Usage: %s [--port PORT | --socket-path PATH] [--launchd-socket-name NAME] [--bundles-dir DIR] [--bundled-apps-dir DIR] [--app-base-url URL] [--public-base-url URL] [--database PATH] [--system-database PATH] [--stay-alive]\n", program);
 }
 
-int HomeScreenBackendMain(int argc, char **argv) {
+int OuterShellBackendMain(int argc, char **argv) {
     int port = DEFAULT_PORT;
     bool use_port = true;
     char socket_path[PATH_MAX] = "";
     char launchd_socket_name[128] = "Listener";
     const char *bundles_dir = "bundles";
-    const char *app_base_url = getenv("HOME_SCREEN_APP_BASE_URL");
-    const char *public_base_url = getenv("HOME_SCREEN_PUBLIC_BASE_URL");
+    const char *app_base_url = getenv("OUTER_SHELL_APP_BASE_URL");
+    const char *public_base_url = getenv("OUTER_SHELL_PUBLIC_BASE_URL");
     if (app_base_url && app_base_url[0]) {
         snprintf(g_bundled_apps_base_url, sizeof(g_bundled_apps_base_url), "%s", app_base_url);
     }
@@ -8571,9 +8571,9 @@ int HomeScreenBackendMain(int argc, char **argv) {
     if (listener < 0) return 1;
     g_listener_fd = listener;
     if (use_port) {
-        fprintf(stderr, "HomeScreenBackend listening on http://127.0.0.1:%d/\n", port);
+        fprintf(stderr, "OuterShellBackend listening on http://127.0.0.1:%d/\n", port);
     } else {
-        fprintf(stderr, "HomeScreenBackend listening on %s/\n", socket_path);
+        fprintf(stderr, "OuterShellBackend listening on %s/\n", socket_path);
     }
     fprintf(stderr, "Registry database: %s\n", g_registry_database_path);
     if (g_system_registry_database_path[0]) {
@@ -8586,7 +8586,7 @@ int HomeScreenBackendMain(int argc, char **argv) {
         fprintf(stderr, "App payloads base URL: %s\n", g_bundled_apps_base_url);
     }
     if (g_home_screen_public_base_url[0]) {
-        fprintf(stderr, "Home Screen public base URL: %s\n", g_home_screen_public_base_url);
+        fprintf(stderr, "Outer Shell public base URL: %s\n", g_home_screen_public_base_url);
     }
 
     run_reactor(listener);
@@ -8599,8 +8599,8 @@ int HomeScreenBackendMain(int argc, char **argv) {
     return 0;
 }
 
-#ifndef HOME_SCREEN_BACKEND_LIBRARY
+#ifndef OUTER_SHELL_BACKEND_LIBRARY
 int main(int argc, char **argv) {
-    return HomeScreenBackendMain(argc, argv);
+    return OuterShellBackendMain(argc, argv);
 }
 #endif

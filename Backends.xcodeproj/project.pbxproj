@@ -7,7 +7,7 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
-		AG0000000000000000000004 /* HomeScreenAgent.swift in Sources */ = {isa = PBXBuildFile; fileRef = AG0000000000000000000003 /* HomeScreenAgent.swift */; };
+		AG0000000000000000000004 /* OuterShellAgent.swift in Sources */ = {isa = PBXBuildFile; fileRef = AG0000000000000000000003 /* OuterShellAgent.swift */; };
 		AG0000000000000000000005 /* main.c in Sources */ = {isa = PBXBuildFile; fileRef = 37B4F9D02FA1B00100873894 /* main.c */; };
 		37B4F9D12FA1B00100873894 /* main.c in Sources */ = {isa = PBXBuildFile; fileRef = 37B4F9D02FA1B00100873894 /* main.c */; };
 /* End PBXBuildFile section */
@@ -31,11 +31,11 @@
 		0F0000000000000000000008 /* README.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = README.md; sourceTree = "<group>"; };
 		0F0000000000000000000009 /* build_site.sh */ = {isa = PBXFileReference; lastKnownFileType = text.script.sh; path = build_site.sh; sourceTree = "<group>"; };
 		0F000000000000000000000A /* .gitignore */ = {isa = PBXFileReference; lastKnownFileType = text; path = .gitignore; sourceTree = "<group>"; };
-		AG0000000000000000000001 /* Home Screen.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "Home Screen.app"; sourceTree = BUILT_PRODUCTS_DIR; };
-		AG0000000000000000000003 /* HomeScreenAgent.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HomeScreenAgent.swift; sourceTree = "<group>"; };
+		AG0000000000000000000001 /* Outer Shell.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "Outer Shell.app"; sourceTree = BUILT_PRODUCTS_DIR; };
+		AG0000000000000000000003 /* OuterShellAgent.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OuterShellAgent.swift; sourceTree = "<group>"; };
 		37B4F9C12FA189AB00873894 /* AGENTS.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = AGENTS.md; sourceTree = "<group>"; };
 		37B4F9C22FA18C1E00873894 /* LICENSE */ = {isa = PBXFileReference; lastKnownFileType = text; path = LICENSE; sourceTree = "<group>"; };
-		37B4F9CF2FA1B00100873894 /* HomeScreenBackend */ = {isa = PBXFileReference; explicitFileType = "compiled.mach-o.executable"; includeInIndex = 0; path = HomeScreenBackend; sourceTree = BUILT_PRODUCTS_DIR; };
+		37B4F9CF2FA1B00100873894 /* OuterShellBackend */ = {isa = PBXFileReference; explicitFileType = "compiled.mach-o.executable"; includeInIndex = 0; path = OuterShellBackend; sourceTree = BUILT_PRODUCTS_DIR; };
 		37B4F9D02FA1B00100873894 /* main.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = main.c; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
@@ -104,8 +104,8 @@
 			isa = PBXGroup;
 			children = (
 				0F0000000000000000000003 /* Backends.bundle */,
-				37B4F9CF2FA1B00100873894 /* HomeScreenBackend */,
-				AG0000000000000000000001 /* Home Screen.app */,
+				37B4F9CF2FA1B00100873894 /* OuterShellBackend */,
+				AG0000000000000000000001 /* Outer Shell.app */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -113,7 +113,7 @@
 		AG0000000000000000000002 /* Agent */ = {
 			isa = PBXGroup;
 			children = (
-				AG0000000000000000000003 /* HomeScreenAgent.swift */,
+				AG0000000000000000000003 /* OuterShellAgent.swift */,
 			);
 			path = Agent;
 			sourceTree = "<group>";
@@ -153,9 +153,9 @@
 			productReference = 0F0000000000000000000003 /* Backends.bundle */;
 			productType = "com.apple.product-type.bundle";
 		};
-		37B4F9D22FA1B00100873894 /* HomeScreenBackend */ = {
+		37B4F9D22FA1B00100873894 /* OuterShellBackend */ = {
 			isa = PBXNativeTarget;
-			buildConfigurationList = 37B4F9D52FA1B00100873894 /* Build configuration list for PBXNativeTarget "HomeScreenBackend" */;
+			buildConfigurationList = 37B4F9D52FA1B00100873894 /* Build configuration list for PBXNativeTarget "OuterShellBackend" */;
 			buildPhases = (
 				37B4F9D32FA1B00100873894 /* Sources */,
 				37B4F9D42FA1B00100873894 /* Frameworks */,
@@ -164,16 +164,16 @@
 			);
 			dependencies = (
 			);
-			name = HomeScreenBackend;
+			name = OuterShellBackend;
 			packageProductDependencies = (
 			);
-			productName = HomeScreenBackend;
-			productReference = 37B4F9CF2FA1B00100873894 /* HomeScreenBackend */;
+			productName = OuterShellBackend;
+			productReference = 37B4F9CF2FA1B00100873894 /* OuterShellBackend */;
 			productType = "com.apple.product-type.tool";
 		};
-		AG0000000000000000000009 /* HomeScreenAgent */ = {
+		AG0000000000000000000009 /* OuterShellAgent */ = {
 			isa = PBXNativeTarget;
-			buildConfigurationList = AG000000000000000000000C /* Build configuration list for PBXNativeTarget "HomeScreenAgent" */;
+			buildConfigurationList = AG000000000000000000000C /* Build configuration list for PBXNativeTarget "OuterShellAgent" */;
 			buildPhases = (
 				AG0000000000000000000007 /* Sources */,
 				AG0000000000000000000006 /* Frameworks */,
@@ -183,11 +183,11 @@
 			);
 			dependencies = (
 			);
-			name = HomeScreenAgent;
+			name = OuterShellAgent;
 			packageProductDependencies = (
 			);
-			productName = "Home Screen";
-			productReference = AG0000000000000000000001 /* Home Screen.app */;
+			productName = "Outer Shell";
+			productReference = AG0000000000000000000001 /* Outer Shell.app */;
 			productType = "com.apple.product-type.application";
 		};
 /* End PBXNativeTarget section */
@@ -229,8 +229,8 @@
 			projectRoot = "";
 			targets = (
 				0F000000000000000000000B /* Backends */,
-				37B4F9D22FA1B00100873894 /* HomeScreenBackend */,
-				AG0000000000000000000009 /* HomeScreenAgent */,
+				37B4F9D22FA1B00100873894 /* OuterShellBackend */,
+				AG0000000000000000000009 /* OuterShellAgent */,
 			);
 		};
 /* End PBXProject section */
@@ -257,7 +257,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				AG0000000000000000000004 /* HomeScreenAgent.swift in Sources */,
+				AG0000000000000000000004 /* OuterShellAgent.swift in Sources */,
 				AG0000000000000000000005 /* main.c in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -426,7 +426,7 @@
 				INSTALL_PATH = "$(LOCAL_LIBRARY_DIR)/Bundles";
 				MACOSX_DEPLOYMENT_TARGET = 14.6;
 				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = dev.outergroup.HomeScreen;
+				PRODUCT_BUNDLE_IDENTIFIER = org.outershell.OuterShell;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				RUNTIME_EXCEPTION_DISABLE_LIBRARY_VALIDATION = YES;
 				SKIP_INSTALL = YES;
@@ -461,7 +461,7 @@
 				INSTALL_PATH = "$(LOCAL_LIBRARY_DIR)/Bundles";
 				MACOSX_DEPLOYMENT_TARGET = 14.6;
 				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = dev.outergroup.HomeScreen;
+				PRODUCT_BUNDLE_IDENTIFIER = org.outershell.OuterShell;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				RUNTIME_EXCEPTION_DISABLE_LIBRARY_VALIDATION = YES;
 				SKIP_INSTALL = YES;
@@ -488,8 +488,8 @@
 					"$(inherited)",
 					"-lsqlite3",
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = dev.outergroup.HomeScreenBackend;
-				PRODUCT_NAME = HomeScreenBackend;
+				PRODUCT_BUNDLE_IDENTIFIER = org.outershell.OuterShellBackend;
+				PRODUCT_NAME = OuterShellBackend;
 				SKIP_INSTALL = YES;
 			};
 			name = Debug;
@@ -510,8 +510,8 @@
 					"$(inherited)",
 					"-lsqlite3",
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = dev.outergroup.HomeScreenBackend;
-				PRODUCT_NAME = HomeScreenBackend;
+				PRODUCT_BUNDLE_IDENTIFIER = org.outershell.OuterShellBackend;
+				PRODUCT_NAME = OuterShellBackend;
 				SKIP_INSTALL = YES;
 			};
 			name = Release;
@@ -526,11 +526,11 @@
 				CURRENT_PROJECT_VERSION = 1;
 				DEAD_CODE_STRIPPING = YES;
 				GCC_PREPROCESSOR_DEFINITIONS = (
-					"HOME_SCREEN_BACKEND_LIBRARY=1",
+					"OUTER_SHELL_BACKEND_LIBRARY=1",
 					"$(inherited)",
 				);
 				GENERATE_INFOPLIST_FILE = YES;
-				INFOPLIST_KEY_CFBundleDisplayName = "Home Screen";
+				INFOPLIST_KEY_CFBundleDisplayName = "Outer Shell";
 				INFOPLIST_KEY_LSUIElement = YES;
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
 				LD_RUNPATH_SEARCH_PATHS = (
@@ -543,8 +543,8 @@
 					"$(inherited)",
 					"-lsqlite3",
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = dev.outergroup.HomeScreen.Agent;
-				PRODUCT_NAME = "Home Screen";
+				PRODUCT_BUNDLE_IDENTIFIER = org.outershell.OuterShell.Agent;
+				PRODUCT_NAME = "Outer Shell";
 				SKIP_INSTALL = YES;
 				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
 				SWIFT_VERSION = 6.0;
@@ -562,11 +562,11 @@
 				CURRENT_PROJECT_VERSION = 1;
 				DEAD_CODE_STRIPPING = YES;
 				GCC_PREPROCESSOR_DEFINITIONS = (
-					"HOME_SCREEN_BACKEND_LIBRARY=1",
+					"OUTER_SHELL_BACKEND_LIBRARY=1",
 					"$(inherited)",
 				);
 				GENERATE_INFOPLIST_FILE = YES;
-				INFOPLIST_KEY_CFBundleDisplayName = "Home Screen";
+				INFOPLIST_KEY_CFBundleDisplayName = "Outer Shell";
 				INFOPLIST_KEY_LSUIElement = YES;
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
 				LD_RUNPATH_SEARCH_PATHS = (
@@ -579,8 +579,8 @@
 					"$(inherited)",
 					"-lsqlite3",
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = dev.outergroup.HomeScreen.Agent;
-				PRODUCT_NAME = "Home Screen";
+				PRODUCT_BUNDLE_IDENTIFIER = org.outershell.OuterShell.Agent;
+				PRODUCT_NAME = "Outer Shell";
 				SKIP_INSTALL = YES;
 				SWIFT_VERSION = 6.0;
 			};
@@ -607,7 +607,7 @@
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
 		};
-		37B4F9D52FA1B00100873894 /* Build configuration list for PBXNativeTarget "HomeScreenBackend" */ = {
+		37B4F9D52FA1B00100873894 /* Build configuration list for PBXNativeTarget "OuterShellBackend" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
 				37B4F9D62FA1B00100873894 /* Debug */,
@@ -616,7 +616,7 @@
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
 		};
-		AG000000000000000000000C /* Build configuration list for PBXNativeTarget "HomeScreenAgent" */ = {
+		AG000000000000000000000C /* Build configuration list for PBXNativeTarget "OuterShellAgent" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
 				AG000000000000000000000A /* Debug */,

@@ -48,7 +48,7 @@ private struct BackendRecord: Decodable {
     }
 
     var isBackendsSelf: Bool {
-        serviceID == "dev.outergroup.HomeScreen" || serviceID == "dev.outergroup.Navigator" || serviceID == "dev.outergroup.Backends"
+        serviceID == "org.outershell.OuterShell" || serviceID == "dev.outergroup.Navigator" || serviceID == "dev.outergroup.Backends"
     }
 
     var isMigrationAction: Bool {
@@ -2238,7 +2238,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         panel.addSublayer(title)
 
         let message = makeTextLayer(size: 12, weight: .regular, color: .secondaryLabelColor)
-        message.string = "Home Screen will download this app and run it as a service."
+        message.string = "Outer Shell will download this app and run it as a service."
         message.isWrapped = true
         message.frame = CGRect(x: 72, y: panelHeight - 82, width: panelWidth - 90, height: 34)
         panel.addSublayer(message)
@@ -4912,11 +4912,11 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                                    isEnabled: true))
             operationByItemID["update"] = "update"
             items.append(OuterframeContextMenuItem(id: "update",
-                                                   title: "Update Home Screen",
+                                                   title: "Update Outer Shell",
                                                    isEnabled: true))
-            operationByItemID["uninstall"] = "uninstallHomeScreen"
+            operationByItemID["uninstall"] = "uninstallOuterShell"
             items.append(OuterframeContextMenuItem(id: "uninstall",
-                                                   title: "Uninstall Home Screen",
+                                                   title: "Uninstall Outer Shell",
                                                    isEnabled: true))
             pendingMenuActions[menuID] = (backend.serviceID, operationByItemID)
             outerframeHost.showContextMenu(menuID: menuID,
@@ -5033,7 +5033,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             return "Installing \(backend.displayName) as user..."
         case "uninstall":
             return "Uninstalling \(backend.displayName)..."
-        case "uninstallHomeScreen":
+        case "uninstallOuterShell":
             return "Uninstalling \(backend.displayName)..."
         case "checkUpdate":
             return "Checking \(backend.displayName) for updates..."

@@ -47,19 +47,19 @@ echo "==> Building Backends.bundle"
     CODE_SIGNING_REQUIRED=NO \
     build
 
-echo "==> Building HomeScreenBackend"
+echo "==> Building OuterShellBackend"
 /usr/bin/xcodebuild \
     -project "${SCRIPT_DIR}/Backends.xcodeproj" \
-    -scheme HomeScreenBackend \
+    -scheme OuterShellBackend \
     -configuration "${CONFIGURATION}" \
     SYMROOT="${BUILD_ROOT}" \
     ONLY_ACTIVE_ARCH=YES \
     build
 
-echo "==> Building Home Screen agent"
+echo "==> Building Outer Shell agent"
 /usr/bin/xcodebuild \
     -project "${SCRIPT_DIR}/Backends.xcodeproj" \
-    -target HomeScreenAgent \
+    -target OuterShellAgent \
     -configuration "${CONFIGURATION}" \
     SYMROOT="${BUILD_ROOT}" \
     ONLY_ACTIVE_ARCH=YES \
@@ -93,9 +93,9 @@ echo "==> Archiving BackendsContent bundles"
     "${BUILD_ROOT}/${CONFIGURATION}/Backends.bundle" \
     "${RUN_ROOT}/bundles" \
     BackendsContent.bundle
-mkdir -p "${BUILD_ROOT}/${CONFIGURATION}/Home Screen.app/Contents/Resources/bundles"
+mkdir -p "${BUILD_ROOT}/${CONFIGURATION}/Outer Shell.app/Contents/Resources/bundles"
 cp "${RUN_ROOT}/bundles"/BackendsContent.bundle.*.aar \
-    "${BUILD_ROOT}/${CONFIGURATION}/Home Screen.app/Contents/Resources/bundles/"
+    "${BUILD_ROOT}/${CONFIGURATION}/Outer Shell.app/Contents/Resources/bundles/"
 
 echo "==> Staging bundled Top"
 if [[ ! -f "${TOP_ICON_PATH}" ]]; then
@@ -112,20 +112,20 @@ install -m 0644 \
     "${TOP_BUILD_ROOT}/${CONFIGURATION}/Top.bundle" \
     "${TOP_PAYLOAD_ROOT}/bundles" \
     TopContent.bundle
-mkdir -p "${BUILD_ROOT}/${CONFIGURATION}/Home Screen.app/Contents/Resources"
-rm -rf "${BUILD_ROOT}/${CONFIGURATION}/Home Screen.app/Contents/Resources/bundled-apps"
+mkdir -p "${BUILD_ROOT}/${CONFIGURATION}/Outer Shell.app/Contents/Resources"
+rm -rf "${BUILD_ROOT}/${CONFIGURATION}/Outer Shell.app/Contents/Resources/bundled-apps"
 cp -R "${RUN_ROOT}/bundled-apps" \
-    "${BUILD_ROOT}/${CONFIGURATION}/Home Screen.app/Contents/Resources/bundled-apps"
+    "${BUILD_ROOT}/${CONFIGURATION}/Outer Shell.app/Contents/Resources/bundled-apps"
 
-ln -sf HomeScreenBackend "${BUILD_ROOT}/${CONFIGURATION}/BackendsBackend"
-ln -sf HomeScreenBackend "${BUILD_ROOT}/${CONFIGURATION}/NavigatorBackend"
+ln -sf OuterShellBackend "${BUILD_ROOT}/${CONFIGURATION}/BackendsBackend"
+ln -sf OuterShellBackend "${BUILD_ROOT}/${CONFIGURATION}/NavigatorBackend"
 
 echo "Built:"
-echo "  ${BUILD_ROOT}/${CONFIGURATION}/HomeScreenBackend"
-echo "  ${BUILD_ROOT}/${CONFIGURATION}/Home Screen.app"
+echo "  ${BUILD_ROOT}/${CONFIGURATION}/OuterShellBackend"
+echo "  ${BUILD_ROOT}/${CONFIGURATION}/Outer Shell.app"
 echo "  ${RUN_ROOT}/bundles"
 echo "  ${TOP_PAYLOAD_ROOT}"
 echo
 echo "Run:"
-echo "  \"${BUILD_ROOT}/${CONFIGURATION}/HomeScreenBackend\" --port 7354 --bundles-dir \"${RUN_ROOT}/bundles\" --bundled-apps-dir \"${RUN_ROOT}/bundled-apps\""
-echo "  \"${BUILD_ROOT}/${CONFIGURATION}/Home Screen.app/Contents/MacOS/Home Screen\" --socket-path \"$(getconf DARWIN_USER_TEMP_DIR)dev.outergroup.HomeScreen\" --bundles-dir \"${RUN_ROOT}/bundles\" --bundled-apps-dir \"${RUN_ROOT}/bundled-apps\""
+echo "  \"${BUILD_ROOT}/${CONFIGURATION}/OuterShellBackend\" --port 7354 --bundles-dir \"${RUN_ROOT}/bundles\" --bundled-apps-dir \"${RUN_ROOT}/bundled-apps\""
+echo "  \"${BUILD_ROOT}/${CONFIGURATION}/Outer Shell.app/Contents/MacOS/Outer Shell\" --socket-path \"$(getconf DARWIN_USER_TEMP_DIR)org.outershell.OuterShell\" --bundles-dir \"${RUN_ROOT}/bundles\" --bundled-apps-dir \"${RUN_ROOT}/bundled-apps\""
