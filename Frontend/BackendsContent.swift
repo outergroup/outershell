@@ -4864,7 +4864,12 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             return row.frontend?.hasEndpoint == true ? [("Open", "open")] : []
         }
         if backend.isBackendsSelf {
-            return row.frontend?.hasEndpoint == true ? [("Open", "open")] : []
+            var actions: [(title: String, operation: String)] = []
+            if row.frontend?.hasEndpoint == true {
+                actions.append(("Open", "open"))
+            }
+            actions.append(("Actions", "menu"))
+            return actions
         }
         if backend.isMigrationAction {
             return [("Migrate", "migrateRoot")]
@@ -4896,10 +4901,29 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func showBackendActionsMenu(for backend: BackendRecord, at point: CGPoint) {
-        guard backend.canUninstallBackend || (backend.isBundled ?? false) else { return }
+        guard backend.isBackendsSelf || backend.canUninstallBackend || (backend.isBundled ?? false) else { return }
         let menuID = UUID()
         var operationByItemID: [String: String] = [:]
         var items: [OuterframeContextMenuItem] = []
+        if backend.isBackendsSelf {
+            operationByItemID["checkUpdate"] = "checkUpdate"
+            items.append(OuterframeContextMenuItem(id: "checkUpdate",
+                                                   title: "Check for Updates",
+                                                   isEnabled: true))
+            operationByItemID["update"] = "update"
+            items.append(OuterframeContextMenuItem(id: "update",
+                                                   title: "Update Home Screen",
+                                                   isEnabled: true))
+            operationByItemID["uninstall"] = "uninstallHomeScreen"
+            items.append(OuterframeContextMenuItem(id: "uninstall",
+                                                   title: "Uninstall Home Screen",
+                                                   isEnabled: true))
+            pendingMenuActions[menuID] = (backend.serviceID, operationByItemID)
+            outerframeHost.showContextMenu(menuID: menuID,
+                                           items: items,
+                                           at: point)
+            return
+        }
         if backend.isBundled ?? false {
             if backend.serviceScope == "system" {
                 operationByItemID["runUser"] = "runUser"
@@ -5009,6 +5033,12 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             return "Installing \(backend.displayName) as user..."
         case "uninstall":
             return "Uninstalling \(backend.displayName)..."
+        case "uninstallHomeScreen":
+            return "Uninstalling \(backend.displayName)..."
+        case "checkUpdate":
+            return "Checking \(backend.displayName) for updates..."
+        case "update":
+            return "Updating \(backend.displayName)..."
         case "migrateRoot":
             return "Migrating \(backend.displayName)..."
         default:

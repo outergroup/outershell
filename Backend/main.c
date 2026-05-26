@@ -66,6 +66,7 @@ static char g_registry_database_path[PATH_MAX] = "";
 static char g_system_registry_database_path[PATH_MAX] = "";
 static char g_bundled_apps_directory[PATH_MAX] = "";
 static char g_bundled_apps_base_url[2048] = "";
+static char g_home_screen_public_base_url[2048] = "";
 static char g_listen_socket_path[PATH_MAX] = "";
 static bool g_systemd_socket_activation = false;
 static bool g_launchd_socket_activation = false;
@@ -696,6 +697,13 @@ static void default_user_outerctl_path(char *out, size_t out_size) {
     char root[PATH_MAX];
     default_user_outerwebapps_root(root, sizeof(root));
     snprintf(out, out_size, "%s/bin/outerctl", root);
+}
+
+static void default_user_home_screen_install_root(char *out, size_t out_size) {
+    if (!out || out_size == 0) return;
+    char root[PATH_MAX];
+    default_user_outerwebapps_root(root, sizeof(root));
+    snprintf(out, out_size, "%s/home-screen", root);
 }
 
 static void default_user_outerwebapps_app_root(const char *install_name, char *out, size_t out_size) {
@@ -3185,6 +3193,15 @@ static bool lookup_launchd_backend_any(const char *service_id,
 #define ACTION_FLAG_NEEDS_PASSWORD 0x02u
 
 static bool root_outerwebapps_migration_pending(void);
+static void trim_whitespace_in_place(char *value);
+static bool installed_home_screen_version(char *out, size_t out_size);
+static bool fetch_home_screen_available_version(const char *heartbeat, char *out, size_t out_size, char *message, size_t message_size);
+static void mark_update_check_completed(void);
+static int compare_versions(const char *installed, const char *available);
+static bool home_screen_base_url(char *out, size_t out_size);
+static bool home_screen_update_available(char *available, size_t available_size);
+static bool run_home_screen_install_script(const char *subcommand, char *message, size_t message_size);
+static bool uninstall_local_home_screen(char *message, size_t message_size);
 
 static bool build_frontend_payload(const char *name,
                                    const char *url,
@@ -3443,6 +3460,13 @@ static bool append_registered_backend_payloads(sqlite3 *database,
 
         uint32_t flags = BACKEND_FLAG_IS_INSTALLED;
         if ((has_systemd_unit || has_launchd_unit) && !is_self) flags |= BACKEND_FLAG_CAN_CONTROL | BACKEND_FLAG_CAN_UNINSTALL;
+        if (is_self) {
+            flags |= BACKEND_FLAG_CAN_UNINSTALL;
+            char available_version[128] = "";
+            if (home_screen_update_available(available_version, sizeof(available_version))) {
+                snprintf(status, sizeof(status), "update available");
+            }
+        }
         if (bundled_app) flags |= BACKEND_FLAG_IS_BUNDLED;
         if (owns_plist) flags |= BACKEND_FLAG_OWNS_LAUNCHD_PLIST;
 
@@ -3886,6 +3910,8 @@ static void send_control_response(int fd, const char *query, const char *body) {
         return;
     }
     query_value_any(query, body, "sudoPassword", sudo_password, sizeof(sudo_password));
+    trim_whitespace_in_place(service_id);
+    trim_whitespace_in_place(operation);
     log_event("Control request operation=%s serviceID=%s.", operation, service_id);
 
     if (strcmp(operation, "setFrontendList") == 0) {
@@ -3922,8 +3948,49 @@ static void send_control_response(int fd, const char *query, const char *body) {
     }
 
     if (is_home_screen_service_id(service_id)) {
+        char message[4096] = "";
+        if (strcmp(operation, "checkUpdate") == 0 || strcmp(operation, "checkHomeScreenUpdate") == 0) {
+            char installed[128] = "";
+            char latest[128] = "";
+            installed_home_screen_version(installed, sizeof(installed));
+            bool ok = fetch_home_screen_available_version("manual", latest, sizeof(latest), message, sizeof(message));
+            if (ok) {
+                mark_update_check_completed();
+                if (compare_versions(installed, latest) < 0) {
+                    snprintf(message, sizeof(message),
+                             "Home Screen %s is available. Installed version: %s.",
+                             latest,
+                             installed[0] ? installed : "unknown");
+                } else {
+                    snprintf(message, sizeof(message),
+                             "Home Screen is up to date. Installed version: %s.",
+                             installed[0] ? installed : latest);
+                }
+            }
+            log_event("%s Home Screen update check: %s", ok ? "Completed" : "Failed", message);
+            send_action_response(fd, ok ? 200 : 500, ok, message);
+            return;
+        }
+        if (strcmp(operation, "update") == 0 || strcmp(operation, "updateHomeScreen") == 0 ||
+            strcmp(operation, "uninstall") == 0 || strcmp(operation, "uninstallHomeScreen") == 0) {
+            const char *installer_command = (strncmp(operation, "uninstall", 9) == 0) ? "uninstall" : "update";
+            bool ok = false;
+#ifdef __APPLE__
+            char base_url[2048] = "";
+            if (strcmp(installer_command, "uninstall") == 0 &&
+                !home_screen_base_url(base_url, sizeof(base_url))) {
+                ok = uninstall_local_home_screen(message, sizeof(message));
+            } else
+#endif
+            {
+                ok = run_home_screen_install_script(installer_command, message, sizeof(message));
+            }
+            log_event("%s Home Screen %s: %s", ok ? "Completed" : "Failed", installer_command, message);
+            send_action_response(fd, ok ? 200 : 500, ok, message);
+            return;
+        }
         log_event("Rejected control request for Home Screen itself: operation=%s.", operation);
-        send_action_response(fd, 400, false, "Home Screen cannot stop, start, or uninstall itself.");
+        send_action_response(fd, 400, false, "Home Screen cannot start or stop itself.");
         return;
     }
 
@@ -4241,6 +4308,285 @@ static bool contains_case_insensitive(const char *haystack, const char *needle) 
         }
         if (i == needle_len) return true;
     }
+    return false;
+}
+
+static void trim_whitespace_in_place(char *value) {
+    if (!value) return;
+    char *start = value;
+    while (*start && isspace((unsigned char)*start)) start++;
+    if (start != value) memmove(value, start, strlen(start) + 1);
+    size_t len = strlen(value);
+    while (len > 0 && isspace((unsigned char)value[len - 1])) {
+        value[--len] = '\0';
+    }
+}
+
+static bool read_first_line_file(const char *path, char *out, size_t out_size) {
+    if (!out || out_size == 0) return false;
+    out[0] = '\0';
+    FILE *file = fopen(path, "r");
+    if (!file) return false;
+    bool ok = fgets(out, (int)out_size, file) != NULL;
+    fclose(file);
+    if (ok) trim_whitespace_in_place(out);
+    return ok;
+}
+
+static bool write_text_file_simple(const char *path, const char *contents) {
+    char error[256] = "";
+    if (!ensure_parent_directory(path, error, sizeof(error))) {
+        return false;
+    }
+    FILE *file = fopen(path, "w");
+    if (!file) return false;
+    if (contents && contents[0]) fputs(contents, file);
+    bool ok = fclose(file) == 0;
+    return ok;
+}
+
+static void append_url_encoded(StringBuilder *builder, const char *value) {
+    static const char hex[] = "0123456789ABCDEF";
+    if (!builder || !value) return;
+    for (const unsigned char *p = (const unsigned char *)value; *p; p++) {
+        unsigned char ch = *p;
+        if (isalnum(ch) || ch == '-' || ch == '_' || ch == '.' || ch == '~') {
+            char one[2] = {(char)ch, '\0'};
+            sb_append(builder, one);
+        } else {
+            char escaped[4] = {'%', hex[ch >> 4], hex[ch & 0x0f], '\0'};
+            sb_append(builder, escaped);
+        }
+    }
+}
+
+static bool home_screen_base_url(char *out, size_t out_size) {
+    if (!out || out_size == 0) return false;
+    const char *env = getenv("HOME_SCREEN_PUBLIC_BASE_URL");
+    const char *value = env && env[0] ? env : g_home_screen_public_base_url;
+    if (!value || !value[0]) {
+        out[0] = '\0';
+        return false;
+    }
+    snprintf(out, out_size, "%s", value);
+    size_t len = strlen(out);
+    while (len > 0 && out[len - 1] == '/') out[--len] = '\0';
+    return out[0] != '\0';
+}
+
+static void home_screen_install_root(char *out, size_t out_size) {
+    default_user_home_screen_install_root(out, out_size);
+}
+
+static void home_screen_version_path(char *out, size_t out_size) {
+    char root[PATH_MAX];
+    home_screen_install_root(root, sizeof(root));
+    snprintf(out, out_size, "%s/version", root);
+}
+
+static void home_screen_last_update_check_path(char *out, size_t out_size) {
+    char root[PATH_MAX];
+    home_screen_install_root(root, sizeof(root));
+    snprintf(out, out_size, "%s/last-update-check", root);
+}
+
+static bool installed_home_screen_version(char *out, size_t out_size) {
+    char path[PATH_MAX];
+    home_screen_version_path(path, sizeof(path));
+    return read_first_line_file(path, out, out_size);
+}
+
+static bool update_check_due(void) {
+    char path[PATH_MAX];
+    char timestamp[64] = "";
+    home_screen_last_update_check_path(path, sizeof(path));
+    if (!read_first_line_file(path, timestamp, sizeof(timestamp))) return true;
+    char *end = NULL;
+    long long last = strtoll(timestamp, &end, 10);
+    if (end == timestamp || last <= 0) return true;
+    time_t now = time(NULL);
+    return now <= 0 || (long long)now - last >= 24 * 60 * 60;
+}
+
+static void mark_update_check_completed(void) {
+    char path[PATH_MAX];
+    char value[64];
+    home_screen_last_update_check_path(path, sizeof(path));
+    snprintf(value, sizeof(value), "%lld\n", (long long)time(NULL));
+    (void)write_text_file_simple(path, value);
+}
+
+static int version_label_rank(const char *label) {
+    if (!label || !label[0]) return 3;
+    if (strcasecmp(label, "DEV") == 0) return 0;
+    if (strcasecmp(label, "ALPHA") == 0) return 0;
+    if (strcasecmp(label, "BETA") == 0) return 1;
+    if (strcasecmp(label, "RC") == 0) return 2;
+    return 3;
+}
+
+static void parse_version_component(const char *component, int *number, char *label, size_t label_size) {
+    if (number) *number = 0;
+    if (label && label_size > 0) label[0] = '\0';
+    if (!component) return;
+    char *end = NULL;
+    long value = strtol(component, &end, 10);
+    if (number && end != component && value >= 0 && value <= 1000000) {
+        *number = (int)value;
+    }
+    if (label && label_size > 0 && end && *end) {
+        while (*end == '-' || *end == '_' || *end == '+') end++;
+        snprintf(label, label_size, "%s", end);
+    }
+}
+
+static int compare_versions(const char *installed, const char *available) {
+    char a[128], b[128];
+    snprintf(a, sizeof(a), "%s", installed ? installed : "");
+    snprintf(b, sizeof(b), "%s", available ? available : "");
+    trim_whitespace_in_place(a);
+    trim_whitespace_in_place(b);
+    char *save_a = NULL;
+    char *save_b = NULL;
+    char *token_a = strtok_r(a, ".", &save_a);
+    char *token_b = strtok_r(b, ".", &save_b);
+    for (int i = 0; i < 8; i++) {
+        int number_a = 0;
+        int number_b = 0;
+        char label_a[64] = "";
+        char label_b[64] = "";
+        parse_version_component(token_a, &number_a, label_a, sizeof(label_a));
+        parse_version_component(token_b, &number_b, label_b, sizeof(label_b));
+        if (number_a < number_b) return -1;
+        if (number_a > number_b) return 1;
+        int rank_a = version_label_rank(label_a);
+        int rank_b = version_label_rank(label_b);
+        if (rank_a < rank_b) return -1;
+        if (rank_a > rank_b) return 1;
+        int label_compare = strcasecmp(label_a, label_b);
+        if (label_compare < 0) return -1;
+        if (label_compare > 0) return 1;
+        token_a = token_a ? strtok_r(NULL, ".", &save_a) : NULL;
+        token_b = token_b ? strtok_r(NULL, ".", &save_b) : NULL;
+        if (!token_a && !token_b) return 0;
+    }
+    return 0;
+}
+
+static bool fetch_home_screen_available_version(const char *heartbeat, char *out, size_t out_size, char *message, size_t message_size) {
+    if (out && out_size > 0) out[0] = '\0';
+    char base_url[2048];
+    if (!home_screen_base_url(base_url, sizeof(base_url))) {
+        snprintf(message, message_size, "No Home Screen update URL is configured.");
+        return false;
+    }
+    StringBuilder url = {0};
+    bool ok = sb_append(&url, base_url) &&
+              sb_append(&url, "/latest/version.txt?heartbeat=") &&
+              (append_url_encoded(&url, heartbeat && heartbeat[0] ? heartbeat : "manual"), true);
+    if (!ok) {
+        free(url.data);
+        snprintf(message, message_size, "Failed to build update URL.");
+        return false;
+    }
+
+    char quoted_url[4096];
+    shell_quote(url.data, quoted_url, sizeof(quoted_url));
+    free(url.data);
+    char command[8192];
+    snprintf(command,
+             sizeof(command),
+             "if command -v curl >/dev/null 2>&1; then "
+             "curl -fsSL %s; "
+             "elif command -v wget >/dev/null 2>&1; then "
+             "wget -qO- %s; "
+             "else echo 'curl or wget is required' >&2; exit 127; fi",
+             quoted_url,
+             quoted_url);
+    FILE *pipe = popen(command, "r");
+    if (!pipe) {
+        snprintf(message, message_size, "Failed to run update check: %s", strerror(errno));
+        return false;
+    }
+    char buffer[256] = "";
+    bool got = fgets(buffer, sizeof(buffer), pipe) != NULL;
+    int status = pclose(pipe);
+    if (status != 0 || !got) {
+        snprintf(message, message_size, "Could not fetch Home Screen version.");
+        return false;
+    }
+    trim_whitespace_in_place(buffer);
+    if (!buffer[0]) {
+        snprintf(message, message_size, "Home Screen version file was empty.");
+        return false;
+    }
+    snprintf(out, out_size, "%s", buffer);
+    return true;
+}
+
+static bool home_screen_update_available(char *available, size_t available_size) {
+    if (!update_check_due()) return false;
+    char base_url[2048] = "";
+    if (!home_screen_base_url(base_url, sizeof(base_url))) return false;
+    char installed[128] = "";
+    char latest[128] = "";
+    char message[256] = "";
+    if (!installed_home_screen_version(installed, sizeof(installed))) return false;
+    if (!fetch_home_screen_available_version("daily", latest, sizeof(latest), message, sizeof(message))) {
+        log_event("Home Screen update check failed: %s", message);
+        return false;
+    }
+    mark_update_check_completed();
+    if (compare_versions(installed, latest) < 0) {
+        snprintf(available, available_size, "%s", latest);
+        return true;
+    }
+    return false;
+}
+
+static bool run_home_screen_install_script(const char *subcommand, char *message, size_t message_size) {
+    char base_url[2048];
+    if (!home_screen_base_url(base_url, sizeof(base_url))) {
+        snprintf(message, message_size, "No Home Screen update URL is configured.");
+        return false;
+    }
+    char script_url[4096];
+    snprintf(script_url, sizeof(script_url), "%s/latest/install.sh?heartbeat=manual", base_url);
+    char quoted_url[4096];
+    char quoted_subcommand[64];
+    shell_quote(script_url, quoted_url, sizeof(quoted_url));
+    shell_quote(subcommand && subcommand[0] ? subcommand : "install", quoted_subcommand, sizeof(quoted_subcommand));
+    char command[8192];
+    snprintf(command,
+             sizeof(command),
+             "if command -v curl >/dev/null 2>&1; then "
+             "curl -fsSL %s | sh -s -- %s; "
+             "elif command -v wget >/dev/null 2>&1; then "
+             "wget -qO- %s | sh -s -- %s; "
+             "else echo 'curl or wget is required' >&2; exit 127; fi",
+             quoted_url,
+             quoted_subcommand,
+             quoted_url,
+             quoted_subcommand);
+    FILE *pipe = popen(command, "r");
+    if (!pipe) {
+        snprintf(message, message_size, "Failed to run Home Screen %s: %s", subcommand, strerror(errno));
+        return false;
+    }
+    size_t offset = 0;
+    while (offset + 1 < message_size) {
+        size_t got = fread(message + offset, 1, message_size - offset - 1, pipe);
+        offset += got;
+        if (got == 0) break;
+    }
+    message[offset] = '\0';
+    trim_whitespace_in_place(message);
+    int status = pclose(pipe);
+    if (status == 0) {
+        if (!message[0]) snprintf(message, message_size, "Home Screen %s completed.", subcommand);
+        return true;
+    }
+    if (!message[0]) snprintf(message, message_size, "Home Screen %s failed.", subcommand);
     return false;
 }
 
@@ -5400,6 +5746,76 @@ static bool unregister_backend_records(const char *service_id, char *error, size
         sqlite3_exec(database, "ROLLBACK;", NULL, NULL, NULL);
     }
     return close_registry_readwrite(database, ok, error, error_size) && ok;
+}
+
+static bool uninstall_local_home_screen(char *message, size_t message_size) {
+#ifdef __APPLE__
+    char error[1024] = "";
+    bool registry_ok = unregister_backend_records(kHomeScreenServiceID, error, sizeof(error));
+
+    const char *home = getenv("HOME");
+    char plist_path[PATH_MAX] = "";
+    if (home && home[0]) {
+        snprintf(plist_path, sizeof(plist_path), "%s/Library/LaunchAgents/dev.outergroup.HomeScreen.plist", home);
+        unlink(plist_path);
+    }
+    char socket_path[PATH_MAX] = "";
+    snprintf(socket_path, sizeof(socket_path), "%s", g_listen_socket_path);
+
+    pid_t parent_pid = getpid();
+    pid_t child = fork();
+    if (child == 0) {
+        setsid();
+        usleep(300000);
+        char service_target[128];
+        snprintf(service_target, sizeof(service_target), "gui/%ld/dev.outergroup.HomeScreen", (long)getuid());
+        pid_t bootout_child = fork();
+        if (bootout_child == 0) {
+            execlp("launchctl", "launchctl", "bootout", service_target, (char *)NULL);
+            _exit(127);
+        }
+        if (bootout_child > 0) {
+            int status = 0;
+            (void)waitpid(bootout_child, &status, 0);
+            if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+                pid_t remove_child = fork();
+                if (remove_child == 0) {
+                    execlp("launchctl", "launchctl", "remove", "dev.outergroup.HomeScreen", (char *)NULL);
+                    _exit(127);
+                }
+                if (remove_child > 0) {
+                    int remove_status = 0;
+                    (void)waitpid(remove_child, &remove_status, 0);
+                }
+            }
+        }
+        if (socket_path[0]) {
+            unlink(socket_path);
+        }
+        usleep(300000);
+        if (kill(parent_pid, 0) == 0) {
+            kill(parent_pid, SIGTERM);
+            usleep(300000);
+        }
+        if (kill(parent_pid, 0) == 0) {
+            kill(parent_pid, SIGKILL);
+        }
+        _exit(0);
+    }
+
+    if (!registry_ok) {
+        snprintf(message,
+                 message_size,
+                 "Removed the Home Screen LaunchAgent. Registry cleanup failed: %s",
+                 error[0] ? error : "unknown error");
+        return true;
+    }
+    snprintf(message, message_size, "Home Screen LaunchAgent removed. The app will stop momentarily.");
+    return true;
+#else
+    snprintf(message, message_size, "Local Home Screen uninstall is only implemented for macOS.");
+    return false;
+#endif
 }
 
 static bool install_bundled_app_macos(const BundledAppDefinition *app,
@@ -8082,7 +8498,7 @@ static void run_reactor(int listener) {
 }
 
 static void usage(const char *program) {
-    fprintf(stderr, "Usage: %s [--port PORT | --socket-path PATH] [--launchd-socket-name NAME] [--bundles-dir DIR] [--bundled-apps-dir DIR] [--app-base-url URL] [--database PATH] [--system-database PATH] [--stay-alive]\n", program);
+    fprintf(stderr, "Usage: %s [--port PORT | --socket-path PATH] [--launchd-socket-name NAME] [--bundles-dir DIR] [--bundled-apps-dir DIR] [--app-base-url URL] [--public-base-url URL] [--database PATH] [--system-database PATH] [--stay-alive]\n", program);
 }
 
 int HomeScreenBackendMain(int argc, char **argv) {
@@ -8092,8 +8508,12 @@ int HomeScreenBackendMain(int argc, char **argv) {
     char launchd_socket_name[128] = "Listener";
     const char *bundles_dir = "bundles";
     const char *app_base_url = getenv("HOME_SCREEN_APP_BASE_URL");
+    const char *public_base_url = getenv("HOME_SCREEN_PUBLIC_BASE_URL");
     if (app_base_url && app_base_url[0]) {
         snprintf(g_bundled_apps_base_url, sizeof(g_bundled_apps_base_url), "%s", app_base_url);
+    }
+    if (public_base_url && public_base_url[0]) {
+        snprintf(g_home_screen_public_base_url, sizeof(g_home_screen_public_base_url), "%s", public_base_url);
     }
     default_registry_database_path(g_registry_database_path, sizeof(g_registry_database_path));
     default_system_registry_database_path(g_system_registry_database_path, sizeof(g_system_registry_database_path));
@@ -8114,6 +8534,8 @@ int HomeScreenBackendMain(int argc, char **argv) {
             expand_tilde_path(argv[++i], g_bundled_apps_directory, sizeof(g_bundled_apps_directory));
         } else if (strcmp(argv[i], "--app-base-url") == 0 && i + 1 < argc) {
             snprintf(g_bundled_apps_base_url, sizeof(g_bundled_apps_base_url), "%s", argv[++i]);
+        } else if (strcmp(argv[i], "--public-base-url") == 0 && i + 1 < argc) {
+            snprintf(g_home_screen_public_base_url, sizeof(g_home_screen_public_base_url), "%s", argv[++i]);
         } else if (strcmp(argv[i], "--database") == 0 && i + 1 < argc) {
             expand_tilde_path(argv[++i], g_registry_database_path, sizeof(g_registry_database_path));
         } else if (strcmp(argv[i], "--system-database") == 0 && i + 1 < argc) {
@@ -8162,6 +8584,9 @@ int HomeScreenBackendMain(int argc, char **argv) {
     fprintf(stderr, "App payloads directory: %s\n", resolved_bundled_apps_root);
     if (g_bundled_apps_base_url[0]) {
         fprintf(stderr, "App payloads base URL: %s\n", g_bundled_apps_base_url);
+    }
+    if (g_home_screen_public_base_url[0]) {
+        fprintf(stderr, "Home Screen public base URL: %s\n", g_home_screen_public_base_url);
     }
 
     run_reactor(listener);
