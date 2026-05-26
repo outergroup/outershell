@@ -582,7 +582,9 @@ static bool sb_append_xml_escaped(StringBuilder *builder, const char *text) {
 static bool safe_unit_name(const char *unit_name) {
     if (!unit_name || !unit_name[0]) return false;
     size_t len = strlen(unit_name);
-    if (len > 240 || len < 9 || strcmp(unit_name + len - 8, ".service") != 0) return false;
+    bool has_service_suffix = len >= 9 && strcmp(unit_name + len - 8, ".service") == 0;
+    bool has_socket_suffix = len >= 8 && strcmp(unit_name + len - 7, ".socket") == 0;
+    if (len > 240 || (!has_service_suffix && !has_socket_suffix)) return false;
     for (const char *p = unit_name; *p; p++) {
         if (!(isalnum((unsigned char)*p) || *p == '.' || *p == '_' || *p == '-' || *p == '@' || *p == ':')) {
             return false;
@@ -1814,7 +1816,12 @@ static void migrate_user_outerwebapps_state(void) {
     };
 
     char error[1024] = "";
-    if (access(old_registry, R_OK) == 0) {
+    char binary_registry[PATH_MAX] = "";
+    bool new_binary_registry_exists = registry_binary_output_path(g_registry_database_path,
+                                                                  binary_registry,
+                                                                  sizeof(binary_registry)) &&
+                                      access(binary_registry, F_OK) == 0;
+    if (!new_binary_registry_exists && access(old_registry, R_OK) == 0) {
         if (merge_registry_database(old_registry,
                                     g_registry_database_path,
                                     replacements,
@@ -3132,7 +3139,12 @@ static bool lookup_systemd_backend_any(const char *service_id,
     if (database) {
         bool found = lookup_systemd_backend(database, service_id, unit_name, unit_name_size, scope, scope_size);
         sqlite3_close(database);
-        if (found) return true;
+        if (found) {
+#ifndef __APPLE__
+            snprintf(scope, scope_size, "system");
+#endif
+            return true;
+        }
     }
     return false;
 }
@@ -3394,7 +3406,8 @@ static bool append_registered_backend_payloads(sqlite3 *database,
                                                sqlite3 *layout_database,
                                                BinaryPayloadList *payloads,
                                                bool *bundled_installed,
-                                               size_t bundled_installed_count) {
+                                               size_t bundled_installed_count,
+                                               const char *registry_scope) {
     sqlite3_stmt *statement = NULL;
     bool has_launchd_table = sqlite_table_exists(database, "launchd_backends");
     bool has_systemd_table = sqlite_table_exists(database, "systemd_backends");
@@ -3422,6 +3435,11 @@ static bool append_registered_backend_payloads(sqlite3 *database,
         const char *service_scope = sqlite_column_text_or_empty(statement, 5);
         char effective_service_scope[32];
         snprintf(effective_service_scope, sizeof(effective_service_scope), "%s", service_scope);
+#ifndef __APPLE__
+        if (registry_scope && strcmp(registry_scope, "system") == 0) {
+            snprintf(effective_service_scope, sizeof(effective_service_scope), "system");
+        }
+#endif
         const BundledAppDefinition *bundled_app = bundled_app_for_service_id(service_id);
         bool is_self = is_home_screen_service_id(service_id);
         if (bundled_app) {
@@ -3610,11 +3628,13 @@ static void send_backends_response(int fd) {
     bool bundled_installed[sizeof(kBundledApps) / sizeof(kBundledApps[0])] = {0};
     if (user_database) {
         ok = ok && append_registered_backend_payloads(user_database, user_database, &payloads, bundled_installed,
-                                                       sizeof(bundled_installed) / sizeof(bundled_installed[0]));
+                                                       sizeof(bundled_installed) / sizeof(bundled_installed[0]),
+                                                       "user");
     }
     if (system_database) {
         ok = ok && append_registered_backend_payloads(system_database, user_database, &payloads, bundled_installed,
-                                                       sizeof(bundled_installed) / sizeof(bundled_installed[0]));
+                                                       sizeof(bundled_installed) / sizeof(bundled_installed[0]),
+                                                       "system");
     }
     ok = ok && append_root_migration_backend_payload(&payloads);
 
@@ -4089,7 +4109,40 @@ static void send_control_response(int fd, const char *query, const char *body) {
 
     char message[4096] = "";
     bool needs_password = false;
-    bool ok = run_systemd_operation(unit_name, scope, operation, sudo_password, &needs_password, message, sizeof(message));
+    bool ok = true;
+    char socket_unit[256] = "";
+    systemd_socket_unit_name(unit_name, socket_unit, sizeof(socket_unit));
+    if (safe_unit_name(socket_unit) && (strcmp(operation, "start") == 0 || strcmp(operation, "stop") == 0)) {
+        log_event("Running socket-backed systemd operation %s for %s (%s): socket=%s service=%s",
+                  operation,
+                  service_id,
+                  scope,
+                  socket_unit,
+                  unit_name);
+        bool ignored_needs_password = false;
+        char ignored_message[1024] = "";
+        if (strcmp(operation, "stop") == 0) {
+            (void)run_systemd_operation(socket_unit,
+                                        scope,
+                                        "stop",
+                                        sudo_password,
+                                        &ignored_needs_password,
+                                        ignored_message,
+                                        sizeof(ignored_message));
+            ok = run_systemd_operation(unit_name, scope, "stop", sudo_password, &needs_password, message, sizeof(message));
+        } else {
+            (void)run_systemd_operation(socket_unit,
+                                        scope,
+                                        "start",
+                                        sudo_password,
+                                        &ignored_needs_password,
+                                        ignored_message,
+                                        sizeof(ignored_message));
+            ok = run_systemd_operation(unit_name, scope, "start", sudo_password, &needs_password, message, sizeof(message));
+        }
+    } else {
+        ok = run_systemd_operation(unit_name, scope, operation, sudo_password, &needs_password, message, sizeof(message));
+    }
     if (ok && strcmp(operation, "stop") == 0) {
         clear_frontends_after_successful_stop(service_id, strcmp(scope, "system") == 0, sudo_password);
     }

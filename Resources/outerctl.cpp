@@ -1480,7 +1480,8 @@ bool updateBackendUnitRegistryRecord(sqlite3* database,
                                      Buffer& errorMessage) {
     sqlite3_stmt* statement = nullptr;
     if (!sqlitePrepareWithError(database,
-                                "UPDATE backends SET unit_name = ?, unit_path = ?, owns_unit = ? WHERE service_id = ?;",
+                                "UPDATE backends SET service_unit = CASE WHEN ? = '' THEN '' ELSE service_unit END, "
+                                "unit_name = ?, unit_path = ?, owns_unit = ? WHERE service_id = ?;",
                                 statement,
                                 errorMessage)) {
         return false;
@@ -1488,9 +1489,10 @@ bool updateBackendUnitRegistryRecord(sqlite3* database,
 
     const bool ok =
         sqlite3_bind_text(statement, 1, unitName ? unitName : "", -1, SQLITE_TRANSIENT) == SQLITE_OK &&
-        sqlite3_bind_text(statement, 2, unitPath ? unitPath : "", -1, SQLITE_TRANSIENT) == SQLITE_OK &&
-        sqlite3_bind_int(statement, 3, ownsUnit ? 1 : 0) == SQLITE_OK &&
-        sqlite3_bind_text(statement, 4, identifier, -1, SQLITE_TRANSIENT) == SQLITE_OK &&
+        sqlite3_bind_text(statement, 2, unitName ? unitName : "", -1, SQLITE_TRANSIENT) == SQLITE_OK &&
+        sqlite3_bind_text(statement, 3, unitPath ? unitPath : "", -1, SQLITE_TRANSIENT) == SQLITE_OK &&
+        sqlite3_bind_int(statement, 4, ownsUnit ? 1 : 0) == SQLITE_OK &&
+        sqlite3_bind_text(statement, 5, identifier, -1, SQLITE_TRANSIENT) == SQLITE_OK &&
         sqliteStepDone(statement, errorMessage);
     if (!ok && errorMessage.size == 0) {
         setSqliteError(errorMessage, database, "Failed to update backend unit registry row: ");
