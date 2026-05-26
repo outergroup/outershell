@@ -122,6 +122,14 @@ private struct ActionResponse: Decodable {
     let needsPassword: Bool?
 }
 
+private struct EventResponse {
+    let backendsChanged: Bool
+    let logChanged: Bool
+    let timedOut: Bool
+    let backendsVersion: UInt64
+    let logVersion: UInt64
+}
+
 private struct RecipesResponse: Decodable {
     let pythonSuggestions: [String]
     let recipes: [RecipeRecord]
@@ -315,6 +323,18 @@ private extension ActionResponse {
         return ActionResponse(ok: (flags & 0x01) != 0,
                               message: try reader.stringRef(at: 4),
                               needsPassword: (flags & 0x02) != 0)
+    }
+}
+
+private extension EventResponse {
+    static func decodeBinary(_ data: Data) throws -> EventResponse {
+        let reader = BinaryPayloadReader(data: data)
+        let flags = try reader.uint32(at: 0)
+        return EventResponse(backendsChanged: (flags & 0x01) != 0,
+                             logChanged: (flags & 0x02) != 0,
+                             timedOut: (flags & 0x04) != 0,
+                             backendsVersion: try reader.uint64(at: 8),
+                             logVersion: try reader.uint64(at: 16))
     }
 }
 
@@ -530,7 +550,11 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private var createEndpoint: URL?
     private var recipesEndpoint: URL?
     private var filePickerEndpoint: URL?
-    private var pollTimer: Timer?
+    private var eventsEndpoint: URL?
+    private var eventWatchTask: URLSessionDataTask?
+    private var eventWatchGeneration = 0
+    private var backendsEventVersion: UInt64 = 0
+    private var logEventVersion: UInt64 = 0
     private var didRegisterLayer = false
 
     private var backends: [BackendRecord] = []
@@ -711,7 +735,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             outerframeHost.setPasteboardDropBehaviorHitTest(acceptedTypes: Self.createFieldPasteboardTypes)
             fetchBackends()
             fetchRecipes()
-            startPolling()
+            startEventWatch()
 
         case .resizeContent(let size):
             currentSize = size
@@ -817,7 +841,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                                              snapshot: OuterframeAccessibilitySnapshot.notImplementedSnapshot())
 
         case .shutdown:
-            stopPolling()
+            stopEventWatch()
             retainedSelf = nil
 
         default:
@@ -826,7 +850,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     func outerframeHostDidDisconnect(_ host: OuterframeHost) {
-        stopPolling()
+        stopEventWatch()
         retainedSelf = nil
     }
 
@@ -838,10 +862,11 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             createEndpoint = URL(string: "/api/create", relativeTo: base)?.absoluteURL
             recipesEndpoint = URL(string: "/api/recipes", relativeTo: base)?.absoluteURL
             filePickerEndpoint = URL(string: "/api/file-picker", relativeTo: base)?.absoluteURL
+            eventsEndpoint = URL(string: "/api/events", relativeTo: base)?.absoluteURL
         }
         let configuration = URLSessionConfiguration.ephemeral
-        configuration.timeoutIntervalForRequest = 20
-        configuration.timeoutIntervalForResource = 30
+        configuration.timeoutIntervalForRequest = 40
+        configuration.timeoutIntervalForResource = 45
         configuration.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
         outerframeHost.applyProxy(to: configuration)
         urlSession = URLSession(configuration: configuration)
@@ -1276,22 +1301,57 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         }
     }
 
-    private func startPolling() {
-        stopPolling()
-        pollTimer = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { [weak self] _ in
+    private func startEventWatch(resetVersions: Bool = false) {
+        guard eventWatchTask == nil, let eventsEndpoint, let urlSession else { return }
+        if resetVersions {
+            backendsEventVersion = 0
+            logEventVersion = 0
+        }
+        let generation = eventWatchGeneration
+        var components = URLComponents(url: eventsEndpoint, resolvingAgainstBaseURL: false)
+        var items = [
+            URLQueryItem(name: "sinceBackends", value: String(backendsEventVersion)),
+            URLQueryItem(name: "sinceLog", value: String(logEventVersion))
+        ]
+        if let selectedLog {
+            items.append(URLQueryItem(name: "serviceID", value: selectedLog.serviceID))
+            items.append(URLQueryItem(name: "logIndex", value: String(selectedLog.logIndex)))
+        }
+        components?.queryItems = items
+        guard let url = components?.url else { return }
+        eventWatchTask = urlSession.dataTask(with: url) { [weak self] data, _, error in
             Task { @MainActor in
-                guard let self else { return }
-                self.fetchBackends(quiet: true)
-                if self.selectedLog != nil {
-                    self.fetchSelectedLog(quiet: true)
+                guard let self, self.eventWatchGeneration == generation else { return }
+                self.eventWatchTask = nil
+                if error == nil,
+                   let data,
+                   let event = try? EventResponse.decodeBinary(data) {
+                    self.backendsEventVersion = event.backendsVersion
+                    self.logEventVersion = event.logVersion
+                    if event.backendsChanged {
+                        self.fetchBackends(quiet: true)
+                    }
+                    if event.logChanged, self.selectedLog != nil {
+                        self.fetchSelectedLog(quiet: true)
+                    }
                 }
+                self.startEventWatch()
             }
         }
+        eventWatchTask?.resume()
     }
 
-    private func stopPolling() {
-        pollTimer?.invalidate()
-        pollTimer = nil
+    private func restartEventWatch(resetVersions: Bool = false) {
+        eventWatchGeneration += 1
+        eventWatchTask?.cancel()
+        eventWatchTask = nil
+        startEventWatch(resetVersions: resetVersions)
+    }
+
+    private func stopEventWatch() {
+        eventWatchGeneration += 1
+        eventWatchTask?.cancel()
+        eventWatchTask = nil
     }
 
     private func configureLayersIfNeeded() {
@@ -2897,6 +2957,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                     if let selectedServiceID = self.selectedServiceID,
                        !self.backends.contains(where: { $0.serviceID == selectedServiceID }) {
                         self.clearLogSelection()
+                        self.restartEventWatch(resetVersions: true)
                     }
                     if self.selectedServiceID != nil {
                         self.ensureLogSelection()
@@ -4240,6 +4301,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             if let row = backendRowFrames.first(where: { $0.frame.contains(rowsPoint) }) {
                 if row.row.serviceID == selectedServiceID {
                     clearLogSelection()
+                    restartEventWatch(resetVersions: true)
                     updateLayout()
                 } else {
                     selectedServiceID = row.row.serviceID
@@ -4247,6 +4309,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                     logSnapshot = nil
                     logScroll = 0
                     fetchSelectedLog()
+                    restartEventWatch(resetVersions: true)
                     updateLayout()
                 }
                 return
@@ -4254,6 +4317,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             if selectedServiceID != nil,
                (rowsClipLayer.frame.contains(contentPoint) || tableHeaderLayer.frame.contains(contentPoint)) {
                 clearLogSelection()
+                restartEventWatch(resetVersions: true)
                 updateLayout()
             }
         } else if mode == .create {
@@ -4407,6 +4471,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         case 53:
             if mode == .backends, selectedServiceID != nil {
                 clearLogSelection()
+                restartEventWatch(resetVersions: true)
                 updateLayout()
             } else {
                 navigateToMode(.apps, pushHistory: true)
@@ -4530,6 +4595,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         logSnapshot = nil
         logScroll = 0
         fetchSelectedLog()
+        restartEventWatch(resetVersions: true)
         updateLayout()
     }
 

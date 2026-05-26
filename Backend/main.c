@@ -81,6 +81,12 @@ typedef struct {
     char request[READ_BUFFER_SIZE];
     size_t length;
     int64_t last_activity_ms;
+    bool waiting_for_events;
+    int64_t event_deadline_ms;
+    uint64_t event_since_backends;
+    uint64_t event_since_log;
+    char event_log_service_id[PATH_MAX];
+    int event_log_index;
 } ReactorClient;
 
 typedef struct {
@@ -105,6 +111,7 @@ typedef struct {
 } SystemdStatusCache;
 
 static SystemdStatusCache g_systemd_status_cache = {0};
+static uint64_t g_backend_event_sequence = 1;
 
 typedef struct {
     const char *service_id;
@@ -660,6 +667,35 @@ static bool query_value(const char *query, const char *name, char *dst, size_t d
 
 static bool query_value_any(const char *query, const char *body, const char *name, char *dst, size_t dst_size) {
     return query_value(query, name, dst, dst_size) || query_value(body, name, dst, dst_size);
+}
+
+static uint64_t parse_u64_or_zero(const char *text) {
+    if (!text || !text[0]) return 0;
+    char *end = NULL;
+    unsigned long long value = strtoull(text, &end, 10);
+    if (!end || *end != '\0') return 0;
+    return (uint64_t)value;
+}
+
+static uint64_t mix_u64(uint64_t hash, uint64_t value) {
+    hash ^= value + UINT64_C(0x9e3779b97f4a7c15) + (hash << 6) + (hash >> 2);
+    return hash ? hash : 1;
+}
+
+static uint64_t file_state_token(const char *path) {
+    if (!path || !path[0]) return 0;
+    struct stat st;
+    if (stat(path, &st) != 0) return 0;
+    uint64_t token = (uint64_t)st.st_size;
+#ifdef __APPLE__
+    token = mix_u64(token, (uint64_t)st.st_mtimespec.tv_sec);
+    token = mix_u64(token, (uint64_t)st.st_mtimespec.tv_nsec);
+#else
+    token = mix_u64(token, (uint64_t)st.st_mtim.tv_sec);
+    token = mix_u64(token, (uint64_t)st.st_mtim.tv_nsec);
+#endif
+    token = mix_u64(token, (uint64_t)st.st_ino);
+    return token ? token : 1;
 }
 
 static const char *home_directory(void) {
@@ -3700,6 +3736,62 @@ static bool resolve_log_path_any(const char *service_id, int log_index, char *pa
     return false;
 }
 
+static uint64_t registry_file_state_token(const char *sqlite_path) {
+    uint64_t token = file_state_token(sqlite_path);
+    char binary_path[PATH_MAX] = "";
+    if (registry_binary_output_path(sqlite_path, binary_path, sizeof(binary_path))) {
+        token = mix_u64(token, file_state_token(binary_path));
+    }
+    return token;
+}
+
+static uint64_t current_backends_event_version(void) {
+    uint64_t version = g_backend_event_sequence;
+    version = mix_u64(version, registry_file_state_token(g_registry_database_path));
+    version = mix_u64(version, registry_file_state_token(g_system_registry_database_path));
+    return version ? version : 1;
+}
+
+static uint64_t current_log_event_version(const char *service_id, int log_index) {
+    if (!service_id || !service_id[0]) return 0;
+    char error[512] = "";
+    char raw_path[PATH_MAX] = "";
+    if (!resolve_log_path_any(service_id, log_index, raw_path, sizeof(raw_path), error, sizeof(error))) {
+        return mix_u64(current_backends_event_version(), 0);
+    }
+    char path[PATH_MAX];
+    expand_tilde_path(raw_path, path, sizeof(path));
+    return mix_u64(current_backends_event_version(), file_state_token(path));
+}
+
+static void mark_backend_event_changed(void) {
+    g_backend_event_sequence++;
+    if (g_backend_event_sequence == 0) g_backend_event_sequence = 1;
+}
+
+static void send_events_response(int fd,
+                                 bool backends_changed,
+                                 bool log_changed,
+                                 bool timed_out,
+                                 uint64_t backends_version,
+                                 uint64_t log_version) {
+    StringBuilder builder = {0};
+    uint32_t flags = (backends_changed ? 1u : 0u) |
+                     (log_changed ? 2u : 0u) |
+                     (timed_out ? 4u : 0u);
+    bool ok = binary_append_zero(&builder, 24) &&
+              binary_write_u32_at(&builder, 0, flags) &&
+              binary_write_u64_at(&builder, 8, backends_version) &&
+              binary_write_u64_at(&builder, 16, log_version);
+    if (!ok) {
+        free(builder.data);
+        send_text_response(fd, 500, "out of memory\n");
+        return;
+    }
+    send_binary_response(fd, 200, &builder);
+    free(builder.data);
+}
+
 static void send_log_response(int fd, const char *service_id, const char *path, const char *contents,
                           bool truncated, uint64_t file_size, double modified, const char *error) {
     StringBuilder builder = {0};
@@ -3950,6 +4042,7 @@ static void send_control_response(int fd, const char *query, const char *body) {
                   frontend_url,
                   list_name,
                   message);
+        if (ok) mark_backend_event_changed();
         send_action_response(fd, ok ? 200 : 500, ok, message);
         return;
     }
@@ -3963,6 +4056,7 @@ static void send_control_response(int fd, const char *query, const char *body) {
         bool needs_password = false;
         bool ok = run_root_outerwebapps_migration(sudo_password, &needs_password, message, sizeof(message));
         log_event("%s root outerwebapps migration: %s", ok ? "Completed" : "Failed", message);
+        if (ok) mark_backend_event_changed();
         send_action_response_ex(fd, ok ? 200 : (needs_password ? 401 : 500), ok, message, needs_password);
         return;
     }
@@ -4006,6 +4100,7 @@ static void send_control_response(int fd, const char *query, const char *body) {
                 ok = run_home_screen_install_script(installer_command, message, sizeof(message));
             }
             log_event("%s Outer Shell %s: %s", ok ? "Completed" : "Failed", installer_command, message);
+            if (ok) mark_backend_event_changed();
             send_action_response(fd, ok ? 200 : 500, ok, message);
             return;
         }
@@ -4057,6 +4152,7 @@ static void send_control_response(int fd, const char *query, const char *body) {
                   app->service_id,
                   scope,
                   message);
+        if (ok) mark_backend_event_changed();
         send_action_response_ex(fd, ok ? 200 : (needs_password ? 401 : 500), ok, message, needs_password);
         return;
     }
@@ -4066,6 +4162,7 @@ static void send_control_response(int fd, const char *query, const char *body) {
         bool needs_password = false;
         bool ok = uninstall_backend(service_id, sudo_password, &needs_password, message, sizeof(message));
         log_event("%s backend %s: %s", ok ? "Uninstalled" : "Failed to uninstall", service_id, message);
+        if (ok) mark_backend_event_changed();
         send_action_response_ex(fd, ok ? 200 : (needs_password ? 401 : 500), ok, message, needs_password);
         return;
     }
@@ -4094,6 +4191,7 @@ static void send_control_response(int fd, const char *query, const char *body) {
                   operation,
                   service_id,
                   message);
+        if (ok) mark_backend_event_changed();
         send_action_response_ex(fd, ok ? 200 : (needs_password ? 401 : 500), ok, message, needs_password);
         return;
     }
@@ -4152,6 +4250,7 @@ static void send_control_response(int fd, const char *query, const char *body) {
               service_id,
               scope,
               message);
+    if (ok) mark_backend_event_changed();
     send_action_response_ex(fd, ok ? 200 : (needs_password ? 401 : 500), ok, message, needs_password);
 }
 
@@ -7965,6 +8064,7 @@ static void send_create_response(int fd, const char *query) {
     char response[512];
     snprintf(response, sizeof(response), "Created %s.", display_name);
     log_event("Created and started backend %s.", service_id);
+    mark_backend_event_changed();
     send_action_response(fd, 200, true, response);
 }
 
@@ -8181,7 +8281,40 @@ static bool request_is_complete(const char *request, size_t length, size_t *comp
     return true;
 }
 
-static void process_client_request(int fd, char *request, size_t n) {
+static bool prepare_events_response_or_wait(ReactorClient *client, const char *query) {
+    char since_backends_raw[64] = "";
+    char since_log_raw[64] = "";
+    char service_id[PATH_MAX] = "";
+    char log_index_raw[64] = "";
+    query_value(query, "sinceBackends", since_backends_raw, sizeof(since_backends_raw));
+    query_value(query, "sinceLog", since_log_raw, sizeof(since_log_raw));
+    query_value(query, "serviceID", service_id, sizeof(service_id));
+    query_value(query, "logIndex", log_index_raw, sizeof(log_index_raw));
+    int log_index = log_index_raw[0] ? atoi(log_index_raw) : 0;
+    if (log_index < 0) log_index = 0;
+
+    uint64_t since_backends = parse_u64_or_zero(since_backends_raw);
+    uint64_t since_log = parse_u64_or_zero(since_log_raw);
+    uint64_t backends_version = current_backends_event_version();
+    uint64_t log_version = current_log_event_version(service_id, log_index);
+    bool backends_changed = since_backends == 0 || backends_version != since_backends;
+    bool log_changed = service_id[0] && (since_log == 0 || log_version != since_log);
+    if (backends_changed || log_changed) {
+        send_events_response(client->fd, backends_changed, log_changed, false, backends_version, log_version);
+        return false;
+    }
+
+    client->waiting_for_events = true;
+    client->event_deadline_ms = monotonic_milliseconds() + 25000;
+    client->event_since_backends = since_backends;
+    client->event_since_log = since_log;
+    snprintf(client->event_log_service_id, sizeof(client->event_log_service_id), "%s", service_id);
+    client->event_log_index = log_index;
+    return true;
+}
+
+static bool process_client_request(ReactorClient *client, char *request, size_t n) {
+    int fd = client->fd;
     request[n] = '\0';
 
     char *body = strstr(request, "\r\n\r\n");
@@ -8209,11 +8342,11 @@ static void process_client_request(int fd, char *request, size_t n) {
     char method[16], target[1024], version[16];
     if (sscanf(request, "%15s %1023s %15s", method, target, version) != 3) {
         send_text_response(fd, 400, "bad request\n");
-        return;
+        return false;
     }
     if (strcasecmp(method, "GET") != 0 && strcasecmp(method, "HEAD") != 0 && strcasecmp(method, "POST") != 0) {
         send_text_response(fd, 400, "unsupported method\n");
-        return;
+        return false;
     }
 
     char *query = strchr(target, '?');
@@ -8248,9 +8381,12 @@ static void process_client_request(int fd, char *request, size_t n) {
         send_recipes_response(fd);
     } else if (strcmp(target, "/api/file-picker") == 0) {
         send_file_picker_response(fd, query);
+    } else if (strcmp(target, "/api/events") == 0) {
+        return prepare_events_response_or_wait(client, query);
     } else {
         send_text_response(fd, 404, "not found\n");
     }
+    return false;
 }
 
 static int create_tcp_listener(int port) {
@@ -8469,6 +8605,35 @@ static void accept_ready_clients(int listener, ReactorClient *clients, size_t *c
     }
 }
 
+static bool event_client_ready(ReactorClient *client, bool *timed_out,
+                               uint64_t *backends_version, uint64_t *log_version) {
+    *timed_out = monotonic_milliseconds() >= client->event_deadline_ms;
+    *backends_version = current_backends_event_version();
+    *log_version = current_log_event_version(client->event_log_service_id, client->event_log_index);
+    bool backends_changed = *backends_version != client->event_since_backends;
+    bool log_changed = client->event_log_service_id[0] && *log_version != client->event_since_log;
+    return *timed_out || backends_changed || log_changed;
+}
+
+static void flush_ready_event_clients(ReactorClient *clients, size_t *client_count) {
+    for (size_t i = *client_count; i > 0; i--) {
+        size_t index = i - 1;
+        ReactorClient *client = &clients[index];
+        if (!client->waiting_for_events) continue;
+        bool timed_out = false;
+        uint64_t backends_version = 0;
+        uint64_t log_version = 0;
+        if (!event_client_ready(client, &timed_out, &backends_version, &log_version)) continue;
+        send_events_response(client->fd,
+                             backends_version != client->event_since_backends,
+                             client->event_log_service_id[0] && log_version != client->event_since_log,
+                             timed_out,
+                             backends_version,
+                             log_version);
+        close_reactor_client(clients, client_count, index);
+    }
+}
+
 static void run_reactor(int listener) {
     ReactorClient *clients = calloc(MAX_REACTOR_CLIENTS, sizeof(ReactorClient));
     if (!clients) {
@@ -8479,6 +8644,7 @@ static void run_reactor(int listener) {
 
     set_fd_nonblocking(listener, true);
     while (!g_shutdown_requested) {
+        flush_ready_event_clients(clients, &client_count);
         struct pollfd poll_fds[MAX_REACTOR_CLIENTS + 1];
         size_t polled_client_count = client_count;
         poll_fds[0] = (struct pollfd){.fd = listener, .events = POLLIN, .revents = 0};
@@ -8512,6 +8678,13 @@ static void run_reactor(int listener) {
                 short revents = poll_fds[index + 1].revents;
                 if (revents == 0) continue;
 
+                if (clients[index].waiting_for_events) {
+                    if (revents & (POLLIN | POLLERR | POLLHUP | POLLNVAL)) {
+                        close_reactor_client(clients, &client_count, index);
+                    }
+                    continue;
+                }
+
                 if (revents & POLLIN) {
                     size_t complete_length = 0;
                     bool should_close = false;
@@ -8520,12 +8693,15 @@ static void run_reactor(int listener) {
                         set_fd_nonblocking(clients[index].fd, false);
                         if (complete_length > READ_BUFFER_SIZE) {
                             send_text_response(clients[index].fd, 400, "request too large\n");
+                            close_reactor_client(clients, &client_count, index);
                         } else {
-                            process_client_request(clients[index].fd,
-                                                   clients[index].request,
-                                                   complete_length);
+                            bool keep_open = process_client_request(&clients[index],
+                                                                    clients[index].request,
+                                                                    complete_length);
+                            if (!keep_open) {
+                                close_reactor_client(clients, &client_count, index);
+                            }
                         }
-                        close_reactor_client(clients, &client_count, index);
                     } else if (should_close) {
                         close_reactor_client(clients, &client_count, index);
                     }
