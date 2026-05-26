@@ -312,57 +312,26 @@ runner_path="$install_root/run-outer-shell.sh"
 cleanup_legacy_home_screen() {
     legacy_install_root="$outerwebapps_home/home-screen"
     legacy_socket_path="$runtime_dir/dev.outergroup.HomeScreen"
+    legacy_service_id="dev.outergroup.HomeScreen"
     systemctl --user disable --now dev.outergroup.HomeScreen.socket dev.outergroup.HomeScreen.service >/dev/null 2>&1 || true
     rm -f "$unit_dir/dev.outergroup.HomeScreen.service" "$unit_dir/dev.outergroup.HomeScreen.socket" "$legacy_socket_path"
     systemctl --user daemon-reload >/dev/null 2>&1 || true
     rm -rf "$legacy_install_root"
-    if command -v python3 >/dev/null 2>&1; then
-        OUTER_SHELL_REGISTRY="$outerwebapps_home/registry.sqlite3" \
-        LEGACY_HOME_SCREEN_SERVICE_ID="dev.outergroup.HomeScreen" \
-        python3 - <<'PY' || true
-import os
-import sqlite3
-
-database_path = os.environ["OUTER_SHELL_REGISTRY"]
-service_id = os.environ["LEGACY_HOME_SCREEN_SERVICE_ID"]
-try:
-    database = sqlite3.connect(database_path)
-except sqlite3.Error:
-    raise SystemExit(0)
-with database:
-    for table in ("frontends", "log_files", "systemd_backends", "backends"):
-        try:
-            database.execute(f"DELETE FROM {table} WHERE service_id = ?", (service_id,))
-        except sqlite3.Error:
-            pass
-database.close()
-PY
+    if [ -x "$outerctl_path" ]; then
+        OUTERWEBAPPS_HOME="$outerwebapps_home" "$outerctl_path" app clear --backend "$legacy_service_id" >/dev/null 2>&1 || true
+        OUTERWEBAPPS_HOME="$outerwebapps_home" "$outerctl_path" log clear --backend "$legacy_service_id" >/dev/null 2>&1 || true
+        OUTERWEBAPPS_HOME="$outerwebapps_home" "$outerctl_path" systemd clear --backend "$legacy_service_id" >/dev/null 2>&1 || true
+        OUTERWEBAPPS_HOME="$outerwebapps_home" "$outerctl_path" backend remove --backend "$legacy_service_id" >/dev/null 2>&1 || true
     fi
 }
 
 if [ "$command" = "uninstall" ]; then
     systemctl --user disable org.outershell.OuterShell.socket >/dev/null 2>&1 || true
-    if command -v python3 >/dev/null 2>&1; then
-        OUTER_SHELL_REGISTRY="$outerwebapps_home/registry.sqlite3" \
-        OUTER_SHELL_SERVICE_ID="org.outershell.OuterShell" \
-        python3 - <<'PY' || true
-import os
-import sqlite3
-
-database_path = os.environ["OUTER_SHELL_REGISTRY"]
-service_id = os.environ["OUTER_SHELL_SERVICE_ID"]
-try:
-    database = sqlite3.connect(database_path)
-except sqlite3.Error:
-    raise SystemExit(0)
-with database:
-    for table in ("frontends", "log_files", "systemd_backends", "backends"):
-        try:
-            database.execute(f"DELETE FROM {table} WHERE service_id = ?", (service_id,))
-        except sqlite3.Error:
-            pass
-database.close()
-PY
+    if [ -x "$outerctl_path" ]; then
+        OUTERWEBAPPS_HOME="$outerwebapps_home" "$outerctl_path" app clear --backend org.outershell.OuterShell >/dev/null 2>&1 || true
+        OUTERWEBAPPS_HOME="$outerwebapps_home" "$outerctl_path" log clear --backend org.outershell.OuterShell >/dev/null 2>&1 || true
+        OUTERWEBAPPS_HOME="$outerwebapps_home" "$outerctl_path" systemd clear --backend org.outershell.OuterShell >/dev/null 2>&1 || true
+        OUTERWEBAPPS_HOME="$outerwebapps_home" "$outerctl_path" backend remove --backend org.outershell.OuterShell >/dev/null 2>&1 || true
     fi
     cleanup_script="$(mktemp)"
     cat > "$cleanup_script" <<EOF
@@ -427,126 +396,12 @@ EOF
 
 printf '[%s] %s Outer Shell package %s from %s.\n' "$(timestamp)" "$command" "__OUTER_SHELL_VERSION__" "$public_base_url" >> "$log_path"
 
-if command -v python3 >/dev/null 2>&1; then
-    OUTER_SHELL_REGISTRY="$outerwebapps_home/registry.sqlite3" \
-    OUTER_SHELL_SERVICE_ID="org.outershell.OuterShell" \
-    OUTER_SHELL_DISPLAY_NAME="Outer Shell" \
-    OUTER_SHELL_UNIT_NAME="org.outershell.OuterShell.service" \
-    OUTER_SHELL_SOCKET_PATH="$socket_path" \
-    OUTER_SHELL_LOG_PATH="$log_path" \
-    OUTER_SHELL_ICON_PATH="$install_root/app-icon.png" \
-    python3 - <<'PY'
-import base64
-import os
-import sqlite3
-
-database_path = os.environ["OUTER_SHELL_REGISTRY"]
-service_id = os.environ["OUTER_SHELL_SERVICE_ID"]
-display_name = os.environ["OUTER_SHELL_DISPLAY_NAME"]
-unit_name = os.environ["OUTER_SHELL_UNIT_NAME"]
-socket_path = os.environ["OUTER_SHELL_SOCKET_PATH"]
-log_path = os.environ["OUTER_SHELL_LOG_PATH"]
-icon_path = os.environ["OUTER_SHELL_ICON_PATH"]
-
-def registry_icon_value(path):
-    try:
-        with open(path, "rb") as file:
-            data = file.read(1024 * 1024 + 1)
-    except OSError:
-        return path
-    if not data or len(data) > 1024 * 1024:
-        return path
-    return "data:image/png;base64," + base64.b64encode(data).decode("ascii")
-
-os.makedirs(os.path.dirname(database_path), exist_ok=True)
-database = sqlite3.connect(database_path)
-database.executescript("""
-CREATE TABLE IF NOT EXISTS backends (
-service_id TEXT PRIMARY KEY,
-display_name TEXT NOT NULL DEFAULT '',
-icon TEXT,
-service_unit TEXT
-);
-CREATE TABLE IF NOT EXISTS frontends (
-url TEXT PRIMARY KEY,
-service_id TEXT,
-display_name TEXT NOT NULL DEFAULT '',
-port INTEGER NOT NULL DEFAULT 0,
-socket_path TEXT NOT NULL DEFAULT '',
-icon TEXT,
-is_home_screen INTEGER NOT NULL DEFAULT 0,
-list TEXT
-);
-CREATE INDEX IF NOT EXISTS frontends_service_id_idx ON frontends(service_id);
-CREATE TABLE IF NOT EXISTS log_files (
-path TEXT PRIMARY KEY,
-service_id TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS log_files_service_id_idx ON log_files(service_id);
-CREATE TABLE IF NOT EXISTS systemd_backends (
-service_id TEXT PRIMARY KEY,
-unit_name TEXT NOT NULL,
-scope TEXT NOT NULL DEFAULT 'user'
-);
-""")
-
-def ensure_column(table, name, definition):
-    columns = {row[1] for row in database.execute(f"PRAGMA table_info({table})")}
-    if name not in columns:
-        database.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
-
-ensure_column("backends", "icon", "TEXT")
-ensure_column("backends", "service_unit", "TEXT")
-ensure_column("frontends", "display_name", "TEXT NOT NULL DEFAULT ''")
-ensure_column("frontends", "icon", "TEXT")
-ensure_column("frontends", "is_home_screen", "INTEGER NOT NULL DEFAULT 0")
-ensure_column("frontends", "list", "TEXT")
-frontend_columns = {row[1] for row in database.execute("PRAGMA table_info(frontends)")}
-if "name" in frontend_columns:
-    database.execute("UPDATE frontends SET display_name = name WHERE display_name = ''")
-    database.executescript("""
-DROP INDEX IF EXISTS frontends_service_id_idx;
-CREATE TABLE frontends_new (
-url TEXT PRIMARY KEY,
-service_id TEXT,
-display_name TEXT NOT NULL DEFAULT '',
-port INTEGER NOT NULL DEFAULT 0,
-socket_path TEXT NOT NULL DEFAULT '',
-icon TEXT,
-is_home_screen INTEGER NOT NULL DEFAULT 0,
-list TEXT
-);
-INSERT OR REPLACE INTO frontends_new(url, service_id, display_name, port, socket_path, icon, is_home_screen, list)
-SELECT url, service_id, COALESCE(NULLIF(display_name, ''), name, ''), COALESCE(port, 0), COALESCE(socket_path, ''), icon, COALESCE(is_home_screen, 0), list FROM frontends;
-DROP TABLE frontends;
-ALTER TABLE frontends_new RENAME TO frontends;
-CREATE INDEX IF NOT EXISTS frontends_service_id_idx ON frontends(service_id);
-""")
-
-icon_value = registry_icon_value(icon_path)
-with database:
-    database.execute(
-        "INSERT INTO backends(service_id, display_name, icon, service_unit) VALUES(?, ?, ?, ?) "
-        "ON CONFLICT(service_id) DO UPDATE SET display_name=excluded.display_name, icon=excluded.icon, service_unit=excluded.service_unit",
-        (service_id, display_name, icon_value, unit_name),
-    )
-    database.execute(
-        "INSERT INTO systemd_backends(service_id, unit_name, scope) VALUES(?, ?, 'user') "
-        "ON CONFLICT(service_id) DO UPDATE SET unit_name=excluded.unit_name, scope=excluded.scope",
-        (service_id, unit_name),
-    )
-    database.execute("DELETE FROM frontends WHERE service_id = ?", (service_id,))
-    database.execute(
-        "INSERT INTO frontends(url, service_id, display_name, port, socket_path, icon, is_home_screen) VALUES(?, ?, ?, 0, ?, ?, 1)",
-        (socket_path, service_id, display_name, socket_path, icon_value),
-    )
-    database.execute("DELETE FROM log_files WHERE service_id = ?", (service_id,))
-    database.execute("INSERT INTO log_files(path, service_id) VALUES(?, ?)", (log_path, service_id))
-database.close()
-PY
-else
-    printf '[%s] python3 is unavailable; skipped registry update for Outer Shell logs.\n' "$(timestamp)" >> "$log_path"
-fi
+OUTERWEBAPPS_HOME="$outerwebapps_home" "$outerctl_path" backend upsert --backend org.outershell.OuterShell --name "Outer Shell" --icon-path "$install_root/app-icon.png"
+OUTERWEBAPPS_HOME="$outerwebapps_home" "$outerctl_path" systemd set --backend org.outershell.OuterShell --unit org.outershell.OuterShell.service
+OUTERWEBAPPS_HOME="$outerwebapps_home" "$outerctl_path" app clear --backend org.outershell.OuterShell
+OUTERWEBAPPS_HOME="$outerwebapps_home" "$outerctl_path" app add --backend org.outershell.OuterShell --socket-path "$socket_path" --name "Outer Shell" --url "$socket_path" --icon-path "$install_root/app-icon.png"
+OUTERWEBAPPS_HOME="$outerwebapps_home" "$outerctl_path" log clear --backend org.outershell.OuterShell
+OUTERWEBAPPS_HOME="$outerwebapps_home" "$outerctl_path" log add --backend org.outershell.OuterShell --path "$log_path"
 
 if [ "$command" = "install" ]; then
     systemctl --user stop org.outershell.OuterShell.service >/dev/null 2>&1 || true
