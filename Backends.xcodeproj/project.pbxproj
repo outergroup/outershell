@@ -7,9 +7,9 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		37B4F9D12FA1B00100873894 /* main.c in Sources */ = {isa = PBXBuildFile; fileRef = 37B4F9D02FA1B00100873894 /* main.c */; };
 		AG0000000000000000000004 /* OuterShellAgent.swift in Sources */ = {isa = PBXBuildFile; fileRef = AG0000000000000000000003 /* OuterShellAgent.swift */; };
 		AG0000000000000000000005 /* main.c in Sources */ = {isa = PBXBuildFile; fileRef = 37B4F9D02FA1B00100873894 /* main.c */; };
-		37B4F9D12FA1B00100873894 /* main.c in Sources */ = {isa = PBXBuildFile; fileRef = 37B4F9D02FA1B00100873894 /* main.c */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXCopyFilesBuildPhase section */
@@ -31,12 +31,12 @@
 		0F0000000000000000000008 /* README.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = README.md; sourceTree = "<group>"; };
 		0F0000000000000000000009 /* build_site.sh */ = {isa = PBXFileReference; lastKnownFileType = text.script.sh; path = build_site.sh; sourceTree = "<group>"; };
 		0F000000000000000000000A /* .gitignore */ = {isa = PBXFileReference; lastKnownFileType = text; path = .gitignore; sourceTree = "<group>"; };
-		AG0000000000000000000001 /* Outer Shell.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "Outer Shell.app"; sourceTree = BUILT_PRODUCTS_DIR; };
-		AG0000000000000000000003 /* OuterShellAgent.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OuterShellAgent.swift; sourceTree = "<group>"; };
 		37B4F9C12FA189AB00873894 /* AGENTS.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = AGENTS.md; sourceTree = "<group>"; };
 		37B4F9C22FA18C1E00873894 /* LICENSE */ = {isa = PBXFileReference; lastKnownFileType = text; path = LICENSE; sourceTree = "<group>"; };
 		37B4F9CF2FA1B00100873894 /* OuterShellBackend */ = {isa = PBXFileReference; explicitFileType = "compiled.mach-o.executable"; includeInIndex = 0; path = OuterShellBackend; sourceTree = BUILT_PRODUCTS_DIR; };
 		37B4F9D02FA1B00100873894 /* main.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = main.c; sourceTree = "<group>"; };
+		AG0000000000000000000001 /* Outer Shell.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "Outer Shell.app"; sourceTree = BUILT_PRODUCTS_DIR; };
+		AG0000000000000000000003 /* OuterShellAgent.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OuterShellAgent.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -58,13 +58,6 @@
 /* End PBXFileSystemSynchronizedRootGroup section */
 
 /* Begin PBXFrameworksBuildPhase section */
-		AG0000000000000000000006 /* Frameworks */ = {
-			isa = PBXFrameworksBuildPhase;
-			buildActionMask = 2147483647;
-			files = (
-			);
-			runOnlyForDeploymentPostprocessing = 0;
-		};
 		0F0000000000000000000010 /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
@@ -73,6 +66,13 @@
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 		37B4F9D42FA1B00100873894 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		AG0000000000000000000006 /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -110,20 +110,20 @@
 			name = Products;
 			sourceTree = "<group>";
 		};
-		AG0000000000000000000002 /* Agent */ = {
-			isa = PBXGroup;
-			children = (
-				AG0000000000000000000003 /* OuterShellAgent.swift */,
-			);
-			path = Agent;
-			sourceTree = "<group>";
-		};
 		37B4F9CE2FA1B00100873894 /* Backend */ = {
 			isa = PBXGroup;
 			children = (
 				37B4F9D02FA1B00100873894 /* main.c */,
 			);
 			path = Backend;
+			sourceTree = "<group>";
+		};
+		AG0000000000000000000002 /* Agent */ = {
+			isa = PBXGroup;
+			children = (
+				AG0000000000000000000003 /* OuterShellAgent.swift */,
+			);
+			path = Agent;
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */
@@ -236,14 +236,14 @@
 /* End PBXProject section */
 
 /* Begin PBXResourcesBuildPhase section */
-		AG0000000000000000000008 /* Resources */ = {
+		0F0000000000000000000012 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
-		0F0000000000000000000012 /* Resources */ = {
+		AG0000000000000000000008 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -253,15 +253,6 @@
 /* End PBXResourcesBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
-		AG0000000000000000000007 /* Sources */ = {
-			isa = PBXSourcesBuildPhase;
-			buildActionMask = 2147483647;
-			files = (
-				AG0000000000000000000004 /* OuterShellAgent.swift in Sources */,
-				AG0000000000000000000005 /* main.c in Sources */,
-			);
-			runOnlyForDeploymentPostprocessing = 0;
-		};
 		0F000000000000000000000F /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
@@ -274,6 +265,15 @@
 			buildActionMask = 2147483647;
 			files = (
 				37B4F9D12FA1B00100873894 /* main.c in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		AG0000000000000000000007 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				AG0000000000000000000004 /* OuterShellAgent.swift in Sources */,
+				AG0000000000000000000005 /* main.c in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

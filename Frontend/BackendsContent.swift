@@ -583,7 +583,7 @@ private struct PendingFilePicker {
 }
 
 @MainActor
-private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLineTextInputControllerDelegate {
+private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLineTextInputControllerDelegate, ScrollbarControllerDelegate {
     private let outerframeHost: OuterframeHost
     private let appConnection: OuterframeAppConnection
     private var retainedSelf: BackendsHandler?
@@ -657,6 +657,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private var logEstimatedContentHeightCache: (generation: Int, textWidth: CGFloat, height: CGFloat)?
     private var logTextFragmentCoverage: (generation: Int, textWidth: CGFloat, contentHeight: CGFloat, rect: CGRect)?
     private var logTextSelectionCoverage: (generation: Int, textWidth: CGFloat, contentHeight: CGFloat, range: NSRange, rect: CGRect)?
+    private var logScrollbarController: ScrollbarController<BackendsHandler>?
     private let logContentStorage = NSTextContentStorage()
     private let logTextLayoutManager = NSTextLayoutManager()
     private let logTextContainer = NSTextContainer(size: CGSize(width: 320, height: 1_000_000))
@@ -1469,6 +1470,12 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         contentLayer.addSublayer(logRowsClipLayer)
         logRowsClipLayer.addSublayer(logTextContentLayer)
         logTextContentLayer.addSublayer(logTextSelectionLayer)
+        let scrollbar = ScrollbarController<BackendsHandler>(appConnection: outerframeHost,
+                                                             viewportLayer: logRowsClipLayer,
+                                                             appearance: appearance ?? NSAppearance.currentDrawing(),
+                                                             scrollOffsetOrigin: .bottom)
+        scrollbar.delegate = self
+        logScrollbarController = scrollbar
         contentLayer.addSublayer(createLayer)
         createLayer.addSublayer(filePickerOverlayLayer)
 
@@ -1624,6 +1631,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 updateLogTextContentIfNeeded(text: currentLogText(), force: true)
                 updateLogTextViewport()
                 updateLogTextSelectionLayers(force: true)
+                logScrollbarController?.updateAppearance(appearance ?? NSAppearance.currentDrawing())
 
                 titleLayer.font = NSFont.systemFont(ofSize: 15, weight: .semibold)
                 titleLayer.fontSize = 15
@@ -2754,6 +2762,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                            width: textWidth,
                                            height: contentHeight)
         logTextSelectionLayer.frame = CGRect(x: 0, y: 0, width: textWidth, height: contentHeight)
+        updateLogScrollbarLayout()
 
         let visibleTextRect = visibleLogTextContentRect()
         if let coverage = logTextFragmentCoverage,
@@ -2839,6 +2848,16 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                       y: minY,
                       width: rect.width,
                       height: max(maxY - minY, rect.height))
+    }
+
+    private func logScrollbarMetrics() -> ScrollbarController<BackendsHandler>.Metrics {
+        ScrollbarController.Metrics(viewportSize: logRowsClipLayer.bounds.size,
+                                    contentHeight: logContentHeight(),
+                                    scrollOffset: logScroll)
+    }
+
+    private func updateLogScrollbarLayout() {
+        logScrollbarController?.updateLayout(metrics: logScrollbarMetrics())
     }
 
     private func updateLogTextContentIfNeeded(text: String, force: Bool = false) {
@@ -4554,6 +4573,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
     private func handleMouseDragged(to point: CGPoint, modifierFlags: NSEvent.ModifierFlags) {
         _ = modifierFlags
+        if logScrollbarController?.handleMouseDragged(to: rootLayer.convert(point, to: logRowsClipLayer)) == true {
+            return
+        }
         if handleLogMouseDragged(to: point) {
             return
         }
@@ -4581,6 +4603,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
     private func handleMouseUp(at point: CGPoint, modifierFlags: NSEvent.ModifierFlags) {
         logDragAnchorSelections = []
+        _ = logScrollbarController?.handleMouseUp(at: rootLayer.convert(point, to: logRowsClipLayer))
         if let pendingAppDrag {
             self.pendingAppDrag = nil
             if pendingAppDrag.isDragging {
@@ -4714,6 +4737,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         } else if mode == .backends {
             let contentPoint = contentLayer.convert(point, from: rootLayer)
             if selectedServiceID != nil && logRowsClipLayer.frame.contains(contentPoint) {
+                logScrollbarController?.cancelAnimation()
                 logScroll -= delta.y * (precise ? 1 : logScrollLineHeight)
                 logScroll = clampedLogScroll(logScroll)
                 updateLogTextViewport()
@@ -4778,6 +4802,12 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             let contentPoint = contentLayer.convert(point, from: rootLayer)
             let createPoint = createLayer.convert(contentPoint, from: contentLayer)
             handleFilePickerMouseDown(at: createPoint, modifierFlags: modifierFlags, clickCount: clickCount)
+            return
+        }
+
+        if mode == .backends,
+           selectedServiceID != nil,
+           logScrollbarController?.handleMouseDown(at: rootLayer.convert(point, to: logRowsClipLayer)) == true {
             return
         }
 
@@ -5329,6 +5359,12 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private func clampedLogScroll(_ value: CGFloat) -> CGFloat {
         let maxScroll = max(logContentHeight() - logRowsClipLayer.bounds.height, 0)
         return min(max(value, 0), maxScroll)
+    }
+
+    func scrollbarDidChangeScrollOffset(_ offset: CGFloat) {
+        logScroll = clampedLogScroll(offset)
+        updateLogTextViewport()
+        updateLogTextSelectionLayers()
     }
 
     private func logContentHeight() -> CGFloat {
