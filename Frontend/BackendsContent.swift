@@ -523,6 +523,54 @@ private enum FilePickerMode {
     case chooseDirectory
 }
 
+private final class LogTextDisplayLayer: CALayer {
+    var textLayoutManager: NSTextLayoutManager?
+    var scrollOffset: CGFloat = 0
+    var textInset: CGPoint = .zero
+    var visibleBounds: CGRect = .zero
+
+    override init() {
+        super.init()
+        contentsScale = NSScreen.main?.backingScaleFactor ?? 2
+        needsDisplayOnBoundsChange = true
+    }
+
+    override init(layer: Any) {
+        super.init(layer: layer)
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func draw(in context: CGContext) {
+        guard let textLayoutManager else { return }
+
+        context.saveGState()
+        context.translateBy(x: textInset.x, y: textInset.y - scrollOffset)
+
+        let visibleTextRect = visibleBounds.offsetBy(dx: -textInset.x,
+                                                     dy: scrollOffset - textInset.y)
+        let layoutRect = visibleTextRect.insetBy(dx: 0, dy: -120)
+        textLayoutManager.ensureLayout(for: layoutRect)
+        let startLocation = textLayoutManager.textLayoutFragment(for: CGPoint(x: 0, y: max(layoutRect.minY, 0)))?.rangeInElement.location
+            ?? textLayoutManager.documentRange.location
+        textLayoutManager.enumerateTextLayoutFragments(from: startLocation,
+                                                        options: [.ensuresLayout]) { fragment in
+            let frame = fragment.layoutFragmentFrame
+            if frame.minY > visibleTextRect.maxY {
+                return false
+            }
+            if frame.maxY >= visibleTextRect.minY {
+                fragment.draw(at: frame.origin, in: context)
+            }
+            return true
+        }
+
+        context.restoreGState()
+    }
+}
+
 private struct PendingFilePicker {
     let mode: FilePickerMode
     let recipeID: String?
@@ -553,6 +601,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private var eventsEndpoint: URL?
     private var eventWatchTask: URLSessionDataTask?
     private var eventWatchGeneration = 0
+    private var eventWatchRetryDelay: TimeInterval = 1
     private var backendsEventVersion: UInt64 = 0
     private var logEventVersion: UInt64 = 0
     private var didRegisterLayer = false
@@ -599,6 +648,14 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private var createMessage = ""
     private var backendScroll: CGFloat = 0
     private var logScroll: CGFloat = 0
+    private var logRenderedText = ""
+    private var logAttributedText = NSAttributedString(string: "")
+    private var logTextSelectionRange: NSRange?
+    private var logDragAnchorSelections: [NSTextSelection] = []
+    private var logTextSelectionLayers: [CALayer] = []
+    private let logContentStorage = NSTextContentStorage()
+    private let logTextLayoutManager = NSTextLayoutManager()
+    private let logTextContainer = NSTextContainer(size: CGSize(width: 320, height: 1_000_000))
     private var appsScroll: CGFloat = 0
     private var createScroll: CGFloat = 0
     private var createContentBottom: CGFloat = 0
@@ -644,6 +701,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private let rowsClipLayer = CALayer()
     private let logHeaderLayer = CALayer()
     private let logRowsClipLayer = CALayer()
+    private let logTextSelectionLayer = CALayer()
+    private let logTextLayer = LogTextDisplayLayer()
     private let dividerLayer = CALayer()
     private let createLayer = CALayer()
     private let iconTransitionLayer = CALayer()
@@ -701,7 +760,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private let tableHeaderHeight: CGFloat = 30
     private let backendRowHeight: CGFloat = 44
     private let logHeaderHeight: CGFloat = 62
-    private let logLineHeight: CGFloat = 18
+    private let logTextInsetX: CGFloat = 12
+    private let logTextInsetY: CGFloat = 10
+    private let logScrollLineHeight: CGFloat = 18
     private let horizontalInset: CGFloat = 18
     private let createBottomInset: CGFloat = 18
     private let pageTransitionDuration: CFTimeInterval = 0.28
@@ -710,6 +771,12 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         self.outerframeHost = outerframeHost
         self.appConnection = appConnection
         super.init()
+        logTextContainer.lineFragmentPadding = 0
+        logTextLayoutManager.textContainer = logTextContainer
+        logTextLayoutManager.usesFontLeading = true
+        logContentStorage.addTextLayoutManager(logTextLayoutManager)
+        logContentStorage.attributedString = logAttributedText
+        logTextLayer.textLayoutManager = logTextLayoutManager
         retainedSelf = self
     }
 
@@ -1319,13 +1386,16 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         }
         components?.queryItems = items
         guard let url = components?.url else { return }
-        eventWatchTask = urlSession.dataTask(with: url) { [weak self] data, _, error in
+        eventWatchTask = urlSession.dataTask(with: url) { [weak self] data, response, error in
             Task { @MainActor in
                 guard let self, self.eventWatchGeneration == generation else { return }
                 self.eventWatchTask = nil
+                let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
                 if error == nil,
+                   statusCode < 400,
                    let data,
                    let event = try? EventResponse.decodeBinary(data) {
+                    self.eventWatchRetryDelay = 1
                     self.backendsEventVersion = event.backendsVersion
                     self.logEventVersion = event.logVersion
                     if event.backendsChanged {
@@ -1334,17 +1404,36 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                     if event.logChanged, self.selectedLog != nil {
                         self.fetchSelectedLog(quiet: true)
                     }
+                    self.startEventWatch()
+                    return
+                }
+                self.scheduleEventWatchRetry()
+            }
+        }
+        eventWatchTask?.resume()
+    }
+
+    private func scheduleEventWatchRetry() {
+        let generation = eventWatchGeneration
+        let delay = eventWatchRetryDelay
+        eventWatchRetryDelay = min(eventWatchRetryDelay * 2, 30)
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            Task { @MainActor in
+                guard let self,
+                      self.eventWatchGeneration == generation,
+                      self.eventWatchTask == nil else {
+                    return
                 }
                 self.startEventWatch()
             }
         }
-        eventWatchTask?.resume()
     }
 
     private func restartEventWatch(resetVersions: Bool = false) {
         eventWatchGeneration += 1
         eventWatchTask?.cancel()
         eventWatchTask = nil
+        eventWatchRetryDelay = 1
         startEventWatch(resetVersions: resetVersions)
     }
 
@@ -1352,6 +1441,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         eventWatchGeneration += 1
         eventWatchTask?.cancel()
         eventWatchTask = nil
+        eventWatchRetryDelay = 1
     }
 
     private func configureLayersIfNeeded() {
@@ -1374,6 +1464,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         contentLayer.addSublayer(dividerLayer)
         contentLayer.addSublayer(logHeaderLayer)
         contentLayer.addSublayer(logRowsClipLayer)
+        logRowsClipLayer.addSublayer(logTextSelectionLayer)
+        logRowsClipLayer.addSublayer(logTextLayer)
         contentLayer.addSublayer(createLayer)
         createLayer.addSublayer(filePickerOverlayLayer)
 
@@ -1381,6 +1473,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         installOverlayLayer.isHidden = true
         passwordOverlayLayer.isHidden = true
         filePickerOverlayLayer.isHidden = true
+        rowsClipLayer.masksToBounds = true
+        logRowsClipLayer.masksToBounds = true
+        logTextSelectionLayer.isGeometryFlipped = true
+        logTextLayer.isGeometryFlipped = true
 
         for layer in [titleLayer, statusLayer] {
             layer.contentsScale = 2
@@ -1524,6 +1620,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 newButtonLayer.applyStyle(textCGColor: resolvedCGColor(.white),
                                           backgroundCGColor: resolvedCGColor(.controlAccentColor),
                                           font: NSFont.systemFont(ofSize: 12, weight: .medium))
+                updateLogTextContentIfNeeded(text: currentLogText(), force: true)
+                logTextLayer.setNeedsDisplay()
+                updateLogTextSelectionLayers()
 
                 titleLayer.font = NSFont.systemFont(ofSize: 15, weight: .semibold)
                 titleLayer.fontSize = 15
@@ -2622,47 +2721,145 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func renderLogRows() {
-        logRowsClipLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
-        let text: String
-        if isLoadingLog && logSnapshot == nil {
-            text = "Loading logs..."
-        } else if !logError.isEmpty {
-            text = logError
-        } else if let contents = logSnapshot?.contents, !contents.isEmpty {
-            text = contents
-        } else if selectedServiceID != nil, selectedLog == nil {
-            text = "No registered log file."
-        } else if selectedServiceID != nil {
-            text = "No logs yet."
+        logTextSelectionLayer.frame = logRowsClipLayer.bounds
+        logTextLayer.frame = logRowsClipLayer.bounds
+        logTextLayer.visibleBounds = logTextLayer.bounds
+        logTextLayer.textInset = CGPoint(x: logTextInsetX, y: logTextInsetY)
+
+        let textWidth = max(logRowsClipLayer.bounds.width - logTextInsetX * 2, 1)
+        logTextContainer.size = CGSize(width: textWidth, height: max(logTextContainer.size.height, logRowsClipLayer.bounds.height))
+        updateLogTextContentIfNeeded(text: currentLogText(), force: true)
+        logTextContainer.size = CGSize(width: textWidth, height: max(estimatedLogContentHeight(textWidth: textWidth) - logTextInsetY * 2, logRowsClipLayer.bounds.height))
+        logScroll = clampedLogScroll(logScroll)
+        logTextLayer.scrollOffset = logScroll
+        logTextLayer.setNeedsDisplay()
+        updateLogTextSelectionLayers()
+    }
+
+    private func updateLogTextContentIfNeeded(text: String, force: Bool = false) {
+        let displayText = text.isEmpty ? " " : text
+        guard force || displayText != logRenderedText else { return }
+
+        let shouldPreserveSelection = force && displayText == logRenderedText
+        let previousRange = logTextSelectionRange
+        logRenderedText = displayText
+        logAttributedText = makeLogAttributedText(displayText)
+        logContentStorage.attributedString = logAttributedText
+
+        if shouldPreserveSelection,
+           let previousRange,
+           previousRange.location + previousRange.length <= logAttributedText.length,
+           let textRange = logTextRange(for: previousRange) {
+            let selection = NSTextSelection([textRange], affinity: .downstream, granularity: .character)
+            logTextLayoutManager.textSelections = [selection]
+            logTextSelectionRange = previousRange
         } else {
-            text = ""
+            setLogTextSelection(nil, notify: false)
+        }
+    }
+
+    private func makeLogAttributedText(_ text: String) -> NSAttributedString {
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.lineBreakMode = .byCharWrapping
+        paragraph.lineSpacing = 2
+
+        let color: NSColor
+        if !logError.isEmpty {
+            color = .systemRed
+        } else if logSnapshot == nil || text == "No logs yet." || text == "No registered log file." || text == "Loading logs..." {
+            color = .secondaryLabelColor
+        } else {
+            color = .labelColor
         }
 
-        let lines = logLines(from: text)
-        let visibleStart = max(Int(floor(logScroll / logLineHeight)), 0)
-        let visibleCount = Int(ceil(logRowsClipLayer.bounds.height / logLineHeight)) + 2
-        let visibleEnd = min(lines.count, visibleStart + visibleCount)
-        let lineColor: NSColor = logError.isEmpty ? .labelColor : .systemRed
+        return NSAttributedString(string: text,
+                                  attributes: [
+                                    .font: logTextFont(),
+                                    .foregroundColor: color,
+                                    .paragraphStyle: paragraph
+                                  ])
+    }
 
-        for index in visibleStart..<visibleEnd {
-            let y = logRowsClipLayer.bounds.height - CGFloat(index) * logLineHeight + logScroll - logLineHeight
-            let rowLayer = CALayer()
-            rowLayer.frame = CGRect(x: 0, y: y, width: logRowsClipLayer.bounds.width, height: logLineHeight)
-            if index.isMultiple(of: 2) {
-                rowLayer.backgroundColor = resolvedCGColor(NSColor.controlBackgroundColor.withAlphaComponent(0.20))
+    private func setLogTextSelection(_ selection: NSTextSelection?, notify: Bool = true) {
+        _ = notify
+        logTextLayoutManager.textSelections = selection.map { [$0] } ?? []
+        logTextSelectionRange = logTextRangeOffsets(for: selection)
+        updateLogTextSelectionLayers()
+        updateEditingAndPasteboardState()
+    }
+
+    private func updateLogTextSelectionLayers() {
+        for layer in logTextSelectionLayers {
+            layer.removeFromSuperlayer()
+        }
+        logTextSelectionLayers = []
+
+        guard let selectionRange = logTextSelectionRange,
+              selectionRange.length > 0,
+              let textRange = logTextRange(for: selectionRange) else {
+            return
+        }
+
+        let selectionColor = resolvedCGColor(windowIsActive ? NSColor.selectedTextBackgroundColor.withAlphaComponent(0.78) : NSColor.unemphasizedSelectedTextBackgroundColor.withAlphaComponent(0.78))
+        logTextLayoutManager.enumerateTextSegments(in: textRange,
+                                                   type: .selection,
+                                                   options: []) { _, rect, _, _ in
+            let visibleFrame = CGRect(x: self.logTextInsetX + rect.minX,
+                                      y: self.logTextInsetY + rect.minY - self.logScroll,
+                                      width: rect.width,
+                                      height: rect.height)
+            guard visibleFrame.intersects(self.logTextSelectionLayer.bounds) else {
+                return true
             }
 
-            let number = makeTextLayer(size: 11, weight: .regular, color: .tertiaryLabelColor, alignment: .right, monospaced: true)
-            number.string = String(index + 1)
-            number.frame = CGRect(x: 8, y: 2, width: 48, height: 14)
-            rowLayer.addSublayer(number)
-
-            let line = makeTextLayer(size: 12, weight: .regular, color: lineColor, monospaced: true)
-            line.string = lines[index].isEmpty ? " " : lines[index]
-            line.frame = CGRect(x: 66, y: 2, width: max(rowLayer.bounds.width - 78, 1), height: 15)
-            rowLayer.addSublayer(line)
-            logRowsClipLayer.addSublayer(rowLayer)
+            let highlight = CALayer()
+            highlight.frame = visibleFrame
+            highlight.backgroundColor = selectionColor
+            highlight.cornerRadius = 2
+            self.logTextSelectionLayer.addSublayer(highlight)
+            self.logTextSelectionLayers.append(highlight)
+            return true
         }
+    }
+
+    private func selectedLogAttributedText() -> NSAttributedString? {
+        guard let selectionRange = logTextSelectionRange,
+              selectionRange.length > 0,
+              selectionRange.location >= 0,
+              selectionRange.location + selectionRange.length <= logAttributedText.length else {
+            return nil
+        }
+        return logAttributedText.attributedSubstring(from: selectionRange)
+    }
+
+    private func logAttributedText(for selection: NSTextSelection?) -> NSAttributedString? {
+        guard let range = logTextRangeOffsets(for: selection),
+              range.location >= 0,
+              range.location + range.length <= logAttributedText.length else {
+            return nil
+        }
+        return logAttributedText.attributedSubstring(from: range)
+    }
+
+    private func logTextRangeOffsets(for selection: NSTextSelection?) -> NSRange? {
+        guard let textRange = selection?.textRanges.first else { return nil }
+        let documentStart = logTextLayoutManager.documentRange.location
+        let start = logContentStorage.offset(from: documentStart, to: textRange.location)
+        let end = logContentStorage.offset(from: documentStart, to: textRange.endLocation)
+        guard start != NSNotFound, end != NSNotFound else { return nil }
+        let location = max(0, min(start, end))
+        let length = min(logAttributedText.length - location, abs(end - start))
+        guard length > 0 else { return nil }
+        return NSRange(location: location, length: length)
+    }
+
+    private func logTextRange(for range: NSRange) -> NSTextRange? {
+        let documentStart = logTextLayoutManager.documentRange.location
+        guard let start = logContentStorage.location(documentStart, offsetBy: range.location),
+              let end = logContentStorage.location(documentStart, offsetBy: range.location + range.length) else {
+            return nil
+        }
+        return NSTextRange(location: start, end: end)
     }
 
     private func renderCreateForm() {
@@ -3746,9 +3943,16 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             return
         }
 
-        let capabilities = createInputController.currentEditingCapabilities()
-        outerframeHost.setEditingCapabilities(canCopy: capabilities.canCopy, canCut: capabilities.canCut)
-        outerframeHost.setAcceptedPasteboardPasteTypes(createInputController.currentAcceptedPasteboardTypeIdentifiers())
+        if createInputController.isFocused {
+            let capabilities = createInputController.currentEditingCapabilities()
+            outerframeHost.setEditingCapabilities(canCopy: capabilities.canCopy, canCut: capabilities.canCut)
+            outerframeHost.setAcceptedPasteboardPasteTypes(createInputController.currentAcceptedPasteboardTypeIdentifiers())
+            return
+        }
+
+        outerframeHost.setEditingCapabilities(canCopy: (logTextSelectionRange?.length ?? 0) > 0,
+                                              canCut: false)
+        outerframeHost.setAcceptedPasteboardPasteTypes([])
     }
 
     private func createInputFont(monospaced: Bool) -> NSFont {
@@ -3906,17 +4110,32 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func pasteboardItemsForCopy() -> [OuterframeContentPasteboardItem] {
-        guard createInputController.isFocused,
-              let selectedText = createInputController.selectedTextContent(),
-              !selectedText.isEmpty else {
+        if createInputController.isFocused,
+           let selectedText = createInputController.selectedTextContent(),
+           !selectedText.isEmpty {
+            return [
+                OuterframeContentPasteboardItem(representations: [
+                    OuterframeContentPasteboardRepresentation(typeIdentifier: NSPasteboard.PasteboardType.string.rawValue,
+                                                              data: Data(selectedText.utf8))
+                ])
+            ]
+        }
+
+        guard let selectedText = selectedLogAttributedText(),
+              selectedText.length > 0 else {
             return []
         }
-        return [
-            OuterframeContentPasteboardItem(representations: [
-                OuterframeContentPasteboardRepresentation(typeIdentifier: NSPasteboard.PasteboardType.string.rawValue,
-                                                          data: Data(selectedText.utf8))
-            ])
+
+        var representations = [
+            OuterframeContentPasteboardRepresentation(typeIdentifier: NSPasteboard.PasteboardType.string.rawValue,
+                                                      data: Data(selectedText.string.utf8))
         ]
+        if let rtfData = try? selectedText.data(from: NSRange(location: 0, length: selectedText.length),
+                                                documentAttributes: [.documentType: NSAttributedString.DocumentType.rtf]) {
+            representations.append(OuterframeContentPasteboardRepresentation(typeIdentifier: NSPasteboard.PasteboardType.rtf.rawValue,
+                                                                             data: rtfData))
+        }
+        return [OuterframeContentPasteboardItem(representations: representations)]
     }
 
     private func pasteboardItemsForCut() -> [OuterframeContentPasteboardItem] {
@@ -4027,6 +4246,160 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         _ = insertPasteboardItemsIntoCreateField(items)
     }
 
+    @discardableResult
+    private func handleLogMouseDown(at point: CGPoint,
+                                    modifierFlags: NSEvent.ModifierFlags,
+                                    clickCount: Int) -> Bool {
+        guard isPointInLogTextRegion(point) else { return false }
+        blurCreateField()
+        blurPasswordField()
+
+        let textPoint = logTextContainerPoint(fromRootPoint: point)
+        let selections = logTextLayoutManager.textSelectionNavigation.textSelections(interactingAt: textPoint,
+                                                                                     inContainerAt: logTextLayoutManager.documentRange.location,
+                                                                                     anchors: [],
+                                                                                     modifiers: [],
+                                                                                     selecting: false,
+                                                                                     bounds: logTextInteractionBounds())
+        logDragAnchorSelections = selections
+
+        if clickCount >= 3 {
+            let fragmentSelection = logTextLayoutFragmentSelection(at: textPoint)
+            logDragAnchorSelections = fragmentSelection.map { [$0] } ?? []
+            setLogTextSelection(fragmentSelection)
+        } else if clickCount == 2, let selection = selections.first {
+            let wordSelection = logTextLayoutManager.textSelectionNavigation.textSelection(for: .word,
+                                                                                          enclosing: selection)
+            setLogTextSelection(wordSelection)
+        } else if !modifierFlags.contains(.shift) {
+            setLogTextSelection(nil)
+        }
+        return true
+    }
+
+    @discardableResult
+    private func handleLogRightMouseDown(at point: CGPoint) -> Bool {
+        guard isPointInLogTextRegion(point) else { return false }
+
+        if let location = logTextLocationOffset(at: point),
+           let selectionRange = logTextSelectionRange,
+           NSLocationInRange(location, selectionRange),
+           let selectedText = selectedLogAttributedText() {
+            outerframeHost.showContextMenu(for: selectedText, at: point)
+            return true
+        }
+
+        guard let selection = logTextSelection(at: point) else { return true }
+        let wordSelection = logTextLayoutManager.textSelectionNavigation.textSelection(for: .word,
+                                                                                      enclosing: selection)
+        guard let selectedText = logAttributedText(for: wordSelection),
+              !selectedText.string.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return true
+        }
+
+        setLogTextSelection(wordSelection)
+        outerframeHost.showContextMenu(for: selectedText, at: point)
+        return true
+    }
+
+    private func handleLogMouseDragged(to point: CGPoint) -> Bool {
+        guard !logDragAnchorSelections.isEmpty else { return false }
+        let textPoint = logTextContainerPoint(fromRootPoint: point)
+        let selections = logTextLayoutManager.textSelectionNavigation.textSelections(interactingAt: textPoint,
+                                                                                     inContainerAt: logTextLayoutManager.documentRange.location,
+                                                                                     anchors: logDragAnchorSelections,
+                                                                                     modifiers: [.extend],
+                                                                                     selecting: true,
+                                                                                     bounds: logTextInteractionBounds())
+        setLogTextSelection(selections.first)
+        return true
+    }
+
+    private func logTextSelection(at point: CGPoint) -> NSTextSelection? {
+        let textPoint = logTextContainerPoint(fromRootPoint: point)
+        return logTextLayoutManager.textSelectionNavigation.textSelections(interactingAt: textPoint,
+                                                                           inContainerAt: logTextLayoutManager.documentRange.location,
+                                                                           anchors: [],
+                                                                           modifiers: [],
+                                                                           selecting: false,
+                                                                           bounds: logTextInteractionBounds()).first
+    }
+
+    private func logTextLayoutFragmentSelection(at textPoint: CGPoint) -> NSTextSelection? {
+        var matchingFragment: NSTextLayoutFragment?
+        logTextLayoutManager.enumerateTextLayoutFragments(from: logTextLayoutManager.documentRange.location,
+                                                          options: [.ensuresLayout]) { fragment in
+            let frame = fragment.layoutFragmentFrame
+            if frame.minY > textPoint.y {
+                return false
+            }
+            let paragraphHitFrame = CGRect(x: 0,
+                                           y: frame.minY,
+                                           width: logTextContainer.size.width,
+                                           height: max(frame.height, 1))
+            if paragraphHitFrame.insetBy(dx: 0, dy: -2).contains(textPoint) {
+                matchingFragment = fragment
+                return false
+            }
+            return true
+        }
+
+        guard let range = matchingFragment?.rangeInElement else { return nil }
+        return NSTextSelection([range], affinity: .downstream, granularity: .paragraph)
+    }
+
+    private func logTextLocationOffset(at point: CGPoint) -> Int? {
+        guard let selection = logTextSelection(at: point),
+              let range = selection.textRanges.first else {
+            return nil
+        }
+        let offset = logContentStorage.offset(from: logTextLayoutManager.documentRange.location,
+                                              to: range.location)
+        return offset == NSNotFound ? nil : offset
+    }
+
+    private func isPointInLogTextRegion(_ point: CGPoint) -> Bool {
+        guard mode == .backends,
+              selectedServiceID != nil,
+              pendingInstallBackend == nil,
+              pendingPasswordAction == nil,
+              pendingFilePicker == nil else { return false }
+        let contentPoint = contentLayer.convert(point, from: rootLayer)
+        return logRowsClipLayer.frame.contains(contentPoint)
+    }
+
+    private func isPointOverLogText(_ point: CGPoint) -> Bool {
+        guard isPointInLogTextRegion(point) else { return false }
+        let textPoint = logTextContainerPoint(fromRootPoint: point)
+        var found = false
+        logTextLayoutManager.enumerateTextSegments(in: logTextLayoutManager.documentRange,
+                                                   type: .standard,
+                                                   options: []) { _, rect, _, _ in
+            if rect.insetBy(dx: -1, dy: -2).contains(textPoint) {
+                found = true
+                return false
+            }
+            return rect.minY <= textPoint.y
+        }
+        return found
+    }
+
+    private func logTextContainerPoint(fromRootPoint point: CGPoint) -> CGPoint {
+        let contentPoint = contentLayer.convert(point, from: rootLayer)
+        let localPoint = logRowsClipLayer.convert(contentPoint, from: contentLayer)
+        let topDownPoint = CGPoint(x: localPoint.x,
+                                   y: logRowsClipLayer.bounds.height - localPoint.y)
+        return CGPoint(x: topDownPoint.x - logTextInsetX,
+                       y: topDownPoint.y + logScroll - logTextInsetY)
+    }
+
+    private func logTextInteractionBounds() -> CGRect {
+        CGRect(x: 0,
+               y: 0,
+               width: logTextContainer.size.width,
+               height: max(logContentHeight() - logTextInsetY * 2, logTextContainer.size.height))
+    }
+
     private func beginDraggingSelectedCreateText(_ text: String) {
         guard !text.isEmpty else { return }
         let item = OuterframeContentPasteboardItem(representations: [
@@ -4041,6 +4414,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
     private func handleMouseDragged(to point: CGPoint, modifierFlags: NSEvent.ModifierFlags) {
         _ = modifierFlags
+        if handleLogMouseDragged(to: point) {
+            return
+        }
         if var pendingAppDrag {
             pendingAppDrag.currentPoint = point
             let dx = point.x - pendingAppDrag.startPoint.x
@@ -4064,6 +4440,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func handleMouseUp(at point: CGPoint, modifierFlags: NSEvent.ModifierFlags) {
+        logDragAnchorSelections = []
         if let pendingAppDrag {
             self.pendingAppDrag = nil
             if pendingAppDrag.isDragging {
@@ -4125,6 +4502,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         }
         if isOverCreateField || isOverPasswordField {
             setCursorIfNeeded(.iBeam)
+        } else if isPointOverLogText(point) {
+            setCursorIfNeeded(.iBeam)
         } else if isOverBundledApp || isOverDirectorySelect || isOverAppTile {
             setCursorIfNeeded(.pointingHand)
         } else {
@@ -4143,6 +4522,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                       clickCount: Int) {
         _ = modifierFlags
         _ = clickCount
+        if handleLogRightMouseDown(at: point) {
+            return
+        }
         if pendingPasswordAction != nil {
             guard passwordFieldFrame.contains(point) else { return }
             let index = characterIndexForPasswordField(xPosition: point.x)
@@ -4192,7 +4574,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         } else if mode == .backends {
             let contentPoint = contentLayer.convert(point, from: rootLayer)
             if selectedServiceID != nil && logRowsClipLayer.frame.contains(contentPoint) {
-                logScroll -= delta.y * (precise ? 1 : logLineHeight)
+                logScroll -= delta.y * (precise ? 1 : logScrollLineHeight)
             } else {
                 backendScroll -= delta.y * multiplier
             }
@@ -4287,6 +4669,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 }
                 return
             }
+            if handleLogMouseDown(at: point, modifierFlags: modifierFlags, clickCount: clickCount) {
+                return
+            }
             let rowsPoint = rowsClipLayer.convert(contentPoint, from: contentLayer)
             if let action = backendActionFrames.first(where: { $0.frame.contains(rowsPoint) }) {
                 if action.operation == "open" {
@@ -4308,6 +4693,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                     ensureLogSelection()
                     logSnapshot = nil
                     logScroll = 0
+                    setLogTextSelection(nil)
                     fetchSelectedLog()
                     restartEventWatch(resetVersions: true)
                     updateLayout()
@@ -4594,6 +4980,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         selectedServiceID = selectedLog?.serviceID
         logSnapshot = nil
         logScroll = 0
+        setLogTextSelection(nil)
         fetchSelectedLog()
         restartEventWatch(resetVersions: true)
         updateLayout()
@@ -4624,6 +5011,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         logSnapshot = nil
         logError = ""
         logScroll = 0
+        setLogTextSelection(nil)
     }
 
     private func selectedRecipe() -> RecipeRecord? {
@@ -4784,7 +5172,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private func clampScrollOffsets() {
         _ = clampAppsScrollUsingRenderedContent()
         backendScroll = clampedScroll(backendScroll, contentRows: backendListRows().count, rowHeight: backendRowHeight, viewportHeight: rowsClipLayer.bounds.height)
-        logScroll = clampedScroll(logScroll, contentRows: logLines(from: currentLogText()).count, rowHeight: logLineHeight, viewportHeight: logRowsClipLayer.bounds.height)
+        logScroll = clampedLogScroll(logScroll)
         _ = clampCreateScrollUsingRenderedContent()
     }
 
@@ -4792,6 +5180,32 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         let contentHeight = CGFloat(contentRows) * rowHeight
         let maxScroll = max(contentHeight - viewportHeight, 0)
         return min(max(value, 0), maxScroll)
+    }
+
+    private func clampedLogScroll(_ value: CGFloat) -> CGFloat {
+        let maxScroll = max(logContentHeight() - logRowsClipLayer.bounds.height, 0)
+        return min(max(value, 0), maxScroll)
+    }
+
+    private func logContentHeight() -> CGFloat {
+        guard logRowsClipLayer.bounds.width > 0, logRowsClipLayer.bounds.height > 0 else { return 0 }
+        let textWidth = max(logRowsClipLayer.bounds.width - logTextInsetX * 2, 1)
+        return max(estimatedLogContentHeight(textWidth: textWidth), logRowsClipLayer.bounds.height)
+    }
+
+    private func estimatedLogContentHeight(textWidth: CGFloat) -> CGFloat {
+        let font = logTextFont()
+        let charWidth = max(("0" as NSString).size(withAttributes: [.font: font]).width, 1)
+        let lineHeight = ceil(font.ascender - font.descender + font.leading + 2)
+        let charactersPerLine = max(Int(floor(textWidth / charWidth)), 1)
+        let visualLineCount = logRenderedText.split(separator: "\n", omittingEmptySubsequences: false).reduce(0) { total, line in
+            total + max(Int(ceil(Double(line.count) / Double(charactersPerLine))), 1)
+        }
+        return CGFloat(max(visualLineCount, 1)) * lineHeight + logTextInsetY * 2
+    }
+
+    private func logTextFont() -> NSFont {
+        NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
     }
 
     private func clampAppsScrollUsingRenderedContent() -> Bool {
@@ -4852,14 +5266,12 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func currentLogText() -> String {
+        if isLoadingLog && logSnapshot == nil { return "Loading logs..." }
         if !logError.isEmpty { return logError }
         if let contents = logSnapshot?.contents, !contents.isEmpty { return contents }
+        if selectedServiceID != nil, selectedLog == nil { return "No registered log file." }
+        if selectedServiceID == nil { return "" }
         return "No logs yet."
-    }
-
-    private func logLines(from text: String) -> [String] {
-        let lines = text.components(separatedBy: .newlines)
-        return lines.isEmpty ? [""] : lines
     }
 
     private func backendColumns(width: CGFloat) -> [(title: String, x: CGFloat, width: CGFloat)] {
