@@ -523,20 +523,33 @@ private enum FilePickerMode {
     case chooseDirectory
 }
 
-private final class LogTextDisplayLayer: CALayer {
-    var textLayoutManager: NSTextLayoutManager?
-    var scrollOffset: CGFloat = 0
-    var textInset: CGPoint = .zero
-    var visibleBounds: CGRect = .zero
+private final class LogTextFragmentLayer: CALayer {
+    var textLayoutFragment: NSTextLayoutFragment? {
+        didSet {
+            if textLayoutFragment !== oldValue {
+                setNeedsDisplay()
+            }
+        }
+    }
+    var renderingSurfaceOffset: CGPoint = .zero {
+        didSet {
+            if renderingSurfaceOffset != oldValue {
+                setNeedsDisplay()
+            }
+        }
+    }
 
     override init() {
         super.init()
         contentsScale = NSScreen.main?.backingScaleFactor ?? 2
-        needsDisplayOnBoundsChange = true
     }
 
     override init(layer: Any) {
         super.init(layer: layer)
+        if let layer = layer as? LogTextFragmentLayer {
+            textLayoutFragment = layer.textLayoutFragment
+            renderingSurfaceOffset = layer.renderingSurfaceOffset
+        }
     }
 
     required init?(coder: NSCoder) {
@@ -544,29 +557,14 @@ private final class LogTextDisplayLayer: CALayer {
     }
 
     override func draw(in context: CGContext) {
-        guard let textLayoutManager else { return }
+        guard let textLayoutFragment else { return }
 
         context.saveGState()
-        context.translateBy(x: textInset.x, y: textInset.y - scrollOffset)
-
-        let visibleTextRect = visibleBounds.offsetBy(dx: -textInset.x,
-                                                     dy: scrollOffset - textInset.y)
-        let layoutRect = visibleTextRect.insetBy(dx: 0, dy: -120)
-        textLayoutManager.ensureLayout(for: layoutRect)
-        let startLocation = textLayoutManager.textLayoutFragment(for: CGPoint(x: 0, y: max(layoutRect.minY, 0)))?.rangeInElement.location
-            ?? textLayoutManager.documentRange.location
-        textLayoutManager.enumerateTextLayoutFragments(from: startLocation,
-                                                        options: [.ensuresLayout]) { fragment in
-            let frame = fragment.layoutFragmentFrame
-            if frame.minY > visibleTextRect.maxY {
-                return false
-            }
-            if frame.maxY >= visibleTextRect.minY {
-                fragment.draw(at: frame.origin, in: context)
-            }
-            return true
-        }
-
+        context.translateBy(x: 0, y: bounds.height)
+        context.scaleBy(x: 1, y: -1)
+        textLayoutFragment.draw(at: CGPoint(x: -renderingSurfaceOffset.x,
+                                            y: -renderingSurfaceOffset.y),
+                                in: context)
         context.restoreGState()
     }
 }
@@ -653,6 +651,12 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private var logTextSelectionRange: NSRange?
     private var logDragAnchorSelections: [NSTextSelection] = []
     private var logTextSelectionLayers: [CALayer] = []
+    private var logTextFragmentLayers: [ObjectIdentifier: LogTextFragmentLayer] = [:]
+    private var logTextLayoutWidth: CGFloat = 0
+    private var logTextContentGeneration = 0
+    private var logEstimatedContentHeightCache: (generation: Int, textWidth: CGFloat, height: CGFloat)?
+    private var logTextFragmentCoverage: (generation: Int, textWidth: CGFloat, contentHeight: CGFloat, rect: CGRect)?
+    private var logTextSelectionCoverage: (generation: Int, textWidth: CGFloat, contentHeight: CGFloat, range: NSRange, rect: CGRect)?
     private let logContentStorage = NSTextContentStorage()
     private let logTextLayoutManager = NSTextLayoutManager()
     private let logTextContainer = NSTextContainer(size: CGSize(width: 320, height: 1_000_000))
@@ -701,8 +705,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private let rowsClipLayer = CALayer()
     private let logHeaderLayer = CALayer()
     private let logRowsClipLayer = CALayer()
+    private let logTextContentLayer = CALayer()
     private let logTextSelectionLayer = CALayer()
-    private let logTextLayer = LogTextDisplayLayer()
     private let dividerLayer = CALayer()
     private let createLayer = CALayer()
     private let iconTransitionLayer = CALayer()
@@ -776,7 +780,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         logTextLayoutManager.usesFontLeading = true
         logContentStorage.addTextLayoutManager(logTextLayoutManager)
         logContentStorage.attributedString = logAttributedText
-        logTextLayer.textLayoutManager = logTextLayoutManager
         retainedSelf = self
     }
 
@@ -1464,8 +1467,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         contentLayer.addSublayer(dividerLayer)
         contentLayer.addSublayer(logHeaderLayer)
         contentLayer.addSublayer(logRowsClipLayer)
-        logRowsClipLayer.addSublayer(logTextSelectionLayer)
-        logRowsClipLayer.addSublayer(logTextLayer)
+        logRowsClipLayer.addSublayer(logTextContentLayer)
+        logTextContentLayer.addSublayer(logTextSelectionLayer)
         contentLayer.addSublayer(createLayer)
         createLayer.addSublayer(filePickerOverlayLayer)
 
@@ -1475,8 +1478,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         filePickerOverlayLayer.isHidden = true
         rowsClipLayer.masksToBounds = true
         logRowsClipLayer.masksToBounds = true
-        logTextSelectionLayer.isGeometryFlipped = true
-        logTextLayer.isGeometryFlipped = true
 
         for layer in [titleLayer, statusLayer] {
             layer.contentsScale = 2
@@ -1621,8 +1622,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                           backgroundCGColor: resolvedCGColor(.controlAccentColor),
                                           font: NSFont.systemFont(ofSize: 12, weight: .medium))
                 updateLogTextContentIfNeeded(text: currentLogText(), force: true)
-                logTextLayer.setNeedsDisplay()
-                updateLogTextSelectionLayers()
+                updateLogTextViewport()
+                updateLogTextSelectionLayers(force: true)
 
                 titleLayer.font = NSFont.systemFont(ofSize: 15, weight: .semibold)
                 titleLayer.fontSize = 15
@@ -2721,19 +2722,123 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func renderLogRows() {
-        logTextSelectionLayer.frame = logRowsClipLayer.bounds
-        logTextLayer.frame = logRowsClipLayer.bounds
-        logTextLayer.visibleBounds = logTextLayer.bounds
-        logTextLayer.textInset = CGPoint(x: logTextInsetX, y: logTextInsetY)
-
         let textWidth = max(logRowsClipLayer.bounds.width - logTextInsetX * 2, 1)
+        if abs(textWidth - logTextLayoutWidth) > 0.5 {
+            logTextLayoutWidth = textWidth
+            clearLogTextFragmentLayers()
+        }
         logTextContainer.size = CGSize(width: textWidth, height: max(logTextContainer.size.height, logRowsClipLayer.bounds.height))
-        updateLogTextContentIfNeeded(text: currentLogText(), force: true)
+        updateLogTextContentIfNeeded(text: currentLogText())
         logTextContainer.size = CGSize(width: textWidth, height: max(estimatedLogContentHeight(textWidth: textWidth) - logTextInsetY * 2, logRowsClipLayer.bounds.height))
         logScroll = clampedLogScroll(logScroll)
-        logTextLayer.scrollOffset = logScroll
-        logTextLayer.setNeedsDisplay()
+        updateLogTextViewport()
         updateLogTextSelectionLayers()
+    }
+
+    private func updateLogTextViewport() {
+        withoutImplicitAnimations {
+            updateLogTextViewportWithoutAnimations()
+        }
+    }
+
+    private func updateLogTextViewportWithoutAnimations() {
+        guard logRowsClipLayer.bounds.width > 0, logRowsClipLayer.bounds.height > 0 else {
+            clearLogTextFragmentLayers()
+            return
+        }
+
+        let textWidth = max(logRowsClipLayer.bounds.width - logTextInsetX * 2, 1)
+        let contentHeight = max(logContentHeight() - logTextInsetY * 2, logRowsClipLayer.bounds.height)
+        logTextContentLayer.frame = CGRect(x: logTextInsetX,
+                                           y: logRowsClipLayer.bounds.height - logTextInsetY - contentHeight + logScroll,
+                                           width: textWidth,
+                                           height: contentHeight)
+        logTextSelectionLayer.frame = CGRect(x: 0, y: 0, width: textWidth, height: contentHeight)
+
+        let visibleTextRect = visibleLogTextContentRect()
+        if let coverage = logTextFragmentCoverage,
+           coverage.generation == logTextContentGeneration,
+           abs(coverage.textWidth - textWidth) <= 0.5,
+           abs(coverage.contentHeight - contentHeight) <= 0.5,
+           coverage.rect.contains(visibleTextRect) {
+            return
+        }
+
+        let layoutRect = expandedLogTextContentRect(containing: visibleTextRect,
+                                                    contentHeight: contentHeight)
+        logTextLayoutManager.ensureLayout(for: layoutRect)
+        let startLocation = logTextLayoutManager.textLayoutFragment(for: CGPoint(x: 0, y: max(layoutRect.minY, 0)))?.rangeInElement.location
+            ?? logTextLayoutManager.documentRange.location
+
+        var visibleFragmentIDs = Set<ObjectIdentifier>()
+        logTextLayoutManager.enumerateTextLayoutFragments(from: startLocation,
+                                                          options: [.ensuresLayout]) { fragment in
+            let frame = fragment.layoutFragmentFrame
+            if frame.minY > layoutRect.maxY {
+                return false
+            }
+            guard frame.maxY >= layoutRect.minY else {
+                return true
+            }
+
+            let id = ObjectIdentifier(fragment)
+            visibleFragmentIDs.insert(id)
+            let layer = self.logTextFragmentLayers[id] ?? {
+                let layer = LogTextFragmentLayer()
+                layer.contentsScale = NSScreen.main?.backingScaleFactor ?? 2
+                self.logTextContentLayer.addSublayer(layer)
+                self.logTextFragmentLayers[id] = layer
+                return layer
+            }()
+            layer.textLayoutFragment = fragment
+            let surface = fragment.renderingSurfaceBounds
+            let topDownFrame = CGRect(x: frame.minX + surface.minX,
+                                      y: frame.minY + surface.minY,
+                                      width: surface.width,
+                                      height: surface.height)
+            layer.renderingSurfaceOffset = surface.origin
+            layer.frame = CGRect(x: topDownFrame.minX,
+                                 y: contentHeight - topDownFrame.maxY,
+                                 width: topDownFrame.width,
+                                 height: topDownFrame.height)
+            return true
+        }
+
+        logTextFragmentCoverage = (generation: logTextContentGeneration,
+                                   textWidth: textWidth,
+                                   contentHeight: contentHeight,
+                                   rect: layoutRect)
+        let staleFragmentIDs = logTextFragmentLayers.keys.filter { !visibleFragmentIDs.contains($0) }
+        for id in staleFragmentIDs {
+            logTextFragmentLayers[id]?.removeFromSuperlayer()
+            logTextFragmentLayers[id] = nil
+        }
+    }
+
+    private func clearLogTextFragmentLayers() {
+        for layer in logTextFragmentLayers.values {
+            layer.removeFromSuperlayer()
+        }
+        logTextFragmentLayers = [:]
+        logTextFragmentCoverage = nil
+        logTextSelectionCoverage = nil
+    }
+
+    private func visibleLogTextContentRect() -> CGRect {
+        CGRect(x: 0,
+               y: max(logScroll - logTextInsetY, 0),
+               width: max(logRowsClipLayer.bounds.width - logTextInsetX * 2, 1),
+               height: logRowsClipLayer.bounds.height)
+    }
+
+    private func expandedLogTextContentRect(containing rect: CGRect, contentHeight: CGFloat) -> CGRect {
+        let overscan = max(logRowsClipLayer.bounds.height * 1.5, 600)
+        let minY = max(rect.minY - overscan, 0)
+        let maxY = min(max(rect.maxY + overscan, minY + rect.height), contentHeight)
+        return CGRect(x: rect.minX,
+                      y: minY,
+                      width: rect.width,
+                      height: max(maxY - minY, rect.height))
     }
 
     private func updateLogTextContentIfNeeded(text: String, force: Bool = false) {
@@ -2743,8 +2848,11 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         let shouldPreserveSelection = force && displayText == logRenderedText
         let previousRange = logTextSelectionRange
         logRenderedText = displayText
+        logTextContentGeneration += 1
+        logEstimatedContentHeightCache = nil
         logAttributedText = makeLogAttributedText(displayText)
         logContentStorage.attributedString = logAttributedText
+        clearLogTextFragmentLayers()
 
         if shouldPreserveSelection,
            let previousRange,
@@ -2788,38 +2896,70 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         updateEditingAndPasteboardState()
     }
 
-    private func updateLogTextSelectionLayers() {
+    private func updateLogTextSelectionLayers(force: Bool = false) {
+        withoutImplicitAnimations {
+            updateLogTextSelectionLayersWithoutAnimations(force: force)
+        }
+    }
+
+    private func updateLogTextSelectionLayersWithoutAnimations(force: Bool) {
+        guard let selectionRange = logTextSelectionRange,
+              selectionRange.length > 0,
+              let textRange = logTextRange(for: selectionRange) else {
+            if !logTextSelectionLayers.isEmpty {
+                for layer in logTextSelectionLayers {
+                    layer.removeFromSuperlayer()
+                }
+                logTextSelectionLayers = []
+            }
+            logTextSelectionCoverage = nil
+            return
+        }
+
+        let textWidth = max(logRowsClipLayer.bounds.width - logTextInsetX * 2, 1)
+        let contentHeight = max(logContentHeight() - logTextInsetY * 2, logRowsClipLayer.bounds.height)
+        let visibleTextRect = visibleLogTextContentRect()
+        if !force,
+           let coverage = logTextSelectionCoverage,
+           coverage.generation == logTextContentGeneration,
+           abs(coverage.textWidth - textWidth) <= 0.5,
+           abs(coverage.contentHeight - contentHeight) <= 0.5,
+           coverage.range == selectionRange,
+           coverage.rect.contains(visibleTextRect) {
+            return
+        }
+
         for layer in logTextSelectionLayers {
             layer.removeFromSuperlayer()
         }
         logTextSelectionLayers = []
 
-        guard let selectionRange = logTextSelectionRange,
-              selectionRange.length > 0,
-              let textRange = logTextRange(for: selectionRange) else {
-            return
-        }
-
         let selectionColor = resolvedCGColor(windowIsActive ? NSColor.selectedTextBackgroundColor.withAlphaComponent(0.78) : NSColor.unemphasizedSelectedTextBackgroundColor.withAlphaComponent(0.78))
+        let selectionRect = expandedLogTextContentRect(containing: visibleTextRect,
+                                                       contentHeight: contentHeight)
         logTextLayoutManager.enumerateTextSegments(in: textRange,
                                                    type: .selection,
                                                    options: []) { _, rect, _, _ in
-            let visibleFrame = CGRect(x: self.logTextInsetX + rect.minX,
-                                      y: self.logTextInsetY + rect.minY - self.logScroll,
-                                      width: rect.width,
-                                      height: rect.height)
-            guard visibleFrame.intersects(self.logTextSelectionLayer.bounds) else {
+            guard rect.intersects(selectionRect) else {
                 return true
             }
 
             let highlight = CALayer()
-            highlight.frame = visibleFrame
+            highlight.frame = CGRect(x: rect.minX,
+                                     y: logTextSelectionLayer.bounds.height - rect.maxY,
+                                     width: rect.width,
+                                     height: rect.height)
             highlight.backgroundColor = selectionColor
             highlight.cornerRadius = 2
             self.logTextSelectionLayer.addSublayer(highlight)
             self.logTextSelectionLayers.append(highlight)
             return true
         }
+        logTextSelectionCoverage = (generation: logTextContentGeneration,
+                                    textWidth: textWidth,
+                                    contentHeight: contentHeight,
+                                    range: selectionRange,
+                                    rect: selectionRect)
     }
 
     private func selectedLogAttributedText() -> NSAttributedString? {
@@ -4575,6 +4715,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             let contentPoint = contentLayer.convert(point, from: rootLayer)
             if selectedServiceID != nil && logRowsClipLayer.frame.contains(contentPoint) {
                 logScroll -= delta.y * (precise ? 1 : logScrollLineHeight)
+                logScroll = clampedLogScroll(logScroll)
+                updateLogTextViewport()
+                updateLogTextSelectionLayers()
+                return
             } else {
                 backendScroll -= delta.y * multiplier
             }
@@ -5194,14 +5338,31 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func estimatedLogContentHeight(textWidth: CGFloat) -> CGFloat {
+        if let cache = logEstimatedContentHeightCache,
+           cache.generation == logTextContentGeneration,
+           abs(cache.textWidth - textWidth) <= 0.5 {
+            return cache.height
+        }
+
         let font = logTextFont()
         let charWidth = max(("0" as NSString).size(withAttributes: [.font: font]).width, 1)
         let lineHeight = ceil(font.ascender - font.descender + font.leading + 2)
         let charactersPerLine = max(Int(floor(textWidth / charWidth)), 1)
-        let visualLineCount = logRenderedText.split(separator: "\n", omittingEmptySubsequences: false).reduce(0) { total, line in
-            total + max(Int(ceil(Double(line.count) / Double(charactersPerLine))), 1)
+        var visualLineCount = 0
+        var currentLineLength = 0
+        for character in logRenderedText.utf8 {
+            if character == 10 {
+                visualLineCount += max(Int(ceil(Double(currentLineLength) / Double(charactersPerLine))), 1)
+                currentLineLength = 0
+            } else {
+                currentLineLength += 1
+            }
         }
-        return CGFloat(max(visualLineCount, 1)) * lineHeight + logTextInsetY * 2
+        visualLineCount += max(Int(ceil(Double(currentLineLength) / Double(charactersPerLine))), 1)
+
+        let height = CGFloat(max(visualLineCount, 1)) * lineHeight + logTextInsetY * 2
+        logEstimatedContentHeightCache = (generation: logTextContentGeneration, textWidth: textWidth, height: height)
+        return height
     }
 
     private func logTextFont() -> NSFont {
