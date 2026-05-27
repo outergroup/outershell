@@ -5304,7 +5304,8 @@ private final class SymbolButtonLayer: CALayer {
 
     override func draw(in context: CGContext) {
         guard bounds.width > 2, bounds.height > 2 else { return }
-        let configuration = NSImage.SymbolConfiguration(pointSize: 13, weight: .medium)
+        let pointSize: CGFloat = 13
+        let configuration = NSImage.SymbolConfiguration(pointSize: pointSize, weight: .medium)
         let image = NSImage(systemSymbolName: symbolName, accessibilityDescription: accessibilityTitle)?
             .withSymbolConfiguration(configuration)
         guard let image else { return }
@@ -5317,14 +5318,61 @@ private final class SymbolButtonLayer: CALayer {
                               width: drawSize.width,
                               height: drawSize.height)
 
-        var proposedRect = CGRect(origin: .zero, size: image.size)
-        guard let cgImage = image.cgImage(forProposedRect: &proposedRect, context: nil, hints: nil) else { return }
+        guard let cgImage = Self.symbolMaskCGImage(named: symbolName,
+                                                   accessibilityTitle: accessibilityTitle,
+                                                   pointSize: pointSize,
+                                                   drawSize: drawSize,
+                                                   scale: max(contentsScale, 1)) else { return }
 
         context.saveGState()
         context.clip(to: drawRect, mask: cgImage)
         context.setFillColor(tintCGColor)
         context.fill(drawRect)
         context.restoreGState()
+    }
+
+    private static func symbolMaskCGImage(named symbolName: String,
+                                          accessibilityTitle: String,
+                                          pointSize: CGFloat,
+                                          drawSize: CGSize,
+                                          scale: CGFloat) -> CGImage? {
+        let pixelWidth = max(Int(ceil(drawSize.width * scale)), 1)
+        let pixelHeight = max(Int(ceil(drawSize.height * scale)), 1)
+        guard let bitmap = NSBitmapImageRep(bitmapDataPlanes: nil,
+                                            pixelsWide: pixelWidth,
+                                            pixelsHigh: pixelHeight,
+                                            bitsPerSample: 8,
+                                            samplesPerPixel: 4,
+                                            hasAlpha: true,
+                                            isPlanar: false,
+                                            colorSpaceName: .deviceRGB,
+                                            bytesPerRow: 0,
+                                            bitsPerPixel: 0) else {
+            return nil
+        }
+        bitmap.size = NSSize(width: drawSize.width, height: drawSize.height)
+
+        guard let graphicsContext = NSGraphicsContext(bitmapImageRep: bitmap) else { return nil }
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = graphicsContext
+        graphicsContext.imageInterpolation = .high
+        defer {
+            NSGraphicsContext.restoreGraphicsState()
+        }
+
+        guard let image = NSImage(systemSymbolName: symbolName, accessibilityDescription: accessibilityTitle)?
+            .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: pointSize, weight: .medium)) else {
+            return nil
+        }
+
+        NSColor.white.setFill()
+        NSRect(origin: .zero, size: drawSize).fill()
+        image.draw(in: NSRect(origin: .zero, size: drawSize),
+                   from: .zero,
+                   operation: .destinationIn,
+                   fraction: 1)
+
+        return bitmap.cgImage
     }
 }
 
