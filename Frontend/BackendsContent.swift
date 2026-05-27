@@ -700,8 +700,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private let backendsToggleLayer = CenteredButtonLayer(title: "Backends")
     private let contentLayer = CALayer()
     private let appsLayer = CALayer()
-    private let bottomBarLayer = CALayer()
-    private let newButtonLayer = CenteredButtonLayer(title: "New")
     private let tableHeaderLayer = CALayer()
     private let rowsClipLayer = CALayer()
     private let logHeaderLayer = CALayer()
@@ -715,7 +713,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private let passwordOverlayLayer = CALayer()
     private let filePickerOverlayLayer = CALayer()
 
-    private var newButtonFrame = CGRect.zero
+    private var newBackendRowFrame = CGRect.zero
     private var appsToggleFrame = CGRect.zero
     private var backendsToggleFrame = CGRect.zero
     private var appCardFrames: [(frame: CGRect, item: AppLauncherItem)] = []
@@ -761,7 +759,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private var filePickerScroll: CGFloat = 0
 
     private let toolbarHeight: CGFloat = 48
-    private let bottomBarHeight: CGFloat = 54
     private let tableHeaderHeight: CGFloat = 30
     private let backendRowHeight: CGFloat = 44
     private let logHeaderHeight: CGFloat = 62
@@ -1291,7 +1288,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             layers = [appsLayer]
         case .backends:
             layers = [
-                bottomBarLayer,
                 tableHeaderLayer,
                 rowsClipLayer,
                 dividerLayer,
@@ -1461,8 +1457,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         toolbarLayer.addSublayer(appsToggleLayer)
         toolbarLayer.addSublayer(backendsToggleLayer)
         contentLayer.addSublayer(appsLayer)
-        contentLayer.addSublayer(bottomBarLayer)
-        bottomBarLayer.addSublayer(newButtonLayer)
         contentLayer.addSublayer(tableHeaderLayer)
         contentLayer.addSublayer(rowsClipLayer)
         contentLayer.addSublayer(dividerLayer)
@@ -1546,7 +1540,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 if mode == .apps {
                     outerframeHost.sendTextCursorUpdate(cursors: [])
                     appsLayer.isHidden = false
-                    bottomBarLayer.isHidden = true
                     tableHeaderLayer.isHidden = true
                     rowsClipLayer.isHidden = true
                     dividerLayer.isHidden = true
@@ -1558,17 +1551,13 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 } else if mode == .backends {
                     outerframeHost.sendTextCursorUpdate(cursors: [])
                     appsLayer.isHidden = true
-                    bottomBarLayer.isHidden = false
                     tableHeaderLayer.isHidden = false
                     rowsClipLayer.isHidden = false
                     dividerLayer.isHidden = selectedServiceID == nil
                     logHeaderLayer.isHidden = selectedServiceID == nil
                     logRowsClipLayer.isHidden = selectedServiceID == nil
                     createLayer.isHidden = true
-                    bottomBarLayer.frame = CGRect(x: 0, y: 0, width: width, height: min(bottomBarHeight, contentHeight))
-                    newButtonFrame = CGRect(x: horizontalInset, y: 12, width: 76, height: 30)
-                    newButtonLayer.frame = newButtonFrame
-                    let tableBottom = bottomBarLayer.frame.maxY
+                    let tableBottom: CGFloat = 0
                     let tableAreaHeight = max(contentHeight - tableBottom, 0)
                     let tableWidth = selectedServiceID == nil ? width : max(floor(width * 0.42), 320)
                     tableHeaderLayer.frame = CGRect(x: 0, y: tableBottom + max(tableAreaHeight - tableHeaderHeight, 0), width: tableWidth, height: tableHeaderHeight)
@@ -1586,7 +1575,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                     renderBackendsRows()
                 } else {
                     appsLayer.isHidden = true
-                    bottomBarLayer.isHidden = true
                     tableHeaderLayer.isHidden = true
                     rowsClipLayer.isHidden = true
                     dividerLayer.isHidden = true
@@ -1610,7 +1598,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 rootLayer.backgroundColor = resolvedCGColor(.windowBackgroundColor)
                 toolbarLayer.backgroundColor = resolvedCGColor(.controlBackgroundColor)
                 contentLayer.backgroundColor = resolvedCGColor(.windowBackgroundColor)
-                bottomBarLayer.backgroundColor = resolvedCGColor(.controlBackgroundColor)
                 tableHeaderLayer.backgroundColor = resolvedCGColor(NSColor.controlBackgroundColor.withAlphaComponent(0.9))
                 logHeaderLayer.backgroundColor = resolvedCGColor(NSColor.controlBackgroundColor.withAlphaComponent(0.9))
                 dividerLayer.backgroundColor = resolvedCGColor(.separatorColor)
@@ -1625,9 +1612,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                                    backgroundCGColor: resolvedCGColor(mode == .backends ? .controlAccentColor : NSColor.controlAccentColor.withAlphaComponent(0.12)),
                                                    font: NSFont.systemFont(ofSize: 12, weight: .medium))
                 }
-                newButtonLayer.applyStyle(textCGColor: resolvedCGColor(.white),
-                                          backgroundCGColor: resolvedCGColor(.controlAccentColor),
-                                          font: NSFont.systemFont(ofSize: 12, weight: .medium))
                 updateLogTextContentIfNeeded(text: currentLogText(), force: true)
                 updateLogTextViewport()
                 updateLogTextSelectionLayers(force: true)
@@ -1659,6 +1643,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         rowsClipLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
         backendRowFrames.removeAll()
         backendActionFrames.removeAll()
+        newBackendRowFrame = .zero
         iconMatchStates.removeAll()
         textMatchStates.removeAll()
         var visibleIconKeys = Set<String>()
@@ -1666,26 +1651,32 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
         let rows = backendListRows()
         if rows.isEmpty {
-            hideUnrenderedMatchedLayers(visibleIconKeys: visibleIconKeys, visibleTextKeys: visibleTextKeys)
             let empty = makeTextLayer(size: 13, weight: .regular, color: .tertiaryLabelColor, alignment: .center)
             empty.string = isLoadingBackends ? "Loading backends..." : (backendError.isEmpty ? "No registered backends." : backendError)
             empty.frame = CGRect(x: horizontalInset, y: max(rowsClipLayer.bounds.midY - 10, 0), width: max(rowsClipLayer.bounds.width - horizontalInset * 2, 1), height: 20)
             rowsClipLayer.addSublayer(empty)
-            return
         }
 
+        let totalRows = rows.count + 1
         let visibleStart = max(Int(floor(backendScroll / backendRowHeight)), 0)
         let visibleCount = Int(ceil(rowsClipLayer.bounds.height / backendRowHeight)) + 2
-        let visibleEnd = min(rows.count, visibleStart + visibleCount)
+        let visibleEnd = min(totalRows, visibleStart + visibleCount)
         let columns = backendColumns(width: rowsClipLayer.bounds.width)
         let selectedBackground = resolvedCGColor(NSColor.controlAccentColor.withAlphaComponent(0.14))
         let alternating = alternatingRowColors()
 
         for index in visibleStart..<visibleEnd {
-            let row = rows[index]
-            let backend = row.backend
             let y = rowsClipLayer.bounds.height - CGFloat(index) * backendRowHeight + backendScroll - backendRowHeight
             let rowFrame = CGRect(x: 0, y: y, width: rowsClipLayer.bounds.width, height: backendRowHeight)
+            if index == rows.count {
+                renderNewBackendRow(rowFrame: rowFrame,
+                                    columns: columns,
+                                    backgroundColor: index.isMultiple(of: 2) ? alternating.even : alternating.odd)
+                continue
+            }
+
+            let row = rows[index]
+            let backend = row.backend
             backendRowFrames.append((rowFrame, row))
 
             let rowLayer = CALayer()
@@ -1746,6 +1737,49 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             }
         }
         hideUnrenderedMatchedLayers(visibleIconKeys: visibleIconKeys, visibleTextKeys: visibleTextKeys)
+    }
+
+    private func renderNewBackendRow(rowFrame: CGRect,
+                                     columns: [(title: String, x: CGFloat, width: CGFloat)],
+                                     backgroundColor: CGColor) {
+        newBackendRowFrame = rowFrame
+
+        let rowLayer = CALayer()
+        rowLayer.frame = rowFrame
+        rowLayer.backgroundColor = backgroundColor
+        rowsClipLayer.addSublayer(rowLayer)
+
+        let iconSize: CGFloat = 18
+        let icon = CALayer()
+        icon.frame = CGRect(x: columns[0].x,
+                            y: floor((backendRowHeight - iconSize) / 2),
+                            width: iconSize,
+                            height: iconSize)
+        icon.contentsGravity = .resizeAspect
+        icon.contentsScale = 2
+        icon.contents = symbolCGImage(named: "plus.circle", pointSize: iconSize)
+        rowLayer.addSublayer(icon)
+
+        addCell(to: rowLayer,
+                text: "New",
+                column: columns[0],
+                y: 14,
+                xOffset: iconSize + 8,
+                color: .controlAccentColor,
+                weight: .medium,
+                emptyPlaceholder: "")
+        addCell(to: rowLayer,
+                text: "Create",
+                column: columns[1],
+                y: 14,
+                color: .secondaryLabelColor,
+                emptyPlaceholder: "")
+        addCell(to: rowLayer,
+                text: "Add a backend",
+                column: columns[2],
+                y: 14,
+                color: .secondaryLabelColor,
+                emptyPlaceholder: "")
     }
 
     private func renderAppsPage() {
@@ -4836,17 +4870,14 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 return
             }
         } else if mode == .backends {
-            if bottomBarLayer.frame.contains(contentPoint) {
-                let bottomPoint = bottomBarLayer.convert(contentPoint, from: contentLayer)
-                if newButtonFrame.contains(bottomPoint) {
-                    navigateToMode(.create, pushHistory: true)
-                }
-                return
-            }
             if handleLogMouseDown(at: point, modifierFlags: modifierFlags, clickCount: clickCount) {
                 return
             }
             let rowsPoint = rowsClipLayer.convert(contentPoint, from: contentLayer)
+            if newBackendRowFrame.contains(rowsPoint) {
+                navigateToMode(.create, pushHistory: true)
+                return
+            }
             if let action = backendActionFrames.first(where: { $0.frame.contains(rowsPoint) }) {
                 if action.operation == "open" {
                     openFrontend(for: action.row, opensInNewTab: modifierFlags.contains(.command))
@@ -5345,7 +5376,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
     private func clampScrollOffsets() {
         _ = clampAppsScrollUsingRenderedContent()
-        backendScroll = clampedScroll(backendScroll, contentRows: backendListRows().count, rowHeight: backendRowHeight, viewportHeight: rowsClipLayer.bounds.height)
+        backendScroll = clampedScroll(backendScroll, contentRows: backendListRows().count + 1, rowHeight: backendRowHeight, viewportHeight: rowsClipLayer.bounds.height)
         logScroll = clampedLogScroll(logScroll)
         _ = clampCreateScrollUsingRenderedContent()
     }
