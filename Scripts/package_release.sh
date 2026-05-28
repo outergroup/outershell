@@ -307,8 +307,10 @@ outerctl_path="$outerwebapps_home/bin/outerctl"
 unit_dir="$HOME/.config/systemd/user"
 socket_path="$runtime_dir/org.outershell.OuterShell"
 log_dir="$install_root/logs"
-log_path="$log_dir/outershelld.log"
+log_path="$log_dir/OuterShellBackend.log"
+broker_log_path="$log_dir/outershelld.log"
 runner_path="$install_root/run-outer-shell.sh"
+broker_runner_path="$install_root/run-outershelld.sh"
 
 cleanup_legacy_home_screen() {
     legacy_install_root="$outerwebapps_home/home-screen"
@@ -327,7 +329,7 @@ cleanup_legacy_home_screen() {
 }
 
 if [ "$command" = "uninstall" ]; then
-    systemctl --user disable org.outershell.OuterShell.socket outershelld.socket >/dev/null 2>&1 || true
+    systemctl --user disable org.outershell.OuterShell.socket outershelld.socket outershelld.service >/dev/null 2>&1 || true
     if [ -x "$outerctl_path" ]; then
         OUTERWEBAPPS_HOME="$outerwebapps_home" "$outerctl_path" app clear --backend org.outershell.OuterShell >/dev/null 2>&1 || true
         OUTERWEBAPPS_HOME="$outerwebapps_home" "$outerctl_path" log clear --backend org.outershell.OuterShell >/dev/null 2>&1 || true
@@ -338,8 +340,8 @@ if [ "$command" = "uninstall" ]; then
     cat > "$cleanup_script" <<EOF
 #!/bin/sh
 sleep 0.25
-systemctl --user stop org.outershell.OuterShell.socket outershelld.socket org.outershell.OuterShell.service >/dev/null 2>&1 || true
-rm -f "$unit_dir/org.outershell.OuterShell.service" "$unit_dir/outershelld.socket" "$unit_dir/org.outershell.OuterShell.socket" "$socket_path" "$runtime_dir/outershelld-api"
+    systemctl --user stop org.outershell.OuterShell.socket outershelld.socket org.outershell.OuterShell.service outershelld.service >/dev/null 2>&1 || true
+    rm -f "$unit_dir/org.outershell.OuterShell.service" "$unit_dir/outershelld.service" "$unit_dir/outershelld.socket" "$unit_dir/org.outershell.OuterShell.socket" "$socket_path" "$runtime_dir/outershelld-api"
 systemctl --user daemon-reload >/dev/null 2>&1 || true
 rm -rf "$install_root"
 rm -f "$cleanup_script"
@@ -366,17 +368,25 @@ ln -sfn outershelld "$install_root/OuterShellBackend"
 chmod 0755 "$install_root/bin/outerctl"
 install -m 0755 "$install_root/bin/outerctl" "$outerctl_path"
 printf '%s\n' "__OUTER_SHELL_VERSION__" > "$install_root/version"
-touch "$log_path"
+touch "$log_path" "$broker_log_path"
 
 cat > "$runner_path" <<EOF
 #!/bin/sh
-exec "$install_root/outershelld" --socket-path "\${1:-$socket_path}" --bundles-dir "$install_root/bundles" --bundled-apps-dir "$install_root/bundled-apps" --app-base-url "$app_base_url" --public-base-url "$public_base_url" >> "$log_path" 2>&1
+exec "$install_root/OuterShellBackend" --http-only --socket-path "\${1:-$socket_path}" --bundles-dir "$install_root/bundles" --bundled-apps-dir "$install_root/bundled-apps" --app-base-url "$app_base_url" --public-base-url "$public_base_url" >> "$log_path" 2>&1
 EOF
 chmod 0755 "$runner_path"
+
+cat > "$broker_runner_path" <<EOF
+#!/bin/sh
+exec "$install_root/outershelld" --broker-only --api-socket-path "\${1:-$runtime_dir/outershelld-api}" >> "$broker_log_path" 2>&1
+EOF
+chmod 0755 "$broker_runner_path"
 
 cat > "$unit_dir/org.outershell.OuterShell.service" <<EOF
 [Unit]
 Description=Outer Group Outer Shell
+After=outershelld.socket
+Wants=outershelld.socket
 
 [Service]
 Environment=OUTERWEBAPPS_HOME=$outerwebapps_home
@@ -406,10 +416,20 @@ Description=Outer Shell API Socket
 ListenStream=%t/outershelld-api
 FileDescriptorName=api
 SocketMode=0600
-Service=org.outershell.OuterShell.service
+Service=outershelld.service
 
 [Install]
 WantedBy=sockets.target
+EOF
+
+cat > "$unit_dir/outershelld.service" <<EOF
+[Unit]
+Description=Outer Shell daemon
+
+[Service]
+Environment=OUTERWEBAPPS_HOME=$outerwebapps_home
+ExecStart=$broker_runner_path %t/outershelld-api
+Restart=no
 EOF
 
 printf '[%s] %s Outer Shell package %s from %s.\n' "$(timestamp)" "$command" "__OUTER_SHELL_VERSION__" "$public_base_url" >> "$log_path"
@@ -419,7 +439,7 @@ if [ "$command" = "install" ]; then
 fi
 systemctl --user daemon-reload
 systemctl --user enable org.outershell.OuterShell.socket outershelld.socket
-systemctl --user stop org.outershell.OuterShell.service org.outershell.OuterShell.socket outershelld.socket >/dev/null 2>&1 || true
+systemctl --user stop org.outershell.OuterShell.service outershelld.service org.outershell.OuterShell.socket outershelld.socket >/dev/null 2>&1 || true
 rm -f "$socket_path" "$runtime_dir/outershelld-api"
 systemctl --user start org.outershell.OuterShell.socket outershelld.socket
 

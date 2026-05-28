@@ -73,6 +73,9 @@ static bool g_systemd_socket_activation = false;
 static bool g_api_systemd_socket_activation = false;
 static bool g_launchd_socket_activation = false;
 static bool g_stay_alive_when_socket_idle = false;
+#ifndef __APPLE__
+static uid_t g_root_helper_owner_uid = (uid_t)-1;
+#endif
 static volatile sig_atomic_t g_shutdown_requested = 0;
 static volatile sig_atomic_t g_listener_fd = -1;
 static volatile sig_atomic_t g_api_listener_fd = -1;
@@ -82,6 +85,8 @@ static char g_registry_write_lock_path[PATH_MAX] = "";
 typedef struct {
     int fd;
     bool is_api;
+    uid_t peer_uid;
+    bool has_peer_uid;
     char request[READ_BUFFER_SIZE];
     size_t length;
     int64_t last_activity_ms;
@@ -844,6 +849,36 @@ static bool resolve_user_script_path(const char *raw_path,
 
 static bool sudo_failure_needs_password(const char *output, int exit_status);
 static bool run_sudo_shell(const char *command, const char *password, char *output, size_t output_size, int *exit_status);
+static bool process_api_client_request(ReactorClient *client, char *request, size_t n);
+#ifndef __APPLE__
+static bool ensure_root_helper_installed(const char *sudo_password, bool *needs_password, char *message, size_t message_size);
+static bool root_helper_outerctl(int argc,
+                                 char **argv,
+                                 const char *sudo_password,
+                                 bool *needs_password,
+                                 char *message,
+                                 size_t message_size);
+static bool root_helper_registry_upsert_systemd(const char *service_id,
+                                                const char *display_name,
+                                                const char *unit_name,
+                                                const char *socket_path,
+                                                const char *log_path,
+                                                const char *icon_path,
+                                                const char *sudo_password,
+                                                bool *needs_password,
+                                                char *message,
+                                                size_t message_size);
+static bool root_helper_registry_remove_backend(const char *service_id,
+                                                const char *sudo_password,
+                                                bool *needs_password,
+                                                char *message,
+                                                size_t message_size);
+static bool root_helper_registry_clear_frontends(const char *service_id,
+                                                const char *sudo_password,
+                                                bool *needs_password,
+                                                char *message,
+                                                size_t message_size);
+#endif
 
 static const BundledAppDefinition *bundled_app_for_service_id(const char *service_id) {
     if (!service_id) return NULL;
@@ -956,8 +991,8 @@ static bool directory_exists(const char *path) {
     return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
 }
 
-#ifdef __APPLE__
 static bool current_executable_path(char *out, size_t out_size) {
+#ifdef __APPLE__
     uint32_t size = (uint32_t)out_size;
     if (_NSGetExecutablePath(out, &size) != 0) return false;
     char resolved[PATH_MAX];
@@ -965,6 +1000,12 @@ static bool current_executable_path(char *out, size_t out_size) {
         snprintf(out, out_size, "%s", resolved);
     }
     return out[0] != '\0';
+#else
+    ssize_t length = readlink("/proc/self/exe", out, out_size > 0 ? out_size - 1 : 0);
+    if (length < 0 || out_size == 0) return false;
+    out[length] = '\0';
+    return out[0] != '\0';
+#endif
 }
 
 static bool parent_directory(const char *path, char *out, size_t out_size) {
@@ -979,7 +1020,6 @@ static bool parent_directory(const char *path, char *out, size_t out_size) {
     }
     return out[0] != '\0';
 }
-#endif
 
 static void bundled_apps_root(char *out, size_t out_size) {
     if (g_bundled_apps_directory[0]) {
@@ -1208,7 +1248,7 @@ static void default_system_registry_database_path(char *out, size_t out_size) {
         expand_tilde_path(env_path, out, out_size);
         return;
     }
-    snprintf(out, out_size, "%s/registry.sqlite3", kSystemOuterWebappsRoot);
+    snprintf(out, out_size, "%s/registry.orwa", kSystemOuterWebappsRoot);
 }
 
 static void default_api_socket_path(char *out, size_t out_size) {
@@ -1234,6 +1274,16 @@ static void default_api_socket_path(char *out, size_t out_size) {
     snprintf(out, out_size, "/run/user/%d/outershelld-api", (int)getuid());
 #endif
 }
+
+#ifndef __APPLE__
+static void root_helper_socket_path_for_uid(uid_t uid, char *out, size_t out_size) {
+    snprintf(out, out_size, "/run/outershelld-root-helper-%ld.sock", (long)uid);
+}
+
+static void root_helper_unit_name_for_uid(uid_t uid, const char *suffix, char *out, size_t out_size) {
+    snprintf(out, out_size, "outershelld-root-helper-%ld.%s", (long)uid, suffix && suffix[0] ? suffix : "service");
+}
+#endif
 
 static bool ensure_parent_directory(const char *path, char *error, size_t error_size) {
     char directory[PATH_MAX];
@@ -4134,6 +4184,7 @@ static bool clear_frontends_in_registry_at(const char *database_path, const char
 }
 
 static void clear_frontends_in_system_registry_as_root(const char *service_id, const char *sudo_password) {
+#ifdef __APPLE__
     char quoted_system_root[PATH_MAX + 8];
     char quoted_service_id[512];
     char outerctl_path[PATH_MAX];
@@ -4142,7 +4193,6 @@ static void clear_frontends_in_system_registry_as_root(const char *service_id, c
     shell_quote(outerctl_path, quoted_outerctl, sizeof(quoted_outerctl));
     shell_quote(kSystemOuterWebappsRoot, quoted_system_root, sizeof(quoted_system_root));
     shell_quote(service_id, quoted_service_id, sizeof(quoted_service_id));
-
     char command[8192];
     snprintf(command,
              sizeof(command),
@@ -4150,10 +4200,15 @@ static void clear_frontends_in_system_registry_as_root(const char *service_id, c
              quoted_system_root,
              quoted_outerctl,
              quoted_service_id);
-
     char output[1024] = "";
     int exit_status = -1;
     (void)run_sudo_shell(command, sudo_password, output, sizeof(output), &exit_status);
+#else
+    char output[1024] = "";
+    bool needs_password = false;
+    if (!ensure_root_helper_installed(sudo_password, &needs_password, output, sizeof(output))) return;
+    (void)root_helper_registry_clear_frontends(service_id, sudo_password, &needs_password, output, sizeof(output));
+#endif
 }
 
 static void clear_frontends_after_successful_stop(const char *service_id, bool system_scope, const char *sudo_password) {
@@ -4905,6 +4960,58 @@ static bool sudo_failure_needs_password(const char *output, int exit_status) {
            contains_case_insensitive(output, "sudo:");
 }
 
+static bool read_exact_with_timeout(int fd, void *buffer, size_t length, int timeout_ms) {
+    unsigned char *bytes = buffer;
+    size_t offset = 0;
+    while (offset < length) {
+        struct pollfd pfd = {.fd = fd, .events = POLLIN, .revents = 0};
+        int poll_result = poll(&pfd, 1, timeout_ms);
+        if (poll_result < 0) {
+            if (errno == EINTR) continue;
+            return false;
+        }
+        if (poll_result == 0 || (pfd.revents & (POLLERR | POLLNVAL))) {
+            return false;
+        }
+        if (!(pfd.revents & POLLIN)) continue;
+        ssize_t got = read(fd, bytes + offset, length - offset);
+        if (got < 0) {
+            if (errno == EINTR) continue;
+            return false;
+        }
+        if (got == 0) return false;
+        offset += (size_t)got;
+    }
+    return true;
+}
+
+static void service_nested_api_client_once(void) {
+    if (g_api_listener_fd < 0) return;
+    struct sockaddr_storage peer;
+    socklen_t peer_len = sizeof(peer);
+    int client_fd = accept((int)g_api_listener_fd, (struct sockaddr *)&peer, &peer_len);
+    if (client_fd < 0) return;
+
+    char request[READ_BUFFER_SIZE];
+    unsigned char length_bytes[4];
+    bool ok = read_exact_with_timeout(client_fd, length_bytes, sizeof(length_bytes), 5000);
+    uint32_t message_length = ok ? read_uint32_le(length_bytes) : 0;
+    if (ok && message_length <= READ_BUFFER_SIZE - 4) {
+        memcpy(request, length_bytes, sizeof(length_bytes));
+        ok = read_exact_with_timeout(client_fd, request + 4, message_length, 5000);
+    } else {
+        ok = false;
+    }
+
+    if (ok) {
+        ReactorClient client = {0};
+        client.fd = client_fd;
+        client.is_api = true;
+        (void)process_api_client_request(&client, request, (size_t)message_length + 4);
+    }
+    close(client_fd);
+}
+
 static bool run_sudo_shell(const char *command, const char *password, char *output, size_t output_size, int *exit_status) {
     if (output_size > 0) output[0] = '\0';
     if (exit_status) *exit_status = -1;
@@ -4955,21 +5062,68 @@ static bool run_sudo_shell(const char *command, const char *password, char *outp
     }
     close(stdin_pipe[1]);
 
+    int status = 0;
+    bool child_exited = false;
     size_t offset = 0;
-    while (offset + 1 < output_size) {
-        ssize_t got = read(output_pipe[0], output + offset, output_size - offset - 1);
+    while (!child_exited) {
+        struct pollfd poll_fds[2];
+        nfds_t poll_count = 0;
+        poll_fds[poll_count++] = (struct pollfd){.fd = output_pipe[0], .events = POLLIN, .revents = 0};
+        if (g_api_listener_fd >= 0) {
+            poll_fds[poll_count++] = (struct pollfd){.fd = (int)g_api_listener_fd, .events = POLLIN, .revents = 0};
+        }
+        int poll_result = poll(poll_fds, poll_count, 100);
+        if (poll_result > 0) {
+            if (poll_fds[0].revents & POLLIN) {
+                char buffer[1024];
+                ssize_t got = read(output_pipe[0], buffer, sizeof(buffer));
+                if (got > 0) {
+                    size_t copy = (size_t)got;
+                    if (output_size > 0 && offset + copy >= output_size) {
+                        copy = output_size - offset - 1;
+                    }
+                    if (copy > 0 && output_size > 0) {
+                        memcpy(output + offset, buffer, copy);
+                        offset += copy;
+                    }
+                }
+            }
+            if (poll_count > 1 && (poll_fds[1].revents & POLLIN)) {
+                service_nested_api_client_once();
+            }
+        } else if (poll_result < 0 && errno != EINTR) {
+            break;
+        }
+        pid_t wait_result = waitpid(pid, &status, WNOHANG);
+        if (wait_result == pid) {
+            child_exited = true;
+        } else if (wait_result < 0 && errno != EINTR) {
+            child_exited = true;
+        }
+    }
+    for (;;) {
+        char buffer[1024];
+        ssize_t got = read(output_pipe[0], buffer, sizeof(buffer));
         if (got < 0) {
             if (errno == EINTR) continue;
             break;
         }
         if (got == 0) break;
-        offset += (size_t)got;
+        size_t copy = (size_t)got;
+        if (output_size > 0 && offset + copy >= output_size) {
+            copy = output_size - offset - 1;
+        }
+        if (copy > 0 && output_size > 0) {
+            memcpy(output + offset, buffer, copy);
+            offset += copy;
+        }
     }
     if (output_size > 0) output[offset] = '\0';
     close(output_pipe[0]);
 
-    int status = 0;
-    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+    if (!child_exited) {
+        while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+    }
     if (WIFEXITED(status)) {
         if (exit_status) *exit_status = WEXITSTATUS(status);
         return WEXITSTATUS(status) == 0;
@@ -4997,6 +5151,97 @@ static bool run_root_script(const char *script_path, const char *sudo_password, 
     }
     return ok;
 }
+
+#ifndef __APPLE__
+static bool ensure_root_helper_installed(const char *sudo_password, bool *needs_password, char *message, size_t message_size) {
+    if (needs_password) *needs_password = false;
+
+    char executable[PATH_MAX];
+    if (!current_executable_path(executable, sizeof(executable))) {
+        snprintf(message, message_size, "Could not resolve outershelld executable path.");
+        return false;
+    }
+
+    uid_t owner_uid = getuid();
+    struct passwd *pw = getpwuid(owner_uid);
+    const char *owner_name = pw && pw->pw_name ? pw->pw_name : "";
+    if (!owner_name[0]) {
+        snprintf(message, message_size, "Could not resolve current user name.");
+        return false;
+    }
+
+    char service_name[256];
+    char socket_name[256];
+    root_helper_unit_name_for_uid(owner_uid, "service", service_name, sizeof(service_name));
+    root_helper_unit_name_for_uid(owner_uid, "socket", socket_name, sizeof(socket_name));
+
+    char quoted_executable[PATH_MAX + 8];
+    char quoted_service_name[320];
+    char quoted_socket_name[320];
+    shell_quote(executable, quoted_executable, sizeof(quoted_executable));
+    shell_quote(service_name, quoted_service_name, sizeof(quoted_service_name));
+    shell_quote(socket_name, quoted_socket_name, sizeof(quoted_socket_name));
+    (void)owner_name;
+
+    char script_template[] = "/tmp/outershelld-root-helper-install-XXXXXX";
+    int script_fd = mkstemp(script_template);
+    if (script_fd < 0) {
+        snprintf(message, message_size, "Failed to create root helper install script: %s", strerror(errno));
+        return false;
+    }
+    FILE *script = fdopen(script_fd, "w");
+    if (!script) {
+        close(script_fd);
+        unlink(script_template);
+        snprintf(message, message_size, "Failed to write root helper install script: %s", strerror(errno));
+        return false;
+    }
+    fprintf(script,
+            "set -eu\n"
+            "systemctl --system disable --now %s >/dev/null 2>&1 || true\n"
+            "systemctl --system disable --now %s >/dev/null 2>&1 || true\n"
+            "rm -f /etc/systemd/system/%s /etc/systemd/system/%s\n"
+            "systemctl --system daemon-reload >/dev/null 2>&1 || true\n"
+            "mkdir -p /usr/local/libexec %s\n"
+            "rm -f /usr/local/libexec/outershelld-root-helper\n"
+            "install -m 0755 %s /usr/local/libexec/outershelld-root-tool\n"
+            "chmod 0755 /usr/local/libexec/outershelld-root-tool\n",
+            quoted_service_name,
+            quoted_socket_name,
+            service_name,
+            socket_name,
+            kSystemOuterWebappsRoot,
+            quoted_executable);
+    fclose(script);
+    chmod(script_template, 0700);
+
+    bool ok = run_root_script(script_template, sudo_password, needs_password, message, message_size);
+    unlink(script_template);
+    if (!ok) return false;
+
+    snprintf(message, message_size, "Root helper installed.");
+    return true;
+}
+#else
+static bool ensure_root_helper_installed(const char *sudo_password, bool *needs_password, char *message, size_t message_size) {
+    (void)sudo_password;
+    if (needs_password) *needs_password = false;
+    snprintf(message, message_size, "Root helper is only implemented on Linux.");
+    return false;
+}
+
+static bool root_helper_registry_remove_backend(const char *service_id,
+                                                const char *sudo_password,
+                                                bool *needs_password,
+                                                char *message,
+                                                size_t message_size) {
+    (void)service_id;
+    (void)sudo_password;
+    if (needs_password) *needs_password = false;
+    snprintf(message, message_size, "Root helper is only implemented on Linux.");
+    return false;
+}
+#endif
 
 static bool run_root_outerwebapps_migration(const char *sudo_password, bool *needs_password, char *message, size_t message_size) {
     if (needs_password) *needs_password = false;
@@ -6900,6 +7145,10 @@ static bool install_bundled_app(const BundledAppDefinition *app, const char *sco
     }
 
     if (install_as_root) {
+        if (!ensure_root_helper_installed(sudo_password, needs_password, message, message_size)) {
+            return false;
+        }
+
         char user_name[128] = "";
         struct passwd *pw = getpwuid(getuid());
         snprintf(user_name, sizeof(user_name), "%s", pw && pw->pw_name ? pw->pw_name : "");
@@ -7130,18 +7379,12 @@ static bool install_bundled_app(const BundledAppDefinition *app, const char *sco
                      "0666");
         }
 
-        char quoted_outerctl[PATH_MAX + 8];
         char quoted_system_outerwebapps_root[PATH_MAX + 8];
-        char outerctl_path[PATH_MAX];
-        default_user_outerctl_path(outerctl_path, sizeof(outerctl_path));
-        shell_quote(outerctl_path, quoted_outerctl, sizeof(quoted_outerctl));
         shell_quote(kSystemOuterWebappsRoot, quoted_system_outerwebapps_root, sizeof(quoted_system_outerwebapps_root));
         char wrapper_contents[4096];
         snprintf(wrapper_contents, sizeof(wrapper_contents),
                  "#!/bin/sh\n"
-                 "exec env OUTERWEBAPPS_HOME=%s %s \"$@\"\n",
-                 quoted_system_outerwebapps_root,
-                 quoted_outerctl);
+                 "exec /usr/local/libexec/outershelld-root-tool --root-helper-outerctl \"$@\"\n");
 
         char script_template[] = "/tmp/backends-root-install-XXXXXX";
         int script_fd = mkstemp(script_template);
@@ -7160,8 +7403,8 @@ static bool install_bundled_app(const BundledAppDefinition *app, const char *sco
         }
         fprintf(script,
                 "set -eu\n"
-                "systemctl --system stop %s >/dev/null 2>&1 || true\n"
-                "systemctl --system reset-failed %s >/dev/null 2>&1 || true\n"
+                "timeout 12s systemctl --system stop %s >/dev/null 2>&1 || true\n"
+                "timeout 5s systemctl --system reset-failed %s >/dev/null 2>&1 || true\n"
                 "mkdir -p %s %s /var/log/outergroup %s\n"
                 "chmod 0755 %s\n"
                 "install -m 0755 %s %s\n"
@@ -7181,8 +7424,8 @@ static bool install_bundled_app(const BundledAppDefinition *app, const char *sco
                 quoted_target_bundle_x86);
         if (quoted_socket_unit[0]) {
             fprintf(script,
-                    "systemctl --system disable --now %s >/dev/null 2>&1 || true\n"
-                    "systemctl --system reset-failed %s >/dev/null 2>&1 || true\n",
+                    "timeout 12s systemctl --system disable --now %s >/dev/null 2>&1 || true\n"
+                    "timeout 5s systemctl --system reset-failed %s >/dev/null 2>&1 || true\n",
                     quoted_socket_unit,
                     quoted_socket_unit);
         }
@@ -7198,12 +7441,6 @@ static bool install_bundled_app(const BundledAppDefinition *app, const char *sco
                 "chmod 0644 %s\n"
                 "touch %s\n"
                 "chmod 0644 %s\n"
-                "OUTERWEBAPPS_HOME=%s %s backend upsert --backend %s --name %s --icon-path %s\n"
-                "OUTERWEBAPPS_HOME=%s %s systemd set --backend %s --unit %s\n"
-                "OUTERWEBAPPS_HOME=%s %s app clear --backend %s\n"
-                "if [ -n %s ]; then OUTERWEBAPPS_HOME=%s %s app add --backend %s --socket-path %s --name %s --icon-path %s; fi\n"
-                "OUTERWEBAPPS_HOME=%s %s log clear --backend %s\n"
-                "OUTERWEBAPPS_HOME=%s %s log add --backend %s --path %s\n"
                 "chmod 0666 %s/registry.orwa.lock 2>/dev/null || true\n"
                 "systemctl --system daemon-reload\n",
                 quoted_version_path,
@@ -7216,32 +7453,6 @@ static bool install_bundled_app(const BundledAppDefinition *app, const char *sco
                 unit_contents,
                 quoted_unit_path,
                 quoted_log_path,
-                quoted_log_path,
-                quoted_system_outerwebapps_root,
-                quoted_wrapper_path,
-                quoted_service_id,
-                quoted_display_name,
-                quoted_target_icon_for_registry,
-                quoted_system_outerwebapps_root,
-                quoted_wrapper_path,
-                quoted_service_id,
-                quoted_unit,
-                quoted_system_outerwebapps_root,
-                quoted_wrapper_path,
-                quoted_service_id,
-                quoted_actual_socket_path,
-                quoted_system_outerwebapps_root,
-                quoted_wrapper_path,
-                quoted_service_id,
-                quoted_actual_socket_path,
-                quoted_display_name,
-                quoted_target_icon_for_registry,
-                quoted_system_outerwebapps_root,
-                quoted_wrapper_path,
-                quoted_service_id,
-                quoted_system_outerwebapps_root,
-                quoted_wrapper_path,
-                quoted_service_id,
                 quoted_log_path,
                 quoted_system_outerwebapps_root);
         if (quoted_socket_unit[0] && quoted_socket_unit_path[0]) {
@@ -7268,6 +7479,19 @@ static bool install_bundled_app(const BundledAppDefinition *app, const char *sco
         unlink(script_template);
         if (compiled_binary[0]) unlink(compiled_binary);
         if (!root_ok) return false;
+
+        if (!root_helper_registry_upsert_systemd(app->service_id,
+                                                 app->display_name,
+                                                 app->unit_name,
+                                                 actual_socket_path,
+                                                 log_path,
+                                                 target_icon,
+                                                 sudo_password,
+                                                 needs_password,
+                                                 message,
+                                                 message_size)) {
+            return false;
+        }
 
         if (!unregister_backend_records(app->service_id, error, sizeof(error))) {
             snprintf(message, message_size, "%s", error);
@@ -8081,6 +8305,10 @@ static bool uninstall_backend(const char *service_id, const char *sudo_password,
         char quoted_unit[320];
         shell_quote(unit_name, quoted_unit, sizeof(quoted_unit));
         if (strcmp(scope, "system") == 0) {
+            if (!ensure_root_helper_installed(sudo_password, needs_password, message, message_size)) {
+                return false;
+            }
+
             const BundledAppDefinition *app = bundled_app_for_service_id(service_id);
             char install_name[PATH_MAX];
             snprintf(install_name, sizeof(install_name), "%s", app ? app->install_directory_name : service_id);
@@ -8098,31 +8326,17 @@ static bool uninstall_backend(const char *service_id, const char *sudo_password,
                 systemd_socket_unit_name(unit_name, socket_unit_name, sizeof(socket_unit_name));
                 snprintf(socket_unit_path, sizeof(socket_unit_path), "/etc/systemd/system/%s", socket_unit_name);
             }
-            char wrapper_path[PATH_MAX] = "";
-            if (install_root[0]) {
-                snprintf(wrapper_path, sizeof(wrapper_path), "%s/outerctl-as-user", install_root);
-            }
 
             char quoted_unit_path[PATH_MAX + 8];
             char quoted_socket_unit[320] = "";
             char quoted_socket_unit_path[PATH_MAX + 8] = "";
             char quoted_install_root[PATH_MAX + 8];
             char quoted_log_path[PATH_MAX + 8];
-            char quoted_wrapper_path[PATH_MAX + 8];
-            char quoted_outerctl_path[PATH_MAX + 8];
-            char quoted_system_outerwebapps_root[PATH_MAX + 8];
-            char quoted_service_id[512];
             shell_quote(unit_path, quoted_unit_path, sizeof(quoted_unit_path));
             if (socket_unit_name[0]) shell_quote(socket_unit_name, quoted_socket_unit, sizeof(quoted_socket_unit)); else quoted_socket_unit[0] = '\0';
             if (socket_unit_path[0]) shell_quote(socket_unit_path, quoted_socket_unit_path, sizeof(quoted_socket_unit_path)); else quoted_socket_unit_path[0] = '\0';
             if (install_root[0]) shell_quote(install_root, quoted_install_root, sizeof(quoted_install_root)); else quoted_install_root[0] = '\0';
             shell_quote(log_path, quoted_log_path, sizeof(quoted_log_path));
-            if (wrapper_path[0]) shell_quote(wrapper_path, quoted_wrapper_path, sizeof(quoted_wrapper_path)); else quoted_wrapper_path[0] = '\0';
-            char outerctl_path[PATH_MAX];
-            default_user_outerctl_path(outerctl_path, sizeof(outerctl_path));
-            shell_quote(outerctl_path, quoted_outerctl_path, sizeof(quoted_outerctl_path));
-            shell_quote(kSystemOuterWebappsRoot, quoted_system_outerwebapps_root, sizeof(quoted_system_outerwebapps_root));
-            shell_quote(service_id, quoted_service_id, sizeof(quoted_service_id));
 
             char script_template[] = "/tmp/backends-root-uninstall-XXXXXX";
             int script_fd = mkstemp(script_template);
@@ -8139,46 +8353,13 @@ static bool uninstall_backend(const char *service_id, const char *sudo_password,
             }
             fprintf(script,
                     "set -eu\n"
-                    "systemctl --system disable --now %s >/dev/null 2>&1 || true\n"
+                    "timeout 12s systemctl --system disable --now %s >/dev/null 2>&1 || true\n"
                     "%s%s%s"
-                    "if [ -x %s ]; then\n"
-                    "  %s app clear --backend %s >/dev/null 2>&1 || true\n"
-                    "  %s log clear --backend %s >/dev/null 2>&1 || true\n"
-                    "  %s systemd clear --backend %s >/dev/null 2>&1 || true\n"
-                    "  %s backend remove --backend %s >/dev/null 2>&1 || true\n"
-                    "elif [ -x %s ]; then\n"
-                    "  env OUTERWEBAPPS_HOME=%s %s app clear --backend %s >/dev/null 2>&1 || true\n"
-                    "  env OUTERWEBAPPS_HOME=%s %s log clear --backend %s >/dev/null 2>&1 || true\n"
-                    "  env OUTERWEBAPPS_HOME=%s %s systemd clear --backend %s >/dev/null 2>&1 || true\n"
-                    "  env OUTERWEBAPPS_HOME=%s %s backend remove --backend %s >/dev/null 2>&1 || true\n"
-                    "fi\n"
                     "rm -f -- %s %s\n",
                     quoted_unit,
-                    quoted_socket_unit[0] ? "systemctl --system disable --now " : "",
+                    quoted_socket_unit[0] ? "timeout 12s systemctl --system disable --now " : "",
                     quoted_socket_unit[0] ? quoted_socket_unit : "",
                     quoted_socket_unit[0] ? " >/dev/null 2>&1 || true\n" : "",
-                    quoted_wrapper_path[0] ? quoted_wrapper_path : "''",
-                    quoted_wrapper_path[0] ? quoted_wrapper_path : "''",
-                    quoted_service_id,
-                    quoted_wrapper_path[0] ? quoted_wrapper_path : "''",
-                    quoted_service_id,
-                    quoted_wrapper_path[0] ? quoted_wrapper_path : "''",
-                    quoted_service_id,
-                    quoted_wrapper_path[0] ? quoted_wrapper_path : "''",
-                    quoted_service_id,
-                    quoted_outerctl_path,
-                    quoted_system_outerwebapps_root,
-                    quoted_outerctl_path,
-                    quoted_service_id,
-                    quoted_system_outerwebapps_root,
-                    quoted_outerctl_path,
-                    quoted_service_id,
-                    quoted_system_outerwebapps_root,
-                    quoted_outerctl_path,
-                    quoted_service_id,
-                    quoted_system_outerwebapps_root,
-                    quoted_outerctl_path,
-                    quoted_service_id,
                     quoted_unit_path,
                     quoted_socket_unit_path[0] ? quoted_socket_unit_path : "''");
             if (quoted_install_root[0]) {
@@ -8193,6 +8374,9 @@ static bool uninstall_backend(const char *service_id, const char *sudo_password,
             bool root_ok = run_root_script(script_template, sudo_password, needs_password, message, message_size);
             unlink(script_template);
             if (!root_ok) return false;
+            if (!root_helper_registry_remove_backend(service_id, sudo_password, needs_password, message, message_size)) {
+                return false;
+            }
         } else {
             char command[768];
             snprintf(command, sizeof(command), "systemctl --user disable --now %s >/dev/null 2>&1 || true", quoted_unit);
@@ -9176,10 +9360,167 @@ static bool api_read_string_ref(const unsigned char *message,
     return true;
 }
 
+enum {
+    OUTERSHELLD_API_OUTERCTL_INVOKE = 1,
+    OUTERSHELLD_API_OUTERCTL_INVOKE_RESPONSE = 2,
+    OUTERSHELLD_API_FILE_OPENERS_QUERY = 3,
+    OUTERSHELLD_API_FILE_OPENERS_RESPONSE = 4,
+    OUTERSHELLD_API_FILE_OPENERS_ROW_SIZE = 40
+};
+
+static bool api_append_string_ref32(StringBuilder *rows, StringBuilder *variable, const char *text) {
+    const char *safe_text = text ? text : "";
+    size_t offset = variable->length;
+    size_t length = strlen(safe_text);
+    if (offset > UINT32_MAX || length > UINT32_MAX) return false;
+    unsigned char ref[8];
+    write_uint32_le(ref, (uint32_t)offset);
+    write_uint32_le(ref + 4, (uint32_t)length);
+    return sb_append_n(rows, (const char *)ref, sizeof(ref)) &&
+           sb_append_n(variable, safe_text, length);
+}
+
+static void api_patch_string_refs32(char *data, size_t data_length, uint32_t variable_offset) {
+    for (size_t offset = 0; offset + 8 <= data_length; offset += 8) {
+        uint32_t relative = read_uint32_le((const unsigned char *)data + offset);
+        write_uint32_le((unsigned char *)data + offset, relative + variable_offset);
+    }
+}
+
+static bool api_send_frame(int fd, StringBuilder *message) {
+    if (!message || message->length > UINT32_MAX) return false;
+    unsigned char prefix[4];
+    write_uint32_le(prefix, (uint32_t)message->length);
+    return queue_all(fd, prefix, sizeof(prefix)) &&
+           queue_all(fd, message->data, message->length);
+}
+
+#ifndef __APPLE__
+static int connect_unix_stream(const char *socket_path, char *error, size_t error_size) {
+    if (!socket_path || !socket_path[0]) {
+        snprintf(error, error_size, "socket path is empty");
+        return -1;
+    }
+    if (strlen(socket_path) >= sizeof(((struct sockaddr_un *)0)->sun_path)) {
+        snprintf(error, error_size, "socket path is too long: %s", socket_path);
+        return -1;
+    }
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) {
+        snprintf(error, error_size, "Failed to create socket: %s", strerror(errno));
+        return -1;
+    }
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", socket_path);
+    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        snprintf(error, error_size, "Failed to connect to root helper socket %s: %s", socket_path, strerror(errno));
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+static bool root_helper_outerctl(int argc,
+                                 char **argv,
+                                 const char *sudo_password,
+                                 bool *needs_password,
+                                 char *message,
+                                 size_t message_size) {
+    if (needs_password) *needs_password = false;
+    if (message_size > 0) message[0] = '\0';
+    if (argc < 3 || !argv) {
+        snprintf(message, message_size, "Invalid root helper registry request.");
+        return false;
+    }
+
+    StringBuilder command = {0};
+    bool ok = sb_append(&command, "/usr/local/libexec/outershelld-root-tool --root-helper-outerctl");
+    for (int i = 1; ok && i < argc; i++) {
+        char quoted[PATH_MAX * 2];
+        shell_quote(argv[i] ? argv[i] : "", quoted, sizeof(quoted));
+        ok = sb_append(&command, " ") && sb_append(&command, quoted);
+    }
+    if (!ok) {
+        free(command.data);
+        snprintf(message, message_size, "Failed to build root registry command.");
+        return false;
+    }
+
+    int exit_status = -1;
+    ok = run_sudo_shell(command.data, sudo_password, message, message_size, &exit_status);
+    free(command.data);
+    if (!ok && sudo_failure_needs_password(message, exit_status)) {
+        if (needs_password) *needs_password = true;
+        snprintf(message, message_size, "Administrator password required.");
+    } else if (!ok && !message[0]) {
+        snprintf(message, message_size, "Root registry operation failed.");
+    }
+    return ok;
+}
+
+static bool root_helper_registry_upsert_systemd(const char *service_id,
+                                                const char *display_name,
+                                                const char *unit_name,
+                                                const char *socket_path,
+                                                const char *log_path,
+                                                const char *icon_path,
+                                                const char *sudo_password,
+                                                bool *needs_password,
+                                                char *message,
+                                                size_t message_size) {
+    char *backend_argv[] = {"outerctl", "backend", "upsert", "--backend", (char *)service_id, "--name", (char *)display_name, "--icon-path", (char *)(icon_path ? icon_path : ""), NULL};
+    if (!root_helper_outerctl(9, backend_argv, sudo_password, needs_password, message, message_size)) return false;
+
+    char *systemd_argv[] = {"outerctl", "systemd", "set", "--backend", (char *)service_id, "--unit", (char *)unit_name, NULL};
+    if (!root_helper_outerctl(7, systemd_argv, sudo_password, needs_password, message, message_size)) return false;
+
+    char *app_clear_argv[] = {"outerctl", "app", "clear", "--backend", (char *)service_id, NULL};
+    if (!root_helper_outerctl(5, app_clear_argv, sudo_password, needs_password, message, message_size)) return false;
+
+    if (socket_path && socket_path[0]) {
+        char *app_add_argv[] = {"outerctl", "app", "add", "--backend", (char *)service_id, "--socket-path", (char *)socket_path, "--name", (char *)display_name, "--icon-path", (char *)(icon_path ? icon_path : ""), NULL};
+        if (!root_helper_outerctl(11, app_add_argv, sudo_password, needs_password, message, message_size)) return false;
+    }
+
+    char *log_clear_argv[] = {"outerctl", "log", "clear", "--backend", (char *)service_id, NULL};
+    if (!root_helper_outerctl(5, log_clear_argv, sudo_password, needs_password, message, message_size)) return false;
+
+    char *log_add_argv[] = {"outerctl", "log", "add", "--backend", (char *)service_id, "--path", (char *)log_path, NULL};
+    return root_helper_outerctl(7, log_add_argv, sudo_password, needs_password, message, message_size);
+}
+
+static bool root_helper_registry_remove_backend(const char *service_id,
+                                                const char *sudo_password,
+                                                bool *needs_password,
+                                                char *message,
+                                                size_t message_size) {
+    char *app_clear_argv[] = {"outerctl", "app", "clear", "--backend", (char *)service_id, NULL};
+    (void)root_helper_outerctl(5, app_clear_argv, sudo_password, needs_password, message, message_size);
+    char *log_clear_argv[] = {"outerctl", "log", "clear", "--backend", (char *)service_id, NULL};
+    (void)root_helper_outerctl(5, log_clear_argv, sudo_password, needs_password, message, message_size);
+    char *systemd_clear_argv[] = {"outerctl", "systemd", "clear", "--backend", (char *)service_id, NULL};
+    (void)root_helper_outerctl(5, systemd_clear_argv, sudo_password, needs_password, message, message_size);
+    char *backend_remove_argv[] = {"outerctl", "backend", "remove", "--backend", (char *)service_id, NULL};
+    if (root_helper_outerctl(5, backend_remove_argv, sudo_password, needs_password, message, message_size)) return true;
+    return contains_case_insensitive(message, "Backend not registered");
+}
+
+static bool root_helper_registry_clear_frontends(const char *service_id,
+                                                const char *sudo_password,
+                                                bool *needs_password,
+                                                char *message,
+                                                size_t message_size) {
+    char *app_clear_argv[] = {"outerctl", "app", "clear", "--backend", (char *)service_id, NULL};
+    return root_helper_outerctl(5, app_clear_argv, sudo_password, needs_password, message, message_size);
+}
+#endif
+
 static void api_send_outerctl_response(int fd, int status, StringBuilder *stdout_buffer, StringBuilder *stderr_buffer) {
     StringBuilder message = {0};
     bool ok = binary_append_zero(&message, 22) &&
-              binary_write_u16_at(&message, 0, 2) &&
+              binary_write_u16_at(&message, 0, OUTERSHELLD_API_OUTERCTL_INVOKE_RESPONSE) &&
               binary_write_u32_at(&message, 2, (uint32_t)status) &&
               binary_append_data_ref_at(&message, 6, stdout_buffer->data, stdout_buffer->length) &&
               binary_append_data_ref_at(&message, 14, stderr_buffer->data, stderr_buffer->length);
@@ -9187,22 +9528,170 @@ static void api_send_outerctl_response(int fd, int status, StringBuilder *stdout
         free(message.data);
         return;
     }
-    unsigned char prefix[4];
-    write_uint32_le(prefix, (uint32_t)message.length);
-    queue_all(fd, prefix, sizeof(prefix));
-    queue_all(fd, message.data, message.length);
+    api_send_frame(fd, &message);
     free(message.data);
 }
 
-static bool process_api_client_request(ReactorClient *client, char *request, size_t n) {
-    if (n < 14) return false;
-    const unsigned char *message = (const unsigned char *)request + 4;
-    size_t message_length = n - 4;
+static void api_send_file_openers_response(int fd,
+                                           uint32_t status,
+                                           const char *error,
+                                           StringBuilder *rows,
+                                           StringBuilder *variable,
+                                           uint32_t row_count) {
+    StringBuilder message = {0};
+    size_t rows_length = rows ? rows->length : 0;
+    size_t variable_length = variable ? variable->length : 0;
+    bool ok = rows_length <= UINT32_MAX &&
+              variable_length <= UINT32_MAX &&
+              18 + rows_length <= UINT32_MAX &&
+              binary_append_zero(&message, 18);
+    if (ok && rows_length > 0) {
+        uint32_t variable_offset = (uint32_t)(18 + rows_length);
+        api_patch_string_refs32(rows->data, rows->length, variable_offset);
+        ok = sb_append_n(&message, rows->data, rows->length);
+    }
+    if (ok && variable_length > 0) {
+        ok = sb_append_n(&message, variable->data, variable->length);
+    }
+    if (ok) {
+        ok = binary_write_u16_at(&message, 0, OUTERSHELLD_API_FILE_OPENERS_RESPONSE) &&
+             binary_write_u32_at(&message, 2, status) &&
+             binary_append_string_ref_at(&message, 6, error ? error : "") &&
+             binary_write_u32_at(&message, 14, row_count);
+    }
+    if (ok) api_send_frame(fd, &message);
+    free(message.data);
+}
+
+static bool unix_socket_path_accessible_to_current_user(const char *socket_path) {
+    if (!socket_path || !socket_path[0]) return false;
+    struct stat st;
+    if (stat(socket_path, &st) != 0 || !S_ISSOCK(st.st_mode)) return false;
+    return access(socket_path, R_OK | W_OK) == 0;
+}
+
+static bool api_append_file_openers_from_database(sqlite3 *database,
+                                                  const char *extension,
+                                                  const char *file_path,
+                                                  bool require_socket_access,
+                                                  StringBuilder *rows,
+                                                  StringBuilder *variable,
+                                                  uint32_t *row_count,
+                                                  char *error,
+                                                  size_t error_size) {
+    const char *sql =
+        "SELECT extension, service_id, display_name, socket_path, url_template "
+        "FROM file_openers "
+        "WHERE extension = ?1 "
+        "ORDER BY rank, display_name, service_id;";
+    sqlite3_stmt *statement = NULL;
+    bool ok = sqlite3_prepare_v2(database, sql, -1, &statement, NULL) == SQLITE_OK;
+    if (ok) {
+        sqlite3_bind_text(statement, 1, extension, -1, SQLITE_TRANSIENT);
+    } else {
+        snprintf(error, error_size, "%s", sqlite3_errmsg(database));
+    }
+
+    int step = SQLITE_DONE;
+    while (ok && (step = sqlite3_step(statement)) == SQLITE_ROW) {
+        const char *socket_path = sqlite_column_text_or_empty(statement, 3);
+        if (require_socket_access && !unix_socket_path_accessible_to_current_user(socket_path)) {
+            continue;
+        }
+        StringBuilder url = {0};
+        ok = append_file_opener_url(&url,
+                                    socket_path,
+                                    sqlite_column_text_or_empty(statement, 4),
+                                    file_path ? file_path : "") &&
+             api_append_string_ref32(rows, variable, sqlite_column_text_or_empty(statement, 0)) &&
+             api_append_string_ref32(rows, variable, sqlite_column_text_or_empty(statement, 1)) &&
+             api_append_string_ref32(rows, variable, sqlite_column_text_or_empty(statement, 2)) &&
+             api_append_string_ref32(rows, variable, socket_path) &&
+             api_append_string_ref32(rows, variable, url.data ? url.data : "");
+        free(url.data);
+        if (ok && row_count) *row_count += 1;
+    }
+    if (ok && step != SQLITE_DONE) {
+        snprintf(error, error_size, "%s", sqlite3_errmsg(database));
+        ok = false;
+    }
+    if (!ok && !error[0]) snprintf(error, error_size, "out of memory");
+    if (statement) sqlite3_finalize(statement);
+    return ok;
+}
+
+static bool api_query_file_openers(const char *extension_filter,
+                                   const char *file_path,
+                                   StringBuilder *rows,
+                                   StringBuilder *variable,
+                                   uint32_t *row_count,
+                                   char *error,
+                                   size_t error_size) {
+    if (row_count) *row_count = 0;
+    char extension[128];
+    if (!normalize_file_extension(extension_filter, extension, sizeof(extension))) {
+        snprintf(error, error_size, "Invalid file extension.");
+        return false;
+    }
+
+    sqlite3 *database = open_registry_readonly(error, error_size);
+    if (!database) return false;
+    bool ok = api_append_file_openers_from_database(database,
+                                                   extension,
+                                                   file_path,
+                                                   false,
+                                                   rows,
+                                                   variable,
+                                                   row_count,
+                                                   error,
+                                                   error_size);
+    sqlite3_close(database);
+
+    if (ok && g_system_registry_database_path[0] && registry_storage_exists_at(g_system_registry_database_path)) {
+        char system_error[512] = "";
+        sqlite3 *system_database = open_system_registry_readonly(system_error, sizeof(system_error));
+        if (system_database) {
+            ok = api_append_file_openers_from_database(system_database,
+                                                       extension,
+                                                       file_path,
+                                                       true,
+                                                       rows,
+                                                       variable,
+                                                       row_count,
+                                                       error,
+                                                       error_size);
+            sqlite3_close(system_database);
+        }
+    }
+    return ok;
+}
+
+static bool process_api_file_openers_request(ReactorClient *client, const unsigned char *message, size_t message_length) {
+    char *extension = NULL;
+    char *file_path = NULL;
+    char error[512] = "";
+    StringBuilder rows = {0};
+    StringBuilder variable = {0};
+    uint32_t row_count = 0;
+    bool ok = message_length >= 18 &&
+              api_read_string_ref(message, message_length, 2, &extension) &&
+              api_read_string_ref(message, message_length, 10, &file_path) &&
+              api_query_file_openers(extension, file_path, &rows, &variable, &row_count, error, sizeof(error));
+    if (!ok && !error[0]) snprintf(error, sizeof(error), "Invalid file openers request.");
+    api_send_file_openers_response(client->fd, ok ? 0u : 1u, error, &rows, &variable, ok ? row_count : 0);
+    free(extension);
+    free(file_path);
+    free(rows.data);
+    free(variable.data);
+    return false;
+}
+
+static bool process_api_outerctl_request(ReactorClient *client, const unsigned char *message, size_t message_length) {
     StringBuilder stdout_buffer = {0};
     StringBuilder stderr_buffer = {0};
     int status = 1;
 
-    if (read_uint16_le(message) != 1 || message_length < 14) {
+    if (message_length < 14) {
         sb_append(&stderr_buffer, "Unsupported API message.\n");
         api_send_outerctl_response(client->fd, status, &stdout_buffer, &stderr_buffer);
         free(stdout_buffer.data);
@@ -9243,6 +9732,27 @@ static bool process_api_client_request(ReactorClient *client, char *request, siz
         free(argv);
     }
     free(registry_path);
+    free(stdout_buffer.data);
+    free(stderr_buffer.data);
+    return false;
+}
+
+static bool process_api_client_request(ReactorClient *client, char *request, size_t n) {
+    if (n < 6) return false;
+    const unsigned char *message = (const unsigned char *)request + 4;
+    size_t message_length = n - 4;
+    uint16_t message_type = read_uint16_le(message);
+    if (message_type == OUTERSHELLD_API_OUTERCTL_INVOKE) {
+        return process_api_outerctl_request(client, message, message_length);
+    }
+    if (message_type == OUTERSHELLD_API_FILE_OPENERS_QUERY) {
+        return process_api_file_openers_request(client, message, message_length);
+    }
+
+    StringBuilder stdout_buffer = {0};
+    StringBuilder stderr_buffer = {0};
+    sb_append(&stderr_buffer, "Unsupported API message.\n");
+    api_send_outerctl_response(client->fd, 1, &stdout_buffer, &stderr_buffer);
     free(stdout_buffer.data);
     free(stderr_buffer.data);
     return false;
@@ -9536,6 +10046,21 @@ static void add_reactor_client(ReactorClient *clients, size_t *client_count, int
     memset(client, 0, sizeof(*client));
     client->fd = client_fd;
     client->is_api = is_api;
+#ifndef __APPLE__
+    struct ucred credentials;
+    socklen_t credentials_length = sizeof(credentials);
+    if (getsockopt(client_fd, SOL_SOCKET, SO_PEERCRED, &credentials, &credentials_length) == 0) {
+        client->peer_uid = credentials.uid;
+        client->has_peer_uid = true;
+    }
+#else
+    uid_t peer_uid = (uid_t)-1;
+    gid_t peer_gid = (gid_t)-1;
+    if (getpeereid(client_fd, &peer_uid, &peer_gid) == 0) {
+        client->peer_uid = peer_uid;
+        client->has_peer_uid = true;
+    }
+#endif
     client->last_activity_ms = monotonic_milliseconds();
 }
 
@@ -9735,14 +10260,150 @@ static void run_reactor(int listener, int api_listener) {
     free(clients);
 }
 
+static void run_api_reactor(int api_listener) {
+    ReactorClient *clients = calloc(MAX_REACTOR_CLIENTS, sizeof(ReactorClient));
+    if (!clients) {
+        fprintf(stderr, "failed to allocate API reactor clients\n");
+        return;
+    }
+    size_t client_count = 0;
+    set_fd_nonblocking(api_listener, true);
+    while (!g_shutdown_requested) {
+        struct pollfd poll_fds[MAX_REACTOR_CLIENTS + 1];
+        size_t polled_client_count = client_count;
+        poll_fds[0] = (struct pollfd){.fd = api_listener, .events = POLLIN, .revents = 0};
+        for (size_t i = 0; i < polled_client_count; i++) {
+            poll_fds[i + 1] = (struct pollfd){.fd = clients[i].fd, .events = POLLIN, .revents = 0};
+        }
+
+        int timeout_ms = socket_activation_enabled() && !g_stay_alive_when_socket_idle && polled_client_count == 0 ? 60000 : 1000;
+        int poll_result = poll(poll_fds, (nfds_t)(polled_client_count + 1), timeout_ms);
+        if (poll_result == 0) {
+            if (socket_activation_enabled() && !g_stay_alive_when_socket_idle && client_count == 0) break;
+            continue;
+        }
+        if (poll_result < 0) {
+            if (errno == EINTR) continue;
+            perror("poll");
+            break;
+        }
+        if (poll_fds[0].revents & POLLIN) {
+            accept_ready_clients(api_listener, clients, &client_count, true);
+        } else if (poll_fds[0].revents & (POLLERR | POLLHUP | POLLNVAL)) {
+            break;
+        }
+
+        for (size_t i = polled_client_count; i > 0; i--) {
+            size_t index = i - 1;
+            short revents = poll_fds[index + 1].revents;
+            if (revents == 0) continue;
+            if (revents & POLLIN) {
+                size_t complete_length = 0;
+                bool should_close = false;
+                bool complete = read_reactor_client(&clients[index], &complete_length, &should_close);
+                if (complete) {
+                    set_fd_nonblocking(clients[index].fd, false);
+                    if (complete_length > READ_BUFFER_SIZE) {
+                        close_reactor_client(clients, &client_count, index);
+                    } else {
+                        (void)process_api_client_request(&clients[index],
+                                                         clients[index].request,
+                                                         complete_length);
+                        close_reactor_client(clients, &client_count, index);
+                    }
+                } else if (should_close) {
+                    close_reactor_client(clients, &client_count, index);
+                }
+            } else if (revents & (POLLERR | POLLHUP | POLLNVAL)) {
+                close_reactor_client(clients, &client_count, index);
+            }
+        }
+
+        int64_t now = monotonic_milliseconds();
+        for (size_t i = client_count; i > 0; i--) {
+            size_t index = i - 1;
+            if (now - clients[index].last_activity_ms > CLIENT_IDLE_TIMEOUT_MS) {
+                close_reactor_client(clients, &client_count, index);
+            }
+        }
+    }
+    for (size_t i = 0; i < client_count; i++) close(clients[i].fd);
+    free(clients);
+}
+
+#ifndef __APPLE__
+static bool root_helper_peer_allowed(int client_fd) {
+    if (g_root_helper_owner_uid == (uid_t)-1) return false;
+    struct ucred credentials;
+    socklen_t length = sizeof(credentials);
+    if (getsockopt(client_fd, SOL_SOCKET, SO_PEERCRED, &credentials, &length) != 0) {
+        return false;
+    }
+    return credentials.uid == 0;
+}
+
+static void run_root_helper_api_loop(int api_listener) {
+    if (api_listener < 0) return;
+    set_fd_nonblocking(api_listener, true);
+    while (!g_shutdown_requested) {
+        struct pollfd pfd = {.fd = api_listener, .events = POLLIN, .revents = 0};
+        int poll_result = poll(&pfd, 1, socket_activation_enabled() ? 60000 : 1000);
+        if (poll_result == 0) {
+            if (socket_activation_enabled()) break;
+            continue;
+        }
+        if (poll_result < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) break;
+        if (!(pfd.revents & POLLIN)) continue;
+
+        struct sockaddr_storage peer;
+        socklen_t peer_len = sizeof(peer);
+        int client_fd = accept(api_listener, (struct sockaddr *)&peer, &peer_len);
+        if (client_fd < 0) {
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
+            break;
+        }
+        if (!root_helper_peer_allowed(client_fd)) {
+            close(client_fd);
+            continue;
+        }
+
+        char request[READ_BUFFER_SIZE];
+        unsigned char length_bytes[4];
+        bool ok = read_exact_with_timeout(client_fd, length_bytes, sizeof(length_bytes), 5000);
+        uint32_t message_length = ok ? read_uint32_le(length_bytes) : 0;
+        if (ok && message_length <= READ_BUFFER_SIZE - 4) {
+            memcpy(request, length_bytes, sizeof(length_bytes));
+            ok = read_exact_with_timeout(client_fd, request + 4, message_length, 5000);
+        } else {
+            ok = false;
+        }
+        if (ok) {
+            ReactorClient client = {0};
+            client.fd = client_fd;
+            client.is_api = true;
+            (void)process_api_client_request(&client, request, (size_t)message_length + 4);
+        }
+        close(client_fd);
+    }
+}
+#endif
+
 static void usage(const char *program) {
-    fprintf(stderr, "Usage: %s [--port PORT | --socket-path PATH] [--api-socket-path PATH | --no-api-socket] [--launchd-socket-name NAME] [--bundles-dir DIR] [--bundled-apps-dir DIR] [--app-base-url URL] [--public-base-url URL] [--database PATH] [--system-database PATH] [--stay-alive]\n", program);
+    fprintf(stderr, "Usage: %s [--port PORT | --socket-path PATH] [--api-socket-path PATH | --no-api-socket] [--http-only | --broker-only] [--launchd-socket-name NAME] [--bundles-dir DIR] [--bundled-apps-dir DIR] [--app-base-url URL] [--public-base-url URL] [--database PATH] [--system-database PATH] [--stay-alive] [--root-helper --root-helper-owner-uid UID]\n", program);
 }
 
 int OuterShellBackendMain(int argc, char **argv) {
     int port = DEFAULT_PORT;
     bool use_port = true;
     bool use_api_socket = true;
+    bool http_enabled = true;
+#ifndef __APPLE__
+    bool root_helper_mode = false;
+#endif
     char socket_path[PATH_MAX] = "";
     char api_socket_path[PATH_MAX] = "";
     char launchd_socket_name[128] = "Listener";
@@ -9759,6 +10420,28 @@ int OuterShellBackendMain(int argc, char **argv) {
     default_system_registry_database_path(g_system_registry_database_path, sizeof(g_system_registry_database_path));
     default_api_socket_path(api_socket_path, sizeof(api_socket_path));
 
+#ifndef __APPLE__
+    if (argc >= 2 && strcmp(argv[1], "--root-helper-outerctl") == 0) {
+        if (geteuid() != 0) {
+            fprintf(stderr, "root helper outerctl mode requires root.\n");
+            return 2;
+        }
+        snprintf(g_registry_database_path, sizeof(g_registry_database_path), "%s", g_system_registry_database_path);
+        StringBuilder stdout_buffer = {0};
+        StringBuilder stderr_buffer = {0};
+        int status = outershelld_handle_outerctl(argc - 1, argv + 1, &stdout_buffer, &stderr_buffer);
+        if (stdout_buffer.data && stdout_buffer.length > 0) {
+            fwrite(stdout_buffer.data, 1, stdout_buffer.length, stdout);
+        }
+        if (stderr_buffer.data && stderr_buffer.length > 0) {
+            fwrite(stderr_buffer.data, 1, stderr_buffer.length, stderr);
+        }
+        free(stdout_buffer.data);
+        free(stderr_buffer.data);
+        return status;
+    }
+#endif
+
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
             port = atoi(argv[++i]);
@@ -9773,6 +10456,14 @@ int OuterShellBackendMain(int argc, char **argv) {
         } else if (strcmp(argv[i], "--no-api-socket") == 0) {
             use_api_socket = false;
             api_socket_path[0] = '\0';
+        } else if (strcmp(argv[i], "--http-only") == 0) {
+            http_enabled = true;
+            use_api_socket = false;
+            api_socket_path[0] = '\0';
+        } else if (strcmp(argv[i], "--broker-only") == 0) {
+            http_enabled = false;
+            use_api_socket = true;
+            use_port = false;
         } else if (strcmp(argv[i], "--launchd-socket-name") == 0 && i + 1 < argc) {
             snprintf(launchd_socket_name, sizeof(launchd_socket_name), "%s", argv[++i]);
         } else if (strcmp(argv[i], "--bundles-dir") == 0 && i + 1 < argc) {
@@ -9789,11 +10480,61 @@ int OuterShellBackendMain(int argc, char **argv) {
             expand_tilde_path(argv[++i], g_system_registry_database_path, sizeof(g_system_registry_database_path));
         } else if (strcmp(argv[i], "--stay-alive") == 0) {
             g_stay_alive_when_socket_idle = true;
+        } else if (strcmp(argv[i], "--root-helper") == 0) {
+#ifdef __APPLE__
+            usage(argv[0]);
+            return 2;
+#else
+            root_helper_mode = true;
+            use_port = false;
+#endif
+        } else if (strcmp(argv[i], "--root-helper-owner-uid") == 0 && i + 1 < argc) {
+#ifdef __APPLE__
+            usage(argv[0]);
+            return 2;
+#else
+            char *end = NULL;
+            unsigned long value = strtoul(argv[++i], &end, 10);
+            if (!end || *end != '\0') {
+                usage(argv[0]);
+                return 2;
+            }
+            g_root_helper_owner_uid = (uid_t)value;
+#endif
         } else {
             usage(argv[0]);
             return 2;
         }
     }
+
+#ifndef __APPLE__
+    if (root_helper_mode) {
+        if (g_root_helper_owner_uid == (uid_t)-1 || geteuid() != 0) {
+            fprintf(stderr, "root helper mode requires root and --root-helper-owner-uid.\n");
+            return 2;
+        }
+        snprintf(g_registry_database_path, sizeof(g_registry_database_path), "%s", g_system_registry_database_path);
+        int api_listener = systemd_activated_listener_named("api", &g_api_systemd_socket_activation);
+        clear_systemd_activation_environment();
+        if (api_listener < 0) {
+            api_listener = create_unix_listener(api_socket_path);
+        }
+        if (api_socket_path[0]) {
+            snprintf(g_api_socket_path, sizeof(g_api_socket_path), "%s", api_socket_path);
+        }
+        if (api_listener < 0) return 1;
+        g_api_listener_fd = api_listener;
+        fprintf(stderr, "outershelld root helper API listening on %s\n", api_socket_path[0] ? api_socket_path : "(socket activated)");
+        fprintf(stderr, "System registry database: %s\n", g_registry_database_path);
+        run_root_helper_api_loop(api_listener);
+        close(api_listener);
+        g_api_listener_fd = -1;
+        if (g_api_socket_path[0] && !g_api_systemd_socket_activation) {
+            unlink(g_api_socket_path);
+        }
+        return 0;
+    }
+#endif
 
     snprintf(g_bundle_file_path_macos_arm, sizeof(g_bundle_file_path_macos_arm),
              "%s/BackendsContent.bundle.macos-arm.aar", bundles_dir);
@@ -9805,6 +10546,35 @@ int OuterShellBackendMain(int argc, char **argv) {
     signal(SIGINT, handle_shutdown_signal);
     signal(SIGTERM, handle_shutdown_signal);
     signal(SIGPIPE, SIG_IGN);
+
+    if (!http_enabled) {
+        int api_listener = use_api_socket ? systemd_activated_listener_named("api", &g_api_systemd_socket_activation) : -1;
+        clear_systemd_activation_environment();
+        if (!use_api_socket) {
+            fprintf(stderr, "broker-only mode requires an API socket\n");
+            return 2;
+        }
+        if (api_listener < 0) {
+            api_listener = create_unix_listener(api_socket_path);
+        }
+        if (api_socket_path[0]) {
+            snprintf(g_api_socket_path, sizeof(g_api_socket_path), "%s", api_socket_path);
+        }
+        if (api_listener < 0) return 1;
+        g_api_listener_fd = api_listener;
+        fprintf(stderr, "outershelld API listening on %s\n", api_socket_path[0] ? api_socket_path : "(socket activated)");
+        fprintf(stderr, "Registry database: %s\n", g_registry_database_path);
+        if (g_system_registry_database_path[0]) {
+            fprintf(stderr, "System registry database: %s\n", g_system_registry_database_path);
+        }
+        run_api_reactor(api_listener);
+        close(api_listener);
+        g_api_listener_fd = -1;
+        if (g_api_socket_path[0] && !g_api_systemd_socket_activation) {
+            unlink(g_api_socket_path);
+        }
+        return 0;
+    }
 
     int listener = !use_port ? systemd_activated_listener_named("http", &g_systemd_socket_activation) : -1;
     int api_listener = use_api_socket ? systemd_activated_listener_named("api", &g_api_systemd_socket_activation) : -1;
