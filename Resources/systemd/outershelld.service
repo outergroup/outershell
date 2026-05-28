@@ -1,0 +1,11 @@
+[Unit]
+Description=Outer Shell daemon
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/outershelld --socket-path %t/org.outershell.OuterShell
+Restart=on-failure
+
+[Install]
+WantedBy=default.target

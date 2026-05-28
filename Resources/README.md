@@ -11,7 +11,7 @@ Each architecture-specific Outer Shell tarball expands to:
 
 ```text
 OuterShell/
-  OuterShellBackend
+  outershelld
   app-icon.png
   bin/
     outerctl
@@ -49,7 +49,7 @@ environment:
 The script writes binaries to:
 
 ```text
-build/linux-package/RemoteLinuxBinaries/<arch>/OuterShellBackend
+build/linux-package/RemoteLinuxBinaries/<arch>/outershelld
 build/linux-package/RemoteLinuxBinaries/<arch>/outerctl
 ```
 

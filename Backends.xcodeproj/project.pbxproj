@@ -33,7 +33,7 @@
 		0F000000000000000000000A /* .gitignore */ = {isa = PBXFileReference; lastKnownFileType = text; path = .gitignore; sourceTree = "<group>"; };
 		37B4F9C12FA189AB00873894 /* AGENTS.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = AGENTS.md; sourceTree = "<group>"; };
 		37B4F9C22FA18C1E00873894 /* LICENSE */ = {isa = PBXFileReference; lastKnownFileType = text; path = LICENSE; sourceTree = "<group>"; };
-		37B4F9CF2FA1B00100873894 /* OuterShellBackend */ = {isa = PBXFileReference; explicitFileType = "compiled.mach-o.executable"; includeInIndex = 0; path = OuterShellBackend; sourceTree = BUILT_PRODUCTS_DIR; };
+		37B4F9CF2FA1B00100873894 /* outershelld */ = {isa = PBXFileReference; explicitFileType = "compiled.mach-o.executable"; includeInIndex = 0; path = outershelld; sourceTree = BUILT_PRODUCTS_DIR; };
 		37B4F9D02FA1B00100873894 /* main.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = main.c; sourceTree = "<group>"; };
 		AG0000000000000000000001 /* Outer Shell.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "Outer Shell.app"; sourceTree = BUILT_PRODUCTS_DIR; };
 		AG0000000000000000000003 /* OuterShellAgent.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OuterShellAgent.swift; sourceTree = "<group>"; };
@@ -104,7 +104,7 @@
 			isa = PBXGroup;
 			children = (
 				0F0000000000000000000003 /* Backends.bundle */,
-				37B4F9CF2FA1B00100873894 /* OuterShellBackend */,
+				37B4F9CF2FA1B00100873894 /* outershelld */,
 				AG0000000000000000000001 /* Outer Shell.app */,
 			);
 			name = Products;
@@ -153,9 +153,9 @@
 			productReference = 0F0000000000000000000003 /* Backends.bundle */;
 			productType = "com.apple.product-type.bundle";
 		};
-		37B4F9D22FA1B00100873894 /* OuterShellBackend */ = {
+		37B4F9D22FA1B00100873894 /* outershelld */ = {
 			isa = PBXNativeTarget;
-			buildConfigurationList = 37B4F9D52FA1B00100873894 /* Build configuration list for PBXNativeTarget "OuterShellBackend" */;
+			buildConfigurationList = 37B4F9D52FA1B00100873894 /* Build configuration list for PBXNativeTarget "outershelld" */;
 			buildPhases = (
 				37B4F9D32FA1B00100873894 /* Sources */,
 				37B4F9D42FA1B00100873894 /* Frameworks */,
@@ -164,11 +164,11 @@
 			);
 			dependencies = (
 			);
-			name = OuterShellBackend;
+			name = outershelld;
 			packageProductDependencies = (
 			);
-			productName = OuterShellBackend;
-			productReference = 37B4F9CF2FA1B00100873894 /* OuterShellBackend */;
+			productName = outershelld;
+			productReference = 37B4F9CF2FA1B00100873894 /* outershelld */;
 			productType = "com.apple.product-type.tool";
 		};
 		AG0000000000000000000009 /* OuterShellAgent */ = {
@@ -229,7 +229,7 @@
 			projectRoot = "";
 			targets = (
 				0F000000000000000000000B /* Backends */,
-				37B4F9D22FA1B00100873894 /* OuterShellBackend */,
+				37B4F9D22FA1B00100873894 /* outershelld */,
 				AG0000000000000000000009 /* OuterShellAgent */,
 			);
 		};
@@ -488,8 +488,8 @@
 					"$(inherited)",
 					"-lsqlite3",
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = org.outershell.OuterShellBackend;
-				PRODUCT_NAME = OuterShellBackend;
+				PRODUCT_BUNDLE_IDENTIFIER = org.outershell.outershelld;
+				PRODUCT_NAME = outershelld;
 				SKIP_INSTALL = YES;
 			};
 			name = Debug;
@@ -510,8 +510,8 @@
 					"$(inherited)",
 					"-lsqlite3",
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = org.outershell.OuterShellBackend;
-				PRODUCT_NAME = OuterShellBackend;
+				PRODUCT_BUNDLE_IDENTIFIER = org.outershell.outershelld;
+				PRODUCT_NAME = outershelld;
 				SKIP_INSTALL = YES;
 			};
 			name = Release;
@@ -607,7 +607,7 @@
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
 		};
-		37B4F9D52FA1B00100873894 /* Build configuration list for PBXNativeTarget "OuterShellBackend" */ = {
+		37B4F9D52FA1B00100873894 /* Build configuration list for PBXNativeTarget "outershelld" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
 				37B4F9D62FA1B00100873894 /* Debug */,

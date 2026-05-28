@@ -648,7 +648,7 @@ private final class OuterShellAgentDelegate: NSObject, NSApplicationDelegate, NS
         backendThread = Thread {
             _ = runBackend(arguments: arguments)
         }
-        backendThread?.name = "OuterShellBackend"
+        backendThread?.name = "outershelld"
         backendThread?.start()
     }
 

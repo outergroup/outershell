@@ -463,6 +463,18 @@ private struct BackendListRow {
     }
 }
 
+private struct LogVisualLine {
+    let range: NSRange
+}
+
+private struct LogVisualLineMetrics {
+    let textWidth: CGFloat
+    let charWidth: CGFloat
+    let lineHeight: CGFloat
+    let charactersPerLine: Int
+    let lines: [LogVisualLine]
+}
+
 private struct PendingPasswordAction {
     let serviceID: String
     let operation: String
@@ -646,15 +658,22 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private var createMessage = ""
     private var backendScroll: CGFloat = 0
     private var logScroll: CGFloat = 0
+    private var shouldScrollLogToBottomOnNextLayout = false
     private var logRenderedText = ""
     private var logAttributedText = NSAttributedString(string: "")
+    private var renderedLogHeaderDetailText = ""
+    private var logHeaderDetailFrame = CGRect.zero
+    private var logHeaderDetailSelectionRange: NSRange?
+    private var logHeaderDetailDragAnchorOffset: Int?
     private var logTextSelectionRange: NSRange?
-    private var logDragAnchorSelections: [NSTextSelection] = []
+    private var logDragAnchorOffset: Int?
+    private var lastLogDragTextPoint: CGPoint?
     private var logTextSelectionLayers: [CALayer] = []
     private var logTextFragmentLayers: [ObjectIdentifier: LogTextFragmentLayer] = [:]
     private var logTextLayoutWidth: CGFloat = 0
     private var logTextContentGeneration = 0
     private var logEstimatedContentHeightCache: (generation: Int, textWidth: CGFloat, height: CGFloat)?
+    private var logVisualLineCache: (generation: Int, textWidth: CGFloat, metrics: LogVisualLineMetrics)?
     private var logTextFragmentCoverage: (generation: Int, textWidth: CGFloat, contentHeight: CGFloat, rect: CGRect)?
     private var logTextSelectionCoverage: (generation: Int, textWidth: CGFloat, contentHeight: CGFloat, range: NSRange, rect: CGRect)?
     private var logScrollbarController: ScrollbarController<BackendsHandler>?
@@ -730,6 +749,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private var textMatchLayers: [String: CATextLayer] = [:]
     private var isRecordingTransitionTargets = false
     private var pendingMenuActions: [UUID: (serviceID: String, operationByItemID: [String: String])] = [:]
+    private var pendingLogMenuSelections: [UUID: (serviceID: String, logIndexByItemID: [String: Int])] = [:]
+    private var logSelectorFrame = CGRect.zero
     private var recipeFrames: [(frame: CGRect, recipeID: String)] = []
     private var bundledAppInstallFrames: [(frame: CGRect, backend: BackendRecord)] = []
     private var bundledAppMenuFrames: [(frame: CGRect, backend: BackendRecord)] = []
@@ -2752,15 +2773,77 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private func renderLogHeader() {
         logHeaderLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
         let backend = selectedBackend()
+        logSelectorFrame = .zero
+
+        if let backend,
+           backend.logFiles.count > 1,
+           logHeaderLayer.bounds.width > horizontalInset * 2 + 80 {
+            let availableWidth = max(logHeaderLayer.bounds.width - horizontalInset * 2, 1)
+            let selectorWidth = min(max(availableWidth * 0.34, 120), min(220, availableWidth))
+            logSelectorFrame = CGRect(x: logHeaderLayer.bounds.width - horizontalInset - selectorWidth,
+                                      y: 31,
+                                      width: selectorWidth,
+                                      height: 24)
+            let currentLog = currentLogFile(for: backend)
+            let selector = makeButtonLayer(title: "Log: \(logSelectorTitle(for: currentLog, index: selectedLog?.logIndex ?? 0))",
+                                           emphasized: false)
+            selector.frame = logSelectorFrame
+            logHeaderLayer.addSublayer(selector)
+        }
+
         let title = makeTextLayer(size: 16, weight: .semibold, color: .labelColor)
         title.string = backend?.displayName ?? "Logs"
-        title.frame = CGRect(x: horizontalInset, y: 34, width: max(logHeaderLayer.bounds.width - horizontalInset * 2, 1), height: 20)
+        let titleMaxX = logSelectorFrame.isNull || logSelectorFrame.isEmpty ? logHeaderLayer.bounds.width - horizontalInset : logSelectorFrame.minX - 8
+        title.frame = CGRect(x: horizontalInset,
+                             y: 34,
+                             width: max(titleMaxX - horizontalInset, 1),
+                             height: 20)
         logHeaderLayer.addSublayer(title)
 
+        let detailText = logHeaderDetailText()
+        if renderedLogHeaderDetailText != detailText {
+            renderedLogHeaderDetailText = detailText
+            if logHeaderDetailSelectionRange != nil {
+                logHeaderDetailSelectionRange = nil
+                updateEditingAndPasteboardState()
+            }
+        }
+
+        logHeaderDetailFrame = CGRect(x: horizontalInset,
+                                      y: 14,
+                                      width: max(logHeaderLayer.bounds.width - horizontalInset * 2, 1),
+                                      height: 16)
+        renderLogHeaderDetailSelection()
+
         let detail = makeTextLayer(size: 11, weight: .regular, color: logHeaderDetailColor())
-        detail.string = logHeaderDetailText()
-        detail.frame = CGRect(x: horizontalInset, y: 14, width: max(logHeaderLayer.bounds.width - horizontalInset * 2, 1), height: 16)
+        detail.string = detailText
+        detail.frame = logHeaderDetailFrame
         logHeaderLayer.addSublayer(detail)
+    }
+
+    private func renderLogHeaderDetailSelection() {
+        guard let selectionRange = normalizedLogHeaderDetailSelectionRange(logHeaderDetailSelectionRange) else {
+            return
+        }
+
+        let line = logHeaderDetailLine()
+        var startSecondaryOffset: CGFloat = 0
+        var endSecondaryOffset: CGFloat = 0
+        let startX = CGFloat(CTLineGetOffsetForStringIndex(line, selectionRange.location, &startSecondaryOffset))
+        let endX = CGFloat(CTLineGetOffsetForStringIndex(line, selectionRange.location + selectionRange.length, &endSecondaryOffset))
+        let minX = min(startX, endX)
+        let maxX = max(startX, endX)
+        let x = max(minX, 0)
+        let width = max(min(maxX, logHeaderDetailFrame.width) - x, 1)
+
+        let selection = CALayer()
+        selection.frame = CGRect(x: logHeaderDetailFrame.minX + x,
+                                 y: logHeaderDetailFrame.minY,
+                                 width: width,
+                                 height: logHeaderDetailFrame.height)
+        selection.backgroundColor = resolvedCGColor(windowIsActive ? NSColor.selectedTextBackgroundColor : NSColor.unemphasizedSelectedTextBackgroundColor)
+        selection.cornerRadius = 2
+        logHeaderLayer.addSublayer(selection)
     }
 
     private func renderLogRows() {
@@ -2772,7 +2855,12 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         logTextContainer.size = CGSize(width: textWidth, height: max(logTextContainer.size.height, logRowsClipLayer.bounds.height))
         updateLogTextContentIfNeeded(text: currentLogText())
         logTextContainer.size = CGSize(width: textWidth, height: max(estimatedLogContentHeight(textWidth: textWidth) - logTextInsetY * 2, logRowsClipLayer.bounds.height))
-        logScroll = clampedLogScroll(logScroll)
+        if shouldScrollLogToBottomOnNextLayout && (logSnapshot != nil || !logError.isEmpty) {
+            logScroll = clampedLogScroll(.greatestFiniteMagnitude)
+            shouldScrollLogToBottomOnNextLayout = false
+        } else {
+            logScroll = clampedLogScroll(logScroll)
+        }
         updateLogTextViewport()
         updateLogTextSelectionLayers()
     }
@@ -2903,6 +2991,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         logRenderedText = displayText
         logTextContentGeneration += 1
         logEstimatedContentHeightCache = nil
+        logVisualLineCache = nil
         logAttributedText = makeLogAttributedText(displayText)
         logContentStorage.attributedString = logAttributedText
         clearLogTextFragmentLayers()
@@ -2941,10 +3030,42 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                   ])
     }
 
+    private func normalizedLogSelectionRange(_ range: NSRange?) -> NSRange? {
+        guard let range else { return nil }
+        let lower = max(min(range.location, logAttributedText.length), 0)
+        let upper = max(min(range.location + range.length, logAttributedText.length), lower)
+        guard upper > lower else { return nil }
+        return NSRange(location: lower, length: upper - lower)
+    }
+
+    private func setLogTextSelectionRange(_ range: NSRange?, notify: Bool = true) {
+        _ = notify
+        let nextRange = normalizedLogSelectionRange(range)
+        if nextRange == logTextSelectionRange {
+            return
+        }
+        if nextRange != nil, logHeaderDetailSelectionRange != nil {
+            logHeaderDetailSelectionRange = nil
+            renderLogHeader()
+        }
+        logTextLayoutManager.textSelections = []
+        logTextSelectionRange = nextRange
+        updateLogTextSelectionLayers()
+        updateEditingAndPasteboardState()
+    }
+
     private func setLogTextSelection(_ selection: NSTextSelection?, notify: Bool = true) {
         _ = notify
+        let nextRange = normalizedLogSelectionRange(logTextRangeOffsets(for: selection))
+        if nextRange == logTextSelectionRange {
+            return
+        }
+        if nextRange != nil, logHeaderDetailSelectionRange != nil {
+            logHeaderDetailSelectionRange = nil
+            renderLogHeader()
+        }
         logTextLayoutManager.textSelections = selection.map { [$0] } ?? []
-        logTextSelectionRange = logTextRangeOffsets(for: selection)
+        logTextSelectionRange = nextRange
         updateLogTextSelectionLayers()
         updateEditingAndPasteboardState()
     }
@@ -2957,8 +3078,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
     private func updateLogTextSelectionLayersWithoutAnimations(force: Bool) {
         guard let selectionRange = logTextSelectionRange,
-              selectionRange.length > 0,
-              let textRange = logTextRange(for: selectionRange) else {
+              selectionRange.length > 0 else {
             if !logTextSelectionLayers.isEmpty {
                 for layer in logTextSelectionLayers {
                     layer.removeFromSuperlayer()
@@ -2990,29 +3110,113 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         let selectionColor = resolvedCGColor(windowIsActive ? NSColor.selectedTextBackgroundColor.withAlphaComponent(0.78) : NSColor.unemphasizedSelectedTextBackgroundColor.withAlphaComponent(0.78))
         let selectionRect = expandedLogTextContentRect(containing: visibleTextRect,
                                                        contentHeight: contentHeight)
-        logTextLayoutManager.enumerateTextSegments(in: textRange,
-                                                   type: .selection,
-                                                   options: []) { _, rect, _, _ in
-            guard rect.intersects(selectionRect) else {
-                return true
-            }
+        let metrics = logVisualLineMetrics(textWidth: textWidth)
+        guard !metrics.lines.isEmpty else {
+            return
+        }
 
-            let highlight = CALayer()
-            highlight.frame = CGRect(x: rect.minX,
-                                     y: logTextSelectionLayer.bounds.height - rect.maxY,
-                                     width: rect.width,
-                                     height: rect.height)
-            highlight.backgroundColor = selectionColor
-            highlight.cornerRadius = 2
-            self.logTextSelectionLayer.addSublayer(highlight)
-            self.logTextSelectionLayers.append(highlight)
-            return true
+        let firstLine = max(Int(floor(max(selectionRect.minY, 0) / metrics.lineHeight)), 0)
+        let lastLine = min(Int(floor(max(selectionRect.maxY - 0.001, 0) / metrics.lineHeight)), metrics.lines.count - 1)
+        if firstLine <= lastLine {
+            for lineIndex in firstLine...lastLine {
+                let line = metrics.lines[lineIndex]
+                let intersection = NSIntersectionRange(selectionRange, line.range)
+                let selectsEmptyLine = line.range.length == 0 &&
+                                       selectionRange.location <= line.range.location &&
+                                       selectionRange.location + selectionRange.length > line.range.location
+                guard intersection.length > 0 || selectsEmptyLine else {
+                    continue
+                }
+
+                let startColumn: Int
+                let selectedColumnCount: Int
+                if selectsEmptyLine {
+                    startColumn = 0
+                    selectedColumnCount = 1
+                } else {
+                    startColumn = max(intersection.location - line.range.location, 0)
+                    selectedColumnCount = max(intersection.length, 1)
+                }
+
+                let x = min(CGFloat(startColumn) * metrics.charWidth, textWidth)
+                let width = max(min(CGFloat(selectedColumnCount) * metrics.charWidth, textWidth - x), 1)
+                let topDownY = CGFloat(lineIndex) * metrics.lineHeight
+                let rect = CGRect(x: x,
+                                  y: topDownY,
+                                  width: width,
+                                  height: metrics.lineHeight)
+                guard rect.intersects(selectionRect) else {
+                    continue
+                }
+
+                let highlight = CALayer()
+                highlight.frame = CGRect(x: rect.minX,
+                                         y: logTextSelectionLayer.bounds.height - rect.maxY,
+                                         width: rect.width,
+                                         height: rect.height)
+                highlight.backgroundColor = selectionColor
+                highlight.cornerRadius = 2
+                self.logTextSelectionLayer.addSublayer(highlight)
+                self.logTextSelectionLayers.append(highlight)
+            }
         }
         logTextSelectionCoverage = (generation: logTextContentGeneration,
                                     textWidth: textWidth,
                                     contentHeight: contentHeight,
                                     range: selectionRange,
                                     rect: selectionRect)
+    }
+
+    private func logHeaderDetailFont() -> NSFont {
+        NSFont.systemFont(ofSize: 11, weight: .regular)
+    }
+
+    private func logHeaderDetailAttributedString() -> NSAttributedString {
+        NSAttributedString(string: renderedLogHeaderDetailText,
+                           attributes: [
+                               .font: logHeaderDetailFont(),
+                               .foregroundColor: logHeaderDetailColor()
+                           ])
+    }
+
+    private func logHeaderDetailLine() -> CTLine {
+        CTLineCreateWithAttributedString(logHeaderDetailAttributedString())
+    }
+
+    private func normalizedLogHeaderDetailSelectionRange(_ range: NSRange?) -> NSRange? {
+        guard let range else { return nil }
+        let length = (renderedLogHeaderDetailText as NSString).length
+        let lower = max(min(range.location, length), 0)
+        let upper = max(min(range.location + range.length, length), lower)
+        guard upper > lower else { return nil }
+        return NSRange(location: lower, length: upper - lower)
+    }
+
+    private func setLogHeaderDetailSelectionRange(_ range: NSRange?) {
+        let nextRange = normalizedLogHeaderDetailSelectionRange(range)
+        if nextRange == logHeaderDetailSelectionRange {
+            return
+        }
+        logHeaderDetailSelectionRange = nextRange
+        if nextRange != nil {
+            setLogTextSelectionRange(nil, notify: false)
+        }
+        renderLogHeader()
+        updateEditingAndPasteboardState()
+    }
+
+    private func selectedLogHeaderDetailAttributedText() -> NSAttributedString? {
+        guard let selectionRange = normalizedLogHeaderDetailSelectionRange(logHeaderDetailSelectionRange) else {
+            return nil
+        }
+        return logHeaderDetailAttributedString().attributedSubstring(from: selectionRange)
+    }
+
+    private func clearLogHeaderDetailSelection() {
+        guard logHeaderDetailSelectionRange != nil else { return }
+        logHeaderDetailSelectionRange = nil
+        renderLogHeader()
+        updateEditingAndPasteboardState()
     }
 
     private func selectedLogAttributedText() -> NSAttributedString? {
@@ -3397,9 +3601,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         }.resume()
     }
 
-    private func fetchSelectedLog(quiet: Bool = false) {
+    private func fetchSelectedLog(quiet: Bool = false, scrollToBottom: Bool = false) {
         guard let selection = selectedLog, let logsEndpoint, let urlSession else { return }
         if isLoadingLog { return }
+        let shouldFollowLogTail = quiet && isLogScrolledNearBottom()
         isLoadingLog = true
         if !quiet {
             logError = ""
@@ -3422,6 +3627,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         urlSession.dataTask(with: url) { [weak self] data, _, error in
             Task { @MainActor in
                 guard let self else { return }
+                guard self.selectedLog == selection else { return }
                 self.isLoadingLog = false
                 if let error {
                     self.logError = error.localizedDescription
@@ -3437,6 +3643,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                     let snapshot = try LogResponse.decodeBinary(data)
                     self.logSnapshot = snapshot
                     self.logError = snapshot.error
+                    if scrollToBottom || shouldFollowLogTail {
+                        self.shouldScrollLogToBottomOnNextLayout = true
+                    }
                     self.clampScrollOffsets()
                     self.updateLayout()
                 } catch {
@@ -4143,7 +4352,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             return
         }
 
-        outerframeHost.setEditingCapabilities(canCopy: (logTextSelectionRange?.length ?? 0) > 0,
+        outerframeHost.setEditingCapabilities(canCopy: (logHeaderDetailSelectionRange?.length ?? 0) > 0 ||
+                                              (logTextSelectionRange?.length ?? 0) > 0,
                                               canCut: false)
         outerframeHost.setAcceptedPasteboardPasteTypes([])
     }
@@ -4314,11 +4524,20 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             ]
         }
 
+        if let selectedText = selectedLogHeaderDetailAttributedText(),
+           selectedText.length > 0 {
+            return pasteboardItems(for: selectedText)
+        }
+
         guard let selectedText = selectedLogAttributedText(),
               selectedText.length > 0 else {
             return []
         }
 
+        return pasteboardItems(for: selectedText)
+    }
+
+    private func pasteboardItems(for selectedText: NSAttributedString) -> [OuterframeContentPasteboardItem] {
         var representations = [
             OuterframeContentPasteboardRepresentation(typeIdentifier: NSPasteboard.PasteboardType.string.rawValue,
                                                       data: Data(selectedText.string.utf8))
@@ -4440,32 +4659,163 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     @discardableResult
+    private func handleLogHeaderMouseDown(at point: CGPoint,
+                                          modifierFlags: NSEvent.ModifierFlags,
+                                          clickCount: Int) -> Bool {
+        _ = modifierFlags
+        if isPointInLogSelector(point) {
+            blurCreateField()
+            blurPasswordField()
+            showLogSelectorMenu(at: point)
+            return true
+        }
+        guard isPointInLogHeaderDetail(point) else { return false }
+        blurCreateField()
+        blurPasswordField()
+
+        let offset = logHeaderDetailCharacterIndex(atRootPoint: point)
+        logHeaderDetailDragAnchorOffset = offset
+        if clickCount >= 3 {
+            setLogHeaderDetailSelectionRange(NSRange(location: 0, length: (renderedLogHeaderDetailText as NSString).length))
+        } else if clickCount == 2 {
+            setLogHeaderDetailSelectionRange(logHeaderDetailWordRange(containing: offset))
+        } else {
+            setLogHeaderDetailSelectionRange(nil)
+        }
+        return true
+    }
+
+    @discardableResult
+    private func handleLogHeaderRightMouseDown(at point: CGPoint) -> Bool {
+        if isPointInLogSelector(point) {
+            blurCreateField()
+            blurPasswordField()
+            showLogSelectorMenu(at: point)
+            return true
+        }
+        guard isPointInLogHeaderDetail(point) else { return false }
+        blurCreateField()
+        blurPasswordField()
+
+        let offset = logHeaderDetailCharacterIndex(atRootPoint: point)
+        if let selectionRange = normalizedLogHeaderDetailSelectionRange(logHeaderDetailSelectionRange),
+           offset >= selectionRange.location,
+           offset <= selectionRange.location + selectionRange.length,
+           let selectedText = selectedLogHeaderDetailAttributedText() {
+            outerframeHost.showContextMenu(for: selectedText, at: point)
+            return true
+        }
+
+        let fullRange = NSRange(location: 0, length: (renderedLogHeaderDetailText as NSString).length)
+        setLogHeaderDetailSelectionRange(fullRange)
+        outerframeHost.showContextMenu(for: selectedLogHeaderDetailAttributedText() ?? logHeaderDetailAttributedString(), at: point)
+        return true
+    }
+
+    private func handleLogHeaderMouseDragged(to point: CGPoint) -> Bool {
+        guard let logHeaderDetailDragAnchorOffset else { return false }
+        let offset = logHeaderDetailCharacterIndex(atRootPoint: point)
+        let location = min(logHeaderDetailDragAnchorOffset, offset)
+        let length = abs(offset - logHeaderDetailDragAnchorOffset)
+        setLogHeaderDetailSelectionRange(NSRange(location: location, length: length))
+        return true
+    }
+
+    private func logHeaderDetailPoint(fromRootPoint point: CGPoint) -> CGPoint {
+        let contentPoint = contentLayer.convert(point, from: rootLayer)
+        return logHeaderLayer.convert(contentPoint, from: contentLayer)
+    }
+
+    private func isPointInLogHeaderDetail(_ point: CGPoint) -> Bool {
+        guard mode == .backends,
+              selectedServiceID != nil,
+              !logHeaderLayer.isHidden else { return false }
+        let localPoint = logHeaderDetailPoint(fromRootPoint: point)
+        return logHeaderDetailFrame.insetBy(dx: 0, dy: -3).contains(localPoint)
+    }
+
+    private func isPointInLogSelector(_ point: CGPoint) -> Bool {
+        guard mode == .backends,
+              selectedServiceID != nil,
+              !logHeaderLayer.isHidden,
+              !logSelectorFrame.isEmpty else { return false }
+        let localPoint = logHeaderDetailPoint(fromRootPoint: point)
+        return logSelectorFrame.insetBy(dx: -2, dy: -2).contains(localPoint)
+    }
+
+    private func logHeaderDetailCharacterIndex(atRootPoint point: CGPoint) -> Int {
+        let length = (renderedLogHeaderDetailText as NSString).length
+        guard length > 0 else { return 0 }
+
+        let localPoint = logHeaderDetailPoint(fromRootPoint: point)
+        let x = max(localPoint.x - logHeaderDetailFrame.minX, 0)
+        if x <= 0 {
+            return 0
+        }
+
+        let line = logHeaderDetailLine()
+        let index = CTLineGetStringIndexForPosition(line, CGPoint(x: x, y: 0))
+        if index == kCFNotFound {
+            return length
+        }
+        return min(max(index, 0), length)
+    }
+
+    private func logHeaderDetailWordRange(containing offset: Int) -> NSRange? {
+        let string = renderedLogHeaderDetailText as NSString
+        let length = string.length
+        guard length > 0 else { return nil }
+
+        var location = min(max(offset, 0), length - 1)
+        if location > 0, !logHeaderDetailCharacterIsWordLike(string.character(at: location)) {
+            location -= 1
+        }
+        guard logHeaderDetailCharacterIsWordLike(string.character(at: location)) else {
+            return NSRange(location: min(max(offset, 0), length), length: 0)
+        }
+
+        var start = location
+        while start > 0, logHeaderDetailCharacterIsWordLike(string.character(at: start - 1)) {
+            start -= 1
+        }
+
+        var end = location + 1
+        while end < length, logHeaderDetailCharacterIsWordLike(string.character(at: end)) {
+            end += 1
+        }
+        return NSRange(location: start, length: end - start)
+    }
+
+    private func logHeaderDetailCharacterIsWordLike(_ character: unichar) -> Bool {
+        if character >= 48 && character <= 57 { return true }
+        if character >= 65 && character <= 90 { return true }
+        if character >= 97 && character <= 122 { return true }
+        return character == 45 || character == 46 || character == 47 || character == 95 || character == 126
+    }
+
+    @discardableResult
     private func handleLogMouseDown(at point: CGPoint,
                                     modifierFlags: NSEvent.ModifierFlags,
                                     clickCount: Int) -> Bool {
         guard isPointInLogTextRegion(point) else { return false }
         blurCreateField()
         blurPasswordField()
+        clearLogHeaderDetailSelection()
 
         let textPoint = logTextContainerPoint(fromRootPoint: point)
-        let selections = logTextLayoutManager.textSelectionNavigation.textSelections(interactingAt: textPoint,
-                                                                                     inContainerAt: logTextLayoutManager.documentRange.location,
-                                                                                     anchors: [],
-                                                                                     modifiers: [],
-                                                                                     selecting: false,
-                                                                                     bounds: logTextInteractionBounds())
-        logDragAnchorSelections = selections
+        let anchorOffset = logTextOffset(atTextPoint: textPoint)
+        logDragAnchorOffset = anchorOffset
+        lastLogDragTextPoint = nil
 
         if clickCount >= 3 {
             let fragmentSelection = logTextLayoutFragmentSelection(at: textPoint)
-            logDragAnchorSelections = fragmentSelection.map { [$0] } ?? []
             setLogTextSelection(fragmentSelection)
-        } else if clickCount == 2, let selection = selections.first {
+        } else if clickCount == 2, let selection = logTextSelection(at: point) {
             let wordSelection = logTextLayoutManager.textSelectionNavigation.textSelection(for: .word,
                                                                                           enclosing: selection)
             setLogTextSelection(wordSelection)
         } else if !modifierFlags.contains(.shift) {
-            setLogTextSelection(nil)
+            setLogTextSelectionRange(nil)
         }
         return true
     }
@@ -4496,15 +4846,18 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func handleLogMouseDragged(to point: CGPoint) -> Bool {
-        guard !logDragAnchorSelections.isEmpty else { return false }
+        guard let logDragAnchorOffset else { return false }
         let textPoint = logTextContainerPoint(fromRootPoint: point)
-        let selections = logTextLayoutManager.textSelectionNavigation.textSelections(interactingAt: textPoint,
-                                                                                     inContainerAt: logTextLayoutManager.documentRange.location,
-                                                                                     anchors: logDragAnchorSelections,
-                                                                                     modifiers: [.extend],
-                                                                                     selecting: true,
-                                                                                     bounds: logTextInteractionBounds())
-        setLogTextSelection(selections.first)
+        if let lastLogDragTextPoint,
+           abs(lastLogDragTextPoint.x - textPoint.x) < 0.5,
+           abs(lastLogDragTextPoint.y - textPoint.y) < 0.5 {
+            return true
+        }
+        lastLogDragTextPoint = textPoint
+        let offset = logTextOffset(atTextPoint: textPoint)
+        let location = min(logDragAnchorOffset, offset)
+        let length = abs(offset - logDragAnchorOffset)
+        setLogTextSelectionRange(NSRange(location: location, length: length))
         return true
     }
 
@@ -4542,13 +4895,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func logTextLocationOffset(at point: CGPoint) -> Int? {
-        guard let selection = logTextSelection(at: point),
-              let range = selection.textRanges.first else {
-            return nil
-        }
-        let offset = logContentStorage.offset(from: logTextLayoutManager.documentRange.location,
-                                              to: range.location)
-        return offset == NSNotFound ? nil : offset
+        guard isPointInLogTextRegion(point) else { return nil }
+        return logTextOffset(atTextPoint: logTextContainerPoint(fromRootPoint: point))
     }
 
     private func isPointInLogTextRegion(_ point: CGPoint) -> Bool {
@@ -4564,17 +4912,11 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private func isPointOverLogText(_ point: CGPoint) -> Bool {
         guard isPointInLogTextRegion(point) else { return false }
         let textPoint = logTextContainerPoint(fromRootPoint: point)
-        var found = false
-        logTextLayoutManager.enumerateTextSegments(in: logTextLayoutManager.documentRange,
-                                                   type: .standard,
-                                                   options: []) { _, rect, _, _ in
-            if rect.insetBy(dx: -1, dy: -2).contains(textPoint) {
-                found = true
-                return false
-            }
-            return rect.minY <= textPoint.y
-        }
-        return found
+        let textWidth = max(logRowsClipLayer.bounds.width - logTextInsetX * 2, 1)
+        return textPoint.x >= -1 &&
+               textPoint.x <= textWidth + 1 &&
+               textPoint.y >= -2 &&
+               textPoint.y <= logScroll + logRowsClipLayer.bounds.height + 2
     }
 
     private func logTextContainerPoint(fromRootPoint point: CGPoint) -> CGPoint {
@@ -4610,6 +4952,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         if logScrollbarController?.handleMouseDragged(to: rootLayer.convert(point, to: logRowsClipLayer)) == true {
             return
         }
+        if handleLogHeaderMouseDragged(to: point) {
+            return
+        }
         if handleLogMouseDragged(to: point) {
             return
         }
@@ -4636,7 +4981,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func handleMouseUp(at point: CGPoint, modifierFlags: NSEvent.ModifierFlags) {
-        logDragAnchorSelections = []
+        logDragAnchorOffset = nil
+        logHeaderDetailDragAnchorOffset = nil
+        lastLogDragTextPoint = nil
         _ = logScrollbarController?.handleMouseUp(at: rootLayer.convert(point, to: logRowsClipLayer))
         if let pendingAppDrag {
             self.pendingAppDrag = nil
@@ -4699,6 +5046,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         }
         if isOverCreateField || isOverPasswordField {
             setCursorIfNeeded(.iBeam)
+        } else if isPointInLogSelector(point) {
+            setCursorIfNeeded(.pointingHand)
+        } else if isPointInLogHeaderDetail(point) {
+            setCursorIfNeeded(.iBeam)
         } else if isPointOverLogText(point) {
             setCursorIfNeeded(.iBeam)
         } else if isOverBundledApp || isOverDirectorySelect || isOverAppTile {
@@ -4719,6 +5070,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                       clickCount: Int) {
         _ = modifierFlags
         _ = clickCount
+        if handleLogHeaderRightMouseDown(at: point) {
+            return
+        }
         if handleLogRightMouseDown(at: point) {
             return
         }
@@ -4772,6 +5126,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             let contentPoint = contentLayer.convert(point, from: rootLayer)
             if selectedServiceID != nil && logRowsClipLayer.frame.contains(contentPoint) {
                 logScrollbarController?.cancelAnimation()
+                shouldScrollLogToBottomOnNextLayout = false
                 logScroll -= delta.y * (precise ? 1 : logScrollLineHeight)
                 logScroll = clampedLogScroll(logScroll)
                 updateLogTextViewport()
@@ -4870,6 +5225,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 return
             }
         } else if mode == .backends {
+            if handleLogHeaderMouseDown(at: point, modifierFlags: modifierFlags, clickCount: clickCount) {
+                return
+            }
             if handleLogMouseDown(at: point, modifierFlags: modifierFlags, clickCount: clickCount) {
                 return
             }
@@ -4899,7 +5257,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                     logSnapshot = nil
                     logScroll = 0
                     setLogTextSelection(nil)
-                    fetchSelectedLog()
+                    fetchSelectedLog(scrollToBottom: true)
                     restartEventWatch(resetVersions: true)
                     updateLayout()
                 }
@@ -5186,7 +5544,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         logSnapshot = nil
         logScroll = 0
         setLogTextSelection(nil)
-        fetchSelectedLog()
+        fetchSelectedLog(scrollToBottom: true)
         restartEventWatch(resetVersions: true)
         updateLayout()
     }
@@ -5207,6 +5565,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         } else {
             selectedLog = nil
             logSnapshot = nil
+            shouldScrollLogToBottomOnNextLayout = false
         }
     }
 
@@ -5216,6 +5575,11 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         logSnapshot = nil
         logError = ""
         logScroll = 0
+        logDragAnchorOffset = nil
+        logHeaderDetailDragAnchorOffset = nil
+        logHeaderDetailSelectionRange = nil
+        lastLogDragTextPoint = nil
+        shouldScrollLogToBottomOnNextLayout = false
         setLogTextSelection(nil)
     }
 
@@ -5309,6 +5673,47 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         return backends.first { $0.serviceID == selectedServiceID }
     }
 
+    private func currentLogFile(for backend: BackendRecord) -> LogFileRecord? {
+        guard let selectedLog,
+              selectedLog.serviceID == backend.serviceID,
+              backend.logFiles.indices.contains(selectedLog.logIndex) else {
+            return backend.logFiles.first
+        }
+        return backend.logFiles[selectedLog.logIndex]
+    }
+
+    private func logSelectorTitle(for logFile: LogFileRecord?, index: Int) -> String {
+        guard let logFile else { return "Log" }
+        let name = logFile.displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+        return name.isEmpty ? "Log \(index + 1)" : name
+    }
+
+    private func logMenuTitle(for logFile: LogFileRecord, index: Int, in logFiles: [LogFileRecord]) -> String {
+        let baseTitle = logSelectorTitle(for: logFile, index: index)
+        let duplicateCount = logFiles.filter { $0.displayName == logFile.displayName }.count
+        guard duplicateCount > 1 else { return baseTitle }
+        return "\(baseTitle) - \(logFile.path)"
+    }
+
+    private func selectLog(serviceID: String, logIndex: Int) {
+        guard let backend = backends.first(where: { $0.serviceID == serviceID }),
+              backend.logFiles.indices.contains(logIndex) else { return }
+        let nextSelection = LogSelection(serviceID: serviceID, logIndex: logIndex)
+        guard selectedLog != nextSelection else { return }
+        selectedServiceID = serviceID
+        selectedLog = nextSelection
+        logSnapshot = nil
+        logError = ""
+        logScroll = 0
+        logHeaderDetailSelectionRange = nil
+        logHeaderDetailDragAnchorOffset = nil
+        isLoadingLog = false
+        setLogTextSelection(nil)
+        fetchSelectedLog(scrollToBottom: true)
+        restartEventWatch(resetVersions: true)
+        updateLayout()
+    }
+
     private func bundledPlaceholderBackends() -> [BackendRecord] {
         backends
             .filter { $0.isBundledPlaceholder }
@@ -5392,7 +5797,13 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         return min(max(value, 0), maxScroll)
     }
 
+    private func isLogScrolledNearBottom(tolerance: CGFloat = 2) -> Bool {
+        let maxScroll = max(logContentHeight() - logRowsClipLayer.bounds.height, 0)
+        return maxScroll - logScroll <= tolerance
+    }
+
     func scrollbarDidChangeScrollOffset(_ offset: CGFloat) {
+        shouldScrollLogToBottomOnNextLayout = false
         logScroll = clampedLogScroll(offset)
         updateLogTextViewport()
         updateLogTextSelectionLayers()
@@ -5434,6 +5845,81 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
     private func logTextFont() -> NSFont {
         NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+    }
+
+    private func logVisualLineMetrics(textWidth: CGFloat? = nil) -> LogVisualLineMetrics {
+        let resolvedTextWidth = max(textWidth ?? (logRowsClipLayer.bounds.width - logTextInsetX * 2), 1)
+        if let cache = logVisualLineCache,
+           cache.generation == logTextContentGeneration,
+           abs(cache.textWidth - resolvedTextWidth) <= 0.5 {
+            return cache.metrics
+        }
+
+        let font = logTextFont()
+        let charWidth = max(("0" as NSString).size(withAttributes: [.font: font]).width, 1)
+        let lineHeight = ceil(font.ascender - font.descender + font.leading + 2)
+        let charactersPerLine = max(Int(floor(resolvedTextWidth / charWidth)), 1)
+        let nsString = logRenderedText as NSString
+        let length = nsString.length
+        var lines: [LogVisualLine] = []
+        var lineStart = 0
+
+        while lineStart < length {
+            let lineRange = nsString.lineRange(for: NSRange(location: lineStart, length: 0))
+            var contentLength = lineRange.length
+            while contentLength > 0 {
+                let character = nsString.character(at: lineRange.location + contentLength - 1)
+                if character == 10 || character == 13 {
+                    contentLength -= 1
+                } else {
+                    break
+                }
+            }
+
+            let visualLineCount = max(Int(ceil(Double(contentLength) / Double(charactersPerLine))), 1)
+            for visualLineIndex in 0..<visualLineCount {
+                let offset = visualLineIndex * charactersPerLine
+                let location = min(lineRange.location + offset, length)
+                let remaining = max(contentLength - offset, 0)
+                let visualLength = min(remaining, charactersPerLine)
+                lines.append(LogVisualLine(range: NSRange(location: location, length: visualLength)))
+            }
+
+            let nextLineStart = NSMaxRange(lineRange)
+            if nextLineStart <= lineStart {
+                break
+            }
+            lineStart = nextLineStart
+        }
+
+        if length == 0 {
+            lines.append(LogVisualLine(range: NSRange(location: 0, length: 0)))
+        } else {
+            let lastCharacter = nsString.character(at: length - 1)
+            if lastCharacter == 10 || lastCharacter == 13 {
+                lines.append(LogVisualLine(range: NSRange(location: length, length: 0)))
+            }
+        }
+
+        let metrics = LogVisualLineMetrics(textWidth: resolvedTextWidth,
+                                           charWidth: charWidth,
+                                           lineHeight: lineHeight,
+                                           charactersPerLine: charactersPerLine,
+                                           lines: lines)
+        logVisualLineCache = (generation: logTextContentGeneration,
+                              textWidth: resolvedTextWidth,
+                              metrics: metrics)
+        return metrics
+    }
+
+    private func logTextOffset(atTextPoint textPoint: CGPoint) -> Int {
+        let metrics = logVisualLineMetrics()
+        guard !metrics.lines.isEmpty else { return 0 }
+
+        let lineIndex = min(max(Int(floor(max(textPoint.y, 0) / metrics.lineHeight)), 0), metrics.lines.count - 1)
+        let line = metrics.lines[lineIndex]
+        let column = min(max(Int(floor(max(textPoint.x, 0) / metrics.charWidth)), 0), line.range.length)
+        return min(line.range.location + column, logAttributedText.length)
     }
 
     private func clampAppsScrollUsingRenderedContent() -> Bool {
@@ -5656,7 +6142,32 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                        at: point)
     }
 
+    private func showLogSelectorMenu(at point: CGPoint) {
+        guard let backend = selectedBackend(),
+              backend.logFiles.count > 1 else { return }
+        let menuID = UUID()
+        var logIndexByItemID: [String: Int] = [:]
+        let items = backend.logFiles.enumerated().map { index, logFile in
+            let itemID = "log-\(index)"
+            logIndexByItemID[itemID] = index
+            let title = index == selectedLog?.logIndex
+                ? "Current: \(logMenuTitle(for: logFile, index: index, in: backend.logFiles))"
+                : logMenuTitle(for: logFile, index: index, in: backend.logFiles)
+            return OuterframeContextMenuItem(id: itemID, title: title, isEnabled: true)
+        }
+        pendingLogMenuSelections[menuID] = (backend.serviceID, logIndexByItemID)
+        outerframeHost.showContextMenu(menuID: menuID,
+                                       items: items,
+                                       at: point)
+    }
+
     private func handleContextMenuSelection(menuID: UUID, itemID: String) {
+        if let menuSelection = pendingLogMenuSelections.removeValue(forKey: menuID),
+           let logIndex = menuSelection.logIndexByItemID[itemID] {
+            selectLog(serviceID: menuSelection.serviceID, logIndex: logIndex)
+            return
+        }
+
         guard let menuAction = pendingMenuActions.removeValue(forKey: menuID),
               let operation = menuAction.operationByItemID[itemID],
               let backend = backends.first(where: { $0.serviceID == menuAction.serviceID }) else {

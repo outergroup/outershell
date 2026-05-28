@@ -26,8 +26,8 @@ require_file() {
     fi
 }
 
-require_file "${PACKAGE_ROOT}/RemoteLinuxBinaries/aarch64/OuterShellBackend"
-require_file "${PACKAGE_ROOT}/RemoteLinuxBinaries/x86_64/OuterShellBackend"
+require_file "${PACKAGE_ROOT}/RemoteLinuxBinaries/aarch64/outershelld"
+require_file "${PACKAGE_ROOT}/RemoteLinuxBinaries/x86_64/outershelld"
 require_file "${PACKAGE_ROOT}/RemoteLinuxBinaries/aarch64/outerctl"
 require_file "${PACKAGE_ROOT}/RemoteLinuxBinaries/x86_64/outerctl"
 require_file "${RUN_ROOT}/bundles/BackendsContent.bundle.macos-arm.aar"
@@ -51,7 +51,8 @@ stage_home_screen() {
     local arch="$1"
     local root="${STAGING_ROOT}/outer-shell-${arch}/OuterShell"
     mkdir -p "${root}/bin" "${root}/bundles"
-    install -m 0755 "${PACKAGE_ROOT}/RemoteLinuxBinaries/${arch}/OuterShellBackend" "${root}/OuterShellBackend"
+    install -m 0755 "${PACKAGE_ROOT}/RemoteLinuxBinaries/${arch}/outershelld" "${root}/outershelld"
+    ln -s outershelld "${root}/OuterShellBackend"
     install -m 0755 "${PACKAGE_ROOT}/RemoteLinuxBinaries/${arch}/outerctl" "${root}/bin/outerctl"
     install -m 0644 "${REPO_ROOT}/app-icon.png" "${root}/app-icon.png"
     install -m 0644 "${RUN_ROOT}/bundles/BackendsContent.bundle.macos-arm.aar" "${root}/bundles/BackendsContent.bundle.macos-arm.aar"
@@ -269,16 +270,16 @@ if [ "$os_name" = "Darwin" ]; then
 </plist>
 EOF
 
+    printf '[%s] %s Outer Shell package %s from %s.\n' "$(timestamp)" "$command" "__OUTER_SHELL_VERSION__" "$public_base_url" >> "$log_path"
+
+    cleanup_legacy_home_screen
+    bootstrap_outer_shell
     OUTERWEBAPPS_HOME="$outerwebapps_home" "$outerctl_path" backend upsert --backend "$service_id" --name "$display_name" --icon-path "$install_root/app-icon.png"
     OUTERWEBAPPS_HOME="$outerwebapps_home" "$outerctl_path" launchd set --backend "$service_id" --plist "$plist_path" --owns-plist true
     OUTERWEBAPPS_HOME="$outerwebapps_home" "$outerctl_path" app clear --backend "$service_id"
     OUTERWEBAPPS_HOME="$outerwebapps_home" "$outerctl_path" app add --backend "$service_id" --socket-path "$socket_path" --name "$display_name" --url "$socket_path" --icon-path "$install_root/app-icon.png"
     OUTERWEBAPPS_HOME="$outerwebapps_home" "$outerctl_path" log clear --backend "$service_id"
     OUTERWEBAPPS_HOME="$outerwebapps_home" "$outerctl_path" log add --backend "$service_id" --path "$log_path"
-    printf '[%s] %s Outer Shell package %s from %s.\n' "$(timestamp)" "$command" "__OUTER_SHELL_VERSION__" "$public_base_url" >> "$log_path"
-
-    cleanup_legacy_home_screen
-    bootstrap_outer_shell
     if [ "$command" = "update" ]; then
         printf 'Outer Shell updated to %s. The new version will run the next time Outer Shell starts.\n' "__OUTER_SHELL_VERSION__"
         exit 0
@@ -306,7 +307,7 @@ outerctl_path="$outerwebapps_home/bin/outerctl"
 unit_dir="$HOME/.config/systemd/user"
 socket_path="$runtime_dir/org.outershell.OuterShell"
 log_dir="$install_root/logs"
-log_path="$log_dir/OuterShellBackend.log"
+log_path="$log_dir/outershelld.log"
 runner_path="$install_root/run-outer-shell.sh"
 
 cleanup_legacy_home_screen() {
@@ -326,7 +327,7 @@ cleanup_legacy_home_screen() {
 }
 
 if [ "$command" = "uninstall" ]; then
-    systemctl --user disable org.outershell.OuterShell.socket >/dev/null 2>&1 || true
+    systemctl --user disable org.outershell.OuterShell.socket outershelld.socket >/dev/null 2>&1 || true
     if [ -x "$outerctl_path" ]; then
         OUTERWEBAPPS_HOME="$outerwebapps_home" "$outerctl_path" app clear --backend org.outershell.OuterShell >/dev/null 2>&1 || true
         OUTERWEBAPPS_HOME="$outerwebapps_home" "$outerctl_path" log clear --backend org.outershell.OuterShell >/dev/null 2>&1 || true
@@ -337,8 +338,8 @@ if [ "$command" = "uninstall" ]; then
     cat > "$cleanup_script" <<EOF
 #!/bin/sh
 sleep 0.25
-systemctl --user stop org.outershell.OuterShell.socket org.outershell.OuterShell.service >/dev/null 2>&1 || true
-rm -f "$unit_dir/org.outershell.OuterShell.service" "$unit_dir/org.outershell.OuterShell.socket" "$socket_path"
+systemctl --user stop org.outershell.OuterShell.socket outershelld.socket org.outershell.OuterShell.service >/dev/null 2>&1 || true
+rm -f "$unit_dir/org.outershell.OuterShell.service" "$unit_dir/outershelld.socket" "$unit_dir/org.outershell.OuterShell.socket" "$socket_path" "$runtime_dir/outershelld-api"
 systemctl --user daemon-reload >/dev/null 2>&1 || true
 rm -rf "$install_root"
 rm -f "$cleanup_script"
@@ -360,7 +361,8 @@ archive_path="$(mktemp)"
 download "${public_base_url%/}/latest/outer-shell-${arch}.tar.gz?v=__ASSET_VERSION__" "$archive_path"
 tar -xzf "$archive_path" -C "$install_root" --strip-components=1
 rm -f "$archive_path"
-chmod 0755 "$install_root/OuterShellBackend"
+chmod 0755 "$install_root/outershelld"
+ln -sfn outershelld "$install_root/OuterShellBackend"
 chmod 0755 "$install_root/bin/outerctl"
 install -m 0755 "$install_root/bin/outerctl" "$outerctl_path"
 printf '%s\n' "__OUTER_SHELL_VERSION__" > "$install_root/version"
@@ -368,7 +370,7 @@ touch "$log_path"
 
 cat > "$runner_path" <<EOF
 #!/bin/sh
-exec "$install_root/OuterShellBackend" --socket-path "\${1:-$socket_path}" --bundles-dir "$install_root/bundles" --bundled-apps-dir "$install_root/bundled-apps" --app-base-url "$app_base_url" --public-base-url "$public_base_url" >> "$log_path" 2>&1
+exec "$install_root/outershelld" --socket-path "\${1:-$socket_path}" --bundles-dir "$install_root/bundles" --bundled-apps-dir "$install_root/bundled-apps" --app-base-url "$app_base_url" --public-base-url "$public_base_url" >> "$log_path" 2>&1
 EOF
 chmod 0755 "$runner_path"
 
@@ -388,7 +390,23 @@ Description=Outer Group Outer Shell Socket
 
 [Socket]
 ListenStream=%t/org.outershell.OuterShell
+FileDescriptorName=http
 SocketMode=0600
+Service=org.outershell.OuterShell.service
+
+[Install]
+WantedBy=sockets.target
+EOF
+
+cat > "$unit_dir/outershelld.socket" <<EOF
+[Unit]
+Description=Outer Shell API Socket
+
+[Socket]
+ListenStream=%t/outershelld-api
+FileDescriptorName=api
+SocketMode=0600
+Service=org.outershell.OuterShell.service
 
 [Install]
 WantedBy=sockets.target
@@ -396,18 +414,21 @@ EOF
 
 printf '[%s] %s Outer Shell package %s from %s.\n' "$(timestamp)" "$command" "__OUTER_SHELL_VERSION__" "$public_base_url" >> "$log_path"
 
+if [ "$command" = "install" ]; then
+    systemctl --user stop org.outershell.OuterShell.service >/dev/null 2>&1 || true
+fi
+systemctl --user daemon-reload
+systemctl --user enable org.outershell.OuterShell.socket outershelld.socket
+systemctl --user stop org.outershell.OuterShell.service org.outershell.OuterShell.socket outershelld.socket >/dev/null 2>&1 || true
+rm -f "$socket_path" "$runtime_dir/outershelld-api"
+systemctl --user start org.outershell.OuterShell.socket outershelld.socket
+
 OUTERWEBAPPS_HOME="$outerwebapps_home" "$outerctl_path" backend upsert --backend org.outershell.OuterShell --name "Outer Shell" --icon-path "$install_root/app-icon.png"
 OUTERWEBAPPS_HOME="$outerwebapps_home" "$outerctl_path" systemd set --backend org.outershell.OuterShell --unit org.outershell.OuterShell.service
 OUTERWEBAPPS_HOME="$outerwebapps_home" "$outerctl_path" app clear --backend org.outershell.OuterShell
 OUTERWEBAPPS_HOME="$outerwebapps_home" "$outerctl_path" app add --backend org.outershell.OuterShell --socket-path "$socket_path" --name "Outer Shell" --url "$socket_path" --icon-path "$install_root/app-icon.png"
 OUTERWEBAPPS_HOME="$outerwebapps_home" "$outerctl_path" log clear --backend org.outershell.OuterShell
 OUTERWEBAPPS_HOME="$outerwebapps_home" "$outerctl_path" log add --backend org.outershell.OuterShell --path "$log_path"
-
-if [ "$command" = "install" ]; then
-    systemctl --user stop org.outershell.OuterShell.service >/dev/null 2>&1 || true
-fi
-systemctl --user daemon-reload
-systemctl --user enable --now org.outershell.OuterShell.socket
 
 if [ "$command" = "update" ]; then
     printf 'Outer Shell updated to %s. The new version will run the next time Outer Shell starts.\n' "__OUTER_SHELL_VERSION__"

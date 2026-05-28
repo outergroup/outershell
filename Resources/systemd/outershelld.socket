@@ -1,0 +1,11 @@
+[Unit]
+Description=Outer Shell API Socket
+
+[Socket]
+ListenStream=%t/outershelld-api
+FileDescriptorName=api
+SocketMode=0600
+Service=outershelld.service
+
+[Install]
+WantedBy=sockets.target

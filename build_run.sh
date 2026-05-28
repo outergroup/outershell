@@ -47,10 +47,10 @@ echo "==> Building Backends.bundle"
     CODE_SIGNING_REQUIRED=NO \
     build
 
-echo "==> Building OuterShellBackend"
+echo "==> Building outershelld"
 /usr/bin/xcodebuild \
     -project "${SCRIPT_DIR}/Backends.xcodeproj" \
-    -scheme OuterShellBackend \
+    -target outershelld \
     -configuration "${CONFIGURATION}" \
     SYMROOT="${BUILD_ROOT}" \
     ONLY_ACTIVE_ARCH=YES \
@@ -117,15 +117,15 @@ rm -rf "${BUILD_ROOT}/${CONFIGURATION}/Outer Shell.app/Contents/Resources/bundle
 cp -R "${RUN_ROOT}/bundled-apps" \
     "${BUILD_ROOT}/${CONFIGURATION}/Outer Shell.app/Contents/Resources/bundled-apps"
 
-ln -sf OuterShellBackend "${BUILD_ROOT}/${CONFIGURATION}/BackendsBackend"
-ln -sf OuterShellBackend "${BUILD_ROOT}/${CONFIGURATION}/NavigatorBackend"
+ln -sf outershelld "${BUILD_ROOT}/${CONFIGURATION}/BackendsBackend"
+ln -sf outershelld "${BUILD_ROOT}/${CONFIGURATION}/NavigatorBackend"
 
 echo "Built:"
-echo "  ${BUILD_ROOT}/${CONFIGURATION}/OuterShellBackend"
+echo "  ${BUILD_ROOT}/${CONFIGURATION}/outershelld"
 echo "  ${BUILD_ROOT}/${CONFIGURATION}/Outer Shell.app"
 echo "  ${RUN_ROOT}/bundles"
 echo "  ${TOP_PAYLOAD_ROOT}"
 echo
 echo "Run:"
-echo "  \"${BUILD_ROOT}/${CONFIGURATION}/OuterShellBackend\" --port 7354 --bundles-dir \"${RUN_ROOT}/bundles\" --bundled-apps-dir \"${RUN_ROOT}/bundled-apps\""
+echo "  \"${BUILD_ROOT}/${CONFIGURATION}/outershelld\" --port 7354 --bundles-dir \"${RUN_ROOT}/bundles\" --bundled-apps-dir \"${RUN_ROOT}/bundled-apps\""
 echo "  \"${BUILD_ROOT}/${CONFIGURATION}/Outer Shell.app/Contents/MacOS/Outer Shell\" --socket-path \"$(getconf DARWIN_USER_TEMP_DIR)org.outershell.OuterShell\" --bundles-dir \"${RUN_ROOT}/bundles\" --bundled-apps-dir \"${RUN_ROOT}/bundled-apps\""

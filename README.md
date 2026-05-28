@@ -1,6 +1,6 @@
 # Outer Shell
 
-Outer Shell is an outerframe app for launching apps and viewing the backends registered on the machine where the app is running. It reads the Outer Loop registry SQLite database directly and tails registered log files in place, so logs do not need to be synced back to Outer Loop.
+Outer Shell is an outerframe app for launching apps and viewing the backends registered on the machine where the app is running. `outershelld` owns the HTTP server and the local socket API used by `outerctl`; it also tails registered log files in place, so logs do not need to be synced back to Outer Loop.
 
 This app will replace the old Outer Loop Services UI and the built-in log viewer. It currently includes:
 
@@ -33,8 +33,13 @@ For backend-only development:
 
 ```bash
 PORT=7354
-./build/macos/Release/OuterShellBackend --port "$PORT" --bundles-dir ./build/run/bundles
+./build/macos/Release/outershelld --port "$PORT" --bundles-dir ./build/run/bundles
 ```
+
+By default `outershelld` also opens an `outerctl` API socket at
+`${OUTERSHELLD_API_SOCKET}`, `$XDG_RUNTIME_DIR/outershelld-api`, or a
+platform-specific per-user temporary path. Use `--api-socket-path` to override
+it, or `--no-api-socket` for direct registry debugging.
 
 Open this URL in Outer Loop or Outerframe:
 
@@ -46,7 +51,7 @@ For ad hoc Unix socket testing:
 
 ```bash
 SOCKET_PATH="$(getconf DARWIN_USER_TEMP_DIR)org.outershell.OuterShell"
-./build/macos/Release/OuterShellBackend \
+./build/macos/Release/outershelld \
   --socket-path "$SOCKET_PATH" \
   --bundles-dir ./build/run/bundles
 ```
@@ -101,8 +106,12 @@ For a user systemd unit, use `%t` for the socket root so systemd resolves it to
 the user's `XDG_RUNTIME_DIR`:
 
 ```ini
-ExecStart=/path/to/OuterShellBackend --socket-path %t/org.outershell.OuterShell --bundles-dir /path/to/bundles
+ExecStart=/path/to/outershelld --stay-alive --socket-path %t/org.outershell.OuterShell --bundles-dir /path/to/bundles
 ```
+
+The socket-activated API unit templates live in `Resources/systemd`. The socket
+unit owns `%t/outershelld-api` and passes it to `outershelld` as the `api` file
+descriptor.
 
 By default the backend reads the user registry. On Linux:
 
@@ -129,7 +138,7 @@ Writable SQLite registries are also exported to the experimental binary
 the authoritative registry until the read/write paths are switched over.
 
 ```bash
-./build/macos/Release/OuterShellBackend \
+./build/macos/Release/outershelld \
   --port 7354 \
   --bundles-dir ./build/run/bundles \
   --database ~/.local/state/outerwebapps/registry.sqlite3
