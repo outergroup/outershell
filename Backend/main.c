@@ -1494,7 +1494,23 @@ static bool ensure_registry_schema(sqlite3 *database, char *error, size_t error_
                         "service_id TEXT PRIMARY KEY,"
                         "plist_path TEXT NOT NULL,"
                         "owns_plist INTEGER NOT NULL DEFAULT 0"
+                        ");"
+                        "CREATE TABLE IF NOT EXISTS file_openers ("
+                        "extension TEXT NOT NULL,"
+                        "service_id TEXT NOT NULL,"
+                        "display_name TEXT NOT NULL DEFAULT '',"
+                        "socket_path TEXT NOT NULL DEFAULT '',"
+                        "url_template TEXT NOT NULL DEFAULT '?file={file}',"
+                        "rank INTEGER NOT NULL DEFAULT 0,"
+                        "PRIMARY KEY(extension, service_id)"
                         ");",
+                        error,
+                        error_size)) {
+        return false;
+    }
+    if (!sqlite_exec_ok(database,
+                        "CREATE INDEX IF NOT EXISTS file_openers_extension_idx ON file_openers(extension, rank, display_name);"
+                        "CREATE INDEX IF NOT EXISTS file_openers_service_id_idx ON file_openers(service_id);",
                         error,
                         error_size)) {
         return false;
@@ -1954,15 +1970,19 @@ enum {
     ORWA_TABLE_FRONTENDS = 1,
     ORWA_TABLE_FRONTEND_LAYOUTS = 2,
     ORWA_TABLE_LOG_FILES = 3,
-    ORWA_TABLE_COUNT = 4,
+    ORWA_TABLE_FILE_OPENERS = 4,
+    ORWA_TABLE_COUNT = 5,
+    ORWA_LEGACY_FOUR_TABLE_COUNT = 4,
     ORWA_LEGACY_THREE_TABLE_COUNT = 3,
     ORWA_TABLE_DESCRIPTOR_SIZE = 20,
     ORWA_HEADER_SIZE = 8 + ORWA_TABLE_COUNT * ORWA_TABLE_DESCRIPTOR_SIZE,
+    ORWA_LEGACY_FOUR_TABLE_HEADER_SIZE = 8 + ORWA_LEGACY_FOUR_TABLE_COUNT * ORWA_TABLE_DESCRIPTOR_SIZE,
     ORWA_LEGACY_THREE_TABLE_HEADER_SIZE = 8 + ORWA_LEGACY_THREE_TABLE_COUNT * ORWA_TABLE_DESCRIPTOR_SIZE,
     ORWA_BACKENDS_ROW_SIZE = 84,
     ORWA_FRONTENDS_ROW_SIZE = 97,
     ORWA_FRONTEND_LAYOUTS_ROW_SIZE = 32,
-    ORWA_LOG_FILES_ROW_SIZE = 32
+    ORWA_LOG_FILES_ROW_SIZE = 32,
+    ORWA_FILE_OPENERS_ROW_SIZE = 88
 };
 
 typedef struct {
@@ -2218,6 +2238,21 @@ static bool registry_binary_append_log_file_row(sqlite3_stmt *statement,
                                                 StringBuilder *rows) {
     return registry_binary_append_string_ref(pool, variable_region, rows, sqlite_column_text_or_empty(statement, 0)) &&
            registry_binary_append_string_ref(pool, variable_region, rows, sqlite_column_text_or_empty(statement, 1));
+}
+
+static bool registry_binary_append_file_opener_row(sqlite3_stmt *statement,
+                                                   RegistryBinaryStringPool *pool,
+                                                   StringBuilder *variable_region,
+                                                   StringBuilder *rows) {
+    unsigned char padding[4] = {0};
+    uint32_t rank = (uint32_t)sqlite3_column_int(statement, 5);
+    return registry_binary_append_string_ref(pool, variable_region, rows, sqlite_column_text_or_empty(statement, 0)) &&
+           registry_binary_append_string_ref(pool, variable_region, rows, sqlite_column_text_or_empty(statement, 1)) &&
+           registry_binary_append_string_ref(pool, variable_region, rows, sqlite_column_text_or_empty(statement, 2)) &&
+           registry_binary_append_string_ref(pool, variable_region, rows, sqlite_column_text_or_empty(statement, 3)) &&
+           registry_binary_append_string_ref(pool, variable_region, rows, sqlite_column_text_or_empty(statement, 4)) &&
+           binary_append_u32(rows, rank) &&
+           sb_append_n(rows, (const char *)padding, sizeof(padding));
 }
 
 static bool registry_binary_write_file(const char *path, const void *data, size_t length, char *error, size_t error_size) {
@@ -2483,6 +2518,37 @@ static bool registry_binary_import_log_file(sqlite3 *database,
     return ok;
 }
 
+static bool registry_binary_import_file_opener(sqlite3 *database,
+                                               const char *extension,
+                                               const char *service_id,
+                                               const char *display_name,
+                                               const char *socket_path,
+                                               const char *url_template,
+                                               uint32_t rank,
+                                               char *error,
+                                               size_t error_size) {
+    sqlite3_stmt *statement = NULL;
+    bool ok = sqlite3_prepare_v2(database,
+                                 "INSERT INTO file_openers(extension, service_id, display_name, socket_path, url_template, rank) VALUES(?, ?, ?, ?, ?, ?) "
+                                 "ON CONFLICT(extension, service_id) DO UPDATE SET display_name=excluded.display_name, socket_path=excluded.socket_path, url_template=excluded.url_template, rank=excluded.rank;",
+                                 -1,
+                                 &statement,
+                                 NULL) == SQLITE_OK;
+    if (ok) {
+        sqlite3_bind_text(statement, 1, extension, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(statement, 2, service_id, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(statement, 3, display_name, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(statement, 4, socket_path, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(statement, 5, url_template, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int(statement, 6, (int)rank);
+        ok = registry_binary_step(database, statement, error, error_size);
+    } else {
+        snprintf(error, error_size, "%s", sqlite3_errmsg(database));
+    }
+    if (statement) sqlite3_finalize(statement);
+    return ok;
+}
+
 static bool import_registry_binary_into_sqlite(sqlite3 *database, const char *sqlite_path, char *error, size_t error_size) {
     char path[PATH_MAX];
     if (!registry_binary_output_path(sqlite_path, path, sizeof(path))) {
@@ -2515,6 +2581,7 @@ static bool import_registry_binary_into_sqlite(sqlite3 *database, const char *sq
     RegistryBinaryTableDescriptor descriptors[ORWA_TABLE_COUNT] = {0};
     uint64_t first_table_offset = read_uint64_le(bytes + 8);
     size_t table_count = first_table_offset == ORWA_HEADER_SIZE ? ORWA_TABLE_COUNT :
+                         first_table_offset == ORWA_LEGACY_FOUR_TABLE_HEADER_SIZE ? ORWA_LEGACY_FOUR_TABLE_COUNT :
                          first_table_offset == ORWA_LEGACY_THREE_TABLE_HEADER_SIZE ? ORWA_LEGACY_THREE_TABLE_COUNT :
                          0;
     if (table_count == 0) {
@@ -2535,7 +2602,8 @@ static bool import_registry_binary_into_sqlite(sqlite3 *database, const char *sq
         descriptors[i].row_size = read_uint32_le(bytes + descriptor_offset + 16);
         uint32_t expected_row_size = i == ORWA_TABLE_BACKENDS ? ORWA_BACKENDS_ROW_SIZE :
                                      i == ORWA_TABLE_FRONTENDS ? ORWA_FRONTENDS_ROW_SIZE :
-                                     i == ORWA_TABLE_FRONTEND_LAYOUTS && table_count == ORWA_TABLE_COUNT ? ORWA_FRONTEND_LAYOUTS_ROW_SIZE :
+                                     i == ORWA_TABLE_FRONTEND_LAYOUTS && table_count != ORWA_LEGACY_THREE_TABLE_COUNT ? ORWA_FRONTEND_LAYOUTS_ROW_SIZE :
+                                     i == ORWA_TABLE_FILE_OPENERS ? ORWA_FILE_OPENERS_ROW_SIZE :
                                      ORWA_LOG_FILES_ROW_SIZE;
         if (descriptors[i].row_size != expected_row_size ||
             descriptors[i].offset > (uint64_t)file_size ||
@@ -2550,7 +2618,7 @@ static bool import_registry_binary_into_sqlite(sqlite3 *database, const char *sq
     }
 
     bool ok = sqlite_exec_ok(database, "BEGIN IMMEDIATE TRANSACTION;", error, error_size) &&
-              sqlite_exec_ok(database, "DELETE FROM frontend_layouts; DELETE FROM frontends; DELETE FROM log_files; DELETE FROM systemd_backends; DELETE FROM launchd_backends; DELETE FROM backends;", error, error_size);
+              sqlite_exec_ok(database, "DELETE FROM file_openers; DELETE FROM frontend_layouts; DELETE FROM frontends; DELETE FROM log_files; DELETE FROM systemd_backends; DELETE FROM launchd_backends; DELETE FROM backends;", error, error_size);
 
     for (uint64_t row = 0; ok && row < descriptors[ORWA_TABLE_BACKENDS].row_count; row++) {
         const unsigned char *row_bytes = bytes + descriptors[ORWA_TABLE_BACKENDS].offset + row * ORWA_BACKENDS_ROW_SIZE;
@@ -2616,7 +2684,7 @@ static bool import_registry_binary_into_sqlite(sqlite3 *database, const char *sq
         free(socket_path);
     }
 
-    if (table_count == ORWA_TABLE_COUNT) {
+    if (table_count != ORWA_LEGACY_THREE_TABLE_COUNT) {
         for (uint64_t row = 0; ok && row < descriptors[ORWA_TABLE_FRONTEND_LAYOUTS].row_count; row++) {
             const unsigned char *row_bytes = bytes + descriptors[ORWA_TABLE_FRONTEND_LAYOUTS].offset + row * ORWA_FRONTEND_LAYOUTS_ROW_SIZE;
             char *url = NULL, *list = NULL;
@@ -2643,6 +2711,34 @@ static bool import_registry_binary_into_sqlite(sqlite3 *database, const char *sq
         free(service_id);
     }
 
+    if (table_count == ORWA_TABLE_COUNT) {
+        for (uint64_t row = 0; ok && row < descriptors[ORWA_TABLE_FILE_OPENERS].row_count; row++) {
+            const unsigned char *row_bytes = bytes + descriptors[ORWA_TABLE_FILE_OPENERS].offset + row * ORWA_FILE_OPENERS_ROW_SIZE;
+            char *extension = NULL, *service_id = NULL, *display_name = NULL, *socket_path = NULL, *url_template = NULL;
+            ok = registry_binary_read_string(bytes, file_size, variable_offset, read_uint64_le(row_bytes), read_uint64_le(row_bytes + 8), &extension, error, error_size) &&
+                 registry_binary_read_string(bytes, file_size, variable_offset, read_uint64_le(row_bytes + 16), read_uint64_le(row_bytes + 24), &service_id, error, error_size) &&
+                 registry_binary_read_string(bytes, file_size, variable_offset, read_uint64_le(row_bytes + 32), read_uint64_le(row_bytes + 40), &display_name, error, error_size) &&
+                 registry_binary_read_string(bytes, file_size, variable_offset, read_uint64_le(row_bytes + 48), read_uint64_le(row_bytes + 56), &socket_path, error, error_size) &&
+                 registry_binary_read_string(bytes, file_size, variable_offset, read_uint64_le(row_bytes + 64), read_uint64_le(row_bytes + 72), &url_template, error, error_size);
+            if (ok) {
+                ok = registry_binary_import_file_opener(database,
+                                                        extension,
+                                                        service_id,
+                                                        display_name,
+                                                        socket_path,
+                                                        url_template,
+                                                        read_uint32_le(row_bytes + 80),
+                                                        error,
+                                                        error_size);
+            }
+            free(extension);
+            free(service_id);
+            free(display_name);
+            free(socket_path);
+            free(url_template);
+        }
+    }
+
     if (ok) {
         ok = sqlite_exec_ok(database, "COMMIT;", error, error_size);
     } else {
@@ -2660,6 +2756,7 @@ static bool export_registry_binary_from_sqlite(sqlite3 *database, const char *sq
         {.row_count = registry_binary_count_rows(database, "frontends"), .row_size = ORWA_FRONTENDS_ROW_SIZE},
         {.row_count = registry_binary_count_rows(database, "frontend_layouts"), .row_size = ORWA_FRONTEND_LAYOUTS_ROW_SIZE},
         {.row_count = registry_binary_count_rows(database, "log_files"), .row_size = ORWA_LOG_FILES_ROW_SIZE},
+        {.row_count = registry_binary_count_rows(database, "file_openers"), .row_size = ORWA_FILE_OPENERS_ROW_SIZE},
     };
 
     uint64_t offset = ORWA_HEADER_SIZE;
@@ -2744,6 +2841,17 @@ static bool export_registry_binary_from_sqlite(sqlite3 *database, const char *sq
                                           "SELECT path, service_id FROM log_files ORDER BY service_id, path;",
                                           2,
                                           registry_binary_append_log_file_row,
+                                          &pool,
+                                          &variable_region,
+                                          &rows,
+                                          error,
+                                          error_size);
+    }
+    if (ok && descriptors[ORWA_TABLE_FILE_OPENERS].row_count > 0) {
+        ok = registry_binary_append_query(database,
+                                          "SELECT extension, service_id, COALESCE(display_name, ''), COALESCE(socket_path, ''), COALESCE(url_template, ''), COALESCE(rank, 0) FROM file_openers ORDER BY extension, rank, display_name, service_id;",
+                                          6,
+                                          registry_binary_append_file_opener_row,
                                           &pool,
                                           &variable_region,
                                           &rows,
@@ -4999,6 +5107,9 @@ static bool run_root_outerwebapps_migration(const char *sudo_password, bool *nee
             "CREATE INDEX IF NOT EXISTS log_files_service_id_idx ON log_files(service_id);\n"
             "CREATE TABLE IF NOT EXISTS systemd_backends (service_id TEXT PRIMARY KEY, unit_name TEXT NOT NULL, scope TEXT NOT NULL DEFAULT 'user');\n"
             "CREATE TABLE IF NOT EXISTS launchd_backends (service_id TEXT PRIMARY KEY, plist_path TEXT NOT NULL, owns_plist INTEGER NOT NULL DEFAULT 0);\n"
+            "CREATE TABLE IF NOT EXISTS file_openers (extension TEXT NOT NULL, service_id TEXT NOT NULL, display_name TEXT NOT NULL DEFAULT '', socket_path TEXT NOT NULL DEFAULT '', url_template TEXT NOT NULL DEFAULT '?file={file}', rank INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(extension, service_id));\n"
+            "CREATE INDEX IF NOT EXISTS file_openers_extension_idx ON file_openers(extension, rank, display_name);\n"
+            "CREATE INDEX IF NOT EXISTS file_openers_service_id_idx ON file_openers(service_id);\n"
             "''')\n"
             "def open_old_registry(path):\n"
             "    uri = 'file:' + urllib.parse.quote(path) + '?mode=ro&immutable=1'\n"
@@ -5039,6 +5150,9 @@ static bool run_root_outerwebapps_migration(const char *sudo_password, bool *nee
             "        for row in old_rows(old, 'launchd_backends'):\n"
             "            db.execute('INSERT OR REPLACE INTO launchd_backends(service_id, plist_path, owns_plist) VALUES (?, ?, ?)',\n"
             "                       (row['service_id'], row['plist_path'], row['owns_plist'] if 'owns_plist' in row.keys() and row['owns_plist'] is not None else 1))\n"
+            "        for row in old_rows(old, 'file_openers'):\n"
+            "            db.execute('INSERT OR REPLACE INTO file_openers(extension, service_id, display_name, socket_path, url_template, rank) VALUES (?, ?, ?, ?, ?, ?)',\n"
+            "                       (row['extension'], row['service_id'], row['display_name'] if 'display_name' in row.keys() and row['display_name'] is not None else '', row['socket_path'] if 'socket_path' in row.keys() and row['socket_path'] is not None else '', row['url_template'] if 'url_template' in row.keys() and row['url_template'] is not None else '?file={file}', row['rank'] if 'rank' in row.keys() and row['rank'] is not None else 0))\n"
             "    finally:\n"
             "        old.close()\n"
             "for old, new in replacements:\n"
@@ -5047,6 +5161,7 @@ static bool run_root_outerwebapps_migration(const char *sudo_password, bool *nee
             "    for sql in [\n"
             "        'UPDATE log_files SET path = replace(path, ?, ?)',\n"
             "        'UPDATE frontends SET url = replace(url, ?, ?), socket_path = replace(socket_path, ?, ?)',\n"
+            "        'UPDATE file_openers SET socket_path = replace(socket_path, ?, ?)',\n"
             "        'UPDATE launchd_backends SET plist_path = replace(plist_path, ?, ?)',\n"
             "    ]:\n"
             "        try:\n"
@@ -5913,6 +6028,109 @@ static bool outerctl_make_frontend_url(const char *raw_url,
     return true;
 }
 
+static bool normalize_file_extension(const char *raw, char *out, size_t out_size) {
+    if (!raw || !raw[0] || !out || out_size == 0) return false;
+    while (*raw == '.') raw++;
+    if (!raw[0]) return false;
+    size_t offset = 0;
+    for (const unsigned char *p = (const unsigned char *)raw; *p && offset + 1 < out_size; p++) {
+        if (*p == '/' || *p == '\\' || *p == '?' || *p == '#') return false;
+        out[offset++] = (char)tolower(*p);
+    }
+    if (raw[offset] != '\0') return false;
+    out[offset] = '\0';
+    return offset > 0;
+}
+
+static bool append_file_opener_url(StringBuilder *out,
+                                   const char *socket_path,
+                                   const char *url_template,
+                                   const char *file_path) {
+    const char *safe_socket_path = socket_path ? socket_path : "";
+    const char *safe_template = (url_template && url_template[0]) ? url_template : "?file={file}";
+    if (safe_socket_path[0]) {
+        if (!sb_append(out, safe_socket_path)) return false;
+        if (safe_template[0] == '?') {
+            if (!sb_append(out, "/")) return false;
+        } else if (safe_template[0] != '/') {
+            if (!sb_append(out, "/")) return false;
+        }
+    }
+    const char *cursor = safe_template;
+    const char *placeholder = "{file}";
+    size_t placeholder_len = strlen(placeholder);
+    while (*cursor) {
+        const char *match = strstr(cursor, placeholder);
+        if (!match) {
+            return sb_append(out, cursor);
+        }
+        if (!sb_append_n(out, cursor, (size_t)(match - cursor))) return false;
+        append_url_encoded(out, file_path ? file_path : "");
+        cursor = match + placeholder_len;
+    }
+    return true;
+}
+
+static bool outerctl_print_file_openers(sqlite3 *database,
+                                        const char *backend_filter,
+                                        const char *extension_filter,
+                                        const char *file_path,
+                                        StringBuilder *out,
+                                        char *error,
+                                        size_t error_size) {
+    const char *sql =
+        "SELECT extension, service_id, display_name, socket_path, url_template, rank "
+        "FROM file_openers "
+        "WHERE (?1 IS NULL OR service_id = ?1) AND (?2 IS NULL OR extension = ?2) "
+        "ORDER BY extension, rank, display_name, service_id;";
+    sqlite3_stmt *statement = NULL;
+    bool ok = sqlite3_prepare_v2(database, sql, -1, &statement, NULL) == SQLITE_OK;
+    if (ok) {
+        if (backend_filter && backend_filter[0]) sqlite3_bind_text(statement, 1, backend_filter, -1, SQLITE_TRANSIENT);
+        else sqlite3_bind_null(statement, 1);
+        if (extension_filter && extension_filter[0]) sqlite3_bind_text(statement, 2, extension_filter, -1, SQLITE_TRANSIENT);
+        else sqlite3_bind_null(statement, 2);
+    }
+    if (!ok) {
+        snprintf(error, error_size, "%s", sqlite3_errmsg(database));
+        if (statement) sqlite3_finalize(statement);
+        return false;
+    }
+
+    const char *headers[] = {"extension", "service_id", "display_name", "socket_path", "url_template", "rank", "url"};
+    for (size_t i = 0; i < sizeof(headers) / sizeof(headers[0]); i++) {
+        if (i > 0 && !sb_append(out, "\t")) ok = false;
+        if (ok && !outerctl_tsv_field(out, headers[i])) ok = false;
+    }
+    if (ok && !sb_append(out, "\n")) ok = false;
+
+    int step = SQLITE_DONE;
+    while (ok && (step = sqlite3_step(statement)) == SQLITE_ROW) {
+        for (int i = 0; i < 6; i++) {
+            if (i > 0 && !sb_append(out, "\t")) ok = false;
+            if (ok && !outerctl_tsv_field(out, sqlite_column_text_or_empty(statement, i))) ok = false;
+        }
+        if (ok && !sb_append(out, "\t")) ok = false;
+        if (ok && file_path && file_path[0]) {
+            StringBuilder url = {0};
+            ok = append_file_opener_url(&url,
+                                        sqlite_column_text_or_empty(statement, 3),
+                                        sqlite_column_text_or_empty(statement, 4),
+                                        file_path) &&
+                 outerctl_tsv_field(out, url.data ? url.data : "");
+            free(url.data);
+        }
+        if (ok && !sb_append(out, "\n")) ok = false;
+    }
+    if (ok && step != SQLITE_DONE) {
+        snprintf(error, error_size, "%s", sqlite3_errmsg(database));
+        ok = false;
+    }
+    if (!ok && !error[0]) snprintf(error, error_size, "out of memory");
+    sqlite3_finalize(statement);
+    return ok;
+}
+
 static int outershelld_handle_outerctl(int argc, char **argv, StringBuilder *stdout_buffer, StringBuilder *stderr_buffer) {
     if (argc < 3) {
         sb_append(stderr_buffer, "Usage: outerctl <resource> <action> [options]\n");
@@ -5930,7 +6148,11 @@ static int outershelld_handle_outerctl(int argc, char **argv, StringBuilder *std
     const char *icon_path = NULL;
     const char *frontend_list = NULL;
     const char *socket_path = NULL;
+    const char *extension = NULL;
+    const char *url_template = NULL;
+    const char *file_path = NULL;
     int port = 0;
+    int rank = 0;
     bool has_port = false;
     bool owns_plist = false;
     bool include_icons = false;
@@ -5962,6 +6184,12 @@ static int outershelld_handle_outerctl(int argc, char **argv, StringBuilder *std
             REQUIRE_VALUE("--list", frontend_list);
         } else if (strcmp(arg, "--socket-path") == 0) {
             REQUIRE_VALUE("--socket-path", socket_path);
+        } else if (strcmp(arg, "--extension") == 0 || strcmp(arg, "--ext") == 0) {
+            REQUIRE_VALUE("--extension", extension);
+        } else if (strcmp(arg, "--url-template") == 0) {
+            REQUIRE_VALUE("--url-template", url_template);
+        } else if (strcmp(arg, "--file") == 0) {
+            REQUIRE_VALUE("--file", file_path);
         } else if (strcmp(arg, "--port") == 0) {
             const char *raw_port = NULL;
             REQUIRE_VALUE("--port", raw_port);
@@ -5971,6 +6199,16 @@ static int outershelld_handle_outerctl(int argc, char **argv, StringBuilder *std
                 sb_append(stderr_buffer, "Invalid port.\n");
                 return 1;
             }
+        } else if (strcmp(arg, "--rank") == 0) {
+            const char *raw_rank = NULL;
+            REQUIRE_VALUE("--rank", raw_rank);
+            char *end = NULL;
+            long value = strtol(raw_rank, &end, 10);
+            if (!end || *end != '\0' || value < 0 || value > INT32_MAX) {
+                sb_append(stderr_buffer, "Invalid rank.\n");
+                return 1;
+            }
+            rank = (int)value;
         } else if (strcmp(arg, "--owns-plist") == 0) {
             const char *raw = NULL;
             REQUIRE_VALUE("--owns-plist", raw);
@@ -6027,6 +6265,20 @@ static int outershelld_handle_outerctl(int argc, char **argv, StringBuilder *std
             ok = outerctl_print_query(database, "SELECT service_id, unit_name FROM systemd_backends WHERE (?1 IS NULL OR service_id = ?1) ORDER BY service_id;", backend, stdout_buffer, error, sizeof(error));
         } else if (strcmp(resource, "launchd") == 0) {
             ok = outerctl_print_query(database, "SELECT service_id, plist_path, owns_plist FROM launchd_backends WHERE (?1 IS NULL OR service_id = ?1) ORDER BY service_id;", backend, stdout_buffer, error, sizeof(error));
+        } else if (strcmp(resource, "opener") == 0) {
+            char normalized_extension[128] = "";
+            if (extension && extension[0] && !normalize_file_extension(extension, normalized_extension, sizeof(normalized_extension))) {
+                snprintf(error, sizeof(error), "Invalid file extension.");
+                ok = false;
+            } else {
+                ok = outerctl_print_file_openers(database,
+                                                 backend,
+                                                 normalized_extension[0] ? normalized_extension : NULL,
+                                                 file_path,
+                                                 stdout_buffer,
+                                                 error,
+                                                 sizeof(error));
+            }
         } else {
             snprintf(error, sizeof(error), "Unknown registry resource.");
             ok = false;
@@ -6054,7 +6306,7 @@ static int outershelld_handle_outerctl(int argc, char **argv, StringBuilder *std
                                sizeof(error));
             changed = ok;
         } else if (strcmp(action, "remove") == 0) {
-            int systemd_count = 0, launchd_count = 0, log_count = 0, frontend_count = 0;
+            int systemd_count = 0, launchd_count = 0, log_count = 0, frontend_count = 0, opener_count = 0;
             bool exists = false;
             ok = outerctl_backend_exists(database, backend, &exists, error, sizeof(error));
             if (ok && !exists) {
@@ -6065,8 +6317,9 @@ static int outershelld_handle_outerctl(int argc, char **argv, StringBuilder *std
             if (ok) ok = outerctl_count_rows(database, "SELECT COUNT(*) FROM launchd_backends WHERE service_id = ?;", backend, &launchd_count, error, sizeof(error));
             if (ok) ok = outerctl_count_rows(database, "SELECT COUNT(*) FROM log_files WHERE service_id = ?;", backend, &log_count, error, sizeof(error));
             if (ok) ok = outerctl_count_rows(database, "SELECT COUNT(*) FROM frontends WHERE service_id = ?;", backend, &frontend_count, error, sizeof(error));
-            if (ok && (systemd_count || launchd_count || log_count || frontend_count)) {
-                snprintf(error, sizeof(error), "Backend still has service-manager, log, or app records. Clear those first.");
+            if (ok) ok = outerctl_count_rows(database, "SELECT COUNT(*) FROM file_openers WHERE service_id = ?;", backend, &opener_count, error, sizeof(error));
+            if (ok && (systemd_count || launchd_count || log_count || frontend_count || opener_count)) {
+                snprintf(error, sizeof(error), "Backend still has service-manager, log, app, or opener records. Clear those first.");
                 ok = false;
             }
             if (ok) {
@@ -6242,6 +6495,65 @@ static int outershelld_handle_outerctl(int argc, char **argv, StringBuilder *std
             changed = ok;
         } else {
             snprintf(error, sizeof(error), "Unknown app action.");
+            ok = false;
+        }
+    } else if (ok && strcmp(resource, "opener") == 0) {
+        char normalized_extension[128] = "";
+        if (strcmp(action, "clear") != 0 &&
+            (!extension || !normalize_file_extension(extension, normalized_extension, sizeof(normalized_extension)))) {
+            snprintf(error, sizeof(error), "Missing or invalid file extension.");
+            ok = false;
+        }
+        if (ok && strcmp(action, "add") == 0) {
+            if (!display_name || !display_name[0]) {
+                snprintf(error, sizeof(error), "Missing opener display name.");
+                ok = false;
+            } else if (!socket_path || !socket_path[0]) {
+                snprintf(error, sizeof(error), "Missing opener socket path.");
+                ok = false;
+            } else {
+                sqlite3_stmt *statement = NULL;
+                ok = sqlite3_prepare_v2(database,
+                                        "INSERT INTO file_openers(extension, service_id, display_name, socket_path, url_template, rank) VALUES(?, ?, ?, ?, ?, ?) "
+                                        "ON CONFLICT(extension, service_id) DO UPDATE SET display_name=excluded.display_name, socket_path=excluded.socket_path, url_template=excluded.url_template, rank=excluded.rank;",
+                                        -1,
+                                        &statement,
+                                        NULL) == SQLITE_OK;
+                if (ok) {
+                    sqlite3_bind_text(statement, 1, normalized_extension, -1, SQLITE_TRANSIENT);
+                    sqlite3_bind_text(statement, 2, backend, -1, SQLITE_TRANSIENT);
+                    sqlite3_bind_text(statement, 3, display_name, -1, SQLITE_TRANSIENT);
+                    sqlite3_bind_text(statement, 4, socket_path, -1, SQLITE_TRANSIENT);
+                    sqlite3_bind_text(statement, 5, (url_template && url_template[0]) ? url_template : "?file={file}", -1, SQLITE_TRANSIENT);
+                    sqlite3_bind_int(statement, 6, rank);
+                    ok = sqlite3_step(statement) == SQLITE_DONE;
+                }
+                if (!ok) snprintf(error, sizeof(error), "%s", sqlite3_errmsg(database));
+                if (statement) sqlite3_finalize(statement);
+                changed = ok;
+            }
+        } else if (ok && strcmp(action, "remove") == 0) {
+            ok = bind_and_step(database,
+                               "DELETE FROM file_openers WHERE service_id = ? AND extension = ?;",
+                               backend,
+                               normalized_extension,
+                               NULL,
+                               NULL,
+                               error,
+                               sizeof(error));
+            changed = ok;
+        } else if (ok && strcmp(action, "clear") == 0) {
+            ok = bind_and_step(database,
+                               "DELETE FROM file_openers WHERE service_id = ?;",
+                               backend,
+                               NULL,
+                               NULL,
+                               NULL,
+                               error,
+                               sizeof(error));
+            changed = ok;
+        } else if (ok) {
+            snprintf(error, sizeof(error), "Unknown opener action.");
             ok = false;
         }
     } else if (ok && strcmp(resource, "backend") != 0) {
@@ -6436,6 +6748,7 @@ static bool unregister_backend_records(const char *service_id, char *error, size
     }
 
     bool ok = sqlite_exec_ok(database, "BEGIN IMMEDIATE TRANSACTION;", error, error_size);
+    if (ok) ok = bind_and_step(database, "DELETE FROM file_openers WHERE service_id = ?;", service_id, NULL, NULL, NULL, error, error_size);
     if (ok) ok = bind_and_step(database, "DELETE FROM frontends WHERE service_id = ?;", service_id, NULL, NULL, NULL, error, error_size);
     if (ok) ok = bind_and_step(database, "DELETE FROM log_files WHERE service_id = ?;", service_id, NULL, NULL, NULL, error, error_size);
     if (ok) ok = bind_and_step(database, "DELETE FROM systemd_backends WHERE service_id = ?;", service_id, NULL, NULL, NULL, error, error_size);

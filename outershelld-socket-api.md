@@ -35,3 +35,22 @@ bytes 2..5:    UInt32 process-style exit status
 bytes 6..13:   StringRef32 stdout bytes
 bytes 14..21:  StringRef32 stderr bytes
 ```
+
+## File Opener Registry
+
+The current daemon-owned `outerctlInvoke` surface includes `opener` commands for
+apps that can open files by extension:
+
+```bash
+outerctl opener add --backend dev.outergroup.Plaintext \
+  --extension txt \
+  --socket-path "$XDG_RUNTIME_DIR/dev.outergroup.Plaintext" \
+  --name Plaintext \
+  --url-template '?file={file}'
+
+outerctl opener list --extension .txt --file /path/to/file.txt
+```
+
+Extensions are stored lowercase without the leading dot. `url_template` uses one
+placeholder, `{file}`, which outershelld replaces with a percent-encoded file
+path while resolving the final app URL.
