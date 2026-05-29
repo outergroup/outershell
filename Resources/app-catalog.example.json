@@ -11,6 +11,11 @@
       "archiveURL": "https://example.com/outer-shell/apps/Files.tar.gz"
     },
     {
+      "serviceID": "dev.outergroup.Plaintext",
+      "name": "Plaintext",
+      "archiveURL": "https://example.com/outer-shell/apps/Plaintext.tar.gz"
+    },
+    {
       "serviceID": "dev.outergroup.NetworkInspector",
       "name": "Network Inspector",
       "archiveURL": "https://example.com/outer-shell/apps/NetworkInspector.tar.gz"

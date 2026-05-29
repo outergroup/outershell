@@ -152,6 +152,7 @@ static bool export_registry_binary_from_sqlite(sqlite3 *database, const char *sq
 static bool import_registry_binary_into_sqlite(sqlite3 *database, const char *sqlite_path, char *error, size_t error_size);
 static bool registry_binary_output_path(const char *sqlite_path, char *out, size_t out_size);
 static int registry_binary_lock(const char *registry_path, int operation, char *error, size_t error_size);
+static bool registry_storage_exists_at(const char *database_path);
 static void rewrite_files_in_directory_replacing_text(const char *directory,
                                                       const TextReplacement *replacements,
                                                       size_t replacement_count,
@@ -189,6 +190,22 @@ static const BundledAppDefinition kBundledApps[] = {
         .socket_name = "dev.outergroup.Files",
         .socket_activated = true,
         .archive_name = "Files.tar.gz",
+        .version = "1"
+    },
+    {
+        .service_id = "dev.outergroup.Plaintext",
+        .display_name = "Plaintext",
+        .unit_name = "dev.outergroup.Plaintext.service",
+        .stage_directory_name = "Plaintext",
+        .install_directory_name = "dev.outergroup.Plaintext",
+        .binary_name = "PlaintextBackend",
+        .bundle_prefix = "PlaintextContent",
+        .icon_symbol_name = "doc.plaintext",
+        .icon_name = NULL,
+        .source_name = "PlaintextBackend.c",
+        .socket_name = "dev.outergroup.Plaintext",
+        .socket_activated = true,
+        .archive_name = "Plaintext.tar.gz",
         .version = "1"
     },
     {
@@ -3390,6 +3407,35 @@ static bool lookup_systemd_backend_any(const char *service_id,
     return false;
 }
 
+#ifndef __APPLE__
+static bool system_registry_has_backend(const char *service_id, bool *exists, char *error, size_t error_size) {
+    if (exists) *exists = false;
+    if (!service_id || !service_id[0] || !g_system_registry_database_path[0] ||
+        !registry_storage_exists_at(g_system_registry_database_path)) {
+        return true;
+    }
+
+    sqlite3 *database = open_system_registry_readonly(error, error_size);
+    if (!database) return false;
+    if (!sqlite_table_exists(database, "backends")) {
+        sqlite3_close(database);
+        return true;
+    }
+
+    sqlite3_stmt *statement = NULL;
+    bool ok = sqlite3_prepare_v2(database, "SELECT 1 FROM backends WHERE service_id = ? LIMIT 1;", -1, &statement, NULL) == SQLITE_OK;
+    if (ok) {
+        sqlite3_bind_text(statement, 1, service_id, -1, SQLITE_TRANSIENT);
+        if (exists) *exists = sqlite3_step(statement) == SQLITE_ROW;
+    } else {
+        snprintf(error, error_size, "%s", sqlite3_errmsg(database));
+    }
+    if (statement) sqlite3_finalize(statement);
+    sqlite3_close(database);
+    return ok;
+}
+#endif
+
 #ifdef __APPLE__
 static bool lookup_launchd_backend(sqlite3 *database,
                                    const char *service_id,
@@ -4338,6 +4384,20 @@ static void send_control_response(int fd, const char *query, const char *body) {
                 bool removed = uninstall_backend(service_id, sudo_password, &needs_password, message, sizeof(message));
                 if (!removed) {
                     log_event("Failed to uninstall existing root install before reinstalling %s as user: %s", service_id, message);
+                    send_action_response_ex(fd, needs_password ? 401 : 500, false, message, needs_password);
+                    return;
+                }
+            }
+            bool root_backend_exists = false;
+            if (!found && !system_registry_has_backend(service_id, &root_backend_exists, message, sizeof(message))) {
+                log_event("Failed to check root registry before reinstalling %s as user: %s", service_id, message);
+                send_action_response(fd, 500, false, message);
+                return;
+            }
+            if (!found && root_backend_exists) {
+                bool removed = root_helper_registry_remove_backend(service_id, sudo_password, &needs_password, message, sizeof(message));
+                if (!removed) {
+                    log_event("Failed to clear existing root registry records before reinstalling %s as user: %s", service_id, message);
                     send_action_response_ex(fd, needs_password ? 401 : 500, false, message, needs_password);
                     return;
                 }
@@ -7130,6 +7190,82 @@ static bool uninstall_local_home_screen(char *message, size_t message_size) {
 #endif
 }
 
+#ifndef __APPLE__
+static void cleanup_user_systemd_bundled_app(const BundledAppDefinition *app,
+                                             bool remove_unit_files,
+                                             bool remove_install_root) {
+    if (!app || !app->unit_name || !safe_unit_name(app->unit_name)) return;
+
+    char quoted_unit[320];
+    shell_quote(app->unit_name, quoted_unit, sizeof(quoted_unit));
+
+    char command[768];
+    snprintf(command, sizeof(command), "systemctl --user stop %s >/dev/null 2>&1 || true", quoted_unit);
+    run_shell_ignored(command);
+
+    char socket_unit[256] = "";
+    char quoted_socket_unit[320] = "";
+    if (app->socket_activated) {
+        systemd_socket_unit_name(app->unit_name, socket_unit, sizeof(socket_unit));
+        if (safe_unit_name(socket_unit)) {
+            shell_quote(socket_unit, quoted_socket_unit, sizeof(quoted_socket_unit));
+            snprintf(command, sizeof(command), "systemctl --user disable --now %s >/dev/null 2>&1 || true", quoted_socket_unit);
+            run_shell_ignored(command);
+
+            /* A service already activated by the socket can outlive the socket unit. */
+            snprintf(command, sizeof(command), "systemctl --user stop %s >/dev/null 2>&1 || true", quoted_unit);
+            run_shell_ignored(command);
+        } else {
+            socket_unit[0] = '\0';
+        }
+    }
+
+    snprintf(command, sizeof(command), "systemctl --user reset-failed %s >/dev/null 2>&1 || true", quoted_unit);
+    run_shell_ignored(command);
+    if (quoted_socket_unit[0]) {
+        snprintf(command, sizeof(command), "systemctl --user reset-failed %s >/dev/null 2>&1 || true", quoted_socket_unit);
+        run_shell_ignored(command);
+    }
+
+    if (remove_unit_files) {
+        char unit_path[PATH_MAX];
+        snprintf(unit_path, sizeof(unit_path), "%s/.config/systemd/user/%s", home_directory(), app->unit_name);
+        unlink(unit_path);
+
+        char unit_wants_path[PATH_MAX];
+        snprintf(unit_wants_path, sizeof(unit_wants_path), "%s/.config/systemd/user/default.target.wants/%s", home_directory(), app->unit_name);
+        unlink(unit_wants_path);
+
+        if (socket_unit[0]) {
+            char socket_unit_path[PATH_MAX];
+            snprintf(socket_unit_path, sizeof(socket_unit_path), "%s/.config/systemd/user/%s", home_directory(), socket_unit);
+            unlink(socket_unit_path);
+
+            char socket_wants_path[PATH_MAX];
+            snprintf(socket_wants_path, sizeof(socket_wants_path), "%s/.config/systemd/user/sockets.target.wants/%s", home_directory(), socket_unit);
+            unlink(socket_wants_path);
+        }
+
+        run_shell_ignored("systemctl --user daemon-reload >/dev/null 2>&1 || true");
+        snprintf(command, sizeof(command), "systemctl --user reset-failed %s >/dev/null 2>&1 || true", quoted_unit);
+        run_shell_ignored(command);
+        if (quoted_socket_unit[0]) {
+            snprintf(command, sizeof(command), "systemctl --user reset-failed %s >/dev/null 2>&1 || true", quoted_socket_unit);
+            run_shell_ignored(command);
+        }
+    }
+
+    if (remove_install_root && safe_service_directory_name(app->install_directory_name)) {
+        char install_root[PATH_MAX];
+        char quoted_root[PATH_MAX + 8];
+        default_user_outerwebapps_app_root(app->install_directory_name, install_root, sizeof(install_root));
+        shell_quote(install_root, quoted_root, sizeof(quoted_root));
+        snprintf(command, sizeof(command), "rm -rf -- %s", quoted_root);
+        run_shell_ignored(command);
+    }
+}
+#endif
+
 static bool install_bundled_app_macos(const BundledAppDefinition *app,
                                       const char *scope,
                                       const char *sudo_password,
@@ -7275,26 +7411,10 @@ static bool install_bundled_app(const BundledAppDefinition *app, const char *sco
             snprintf(socket_unit_path, sizeof(socket_unit_path), "/etc/systemd/system/%s", socket_unit_name);
         }
 
-        char user_unit_path[PATH_MAX];
-        snprintf(user_unit_path, sizeof(user_unit_path), "%s/.config/systemd/user/%s", home_directory(), app->unit_name);
+        cleanup_user_systemd_bundled_app(app, true, false);
+
         char quoted_unit[320];
         shell_quote(app->unit_name, quoted_unit, sizeof(quoted_unit));
-        char stop_user_command[512];
-        snprintf(stop_user_command, sizeof(stop_user_command), "systemctl --user disable --now %s >/dev/null 2>&1 || true", quoted_unit);
-        run_shell_ignored(stop_user_command);
-        unlink(user_unit_path);
-        if (app->socket_activated) {
-            char user_socket_unit[256];
-            char quoted_user_socket_unit[320];
-            char user_socket_path[PATH_MAX];
-            systemd_socket_unit_name(app->unit_name, user_socket_unit, sizeof(user_socket_unit));
-            shell_quote(user_socket_unit, quoted_user_socket_unit, sizeof(quoted_user_socket_unit));
-            snprintf(stop_user_command, sizeof(stop_user_command), "systemctl --user disable --now %s >/dev/null 2>&1 || true", quoted_user_socket_unit);
-            run_shell_ignored(stop_user_command);
-            snprintf(user_socket_path, sizeof(user_socket_path), "%s/.config/systemd/user/%s", home_directory(), user_socket_unit);
-            unlink(user_socket_path);
-        }
-        run_shell_ignored("systemctl --user daemon-reload >/dev/null 2>&1 || true");
 
         const char *binary_source = has_source_code ? compiled_binary : source_binary;
         char quoted_binary_source[PATH_MAX + 8];
@@ -7475,8 +7595,10 @@ static bool install_bundled_app(const BundledAppDefinition *app, const char *sco
         if (quoted_socket_unit[0]) {
             fprintf(script,
                     "timeout 12s systemctl --system disable --now %s >/dev/null 2>&1 || true\n"
+                    "timeout 12s systemctl --system stop %s >/dev/null 2>&1 || true\n"
                     "timeout 5s systemctl --system reset-failed %s >/dev/null 2>&1 || true\n",
                     quoted_socket_unit,
+                    quoted_unit,
                     quoted_socket_unit);
         }
         if (quoted_source_icon[0] && quoted_target_icon[0]) {
@@ -7548,13 +7670,7 @@ static bool install_bundled_app(const BundledAppDefinition *app, const char *sco
             return false;
         }
 
-        char user_install_root[PATH_MAX];
-        default_user_outerwebapps_app_root(app->install_directory_name, user_install_root, sizeof(user_install_root));
-        char quoted_user_install_root[PATH_MAX + 8];
-        shell_quote(user_install_root, quoted_user_install_root, sizeof(quoted_user_install_root));
-        char remove_user_install_command[PATH_MAX + 64];
-        snprintf(remove_user_install_command, sizeof(remove_user_install_command), "rm -rf -- %s", quoted_user_install_root);
-        run_shell_ignored(remove_user_install_command);
+        cleanup_user_systemd_bundled_app(app, true, true);
 
         snprintf(message, message_size, "Installed %s as root.", app->display_name);
         return true;
@@ -7589,21 +7705,10 @@ static bool install_bundled_app(const BundledAppDefinition *app, const char *sco
         snprintf(socket_unit_path, sizeof(socket_unit_path), "%s/.config/systemd/user/%s", home_directory(), socket_unit_name);
     }
 
-    char stop_command[512];
+    cleanup_user_systemd_bundled_app(app, true, false);
+
     char quoted_unit[320];
     shell_quote(app->unit_name, quoted_unit, sizeof(quoted_unit));
-    snprintf(stop_command, sizeof(stop_command), "systemctl --user stop %s >/dev/null 2>&1 || true", quoted_unit);
-    run_shell_ignored(stop_command);
-    snprintf(stop_command, sizeof(stop_command), "systemctl --user reset-failed %s >/dev/null 2>&1 || true", quoted_unit);
-    run_shell_ignored(stop_command);
-    if (socket_unit_name[0]) {
-        char quoted_socket_unit[320];
-        shell_quote(socket_unit_name, quoted_socket_unit, sizeof(quoted_socket_unit));
-        snprintf(stop_command, sizeof(stop_command), "systemctl --user disable --now %s >/dev/null 2>&1 || true", quoted_socket_unit);
-        run_shell_ignored(stop_command);
-        snprintf(stop_command, sizeof(stop_command), "systemctl --user reset-failed %s >/dev/null 2>&1 || true", quoted_socket_unit);
-        run_shell_ignored(stop_command);
-    }
 
     if (!mkdir_p(bundles_dir)) {
         snprintf(message, message_size, "Failed to create %s: %s", bundles_dir, strerror(errno));
@@ -8405,10 +8510,14 @@ static bool uninstall_backend(const char *service_id, const char *sudo_password,
                     "set -eu\n"
                     "timeout 12s systemctl --system disable --now %s >/dev/null 2>&1 || true\n"
                     "%s%s%s"
+                    "%s%s%s"
                     "rm -f -- %s %s\n",
                     quoted_unit,
                     quoted_socket_unit[0] ? "timeout 12s systemctl --system disable --now " : "",
                     quoted_socket_unit[0] ? quoted_socket_unit : "",
+                    quoted_socket_unit[0] ? " >/dev/null 2>&1 || true\n" : "",
+                    quoted_socket_unit[0] ? "timeout 12s systemctl --system stop " : "",
+                    quoted_socket_unit[0] ? quoted_unit : "",
                     quoted_socket_unit[0] ? " >/dev/null 2>&1 || true\n" : "",
                     quoted_unit_path,
                     quoted_socket_unit_path[0] ? quoted_socket_unit_path : "''");
@@ -8428,28 +8537,24 @@ static bool uninstall_backend(const char *service_id, const char *sudo_password,
                 return false;
             }
         } else {
-            char command[768];
-            snprintf(command, sizeof(command), "systemctl --user disable --now %s >/dev/null 2>&1 || true", quoted_unit);
-            run_shell_ignored(command);
-            char unit_path[PATH_MAX];
-            snprintf(unit_path, sizeof(unit_path), "%s/.config/systemd/user/%s", home_directory(), unit_name);
-            unlink(unit_path);
             const BundledAppDefinition *app = bundled_app_for_service_id(service_id);
-            if (app && app->socket_activated) {
-                char socket_unit[256];
-                char quoted_socket_unit[320];
-                char socket_unit_path[PATH_MAX];
-                systemd_socket_unit_name(unit_name, socket_unit, sizeof(socket_unit));
-                if (safe_unit_name(socket_unit)) {
-                    shell_quote(socket_unit, quoted_socket_unit, sizeof(quoted_socket_unit));
-                    snprintf(command, sizeof(command), "systemctl --user disable --now %s >/dev/null 2>&1 || true", quoted_socket_unit);
-                    run_shell_ignored(command);
-                    snprintf(socket_unit_path, sizeof(socket_unit_path), "%s/.config/systemd/user/%s", home_directory(), socket_unit);
-                    unlink(socket_unit_path);
-                }
+            if (app) {
+                cleanup_user_systemd_bundled_app(app, true, false);
+            } else {
+                char command[768];
+                snprintf(command, sizeof(command), "systemctl --user disable --now %s >/dev/null 2>&1 || true", quoted_unit);
+                run_shell_ignored(command);
+                char unit_path[PATH_MAX];
+                snprintf(unit_path, sizeof(unit_path), "%s/.config/systemd/user/%s", home_directory(), unit_name);
+                unlink(unit_path);
+                run_shell_ignored("systemctl --user daemon-reload >/dev/null 2>&1 || true");
             }
-            run_shell_ignored("systemctl --user daemon-reload >/dev/null 2>&1 || true");
         }
+    }
+
+    const BundledAppDefinition *bundled_app = bundled_app_for_service_id(service_id);
+    if (!found && bundled_app) {
+        cleanup_user_systemd_bundled_app(bundled_app, true, false);
     }
 
     if (!unregister_backend_records(service_id, error, sizeof(error))) {
@@ -9550,6 +9655,8 @@ static bool root_helper_registry_remove_backend(const char *service_id,
     (void)root_helper_outerctl(5, app_clear_argv, sudo_password, needs_password, message, message_size);
     char *log_clear_argv[] = {"outerctl", "log", "clear", "--backend", (char *)service_id, NULL};
     (void)root_helper_outerctl(5, log_clear_argv, sudo_password, needs_password, message, message_size);
+    char *opener_clear_argv[] = {"outerctl", "opener", "clear", "--backend", (char *)service_id, NULL};
+    (void)root_helper_outerctl(5, opener_clear_argv, sudo_password, needs_password, message, message_size);
     char *systemd_clear_argv[] = {"outerctl", "systemd", "clear", "--backend", (char *)service_id, NULL};
     (void)root_helper_outerctl(5, systemd_clear_argv, sudo_password, needs_password, message, message_size);
     char *backend_remove_argv[] = {"outerctl", "backend", "remove", "--backend", (char *)service_id, NULL};
