@@ -719,8 +719,11 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private let backendsToggleLayer = CenteredButtonLayer(title: "Backends")
     private let contentLayer = CALayer()
     private let appsLayer = CALayer()
+    private let appsScrollContentLayer = CALayer()
+    private let appsOverlayLayer = CALayer()
     private let tableHeaderLayer = CALayer()
     private let rowsClipLayer = CALayer()
+    private let backendRowsContentLayer = CALayer()
     private let logHeaderLayer = CALayer()
     private let logRowsClipLayer = CALayer()
     private let logTextContentLayer = CALayer()
@@ -1253,6 +1256,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 layer.opacity = 1
                 layer.isHidden = true
             }
+            if mode == currentMode {
+                updateMatchedLayerVisibility()
+            }
         }
     }
 
@@ -1478,8 +1484,11 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         toolbarLayer.addSublayer(appsToggleLayer)
         toolbarLayer.addSublayer(backendsToggleLayer)
         contentLayer.addSublayer(appsLayer)
+        appsLayer.addSublayer(appsScrollContentLayer)
+        appsLayer.addSublayer(appsOverlayLayer)
         contentLayer.addSublayer(tableHeaderLayer)
         contentLayer.addSublayer(rowsClipLayer)
+        rowsClipLayer.addSublayer(backendRowsContentLayer)
         contentLayer.addSublayer(dividerLayer)
         contentLayer.addSublayer(logHeaderLayer)
         contentLayer.addSublayer(logRowsClipLayer)
@@ -1498,6 +1507,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         installOverlayLayer.isHidden = true
         passwordOverlayLayer.isHidden = true
         filePickerOverlayLayer.isHidden = true
+        appsLayer.masksToBounds = true
         rowsClipLayer.masksToBounds = true
         logRowsClipLayer.masksToBounds = true
 
@@ -1568,6 +1578,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                     logRowsClipLayer.isHidden = true
                     createLayer.isHidden = true
                     appsLayer.frame = CGRect(x: 0, y: 0, width: width, height: contentHeight)
+                    updateAppsScrollLayerFrames()
                     renderAppsPage()
                 } else if mode == .backends {
                     outerframeHost.sendTextCursorUpdate(cursors: [])
@@ -1583,6 +1594,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                     let tableWidth = selectedServiceID == nil ? width : max(floor(width * 0.42), 320)
                     tableHeaderLayer.frame = CGRect(x: 0, y: tableBottom + max(tableAreaHeight - tableHeaderHeight, 0), width: tableWidth, height: tableHeaderHeight)
                     rowsClipLayer.frame = CGRect(x: 0, y: tableBottom, width: tableWidth, height: max(tableAreaHeight - tableHeaderHeight, 0))
+                    updateBackendRowsScrollLayerFrame()
                     if selectedServiceID != nil {
                         dividerLayer.frame = CGRect(x: tableWidth, y: tableBottom, width: 1, height: tableAreaHeight)
                         let logX = tableWidth + 1
@@ -1660,8 +1672,92 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         }
     }
 
+    private func updateAppsScrollLayerFrames() {
+        appsScrollContentLayer.frame = CGRect(x: 0,
+                                              y: appsScroll,
+                                              width: appsLayer.bounds.width,
+                                              height: appsLayer.bounds.height)
+        appsOverlayLayer.frame = appsLayer.bounds
+    }
+
+    private func updateBackendRowsScrollLayerFrame() {
+        backendRowsContentLayer.frame = CGRect(x: 0,
+                                               y: backendScroll,
+                                               width: rowsClipLayer.bounds.width,
+                                               height: rowsClipLayer.bounds.height)
+    }
+
+    private func updateMatchedLayerVisibility() {
+        let clipLayer: CALayer?
+        switch mode {
+        case .apps:
+            clipLayer = appsLayer
+        case .backends:
+            clipLayer = rowsClipLayer
+        case .create:
+            clipLayer = nil
+        }
+        guard let clipLayer else {
+            hideAllMatchedLayers()
+            return
+        }
+        let clipFrame = rootLayer.convert(clipLayer.bounds, from: clipLayer).insetBy(dx: -1, dy: -1)
+        for (key, state) in iconMatchStates {
+            iconMatchLayers[key]?.isHidden = !state.frame.intersects(clipFrame)
+        }
+        for (key, state) in textMatchStates {
+            textMatchLayers[key]?.isHidden = !state.frame.intersects(clipFrame)
+        }
+    }
+
+    private func offsetMatchedLayers(deltaY: CGFloat) {
+        guard abs(deltaY) > 0.001 else {
+            updateMatchedLayerVisibility()
+            return
+        }
+        for (key, state) in iconMatchStates {
+            let frame = state.frame.offsetBy(dx: 0, dy: deltaY)
+            iconMatchStates[key] = IconMatchState(frame: frame,
+                                                  image: state.image,
+                                                  title: state.title)
+            iconMatchLayers[key]?.frame = frame
+        }
+        for (key, state) in textMatchStates {
+            let frame = state.frame.offsetBy(dx: 0, dy: deltaY)
+            textMatchStates[key] = TextMatchState(frame: frame,
+                                                  title: state.title,
+                                                  fontSize: state.fontSize,
+                                                  weight: state.weight,
+                                                  alignment: state.alignment,
+                                                  isWrapped: state.isWrapped)
+            textMatchLayers[key]?.frame = frame
+        }
+        updateMatchedLayerVisibility()
+    }
+
+    private func scrollCurrentModeWithoutRerender(deltaY: CGFloat) {
+        withoutImplicitAnimations {
+            switch mode {
+            case .apps:
+                updateAppsScrollLayerFrames()
+                offsetMatchedLayers(deltaY: deltaY)
+            case .backends:
+                updateBackendRowsScrollLayerFrame()
+                offsetMatchedLayers(deltaY: deltaY)
+            case .create:
+                break
+            }
+        }
+    }
+
     private func renderBackendsRows() {
-        rowsClipLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
+        for layer in rowsClipLayer.sublayers ?? [] where layer !== backendRowsContentLayer {
+            layer.removeFromSuperlayer()
+        }
+        if backendRowsContentLayer.superlayer == nil {
+            rowsClipLayer.addSublayer(backendRowsContentLayer)
+        }
+        backendRowsContentLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
         backendRowFrames.removeAll()
         backendActionFrames.removeAll()
         newBackendRowFrame = .zero
@@ -1679,15 +1775,12 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         }
 
         let totalRows = rows.count + 1
-        let visibleStart = max(Int(floor(backendScroll / backendRowHeight)), 0)
-        let visibleCount = Int(ceil(rowsClipLayer.bounds.height / backendRowHeight)) + 2
-        let visibleEnd = min(totalRows, visibleStart + visibleCount)
         let columns = backendColumns(width: rowsClipLayer.bounds.width)
         let selectedBackground = resolvedCGColor(NSColor.controlAccentColor.withAlphaComponent(0.14))
         let alternating = alternatingRowColors()
 
-        for index in visibleStart..<visibleEnd {
-            let y = rowsClipLayer.bounds.height - CGFloat(index) * backendRowHeight + backendScroll - backendRowHeight
+        for index in 0..<totalRows {
+            let y = rowsClipLayer.bounds.height - CGFloat(index + 1) * backendRowHeight
             let rowFrame = CGRect(x: 0, y: y, width: rowsClipLayer.bounds.width, height: backendRowHeight)
             if index == rows.count {
                 renderNewBackendRow(rowFrame: rowFrame,
@@ -1709,7 +1802,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             } else {
                 rowLayer.backgroundColor = alternating.odd
             }
-            rowsClipLayer.addSublayer(rowLayer)
+            backendRowsContentLayer.addSublayer(rowLayer)
 
             let italic = backend.isBundledPlaceholder
             let indent: CGFloat
@@ -1758,6 +1851,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             }
         }
         hideUnrenderedMatchedLayers(visibleIconKeys: visibleIconKeys, visibleTextKeys: visibleTextKeys)
+        updateMatchedLayerVisibility()
     }
 
     private func renderNewBackendRow(rowFrame: CGRect,
@@ -1768,7 +1862,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         let rowLayer = CALayer()
         rowLayer.frame = rowFrame
         rowLayer.backgroundColor = backgroundColor
-        rowsClipLayer.addSublayer(rowLayer)
+        backendRowsContentLayer.addSublayer(rowLayer)
 
         let iconSize: CGFloat = 18
         let icon = CALayer()
@@ -1804,7 +1898,17 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func renderAppsPage() {
-        appsLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
+        for layer in appsLayer.sublayers ?? [] where layer !== appsScrollContentLayer && layer !== appsOverlayLayer {
+            layer.removeFromSuperlayer()
+        }
+        if appsScrollContentLayer.superlayer == nil {
+            appsLayer.addSublayer(appsScrollContentLayer)
+        }
+        if appsOverlayLayer.superlayer == nil {
+            appsLayer.addSublayer(appsOverlayLayer)
+        }
+        appsScrollContentLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
+        appsOverlayLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
         appCardFrames.removeAll()
         appListDropFrames.removeAll()
         appUnlistedDropFrames.removeAll()
@@ -1822,7 +1926,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
         let contentWidth = max(appsLayer.bounds.width - horizontalInset * 2, 1)
         let left = horizontalInset
-        let top = max(appsLayer.bounds.height - 28, 0) + appsScroll
+        let top = max(appsLayer.bounds.height - 28, 0)
 
         let splitGap: CGFloat = 34
         let usesSplitLayout = contentWidth >= 760 && !listGroups.isEmpty
@@ -1862,7 +1966,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         }
         renderAppDragOverlayIfNeeded()
         hideUnrenderedMatchedLayers(visibleIconKeys: visibleIconKeys, visibleTextKeys: visibleTextKeys)
+        updateMatchedLayerVisibility()
         if clampAppsScrollUsingRenderedContent() {
+            updateAppsScrollLayerFrames()
             renderAppsPage()
         }
     }
@@ -1900,14 +2006,14 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                                               y: frame.maxY - iconSize - 12,
                                                               width: iconSize,
                                                               height: iconSize),
-                                                       from: appsLayer),
+                                                       from: appsScrollContentLayer),
                               image: item.iconImage,
                               title: item.displayName)
             visibleIconKeys.insert(item.iconKey)
 
             recordMatchedText(key: item.iconKey,
                               frame: rootLayer.convert(CGRect(x: frame.minX, y: frame.minY + 10, width: itemWidth, height: 28),
-                                                       from: appsLayer),
+                                                       from: appsScrollContentLayer),
                               title: item.displayName,
                               fontSize: 12,
                               weight: .medium,
@@ -1946,12 +2052,12 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         icon.contentsGravity = .resizeAspect
         icon.contentsScale = 2
         icon.contents = symbolCGImage(named: "plus.square", pointSize: iconSize)
-        appsLayer.addSublayer(icon)
+        appsScrollContentLayer.addSublayer(icon)
 
         let title = makeTextLayer(size: 12, weight: .medium, color: .labelColor, alignment: .center, italic: true)
         title.string = "Add app"
         title.frame = CGRect(x: frame.minX, y: frame.minY + 10, width: frame.width, height: 28)
-        appsLayer.addSublayer(title)
+        appsScrollContentLayer.addSublayer(title)
     }
 
     private func renderAddableAppsSection(apps: [BackendRecord],
@@ -2044,7 +2150,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             let label = makeTextLayer(size: 12, weight: .medium, color: .secondaryLabelColor, alignment: .center)
             label.string = group.name
             label.frame = CGRect(x: widgetFrame.minX, y: widgetFrame.minY - labelHeight, width: widgetFrame.width, height: 16)
-            appsLayer.addSublayer(label)
+            appsScrollContentLayer.addSublayer(label)
             y -= labelHeight + 22
         }
 
@@ -2063,7 +2169,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         background.backgroundColor = resolvedCGColor(NSColor.controlBackgroundColor.withAlphaComponent(0.86))
         background.borderWidth = 0.5
         background.borderColor = resolvedCGColor(NSColor.separatorColor.withAlphaComponent(0.55))
-        appsLayer.addSublayer(background)
+        appsScrollContentLayer.addSublayer(background)
 
         let iconSize: CGFloat = 30
         let rowInset: CGFloat = 12
@@ -2079,7 +2185,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                          y: rowFrame.maxY - 0.5,
                                          width: max(rowFrame.width - rowInset - iconSize - 22, 1),
                                          height: 0.5)
-                appsLayer.addSublayer(separator)
+                appsScrollContentLayer.addSublayer(separator)
             }
 
             let iconFrame = CGRect(x: rowFrame.minX + rowInset,
@@ -2087,7 +2193,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                    width: iconSize,
                                    height: iconSize)
             recordMatchedIcon(key: item.iconKey,
-                              frame: rootLayer.convert(iconFrame, from: appsLayer),
+                              frame: rootLayer.convert(iconFrame, from: appsScrollContentLayer),
                               image: item.iconImage,
                               title: item.displayName)
             visibleIconKeys.insert(item.iconKey)
@@ -2097,7 +2203,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                    width: max(rowFrame.maxX - iconFrame.maxX - 28, 1),
                                    height: 20)
             recordMatchedText(key: item.iconKey,
-                              frame: rootLayer.convert(textFrame, from: appsLayer),
+                              frame: rootLayer.convert(textFrame, from: appsScrollContentLayer),
                               title: item.displayName,
                               fontSize: 13,
                               weight: .medium,
@@ -2111,7 +2217,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private func renderAppDragOverlayIfNeeded() {
         guard let drag = pendingAppDrag, drag.isDragging else { return }
         let appsPoint = appsLayer.convert(drag.currentPoint, from: rootLayer)
-        if let target = appDropTarget(at: appsPoint, for: drag.item),
+        let appsContentPoint = appsScrollContentLayer.convert(drag.currentPoint, from: rootLayer)
+        if let target = appDropTarget(at: appsContentPoint, for: drag.item),
            target.listName != drag.item.frontend.listName,
            let highlightFrame = appDropHighlightFrame(for: target) {
             let highlight = CALayer()
@@ -2120,7 +2227,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             highlight.borderWidth = 2
             highlight.borderColor = resolvedCGColor(.controlAccentColor)
             highlight.backgroundColor = resolvedCGColor(NSColor.controlAccentColor.withAlphaComponent(0.08))
-            appsLayer.addSublayer(highlight)
+            appsScrollContentLayer.addSublayer(highlight)
         }
 
         let iconSize: CGFloat = 46
@@ -2133,7 +2240,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                          iconSize: iconSize)
         icon.frame = iconFrame
         icon.opacity = 0.82
-        appsLayer.addSublayer(icon)
+        appsOverlayLayer.addSublayer(icon)
 
         let title = makeTextLayer(size: 12, weight: .medium, color: .labelColor, alignment: .center)
         title.string = drag.item.displayName
@@ -2141,7 +2248,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         title.truncationMode = .none
         title.frame = CGRect(x: appsPoint.x - 70, y: iconFrame.minY - 32, width: 140, height: 30)
         title.opacity = 0.82
-        appsLayer.addSublayer(title)
+        appsOverlayLayer.addSublayer(title)
     }
 
     private func appDropTarget(at appsPoint: CGPoint, for _: AppLauncherItem) -> AppDropTarget? {
@@ -4989,7 +5096,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             self.pendingAppDrag = nil
             if pendingAppDrag.isDragging {
                 let contentPoint = contentLayer.convert(point, from: rootLayer)
-                let appsPoint = appsLayer.convert(contentPoint, from: contentLayer)
+                let appsPoint = appsScrollContentLayer.convert(contentPoint, from: contentLayer)
                 if let target = appDropTarget(at: appsPoint, for: pendingAppDrag.item),
                    target.listName != pendingAppDrag.item.frontend.listName {
                     setFrontendList(for: pendingAppDrag.item, listName: target.listName)
@@ -5040,7 +5147,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             isOverDirectorySelect = createDirectorySelectFrames.contains { $0.frame.contains(createPoint) }
         } else if pendingPasswordAction == nil, mode == .apps {
             let contentPoint = contentLayer.convert(point, from: rootLayer)
-            let appsPoint = appsLayer.convert(contentPoint, from: contentLayer)
+            let appsPoint = appsScrollContentLayer.convert(contentPoint, from: contentLayer)
             isOverAppTile = appCardFrames.contains { $0.frame.contains(appsPoint) } ||
                             addAppFrame.contains(appsPoint)
         }
@@ -5120,6 +5227,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
     private func handleScroll(at point: CGPoint, delta: CGPoint, precise: Bool) {
         let multiplier: CGFloat = precise ? 1 : backendRowHeight
+        let previousAppsScroll = appsScroll
+        let previousBackendScroll = backendScroll
         if mode == .apps {
             appsScroll -= delta.y * multiplier
         } else if mode == .backends {
@@ -5149,7 +5258,13 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             }
         }
         clampScrollOffsets()
-        updateLayout()
+        if mode == .apps {
+            scrollCurrentModeWithoutRerender(deltaY: appsScroll - previousAppsScroll)
+        } else if mode == .backends {
+            scrollCurrentModeWithoutRerender(deltaY: backendScroll - previousBackendScroll)
+        } else {
+            updateLayout()
+        }
     }
 
     private func handleMouseDown(at point: CGPoint,
@@ -5212,7 +5327,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
         let contentPoint = contentLayer.convert(point, from: rootLayer)
         if mode == .apps {
-            let appsPoint = appsLayer.convert(contentPoint, from: contentLayer)
+            let appsPoint = appsScrollContentLayer.convert(contentPoint, from: contentLayer)
             if addAppFrame.contains(appsPoint) {
                 navigateToMode(.create, pushHistory: true)
                 return
@@ -5231,7 +5346,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             if handleLogMouseDown(at: point, modifierFlags: modifierFlags, clickCount: clickCount) {
                 return
             }
-            let rowsPoint = rowsClipLayer.convert(contentPoint, from: contentLayer)
+            let rowsPoint = backendRowsContentLayer.convert(contentPoint, from: contentLayer)
             if newBackendRowFrame.contains(rowsPoint) {
                 navigateToMode(.create, pushHistory: true)
                 return
@@ -5923,7 +6038,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func clampAppsScrollUsingRenderedContent() -> Bool {
-        let maxScroll = max(appsScroll + createBottomInset - appsContentBottom, 0)
+        let maxScroll = max(createBottomInset - appsContentBottom, 0)
         let clamped = min(max(appsScroll, 0), maxScroll)
         if abs(clamped - appsScroll) > 0.5 {
             appsScroll = clamped
