@@ -42,11 +42,12 @@ bytes 14..21:  StringRef32 stderr bytes
 
 ## `fileOpenersQuery` (`messageType = 3`)
 
-Returns applications that can open a file extension.
+Returns applications that can open a file extension or a detected generic kind.
 
 ```text
 bytes 2..9:    StringRef32 extension, with or without leading "."
 bytes 10..17:  StringRef32 file path, used to expand the opener URL template
+bytes 18..25:  StringRef32 detected kind, currently e.g. "text" (optional for older clients)
 ```
 
 ## `fileOpenersResponse` (`messageType = 4`)
@@ -58,7 +59,7 @@ bytes 14..17:  UInt32 opener row count
 bytes 18..:    opener rows, 40 bytes each
 
 Opener row:
-bytes 0..7:    StringRef32 extension
+bytes 0..7:    StringRef32 match key, either an extension or `kind:<kind>`
 bytes 8..15:   StringRef32 service id
 bytes 16..23:  StringRef32 display name
 bytes 24..31:  StringRef32 socket path
@@ -68,21 +69,24 @@ bytes 32..39:  StringRef32 resolved URL
 ## File Opener Registry
 
 The daemon-owned API includes `opener` commands for apps that can open files by
-extension, plus the typed `fileOpenersQuery` message for direct socket clients:
+extension or by generic kind, plus the typed `fileOpenersQuery` message for
+direct socket clients:
 
 ```bash
 outerctl opener add --backend dev.outergroup.Plaintext \
-  --extension txt \
+  --kind text \
   --socket-path "$XDG_RUNTIME_DIR/dev.outergroup.Plaintext" \
   --name Plaintext \
   --url-template '?file={file}'
 
 outerctl opener list --extension .txt --file /path/to/file.txt
+outerctl opener list --kind text --file /path/to/.gitignore
 ```
 
-Extensions are stored lowercase without the leading dot. `url_template` uses one
-placeholder, `{file}`, which outershelld replaces with a percent-encoded file
-path while resolving the final app URL.
+Extensions are stored lowercase without the leading dot. Kinds are lowercase
+alphanumeric identifiers such as `text`. `url_template` uses one placeholder,
+`{file}`, which outershelld replaces with a percent-encoded file path while
+resolving the final app URL.
 
 Lookup is user-contextual. A backend that receives an HTTP request over a Unix
 socket should inspect the peer UID for that request and query that user's

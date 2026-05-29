@@ -3398,9 +3398,9 @@ void printUsage() {
             "  outerctl app add --backend <identifier> (--port <port> | --socket-path <path>) --name <name> [--url <url>] [--icon-path <path>] [--list <name>]\n"
             "  outerctl app remove --backend <identifier> (--port <port> | --socket-path <path>)\n"
             "  outerctl app clear --backend <identifier>\n"
-            "  outerctl opener list [--backend <identifier>] [--extension <ext>] [--file <path>]\n"
-            "  outerctl opener add --backend <identifier> --extension <ext> --socket-path <path> --name <name> [--url-template <template>] [--rank <rank>]\n"
-            "  outerctl opener remove --backend <identifier> --extension <ext>\n"
+            "  outerctl opener list [--backend <identifier>] [--extension <ext> | --kind <kind>] [--file <path>]\n"
+            "  outerctl opener add --backend <identifier> (--extension <ext> | --kind <kind>) --socket-path <path> --name <name> [--url-template <template>] [--rank <rank>]\n"
+            "  outerctl opener remove --backend <identifier> (--extension <ext> | --kind <kind>)\n"
             "  outerctl opener clear --backend <identifier>\n");
 }
 

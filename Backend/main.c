@@ -6287,6 +6287,25 @@ static bool normalize_file_extension(const char *raw, char *out, size_t out_size
     return offset > 0;
 }
 
+static bool normalize_opener_kind(const char *raw, char *out, size_t out_size) {
+    if (!raw || !raw[0] || !out || out_size == 0) return false;
+    size_t offset = 0;
+    for (const unsigned char *p = (const unsigned char *)raw; *p && offset + 1 < out_size; p++) {
+        if (!isalnum(*p) && *p != '-' && *p != '_') return false;
+        out[offset++] = (char)tolower(*p);
+    }
+    if (raw[offset] != '\0') return false;
+    out[offset] = '\0';
+    return offset > 0;
+}
+
+static bool make_file_opener_kind_key(const char *raw_kind, char *out, size_t out_size) {
+    char normalized[128];
+    if (!normalize_opener_kind(raw_kind, normalized, sizeof(normalized))) return false;
+    int written = snprintf(out, out_size, "kind:%s", normalized);
+    return written > 0 && (size_t)written < out_size;
+}
+
 static bool append_file_opener_url(StringBuilder *out,
                                    const char *socket_path,
                                    const char *url_template,
@@ -6394,6 +6413,7 @@ static int outershelld_handle_outerctl(int argc, char **argv, StringBuilder *std
     const char *frontend_list = NULL;
     const char *socket_path = NULL;
     const char *extension = NULL;
+    const char *opener_kind = NULL;
     const char *url_template = NULL;
     const char *file_path = NULL;
     int port = 0;
@@ -6431,6 +6451,8 @@ static int outershelld_handle_outerctl(int argc, char **argv, StringBuilder *std
             REQUIRE_VALUE("--socket-path", socket_path);
         } else if (strcmp(arg, "--extension") == 0 || strcmp(arg, "--ext") == 0) {
             REQUIRE_VALUE("--extension", extension);
+        } else if (strcmp(arg, "--kind") == 0) {
+            REQUIRE_VALUE("--kind", opener_kind);
         } else if (strcmp(arg, "--url-template") == 0) {
             REQUIRE_VALUE("--url-template", url_template);
         } else if (strcmp(arg, "--file") == 0) {
@@ -6512,13 +6534,27 @@ static int outershelld_handle_outerctl(int argc, char **argv, StringBuilder *std
             ok = outerctl_print_query(database, "SELECT service_id, plist_path, owns_plist FROM launchd_backends WHERE (?1 IS NULL OR service_id = ?1) ORDER BY service_id;", backend, stdout_buffer, error, sizeof(error));
         } else if (strcmp(resource, "opener") == 0) {
             char normalized_extension[128] = "";
-            if (extension && extension[0] && !normalize_file_extension(extension, normalized_extension, sizeof(normalized_extension))) {
-                snprintf(error, sizeof(error), "Invalid file extension.");
+            char opener_key[160] = "";
+            if (extension && extension[0] && opener_kind && opener_kind[0]) {
+                snprintf(error, sizeof(error), "Specify either opener extension or kind, not both.");
                 ok = false;
-            } else {
+            } else if (extension && extension[0]) {
+                if (!normalize_file_extension(extension, normalized_extension, sizeof(normalized_extension))) {
+                    snprintf(error, sizeof(error), "Invalid file extension.");
+                    ok = false;
+                } else {
+                    snprintf(opener_key, sizeof(opener_key), "%s", normalized_extension);
+                }
+            } else if (opener_kind && opener_kind[0]) {
+                if (!make_file_opener_kind_key(opener_kind, opener_key, sizeof(opener_key))) {
+                    snprintf(error, sizeof(error), "Invalid opener kind.");
+                    ok = false;
+                }
+            }
+            if (ok) {
                 ok = outerctl_print_file_openers(database,
                                                  backend,
-                                                 normalized_extension[0] ? normalized_extension : NULL,
+                                                 opener_key[0] ? opener_key : NULL,
                                                  file_path,
                                                  stdout_buffer,
                                                  error,
@@ -6743,11 +6779,25 @@ static int outershelld_handle_outerctl(int argc, char **argv, StringBuilder *std
             ok = false;
         }
     } else if (ok && strcmp(resource, "opener") == 0) {
-        char normalized_extension[128] = "";
-        if (strcmp(action, "clear") != 0 &&
-            (!extension || !normalize_file_extension(extension, normalized_extension, sizeof(normalized_extension)))) {
-            snprintf(error, sizeof(error), "Missing or invalid file extension.");
-            ok = false;
+        char opener_key[160] = "";
+        if (strcmp(action, "clear") != 0) {
+            if (extension && extension[0] && opener_kind && opener_kind[0]) {
+                snprintf(error, sizeof(error), "Specify either opener extension or kind, not both.");
+                ok = false;
+            } else if (extension && extension[0]) {
+                if (!normalize_file_extension(extension, opener_key, sizeof(opener_key))) {
+                    snprintf(error, sizeof(error), "Invalid file extension.");
+                    ok = false;
+                }
+            } else if (opener_kind && opener_kind[0]) {
+                if (!make_file_opener_kind_key(opener_kind, opener_key, sizeof(opener_key))) {
+                    snprintf(error, sizeof(error), "Invalid opener kind.");
+                    ok = false;
+                }
+            } else {
+                snprintf(error, sizeof(error), "Missing opener extension or kind.");
+                ok = false;
+            }
         }
         if (ok && strcmp(action, "add") == 0) {
             if (!display_name || !display_name[0]) {
@@ -6765,7 +6815,7 @@ static int outershelld_handle_outerctl(int argc, char **argv, StringBuilder *std
                                         &statement,
                                         NULL) == SQLITE_OK;
                 if (ok) {
-                    sqlite3_bind_text(statement, 1, normalized_extension, -1, SQLITE_TRANSIENT);
+                    sqlite3_bind_text(statement, 1, opener_key, -1, SQLITE_TRANSIENT);
                     sqlite3_bind_text(statement, 2, backend, -1, SQLITE_TRANSIENT);
                     sqlite3_bind_text(statement, 3, display_name, -1, SQLITE_TRANSIENT);
                     sqlite3_bind_text(statement, 4, socket_path, -1, SQLITE_TRANSIENT);
@@ -6781,7 +6831,7 @@ static int outershelld_handle_outerctl(int argc, char **argv, StringBuilder *std
             ok = bind_and_step(database,
                                "DELETE FROM file_openers WHERE service_id = ? AND extension = ?;",
                                backend,
-                               normalized_extension,
+                               opener_key,
                                NULL,
                                NULL,
                                error,
@@ -7376,7 +7426,7 @@ static bool install_bundled_app(const BundledAppDefinition *app, const char *sco
                      "WantedBy=sockets.target\n",
                      description,
                      systemd_socket_path,
-                     "0666");
+                     "0600");
         }
 
         char quoted_system_outerwebapps_root[PATH_MAX + 8];
@@ -7926,7 +7976,7 @@ static bool install_bundled_app_macos(const BundledAppDefinition *app,
                                         bundles_dir,
                                         target_icon,
                                         socket_path,
-                                        0666,
+                                        0600,
                                         install_root,
                                         wrapper_path,
                                         log_path,
@@ -9621,6 +9671,7 @@ static bool api_append_file_openers_from_database(sqlite3 *database,
 }
 
 static bool api_query_file_openers(const char *extension_filter,
+                                   const char *detected_kind,
                                    const char *file_path,
                                    StringBuilder *rows,
                                    StringBuilder *variable,
@@ -9628,38 +9679,76 @@ static bool api_query_file_openers(const char *extension_filter,
                                    char *error,
                                    size_t error_size) {
     if (row_count) *row_count = 0;
-    char extension[128];
-    if (!normalize_file_extension(extension_filter, extension, sizeof(extension))) {
+    char extension[128] = "";
+    char kind_key[160] = "";
+    if (extension_filter && extension_filter[0] &&
+        !normalize_file_extension(extension_filter, extension, sizeof(extension))) {
         snprintf(error, error_size, "Invalid file extension.");
+        return false;
+    }
+    if (detected_kind && detected_kind[0] &&
+        !make_file_opener_kind_key(detected_kind, kind_key, sizeof(kind_key))) {
+        snprintf(error, error_size, "Invalid opener kind.");
+        return false;
+    }
+    if (!extension[0] && !kind_key[0]) {
+        snprintf(error, error_size, "Missing file opener query.");
         return false;
     }
 
     sqlite3 *database = open_registry_readonly(error, error_size);
     if (!database) return false;
-    bool ok = api_append_file_openers_from_database(database,
-                                                   extension,
-                                                   file_path,
-                                                   false,
-                                                   rows,
-                                                   variable,
-                                                   row_count,
-                                                   error,
-                                                   error_size);
+    bool ok = true;
+    if (extension[0]) {
+        ok = api_append_file_openers_from_database(database,
+                                                  extension,
+                                                  file_path,
+                                                  false,
+                                                  rows,
+                                                  variable,
+                                                  row_count,
+                                                  error,
+                                                  error_size);
+    }
+    if (ok && kind_key[0]) {
+        ok = api_append_file_openers_from_database(database,
+                                                  kind_key,
+                                                  file_path,
+                                                  false,
+                                                  rows,
+                                                  variable,
+                                                  row_count,
+                                                  error,
+                                                  error_size);
+    }
     sqlite3_close(database);
 
     if (ok && g_system_registry_database_path[0] && registry_storage_exists_at(g_system_registry_database_path)) {
         char system_error[512] = "";
         sqlite3 *system_database = open_system_registry_readonly(system_error, sizeof(system_error));
         if (system_database) {
-            ok = api_append_file_openers_from_database(system_database,
-                                                       extension,
-                                                       file_path,
-                                                       true,
-                                                       rows,
-                                                       variable,
-                                                       row_count,
-                                                       error,
-                                                       error_size);
+            if (extension[0]) {
+                ok = api_append_file_openers_from_database(system_database,
+                                                          extension,
+                                                          file_path,
+                                                          true,
+                                                          rows,
+                                                          variable,
+                                                          row_count,
+                                                          error,
+                                                          error_size);
+            }
+            if (ok && kind_key[0]) {
+                ok = api_append_file_openers_from_database(system_database,
+                                                          kind_key,
+                                                          file_path,
+                                                          true,
+                                                          rows,
+                                                          variable,
+                                                          row_count,
+                                                          error,
+                                                          error_size);
+            }
             sqlite3_close(system_database);
         }
     }
@@ -9668,6 +9757,7 @@ static bool api_query_file_openers(const char *extension_filter,
 
 static bool process_api_file_openers_request(ReactorClient *client, const unsigned char *message, size_t message_length) {
     char *extension = NULL;
+    char *detected_kind = NULL;
     char *file_path = NULL;
     char error[512] = "";
     StringBuilder rows = {0};
@@ -9675,11 +9765,20 @@ static bool process_api_file_openers_request(ReactorClient *client, const unsign
     uint32_t row_count = 0;
     bool ok = message_length >= 18 &&
               api_read_string_ref(message, message_length, 2, &extension) &&
-              api_read_string_ref(message, message_length, 10, &file_path) &&
-              api_query_file_openers(extension, file_path, &rows, &variable, &row_count, error, sizeof(error));
+              api_read_string_ref(message, message_length, 10, &file_path);
+    if (ok) {
+        if (message_length >= 26) {
+            ok = api_read_string_ref(message, message_length, 18, &detected_kind);
+        } else {
+            detected_kind = strdup("");
+            ok = detected_kind != NULL;
+        }
+    }
+    ok = ok && api_query_file_openers(extension, detected_kind, file_path, &rows, &variable, &row_count, error, sizeof(error));
     if (!ok && !error[0]) snprintf(error, sizeof(error), "Invalid file openers request.");
     api_send_file_openers_response(client->fd, ok ? 0u : 1u, error, &rows, &variable, ok ? row_count : 0);
     free(extension);
+    free(detected_kind);
     free(file_path);
     free(rows.data);
     free(variable.data);
