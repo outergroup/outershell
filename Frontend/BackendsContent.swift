@@ -426,7 +426,6 @@ private struct LogSelection: Equatable {
 
 private enum BackendsViewMode {
     case apps
-    case backends
     case create
 }
 
@@ -690,7 +689,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private var isPerformingAction = false
     private var lastBackendsResponseData: Data?
     private var backendsRefreshGeneration = 0
-    private var mode: BackendsViewMode = .backends
+    private var mode: BackendsViewMode = .apps
     private var recipes: [RecipeRecord] = []
     private var selectedRecipeID = "command-port"
     private var createValues: [String: String] = [:]
@@ -778,8 +777,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private let toolbarLayer = CALayer()
     private let titleLayer = CATextLayer()
     private let statusLayer = CATextLayer()
-    private let appsToggleLayer = CenteredButtonLayer(title: "Apps")
-    private let backendsToggleLayer = CenteredButtonLayer(title: "Backends")
     private let outerShellActionLayer = SymbolButtonLayer(symbolName: "ellipsis.circle", accessibilityTitle: "Outer Shell Actions")
     private let contentLayer = CALayer()
     private let appsLayer = CALayer()
@@ -800,8 +797,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private let filePickerOverlayLayer = CALayer()
 
     private var newBackendRowFrame = CGRect.zero
-    private var appsToggleFrame = CGRect.zero
-    private var backendsToggleFrame = CGRect.zero
     private var appCardFrames: [(frame: CGRect, item: AppLauncherItem)] = []
     private var appBadgeFrames: [AppLauncherBadgeTarget] = []
     private var appListDropFrames: [(frame: CGRect, listName: String)] = []
@@ -816,7 +811,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private var iconMatchLayers: [String: CALayer] = [:]
     private var textMatchStates: [String: TextMatchState] = [:]
     private var textMatchLayers: [String: CATextLayer] = [:]
-    private var isRecordingTransitionTargets = false
     private var pendingMenuActions: [UUID: (serviceID: String, operationByItemID: [String: String])] = [:]
     private var pendingAppMenuActions: [UUID: (item: AppLauncherItem, operationByItemID: [String: String])] = [:]
     private var pendingLogMenuSelections: [UUID: (serviceID: String, logIndexByItemID: [String: Int])] = [:]
@@ -860,8 +854,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private let logScrollLineHeight: CGFloat = 18
     private let horizontalInset: CGFloat = 18
     private let createBottomInset: CGFloat = 18
-    private let pageTransitionDuration: CFTimeInterval = 0.28
-
     init(outerframeHost: OuterframeHost, appConnection: OuterframeAppConnection) {
         self.outerframeHost = outerframeHost
         self.appConnection = appConnection
@@ -1042,7 +1034,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         let normalizedPath = components.path.trimmingCharacters(in: CharacterSet(charactersIn: "/")).lowercased()
         switch normalizedPath {
         case "backends":
-            return .backends
+            return .apps
         case "new":
             return .create
         case "", "apps":
@@ -1053,7 +1045,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
         switch components.queryItems?.first(where: { $0.name == "view" })?.value {
         case "backends":
-            return .backends
+            return .apps
         case "new":
             return .create
         default:
@@ -1071,8 +1063,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         switch mode {
         case .apps:
             components.path = "/"
-        case .backends:
-            components.path = "/backends"
         case .create:
             components.path = "/new"
         }
@@ -1088,10 +1078,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             } else {
                 outerframeHost.replaceHistoryEntry(url: url)
             }
-        }
-        if (mode == .apps && nextMode == .backends) || (mode == .backends && nextMode == .apps) {
-            animateIconTransition(to: nextMode)
-            return
         }
         applyMode(nextMode)
     }
@@ -1110,357 +1096,11 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         updateColors()
     }
 
-    private func animateIconTransition(to nextMode: BackendsViewMode) {
-        let startStates = iconMatchStates
-        let startTextStates = textMatchStates
-        let startIconLayers = iconMatchLayers
-        let startTextLayers = textMatchLayers
-        let previousMode = mode
-        let outgoingLayers = visibleModeLayers(for: previousMode)
-        let wasRecordingTransitionTargets = isRecordingTransitionTargets
-        isRecordingTransitionTargets = true
-        defer {
-            isRecordingTransitionTargets = wasRecordingTransitionTargets
-        }
-        applyMode(nextMode)
-        isRecordingTransitionTargets = wasRecordingTransitionTargets
-        let endStates = iconMatchStates
-        let endTextStates = textMatchStates
-        let incomingLayers = visibleModeLayers(for: nextMode)
-        let sharedKeys = Set(startStates.keys).intersection(endStates.keys)
-        let sharedTextKeys = Set(startTextStates.keys).intersection(endTextStates.keys)
-        let incomingIconKeys = Set(endStates.keys).subtracting(startStates.keys)
-        let outgoingIconKeys = Set(startStates.keys).subtracting(endStates.keys)
-        let incomingTextKeys = Set(endTextStates.keys).subtracting(startTextStates.keys)
-        let outgoingTextKeys = Set(startTextStates.keys).subtracting(endTextStates.keys)
-        guard !sharedKeys.isEmpty || !sharedTextKeys.isEmpty || !outgoingLayers.isEmpty || !incomingLayers.isEmpty else { return }
-
-        prepareCrossfade(from: outgoingLayers, to: incomingLayers)
-        prepareMatchedLayerFades(incomingIconKeys: incomingIconKeys,
-                                 outgoingIconKeys: outgoingIconKeys,
-                                 incomingTextKeys: incomingTextKeys,
-                                 outgoingTextKeys: outgoingTextKeys,
-                                 startIconLayers: startIconLayers,
-                                 startTextLayers: startTextLayers)
-
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        animateCrossfade(from: outgoingLayers, to: incomingLayers)
-        animateMatchedLayerFades(incomingIconKeys: incomingIconKeys,
-                                 outgoingIconKeys: outgoingIconKeys,
-                                 incomingTextKeys: incomingTextKeys,
-                                 outgoingTextKeys: outgoingTextKeys,
-                                 startIconLayers: startIconLayers,
-                                 startTextLayers: startTextLayers)
-        for key in sharedKeys {
-            guard let start = startStates[key],
-                  let end = endStates[key],
-                  let layer = iconMatchLayers[key] else {
-                continue
-            }
-
-            let positionAnimation = CABasicAnimation(keyPath: "position")
-            positionAnimation.fromValue = CGPoint(x: start.frame.midX, y: start.frame.midY)
-            positionAnimation.toValue = CGPoint(x: end.frame.midX, y: end.frame.midY)
-
-            let boundsAnimation = CABasicAnimation(keyPath: "bounds")
-            boundsAnimation.fromValue = CGRect(origin: .zero, size: start.frame.size)
-            boundsAnimation.toValue = CGRect(origin: .zero, size: end.frame.size)
-
-            let radiusAnimation = CABasicAnimation(keyPath: "cornerRadius")
-            radiusAnimation.fromValue = layer.cornerRadius
-            radiusAnimation.toValue = iconCornerRadius(for: end.frame.width)
-
-            let group = CAAnimationGroup()
-            group.animations = [positionAnimation, boundsAnimation, radiusAnimation]
-            group.duration = pageTransitionDuration
-            group.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-            layer.position = CGPoint(x: end.frame.midX, y: end.frame.midY)
-            layer.bounds = CGRect(origin: .zero, size: end.frame.size)
-            configureLauncherIconLayer(layer, image: end.image, symbolName: nil, title: end.title, iconSize: end.frame.width)
-            layer.cornerRadius = iconCornerRadius(for: end.frame.width)
-            layer.add(group, forKey: "matchedIconTransition")
-        }
-        for key in sharedTextKeys {
-            guard let start = startTextStates[key],
-                  let end = endTextStates[key],
-                  let layer = textMatchLayers[key] else {
-                continue
-            }
-            let startFlightFrame = flightFrame(for: start)
-            let endFlightFrame = flightFrame(for: end)
-            configureTextLayer(layer,
-                               title: start.title,
-                               fontSize: start.fontSize,
-                               weight: start.weight,
-                               color: .labelColor,
-                               alignment: .left,
-                               isWrapped: false)
-            layer.frame = startFlightFrame
-
-            let positionAnimation = CABasicAnimation(keyPath: "position")
-            positionAnimation.fromValue = CGPoint(x: startFlightFrame.midX, y: startFlightFrame.midY)
-            positionAnimation.toValue = CGPoint(x: endFlightFrame.midX, y: endFlightFrame.midY)
-
-            let boundsAnimation = CABasicAnimation(keyPath: "bounds")
-            boundsAnimation.fromValue = CGRect(origin: .zero, size: startFlightFrame.size)
-            boundsAnimation.toValue = CGRect(origin: .zero, size: endFlightFrame.size)
-
-            let fontAnimation = CABasicAnimation(keyPath: "fontSize")
-            fontAnimation.fromValue = start.fontSize
-            fontAnimation.toValue = end.fontSize
-
-            let group = CAAnimationGroup()
-            group.animations = [positionAnimation, boundsAnimation, fontAnimation]
-            group.duration = pageTransitionDuration
-            group.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-            layer.position = CGPoint(x: endFlightFrame.midX, y: endFlightFrame.midY)
-            layer.bounds = CGRect(origin: .zero, size: endFlightFrame.size)
-            layer.fontSize = end.fontSize
-            layer.add(group, forKey: "matchedTextTransition")
-        }
-        CATransaction.commit()
-
-        DispatchQueue.main.asyncAfter(deadline: .now() + pageTransitionDuration + 0.01) { [weak self] in
-            guard let self else { return }
-            self.finishCrossfade(from: outgoingLayers, to: incomingLayers, currentMode: nextMode)
-            self.finishMatchedTextTransition(endTextStates: endTextStates, sharedTextKeys: sharedTextKeys)
-            self.finishMatchedLayerFades(incomingIconKeys: incomingIconKeys,
-                                         outgoingIconKeys: outgoingIconKeys,
-                                         incomingTextKeys: incomingTextKeys,
-                                         outgoingTextKeys: outgoingTextKeys,
-                                         startIconLayers: startIconLayers,
-                                         startTextLayers: startTextLayers,
-                                         currentMode: nextMode)
-        }
-    }
-
-    private func prepareMatchedLayerFades(incomingIconKeys: Set<String>,
-                                          outgoingIconKeys: Set<String>,
-                                          incomingTextKeys: Set<String>,
-                                          outgoingTextKeys: Set<String>,
-                                          startIconLayers: [String: CALayer],
-                                          startTextLayers: [String: CATextLayer]) {
-        withoutImplicitAnimations {
-            for key in incomingIconKeys {
-                guard let layer = iconMatchLayers[key] else { continue }
-                layer.isHidden = false
-                layer.opacity = 0
-            }
-            for key in incomingTextKeys {
-                guard let layer = textMatchLayers[key] else { continue }
-                layer.isHidden = false
-                layer.opacity = 0
-            }
-            for key in outgoingIconKeys {
-                guard let layer = startIconLayers[key] else { continue }
-                layer.isHidden = false
-                layer.opacity = 1
-            }
-            for key in outgoingTextKeys {
-                guard let layer = startTextLayers[key] else { continue }
-                layer.isHidden = false
-                layer.opacity = 1
-            }
-        }
-    }
-
-    private func animateMatchedLayerFades(incomingIconKeys: Set<String>,
-                                          outgoingIconKeys: Set<String>,
-                                          incomingTextKeys: Set<String>,
-                                          outgoingTextKeys: Set<String>,
-                                          startIconLayers: [String: CALayer],
-                                          startTextLayers: [String: CATextLayer]) {
-        for key in incomingIconKeys {
-            guard let layer = iconMatchLayers[key] else { continue }
-            addOpacityAnimation(to: layer, from: 0, to: 1, key: "matchedIconAppear")
-            layer.opacity = 1
-        }
-        for key in incomingTextKeys {
-            guard let layer = textMatchLayers[key] else { continue }
-            addOpacityAnimation(to: layer, from: 0, to: 1, key: "matchedTextAppear")
-            layer.opacity = 1
-        }
-        for key in outgoingIconKeys {
-            guard let layer = startIconLayers[key] else { continue }
-            addOpacityAnimation(to: layer, from: 1, to: 0, key: "matchedIconDisappear")
-            layer.opacity = 0
-        }
-        for key in outgoingTextKeys {
-            guard let layer = startTextLayers[key] else { continue }
-            addOpacityAnimation(to: layer, from: 1, to: 0, key: "matchedTextDisappear")
-            layer.opacity = 0
-        }
-    }
-
-    private func finishMatchedLayerFades(incomingIconKeys: Set<String>,
-                                         outgoingIconKeys: Set<String>,
-                                         incomingTextKeys: Set<String>,
-                                         outgoingTextKeys: Set<String>,
-                                         startIconLayers: [String: CALayer],
-                                         startTextLayers: [String: CATextLayer],
-                                         currentMode: BackendsViewMode) {
-        withoutImplicitAnimations {
-            for key in incomingIconKeys {
-                guard let layer = iconMatchLayers[key] else { continue }
-                layer.removeAnimation(forKey: "matchedIconAppear")
-                layer.opacity = 1
-                layer.isHidden = mode != currentMode
-            }
-            for key in incomingTextKeys {
-                guard let layer = textMatchLayers[key] else { continue }
-                layer.removeAnimation(forKey: "matchedTextAppear")
-                layer.opacity = 1
-                layer.isHidden = mode != currentMode
-            }
-            for key in outgoingIconKeys {
-                guard let layer = startIconLayers[key] else { continue }
-                layer.removeAnimation(forKey: "matchedIconDisappear")
-                layer.opacity = 1
-                layer.isHidden = true
-            }
-            for key in outgoingTextKeys {
-                guard let layer = startTextLayers[key] else { continue }
-                layer.removeAnimation(forKey: "matchedTextDisappear")
-                layer.opacity = 1
-                layer.isHidden = true
-            }
-            if mode == currentMode {
-                updateMatchedLayerVisibility()
-            }
-        }
-    }
-
-    private func flightFrame(for state: TextMatchState) -> CGRect {
-        let width = max(measuredTextWidth(for: state), 1)
-        return CGRect(x: glyphOriginX(for: state),
-                      y: state.frame.minY,
-                      width: width,
-                      height: state.frame.height)
-    }
-
-    private func glyphOriginX(for state: TextMatchState) -> CGFloat {
-        let textWidth = measuredTextWidth(for: state)
-        switch state.alignment {
-        case .center:
-            return state.frame.minX + max((state.frame.width - textWidth) / 2, 0)
-        case .right:
-            return state.frame.minX + max(state.frame.width - textWidth, 0)
-        default:
-            return state.frame.minX
-        }
-    }
-
-    private func measuredTextWidth(for state: TextMatchState) -> CGFloat {
-        let font = NSFont.systemFont(ofSize: state.fontSize, weight: state.weight)
-        let attributes: [NSAttributedString.Key: Any] = [.font: font]
-        let width = (state.title as NSString).size(withAttributes: attributes).width
-        return min(ceil(width), state.frame.width)
-    }
-
-    private func finishMatchedTextTransition(endTextStates: [String: TextMatchState], sharedTextKeys: Set<String>) {
-        withoutImplicitAnimations {
-            for key in sharedTextKeys {
-                guard let state = endTextStates[key],
-                      let layer = textMatchLayers[key] else {
-                    continue
-                }
-                configureTextLayer(layer,
-                                   title: state.title,
-                                   fontSize: state.fontSize,
-                                   weight: state.weight,
-                                   color: .labelColor,
-                                   alignment: state.alignment,
-                                   isWrapped: state.isWrapped)
-                layer.frame = state.frame
-            }
-        }
-    }
-
-    private func visibleModeLayers(for mode: BackendsViewMode) -> [CALayer] {
-        let layers: [CALayer]
-        switch mode {
-        case .apps:
-            layers = [appsLayer]
-        case .backends:
-            layers = [
-                tableHeaderLayer,
-                rowsClipLayer,
-                dividerLayer,
-                logHeaderLayer,
-                logRowsClipLayer
-            ]
-        case .create:
-            layers = [createLayer]
-        }
-        return layers.filter { !$0.isHidden && $0.opacity > 0 }
-    }
-
-    private func prepareCrossfade(from outgoingLayers: [CALayer], to incomingLayers: [CALayer]) {
-        withoutImplicitAnimations {
-            for layer in outgoingLayers {
-                layer.isHidden = false
-                layer.opacity = 1
-            }
-            for layer in incomingLayers {
-                layer.isHidden = false
-                layer.opacity = 0
-            }
-        }
-    }
-
-    private func animateCrossfade(from outgoingLayers: [CALayer], to incomingLayers: [CALayer]) {
-        for layer in outgoingLayers {
-            addOpacityAnimation(to: layer, from: 1, to: 0, key: "outerframeDisappear")
-            layer.opacity = 0
-        }
-        for layer in incomingLayers {
-            addOpacityAnimation(to: layer, from: 0, to: 1, key: "outerframeAppear")
-            layer.opacity = 1
-        }
-    }
-
-    private func addOpacityAnimation(to layer: CALayer, from startOpacity: Float, to endOpacity: Float, key: String) {
-        let animation = CABasicAnimation(keyPath: "opacity")
-        animation.fromValue = startOpacity
-        animation.toValue = endOpacity
-        animation.duration = pageTransitionDuration
-        animation.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-        layer.add(animation, forKey: key)
-    }
-
-    private func finishCrossfade(from outgoingLayers: [CALayer],
-                                 to incomingLayers: [CALayer],
-                                 currentMode: BackendsViewMode) {
-        withoutImplicitAnimations {
-            for layer in outgoingLayers {
-                layer.removeAnimation(forKey: "outerframeDisappear")
-                layer.opacity = 1
-                if mode == currentMode {
-                    layer.isHidden = true
-                }
-            }
-            for layer in incomingLayers {
-                layer.removeAnimation(forKey: "outerframeAppear")
-                layer.opacity = 1
-                if mode == currentMode {
-                    layer.isHidden = false
-                }
-            }
-            if mode != currentMode {
-                for layer in visibleModeLayers(for: mode) {
-                    layer.isHidden = false
-                    layer.opacity = 1
-                }
-            }
-        }
-    }
-
-    private func returnToBackendsFromCreate() {
+    private func returnToAppsFromCreate() {
         if outerframeHost.canGoBackInHistory() {
             outerframeHost.goBackInHistory()
         } else {
-            navigateToMode(.backends, pushHistory: false)
+            navigateToMode(.apps, pushHistory: false)
         }
     }
 
@@ -1550,8 +1190,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         rootLayer.addSublayer(passwordOverlayLayer)
         toolbarLayer.addSublayer(titleLayer)
         toolbarLayer.addSublayer(statusLayer)
-        toolbarLayer.addSublayer(appsToggleLayer)
-        toolbarLayer.addSublayer(backendsToggleLayer)
         toolbarLayer.addSublayer(outerShellActionLayer)
         contentLayer.addSublayer(appsLayer)
         appsLayer.addSublayer(appsScrollContentLayer)
@@ -1624,28 +1262,16 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 iconTransitionLayer.frame = rootLayer.bounds
 
                 titleLayer.frame = .zero
-                let toggleWidth: CGFloat = 184
-                let toggleHeight: CGFloat = 30
-                let toggleX = floor((width - toggleWidth) / 2)
-                let showsModeToggle = mode != .create
-                appsToggleFrame = showsModeToggle ? CGRect(x: toggleX, y: 9, width: 84, height: toggleHeight) : .zero
-                backendsToggleFrame = showsModeToggle ? CGRect(x: toggleX + 86, y: 9, width: 98, height: toggleHeight) : .zero
                 outerShellActionFrame = mode == .apps && outerShellBackend() != nil
                     ? CGRect(x: max(width - horizontalInset - 28, horizontalInset),
                              y: 10,
                              width: 28,
                              height: 28)
                     : .zero
-                appsToggleLayer.frame = appsToggleFrame
-                backendsToggleLayer.frame = backendsToggleFrame
                 outerShellActionLayer.frame = outerShellActionFrame
-                appsToggleLayer.isHidden = !showsModeToggle
-                backendsToggleLayer.isHidden = !showsModeToggle
                 outerShellActionLayer.isHidden = outerShellActionFrame.isEmpty
-                appsToggleLayer.opacity = showsModeToggle ? 1 : 0
-                backendsToggleLayer.opacity = showsModeToggle ? 1 : 0
                 outerShellActionLayer.opacity = outerShellActionFrame.isEmpty ? 0 : 1
-                statusLayer.frame = CGRect(x: 152, y: 14, width: max(toggleX - 170, 1), height: 18)
+                statusLayer.frame = CGRect(x: horizontalInset, y: 14, width: max(width - horizontalInset * 2 - 36, 1), height: 18)
 
                 let contentHeight = contentLayer.bounds.height
                 if mode == .apps {
@@ -1670,32 +1296,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                         renderLogRows()
                     }
                     renderAppsPage()
-                } else if mode == .backends {
-                    outerframeHost.sendTextCursorUpdate(cursors: [])
-                    appsLayer.isHidden = true
-                    tableHeaderLayer.isHidden = false
-                    rowsClipLayer.isHidden = false
-                    dividerLayer.isHidden = selectedServiceID == nil
-                    logHeaderLayer.isHidden = selectedServiceID == nil
-                    logRowsClipLayer.isHidden = selectedServiceID == nil
-                    createLayer.isHidden = true
-                    let tableBottom: CGFloat = 0
-                    let tableAreaHeight = max(contentHeight - tableBottom, 0)
-                    let tableWidth = selectedServiceID == nil ? width : max(floor(width * 0.42), 320)
-                    tableHeaderLayer.frame = CGRect(x: 0, y: tableBottom + max(tableAreaHeight - tableHeaderHeight, 0), width: tableWidth, height: tableHeaderHeight)
-                    rowsClipLayer.frame = CGRect(x: 0, y: tableBottom, width: tableWidth, height: max(tableAreaHeight - tableHeaderHeight, 0))
-                    updateBackendRowsScrollLayerFrame()
-                    if selectedServiceID != nil {
-                        dividerLayer.frame = CGRect(x: tableWidth, y: tableBottom, width: 1, height: tableAreaHeight)
-                        let logX = tableWidth + 1
-                        let logWidth = max(width - logX, 1)
-                        logHeaderLayer.frame = CGRect(x: logX, y: tableBottom + max(tableAreaHeight - logHeaderHeight, 0), width: logWidth, height: logHeaderHeight)
-                        logRowsClipLayer.frame = CGRect(x: logX, y: tableBottom, width: logWidth, height: max(tableAreaHeight - logHeaderHeight, 0))
-                        renderLogHeader()
-                        renderLogRows()
-                    }
-                    renderBackendsHeader()
-                    renderBackendsRows()
                 } else {
                     appsLayer.isHidden = true
                     tableHeaderLayer.isHidden = true
@@ -1727,16 +1327,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
                 titleLayer.foregroundColor = resolvedCGColor(.labelColor)
                 statusLayer.foregroundColor = resolvedCGColor(.secondaryLabelColor)
-                if mode != .create {
-                    appsToggleLayer.applyStyle(textCGColor: resolvedCGColor(mode == .apps ? .white : .controlAccentColor),
-                                               backgroundCGColor: resolvedCGColor(mode == .apps ? .controlAccentColor : NSColor.controlAccentColor.withAlphaComponent(0.12)),
-                                               font: NSFont.systemFont(ofSize: 12, weight: .medium))
-                    backendsToggleLayer.applyStyle(textCGColor: resolvedCGColor(mode == .backends ? .white : .controlAccentColor),
-                                                   backgroundCGColor: resolvedCGColor(mode == .backends ? .controlAccentColor : NSColor.controlAccentColor.withAlphaComponent(0.12)),
-                                                   font: NSFont.systemFont(ofSize: 12, weight: .medium))
-                    outerShellActionLayer.applyStyle(tintCGColor: resolvedCGColor(.secondaryLabelColor),
-                                                     backgroundCGColor: resolvedCGColor(.clear))
-                }
+                outerShellActionLayer.applyStyle(tintCGColor: resolvedCGColor(.secondaryLabelColor),
+                                                 backgroundCGColor: resolvedCGColor(.clear))
                 updateLogTextContentIfNeeded(text: currentLogText(), force: true)
                 updateLogTextViewport()
                 updateLogTextSelectionLayers(force: true)
@@ -1784,8 +1376,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         switch mode {
         case .apps:
             clipLayer = appsLayer
-        case .backends:
-            clipLayer = rowsClipLayer
         case .create:
             clipLayer = nil
         }
@@ -1832,9 +1422,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             switch mode {
             case .apps:
                 updateAppsScrollLayerFrames()
-                offsetMatchedLayers(deltaY: deltaY)
-            case .backends:
-                updateBackendRowsScrollLayerFrame()
                 offsetMatchedLayers(deltaY: deltaY)
             case .create:
                 break
@@ -2507,10 +2094,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         if layer.superlayer == nil {
             iconTransitionLayer.addSublayer(layer)
         }
-        if !isRecordingTransitionTargets || existingLayer == nil {
-            configureLauncherIconLayer(layer, image: image, symbolName: nil, title: title, iconSize: frame.width)
-            layer.frame = frame
-        }
+        configureLauncherIconLayer(layer, image: image, symbolName: nil, title: title, iconSize: frame.width)
+        layer.frame = frame
         layer.isHidden = false
         layer.opacity = 1
         iconMatchStates[key] = IconMatchState(frame: frame,
@@ -2582,17 +2167,15 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         if layer.superlayer == nil {
             iconTransitionLayer.addSublayer(layer)
         }
-        if !isRecordingTransitionTargets || existingLayer == nil {
-            configureTextLayer(layer,
-                               title: title,
-                               fontSize: fontSize,
-                               weight: weight,
-                               color: .labelColor,
-                               alignment: alignment,
-                               isWrapped: isWrapped,
-                               italic: italic)
-            layer.frame = frame
-        }
+        configureTextLayer(layer,
+                           title: title,
+                           fontSize: fontSize,
+                           weight: weight,
+                           color: .labelColor,
+                           alignment: alignment,
+                           isWrapped: isWrapped,
+                           italic: italic)
+        layer.frame = frame
         layer.isHidden = false
         layer.opacity = 1
         textMatchStates[key] = TextMatchState(frame: frame,
@@ -3755,7 +3338,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         if !quiet {
             backendError = ""
             updateStatusText()
-            renderBackendsRows()
         }
         urlSession.dataTask(with: backendsEndpoint) { [weak self] data, response, error in
             Task { @MainActor in
@@ -4331,7 +3913,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                             self.createValues.removeAll()
                             self.applyRecipeDefaults(overwrite: true)
                             self.pendingFilePicker = nil
-                            self.navigateToMode(.backends, pushHistory: false)
+                            self.navigateToMode(.apps, pushHistory: false)
                             self.fetchBackends()
                         }
                 } else {
@@ -4548,7 +4130,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         case 36, 76:
             submitCreateForm()
         case 53:
-            returnToBackendsFromCreate()
+            returnToAppsFromCreate()
         default:
             if let characters, !characters.isEmpty {
                 insertCreateText(characters)
@@ -4691,7 +4273,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             if pendingFilePicker != nil {
                 dismissFilePicker()
             } else {
-                returnToBackendsFromCreate()
+                returnToAppsFromCreate()
             }
             return
         }
@@ -5130,7 +4712,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func isPointInLogDismissButton(_ point: CGPoint) -> Bool {
-        guard (mode == .backends || mode == .apps),
+        guard mode == .apps,
               selectedServiceID != nil,
               !logHeaderLayer.isHidden else { return false }
         let localPoint = logHeaderDetailPoint(fromRootPoint: point)
@@ -5138,7 +4720,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func isPointInLogHeaderDetail(_ point: CGPoint) -> Bool {
-        guard (mode == .backends || mode == .apps),
+        guard mode == .apps,
               selectedServiceID != nil,
               !logHeaderLayer.isHidden else { return false }
         let localPoint = logHeaderDetailPoint(fromRootPoint: point)
@@ -5146,7 +4728,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func isPointInLogSelector(_ point: CGPoint) -> Bool {
-        guard (mode == .backends || mode == .apps),
+        guard mode == .apps,
               selectedServiceID != nil,
               !logHeaderLayer.isHidden,
               !logSelectorFrame.isEmpty else { return false }
@@ -5311,7 +4893,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func isPointInLogTextRegion(_ point: CGPoint) -> Bool {
-        guard mode == .backends,
+        guard mode == .apps,
               selectedServiceID != nil,
               pendingInstallBackend == nil,
               pendingPasswordAction == nil,
@@ -5549,7 +5131,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private func handleScroll(at point: CGPoint, delta: CGPoint, precise: Bool) {
         let multiplier: CGFloat = precise ? 1 : backendRowHeight
         let previousAppsScroll = appsScroll
-        let previousBackendScroll = backendScroll
         if mode == .apps {
             let contentPoint = contentLayer.convert(point, from: rootLayer)
             if selectedServiceID != nil && logRowsClipLayer.frame.contains(contentPoint) {
@@ -5562,19 +5143,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 return
             } else {
                 appsScroll -= delta.y * multiplier
-            }
-        } else if mode == .backends {
-            let contentPoint = contentLayer.convert(point, from: rootLayer)
-            if selectedServiceID != nil && logRowsClipLayer.frame.contains(contentPoint) {
-                logScrollbarController?.cancelAnimation()
-                shouldScrollLogToBottomOnNextLayout = false
-                logScroll -= delta.y * (precise ? 1 : logScrollLineHeight)
-                logScroll = clampedLogScroll(logScroll)
-                updateLogTextViewport()
-                updateLogTextSelectionLayers()
-                return
-            } else {
-                backendScroll -= delta.y * multiplier
             }
         } else if mode == .create {
             if pendingFilePicker != nil {
@@ -5592,8 +5160,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         clampScrollOffsets()
         if mode == .apps {
             scrollCurrentModeWithoutRerender(deltaY: appsScroll - previousAppsScroll)
-        } else if mode == .backends {
-            scrollCurrentModeWithoutRerender(deltaY: backendScroll - previousBackendScroll)
         } else {
             updateLayout()
         }
@@ -5645,7 +5211,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             return
         }
 
-        if (mode == .backends || mode == .apps),
+        if mode == .apps,
            selectedServiceID != nil,
            logScrollbarController?.handleMouseDown(at: rootLayer.convert(point, to: logRowsClipLayer)) == true {
             return
@@ -5658,15 +5224,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             showBackendActionsMenu(for: backend, at: point)
             return
         }
-        if mode != .create, appsToggleFrame.contains(toolbarPoint) {
-            navigateToMode(.apps, pushHistory: true)
-            return
-        }
-        if mode != .create, backendsToggleFrame.contains(toolbarPoint) {
-            navigateToMode(.backends, pushHistory: true)
-            return
-        }
-
         let contentPoint = contentLayer.convert(point, from: rootLayer)
         if mode == .apps {
             if handleLogHeaderMouseDown(at: point, modifierFlags: modifierFlags, clickCount: clickCount) {
@@ -5697,51 +5254,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                                 isDragging: false)
                 return
             }
-        } else if mode == .backends {
-            if handleLogHeaderMouseDown(at: point, modifierFlags: modifierFlags, clickCount: clickCount) {
-                return
-            }
-            if handleLogMouseDown(at: point, modifierFlags: modifierFlags, clickCount: clickCount) {
-                return
-            }
-            let rowsPoint = backendRowsContentLayer.convert(contentPoint, from: contentLayer)
-            if newBackendRowFrame.contains(rowsPoint) {
-                navigateToMode(.create, pushHistory: true)
-                return
-            }
-            if let action = backendActionFrames.first(where: { $0.frame.contains(rowsPoint) }) {
-                if action.operation == "open" {
-                    openFrontend(for: action.row, opensInNewTab: modifierFlags.contains(.command))
-                } else if action.operation == "menu" {
-                    showBackendActionsMenu(for: action.row.backend, at: point)
-                } else {
-                    performControlAction(for: action.row.backend, operation: action.operation)
-                }
-                return
-            }
-            if let row = backendRowFrames.first(where: { $0.frame.contains(rowsPoint) }) {
-                if row.row.serviceID == selectedServiceID {
-                    clearLogSelection()
-                    restartEventWatch(resetVersions: true)
-                    updateLayout()
-                } else {
-                    selectedServiceID = row.row.serviceID
-                    ensureLogSelection()
-                    logSnapshot = nil
-                    logScroll = 0
-                    setLogTextSelection(nil)
-                    fetchSelectedLog(scrollToBottom: true)
-                    restartEventWatch(resetVersions: true)
-                    updateLayout()
-                }
-                return
-            }
-            if selectedServiceID != nil,
-               (rowsClipLayer.frame.contains(contentPoint) || tableHeaderLayer.frame.contains(contentPoint)) {
-                clearLogSelection()
-                restartEventWatch(resetVersions: true)
-                updateLayout()
-            }
         } else if mode == .create {
             let createPoint = createLayer.convert(contentPoint, from: contentLayer)
             if let menu = bundledAppMenuFrames.first(where: { $0.frame.contains(createPoint) }) {
@@ -5769,7 +5281,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 return
             }
             if cancelCreateFrame.contains(createPoint) {
-                returnToBackendsFromCreate()
+                returnToAppsFromCreate()
                 return
             }
             if let choice = createChoiceFrames.first(where: { $0.frame.contains(createPoint) }) {
@@ -5891,17 +5403,11 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         }
         switch keyCode {
         case 53:
-            if mode == .backends, selectedServiceID != nil {
+            if selectedServiceID != nil {
                 clearLogSelection()
                 restartEventWatch(resetVersions: true)
                 updateLayout()
-            } else {
-                navigateToMode(.apps, pushHistory: true)
             }
-        case 125:
-            moveSelection(delta: 1)
-        case 126:
-            moveSelection(delta: -1)
         default:
             break
         }
@@ -6008,7 +5514,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func moveSelection(delta: Int) {
-        guard mode == .backends else { return }
+        guard mode == .apps else { return }
         let selections = backends.compactMap { backend -> LogSelection? in
             guard !backend.logFiles.isEmpty else { return nil }
             return LogSelection(serviceID: backend.serviceID, logIndex: 0)
@@ -6403,15 +5909,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
     private func clampScrollOffsets() {
         _ = clampAppsScrollUsingRenderedContent()
-        backendScroll = clampedScroll(backendScroll, contentRows: backendListRows().count + 1, rowHeight: backendRowHeight, viewportHeight: rowsClipLayer.bounds.height)
         logScroll = clampedLogScroll(logScroll)
         _ = clampCreateScrollUsingRenderedContent()
-    }
-
-    private func clampedScroll(_ value: CGFloat, contentRows: Int, rowHeight: CGFloat, viewportHeight: CGFloat) -> CGFloat {
-        let contentHeight = CGFloat(contentRows) * rowHeight
-        let maxScroll = max(contentHeight - viewportHeight, 0)
-        return min(max(value, 0), maxScroll)
     }
 
     private func clampedLogScroll(_ value: CGFloat) -> CGFloat {
