@@ -176,7 +176,7 @@ static const BundledAppDefinition kBundledApps[] = {
         .icon_name = "app-icon.png",
         .source_name = "TopBackend.c",
         .socket_name = "dev.outergroup.Top",
-        .socket_activated = false,
+        .socket_activated = true,
         .supports_root = true,
         .root_only = false,
         .archive_name = "Top.tar.gz",
@@ -8069,9 +8069,11 @@ static bool install_bundled_app(const BundledAppDefinition *app, const char *sco
         if (quoted_socket_unit[0]) {
             fprintf(script,
                     "timeout 12s systemctl --system disable --now %s >/dev/null 2>&1 || true\n"
+                    "timeout 12s systemctl --system disable %s >/dev/null 2>&1 || true\n"
                     "timeout 12s systemctl --system stop %s >/dev/null 2>&1 || true\n"
                     "timeout 5s systemctl --system reset-failed %s >/dev/null 2>&1 || true\n",
                     quoted_socket_unit,
+                    quoted_unit,
                     quoted_unit,
                     quoted_socket_unit);
         }
