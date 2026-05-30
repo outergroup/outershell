@@ -33,6 +33,9 @@ private struct BackendRecord: Decodable {
     let isBundled: Bool?
     let isInstalled: Bool?
     let isMigration: Bool?
+    let supportsRoot: Bool?
+    let rootOnly: Bool?
+    let hasRootSupport: Bool?
     let iconSymbolName: String?
     let launchdPlistPath: String
     let ownsLaunchdPlist: Bool
@@ -271,6 +274,9 @@ private extension BackendRecord {
                              isBundled: (flags & 0x04) != 0,
                              isInstalled: (flags & 0x08) != 0,
                              isMigration: (flags & 0x10) != 0,
+                             supportsRoot: (flags & 0x40) != 0,
+                             rootOnly: (flags & 0x80) != 0,
+                             hasRootSupport: (flags & 0x100) != 0,
                              iconSymbolName: emptyToNil(try reader.stringRef(at: 48)),
                              launchdPlistPath: try reader.stringRef(at: 56),
                              ownsLaunchdPlist: (flags & 0x20) != 0,
@@ -414,10 +420,29 @@ private enum BackendsViewMode {
     case create
 }
 
-private struct AppLauncherItem {
+private struct AppLauncherEndpoint {
     let backend: BackendRecord
     let frontend: FrontendRecord
     let frontendIndex: Int
+}
+
+private struct AppLauncherItem {
+    let identityKey: String
+    let primaryEndpoint: AppLauncherEndpoint
+    let userEndpoint: AppLauncherEndpoint?
+    let rootEndpoint: AppLauncherEndpoint?
+
+    var backend: BackendRecord {
+        primaryEndpoint.backend
+    }
+
+    var frontend: FrontendRecord {
+        primaryEndpoint.frontend
+    }
+
+    var frontendIndex: Int {
+        primaryEndpoint.frontendIndex
+    }
 
     var displayName: String {
         let frontendName = frontend.name.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -438,7 +463,7 @@ private struct AppLauncherItem {
     }
 
     var iconKey: String {
-        "\(backend.serviceID):frontend:\(frontendIndex)"
+        identityKey
     }
 }
 
@@ -451,16 +476,34 @@ private struct BackendListRow {
     var serviceID: String { backend.serviceID }
 
     var iconKey: String? {
-        guard let frontendIndex else { return nil }
-        return "\(backend.serviceID):frontend:\(frontendIndex)"
+        guard let frontendIndex,
+              let frontend else { return nil }
+        return frontendIdentityKey(backend: backend, frontend: frontend, frontendIndex: frontendIndex)
     }
 
     var rowID: String {
         if let frontendIndex {
-            return "\(backend.serviceID):frontend:\(frontendIndex)"
+            return "\(backendIdentityKey(backend)):frontend:\(frontendIndex)"
         }
-        return "\(backend.serviceID):backend"
+        return "\(backendIdentityKey(backend)):backend"
     }
+}
+
+private func backendIdentityKey(_ backend: BackendRecord) -> String {
+    let path = backend.serviceUnitPath ?? backend.serviceUnit
+    return "\(backend.serviceID):\(backend.serviceScope):\(path)"
+}
+
+private func frontendIdentityKey(backend: BackendRecord, frontend: FrontendRecord, frontendIndex: Int) -> String {
+    let endpoint: String
+    if !frontend.socketPath.isEmpty {
+        endpoint = frontend.socketPath
+    } else if frontend.port > 0 {
+        endpoint = "port:\(frontend.port)"
+    } else {
+        endpoint = frontend.url
+    }
+    return "\(backendIdentityKey(backend)):frontend:\(frontendIndex):\(endpoint)"
 }
 
 private struct LogVisualLine {
@@ -752,6 +795,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private var textMatchLayers: [String: CATextLayer] = [:]
     private var isRecordingTransitionTargets = false
     private var pendingMenuActions: [UUID: (serviceID: String, operationByItemID: [String: String])] = [:]
+    private var pendingAppMenuActions: [UUID: (item: AppLauncherItem, operationByItemID: [String: String])] = [:]
     private var pendingLogMenuSelections: [UUID: (serviceID: String, logIndexByItemID: [String: Int])] = [:]
     private var logSelectorFrame = CGRect.zero
     private var recipeFrames: [(frame: CGRect, recipeID: String)] = []
@@ -770,8 +814,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private var passwordCancelFrame = CGRect.zero
     private var passwordPanelFrame = CGRect.zero
     private var pendingInstallBackend: BackendRecord?
+    private var pendingInstallOperation: String = "run"
     private var installPanelFrame = CGRect.zero
     private var installConfirmFrame = CGRect.zero
+    private var installRootConfirmFrame = CGRect.zero
     private var installCancelFrame = CGRect.zero
     private var filePickerPanelFrame = CGRect.zero
     private var filePickerEntryFrames: [(frame: CGRect, entry: FilePickerEntryRecord)] = []
@@ -2446,7 +2492,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         }) else {
             return false
         }
-        let key = "\(row.backend.serviceID):frontend:\(match.offset)"
+        let key = frontendIdentityKey(backend: row.backend, frontend: match.element, frontendIndex: match.offset)
         let frame = rootLayer.convert(cellFrame(column: column, y: y, xOffset: xOffset), from: rowLayer)
         recordMatchedText(key: key,
                           frame: frame,
@@ -2524,6 +2570,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             installOverlayLayer.isHidden = true
             installPanelFrame = .zero
             installConfirmFrame = .zero
+            installRootConfirmFrame = .zero
             installCancelFrame = .zero
             return
         }
@@ -2532,8 +2579,12 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         installOverlayLayer.frame = CGRect(x: 0, y: 0, width: width, height: height)
         installOverlayLayer.backgroundColor = resolvedCGColor(NSColor.black.withAlphaComponent(0.18))
 
-        let panelWidth = min(max(width - 48, 280), 390)
-        let panelHeight: CGFloat = 170
+        let hasRootChoice = (backend.supportsRoot ?? false) && !(backend.rootOnly ?? false)
+        let isRootOnly = backend.rootOnly ?? false
+        let preferredPanelWidth: CGFloat = hasRootChoice ? 430 : 360
+        let panelWidth = min(max(width - 48, 280), preferredPanelWidth)
+        let stacksButtons = hasRootChoice && panelWidth < 398
+        let panelHeight: CGFloat = stacksButtons ? 208 : 160
         let panelFrame = CGRect(x: floor((width - panelWidth) / 2),
                                 y: floor((height - panelHeight) / 2),
                                 width: panelWidth,
@@ -2568,32 +2619,60 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         panel.addSublayer(title)
 
         let message = makeTextLayer(size: 12, weight: .regular, color: .secondaryLabelColor)
-        message.string = "Outer Shell will download this app and run it as a service."
+        message.string = "Outer Shell will download this app."
         message.isWrapped = true
-        message.frame = CGRect(x: 72, y: panelHeight - 82, width: panelWidth - 90, height: 34)
+        message.frame = CGRect(x: 72, y: panelHeight - 74, width: panelWidth - 90, height: 20)
         panel.addSublayer(message)
 
         let buttonY: CGFloat = 18
-        let installButtonWidth: CGFloat = 74
+        let rootButtonWidth: CGFloat = hasRootChoice ? 156 : 112
+        let installButtonWidth: CGFloat = hasRootChoice ? 118 : (isRootOnly ? 112 : 118)
         let cancelButtonWidth: CGFloat = 70
-        let installLocalFrame = CGRect(x: panelWidth - installButtonWidth - 18,
-                                       y: buttonY,
-                                       width: installButtonWidth,
-                                       height: 30)
-        let cancelLocalFrame = CGRect(x: installLocalFrame.minX - cancelButtonWidth - 8,
+        let rootLocalFrame: CGRect
+        let installLocalFrame: CGRect
+        let cancelLocalFrame: CGRect
+        if stacksButtons {
+            let buttonWidth = panelWidth - 36
+            rootLocalFrame = CGRect(x: 18, y: buttonY, width: buttonWidth, height: 30)
+            installLocalFrame = CGRect(x: 18, y: buttonY + 38, width: buttonWidth, height: 30)
+            cancelLocalFrame = CGRect(x: 18, y: buttonY + 76, width: buttonWidth, height: 30)
+        } else {
+            rootLocalFrame = (hasRootChoice || isRootOnly)
+                ? CGRect(x: panelWidth - rootButtonWidth - 18,
+                         y: buttonY,
+                         width: rootButtonWidth,
+                         height: 30)
+                : .zero
+            installLocalFrame = isRootOnly
+                ? .zero
+                : CGRect(x: (hasRootChoice ? rootLocalFrame.minX : panelWidth) - installButtonWidth - 8,
+                         y: buttonY,
+                         width: installButtonWidth,
+                         height: 30)
+            let cancelAnchorX = isRootOnly ? rootLocalFrame.minX : installLocalFrame.minX
+            cancelLocalFrame = CGRect(x: cancelAnchorX - cancelButtonWidth - 8,
                                       y: buttonY,
                                       width: cancelButtonWidth,
                                       height: 30)
+        }
         installConfirmFrame = installLocalFrame.offsetBy(dx: panelFrame.minX, dy: panelFrame.minY)
+        installRootConfirmFrame = (hasRootChoice || isRootOnly) ? rootLocalFrame.offsetBy(dx: panelFrame.minX, dy: panelFrame.minY) : .zero
         installCancelFrame = cancelLocalFrame.offsetBy(dx: panelFrame.minX, dy: panelFrame.minY)
 
         let cancelButton = makeButtonLayer(title: "Cancel", emphasized: false)
         cancelButton.frame = cancelLocalFrame
         panel.addSublayer(cancelButton)
 
-        let installButton = makeButtonLayer(title: "Install", emphasized: true)
-        installButton.frame = installLocalFrame
-        panel.addSublayer(installButton)
+        if !isRootOnly {
+            let installButton = makeButtonLayer(title: "Enable for user", emphasized: true)
+            installButton.frame = installLocalFrame
+            panel.addSublayer(installButton)
+        }
+        if hasRootChoice || isRootOnly {
+            let rootButton = makeButtonLayer(title: hasRootChoice ? "Enable for user and root" : "Enable for root", emphasized: true)
+            rootButton.frame = rootLocalFrame
+            panel.addSublayer(rootButton)
+        }
     }
 
     private func renderPasswordPromptIfNeeded(width: CGFloat, height: CGFloat) {
@@ -3888,7 +3967,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         switch operation {
         case "stop":
             status = "stopped"
-        case "start", "restart", "run", "install", "runUser", "installUser", "runRoot", "installRoot":
+        case "start", "restart", "run", "install", "runUser", "installUser", "runRoot", "installRoot", "addRootSupport":
             status = "running"
         default:
             return
@@ -3906,6 +3985,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                  isBundled: backend.isBundled,
                                  isInstalled: operation == "run" || operation == "install" || operation == "runUser" || operation == "installUser" || operation == "runRoot" || operation == "installRoot" ? true : backend.isInstalled,
                                  isMigration: backend.isMigration,
+                                 supportsRoot: backend.supportsRoot,
+                                 rootOnly: backend.rootOnly,
+                                 hasRootSupport: operation == "runRoot" || operation == "installRoot" || operation == "addRootSupport" ? true : (operation == "removeRootSupport" ? false : backend.hasRootSupport),
                                  iconSymbolName: backend.iconSymbolName,
                                  launchdPlistPath: backend.launchdPlistPath,
                                  ownsLaunchdPlist: backend.ownsLaunchdPlist,
@@ -3939,6 +4021,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                  isBundled: backend.isBundled,
                                  isInstalled: backend.isInstalled,
                                  isMigration: backend.isMigration,
+                                 supportsRoot: backend.supportsRoot,
+                                 rootOnly: backend.rootOnly,
+                                 hasRootSupport: backend.hasRootSupport,
                                  iconSymbolName: backend.iconSymbolName,
                                  launchdPlistPath: backend.launchdPlistPath,
                                  ownsLaunchdPlist: backend.ownsLaunchdPlist,
@@ -3967,16 +4052,39 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func openLauncherItem(_ item: AppLauncherItem, opensInNewTab: Bool) {
-        guard let url = frontendNavigationURL(item.frontend) else {
+        openLauncherEndpoint(item.primaryEndpoint, displayName: item.displayName, opensInNewTab: opensInNewTab)
+    }
+
+    private func openLauncherEndpoint(_ endpoint: AppLauncherEndpoint, displayName: String, opensInNewTab: Bool) {
+        guard let url = frontendNavigationURL(endpoint.frontend) else {
             backendError = "Could not build frontend URL."
             updateLayout()
             return
         }
 
         if opensInNewTab {
-            outerframeHost.openNewTab(with: url, displayString: item.displayName)
+            outerframeHost.openNewTab(with: url, displayString: displayName)
         } else {
             outerframeHost.navigate(to: url)
+        }
+    }
+
+    private func performAppMenuAction(_ item: AppLauncherItem, operation: String) {
+        switch operation {
+        case "run":
+            if let userEndpoint = item.userEndpoint {
+                openLauncherEndpoint(userEndpoint, displayName: item.displayName, opensInNewTab: false)
+            } else {
+                openLauncherItem(item, opensInNewTab: false)
+            }
+        case "runRoot":
+            if let rootEndpoint = item.rootEndpoint {
+                openLauncherEndpoint(rootEndpoint, displayName: item.displayName, opensInNewTab: false)
+            } else {
+                performControlAction(for: item.backend, operation: "runRoot")
+            }
+        default:
+            break
         }
     }
 
@@ -5118,7 +5226,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private func handleMouseMoved(to point: CGPoint, modifierFlags: NSEvent.ModifierFlags) {
         _ = modifierFlags
         if pendingInstallBackend != nil {
-            setCursorIfNeeded((installConfirmFrame.contains(point) || installCancelFrame.contains(point)) ? .pointingHand : .arrow)
+            setCursorIfNeeded((installConfirmFrame.contains(point) || installRootConfirmFrame.contains(point) || installCancelFrame.contains(point)) ? .pointingHand : .arrow)
             return
         }
         if pendingFilePicker != nil, mode == .create {
@@ -5209,8 +5317,16 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             return
         }
 
-        guard pendingPasswordAction == nil, mode == .create else { return }
         let contentPoint = contentLayer.convert(point, from: rootLayer)
+        if mode == .apps {
+            let appsPoint = appsScrollContentLayer.convert(contentPoint, from: contentLayer)
+            if let card = appCardFrames.first(where: { $0.frame.contains(appsPoint) }) {
+                showAppActionsMenu(for: card.item, at: point)
+            }
+            return
+        }
+
+        guard pendingPasswordAction == nil, mode == .create else { return }
         let createPoint = createLayer.convert(contentPoint, from: contentLayer)
         guard let key = createFieldFrames.first(where: { $0.frame.contains(createPoint) })?.key else { return }
         let index = characterIndexForCreateField(key: key, xPosition: createPoint.x)
@@ -5273,6 +5389,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         pendingCreateTextDrag = nil
         if pendingInstallBackend != nil {
             if installConfirmFrame.contains(point) {
+                pendingInstallOperation = "run"
+                confirmPendingInstall()
+            } else if installRootConfirmFrame.contains(point) {
+                pendingInstallOperation = "runRoot"
                 confirmPendingInstall()
             } else if installCancelFrame.contains(point) || !installPanelFrame.contains(point) {
                 dismissInstallPrompt()
@@ -5333,6 +5453,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 return
             }
             if let card = appCardFrames.first(where: { $0.frame.contains(appsPoint) }) {
+                if modifierFlags.contains(.control) {
+                    showAppActionsMenu(for: card.item, at: point)
+                    return
+                }
                 pendingAppDrag = PendingAppDrag(item: card.item,
                                                 startPoint: point,
                                                 currentPoint: point,
@@ -5552,18 +5676,22 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private func showInstallPrompt(for backend: BackendRecord) {
         blurCreateField()
         pendingInstallBackend = backend
+        pendingInstallOperation = (backend.rootOnly ?? false) ? "runRoot" : "run"
         updateLayout()
     }
 
     private func dismissInstallPrompt() {
         pendingInstallBackend = nil
+        pendingInstallOperation = "run"
         updateLayout()
     }
 
     private func confirmPendingInstall() {
         guard let backend = pendingInstallBackend else { return }
+        let operation = (backend.rootOnly ?? false) ? "runRoot" : pendingInstallOperation
         pendingInstallBackend = nil
-        performControlAction(for: backend, operation: "run")
+        pendingInstallOperation = "run"
+        performControlAction(for: backend, operation: operation)
     }
 
     private func handleInstallPromptKeyDown(keyCode: UInt16) {
@@ -5836,33 +5964,78 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func appLauncherItems() -> [AppLauncherItem] {
-        backends.flatMap { backend -> [AppLauncherItem] in
+        appLauncherItems(from: backends)
+    }
+
+    private func appLauncherItems(from records: [BackendRecord]) -> [AppLauncherItem] {
+        let endpoints = records.flatMap { backend -> [AppLauncherEndpoint] in
             guard !backend.isBackendsSelf else { return [] }
             return backend.frontends.enumerated().compactMap { index, frontend in
                 guard frontend.hasEndpoint else { return nil }
-                return AppLauncherItem(backend: backend, frontend: frontend, frontendIndex: index)
+                return AppLauncherEndpoint(backend: backend, frontend: frontend, frontendIndex: index)
             }
         }
+
+        let grouped = Dictionary(grouping: endpoints) { endpoint in
+            appLauncherGroupingKey(backend: endpoint.backend, frontend: endpoint.frontend)
+        }
+        return grouped.map { key, endpoints in
+            let sorted = endpoints.sorted { lhs, rhs in
+                if lhs.backend.serviceScope == "system", rhs.backend.serviceScope != "system" { return false }
+                if lhs.backend.serviceScope != "system", rhs.backend.serviceScope == "system" { return true }
+                return frontendIdentityKey(backend: lhs.backend, frontend: lhs.frontend, frontendIndex: lhs.frontendIndex)
+                    .localizedStandardCompare(frontendIdentityKey(backend: rhs.backend, frontend: rhs.frontend, frontendIndex: rhs.frontendIndex)) == .orderedAscending
+            }
+            let userEndpoint = sorted.first { $0.backend.serviceScope != "system" }
+            let rootEndpoint = sorted.first { $0.backend.serviceScope == "system" }
+            let primaryEndpoint = userEndpoint ?? rootEndpoint ?? sorted[0]
+            return AppLauncherItem(identityKey: key,
+                                   primaryEndpoint: primaryEndpoint,
+                                   userEndpoint: userEndpoint,
+                                   rootEndpoint: rootEndpoint)
+        }
+        .sorted { $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending }
+    }
+
+    private func appLauncherGroupingKey(backend: BackendRecord, frontend: FrontendRecord) -> String {
+        let frontendName = frontend.name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let displayName = frontendName.isEmpty ? backend.displayName.trimmingCharacters(in: .whitespacesAndNewlines) : frontendName
+        let endpointPath: String
+        if !frontend.socketPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            endpointPath = pathAndQuery(fromFrontendURL: frontend.url, socketPath: frontend.socketPath)
+        } else if frontend.port > 0 {
+            endpointPath = pathAndQuery(fromFrontendURL: frontend.url, socketPath: nil)
+        } else if let parsed = URL(string: frontend.url), parsed.scheme != nil {
+            endpointPath = normalizedPathAndQuery((parsed.path.isEmpty ? "/" : parsed.path) + (parsed.query.map { "?\($0)" } ?? ""))
+        } else {
+            endpointPath = normalizedPathAndQuery(frontend.url)
+        }
+        return [
+            "app",
+            backend.serviceID,
+            displayName,
+            endpointPath
+        ].joined(separator: "\u{1f}")
     }
 
     private func appLauncherSignature(for backends: [BackendRecord]) -> String {
-        backends.flatMap { backend -> [String] in
-            guard !backend.isBackendsSelf else { return [] }
-            return backend.frontends.compactMap { frontend in
-                guard frontend.hasEndpoint else { return nil }
-                let iconBytes = frontend.iconData?.count ?? 0
-                return [
-                    backend.serviceID,
-                    backend.displayName,
-                    frontend.url,
-                    frontend.name,
-                    frontend.socketPath,
-                    String(frontend.port),
-                    frontend.iconPath ?? "",
-                    String(iconBytes),
-                    frontend.listName
-                ].joined(separator: "\u{1f}")
-            }
+        appLauncherItems(from: backends).map { item in
+            let iconBytes = item.frontend.iconData?.count ?? 0
+            return [
+                item.identityKey,
+                item.backend.serviceID,
+                item.backend.serviceScope,
+                item.backend.displayName,
+                item.frontend.url,
+                item.frontend.name,
+                item.frontend.socketPath,
+                String(item.frontend.port),
+                item.frontend.iconPath ?? "",
+                String(iconBytes),
+                item.frontend.listName,
+                item.userEndpoint.map { frontendIdentityKey(backend: $0.backend, frontend: $0.frontend, frontendIndex: $0.frontendIndex) } ?? "",
+                item.rootEndpoint.map { frontendIdentityKey(backend: $0.backend, frontend: $0.frontend, frontendIndex: $0.frontendIndex) } ?? ""
+            ].joined(separator: "\u{1f}")
         }
         .sorted()
         .joined(separator: "\u{1e}")
@@ -6182,7 +6355,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             return [("Migrate", "migrateRoot")]
         }
         if backend.isBundledPlaceholder {
-            return [("Run", "run"), ("Actions", "menu")]
+            let operation = (backend.rootOnly ?? false) ? "runRoot" : "run"
+            let title = (backend.rootOnly ?? false) ? "Run as root" : "Run"
+            return [(title, operation), ("Actions", "menu")]
         }
         var actions: [(title: String, operation: String)] = []
         if row.frontend?.hasEndpoint == true {
@@ -6232,15 +6407,22 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             return
         }
         if backend.isBundled ?? false {
-            if backend.serviceScope == "system" {
-                operationByItemID["runUser"] = "runUser"
-                items.append(OuterframeContextMenuItem(id: "runUser",
-                                                       title: "Reinstall as User",
+            if backend.isBundledPlaceholder {
+                operationByItemID["run"] = (backend.rootOnly ?? false) ? "runRoot" : "run"
+                items.append(OuterframeContextMenuItem(id: "run",
+                                                       title: (backend.rootOnly ?? false) ? "Run as root" : "Run",
                                                        isEnabled: true))
-            } else {
-                operationByItemID["runRoot"] = "runRoot"
-                items.append(OuterframeContextMenuItem(id: "runRoot",
-                                                       title: backend.isBundledPlaceholder ? "Run as Root" : "Reinstall as Root",
+                if (backend.supportsRoot ?? false) && !(backend.rootOnly ?? false) {
+                    operationByItemID["runRoot"] = "runRoot"
+                    items.append(OuterframeContextMenuItem(id: "runRoot",
+                                                           title: "Run as root",
+                                                           isEnabled: true))
+                }
+            } else if (backend.supportsRoot ?? false) {
+                let hasRootSupport = backend.hasRootSupport ?? (backend.serviceScope == "system")
+                operationByItemID["rootSupport"] = hasRootSupport ? "removeRootSupport" : "addRootSupport"
+                items.append(OuterframeContextMenuItem(id: "rootSupport",
+                                                       title: hasRootSupport ? "Remove Root Support" : "Add Root Support",
                                                        isEnabled: true))
             }
         }
@@ -6252,6 +6434,37 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         }
         guard !items.isEmpty else { return }
         pendingMenuActions[menuID] = (backend.serviceID, operationByItemID)
+        outerframeHost.showContextMenu(menuID: menuID,
+                                       items: items,
+                                       at: point)
+    }
+
+    private func showAppActionsMenu(for item: AppLauncherItem, at point: CGPoint) {
+        let menuID = UUID()
+        var operationByItemID: [String: String] = [:]
+        var items: [OuterframeContextMenuItem] = []
+
+        if item.backend.rootOnly ?? false {
+            operationByItemID["runRoot"] = "runRoot"
+            items.append(OuterframeContextMenuItem(id: "runRoot",
+                                                   title: "Run as root",
+                                                   isEnabled: true))
+        } else {
+            if item.userEndpoint != nil || item.rootEndpoint == nil {
+                operationByItemID["run"] = "run"
+                items.append(OuterframeContextMenuItem(id: "run",
+                                                       title: "Run",
+                                                       isEnabled: true))
+            }
+        }
+        if ((item.backend.supportsRoot ?? false) || item.rootEndpoint != nil) && !(item.backend.rootOnly ?? false) {
+            operationByItemID["runRoot"] = "runRoot"
+            items.append(OuterframeContextMenuItem(id: "runRoot",
+                                                   title: "Run as root",
+                                                   isEnabled: true))
+        }
+
+        pendingAppMenuActions[menuID] = (item, operationByItemID)
         outerframeHost.showContextMenu(menuID: menuID,
                                        items: items,
                                        at: point)
@@ -6280,6 +6493,12 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         if let menuSelection = pendingLogMenuSelections.removeValue(forKey: menuID),
            let logIndex = menuSelection.logIndexByItemID[itemID] {
             selectLog(serviceID: menuSelection.serviceID, logIndex: logIndex)
+            return
+        }
+
+        if let appAction = pendingAppMenuActions.removeValue(forKey: menuID),
+           let operation = appAction.operationByItemID[itemID] {
+            performAppMenuAction(appAction.item, operation: operation)
             return
         }
 
@@ -6359,10 +6578,12 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         switch operation {
         case "run":
             return "Installing \(backend.displayName)..."
-        case "runRoot", "installRoot":
-            return "Installing \(backend.displayName) as root..."
+        case "runRoot", "installRoot", "addRootSupport":
+            return "Adding root support for \(backend.displayName)..."
         case "runUser", "installUser":
-            return "Installing \(backend.displayName) as user..."
+            return "Installing \(backend.displayName)..."
+        case "removeRootSupport":
+            return "Removing root support from \(backend.displayName)..."
         case "uninstall":
             return "Uninstalling \(backend.displayName)..."
         case "uninstallOuterShell":

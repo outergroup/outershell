@@ -135,6 +135,8 @@ typedef struct {
     const char *source_name;
     const char *socket_name;
     bool socket_activated;
+    bool supports_root;
+    bool root_only;
     const char *archive_name;
     const char *version;
 } BundledAppDefinition;
@@ -173,6 +175,8 @@ static const BundledAppDefinition kBundledApps[] = {
         .source_name = "TopBackend.c",
         .socket_name = "dev.outergroup.Top",
         .socket_activated = false,
+        .supports_root = true,
+        .root_only = false,
         .archive_name = "Top.tar.gz",
         .version = "1"
     },
@@ -189,6 +193,8 @@ static const BundledAppDefinition kBundledApps[] = {
         .source_name = "FilesBackend.c",
         .socket_name = "dev.outergroup.Files",
         .socket_activated = true,
+        .supports_root = true,
+        .root_only = false,
         .archive_name = "Files.tar.gz",
         .version = "1"
     },
@@ -205,6 +211,8 @@ static const BundledAppDefinition kBundledApps[] = {
         .source_name = "PlaintextBackend.c",
         .socket_name = "dev.outergroup.Plaintext",
         .socket_activated = true,
+        .supports_root = true,
+        .root_only = false,
         .archive_name = "Plaintext.tar.gz",
         .version = "1"
     },
@@ -221,6 +229,8 @@ static const BundledAppDefinition kBundledApps[] = {
         .source_name = "NetworkInspectorBackend.c",
         .socket_name = "dev.outergroup.NetworkInspector",
         .socket_activated = true,
+        .supports_root = true,
+        .root_only = false,
         .archive_name = "NetworkInspector.tar.gz",
         .version = "1"
     },
@@ -237,6 +247,8 @@ static const BundledAppDefinition kBundledApps[] = {
         .source_name = "TraceBackend.c",
         .socket_name = "dev.outergroup.Firehose",
         .socket_activated = true,
+        .supports_root = true,
+        .root_only = true,
         .archive_name = "Firehose.tar.gz",
         .version = "1"
     }
@@ -895,6 +907,11 @@ static bool root_helper_registry_clear_frontends(const char *service_id,
                                                 bool *needs_password,
                                                 char *message,
                                                 size_t message_size);
+static bool remove_bundled_root_support(const BundledAppDefinition *app,
+                                        const char *sudo_password,
+                                        bool *needs_password,
+                                        char *message,
+                                        size_t message_size);
 #endif
 
 static const BundledAppDefinition *bundled_app_for_service_id(const char *service_id) {
@@ -3486,6 +3503,9 @@ static bool lookup_launchd_backend_any(const char *service_id,
 #define BACKEND_FLAG_IS_INSTALLED 0x08u
 #define BACKEND_FLAG_IS_MIGRATION 0x10u
 #define BACKEND_FLAG_OWNS_LAUNCHD_PLIST 0x20u
+#define BACKEND_FLAG_SUPPORTS_ROOT 0x40u
+#define BACKEND_FLAG_ROOT_ONLY 0x80u
+#define BACKEND_FLAG_HAS_ROOT_SUPPORT 0x100u
 #define LOG_FILE_FLAG_READABLE 0x01u
 #define FILE_PICKER_FLAG_IS_DIRECTORY 0x01u
 #define ACTION_FLAG_OK 0x01u
@@ -3773,6 +3793,18 @@ static bool append_registered_backend_payloads(sqlite3 *database,
             }
         }
         if (bundled_app) flags |= BACKEND_FLAG_IS_BUNDLED;
+        if (bundled_app && bundled_app->supports_root) flags |= BACKEND_FLAG_SUPPORTS_ROOT;
+        if (bundled_app && bundled_app->root_only) flags |= BACKEND_FLAG_ROOT_ONLY;
+#ifndef __APPLE__
+        if (bundled_app && bundled_app->supports_root) {
+            bool has_root_support = registry_scope && strcmp(registry_scope, "system") == 0;
+            if (!has_root_support) {
+                char ignored_error[256] = "";
+                (void)system_registry_has_backend(service_id, &has_root_support, ignored_error, sizeof(ignored_error));
+            }
+            if (has_root_support) flags |= BACKEND_FLAG_HAS_ROOT_SUPPORT;
+        }
+#endif
         if (owns_plist) flags |= BACKEND_FLAG_OWNS_LAUNCHD_PLIST;
 
         StringBuilder frontends = {0};
@@ -3835,7 +3867,10 @@ static bool append_bundled_backend_placeholder_payload(BinaryPayloadList *payloa
                                     "",
                                     "user",
                                     "available",
-                                    BACKEND_FLAG_CAN_CONTROL | BACKEND_FLAG_IS_BUNDLED,
+                                    BACKEND_FLAG_CAN_CONTROL |
+                                        BACKEND_FLAG_IS_BUNDLED |
+                                        (app->supports_root ? BACKEND_FLAG_SUPPORTS_ROOT : 0) |
+                                        (app->root_only ? BACKEND_FLAG_ROOT_ONLY : 0),
                                     app->icon_symbol_name ? app->icon_symbol_name : "",
                                     "",
                                     &frontends,
@@ -4376,46 +4411,29 @@ static void send_control_response(int fd, const char *query, const char *body) {
         char message[4096] = "";
         bool needs_password = false;
         const char *scope = (strcmp(operation, "runRoot") == 0 || strcmp(operation, "installRoot") == 0) ? "system" : "user";
-        if (strcmp(scope, "user") == 0) {
-            char existing_unit[256] = "";
-            char existing_scope[32] = "user";
-            bool found = lookup_systemd_backend_any(service_id, existing_unit, sizeof(existing_unit), existing_scope, sizeof(existing_scope));
-            if (found && strcmp(existing_scope, "system") == 0) {
-                bool removed = uninstall_backend(service_id, sudo_password, &needs_password, message, sizeof(message));
-                if (!removed) {
-                    log_event("Failed to uninstall existing root install before reinstalling %s as user: %s", service_id, message);
-                    send_action_response_ex(fd, needs_password ? 401 : 500, false, message, needs_password);
-                    return;
-                }
-            }
-            bool root_backend_exists = false;
-            if (!found && !system_registry_has_backend(service_id, &root_backend_exists, message, sizeof(message))) {
-                log_event("Failed to check root registry before reinstalling %s as user: %s", service_id, message);
-                send_action_response(fd, 500, false, message);
-                return;
-            }
-            if (!found && root_backend_exists) {
-                bool removed = root_helper_registry_remove_backend(service_id, sudo_password, &needs_password, message, sizeof(message));
-                if (!removed) {
-                    log_event("Failed to clear existing root registry records before reinstalling %s as user: %s", service_id, message);
-                    send_action_response_ex(fd, needs_password ? 401 : 500, false, message, needs_password);
-                    return;
-                }
-            }
+        if (strcmp(scope, "system") == 0 && !app->supports_root) {
+            send_action_response(fd, 400, false, "This app does not support running as root.");
+            return;
+        }
+        if (strcmp(scope, "user") == 0 && app->root_only) {
+            send_action_response(fd, 400, false, "This app can only run as root.");
+            return;
+        }
 #ifdef __APPLE__
+        if (strcmp(scope, "user") == 0) {
             char existing_plist[PATH_MAX] = "";
             int owns_existing_plist = 0;
             if (lookup_launchd_backend_any(service_id, existing_plist, sizeof(existing_plist), &owns_existing_plist) &&
                 strncmp(existing_plist, "/Library/LaunchDaemons/", 23) == 0) {
                 bool removed = uninstall_backend(service_id, sudo_password, &needs_password, message, sizeof(message));
                 if (!removed) {
-                    log_event("Failed to uninstall existing root launchd install before reinstalling %s as user: %s", service_id, message);
+                    log_event("Failed to remove existing root launchd install before installing %s: %s", service_id, message);
                     send_action_response_ex(fd, needs_password ? 401 : 500, false, message, needs_password);
                     return;
                 }
             }
-#endif
         }
+#endif
         bool ok = install_bundled_app(app, scope, sudo_password, &needs_password, message, sizeof(message));
         log_event("%s app %s as %s: %s",
                   ok ? "Installed" : "Failed to install",
@@ -4426,6 +4444,49 @@ static void send_control_response(int fd, const char *query, const char *body) {
         send_action_response_ex(fd, ok ? 200 : (needs_password ? 401 : 500), ok, message, needs_password);
         return;
     }
+
+#ifndef __APPLE__
+    if (strcmp(operation, "addRootSupport") == 0 || strcmp(operation, "removeRootSupport") == 0) {
+        const BundledAppDefinition *app = bundled_app_for_service_id(service_id);
+        if (!app || !app->supports_root) {
+            send_action_response(fd, 404, false, "This app does not support root support.");
+            return;
+        }
+        char message[4096] = "";
+        bool needs_password = false;
+        bool ok = false;
+        if (strcmp(operation, "addRootSupport") == 0) {
+            ok = install_bundled_app(app, "system", sudo_password, &needs_password, message, sizeof(message));
+        } else {
+            if (!app->root_only) {
+                char user_unit[256] = "";
+                char user_scope[32] = "user";
+                sqlite3 *database = open_registry_readonly(message, sizeof(message));
+                bool has_user_install = false;
+                if (database) {
+                    has_user_install = lookup_systemd_backend(database, service_id, user_unit, sizeof(user_unit), user_scope, sizeof(user_scope));
+                    sqlite3_close(database);
+                }
+                if (has_user_install) {
+                    ok = install_bundled_app(app, "user", NULL, NULL, message, sizeof(message));
+                    if (!ok) {
+                        log_event("Failed to restore user install before removing root support for %s: %s", service_id, message);
+                        send_action_response(fd, 500, false, message);
+                        return;
+                    }
+                }
+            }
+            ok = remove_bundled_root_support(app, sudo_password, &needs_password, message, sizeof(message));
+        }
+        log_event("%s root support for app %s: %s",
+                  ok ? (strcmp(operation, "addRootSupport") == 0 ? "Added" : "Removed") : "Failed to change",
+                  app->service_id,
+                  message);
+        if (ok) mark_backend_event_changed();
+        send_action_response_ex(fd, ok ? 200 : (needs_password ? 401 : 500), ok, message, needs_password);
+        return;
+    }
+#endif
 
     if (strcmp(operation, "uninstall") == 0) {
         char message[4096] = "";
@@ -7264,6 +7325,175 @@ static void cleanup_user_systemd_bundled_app(const BundledAppDefinition *app,
         run_shell_ignored(command);
     }
 }
+#else
+static void cleanup_user_systemd_bundled_app(const BundledAppDefinition *app,
+                                             bool remove_unit_files,
+                                             bool remove_install_root) {
+    (void)app;
+    (void)remove_unit_files;
+    (void)remove_install_root;
+}
+#endif
+
+#ifndef __APPLE__
+static bool install_bundled_user_systemd_unit_from_paths(const BundledAppDefinition *app,
+                                                         const char *working_directory,
+                                                         const char *binary_path,
+                                                         const char *bundles_dir,
+                                                         const char *icon_path,
+                                                         const char *log_path,
+                                                         const char *outerctl_path,
+                                                         char *message,
+                                                         size_t message_size) {
+    char error[1024] = "";
+    char unit_path[PATH_MAX];
+    snprintf(unit_path, sizeof(unit_path), "%s/.config/systemd/user/%s", home_directory(), app->unit_name);
+    char socket_unit_name[256] = "";
+    char socket_unit_path[PATH_MAX] = "";
+    if (app->socket_activated) {
+        systemd_socket_unit_name(app->unit_name, socket_unit_name, sizeof(socket_unit_name));
+        snprintf(socket_unit_path, sizeof(socket_unit_path), "%s/.config/systemd/user/%s", home_directory(), socket_unit_name);
+    }
+
+    cleanup_user_systemd_bundled_app(app, true, false);
+
+    char user_name[128] = "";
+    struct passwd *pw = getpwuid(getuid());
+    snprintf(user_name, sizeof(user_name), "%s", pw && pw->pw_name ? pw->pw_name : "");
+
+    char quoted_binary[PATH_MAX + 8];
+    char quoted_bundles[PATH_MAX + 8];
+    char quoted_icon[PATH_MAX + 8];
+    char quoted_log[PATH_MAX + 8];
+    char quoted_service_id[512];
+    char quoted_socket_path[PATH_MAX + 32];
+    char actual_socket_path[PATH_MAX] = "";
+    char systemd_socket_path[PATH_MAX] = "";
+    shell_quote(binary_path, quoted_binary, sizeof(quoted_binary));
+    shell_quote(bundles_dir, quoted_bundles, sizeof(quoted_bundles));
+    if (icon_path && icon_path[0]) shell_quote(icon_path, quoted_icon, sizeof(quoted_icon)); else quoted_icon[0] = '\0';
+    shell_quote(log_path, quoted_log, sizeof(quoted_log));
+    shell_quote(app->service_id, quoted_service_id, sizeof(quoted_service_id));
+    if (app->socket_name && app->socket_name[0]) {
+        snprintf(systemd_socket_path, sizeof(systemd_socket_path), "%%t/%s", app->socket_name);
+        shell_quote(systemd_socket_path, quoted_socket_path, sizeof(quoted_socket_path));
+        bundled_socket_path_for_scope(app, "user", actual_socket_path, sizeof(actual_socket_path));
+    } else {
+        quoted_socket_path[0] = '\0';
+    }
+
+    char run_script[PATH_MAX * 4];
+    if (quoted_icon[0]) {
+        if (quoted_socket_path[0]) {
+            snprintf(run_script, sizeof(run_script),
+                     "exec %s --label %s --socket-path %s --bundles-dir %s --icon-file %s >> %s 2>&1",
+                     quoted_binary, quoted_service_id, quoted_socket_path, quoted_bundles, quoted_icon, quoted_log);
+        } else {
+            snprintf(run_script, sizeof(run_script),
+                     "exec %s --label %s --bundles-dir %s --icon-file %s >> %s 2>&1",
+                     quoted_binary, quoted_service_id, quoted_bundles, quoted_icon, quoted_log);
+        }
+    } else {
+        if (quoted_socket_path[0]) {
+            snprintf(run_script, sizeof(run_script),
+                     "exec %s --label %s --socket-path %s --bundles-dir %s >> %s 2>&1",
+                     quoted_binary, quoted_service_id, quoted_socket_path, quoted_bundles, quoted_log);
+        } else {
+            snprintf(run_script, sizeof(run_script),
+                     "exec %s --label %s --bundles-dir %s >> %s 2>&1",
+                     quoted_binary, quoted_service_id, quoted_bundles, quoted_log);
+        }
+    }
+    char quoted_run_script[sizeof(run_script) + 16];
+    shell_quote(run_script, quoted_run_script, sizeof(quoted_run_script));
+
+    char description[256];
+    unit_description_text(app->display_name, description, sizeof(description));
+    char unit_contents[12000];
+    snprintf(unit_contents, sizeof(unit_contents),
+             "[Unit]\n"
+             "Description=%s\n"
+             "After=network.target\n"
+             "\n"
+             "[Service]\n"
+             "Type=simple\n"
+             "WorkingDirectory=%s\n"
+             "Environment=HOME=%s\n"
+             "Environment=USER=%s\n"
+             "Environment=LOGNAME=%s\n"
+             "Environment=OUTERCTL_PATH=%s\n"
+             "ExecStart=/bin/sh -lc %s\n"
+             "Restart=on-failure\n"
+             "KillMode=control-group\n"
+             "\n"
+             "[Install]\n"
+             "WantedBy=default.target\n",
+             description,
+             working_directory,
+             home_directory(),
+             user_name,
+             user_name,
+             outerctl_path,
+             quoted_run_script);
+    char socket_contents[2048] = "";
+    if (app->socket_activated && quoted_socket_path[0]) {
+        snprintf(socket_contents, sizeof(socket_contents),
+                 "[Unit]\n"
+                 "Description=%s Socket\n"
+                 "\n"
+                 "[Socket]\n"
+                 "ListenStream=%s\n"
+                 "SocketMode=0600\n"
+                 "\n"
+                 "[Install]\n"
+                 "WantedBy=sockets.target\n",
+                 description,
+                 systemd_socket_path);
+    }
+    if (!write_text_file(unit_path, unit_contents, error, sizeof(error))) {
+        snprintf(message, message_size, "%s", error);
+        return false;
+    }
+    if (socket_unit_path[0] && !write_text_file(socket_unit_path, socket_contents, error, sizeof(error))) {
+        unlink(unit_path);
+        snprintf(message, message_size, "%s", error);
+        return false;
+    }
+    if (!upsert_systemd_backend_registry(app->service_id, app->display_name, app->unit_name, "user", actual_socket_path, log_path, icon_path, error, sizeof(error))) {
+        unlink(unit_path);
+        if (socket_unit_path[0]) unlink(socket_unit_path);
+        snprintf(message, message_size, "%s", error);
+        return false;
+    }
+
+    char quoted_unit[320];
+    shell_quote(app->unit_name, quoted_unit, sizeof(quoted_unit));
+    char enable_command[512];
+    run_shell_ignored("systemctl --user daemon-reload >/dev/null 2>&1");
+    if (socket_unit_name[0]) {
+        char quoted_socket_unit[320];
+        shell_quote(socket_unit_name, quoted_socket_unit, sizeof(quoted_socket_unit));
+        snprintf(enable_command, sizeof(enable_command), "systemctl --user enable --now %s >/dev/null 2>&1", quoted_socket_unit);
+        int status = system(enable_command);
+        if (status != 0) {
+            snprintf(message, message_size, "Installed %s, but failed to enable its user socket.", app->display_name);
+            return false;
+        }
+    } else {
+        snprintf(enable_command, sizeof(enable_command), "systemctl --user enable %s >/dev/null 2>&1 || true", quoted_unit);
+        run_shell_ignored(enable_command);
+        char systemd_message[4096] = "";
+        bool started = run_systemd_operation(app->unit_name, "user", "restart", NULL, NULL, systemd_message, sizeof(systemd_message));
+        if (!started) {
+            started = run_systemd_operation(app->unit_name, "user", "start", NULL, NULL, systemd_message, sizeof(systemd_message));
+        }
+        if (!started) {
+            snprintf(message, message_size, "Installed %s, but failed to start its user service: %s", app->display_name, systemd_message);
+            return false;
+        }
+    }
+    return true;
+}
 #endif
 
 static bool install_bundled_app_macos(const BundledAppDefinition *app,
@@ -7272,6 +7502,13 @@ static bool install_bundled_app_macos(const BundledAppDefinition *app,
                                       bool *needs_password,
                                       char *message,
                                       size_t message_size);
+#ifndef __APPLE__
+static bool remove_bundled_root_support(const BundledAppDefinition *app,
+                                        const char *sudo_password,
+                                        bool *needs_password,
+                                        char *message,
+                                        size_t message_size);
+#endif
 
 static bool install_bundled_app(const BundledAppDefinition *app, const char *scope, const char *sudo_password, bool *needs_password, char *message, size_t message_size) {
 #ifdef __APPLE__
@@ -7283,6 +7520,14 @@ static bool install_bundled_app(const BundledAppDefinition *app, const char *sco
         return false;
     }
     bool install_as_root = scope && strcmp(scope, "system") == 0;
+    if (install_as_root && !app->supports_root) {
+        snprintf(message, message_size, "%s does not support root installation.", app->display_name);
+        return false;
+    }
+    if (!install_as_root && app->root_only) {
+        snprintf(message, message_size, "%s can only run as root.", app->display_name);
+        return false;
+    }
     char architecture[64];
     if (!remote_machine_architecture(architecture, sizeof(architecture))) {
         snprintf(message, message_size, "Unsupported machine architecture.");
@@ -7665,14 +7910,31 @@ static bool install_bundled_app(const BundledAppDefinition *app, const char *sco
             return false;
         }
 
-        if (!unregister_backend_records(app->service_id, error, sizeof(error))) {
-            snprintf(message, message_size, "%s", error);
-            return false;
+        if (!app->root_only) {
+            char user_state_root[PATH_MAX];
+            default_user_outerwebapps_app_root(app->install_directory_name, user_state_root, sizeof(user_state_root));
+            if (!mkdir_p(user_state_root)) {
+                snprintf(message, message_size, "Failed to create %s: %s", user_state_root, strerror(errno));
+                return false;
+            }
+            char user_log_path[PATH_MAX];
+            snprintf(user_log_path, sizeof(user_log_path), "%s/backend.log", user_state_root);
+            char user_outerctl_path[PATH_MAX];
+            default_user_outerctl_path(user_outerctl_path, sizeof(user_outerctl_path));
+            if (!install_bundled_user_systemd_unit_from_paths(app,
+                                                              install_root,
+                                                              target_binary,
+                                                              bundles_dir,
+                                                              target_icon,
+                                                              user_log_path,
+                                                              user_outerctl_path,
+                                                              message,
+                                                              message_size)) {
+                return false;
+            }
         }
 
-        cleanup_user_systemd_bundled_app(app, true, true);
-
-        snprintf(message, message_size, "Installed %s as root.", app->display_name);
+        snprintf(message, message_size, "Installed %s with root support.", app->display_name);
         return true;
     }
 
@@ -7901,6 +8163,93 @@ static bool install_bundled_app(const BundledAppDefinition *app, const char *sco
     return true;
 #endif
 }
+
+#ifndef __APPLE__
+static bool remove_bundled_root_support(const BundledAppDefinition *app,
+                                        const char *sudo_password,
+                                        bool *needs_password,
+                                        char *message,
+                                        size_t message_size) {
+    if (needs_password) *needs_password = false;
+    if (!app || !app->supports_root) {
+        snprintf(message, message_size, "This app does not have root support.");
+        return false;
+    }
+    if (!ensure_root_helper_installed(sudo_password, needs_password, message, message_size)) {
+        return false;
+    }
+
+    char install_root[PATH_MAX];
+    snprintf(install_root, sizeof(install_root), "/opt/outergroup/%s", app->install_directory_name);
+    char log_path[PATH_MAX];
+    snprintf(log_path, sizeof(log_path), "/var/log/outergroup/%s.log", app->service_id);
+    char unit_path[PATH_MAX];
+    snprintf(unit_path, sizeof(unit_path), "/etc/systemd/system/%s", app->unit_name);
+    char socket_unit_name[256] = "";
+    char socket_unit_path[PATH_MAX] = "";
+    if (app->socket_activated) {
+        systemd_socket_unit_name(app->unit_name, socket_unit_name, sizeof(socket_unit_name));
+        snprintf(socket_unit_path, sizeof(socket_unit_path), "/etc/systemd/system/%s", socket_unit_name);
+    }
+
+    char quoted_unit[320];
+    char quoted_install_root[PATH_MAX + 8];
+    char quoted_log_path[PATH_MAX + 8];
+    char quoted_unit_path[PATH_MAX + 8];
+    char quoted_socket_unit[320] = "";
+    char quoted_socket_unit_path[PATH_MAX + 8] = "";
+    shell_quote(app->unit_name, quoted_unit, sizeof(quoted_unit));
+    shell_quote(install_root, quoted_install_root, sizeof(quoted_install_root));
+    shell_quote(log_path, quoted_log_path, sizeof(quoted_log_path));
+    shell_quote(unit_path, quoted_unit_path, sizeof(quoted_unit_path));
+    if (socket_unit_name[0]) shell_quote(socket_unit_name, quoted_socket_unit, sizeof(quoted_socket_unit)); else quoted_socket_unit[0] = '\0';
+    if (socket_unit_path[0]) shell_quote(socket_unit_path, quoted_socket_unit_path, sizeof(quoted_socket_unit_path)); else quoted_socket_unit_path[0] = '\0';
+
+    char script_template[] = "/tmp/backends-root-uninstall-XXXXXX";
+    int script_fd = mkstemp(script_template);
+    if (script_fd < 0) {
+        snprintf(message, message_size, "Failed to create privileged uninstall script: %s", strerror(errno));
+        return false;
+    }
+    FILE *script = fdopen(script_fd, "w");
+    if (!script) {
+        close(script_fd);
+        unlink(script_template);
+        snprintf(message, message_size, "Failed to write privileged uninstall script: %s", strerror(errno));
+        return false;
+    }
+    fprintf(script,
+            "set -eu\n"
+            "timeout 12s systemctl --system disable --now %s >/dev/null 2>&1 || true\n"
+            "%s%s%s"
+            "%s%s%s"
+            "rm -f -- %s %s\n"
+            "rm -rf -- %s\n"
+            "rm -f -- %s\n"
+            "systemctl --system daemon-reload\n",
+            quoted_unit,
+            quoted_socket_unit[0] ? "timeout 12s systemctl --system disable --now " : "",
+            quoted_socket_unit[0] ? quoted_socket_unit : "",
+            quoted_socket_unit[0] ? " >/dev/null 2>&1 || true\n" : "",
+            quoted_socket_unit[0] ? "timeout 12s systemctl --system stop " : "",
+            quoted_socket_unit[0] ? quoted_unit : "",
+            quoted_socket_unit[0] ? " >/dev/null 2>&1 || true\n" : "",
+            quoted_unit_path,
+            quoted_socket_unit_path[0] ? quoted_socket_unit_path : "''",
+            quoted_install_root,
+            quoted_log_path);
+    fclose(script);
+    chmod(script_template, 0700);
+    bool root_ok = run_root_script(script_template, sudo_password, needs_password, message, message_size);
+    unlink(script_template);
+    if (!root_ok) return false;
+    if (!root_helper_registry_remove_backend(app->service_id, sudo_password, needs_password, message, message_size)) {
+        return false;
+    }
+    snprintf(message, message_size, "Removed root support for %s.", app->display_name);
+    return true;
+}
+#endif
 
 #ifdef __APPLE__
 static bool append_xml_string_element(StringBuilder *builder, const char *value) {

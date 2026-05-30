@@ -3,26 +3,32 @@
     {
       "serviceID": "dev.outergroup.Top",
       "name": "Top",
+      "supportsRoot": true,
       "archiveURL": "https://example.com/outer-shell/apps/Top.tar.gz"
     },
     {
       "serviceID": "dev.outergroup.Files",
       "name": "Files",
+      "supportsRoot": true,
       "archiveURL": "https://example.com/outer-shell/apps/Files.tar.gz"
     },
     {
       "serviceID": "dev.outergroup.Plaintext",
       "name": "Plaintext",
+      "supportsRoot": true,
       "archiveURL": "https://example.com/outer-shell/apps/Plaintext.tar.gz"
     },
     {
       "serviceID": "dev.outergroup.NetworkInspector",
       "name": "Network Inspector",
+      "supportsRoot": true,
       "archiveURL": "https://example.com/outer-shell/apps/NetworkInspector.tar.gz"
     },
     {
       "serviceID": "dev.outergroup.Firehose",
       "name": "Firehose",
+      "supportsRoot": true,
+      "rootOnly": true,
       "archiveURL": "https://example.com/outer-shell/apps/Firehose.tar.gz"
     }
   ]
