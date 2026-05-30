@@ -780,6 +780,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private let statusLayer = CATextLayer()
     private let appsToggleLayer = CenteredButtonLayer(title: "Apps")
     private let backendsToggleLayer = CenteredButtonLayer(title: "Backends")
+    private let outerShellActionLayer = SymbolButtonLayer(symbolName: "ellipsis.circle", accessibilityTitle: "Outer Shell Actions")
     private let contentLayer = CALayer()
     private let appsLayer = CALayer()
     private let appsScrollContentLayer = CALayer()
@@ -806,6 +807,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private var appListDropFrames: [(frame: CGRect, listName: String)] = []
     private var appUnlistedDropFrames: [CGRect] = []
     private var addAppFrame = CGRect.zero
+    private var outerShellActionFrame = CGRect.zero
     private var appsContentBottom: CGFloat = 0
     private var pendingAppDrag: PendingAppDrag?
     private var backendRowFrames: [(frame: CGRect, row: BackendListRow)] = []
@@ -1550,6 +1552,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         toolbarLayer.addSublayer(statusLayer)
         toolbarLayer.addSublayer(appsToggleLayer)
         toolbarLayer.addSublayer(backendsToggleLayer)
+        toolbarLayer.addSublayer(outerShellActionLayer)
         contentLayer.addSublayer(appsLayer)
         appsLayer.addSublayer(appsScrollContentLayer)
         appsLayer.addSublayer(appsOverlayLayer)
@@ -1571,6 +1574,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         createLayer.addSublayer(filePickerOverlayLayer)
 
         titleLayer.string = ""
+        outerShellActionLayer.isHidden = true
         installOverlayLayer.isHidden = true
         passwordOverlayLayer.isHidden = true
         filePickerOverlayLayer.isHidden = true
@@ -1626,12 +1630,21 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 let showsModeToggle = mode != .create
                 appsToggleFrame = showsModeToggle ? CGRect(x: toggleX, y: 9, width: 84, height: toggleHeight) : .zero
                 backendsToggleFrame = showsModeToggle ? CGRect(x: toggleX + 86, y: 9, width: 98, height: toggleHeight) : .zero
+                outerShellActionFrame = mode == .apps && outerShellBackend() != nil
+                    ? CGRect(x: max(width - horizontalInset - 28, horizontalInset),
+                             y: 10,
+                             width: 28,
+                             height: 28)
+                    : .zero
                 appsToggleLayer.frame = appsToggleFrame
                 backendsToggleLayer.frame = backendsToggleFrame
+                outerShellActionLayer.frame = outerShellActionFrame
                 appsToggleLayer.isHidden = !showsModeToggle
                 backendsToggleLayer.isHidden = !showsModeToggle
+                outerShellActionLayer.isHidden = outerShellActionFrame.isEmpty
                 appsToggleLayer.opacity = showsModeToggle ? 1 : 0
                 backendsToggleLayer.opacity = showsModeToggle ? 1 : 0
+                outerShellActionLayer.opacity = outerShellActionFrame.isEmpty ? 0 : 1
                 statusLayer.frame = CGRect(x: 152, y: 14, width: max(toggleX - 170, 1), height: 18)
 
                 let contentHeight = contentLayer.bounds.height
@@ -1721,6 +1734,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                     backendsToggleLayer.applyStyle(textCGColor: resolvedCGColor(mode == .backends ? .white : .controlAccentColor),
                                                    backgroundCGColor: resolvedCGColor(mode == .backends ? .controlAccentColor : NSColor.controlAccentColor.withAlphaComponent(0.12)),
                                                    font: NSFont.systemFont(ofSize: 12, weight: .medium))
+                    outerShellActionLayer.applyStyle(tintCGColor: resolvedCGColor(.secondaryLabelColor),
+                                                     backgroundCGColor: resolvedCGColor(.clear))
                 }
                 updateLogTextContentIfNeeded(text: currentLogText(), force: true)
                 updateLogTextViewport()
@@ -4250,7 +4265,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 performControlAction(for: item.backend, operation: "runRoot")
             }
         default:
-            break
+            performControlAction(for: item.backend, operation: operation)
         }
     }
 
@@ -5437,9 +5452,11 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         } else if pendingPasswordAction == nil, mode == .apps {
             let contentPoint = contentLayer.convert(point, from: rootLayer)
             let appsPoint = appsScrollContentLayer.convert(contentPoint, from: contentLayer)
+            let toolbarPoint = toolbarLayer.convert(point, from: rootLayer)
             isOverAppTile = appCardFrames.contains { $0.frame.contains(appsPoint) } ||
                             appBadgeFrames.contains { $0.frame.contains(appsPoint) } ||
-                            addAppFrame.contains(appsPoint)
+                            addAppFrame.contains(appsPoint) ||
+                            outerShellActionFrame.contains(toolbarPoint)
         }
         if isOverCreateField || isOverPasswordField {
             setCursorIfNeeded(.iBeam)
@@ -5501,6 +5518,12 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
         let contentPoint = contentLayer.convert(point, from: rootLayer)
         if mode == .apps {
+            let toolbarPoint = toolbarLayer.convert(point, from: rootLayer)
+            if outerShellActionFrame.contains(toolbarPoint),
+               let backend = outerShellBackend() {
+                showBackendActionsMenu(for: backend, at: point)
+                return
+            }
             let appsPoint = appsScrollContentLayer.convert(contentPoint, from: contentLayer)
             if let card = appCardFrames.first(where: { $0.frame.contains(appsPoint) }) {
                 showAppActionsMenu(for: card.item, at: point)
@@ -5629,6 +5652,12 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         }
 
         let toolbarPoint = toolbarLayer.convert(point, from: rootLayer)
+        if mode == .apps,
+           outerShellActionFrame.contains(toolbarPoint),
+           let backend = outerShellBackend() {
+            showBackendActionsMenu(for: backend, at: point)
+            return
+        }
         if mode != .create, appsToggleFrame.contains(toolbarPoint) {
             navigateToMode(.apps, pushHistory: true)
             return
@@ -6127,6 +6156,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         return backends.first { $0.serviceID == selectedServiceID }
     }
 
+    private func outerShellBackend() -> BackendRecord? {
+        backends.first { $0.isBackendsSelf }
+    }
+
     private func currentLogFile(for backend: BackendRecord) -> LogFileRecord? {
         guard let selectedLog,
               selectedLog.serviceID == backend.serviceID,
@@ -6294,7 +6327,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         let frontendName = frontend.name.trimmingCharacters(in: .whitespacesAndNewlines)
         let displayName = frontendName.isEmpty ? backend.displayName.trimmingCharacters(in: .whitespacesAndNewlines) : frontendName
         let endpointPath: String
-        if !frontend.id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        if backend.isBundled ?? false {
+            endpointPath = pathAndQuery(fromFrontendURL: frontend.url, socketPath: frontend.socketPath)
+        } else if !frontend.id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             endpointPath = frontend.id
         } else if !frontend.socketPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             endpointPath = pathAndQuery(fromFrontendURL: frontend.url, socketPath: frontend.socketPath)
@@ -6681,9 +6716,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         }
     }
 
-    private func showBackendActionsMenu(for backend: BackendRecord, at point: CGPoint) {
-        guard backend.isBackendsSelf || backend.canUninstallBackend || (backend.isBundled ?? false) else { return }
-        let menuID = UUID()
+    private func backendManagementMenuItems(for backend: BackendRecord,
+                                            includePlaceholderRunActions: Bool) -> (operationByItemID: [String: String], items: [OuterframeContextMenuItem]) {
         var operationByItemID: [String: String] = [:]
         var items: [OuterframeContextMenuItem] = []
         if backend.isBackendsSelf {
@@ -6699,14 +6733,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             items.append(OuterframeContextMenuItem(id: "uninstall",
                                                    title: "Uninstall Outer Shell",
                                                    isEnabled: true))
-            pendingMenuActions[menuID] = (backend.serviceID, operationByItemID)
-            outerframeHost.showContextMenu(menuID: menuID,
-                                           items: items,
-                                           at: point)
-            return
+            return (operationByItemID, items)
         }
         if backend.isBundled ?? false {
-            if backend.isBundledPlaceholder {
+            if backend.isBundledPlaceholder && includePlaceholderRunActions {
                 operationByItemID["run"] = (backend.rootOnly ?? false) ? "runRoot" : "run"
                 items.append(OuterframeContextMenuItem(id: "run",
                                                        title: (backend.rootOnly ?? false) ? "Run as root" : "Run",
@@ -6731,10 +6761,16 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                                    title: "Uninstall",
                                                    isEnabled: true))
         }
-        guard !items.isEmpty else { return }
-        pendingMenuActions[menuID] = (backend.serviceID, operationByItemID)
+        return (operationByItemID, items)
+    }
+
+    private func showBackendActionsMenu(for backend: BackendRecord, at point: CGPoint) {
+        let menu = backendManagementMenuItems(for: backend, includePlaceholderRunActions: true)
+        guard !menu.items.isEmpty else { return }
+        let menuID = UUID()
+        pendingMenuActions[menuID] = (backend.serviceID, menu.operationByItemID)
         outerframeHost.showContextMenu(menuID: menuID,
-                                       items: items,
+                                       items: menu.items,
                                        at: point)
     }
 
@@ -6768,6 +6804,13 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                                    title: logEndpoint.title,
                                                    isEnabled: true))
         }
+        let management = backendManagementMenuItems(for: item.backend, includePlaceholderRunActions: false)
+        for menuItem in management.items where operationByItemID[menuItem.id] == nil {
+            guard let operation = management.operationByItemID[menuItem.id] else { continue }
+            operationByItemID[menuItem.id] = operation
+            items.append(menuItem)
+        }
+        guard !items.isEmpty else { return }
 
         pendingAppMenuActions[menuID] = (item, operationByItemID)
         outerframeHost.showContextMenu(menuID: menuID,
