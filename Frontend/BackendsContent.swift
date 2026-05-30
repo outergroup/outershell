@@ -712,6 +712,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private var logAttributedText = NSAttributedString(string: "")
     private var renderedLogHeaderDetailText = ""
     private var logHeaderDetailFrame = CGRect.zero
+    private var logDismissFrame = CGRect.zero
     private var logHeaderDetailSelectionRange: NSRange?
     private var logHeaderDetailDragAnchorOffset: Int?
     private var logTextSelectionRange: NSRange?
@@ -1626,12 +1627,22 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                     appsLayer.isHidden = false
                     tableHeaderLayer.isHidden = true
                     rowsClipLayer.isHidden = true
-                    dividerLayer.isHidden = true
-                    logHeaderLayer.isHidden = true
-                    logRowsClipLayer.isHidden = true
+                    dividerLayer.isHidden = selectedServiceID == nil
+                    logHeaderLayer.isHidden = selectedServiceID == nil
+                    logRowsClipLayer.isHidden = selectedServiceID == nil
                     createLayer.isHidden = true
-                    appsLayer.frame = CGRect(x: 0, y: 0, width: width, height: contentHeight)
+                    let appWidth = selectedServiceID == nil ? width : max(floor(width * 0.42), 320)
+                    appsLayer.frame = CGRect(x: 0, y: 0, width: appWidth, height: contentHeight)
                     updateAppsScrollLayerFrames()
+                    if selectedServiceID != nil {
+                        dividerLayer.frame = CGRect(x: appWidth, y: 0, width: 1, height: contentHeight)
+                        let logX = appWidth + 1
+                        let logWidth = max(width - logX, 1)
+                        logHeaderLayer.frame = CGRect(x: logX, y: max(contentHeight - logHeaderHeight, 0), width: logWidth, height: logHeaderHeight)
+                        logRowsClipLayer.frame = CGRect(x: logX, y: 0, width: logWidth, height: max(contentHeight - logHeaderHeight, 0))
+                        renderLogHeader()
+                        renderLogRows()
+                    }
                     renderAppsPage()
                 } else if mode == .backends {
                     outerframeHost.sendTextCursorUpdate(cursors: [])
@@ -2980,13 +2991,22 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         logHeaderLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
         let backend = selectedBackend()
         logSelectorFrame = .zero
+        logDismissFrame = CGRect(x: max(logHeaderLayer.bounds.width - horizontalInset - 24, horizontalInset),
+                                 y: 32,
+                                 width: 24,
+                                 height: 24)
+        let dismiss = makeSymbolButtonLayer(symbolName: "x.circle", accessibilityTitle: "Dismiss logs")
+        dismiss.frame = logDismissFrame
+        logHeaderLayer.addSublayer(dismiss)
 
         if let backend,
            backend.logFiles.count > 1,
            logHeaderLayer.bounds.width > horizontalInset * 2 + 80 {
             let availableWidth = max(logHeaderLayer.bounds.width - horizontalInset * 2, 1)
-            let selectorWidth = min(max(availableWidth * 0.34, 120), min(220, availableWidth))
-            logSelectorFrame = CGRect(x: logHeaderLayer.bounds.width - horizontalInset - selectorWidth,
+            let selectorMaxX = logDismissFrame.minX - 8
+            let selectorAvailableWidth = max(selectorMaxX - horizontalInset, 1)
+            let selectorWidth = min(max(availableWidth * 0.34, 120), min(220, selectorAvailableWidth))
+            logSelectorFrame = CGRect(x: selectorMaxX - selectorWidth,
                                       y: 31,
                                       width: selectorWidth,
                                       height: 24)
@@ -2999,7 +3019,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
         let title = makeTextLayer(size: 16, weight: .semibold, color: .labelColor)
         title.string = backend?.displayName ?? "Logs"
-        let titleMaxX = logSelectorFrame.isNull || logSelectorFrame.isEmpty ? logHeaderLayer.bounds.width - horizontalInset : logSelectorFrame.minX - 8
+        let titleMaxX = logSelectorFrame.isNull || logSelectorFrame.isEmpty ? logDismissFrame.minX - 8 : logSelectorFrame.minX - 8
         title.frame = CGRect(x: horizontalInset,
                              y: 34,
                              width: max(titleMaxX - horizontalInset, 1),
@@ -4090,6 +4110,13 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func performAppMenuAction(_ item: AppLauncherItem, operation: String) {
+        if operation.hasPrefix("showLogs:") {
+            let serviceID = String(operation.dropFirst("showLogs:".count))
+            guard let backend = backends.first(where: { $0.serviceID == serviceID }) else { return }
+            showLogs(for: backend)
+            return
+        }
+
         switch operation {
         case "run":
             if let userEndpoint = item.userEndpoint {
@@ -4898,6 +4925,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                           modifierFlags: NSEvent.ModifierFlags,
                                           clickCount: Int) -> Bool {
         _ = modifierFlags
+        if isPointInLogDismissButton(point) {
+            dismissLogViewer()
+            return true
+        }
         if isPointInLogSelector(point) {
             blurCreateField()
             blurPasswordField()
@@ -4922,6 +4953,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
     @discardableResult
     private func handleLogHeaderRightMouseDown(at point: CGPoint) -> Bool {
+        if isPointInLogDismissButton(point) {
+            return true
+        }
         if isPointInLogSelector(point) {
             blurCreateField()
             blurPasswordField()
@@ -4961,8 +4995,16 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         return logHeaderLayer.convert(contentPoint, from: contentLayer)
     }
 
+    private func isPointInLogDismissButton(_ point: CGPoint) -> Bool {
+        guard (mode == .backends || mode == .apps),
+              selectedServiceID != nil,
+              !logHeaderLayer.isHidden else { return false }
+        let localPoint = logHeaderDetailPoint(fromRootPoint: point)
+        return logDismissFrame.insetBy(dx: -2, dy: -2).contains(localPoint)
+    }
+
     private func isPointInLogHeaderDetail(_ point: CGPoint) -> Bool {
-        guard mode == .backends,
+        guard (mode == .backends || mode == .apps),
               selectedServiceID != nil,
               !logHeaderLayer.isHidden else { return false }
         let localPoint = logHeaderDetailPoint(fromRootPoint: point)
@@ -4970,7 +5012,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func isPointInLogSelector(_ point: CGPoint) -> Bool {
-        guard mode == .backends,
+        guard (mode == .backends || mode == .apps),
               selectedServiceID != nil,
               !logHeaderLayer.isHidden,
               !logSelectorFrame.isEmpty else { return false }
@@ -5282,7 +5324,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         }
         if isOverCreateField || isOverPasswordField {
             setCursorIfNeeded(.iBeam)
-        } else if isPointInLogSelector(point) {
+        } else if isPointInLogDismissButton(point) || isPointInLogSelector(point) {
             setCursorIfNeeded(.pointingHand)
         } else if isPointInLogHeaderDetail(point) {
             setCursorIfNeeded(.iBeam)
@@ -5367,7 +5409,18 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         let previousAppsScroll = appsScroll
         let previousBackendScroll = backendScroll
         if mode == .apps {
-            appsScroll -= delta.y * multiplier
+            let contentPoint = contentLayer.convert(point, from: rootLayer)
+            if selectedServiceID != nil && logRowsClipLayer.frame.contains(contentPoint) {
+                logScrollbarController?.cancelAnimation()
+                shouldScrollLogToBottomOnNextLayout = false
+                logScroll -= delta.y * (precise ? 1 : logScrollLineHeight)
+                logScroll = clampedLogScroll(logScroll)
+                updateLogTextViewport()
+                updateLogTextSelectionLayers()
+                return
+            } else {
+                appsScroll -= delta.y * multiplier
+            }
         } else if mode == .backends {
             let contentPoint = contentLayer.convert(point, from: rootLayer)
             if selectedServiceID != nil && logRowsClipLayer.frame.contains(contentPoint) {
@@ -5450,7 +5503,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             return
         }
 
-        if mode == .backends,
+        if (mode == .backends || mode == .apps),
            selectedServiceID != nil,
            logScrollbarController?.handleMouseDown(at: rootLayer.convert(point, to: logRowsClipLayer)) == true {
             return
@@ -5468,6 +5521,12 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
         let contentPoint = contentLayer.convert(point, from: rootLayer)
         if mode == .apps {
+            if handleLogHeaderMouseDown(at: point, modifierFlags: modifierFlags, clickCount: clickCount) {
+                return
+            }
+            if handleLogMouseDown(at: point, modifierFlags: modifierFlags, clickCount: clickCount) {
+                return
+            }
             let appsPoint = appsScrollContentLayer.convert(contentPoint, from: contentLayer)
             if let badge = appBadgeFrames.first(where: { $0.frame.contains(appsPoint) }) {
                 openLauncherEndpoint(badge.endpoint,
@@ -5853,6 +5912,12 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         setLogTextSelection(nil)
     }
 
+    private func dismissLogViewer() {
+        clearLogSelection()
+        restartEventWatch(resetVersions: true)
+        updateLayout()
+    }
+
     private func selectedRecipe() -> RecipeRecord? {
         recipes.first { $0.identifier == selectedRecipeID } ?? recipes.first
     }
@@ -5980,6 +6045,23 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         isLoadingLog = false
         setLogTextSelection(nil)
         fetchSelectedLog(scrollToBottom: true)
+        restartEventWatch(resetVersions: true)
+        updateLayout()
+    }
+
+    private func showLogs(for backend: BackendRecord) {
+        selectedServiceID = backend.serviceID
+        ensureLogSelection()
+        logSnapshot = nil
+        logError = ""
+        logScroll = 0
+        logHeaderDetailSelectionRange = nil
+        logHeaderDetailDragAnchorOffset = nil
+        isLoadingLog = false
+        setLogTextSelection(nil)
+        if selectedLog != nil {
+            fetchSelectedLog(scrollToBottom: true)
+        }
         restartEventWatch(resetVersions: true)
         updateLayout()
     }
@@ -6558,11 +6640,31 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                                    title: "Run as root",
                                                    isEnabled: true))
         }
+        for logEndpoint in appLogEndpoints(for: item) {
+            operationByItemID[logEndpoint.itemID] = "showLogs:\(logEndpoint.endpoint.backend.serviceID)"
+            items.append(OuterframeContextMenuItem(id: logEndpoint.itemID,
+                                                   title: logEndpoint.title,
+                                                   isEnabled: true))
+        }
 
         pendingAppMenuActions[menuID] = (item, operationByItemID)
         outerframeHost.showContextMenu(menuID: menuID,
                                        items: items,
                                        at: point)
+    }
+
+    private func appLogEndpoints(for item: AppLauncherItem) -> [(itemID: String, title: String, endpoint: AppLauncherEndpoint)] {
+        let endpoints = [item.userEndpoint, item.rootEndpoint].compactMap { $0 }
+        guard !endpoints.isEmpty else { return [] }
+
+        let hasMultipleInstalls = endpoints.count > 1
+        return endpoints.map { endpoint in
+            let isRoot = endpoint.backend.serviceScope == "system"
+            let prefix = hasMultipleInstalls && isRoot ? "root/" : ""
+            let title = "Show logs for \(prefix)\(item.displayName)"
+            let itemID = isRoot ? "showRootLogs" : "showLogs"
+            return (itemID: itemID, title: title, endpoint: endpoint)
+        }
     }
 
     private func showLogSelectorMenu(at point: CGPoint) {
