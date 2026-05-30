@@ -3507,6 +3507,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         var components = URLComponents(url: controlEndpoint, resolvingAgainstBaseURL: false)
         components?.queryItems = [
             URLQueryItem(name: "serviceID", value: backend.serviceID),
+            URLQueryItem(name: "scope", value: backend.serviceScope),
             URLQueryItem(name: "operation", value: operation)
         ]
         guard let url = components?.url else {
@@ -3709,8 +3710,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func canOpenStoppedSocketActivatedFrontend(_ endpoint: AppLauncherEndpoint) -> Bool {
-        !endpoint.frontend.socketPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty &&
-        endpoint.backend.status == "available"
+        !endpoint.frontend.socketPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     private func openLauncherEndpoint(_ endpoint: AppLauncherEndpoint, displayName: String, opensInNewTab: Bool) {
@@ -3740,6 +3740,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         var components = URLComponents(url: controlEndpoint, resolvingAgainstBaseURL: false)
         components?.queryItems = [
             URLQueryItem(name: "serviceID", value: endpoint.backend.serviceID),
+            URLQueryItem(name: "scope", value: endpoint.backend.serviceScope),
             URLQueryItem(name: "operation", value: "start")
         ]
         guard let url = components?.url else {
@@ -3788,6 +3789,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                    let response = try? BackendsResponse.decodeBinary(data) {
                     self.backends = response.backends
                     if let nextEndpoint = self.findLauncherEndpoint(serviceID: endpoint.backend.serviceID,
+                                                                    serviceScope: endpoint.backend.serviceScope,
                                                                     frontendID: endpoint.frontend.id),
                        let url = self.frontendNavigationURL(nextEndpoint.frontend),
                        nextEndpoint.frontend.isRunning || self.canOpenStoppedSocketActivatedFrontend(nextEndpoint) {
@@ -3816,8 +3818,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         }.resume()
     }
 
-    private func findLauncherEndpoint(serviceID: String, frontendID: String) -> AppLauncherEndpoint? {
-        for backend in backends where backend.serviceID == serviceID {
+    private func findLauncherEndpoint(serviceID: String, serviceScope: String, frontendID: String) -> AppLauncherEndpoint? {
+        for backend in backends where backend.serviceID == serviceID && backend.serviceScope == serviceScope {
             for (index, frontend) in backend.frontends.enumerated() where frontend.id == frontendID {
                 return AppLauncherEndpoint(backend: backend, frontend: frontend, frontendIndex: index)
             }
@@ -3830,6 +3832,13 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             let serviceID = String(operation.dropFirst("showLogs:".count))
             guard let backend = backends.first(where: { $0.serviceID == serviceID }) else { return }
             showLogs(for: backend)
+            return
+        }
+        if operation.hasPrefix("stop:") {
+            let scope = String(operation.dropFirst("stop:".count))
+            let endpoint = scope == "system" ? item.rootEndpoint : item.userEndpoint
+            guard let endpoint else { return }
+            performControlAction(for: endpoint.backend, operation: "stop")
             return
         }
 
@@ -5737,14 +5746,18 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private func runningEndpoints(for item: AppLauncherItem) -> [(endpoint: AppLauncherEndpoint, symbolName: String)] {
         var endpoints: [(endpoint: AppLauncherEndpoint, symbolName: String)] = []
         if let userEndpoint = item.userEndpoint,
-           userEndpoint.frontend.isRunning {
+           endpointIsRunning(userEndpoint) {
             endpoints.append((userEndpoint, "person.fill"))
         }
         if let rootEndpoint = item.rootEndpoint,
-           rootEndpoint.frontend.isRunning {
+           endpointIsRunning(rootEndpoint) {
             endpoints.append((rootEndpoint, "checkmark.shield.fill"))
         }
         return endpoints
+    }
+
+    private func endpointIsRunning(_ endpoint: AppLauncherEndpoint) -> Bool {
+        endpoint.frontend.isRunning || endpoint.backend.status == "running"
     }
 
     private func renderRunningBadges(for item: AppLauncherItem,
@@ -6297,6 +6310,12 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                                    title: "Run as root",
                                                    isEnabled: true))
         }
+        for stopEndpoint in appStopEndpoints(for: item) {
+            operationByItemID[stopEndpoint.itemID] = "stop:\(stopEndpoint.endpoint.backend.serviceScope)"
+            items.append(OuterframeContextMenuItem(id: stopEndpoint.itemID,
+                                                   title: stopEndpoint.title,
+                                                   isEnabled: stopEndpoint.isEnabled))
+        }
         for logEndpoint in appLogEndpoints(for: item) {
             operationByItemID[logEndpoint.itemID] = "showLogs:\(logEndpoint.endpoint.backend.serviceID)"
             items.append(OuterframeContextMenuItem(id: logEndpoint.itemID,
@@ -6315,6 +6334,26 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         outerframeHost.showContextMenu(menuID: menuID,
                                        items: items,
                                        at: point)
+    }
+
+    private func appStopEndpoints(for item: AppLauncherItem) -> [(itemID: String, title: String, endpoint: AppLauncherEndpoint, isEnabled: Bool)] {
+        let endpoints = [item.userEndpoint, item.rootEndpoint].compactMap { $0 }
+        guard !endpoints.isEmpty else { return [] }
+
+        let hasMultipleInstalls = endpoints.count > 1
+        return endpoints.compactMap { endpoint in
+            guard endpoint.backend.canControl else { return nil }
+            let isRoot = endpoint.backend.serviceScope == "system"
+            let itemID = isRoot ? "stopRoot" : "stopUser"
+            let title: String
+            if hasMultipleInstalls {
+                title = isRoot ? "Stop (root)" : "Stop (user)"
+            } else {
+                title = "Stop"
+            }
+            let isRunning = endpoint.frontend.isRunning || endpoint.backend.status == "running"
+            return (itemID: itemID, title: title, endpoint: endpoint, isEnabled: isRunning)
+        }
     }
 
     private func appLogEndpoints(for item: AppLauncherItem) -> [(itemID: String, title: String, endpoint: AppLauncherEndpoint)] {
@@ -6455,6 +6494,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             return "Updating \(backend.displayName)..."
         case "migrateRoot":
             return "Migrating \(backend.displayName)..."
+        case "start":
+            return "Starting \(backend.displayName)..."
+        case "stop":
+            return "Stopping \(backend.displayName)..."
         default:
             return "\(operation.capitalized)ing \(backend.displayName)..."
         }

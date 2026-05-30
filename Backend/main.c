@@ -3558,6 +3558,42 @@ static bool lookup_systemd_backend_any(const char *service_id,
     return false;
 }
 
+static bool lookup_systemd_backend_any_for_scope(const char *service_id,
+                                                 const char *requested_scope,
+                                                 char *unit_name,
+                                                 size_t unit_name_size,
+                                                 char *scope,
+                                                 size_t scope_size) {
+    bool wants_system = requested_scope && strcmp(requested_scope, "system") == 0;
+    bool wants_user = requested_scope && strcmp(requested_scope, "user") == 0;
+    char error[512] = "";
+
+    if (!wants_system) {
+        sqlite3 *database = open_registry_readonly(error, sizeof(error));
+        if (database) {
+            bool found = lookup_systemd_backend(database, service_id, unit_name, unit_name_size, scope, scope_size);
+            sqlite3_close(database);
+            if (found) return true;
+        }
+    }
+
+    if (!wants_user) {
+        sqlite3 *database = open_system_registry_readonly(error, sizeof(error));
+        if (database) {
+            bool found = lookup_systemd_backend(database, service_id, unit_name, unit_name_size, scope, scope_size);
+            sqlite3_close(database);
+            if (found) {
+#ifndef __APPLE__
+                snprintf(scope, scope_size, "system");
+#endif
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
 #ifndef __APPLE__
 static bool system_registry_has_backend(const char *service_id, bool *exists, char *error, size_t error_size) {
     if (exists) *exists = false;
@@ -4448,11 +4484,13 @@ static void clear_frontends_in_system_registry_as_root(const char *service_id, c
 
 static void clear_frontends_after_successful_stop(const char *service_id, bool system_scope, const char *sudo_password) {
     char error[512] = "";
-    (void)clear_frontends_in_registry_at(g_registry_database_path, service_id, error, sizeof(error));
-    error[0] = '\0';
+    if (!system_scope) {
+        (void)clear_frontends_in_registry_at(g_registry_database_path, service_id, error, sizeof(error));
+        return;
+    }
     if (g_system_registry_database_path[0] && access(g_system_registry_database_path, W_OK) == 0) {
         (void)clear_frontends_in_registry_at(g_system_registry_database_path, service_id, error, sizeof(error));
-    } else if (system_scope) {
+    } else {
         clear_frontends_in_system_registry_as_root(service_id, sudo_password);
     }
 }
@@ -4460,16 +4498,19 @@ static void clear_frontends_after_successful_stop(const char *service_id, bool s
 static void send_control_response(int fd, const char *query, const char *body) {
     char service_id[PATH_MAX] = "";
     char operation[32] = "";
+    char requested_scope[32] = "";
     char sudo_password[PATH_MAX] = "";
     if (!query_value_any(query, body, "serviceID", service_id, sizeof(service_id)) ||
         !query_value_any(query, body, "operation", operation, sizeof(operation))) {
         send_action_response(fd, 400, false, "Missing serviceID or operation.");
         return;
     }
+    query_value_any(query, body, "scope", requested_scope, sizeof(requested_scope));
     query_value_any(query, body, "sudoPassword", sudo_password, sizeof(sudo_password));
     trim_whitespace_in_place(service_id);
     trim_whitespace_in_place(operation);
-    log_event("Control request operation=%s serviceID=%s.", operation, service_id);
+    trim_whitespace_in_place(requested_scope);
+    log_event("Control request operation=%s serviceID=%s scope=%s.", operation, service_id, requested_scope);
 
     if (strcmp(operation, "setFrontendList") == 0) {
         char frontend_id[PATH_MAX] = "";
@@ -4688,7 +4729,12 @@ static void send_control_response(int fd, const char *query, const char *body) {
 
     char unit_name[256] = "";
     char scope[32] = "user";
-    bool found = lookup_systemd_backend_any(service_id, unit_name, sizeof(unit_name), scope, sizeof(scope));
+    bool found = lookup_systemd_backend_any_for_scope(service_id,
+                                                      requested_scope,
+                                                      unit_name,
+                                                      sizeof(unit_name),
+                                                      scope,
+                                                      sizeof(scope));
     if (!found) {
         send_action_response(fd, 404, false, "This backend does not have a registered systemd unit.");
         return;
@@ -4709,13 +4755,8 @@ static void send_control_response(int fd, const char *query, const char *body) {
         bool ignored_needs_password = false;
         char ignored_message[1024] = "";
         if (strcmp(operation, "stop") == 0) {
-            (void)run_systemd_operation(socket_unit,
-                                        scope,
-                                        "stop",
-                                        sudo_password,
-                                        &ignored_needs_password,
-                                        ignored_message,
-                                        sizeof(ignored_message));
+            (void)ignored_needs_password;
+            (void)ignored_message;
             ok = run_systemd_operation(unit_name, scope, "stop", sudo_password, &needs_password, message, sizeof(message));
         } else {
             (void)run_systemd_operation(socket_unit,
