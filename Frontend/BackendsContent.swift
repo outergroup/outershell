@@ -2076,8 +2076,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             renderRunningBadges(for: item,
                                 leftX: iconFrame.maxX + 6,
                                 centerY: iconFrame.midY,
-                                pointSize: 15,
-                                gap: 2)
+                                pointSize: 10,
+                                circleDiameter: 18,
+                                gap: 3)
 
             x += itemWidth + horizontalGap
         }
@@ -2256,7 +2257,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                               title: item.displayName)
             visibleIconKeys.insert(item.iconKey)
             let hasRunningBadges = !runningEndpoints(for: item).isEmpty
-            let textLeft = iconFrame.maxX + (hasRunningBadges ? 34 : 12)
+            let textLeft = iconFrame.maxX + (hasRunningBadges ? 28 : 12)
             let textFrame = CGRect(x: textLeft,
                                    y: rowFrame.midY - 10,
                                    width: max(rowFrame.maxX - textLeft - 16, 1),
@@ -2272,7 +2273,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             renderRunningBadges(for: item,
                                 leftX: iconFrame.maxX + 6,
                                 centerY: iconFrame.midY,
-                                pointSize: 10,
+                                pointSize: 8,
+                                circleDiameter: 14,
                                 gap: 2)
             y -= rowHeight
         }
@@ -6000,7 +6002,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         }
         if let rootEndpoint = item.rootEndpoint,
            rootEndpoint.backend.status == "running" {
-            endpoints.append((rootEndpoint, "person.badge.key.fill"))
+            endpoints.append((rootEndpoint, "checkmark.shield.fill"))
         }
         return endpoints
     }
@@ -6009,6 +6011,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                      leftX: CGFloat,
                                      centerY: CGFloat,
                                      pointSize: CGFloat,
+                                     circleDiameter: CGFloat,
                                      gap: CGFloat) {
         let badges = runningEndpoints(for: item).compactMap { badge -> (endpoint: AppLauncherEndpoint, image: CGImage, size: CGSize)? in
             guard let symbol = naturalSymbolCGImage(named: badge.symbolName, pointSize: pointSize) else { return nil }
@@ -6016,25 +6019,43 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         }
         guard !badges.isEmpty else { return }
 
-        let totalHeight = badges.reduce(CGFloat(0)) { $0 + $1.size.height } + CGFloat(max(badges.count - 1, 0)) * gap
+        let circleSize = CGSize(width: circleDiameter, height: circleDiameter)
+        let chips = badges.map { (badge: $0, size: circleSize) }
+        let totalHeight = chips.reduce(CGFloat(0)) { $0 + $1.size.height } + CGFloat(max(chips.count - 1, 0)) * gap
         let x = floor(leftX)
         var y = floor(centerY + totalHeight / 2)
-        for badge in badges {
-            y -= badge.size.height
-            let frame = CGRect(x: x,
-                               y: floor(y),
-                               width: badge.size.width,
-                               height: badge.size.height)
-            appBadgeFrames.append(AppLauncherBadgeTarget(frame: frame.insetBy(dx: -3, dy: -3),
-                                                         endpoint: badge.endpoint,
+        for chip in chips {
+            y -= chip.size.height
+            let chipFrame = CGRect(x: x,
+                                   y: floor(y),
+                                   width: chip.size.width,
+                                   height: chip.size.height)
+            appBadgeFrames.append(AppLauncherBadgeTarget(frame: chipFrame.insetBy(dx: -3, dy: -3),
+                                                         endpoint: chip.badge.endpoint,
                                                          displayName: item.displayName))
 
-            let layer = CALayer()
-            layer.frame = frame
-            layer.contentsGravity = .resizeAspect
-            layer.contentsScale = 2
-            layer.contents = badge.image
-            appsScrollContentLayer.addSublayer(layer)
+            let chipLayer = CALayer()
+            chipLayer.frame = chipFrame
+            chipLayer.cornerRadius = floor(chipFrame.height / 2)
+            chipLayer.backgroundColor = resolvedCGColor(NSColor.systemGreen.withAlphaComponent(0.95))
+            chipLayer.borderWidth = 0.5
+            chipLayer.borderColor = resolvedCGColor(NSColor.white.withAlphaComponent(0.8))
+            chipLayer.shadowColor = resolvedCGColor(NSColor.systemGreen.withAlphaComponent(0.4))
+            chipLayer.shadowOpacity = 0.22
+            chipLayer.shadowRadius = 3
+            chipLayer.shadowOffset = CGSize(width: 0, height: 1)
+
+            let symbolLayer = CALayer()
+            symbolLayer.frame = CGRect(x: floor((chipFrame.width - chip.badge.size.width) / 2),
+                                       y: floor((chipFrame.height - chip.badge.size.height) / 2),
+                                       width: chip.badge.size.width,
+                                       height: chip.badge.size.height)
+            symbolLayer.contentsGravity = .resizeAspect
+            symbolLayer.contentsScale = 2
+            symbolLayer.contents = chip.badge.image
+            chipLayer.addSublayer(symbolLayer)
+
+            appsScrollContentLayer.addSublayer(chipLayer)
             y -= gap
         }
     }
@@ -6831,7 +6852,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         return output
     }
 
-    private func naturalSymbolCGImage(named symbolName: String, pointSize: CGFloat) -> (image: CGImage, size: CGSize)? {
+    private func naturalSymbolCGImage(named symbolName: String,
+                                      pointSize: CGFloat,
+                                      color: NSColor = .white) -> (image: CGImage, size: CGSize)? {
         var output: CGImage?
         var displaySize = CGSize.zero
         withEffectiveAppearance {
@@ -6846,7 +6869,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
             let canvas = NSImage(size: canvasSize)
             canvas.lockFocus()
-            NSColor.controlAccentColor.setFill()
+            color.setFill()
             NSRect(origin: .zero, size: canvasSize).fill()
             image.draw(in: NSRect(origin: .zero, size: canvasSize),
                        from: .zero,
