@@ -5833,7 +5833,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             }
             let userEndpoint = sorted.first { $0.backend.serviceScope != "system" }
             let rootEndpoint = sorted.first { $0.backend.serviceScope == "system" }
-            let primaryEndpoint = userEndpoint ?? rootEndpoint ?? sorted[0]
+            let runningUserEndpoint = userEndpoint.flatMap { endpointIsRunning($0) ? $0 : nil }
+            let runningEndpoint = sorted.first { endpointIsRunning($0) }
+            let primaryEndpoint = runningUserEndpoint ?? runningEndpoint ?? userEndpoint ?? rootEndpoint ?? sorted[0]
             return AppLauncherItem(identityKey: key,
                                    primaryEndpoint: primaryEndpoint,
                                    userEndpoint: userEndpoint,
