@@ -467,6 +467,12 @@ private struct AppLauncherItem {
     }
 }
 
+private struct AppLauncherBadgeTarget {
+    let frame: CGRect
+    let endpoint: AppLauncherEndpoint
+    let displayName: String
+}
+
 private struct BackendListRow {
     let backend: BackendRecord
     let frontend: FrontendRecord?
@@ -782,6 +788,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private var appsToggleFrame = CGRect.zero
     private var backendsToggleFrame = CGRect.zero
     private var appCardFrames: [(frame: CGRect, item: AppLauncherItem)] = []
+    private var appBadgeFrames: [AppLauncherBadgeTarget] = []
     private var appListDropFrames: [(frame: CGRect, listName: String)] = []
     private var appUnlistedDropFrames: [CGRect] = []
     private var addAppFrame = CGRect.zero
@@ -1956,6 +1963,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         appsScrollContentLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
         appsOverlayLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
         appCardFrames.removeAll()
+        appBadgeFrames.removeAll()
         appListDropFrames.removeAll()
         appUnlistedDropFrames.removeAll()
         addAppFrame = .zero
@@ -2028,7 +2036,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         guard !items.isEmpty || includesAddTile else { return top }
 
         let itemWidth = max(min(floor(area.width / 4) - 10, 112), 86)
-        let itemHeight: CGFloat = 104
+        let itemHeight: CGFloat = 116
         let iconSize: CGFloat = 46
         let horizontalGap: CGFloat = 10
         let verticalGap: CGFloat = 10
@@ -2046,26 +2054,30 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
             let frame = CGRect(x: x, y: y, width: itemWidth, height: itemHeight)
             appCardFrames.append((frame, item))
+            let iconFrame = CGRect(x: frame.minX + floor((itemWidth - iconSize) / 2),
+                                   y: frame.maxY - iconSize - 10,
+                                   width: iconSize,
+                                   height: iconSize)
 
             recordMatchedIcon(key: item.iconKey,
-                              frame: rootLayer.convert(CGRect(x: frame.minX + floor((itemWidth - iconSize) / 2),
-                                                              y: frame.maxY - iconSize - 12,
-                                                              width: iconSize,
-                                                              height: iconSize),
-                                                       from: appsScrollContentLayer),
+                              frame: rootLayer.convert(iconFrame, from: appsScrollContentLayer),
                               image: item.iconImage,
                               title: item.displayName)
             visibleIconKeys.insert(item.iconKey)
-
+            let titleFrame = CGRect(x: frame.minX, y: frame.minY + 26, width: itemWidth, height: 28)
             recordMatchedText(key: item.iconKey,
-                              frame: rootLayer.convert(CGRect(x: frame.minX, y: frame.minY + 10, width: itemWidth, height: 28),
-                                                       from: appsScrollContentLayer),
+                              frame: rootLayer.convert(titleFrame, from: appsScrollContentLayer),
                               title: item.displayName,
                               fontSize: 12,
                               weight: .medium,
                               alignment: .center,
                               isWrapped: true)
             visibleTextKeys.insert(item.iconKey)
+            renderRunningBadges(for: item,
+                                leftX: iconFrame.maxX + 6,
+                                centerY: iconFrame.midY,
+                                pointSize: 15,
+                                gap: 2)
 
             x += itemWidth + horizontalGap
         }
@@ -2090,7 +2102,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
     private func renderAddAppTile(frame: CGRect, iconSize: CGFloat) {
         let iconFrame = CGRect(x: frame.minX + floor((frame.width - iconSize) / 2),
-                               y: frame.maxY - iconSize - 12,
+                               y: frame.maxY - iconSize - 10,
                                width: iconSize,
                                height: iconSize)
         let icon = CALayer()
@@ -2102,7 +2114,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
         let title = makeTextLayer(size: 12, weight: .medium, color: .labelColor, alignment: .center, italic: true)
         title.string = "Add app"
-        title.frame = CGRect(x: frame.minX, y: frame.minY + 10, width: frame.width, height: 28)
+        title.frame = CGRect(x: frame.minX, y: frame.minY + 26, width: frame.width, height: 28)
         appsScrollContentLayer.addSublayer(title)
     }
 
@@ -2243,10 +2255,11 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                               image: item.iconImage,
                               title: item.displayName)
             visibleIconKeys.insert(item.iconKey)
-
-            let textFrame = CGRect(x: iconFrame.maxX + 12,
+            let hasRunningBadges = !runningEndpoints(for: item).isEmpty
+            let textLeft = iconFrame.maxX + (hasRunningBadges ? 34 : 12)
+            let textFrame = CGRect(x: textLeft,
                                    y: rowFrame.midY - 10,
-                                   width: max(rowFrame.maxX - iconFrame.maxX - 28, 1),
+                                   width: max(rowFrame.maxX - textLeft - 16, 1),
                                    height: 20)
             recordMatchedText(key: item.iconKey,
                               frame: rootLayer.convert(textFrame, from: appsScrollContentLayer),
@@ -2256,6 +2269,11 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                               alignment: .left,
                               isWrapped: false)
             visibleTextKeys.insert(item.iconKey)
+            renderRunningBadges(for: item,
+                                leftX: iconFrame.maxX + 6,
+                                centerY: iconFrame.midY,
+                                pointSize: 10,
+                                gap: 2)
             y -= rowHeight
         }
     }
@@ -5257,6 +5275,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             let contentPoint = contentLayer.convert(point, from: rootLayer)
             let appsPoint = appsScrollContentLayer.convert(contentPoint, from: contentLayer)
             isOverAppTile = appCardFrames.contains { $0.frame.contains(appsPoint) } ||
+                            appBadgeFrames.contains { $0.frame.contains(appsPoint) } ||
                             addAppFrame.contains(appsPoint)
         }
         if isOverCreateField || isOverPasswordField {
@@ -5448,6 +5467,12 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         let contentPoint = contentLayer.convert(point, from: rootLayer)
         if mode == .apps {
             let appsPoint = appsScrollContentLayer.convert(contentPoint, from: contentLayer)
+            if let badge = appBadgeFrames.first(where: { $0.frame.contains(appsPoint) }) {
+                openLauncherEndpoint(badge.endpoint,
+                                     displayName: badge.displayName,
+                                     opensInNewTab: modifierFlags.contains(.command))
+                return
+            }
             if addAppFrame.contains(appsPoint) {
                 navigateToMode(.create, pushHistory: true)
                 return
@@ -5967,6 +5992,53 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         appLauncherItems(from: backends)
     }
 
+    private func runningEndpoints(for item: AppLauncherItem) -> [(endpoint: AppLauncherEndpoint, symbolName: String)] {
+        var endpoints: [(endpoint: AppLauncherEndpoint, symbolName: String)] = []
+        if let userEndpoint = item.userEndpoint,
+           userEndpoint.backend.status == "running" {
+            endpoints.append((userEndpoint, "person.fill"))
+        }
+        if let rootEndpoint = item.rootEndpoint,
+           rootEndpoint.backend.status == "running" {
+            endpoints.append((rootEndpoint, "person.badge.key.fill"))
+        }
+        return endpoints
+    }
+
+    private func renderRunningBadges(for item: AppLauncherItem,
+                                     leftX: CGFloat,
+                                     centerY: CGFloat,
+                                     pointSize: CGFloat,
+                                     gap: CGFloat) {
+        let badges = runningEndpoints(for: item).compactMap { badge -> (endpoint: AppLauncherEndpoint, image: CGImage, size: CGSize)? in
+            guard let symbol = naturalSymbolCGImage(named: badge.symbolName, pointSize: pointSize) else { return nil }
+            return (badge.endpoint, symbol.image, symbol.size)
+        }
+        guard !badges.isEmpty else { return }
+
+        let totalHeight = badges.reduce(CGFloat(0)) { $0 + $1.size.height } + CGFloat(max(badges.count - 1, 0)) * gap
+        let x = floor(leftX)
+        var y = floor(centerY + totalHeight / 2)
+        for badge in badges {
+            y -= badge.size.height
+            let frame = CGRect(x: x,
+                               y: floor(y),
+                               width: badge.size.width,
+                               height: badge.size.height)
+            appBadgeFrames.append(AppLauncherBadgeTarget(frame: frame.insetBy(dx: -3, dy: -3),
+                                                         endpoint: badge.endpoint,
+                                                         displayName: item.displayName))
+
+            let layer = CALayer()
+            layer.frame = frame
+            layer.contentsGravity = .resizeAspect
+            layer.contentsScale = 2
+            layer.contents = badge.image
+            appsScrollContentLayer.addSublayer(layer)
+            y -= gap
+        }
+    }
+
     private func appLauncherItems(from records: [BackendRecord]) -> [AppLauncherItem] {
         let endpoints = records.flatMap { backend -> [AppLauncherEndpoint] in
             guard !backend.isBackendsSelf else { return [] }
@@ -6034,7 +6106,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 String(iconBytes),
                 item.frontend.listName,
                 item.userEndpoint.map { frontendIdentityKey(backend: $0.backend, frontend: $0.frontend, frontendIndex: $0.frontendIndex) } ?? "",
-                item.rootEndpoint.map { frontendIdentityKey(backend: $0.backend, frontend: $0.frontend, frontendIndex: $0.frontendIndex) } ?? ""
+                item.userEndpoint?.backend.status ?? "",
+                item.rootEndpoint.map { frontendIdentityKey(backend: $0.backend, frontend: $0.frontend, frontendIndex: $0.frontendIndex) } ?? "",
+                item.rootEndpoint?.backend.status ?? ""
             ].joined(separator: "\u{1f}")
         }
         .sorted()
@@ -6755,6 +6829,37 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             output = cgImage(for: canvas)
         }
         return output
+    }
+
+    private func naturalSymbolCGImage(named symbolName: String, pointSize: CGFloat) -> (image: CGImage, size: CGSize)? {
+        var output: CGImage?
+        var displaySize = CGSize.zero
+        withEffectiveAppearance {
+            let scale: CGFloat = 2
+            guard let image = NSImage(systemSymbolName: symbolName, accessibilityDescription: nil)?
+                    .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: pointSize * scale, weight: .regular)) else {
+                return
+            }
+
+            let canvasSize = NSSize(width: ceil(image.size.width), height: ceil(image.size.height))
+            guard canvasSize.width > 0, canvasSize.height > 0 else { return }
+
+            let canvas = NSImage(size: canvasSize)
+            canvas.lockFocus()
+            NSColor.controlAccentColor.setFill()
+            NSRect(origin: .zero, size: canvasSize).fill()
+            image.draw(in: NSRect(origin: .zero, size: canvasSize),
+                       from: .zero,
+                       operation: .destinationIn,
+                       fraction: 1)
+            canvas.unlockFocus()
+
+            output = cgImage(for: canvas)
+            displaySize = CGSize(width: ceil(canvasSize.width / scale),
+                                 height: ceil(canvasSize.height / scale))
+        }
+        guard let output else { return nil }
+        return (image: output, size: displaySize)
     }
 
     private func alternatingRowColors() -> (even: CGColor, odd: CGColor) {
