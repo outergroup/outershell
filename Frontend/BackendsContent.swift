@@ -74,6 +74,7 @@ private struct BackendRecord: Decodable {
 }
 
 private struct FrontendRecord: Decodable {
+    let id: String
     let name: String
     let url: String
     let port: Int
@@ -81,9 +82,14 @@ private struct FrontendRecord: Decodable {
     let iconPath: String?
     let iconData: Data?
     let list: String?
+    let isRunning: Bool
 
     var hasEndpoint: Bool {
-        !socketPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || port > 0 || !url.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        if !socketPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || port > 0 {
+            return true
+        }
+        let trimmedURL = url.trimmingCharacters(in: .whitespacesAndNewlines)
+        return URL(string: trimmedURL)?.scheme != nil
     }
 
     var iconImage: NSImage? {
@@ -288,13 +294,17 @@ private extension BackendRecord {
 private extension FrontendRecord {
     static func decodeBinary(_ reader: BinaryPayloadReader) throws -> FrontendRecord {
         let iconData = try reader.dataRef(at: 32)
-        return FrontendRecord(name: try reader.stringRef(at: 0),
+        let id = reader.data.count >= 60 ? try reader.stringRef(at: 52) : ""
+        let flags = reader.data.count >= 64 ? try reader.uint32(at: 60) : 1
+        return FrontendRecord(id: id,
+                              name: try reader.stringRef(at: 0),
                               url: try reader.stringRef(at: 8),
                               port: Int(try reader.uint32(at: 48)),
                               socketPath: try reader.stringRef(at: 16),
                               iconPath: emptyToNil(try reader.stringRef(at: 24)),
                               iconData: iconData.isEmpty ? nil : iconData,
-                              list: emptyToNil(try reader.stringRef(at: 40)))
+                              list: emptyToNil(try reader.stringRef(at: 40)),
+                              isRunning: (flags & 0x01) != 0)
     }
 }
 
@@ -501,6 +511,9 @@ private func backendIdentityKey(_ backend: BackendRecord) -> String {
 }
 
 private func frontendIdentityKey(backend: BackendRecord, frontend: FrontendRecord, frontendIndex: Int) -> String {
+    if !frontend.id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        return "\(backendIdentityKey(backend)):frontend:\(frontend.id)"
+    }
     let endpoint: String
     if !frontend.socketPath.isEmpty {
         endpoint = frontend.socketPath
@@ -3962,6 +3975,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         request.httpMethod = "POST"
         request.setValue("application/x-www-form-urlencoded; charset=utf-8", forHTTPHeaderField: "Content-Type")
         request.httpBody = formEncodedBody([
+            "frontendID": item.frontend.id,
             "frontendURL": item.frontend.url,
             "list": listName
         ])
@@ -4042,13 +4056,15 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             guard backend.serviceID == serviceID else { return backend }
             let frontends = backend.frontends.map { frontend in
                 guard frontend.url == frontendURL else { return frontend }
-                return FrontendRecord(name: frontend.name,
+                return FrontendRecord(id: frontend.id,
+                                      name: frontend.name,
                                       url: frontend.url,
                                       port: frontend.port,
                                       socketPath: frontend.socketPath,
                                       iconPath: frontend.iconPath,
                                       iconData: frontend.iconData,
-                                      list: listName.isEmpty ? nil : listName)
+                                      list: listName.isEmpty ? nil : listName,
+                                      isRunning: frontend.isRunning)
             }
             return BackendRecord(serviceID: backend.serviceID,
                                  displayName: backend.displayName,
@@ -4095,10 +4111,19 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         openLauncherEndpoint(item.primaryEndpoint, displayName: item.displayName, opensInNewTab: opensInNewTab)
     }
 
+    private func canOpenStoppedSocketActivatedFrontend(_ endpoint: AppLauncherEndpoint) -> Bool {
+        !endpoint.frontend.socketPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty &&
+        endpoint.backend.status == "available"
+    }
+
     private func openLauncherEndpoint(_ endpoint: AppLauncherEndpoint, displayName: String, opensInNewTab: Bool) {
+        if !endpoint.frontend.isRunning,
+           !canOpenStoppedSocketActivatedFrontend(endpoint) {
+            startAndOpenLauncherEndpoint(endpoint, displayName: displayName, opensInNewTab: opensInNewTab)
+            return
+        }
         guard let url = frontendNavigationURL(endpoint.frontend) else {
-            backendError = "Could not build frontend URL."
-            updateLayout()
+            startAndOpenLauncherEndpoint(endpoint, displayName: displayName, opensInNewTab: opensInNewTab)
             return
         }
 
@@ -4107,6 +4132,100 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         } else {
             outerframeHost.navigate(to: url)
         }
+    }
+
+    private func startAndOpenLauncherEndpoint(_ endpoint: AppLauncherEndpoint, displayName: String, opensInNewTab: Bool) {
+        guard !isPerformingAction, let controlEndpoint, let urlSession else { return }
+        isPerformingAction = true
+        backendError = "Starting \(displayName)..."
+        updateLayout()
+
+        var components = URLComponents(url: controlEndpoint, resolvingAgainstBaseURL: false)
+        components?.queryItems = [
+            URLQueryItem(name: "serviceID", value: endpoint.backend.serviceID),
+            URLQueryItem(name: "operation", value: "start")
+        ]
+        guard let url = components?.url else {
+            isPerformingAction = false
+            backendError = "Could not build frontend URL."
+            updateLayout()
+            return
+        }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        urlSession.dataTask(with: request) { [weak self] data, _, error in
+            Task { @MainActor in
+                guard let self else { return }
+                self.isPerformingAction = false
+                if let error {
+                    self.backendError = error.localizedDescription
+                    self.updateLayout()
+                    return
+                }
+                if let data,
+                   let response = try? ActionResponse.decodeBinary(data),
+                   !response.ok {
+                    self.backendError = response.message
+                    self.updateLayout()
+                    return
+                }
+                self.waitForLauncherEndpoint(endpoint,
+                                             displayName: displayName,
+                                             opensInNewTab: opensInNewTab,
+                                             attempt: 0)
+            }
+        }.resume()
+    }
+
+    private func waitForLauncherEndpoint(_ endpoint: AppLauncherEndpoint,
+                                         displayName: String,
+                                         opensInNewTab: Bool,
+                                         attempt: Int) {
+        guard let backendsEndpoint, let urlSession else { return }
+        backendError = "Waiting for \(displayName)..."
+        updateLayout()
+        urlSession.dataTask(with: backendsEndpoint) { [weak self] data, _, _ in
+            Task { @MainActor in
+                guard let self else { return }
+                if let data,
+                   let response = try? BackendsResponse.decodeBinary(data) {
+                    self.backends = response.backends
+                    if let nextEndpoint = self.findLauncherEndpoint(serviceID: endpoint.backend.serviceID,
+                                                                    frontendID: endpoint.frontend.id),
+                       let url = self.frontendNavigationURL(nextEndpoint.frontend),
+                       nextEndpoint.frontend.isRunning || self.canOpenStoppedSocketActivatedFrontend(nextEndpoint) {
+                        self.backendError = ""
+                        self.updateLayout()
+                        if opensInNewTab {
+                            self.outerframeHost.openNewTab(with: url, displayString: displayName)
+                        } else {
+                            self.outerframeHost.navigate(to: url)
+                        }
+                        return
+                    }
+                }
+                guard attempt < 30 else {
+                    self.backendError = "Timed out waiting for \(displayName)."
+                    self.updateLayout()
+                    return
+                }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                    self.waitForLauncherEndpoint(endpoint,
+                                                 displayName: displayName,
+                                                 opensInNewTab: opensInNewTab,
+                                                 attempt: attempt + 1)
+                }
+            }
+        }.resume()
+    }
+
+    private func findLauncherEndpoint(serviceID: String, frontendID: String) -> AppLauncherEndpoint? {
+        for backend in backends where backend.serviceID == serviceID {
+            for (index, frontend) in backend.frontends.enumerated() where frontend.id == frontendID {
+                return AppLauncherEndpoint(backend: backend, frontend: frontend, frontendIndex: index)
+            }
+        }
+        return nil
     }
 
     private func performAppMenuAction(_ item: AppLauncherItem, operation: String) {
@@ -6079,11 +6198,11 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private func runningEndpoints(for item: AppLauncherItem) -> [(endpoint: AppLauncherEndpoint, symbolName: String)] {
         var endpoints: [(endpoint: AppLauncherEndpoint, symbolName: String)] = []
         if let userEndpoint = item.userEndpoint,
-           userEndpoint.backend.status == "running" {
+           userEndpoint.frontend.isRunning {
             endpoints.append((userEndpoint, "person.fill"))
         }
         if let rootEndpoint = item.rootEndpoint,
-           rootEndpoint.backend.status == "running" {
+           rootEndpoint.frontend.isRunning {
             endpoints.append((rootEndpoint, "checkmark.shield.fill"))
         }
         return endpoints
@@ -6146,7 +6265,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         let endpoints = records.flatMap { backend -> [AppLauncherEndpoint] in
             guard !backend.isBackendsSelf else { return [] }
             return backend.frontends.enumerated().compactMap { index, frontend in
-                guard frontend.hasEndpoint else { return nil }
                 return AppLauncherEndpoint(backend: backend, frontend: frontend, frontendIndex: index)
             }
         }
@@ -6176,7 +6294,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         let frontendName = frontend.name.trimmingCharacters(in: .whitespacesAndNewlines)
         let displayName = frontendName.isEmpty ? backend.displayName.trimmingCharacters(in: .whitespacesAndNewlines) : frontendName
         let endpointPath: String
-        if !frontend.socketPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        if !frontend.id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            endpointPath = frontend.id
+        } else if !frontend.socketPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             endpointPath = pathAndQuery(fromFrontendURL: frontend.url, socketPath: frontend.socketPath)
         } else if frontend.port > 0 {
             endpointPath = pathAndQuery(fromFrontendURL: frontend.url, socketPath: nil)
@@ -6202,9 +6322,11 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 item.backend.serviceScope,
                 item.backend.displayName,
                 item.frontend.url,
+                item.frontend.id,
                 item.frontend.name,
                 item.frontend.socketPath,
                 String(item.frontend.port),
+                item.frontend.isRunning ? "running" : "stopped",
                 item.frontend.iconPath ?? "",
                 String(iconBytes),
                 item.frontend.listName,

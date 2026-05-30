@@ -119,6 +119,8 @@ typedef struct {
     int64_t refreshed_at_ms;
 } SystemdStatusCache;
 
+#define FRONTEND_FLAG_RUNNING 0x01u
+
 static SystemdStatusCache g_systemd_status_cache = {0};
 static uint64_t g_backend_event_sequence = 1;
 
@@ -992,6 +994,30 @@ static void bundled_socket_path_for_scope(const BundledAppDefinition *app,
 #endif
 }
 
+static void runtime_socket_path(const char *name, char *out, size_t out_size) {
+#ifdef __APPLE__
+    size_t required_length = confstr(_CS_DARWIN_USER_TEMP_DIR, NULL, 0);
+    if (required_length > 0) {
+        char temp_dir[PATH_MAX];
+        if (required_length < sizeof(temp_dir) &&
+            confstr(_CS_DARWIN_USER_TEMP_DIR, temp_dir, required_length) > 0 &&
+            temp_dir[0]) {
+            size_t length = strlen(temp_dir);
+            snprintf(out, out_size, "%s%s%s", temp_dir, length > 0 && temp_dir[length - 1] == '/' ? "" : "/", name);
+            return;
+        }
+    }
+    snprintf(out, out_size, "/tmp/%s", name);
+#else
+    const char *runtime_dir = getenv("XDG_RUNTIME_DIR");
+    if (runtime_dir && runtime_dir[0]) {
+        snprintf(out, out_size, "%s/%s", runtime_dir, name);
+    } else {
+        snprintf(out, out_size, "/run/user/%d/%s", (int)getuid(), name);
+    }
+#endif
+}
+
 static bool safe_service_directory_name(const char *value) {
     if (!value || !value[0] || value[0] == '.') return false;
     for (const char *p = value; *p; p++) {
@@ -1538,6 +1564,26 @@ static bool table_has_column(sqlite3 *database, const char *table_name, const ch
     return has_column;
 }
 
+static bool table_column_is_primary_key(sqlite3 *database, const char *table_name, const char *name, bool *is_primary_key, char *error, size_t error_size) {
+    *is_primary_key = false;
+    sqlite3_stmt *statement = NULL;
+    char sql[160];
+    snprintf(sql, sizeof(sql), "PRAGMA table_info(%s);", table_name);
+    if (sqlite3_prepare_v2(database, sql, -1, &statement, NULL) != SQLITE_OK) {
+        snprintf(error, error_size, "%s", sqlite3_errmsg(database));
+        return false;
+    }
+    while (sqlite3_step(statement) == SQLITE_ROW) {
+        const char *column_name = (const char *)sqlite3_column_text(statement, 1);
+        if (column_name && strcmp(column_name, name) == 0) {
+            *is_primary_key = sqlite3_column_int(statement, 5) != 0;
+            break;
+        }
+    }
+    sqlite3_finalize(statement);
+    return true;
+}
+
 static bool frontends_has_column(sqlite3 *database, const char *name, char *error, size_t error_size) {
     return table_has_column(database, "frontends", name, error, error_size);
 }
@@ -1554,14 +1600,16 @@ static bool ensure_registry_schema(sqlite3 *database, char *error, size_t error_
                         "service_unit TEXT"
                         ");"
                         "CREATE TABLE IF NOT EXISTS frontends ("
-                        "url TEXT PRIMARY KEY,"
+                        "frontend_id TEXT PRIMARY KEY,"
+                        "url TEXT NOT NULL DEFAULT '',"
                         "service_id TEXT,"
                         "display_name TEXT NOT NULL DEFAULT '',"
                         "port INTEGER NOT NULL DEFAULT 0,"
                         "socket_path TEXT NOT NULL DEFAULT '',"
                         "icon TEXT,"
                         "icon_path TEXT,"
-                        "list TEXT"
+                        "list TEXT,"
+                        "running INTEGER NOT NULL DEFAULT 1"
                         ");"
                         "CREATE INDEX IF NOT EXISTS frontends_service_id_idx ON frontends(service_id);"
                         "CREATE TABLE IF NOT EXISTS log_files ("
@@ -1658,21 +1706,58 @@ static bool ensure_registry_schema(sqlite3 *database, char *error, size_t error_
             return false;
         }
     }
-    if (has_frontend_name_column) {
+    if (!frontends_has_column(database, "frontend_id", error, error_size)) {
+        if (!sqlite_exec_ok(database,
+                            "ALTER TABLE frontends ADD COLUMN frontend_id TEXT NOT NULL DEFAULT '';"
+                            "UPDATE frontends SET frontend_id = COALESCE(NULLIF(service_id, ''), 'app') || ':' || rowid WHERE frontend_id = '';",
+                            error,
+                            error_size)) {
+            return false;
+        }
+    }
+    if (!frontends_has_column(database, "running", error, error_size)) {
+        if (!sqlite_exec_ok(database,
+                            "ALTER TABLE frontends ADD COLUMN running INTEGER NOT NULL DEFAULT 1;",
+                            error,
+                            error_size)) {
+            return false;
+        }
+    }
+    if (!sqlite_exec_ok(database,
+                        "UPDATE frontends SET frontend_id = COALESCE(NULLIF(service_id, ''), 'app') || ':' || rowid WHERE frontend_id = '';",
+                        error,
+                        error_size)) {
+        return false;
+    }
+    bool frontend_id_is_primary_key = false;
+    if (!table_column_is_primary_key(database, "frontends", "frontend_id", &frontend_id_is_primary_key, error, error_size)) {
+        return false;
+    }
+    if (has_frontend_name_column || !frontend_id_is_primary_key) {
+        const char *copy_frontends_sql = has_frontend_name_column
+            ? "INSERT OR REPLACE INTO frontends_new(frontend_id, url, service_id, display_name, port, socket_path, icon, icon_path, list, running) "
+              "SELECT frontend_id, COALESCE(url, ''), service_id, COALESCE(NULLIF(display_name, ''), name, ''), COALESCE(port, 0), COALESCE(socket_path, ''), icon, icon_path, list, COALESCE(running, 1) FROM frontends;"
+            : "INSERT OR REPLACE INTO frontends_new(frontend_id, url, service_id, display_name, port, socket_path, icon, icon_path, list, running) "
+              "SELECT frontend_id, COALESCE(url, ''), service_id, COALESCE(display_name, ''), COALESCE(port, 0), COALESCE(socket_path, ''), icon, icon_path, list, COALESCE(running, 1) FROM frontends;";
         if (!sqlite_exec_ok(database,
                             "DROP INDEX IF EXISTS frontends_service_id_idx;"
+                            "DROP INDEX IF EXISTS frontends_frontend_id_unique;"
                             "CREATE TABLE frontends_new ("
-                            "url TEXT PRIMARY KEY,"
+                            "frontend_id TEXT PRIMARY KEY,"
+                            "url TEXT NOT NULL DEFAULT '',"
                             "service_id TEXT,"
                             "display_name TEXT NOT NULL DEFAULT '',"
                             "port INTEGER NOT NULL DEFAULT 0,"
                             "socket_path TEXT NOT NULL DEFAULT '',"
                             "icon TEXT,"
                             "icon_path TEXT,"
-                            "list TEXT"
-                            ");"
-                            "INSERT OR REPLACE INTO frontends_new(url, service_id, display_name, port, socket_path, icon, icon_path, list) "
-                            "SELECT url, service_id, COALESCE(NULLIF(display_name, ''), name, ''), COALESCE(port, 0), COALESCE(socket_path, ''), icon, icon_path, list FROM frontends;"
+                            "list TEXT,"
+                            "running INTEGER NOT NULL DEFAULT 1"
+                            ");",
+                            error,
+                            error_size) ||
+            !sqlite_exec_ok(database, copy_frontends_sql, error, error_size) ||
+            !sqlite_exec_ok(database,
                             "DROP TABLE frontends;"
                             "ALTER TABLE frontends_new RENAME TO frontends;"
                             "CREATE INDEX IF NOT EXISTS frontends_service_id_idx ON frontends(service_id);",
@@ -1680,12 +1765,35 @@ static bool ensure_registry_schema(sqlite3 *database, char *error, size_t error_
                             error_size)) {
             return false;
         }
+    } else if (!sqlite_exec_ok(database,
+                               "CREATE INDEX IF NOT EXISTS frontends_service_id_idx ON frontends(service_id);",
+                               error,
+                               error_size)) {
+        return false;
     }
     if (!sqlite_exec_ok(database,
                         "CREATE TABLE IF NOT EXISTS frontend_layouts ("
                         "url TEXT PRIMARY KEY,"
-                        "list TEXT NOT NULL DEFAULT ''"
+                        "list TEXT NOT NULL DEFAULT '',"
+                        "frontend_id TEXT"
                         ");",
+                        error,
+                        error_size)) {
+        return false;
+    }
+    if (!table_has_column(database, "frontend_layouts", "frontend_id", error, error_size)) {
+        if (!sqlite_exec_ok(database,
+                            "ALTER TABLE frontend_layouts ADD COLUMN frontend_id TEXT;",
+                            error,
+                            error_size)) {
+            return false;
+        }
+    }
+    if (!sqlite_exec_ok(database,
+                        "UPDATE frontend_layouts "
+                        "SET frontend_id = (SELECT f.frontend_id FROM frontends f WHERE f.url = frontend_layouts.url LIMIT 1) "
+                        "WHERE frontend_id IS NULL OR frontend_id = '';"
+                        "CREATE INDEX IF NOT EXISTS frontend_layouts_frontend_id_idx ON frontend_layouts(frontend_id);",
                         error,
                         error_size)) {
         return false;
@@ -2063,7 +2171,8 @@ enum {
     ORWA_LEGACY_FOUR_TABLE_HEADER_SIZE = 8 + ORWA_LEGACY_FOUR_TABLE_COUNT * ORWA_TABLE_DESCRIPTOR_SIZE,
     ORWA_LEGACY_THREE_TABLE_HEADER_SIZE = 8 + ORWA_LEGACY_THREE_TABLE_COUNT * ORWA_TABLE_DESCRIPTOR_SIZE,
     ORWA_BACKENDS_ROW_SIZE = 84,
-    ORWA_FRONTENDS_ROW_SIZE = 97,
+    ORWA_LEGACY_FRONTENDS_ROW_SIZE = 97,
+    ORWA_FRONTENDS_ROW_SIZE = 117,
     ORWA_FRONTEND_LAYOUTS_ROW_SIZE = 32,
     ORWA_LOG_FILES_ROW_SIZE = 32,
     ORWA_FILE_OPENERS_ROW_SIZE = 88
@@ -2299,13 +2408,16 @@ static bool registry_binary_append_frontend_row(sqlite3_stmt *statement,
               sb_append_n(rows, (const char *)&endpoint_kind, sizeof(endpoint_kind));
     if (!ok) return false;
     if (endpoint_kind == 2u) {
-        return registry_binary_append_string_ref(pool, variable_region, rows, socket_path);
+        ok = registry_binary_append_string_ref(pool, variable_region, rows, socket_path);
+    } else if (endpoint_kind == 1u) {
+        ok = binary_append_u32(rows, port) &&
+             sb_append_n(rows, (const char *)zero_padding, sizeof(zero_padding));
+    } else {
+        ok = sb_append_n(rows, (const char *)empty_payload, sizeof(empty_payload));
     }
-    if (endpoint_kind == 1u) {
-        return binary_append_u32(rows, port) &&
-               sb_append_n(rows, (const char *)zero_padding, sizeof(zero_padding));
-    }
-    return sb_append_n(rows, (const char *)empty_payload, sizeof(empty_payload));
+    if (!ok) return false;
+    return registry_binary_append_string_ref(pool, variable_region, rows, sqlite_column_text_or_empty(statement, 7)) &&
+           binary_append_u32(rows, sqlite3_column_int(statement, 8) ? FRONTEND_FLAG_RUNNING : 0);
 }
 
 static bool registry_binary_append_frontend_layout_row(sqlite3_stmt *statement,
@@ -2527,6 +2639,7 @@ static bool registry_binary_import_backend(sqlite3 *database,
 }
 
 static bool registry_binary_import_frontend(sqlite3 *database,
+                                            const char *frontend_id,
                                             const char *url,
                                             const char *service_id,
                                             const char *display_name,
@@ -2534,22 +2647,26 @@ static bool registry_binary_import_frontend(sqlite3 *database,
                                             const char *socket_path,
                                             const char *icon_path,
                                             const char *list,
+                                            bool running,
                                             char *error,
                                             size_t error_size) {
     sqlite3_stmt *statement = NULL;
     bool ok = sqlite3_prepare_v2(database,
-                                 "INSERT OR REPLACE INTO frontends(url, service_id, display_name, port, socket_path, icon_path, list) VALUES(?, ?, ?, ?, ?, NULLIF(?, ''), NULLIF(?, ''));",
+                                 "INSERT INTO frontends(frontend_id, url, service_id, display_name, port, socket_path, icon_path, list, running) VALUES(?, ?, ?, ?, ?, ?, NULLIF(?, ''), NULLIF(?, ''), ?) "
+                                 "ON CONFLICT(frontend_id) DO UPDATE SET url=excluded.url, service_id=excluded.service_id, display_name=excluded.display_name, port=excluded.port, socket_path=excluded.socket_path, icon_path=excluded.icon_path, list=excluded.list, running=excluded.running;",
                                  -1,
                                  &statement,
                                  NULL) == SQLITE_OK;
     if (ok) {
-        sqlite3_bind_text(statement, 1, url, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(statement, 2, service_id, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(statement, 3, display_name, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int(statement, 4, (int)port);
-        sqlite3_bind_text(statement, 5, socket_path, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(statement, 6, icon_path, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(statement, 7, list, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(statement, 1, frontend_id && frontend_id[0] ? frontend_id : service_id, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(statement, 2, url, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(statement, 3, service_id, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(statement, 4, display_name, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int(statement, 5, (int)port);
+        sqlite3_bind_text(statement, 6, socket_path, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(statement, 7, icon_path, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(statement, 8, list, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int(statement, 9, running ? 1 : 0);
         ok = registry_binary_step(database, statement, error, error_size);
     } else {
         snprintf(error, error_size, "%s", sqlite3_errmsg(database));
@@ -2685,11 +2802,13 @@ static bool import_registry_binary_into_sqlite(sqlite3 *database, const char *sq
         descriptors[i].row_count = read_uint64_le(bytes + descriptor_offset + 8);
         descriptors[i].row_size = read_uint32_le(bytes + descriptor_offset + 16);
         uint32_t expected_row_size = i == ORWA_TABLE_BACKENDS ? ORWA_BACKENDS_ROW_SIZE :
-                                     i == ORWA_TABLE_FRONTENDS ? ORWA_FRONTENDS_ROW_SIZE :
+                                     i == ORWA_TABLE_FRONTENDS ? descriptors[i].row_size :
                                      i == ORWA_TABLE_FRONTEND_LAYOUTS && table_count != ORWA_LEGACY_THREE_TABLE_COUNT ? ORWA_FRONTEND_LAYOUTS_ROW_SIZE :
                                      i == ORWA_TABLE_FILE_OPENERS ? ORWA_FILE_OPENERS_ROW_SIZE :
                                      ORWA_LOG_FILES_ROW_SIZE;
-        if (descriptors[i].row_size != expected_row_size ||
+        if ((i == ORWA_TABLE_FRONTENDS
+                ? (descriptors[i].row_size != ORWA_FRONTENDS_ROW_SIZE && descriptors[i].row_size != ORWA_LEGACY_FRONTENDS_ROW_SIZE)
+                : descriptors[i].row_size != expected_row_size) ||
             descriptors[i].offset > (uint64_t)file_size ||
             descriptors[i].row_count > UINT64_MAX / descriptors[i].row_size ||
             descriptors[i].row_count * descriptors[i].row_size > (uint64_t)file_size - descriptors[i].offset) {
@@ -2724,9 +2843,10 @@ static bool import_registry_binary_into_sqlite(sqlite3 *database, const char *sq
     }
 
     for (uint64_t row = 0; ok && row < descriptors[ORWA_TABLE_FRONTENDS].row_count; row++) {
-        const unsigned char *row_bytes = bytes + descriptors[ORWA_TABLE_FRONTENDS].offset + row * ORWA_FRONTENDS_ROW_SIZE;
-        char *url = NULL, *service_id = NULL, *display_name = NULL, *icon_path = NULL, *list = NULL, *socket_path = NULL;
+        const unsigned char *row_bytes = bytes + descriptors[ORWA_TABLE_FRONTENDS].offset + row * descriptors[ORWA_TABLE_FRONTENDS].row_size;
+        char *url = NULL, *service_id = NULL, *display_name = NULL, *icon_path = NULL, *list = NULL, *socket_path = NULL, *frontend_id = NULL;
         uint32_t port = 0;
+        uint32_t flags = FRONTEND_FLAG_RUNNING;
         ok = registry_binary_read_string(bytes, file_size, variable_offset, read_uint64_le(row_bytes), read_uint64_le(row_bytes + 8), &url, error, error_size) &&
              registry_binary_read_string(bytes, file_size, variable_offset, read_uint64_le(row_bytes + 16), read_uint64_le(row_bytes + 24), &service_id, error, error_size) &&
              registry_binary_read_string(bytes, file_size, variable_offset, read_uint64_le(row_bytes + 32), read_uint64_le(row_bytes + 40), &display_name, error, error_size) &&
@@ -2754,8 +2874,21 @@ static bool import_registry_binary_into_sqlite(sqlite3 *database, const char *sq
                 ok = false;
             }
         }
+        if (ok && descriptors[ORWA_TABLE_FRONTENDS].row_size >= ORWA_FRONTENDS_ROW_SIZE) {
+            ok = registry_binary_read_string(bytes, file_size, variable_offset, read_uint64_le(row_bytes + 97), read_uint64_le(row_bytes + 105), &frontend_id, error, error_size);
+            flags = read_uint32_le(row_bytes + 113);
+        } else if (ok) {
+            size_t needed = strlen(service_id ? service_id : "") + strlen(url ? url : "") + 2;
+            frontend_id = (char *)malloc(needed);
+            if (frontend_id) {
+                snprintf(frontend_id, needed, "%s:%s", service_id ? service_id : "app", url && url[0] ? url : "main");
+            } else {
+                snprintf(error, error_size, "Out of memory.");
+                ok = false;
+            }
+        }
         if (ok) {
-            ok = registry_binary_import_frontend(database, url, service_id, display_name, port, socket_path, icon_path, list, error, error_size);
+            ok = registry_binary_import_frontend(database, frontend_id, url, service_id, display_name, port, socket_path, icon_path, list, (flags & FRONTEND_FLAG_RUNNING) != 0, error, error_size);
         }
         if (ok && table_count == ORWA_LEGACY_THREE_TABLE_COUNT) {
             ok = registry_binary_import_frontend_layout(database, url, list, error, error_size);
@@ -2766,6 +2899,7 @@ static bool import_registry_binary_into_sqlite(sqlite3 *database, const char *sq
         free(icon_path);
         free(list);
         free(socket_path);
+        free(frontend_id);
     }
 
     if (table_count != ORWA_LEGACY_THREE_TABLE_COUNT) {
@@ -2900,8 +3034,8 @@ static bool export_registry_binary_from_sqlite(sqlite3 *database, const char *sq
     }
     if (ok && descriptors[ORWA_TABLE_FRONTENDS].row_count > 0) {
         ok = registry_binary_append_query(database,
-                                          "SELECT url, COALESCE(service_id, ''), COALESCE(display_name, ''), COALESCE(port, 0), COALESCE(socket_path, ''), COALESCE(icon_path, ''), COALESCE(list, '') FROM frontends ORDER BY service_id, COALESCE(list, ''), display_name, url;",
-                                          7,
+                                          "SELECT url, COALESCE(service_id, ''), COALESCE(display_name, ''), COALESCE(port, 0), COALESCE(socket_path, ''), COALESCE(icon_path, ''), COALESCE(list, ''), COALESCE(frontend_id, ''), COALESCE(running, 0) FROM frontends ORDER BY service_id, COALESCE(list, ''), display_name, url;",
+                                          9,
                                           registry_binary_append_frontend_row,
                                           &pool,
                                           &variable_region,
@@ -3523,20 +3657,24 @@ static bool run_home_screen_install_script(const char *subcommand, char *message
 static bool uninstall_local_home_screen(char *message, size_t message_size);
 
 static bool build_frontend_payload(const char *name,
+                                   const char *frontend_id,
                                    const char *url,
                                    int port,
                                    const char *socket_path,
                                    const char *icon_path,
                                    const char *list,
+                                   bool running,
                                    StringBuilder *payload) {
-    if (!binary_append_zero(payload, 52)) return false;
+    if (!binary_append_zero(payload, 64)) return false;
     return binary_append_string_ref_at(payload, 0, name) &&
            binary_append_string_ref_at(payload, 8, url) &&
            binary_append_string_ref_at(payload, 16, socket_path) &&
            binary_append_string_ref_at(payload, 24, icon_path) &&
            binary_append_file_ref_at(payload, 32, icon_path) &&
            binary_append_string_ref_at(payload, 40, list) &&
-           binary_write_u32_at(payload, 48, (uint32_t)(port < 0 ? 0 : port));
+           binary_write_u32_at(payload, 48, (uint32_t)(port < 0 ? 0 : port)) &&
+           binary_append_string_ref_at(payload, 52, frontend_id) &&
+           binary_write_u32_at(payload, 60, running ? FRONTEND_FLAG_RUNNING : 0);
 }
 
 static bool build_log_file_payload(const char *service_id,
@@ -3563,26 +3701,29 @@ static bool build_log_file_payload(const char *service_id,
 }
 
 static bool lookup_frontend_layout(sqlite3 *database,
+                                   const char *frontend_id,
                                    const char *url,
                                    char *list,
                                    size_t list_size,
                                    bool *found) {
     if (found) *found = false;
     if (list && list_size) list[0] = '\0';
-    if (!database || !url || !url[0] || !sqlite_table_exists(database, "frontend_layouts")) return true;
+    if (!database || !sqlite_table_exists(database, "frontend_layouts")) return true;
     sqlite3_stmt *statement = NULL;
-    const char *sql = "SELECT list FROM frontend_layouts WHERE url = ? LIMIT 1;";
+    const char *sql = (frontend_id && frontend_id[0])
+        ? "SELECT list FROM frontend_layouts WHERE frontend_id = ? LIMIT 1;"
+        : "SELECT list FROM frontend_layouts WHERE url = ? LIMIT 1;";
     if (sqlite3_prepare_v2(database, sql, -1, &statement, NULL) != SQLITE_OK) {
         return false;
     }
-    sqlite3_bind_text(statement, 1, url, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(statement, 1, (frontend_id && frontend_id[0]) ? frontend_id : (url ? url : ""), -1, SQLITE_TRANSIENT);
     bool has_row = sqlite3_step(statement) == SQLITE_ROW;
     if (has_row) {
         if (found) *found = true;
         snprintf(list, list_size, "%s", sqlite_column_text_or_empty(statement, 0));
     }
     sqlite3_finalize(statement);
-    if (!has_row && url[0]) {
+    if (!has_row && (!frontend_id || !frontend_id[0]) && url && url[0]) {
         size_t length = strlen(url);
         if (length > 1 && url[length - 1] == '/') {
             char without_trailing_slash[PATH_MAX];
@@ -3612,10 +3753,10 @@ static bool build_frontends_array_payload(sqlite3 *database, sqlite3 *layout_dat
     char column_error[256] = "";
     bool has_list_column = frontends_has_column(database, "list", column_error, sizeof(column_error));
     const char *sql = has_list_column ?
-        "SELECT f.display_name, COALESCE(f.url, ''), COALESCE(f.port, 0), COALESCE(f.socket_path, ''), COALESCE(NULLIF(f.icon_path, ''), COALESCE(b.icon_path, '')), COALESCE(f.list, '') "
+        "SELECT f.display_name, COALESCE(f.url, ''), COALESCE(f.port, 0), COALESCE(f.socket_path, ''), COALESCE(NULLIF(f.icon_path, ''), COALESCE(b.icon_path, '')), COALESCE(f.list, ''), COALESCE(f.frontend_id, ''), COALESCE(f.running, 0) "
         "FROM frontends f LEFT JOIN backends b ON b.service_id = f.service_id WHERE f.service_id = ? "
         "ORDER BY COALESCE(f.list, ''), f.display_name, f.url;" :
-        "SELECT f.display_name, COALESCE(f.url, ''), COALESCE(f.port, 0), COALESCE(f.socket_path, ''), COALESCE(NULLIF(f.icon_path, ''), COALESCE(b.icon_path, '')), '' "
+        "SELECT f.display_name, COALESCE(f.url, ''), COALESCE(f.port, 0), COALESCE(f.socket_path, ''), COALESCE(NULLIF(f.icon_path, ''), COALESCE(b.icon_path, '')), '', COALESCE(f.frontend_id, ''), COALESCE(f.running, 0) "
         "FROM frontends f LEFT JOIN backends b ON b.service_id = f.service_id WHERE f.service_id = ? "
         "ORDER BY f.display_name, f.url;";
     if (sqlite3_prepare_v2(database, sql, -1, &statement, NULL) != SQLITE_OK) {
@@ -3627,10 +3768,12 @@ static bool build_frontends_array_payload(sqlite3 *database, sqlite3 *layout_dat
     while (ok && sqlite3_step(statement) == SQLITE_ROW) {
         StringBuilder payload = {0};
         const char *url = sqlite_column_text_or_empty(statement, 1);
+        const char *frontend_id = sqlite_column_text_or_empty(statement, 6);
         const char *suggested_list = sqlite_column_text_or_empty(statement, 5);
         char layout_list[PATH_MAX] = "";
         bool has_layout = false;
         ok = lookup_frontend_layout(layout_database ? layout_database : database,
+                                    frontend_id,
                                     url,
                                     layout_list,
                                     sizeof(layout_list),
@@ -3640,11 +3783,13 @@ static bool build_frontends_array_payload(sqlite3 *database, sqlite3 *layout_dat
             break;
         }
         ok = build_frontend_payload(sqlite_column_text_or_empty(statement, 0),
+                                    frontend_id,
                                     url,
                                     sqlite3_column_int(statement, 2),
                                     sqlite_column_text_or_empty(statement, 3),
                                     sqlite_column_text_or_empty(statement, 4),
                                     has_layout ? layout_list : suggested_list,
+                                    sqlite3_column_int(statement, 7) != 0,
                                     &payload) &&
              binary_payload_list_append(&list, &payload);
         if (!ok) free(payload.data);
@@ -4136,6 +4281,7 @@ static bool registry_storage_exists_at(const char *database_path) {
 
 static bool frontend_exists_in_registry_at(const char *database_path,
                                            const char *service_id,
+                                           const char *frontend_id,
                                            const char *frontend_url,
                                            bool *found,
                                            char *error,
@@ -4144,14 +4290,17 @@ static bool frontend_exists_in_registry_at(const char *database_path,
     sqlite3 *database = open_registry_readonly_at(database_path, error, error_size);
     if (!database) return false;
     sqlite3_stmt *statement = NULL;
+    bool use_frontend_id = frontend_id && frontend_id[0];
     bool ok = sqlite3_prepare_v2(database,
-                                 "SELECT 1 FROM frontends WHERE service_id = ? AND url = ? LIMIT 1;",
+                                 use_frontend_id
+                                     ? "SELECT 1 FROM frontends WHERE service_id = ? AND frontend_id = ? LIMIT 1;"
+                                     : "SELECT 1 FROM frontends WHERE service_id = ? AND url = ? LIMIT 1;",
                                  -1,
                                  &statement,
                                  NULL) == SQLITE_OK;
     if (ok) {
         sqlite3_bind_text(statement, 1, service_id, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(statement, 2, frontend_url, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(statement, 2, use_frontend_id ? frontend_id : frontend_url, -1, SQLITE_TRANSIENT);
         int step = sqlite3_step(statement);
         if (step == SQLITE_ROW) {
             if (found) *found = true;
@@ -4165,7 +4314,8 @@ static bool frontend_exists_in_registry_at(const char *database_path,
     return ok;
 }
 
-static bool update_frontend_layout_in_user_registry(const char *frontend_url,
+static bool update_frontend_layout_in_user_registry(const char *frontend_id,
+                                                    const char *frontend_url,
                                                     const char *list_name,
                                                     char *error,
                                                     size_t error_size) {
@@ -4177,14 +4327,15 @@ static bool update_frontend_layout_in_user_registry(const char *frontend_url,
     }
     sqlite3_stmt *statement = NULL;
     bool ok = sqlite3_prepare_v2(database,
-                                 "INSERT INTO frontend_layouts(url, list) VALUES(?, ?) "
-                                 "ON CONFLICT(url) DO UPDATE SET list = excluded.list;",
+                                 "INSERT INTO frontend_layouts(url, list, frontend_id) VALUES(?, ?, NULLIF(?, '')) "
+                                 "ON CONFLICT(url) DO UPDATE SET list = excluded.list, frontend_id = excluded.frontend_id;",
                                  -1,
                                  &statement,
                                  NULL) == SQLITE_OK;
     if (ok) {
-        sqlite3_bind_text(statement, 1, frontend_url, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(statement, 1, (frontend_url && frontend_url[0]) ? frontend_url : (frontend_id ? frontend_id : ""), -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(statement, 2, list_name ? list_name : "", -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(statement, 3, frontend_id ? frontend_id : "", -1, SQLITE_TRANSIENT);
         ok = registry_binary_step(database, statement, error, error_size);
     } else {
         snprintf(error, error_size, "%s", sqlite3_errmsg(database));
@@ -4194,6 +4345,7 @@ static bool update_frontend_layout_in_user_registry(const char *frontend_url,
 }
 
 static bool update_frontend_list_any_registry(const char *service_id,
+                                              const char *frontend_id,
                                               const char *frontend_url,
                                               const char *list_name,
                                               char *message,
@@ -4202,6 +4354,7 @@ static bool update_frontend_list_any_registry(const char *service_id,
     char error[512] = "";
     if (!frontend_exists_in_registry_at(g_registry_database_path,
                                         service_id,
+                                        frontend_id,
                                         frontend_url,
                                         &found,
                                         error,
@@ -4214,6 +4367,7 @@ static bool update_frontend_list_any_registry(const char *service_id,
         error[0] = '\0';
         if (!frontend_exists_in_registry_at(g_system_registry_database_path,
                                             service_id,
+                                            frontend_id,
                                             frontend_url,
                                             &found,
                                             error,
@@ -4224,7 +4378,7 @@ static bool update_frontend_list_any_registry(const char *service_id,
     }
 
     if (found) {
-        if (update_frontend_layout_in_user_registry(frontend_url, list_name, error, sizeof(error))) {
+        if (update_frontend_layout_in_user_registry(frontend_id, frontend_url, list_name, error, sizeof(error))) {
             snprintf(message, message_size, "Updated app list.");
             return true;
         }
@@ -4247,7 +4401,7 @@ static bool clear_frontends_in_registry_at(const char *database_path, const char
     bool ok = sqlite_exec_ok(database, "BEGIN IMMEDIATE TRANSACTION;", error, error_size);
     sqlite3_stmt *statement = NULL;
     if (ok) {
-        ok = sqlite3_prepare_v2(database, "DELETE FROM frontends WHERE service_id = ?;", -1, &statement, NULL) == SQLITE_OK;
+        ok = sqlite3_prepare_v2(database, "UPDATE frontends SET running = 0, url = '', port = 0 WHERE service_id = ?;", -1, &statement, NULL) == SQLITE_OK;
         if (ok) {
             sqlite3_bind_text(statement, 1, service_id, -1, SQLITE_TRANSIENT);
             ok = sqlite3_step(statement) == SQLITE_DONE;
@@ -4318,18 +4472,22 @@ static void send_control_response(int fd, const char *query, const char *body) {
     log_event("Control request operation=%s serviceID=%s.", operation, service_id);
 
     if (strcmp(operation, "setFrontendList") == 0) {
+        char frontend_id[PATH_MAX] = "";
         char frontend_url[PATH_MAX] = "";
         char list_name[PATH_MAX] = "";
-        if (!query_value_any(query, body, "frontendURL", frontend_url, sizeof(frontend_url))) {
-            send_action_response(fd, 400, false, "Missing frontend URL.");
+        query_value_any(query, body, "frontendID", frontend_id, sizeof(frontend_id));
+        query_value_any(query, body, "frontendURL", frontend_url, sizeof(frontend_url));
+        if (!frontend_id[0] && !frontend_url[0]) {
+            send_action_response(fd, 400, false, "Missing frontend identifier.");
             return;
         }
         query_value_any(query, body, "list", list_name, sizeof(list_name));
         char message[1024] = "";
-        bool ok = update_frontend_list_any_registry(service_id, frontend_url, list_name, message, sizeof(message));
-        log_event("%s frontend list update for %s url=%s list=%s: %s",
+        bool ok = update_frontend_list_any_registry(service_id, frontend_id, frontend_url, list_name, message, sizeof(message));
+        log_event("%s frontend list update for %s frontend=%s url=%s list=%s: %s",
                   ok ? "Completed" : "Failed",
                   service_id,
+                  frontend_id,
                   frontend_url,
                   list_name,
                   message);
@@ -5881,7 +6039,7 @@ static bool make_fixed_port_script(const char *service_id,
         "\n"
         "while kill -0 \"$CMD_PID\" 2>/dev/null; do\n"
         "    if server_ready; then\n"
-        "        run_outerctl app add --backend \"$BACKEND_ID\" --port \"$PORT\" --name \"$DISPLAY_NAME\" --url \"127.0.0.1:$PORT/\"\n"
+        "        run_outerctl app add --backend \"$BACKEND_ID\" --frontend-id \"$BACKEND_ID:main\" --port \"$PORT\" --name \"$DISPLAY_NAME\" --url \"127.0.0.1:$PORT/\" --running\n"
         "        break\n"
         "    fi\n"
         "    sleep 0.25\n"
@@ -6106,10 +6264,10 @@ static bool make_jupyter_script(const char *service_id,
         "            if discovered is not None:\n"
         "                if USE_UNIX_SOCKET:\n"
         "                    app_url, icon_path = discovered\n"
-        "                    add_args = [\"app\", \"add\", \"--backend\", BACKEND_ID, \"--socket-path\", SOCKET_PATH, \"--name\", DISPLAY_NAME, \"--url\", app_url]\n"
+        "                    add_args = [\"app\", \"add\", \"--backend\", BACKEND_ID, \"--frontend-id\", f\"{BACKEND_ID}:main\", \"--socket-path\", SOCKET_PATH, \"--name\", DISPLAY_NAME, \"--url\", app_url, \"--running\"]\n"
         "                else:\n"
         "                    port, app_url, icon_path = discovered\n"
-        "                    add_args = [\"app\", \"add\", \"--backend\", BACKEND_ID, \"--port\", port, \"--name\", DISPLAY_NAME, \"--url\", app_url]\n"
+        "                    add_args = [\"app\", \"add\", \"--backend\", BACKEND_ID, \"--frontend-id\", f\"{BACKEND_ID}:main\", \"--port\", port, \"--name\", DISPLAY_NAME, \"--url\", app_url, \"--running\"]\n"
         "                add_args.extend([\"--list\", \"Jupyter\"])\n"
         "                if icon_path:\n"
         "                    add_args.extend([\"--icon-path\", icon_path])\n"
@@ -6138,6 +6296,11 @@ static bool register_created_backend(const char *service_id,
                                      const char *display_name,
                                      const char *unit_name,
                                      const char *log_path,
+                                     const char *frontend_id,
+                                     const char *frontend_url,
+                                     int frontend_port,
+                                     const char *frontend_socket_path,
+                                     const char *frontend_list,
                                      char *error,
                                      size_t error_size) {
     sqlite3 *database = open_registry_readwrite(error, error_size);
@@ -6217,6 +6380,26 @@ static bool register_created_backend(const char *service_id,
         }
         if (!ok) snprintf(error, error_size, "%s", sqlite3_errmsg(database));
         if (statement) sqlite3_finalize(statement);
+    }
+    if (ok && frontend_id && frontend_id[0]) {
+        const char *sql =
+            "INSERT INTO frontends(frontend_id, url, service_id, display_name, port, socket_path, icon_path, list, running) "
+            "VALUES(?, ?, ?, ?, ?, ?, NULL, NULLIF(?, ''), 0) "
+            "ON CONFLICT(frontend_id) DO UPDATE SET url=excluded.url, service_id=excluded.service_id, display_name=excluded.display_name, port=excluded.port, socket_path=excluded.socket_path, list=excluded.list, running=0;";
+        ok = sqlite3_prepare_v2(database, sql, -1, &statement, NULL) == SQLITE_OK;
+        if (ok) {
+            sqlite3_bind_text(statement, 1, frontend_id, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(statement, 2, frontend_url ? frontend_url : "", -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(statement, 3, service_id, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(statement, 4, display_name, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_int(statement, 5, frontend_port > 0 ? frontend_port : 0);
+            sqlite3_bind_text(statement, 6, frontend_socket_path ? frontend_socket_path : "", -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(statement, 7, frontend_list ? frontend_list : "", -1, SQLITE_TRANSIENT);
+            ok = sqlite3_step(statement) == SQLITE_DONE;
+        }
+        if (!ok) snprintf(error, error_size, "%s", sqlite3_errmsg(database));
+        if (statement) sqlite3_finalize(statement);
+        statement = NULL;
     }
 
     if (ok) {
@@ -6530,6 +6713,7 @@ static int outershelld_handle_outerctl(int argc, char **argv, StringBuilder *std
     const char *systemd_unit = NULL;
     const char *log_path = NULL;
     const char *url = NULL;
+    const char *frontend_id = NULL;
     const char *icon_path = NULL;
     const char *frontend_list = NULL;
     const char *socket_path = NULL;
@@ -6540,6 +6724,7 @@ static int outershelld_handle_outerctl(int argc, char **argv, StringBuilder *std
     int port = 0;
     int rank = 0;
     bool has_port = false;
+    bool frontend_running = true;
     bool owns_plist = false;
     bool include_icons = false;
 
@@ -6564,6 +6749,8 @@ static int outershelld_handle_outerctl(int argc, char **argv, StringBuilder *std
             REQUIRE_VALUE("--path", log_path);
         } else if (strcmp(arg, "--url") == 0) {
             REQUIRE_VALUE("--url", url);
+        } else if (strcmp(arg, "--frontend-id") == 0 || strcmp(arg, "--id") == 0) {
+            REQUIRE_VALUE("--frontend-id", frontend_id);
         } else if (strcmp(arg, "--icon-path") == 0 || strcmp(arg, "--icon-file") == 0) {
             REQUIRE_VALUE("--icon-path", icon_path);
         } else if (strcmp(arg, "--list") == 0) {
@@ -6603,6 +6790,10 @@ static int outershelld_handle_outerctl(int argc, char **argv, StringBuilder *std
             owns_plist = strcmp(raw, "true") == 0 || strcmp(raw, "1") == 0 || strcmp(raw, "yes") == 0;
         } else if (strcmp(arg, "--icons") == 0) {
             include_icons = true;
+        } else if (strcmp(arg, "--running") == 0) {
+            frontend_running = true;
+        } else if (strcmp(arg, "--stopped") == 0) {
+            frontend_running = false;
         } else {
             sb_append(stderr_buffer, "Unknown argument: ");
             sb_append(stderr_buffer, arg);
@@ -6644,8 +6835,8 @@ static int outershelld_handle_outerctl(int argc, char **argv, StringBuilder *std
             ok = outerctl_print_query(database, sql, backend, stdout_buffer, error, sizeof(error));
         } else if (strcmp(resource, "app") == 0) {
             const char *sql = include_icons ?
-                "SELECT f.url, COALESCE(f.service_id, '') AS service_id, COALESCE(f.display_name, '') AS display_name, f.port, COALESCE(f.socket_path, '') AS socket_path, COALESCE(f.icon_path, '') AS icon_path, COALESCE(fl.list, f.list, '') AS list FROM frontends f LEFT JOIN frontend_layouts fl ON fl.url = f.url WHERE (?1 IS NULL OR f.service_id = ?1) ORDER BY f.service_id, COALESCE(fl.list, f.list, ''), f.display_name, f.url;" :
-                "SELECT f.url, COALESCE(f.service_id, '') AS service_id, COALESCE(f.display_name, '') AS display_name, f.port, COALESCE(f.socket_path, '') AS socket_path, COALESCE(f.icon_path, '') AS icon_path, COALESCE(fl.list, f.list, '') AS list FROM frontends f LEFT JOIN frontend_layouts fl ON fl.url = f.url WHERE (?1 IS NULL OR f.service_id = ?1) ORDER BY f.service_id, COALESCE(fl.list, f.list, ''), f.display_name, f.url;";
+                "SELECT f.frontend_id, f.url, COALESCE(f.service_id, '') AS service_id, COALESCE(f.display_name, '') AS display_name, f.port, COALESCE(f.socket_path, '') AS socket_path, COALESCE(f.icon_path, '') AS icon_path, COALESCE(fl.list, flu.list, f.list, '') AS list, COALESCE(f.running, 0) AS running FROM frontends f LEFT JOIN frontend_layouts fl ON fl.frontend_id = f.frontend_id LEFT JOIN frontend_layouts flu ON flu.url = f.url WHERE (?1 IS NULL OR f.service_id = ?1) ORDER BY f.service_id, COALESCE(fl.list, flu.list, f.list, ''), f.display_name, f.url;" :
+                "SELECT f.frontend_id, f.url, COALESCE(f.service_id, '') AS service_id, COALESCE(f.display_name, '') AS display_name, f.port, COALESCE(f.socket_path, '') AS socket_path, COALESCE(f.icon_path, '') AS icon_path, COALESCE(fl.list, flu.list, f.list, '') AS list, COALESCE(f.running, 0) AS running FROM frontends f LEFT JOIN frontend_layouts fl ON fl.frontend_id = f.frontend_id LEFT JOIN frontend_layouts flu ON flu.url = f.url WHERE (?1 IS NULL OR f.service_id = ?1) ORDER BY f.service_id, COALESCE(fl.list, flu.list, f.list, ''), f.display_name, f.url;";
             ok = outerctl_print_query(database, sql, backend, stdout_buffer, error, sizeof(error));
         } else if (strcmp(resource, "log") == 0) {
             ok = outerctl_print_query(database, "SELECT path, service_id FROM log_files WHERE (?1 IS NULL OR service_id = ?1) ORDER BY service_id, path;", backend, stdout_buffer, error, sizeof(error));
@@ -6814,54 +7005,42 @@ static int outershelld_handle_outerctl(int argc, char **argv, StringBuilder *std
         }
     } else if (ok && strcmp(resource, "app") == 0) {
         const bool has_socket = socket_path && socket_path[0];
+        char stable_frontend_id[PATH_MAX * 2] = "";
+        if (frontend_id && frontend_id[0]) {
+            snprintf(stable_frontend_id, sizeof(stable_frontend_id), "%s", frontend_id);
+        } else {
+            snprintf(stable_frontend_id, sizeof(stable_frontend_id), "%s:main", backend);
+        }
         if ((has_port ? 1 : 0) + (has_socket ? 1 : 0) > 1) {
             snprintf(error, sizeof(error), "Specify either --port or --socket-path, not both.");
             ok = false;
         } else if (strcmp(action, "add") == 0) {
-            if ((!has_port && !has_socket) || !display_name || !display_name[0]) {
+            if ((!has_port && !has_socket && frontend_running) || !display_name || !display_name[0]) {
                 snprintf(error, sizeof(error), "Missing app endpoint or display name.");
                 ok = false;
             }
             char frontend_url[PATH_MAX * 2] = "";
-            if (ok && !outerctl_make_frontend_url(url, port, socket_path, frontend_url, sizeof(frontend_url))) {
+            if (ok && (has_port || has_socket || (url && url[0])) &&
+                !outerctl_make_frontend_url(url, port, socket_path, frontend_url, sizeof(frontend_url))) {
                 snprintf(error, sizeof(error), "Could not build app URL.");
                 ok = false;
             }
             if (ok) {
-                ok = bind_and_step(database,
-                                   has_socket ? "DELETE FROM frontends WHERE service_id = ? AND socket_path = ?;" : "DELETE FROM frontends WHERE service_id = ? AND port = ?;",
-                                   backend,
-                                   has_socket ? socket_path : NULL,
-                                   NULL,
-                                   NULL,
-                                   error,
-                                   sizeof(error));
-                if (!has_socket && ok) {
-                    sqlite3_stmt *delete_by_port = NULL;
-                    ok = sqlite3_prepare_v2(database, "DELETE FROM frontends WHERE service_id = ? AND port = ?;", -1, &delete_by_port, NULL) == SQLITE_OK;
-                    if (ok) {
-                        sqlite3_bind_text(delete_by_port, 1, backend, -1, SQLITE_TRANSIENT);
-                        sqlite3_bind_int(delete_by_port, 2, port);
-                        ok = sqlite3_step(delete_by_port) == SQLITE_DONE;
-                    }
-                    if (!ok) snprintf(error, sizeof(error), "%s", sqlite3_errmsg(database));
-                    if (delete_by_port) sqlite3_finalize(delete_by_port);
-                }
-            }
-            if (ok) {
                 sqlite3_stmt *statement = NULL;
                 ok = sqlite3_prepare_v2(database,
-                                        "INSERT INTO frontends(url, service_id, display_name, port, socket_path, icon_path, list) VALUES(?, ?, ?, ?, ?, NULLIF(?, ''), NULLIF(?, '')) "
-                                        "ON CONFLICT(url) DO UPDATE SET service_id=excluded.service_id, display_name=excluded.display_name, port=excluded.port, socket_path=excluded.socket_path, icon_path=excluded.icon_path, list=excluded.list;",
+                                        "INSERT INTO frontends(frontend_id, url, service_id, display_name, port, socket_path, icon_path, list, running) VALUES(?, ?, ?, ?, ?, ?, NULLIF(?, ''), NULLIF(?, ''), ?) "
+                                        "ON CONFLICT(frontend_id) DO UPDATE SET url=excluded.url, service_id=excluded.service_id, display_name=excluded.display_name, port=excluded.port, socket_path=excluded.socket_path, icon_path=COALESCE(excluded.icon_path, frontends.icon_path), list=COALESCE(excluded.list, frontends.list), running=excluded.running;",
                                         -1, &statement, NULL) == SQLITE_OK;
                 if (ok) {
-                    sqlite3_bind_text(statement, 1, frontend_url, -1, SQLITE_TRANSIENT);
-                    sqlite3_bind_text(statement, 2, backend, -1, SQLITE_TRANSIENT);
-                    sqlite3_bind_text(statement, 3, display_name, -1, SQLITE_TRANSIENT);
-                    sqlite3_bind_int(statement, 4, port);
-                    sqlite3_bind_text(statement, 5, has_socket ? socket_path : "", -1, SQLITE_TRANSIENT);
-                    sqlite3_bind_text(statement, 6, icon_path ? icon_path : "", -1, SQLITE_TRANSIENT);
-                    sqlite3_bind_text(statement, 7, frontend_list ? frontend_list : "", -1, SQLITE_TRANSIENT);
+                    sqlite3_bind_text(statement, 1, stable_frontend_id, -1, SQLITE_TRANSIENT);
+                    sqlite3_bind_text(statement, 2, frontend_url, -1, SQLITE_TRANSIENT);
+                    sqlite3_bind_text(statement, 3, backend, -1, SQLITE_TRANSIENT);
+                    sqlite3_bind_text(statement, 4, display_name, -1, SQLITE_TRANSIENT);
+                    sqlite3_bind_int(statement, 5, frontend_running ? port : 0);
+                    sqlite3_bind_text(statement, 6, has_socket ? socket_path : "", -1, SQLITE_TRANSIENT);
+                    sqlite3_bind_text(statement, 7, icon_path ? icon_path : "", -1, SQLITE_TRANSIENT);
+                    sqlite3_bind_text(statement, 8, frontend_list ? frontend_list : "", -1, SQLITE_TRANSIENT);
+                    sqlite3_bind_int(statement, 9, frontend_running ? 1 : 0);
                     ok = sqlite3_step(statement) == SQLITE_DONE;
                 }
                 if (!ok) snprintf(error, sizeof(error), "%s", sqlite3_errmsg(database));
@@ -6869,14 +7048,17 @@ static int outershelld_handle_outerctl(int argc, char **argv, StringBuilder *std
             }
             if (ok) {
                 ok = bind_and_step(database,
-                                   "INSERT INTO frontend_layouts(url, list) VALUES(?, ?) ON CONFLICT(url) DO UPDATE SET list=excluded.list;",
-                                   frontend_url, frontend_list ? frontend_list : "", NULL, NULL, error, sizeof(error));
+                                   "INSERT INTO frontend_layouts(url, list, frontend_id) VALUES(?, ?, NULLIF(?, '')) ON CONFLICT(url) DO UPDATE SET list=excluded.list, frontend_id=excluded.frontend_id;",
+                                   frontend_url[0] ? frontend_url : stable_frontend_id, frontend_list ? frontend_list : "", stable_frontend_id, NULL, error, sizeof(error));
             }
             changed = ok;
         } else if (strcmp(action, "remove") == 0) {
-            if (!has_port && !has_socket) {
+            if (!frontend_id && !has_port && !has_socket) {
                 snprintf(error, sizeof(error), "Missing app endpoint.");
                 ok = false;
+            } else if (frontend_id && frontend_id[0]) {
+                ok = bind_and_step(database, "DELETE FROM frontends WHERE service_id = ? AND frontend_id = ?;", backend, frontend_id, NULL, NULL, error, sizeof(error));
+                changed = ok;
             } else if (has_socket) {
                 ok = bind_and_step(database, "DELETE FROM frontends WHERE service_id = ? AND socket_path = ?;", backend, socket_path, NULL, NULL, error, sizeof(error));
                 changed = ok;
@@ -6893,7 +7075,7 @@ static int outershelld_handle_outerctl(int argc, char **argv, StringBuilder *std
                 changed = ok;
             }
         } else if (strcmp(action, "clear") == 0) {
-            ok = bind_and_step(database, "DELETE FROM frontends WHERE service_id = ?;", backend, NULL, NULL, NULL, error, sizeof(error));
+            ok = bind_and_step(database, "UPDATE frontends SET running = 0, url = '', port = 0 WHERE service_id = ?;", backend, NULL, NULL, NULL, error, sizeof(error));
             changed = ok;
         } else {
             snprintf(error, sizeof(error), "Unknown app action.");
@@ -7043,10 +7225,13 @@ static bool upsert_systemd_backend_registry(const char *service_id,
     if (ok && socket_path && socket_path[0]) {
         sqlite3_stmt *statement = NULL;
         const char *sql =
-            "INSERT INTO frontends(url, service_id, display_name, port, socket_path, icon_path) VALUES(?, ?, ?, 0, ?, ?);";
+            "INSERT INTO frontends(frontend_id, url, service_id, display_name, port, socket_path, icon_path, running) VALUES(?, '', ?, ?, 0, ?, ?, 0) "
+            "ON CONFLICT(frontend_id) DO UPDATE SET service_id=excluded.service_id, display_name=excluded.display_name, socket_path=excluded.socket_path, icon_path=excluded.icon_path, running=0;";
         ok = sqlite3_prepare_v2(database, sql, -1, &statement, NULL) == SQLITE_OK;
         if (ok) {
-            sqlite3_bind_text(statement, 1, socket_path, -1, SQLITE_TRANSIENT);
+            char frontend_id[PATH_MAX * 2];
+            snprintf(frontend_id, sizeof(frontend_id), "%s:main", service_id);
+            sqlite3_bind_text(statement, 1, frontend_id, -1, SQLITE_TRANSIENT);
             sqlite3_bind_text(statement, 2, service_id, -1, SQLITE_TRANSIENT);
             sqlite3_bind_text(statement, 3, display_name, -1, SQLITE_TRANSIENT);
             sqlite3_bind_text(statement, 4, socket_path, -1, SQLITE_TRANSIENT);
@@ -7119,10 +7304,13 @@ static bool upsert_launchd_backend_registry_at(const char *database_path,
     if (ok && socket_path && socket_path[0]) {
         sqlite3_stmt *statement = NULL;
         const char *sql =
-            "INSERT INTO frontends(url, service_id, display_name, port, socket_path, icon_path) VALUES(?, ?, ?, 0, ?, ?);";
+            "INSERT INTO frontends(frontend_id, url, service_id, display_name, port, socket_path, icon_path, running) VALUES(?, '', ?, ?, 0, ?, ?, 0) "
+            "ON CONFLICT(frontend_id) DO UPDATE SET service_id=excluded.service_id, display_name=excluded.display_name, socket_path=excluded.socket_path, icon_path=excluded.icon_path, running=0;";
         ok = sqlite3_prepare_v2(database, sql, -1, &statement, NULL) == SQLITE_OK;
         if (ok) {
-            sqlite3_bind_text(statement, 1, socket_path, -1, SQLITE_TRANSIENT);
+            char frontend_id[PATH_MAX * 2];
+            snprintf(frontend_id, sizeof(frontend_id), "%s:main", service_id);
+            sqlite3_bind_text(statement, 1, frontend_id, -1, SQLITE_TRANSIENT);
             sqlite3_bind_text(statement, 2, service_id, -1, SQLITE_TRANSIENT);
             sqlite3_bind_text(statement, 3, display_name, -1, SQLITE_TRANSIENT);
             sqlite3_bind_text(statement, 4, socket_path, -1, SQLITE_TRANSIENT);
@@ -9350,6 +9538,11 @@ static void send_create_response(int fd, const char *query) {
     char backend_dir[PATH_MAX];
     char log_path[PATH_MAX];
     char unit_path[PATH_MAX];
+    char initial_frontend_id[PATH_MAX * 2] = "";
+    char initial_frontend_url[PATH_MAX * 2] = "";
+    char initial_frontend_socket_path[PATH_MAX] = "";
+    char initial_frontend_list[PATH_MAX] = "";
+    int initial_frontend_port = 0;
     default_user_outerwebapps_app_root(service_id, backend_dir, sizeof(backend_dir));
 #ifdef __APPLE__
     snprintf(log_path, sizeof(log_path), "%s/Library/Logs/%s/output.log", home_directory(), service_id);
@@ -9392,6 +9585,9 @@ static void send_create_response(int fd, const char *query) {
                 send_action_response(fd, 400, false, "Command and a valid port are required.");
                 return;
             }
+            snprintf(initial_frontend_id, sizeof(initial_frontend_id), "%s:main", service_id);
+            snprintf(initial_frontend_url, sizeof(initial_frontend_url), "127.0.0.1:%s/", port);
+            initial_frontend_port = atoi(port);
             StringBuilder script = {0};
             if (!make_fixed_port_script(service_id, display_name, port, command, &script)) {
                 free(script.data);
@@ -9440,6 +9636,15 @@ static void send_create_response(int fd, const char *query) {
             if (!use_unix_socket && port[0] && !valid_port_text(port)) {
                 send_action_response(fd, 400, false, "Port must be empty or a valid TCP port.");
                 return;
+            }
+            snprintf(initial_frontend_id, sizeof(initial_frontend_id), "%s:main", service_id);
+            snprintf(initial_frontend_url, sizeof(initial_frontend_url), "/lab");
+            snprintf(initial_frontend_list, sizeof(initial_frontend_list), "Jupyter");
+            if (use_unix_socket) {
+                runtime_socket_path(service_id, initial_frontend_socket_path, sizeof(initial_frontend_socket_path));
+            } else if (port[0]) {
+                initial_frontend_port = atoi(port);
+                snprintf(initial_frontend_url, sizeof(initial_frontend_url), "127.0.0.1:%s/lab", port);
             }
             StringBuilder script = {0};
             if (!make_jupyter_script(service_id, display_name, python, use_unix_socket ? "" : port,
@@ -9587,7 +9792,14 @@ static void send_create_response(int fd, const char *query) {
 #else
                                   unit_name,
 #endif
-                                  log_path, error, sizeof(error))) {
+                                  log_path,
+                                  initial_frontend_id,
+                                  initial_frontend_url,
+                                  initial_frontend_port,
+                                  initial_frontend_socket_path,
+                                  initial_frontend_list,
+                                  error,
+                                  sizeof(error))) {
         unlink(unit_path);
         send_action_response(fd, 500, false, error);
         return;
