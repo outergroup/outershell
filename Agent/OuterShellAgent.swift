@@ -135,15 +135,15 @@ private enum OuterShellRegistry {
     private static func registryPaths() -> [String] {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
         var paths: [String] = []
-        if let override = ProcessInfo.processInfo.environment["OUTERWEBAPPS_REGISTRY"], !override.isEmpty {
+        if let override = ProcessInfo.processInfo.environment["OUTERSHELL_REGISTRY"], !override.isEmpty {
             paths.append((override as NSString).expandingTildeInPath)
         } else {
-            paths.append((home as NSString).appendingPathComponent("Library/Application Support/outerwebapps/registry.sqlite3"))
+            paths.append((home as NSString).appendingPathComponent("Library/Application Support/outershell/registry.sqlite3"))
         }
-        if let override = ProcessInfo.processInfo.environment["OUTERWEBAPPS_SYSTEM_REGISTRY"], !override.isEmpty {
+        if let override = ProcessInfo.processInfo.environment["OUTERSHELL_SYSTEM_REGISTRY"], !override.isEmpty {
             paths.append((override as NSString).expandingTildeInPath)
         } else {
-            paths.append("/Library/Application Support/outerwebapps/registry.sqlite3")
+            paths.append("/Library/Application Support/outershell/registry.sqlite3")
         }
         return Array(Set(paths))
     }

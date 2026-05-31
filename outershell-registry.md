@@ -1,6 +1,6 @@
-# Outerwebapps Registry Binary Format
+# OuterShell Registry Binary Format
 
-This file format is the source of truth for the outerwebapps registry. Older
+This file format is the source of truth for the outershell registry. Older
 `registry.sqlite3` files are read only by migration code, which publishes a
 `registry.orwa` file next to the old database.
 

@@ -81,9 +81,9 @@ struct RegistryRowArray {
 };
 
 #if defined(__APPLE__)
-constexpr const char* kOuterwebappsLibraryDirectoryRelativePath = "Library/Application Support/outerwebapps";
+constexpr const char* kOuterShellLibraryDirectoryRelativePath = "Library/Application Support/outershell";
 #else
-constexpr const char* kOuterwebappsStateDirectoryRelativePath = ".local/state/outerwebapps";
+constexpr const char* kOuterShellStateDirectoryRelativePath = ".local/state/outershell";
 #endif
 constexpr const char* kRegistryDatabaseFileName = "registry.sqlite3";
 constexpr const char* kRegistryBinaryFileName = "registry.orwa";
@@ -430,7 +430,7 @@ bool appendZeroBytes(Buffer& buffer, size_t size) {
     return true;
 }
 
-bool buildOuterwebappsPath(const char* fileName, Buffer& path);
+bool buildOuterShellPath(const char* fileName, Buffer& path);
 
 bool writeBufferLittleEndianUInt32At(Buffer& buffer, size_t offset, uint32_t value) {
     if (offset + 4 > buffer.size) {
@@ -528,14 +528,14 @@ bool readOuterctlApiStringRef(const Buffer& message, size_t refOffset, Buffer& o
 
 bool outerctlApiRegistryPath(Buffer& path) {
     clearBuffer(path);
-    const char* registry = getenv("OUTERWEBAPPS_REGISTRY");
+    const char* registry = getenv("OUTERSHELL_REGISTRY");
     if (!registry || !registry[0]) {
         registry = getenv("BACKENDS_REGISTRY_DB");
     }
     if (registry && registry[0]) {
         return appendCString(path, registry);
     }
-    return buildOuterwebappsPath(kRegistryDatabaseFileName, path);
+    return buildOuterShellPath(kRegistryDatabaseFileName, path);
 }
 
 bool tryOuterctlApi(int argc, char* argv[], int& exitStatus, Buffer& errorMessage) {
@@ -922,10 +922,10 @@ bool upsertLoadedRow(RegistryRowArray& rows, Buffer& identifier, RegistryFieldAr
     return true;
 }
 
-bool resolveOuterwebappsHome(Buffer& path) {
+bool resolveOuterShellHome(Buffer& path) {
     clearBuffer(path);
 
-    const char* overrideRoot = getenv("OUTERWEBAPPS_HOME");
+    const char* overrideRoot = getenv("OUTERSHELL_HOME");
     if (overrideRoot && overrideRoot[0] != '\0') {
         return appendCString(path, overrideRoot);
     }
@@ -934,7 +934,7 @@ bool resolveOuterwebappsHome(Buffer& path) {
     const char* stateHome = getenv("XDG_STATE_HOME");
     if (stateHome && stateHome[0] != '\0') {
         return appendCString(path, stateHome) &&
-               appendPathComponent(path, "outerwebapps");
+               appendPathComponent(path, "outershell");
     }
 #endif
 
@@ -942,10 +942,10 @@ bool resolveOuterwebappsHome(Buffer& path) {
     if (home && home[0] != '\0') {
 #ifdef __APPLE__
         return appendCString(path, home) &&
-               appendPathComponent(path, kOuterwebappsLibraryDirectoryRelativePath);
+               appendPathComponent(path, kOuterShellLibraryDirectoryRelativePath);
 #else
         return appendCString(path, home) &&
-               appendPathComponent(path, kOuterwebappsStateDirectoryRelativePath);
+               appendPathComponent(path, kOuterShellStateDirectoryRelativePath);
 #endif
     }
 
@@ -953,22 +953,22 @@ bool resolveOuterwebappsHome(Buffer& path) {
     if (entry && entry->pw_dir && entry->pw_dir[0] != '\0') {
 #ifdef __APPLE__
         return appendCString(path, entry->pw_dir) &&
-               appendPathComponent(path, kOuterwebappsLibraryDirectoryRelativePath);
+               appendPathComponent(path, kOuterShellLibraryDirectoryRelativePath);
 #else
         return appendCString(path, entry->pw_dir) &&
-               appendPathComponent(path, kOuterwebappsStateDirectoryRelativePath);
+               appendPathComponent(path, kOuterShellStateDirectoryRelativePath);
 #endif
     }
 
 #ifdef __APPLE__
-    return appendCString(path, kOuterwebappsLibraryDirectoryRelativePath);
+    return appendCString(path, kOuterShellLibraryDirectoryRelativePath);
 #else
-    return appendCString(path, kOuterwebappsStateDirectoryRelativePath);
+    return appendCString(path, kOuterShellStateDirectoryRelativePath);
 #endif
 }
 
-bool buildOuterwebappsPath(const char* fileName, Buffer& path) {
-    return resolveOuterwebappsHome(path) && appendPathComponent(path, fileName);
+bool buildOuterShellPath(const char* fileName, Buffer& path) {
+    return resolveOuterShellHome(path) && appendPathComponent(path, fileName);
 }
 
 bool ensureDirectoryExists(const char* path, Buffer& errorMessage) {
@@ -991,7 +991,7 @@ bool ensureDirectoryExists(const char* path, Buffer& errorMessage) {
         mutablePath[i] = '\0';
         if (mutablePath[0] != '\0') {
             if (mkdir(mutablePath, 0700) != 0 && errno != EEXIST) {
-                setErrnoError(errorMessage, "Failed to create outerwebapps home: ");
+                setErrnoError(errorMessage, "Failed to create outershell home: ");
                 free(mutablePath);
                 return false;
             }
@@ -1018,9 +1018,9 @@ public:
         initBuffer(rootPath);
         initBuffer(lockPath);
 
-        const bool haveRootPath = resolveOuterwebappsHome(rootPath);
+        const bool haveRootPath = resolveOuterShellHome(rootPath);
         const bool directoryReady = haveRootPath && ensureDirectoryExists(rootPath.data, errorMessage);
-        const bool haveLockPath = directoryReady && buildOuterwebappsPath(kRegistryBinaryLockFileName, lockPath);
+        const bool haveLockPath = directoryReady && buildOuterShellPath(kRegistryBinaryLockFileName, lockPath);
         if (!haveRootPath || !haveLockPath) {
             if (errorMessage.size == 0) {
                 setError(errorMessage, "Out of memory.");
@@ -1164,7 +1164,7 @@ bool loadLegacyRegistryRows(RegistryRowArray& rows, Buffer& errorMessage) {
     initBuffer(path);
     initBuffer(contents);
 
-    if (!buildOuterwebappsPath(kLegacyRegistryStorageFileName, path)) {
+    if (!buildOuterShellPath(kLegacyRegistryStorageFileName, path)) {
         freeBuffer(path);
         freeBuffer(contents);
         return setError(errorMessage, "Out of memory.");
@@ -1912,10 +1912,10 @@ bool deleteSystemdBackendRegistryRecord(sqlite3* database,
 
 bool buildLogPathForIdentifier(const char* identifier, Buffer& path) {
     clearBuffer(path);
-    if (!resolveOuterwebappsHome(path)) {
+    if (!resolveOuterShellHome(path)) {
         return false;
     }
-    if (strcmp(identifier, "outerwebapps") == 0) {
+    if (strcmp(identifier, "outershell") == 0) {
         return appendPathComponent(path, "backend.log");
     }
     return appendPathComponent(path, identifier) &&
@@ -2619,7 +2619,7 @@ bool exportRegistryBinaryFromDatabase(sqlite3* database, Buffer& errorMessage) {
         ok = appendBuffer(file, rows.data ? rows.data : "", rows.size) &&
             appendBuffer(file, variableRegion.data ? variableRegion.data : "", variableRegion.size);
     }
-    if (ok && !buildOuterwebappsPath(kRegistryBinaryFileName, outputPath)) {
+    if (ok && !buildOuterShellPath(kRegistryBinaryFileName, outputPath)) {
         ok = setError(errorMessage, "Out of memory.");
     }
     if (ok) {
@@ -2689,7 +2689,7 @@ bool importRegistryBinaryIntoDatabaseIfPresent(sqlite3* database, Buffer& errorM
     Buffer file;
     initBuffer(path);
     initBuffer(file);
-    if (!buildOuterwebappsPath(kRegistryBinaryFileName, path)) {
+    if (!buildOuterShellPath(kRegistryBinaryFileName, path)) {
         freeBuffer(path);
         freeBuffer(file);
         return setError(errorMessage, "Out of memory.");
@@ -3042,7 +3042,7 @@ bool printRegistryList(sqlite3* database,
 bool migrateLegacyRegistryIfNeeded(sqlite3* database, Buffer& errorMessage) {
     Buffer legacyPath;
     initBuffer(legacyPath);
-    if (!buildOuterwebappsPath(kLegacyRegistryStorageFileName, legacyPath)) {
+    if (!buildOuterShellPath(kLegacyRegistryStorageFileName, legacyPath)) {
         freeBuffer(legacyPath);
         return setError(errorMessage, "Out of memory.");
     }
@@ -3147,10 +3147,10 @@ bool openRegistryDatabase(sqlite3*& databaseOut, Buffer& errorMessage) {
     initBuffer(rootPath);
     initBuffer(sqlitePath);
     initBuffer(binaryPath);
-    if (!resolveOuterwebappsHome(rootPath) ||
+    if (!resolveOuterShellHome(rootPath) ||
         !ensureDirectoryExists(rootPath.data, errorMessage) ||
-        !buildOuterwebappsPath(kRegistryDatabaseFileName, sqlitePath) ||
-        !buildOuterwebappsPath(kRegistryBinaryFileName, binaryPath)) {
+        !buildOuterShellPath(kRegistryDatabaseFileName, sqlitePath) ||
+        !buildOuterShellPath(kRegistryBinaryFileName, binaryPath)) {
         freeBuffer(rootPath);
         freeBuffer(sqlitePath);
         freeBuffer(binaryPath);

@@ -63,7 +63,7 @@ Resources/ThirdParty/sqlite/sqlite3.h
 ```
 
 Those files are Outer Shell resources because `outerctl` is part of the
-outerwebapps/Outer Shell install surface, not part of the Outer Loop browser.
+outershell/Outer Shell install surface, not part of the Outer Loop browser.
 
 Then run the macOS build from the host to refresh the outerframe bundles:
 

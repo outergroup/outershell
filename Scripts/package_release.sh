@@ -128,9 +128,9 @@ public_base_url="__PUBLIC_BASE_URL__"
 app_base_url="${public_base_url%/}/apps"
 
 if [ "$os_name" = "Darwin" ]; then
-    outerwebapps_home="${OUTERWEBAPPS_HOME:-$HOME/Library/Application Support/outerwebapps}"
-    install_root="$outerwebapps_home/outer-shell"
-    outerctl_path="$outerwebapps_home/bin/outerctl"
+    outershell_home="${OUTERSHELL_HOME:-$HOME/Library/Application Support/outershell}"
+    install_root="$outershell_home/outer-shell"
+    outerctl_path="$outershell_home/bin/outerctl"
     launch_agent_dir="$HOME/Library/LaunchAgents"
     plist_path="$launch_agent_dir/org.outershell.OuterShell.plist"
     socket_path="$(getconf DARWIN_USER_TEMP_DIR)org.outershell.OuterShell"
@@ -156,15 +156,15 @@ if [ "$os_name" = "Darwin" ]; then
         legacy_service_id="dev.outergroup.HomeScreen"
         legacy_plist_path="$launch_agent_dir/dev.outergroup.HomeScreen.plist"
         legacy_socket_path="$(getconf DARWIN_USER_TEMP_DIR)dev.outergroup.HomeScreen"
-        legacy_install_root="$outerwebapps_home/home-screen"
+        legacy_install_root="$outershell_home/home-screen"
         launchctl bootout "gui/$(id -u)/$legacy_service_id" >/dev/null 2>&1 || launchctl remove "$legacy_service_id" >/dev/null 2>&1 || true
         rm -f "$legacy_plist_path" "$legacy_socket_path"
         rm -rf "$legacy_install_root"
         if [ -x "$outerctl_path" ]; then
-            OUTERWEBAPPS_HOME="$outerwebapps_home" "$outerctl_path" app clear --backend "$legacy_service_id" >/dev/null 2>&1 || true
-            OUTERWEBAPPS_HOME="$outerwebapps_home" "$outerctl_path" log clear --backend "$legacy_service_id" >/dev/null 2>&1 || true
-            OUTERWEBAPPS_HOME="$outerwebapps_home" "$outerctl_path" launchd clear --backend "$legacy_service_id" >/dev/null 2>&1 || true
-            OUTERWEBAPPS_HOME="$outerwebapps_home" "$outerctl_path" backend remove --backend "$legacy_service_id" >/dev/null 2>&1 || true
+            OUTERSHELL_HOME="$outershell_home" "$outerctl_path" app clear --backend "$legacy_service_id" >/dev/null 2>&1 || true
+            OUTERSHELL_HOME="$outershell_home" "$outerctl_path" log clear --backend "$legacy_service_id" >/dev/null 2>&1 || true
+            OUTERSHELL_HOME="$outershell_home" "$outerctl_path" launchd clear --backend "$legacy_service_id" >/dev/null 2>&1 || true
+            OUTERSHELL_HOME="$outershell_home" "$outerctl_path" backend remove --backend "$legacy_service_id" >/dev/null 2>&1 || true
         fi
     }
 
@@ -192,10 +192,10 @@ if [ "$os_name" = "Darwin" ]; then
         unload_outer_shell
         rm -f "$plist_path" "$socket_path"
         if [ -x "$outerctl_path" ]; then
-            OUTERWEBAPPS_HOME="$outerwebapps_home" "$outerctl_path" app clear --backend "$service_id" >/dev/null 2>&1 || true
-            OUTERWEBAPPS_HOME="$outerwebapps_home" "$outerctl_path" log clear --backend "$service_id" >/dev/null 2>&1 || true
-            OUTERWEBAPPS_HOME="$outerwebapps_home" "$outerctl_path" launchd clear --backend "$service_id" >/dev/null 2>&1 || true
-            OUTERWEBAPPS_HOME="$outerwebapps_home" "$outerctl_path" backend remove --backend "$service_id" >/dev/null 2>&1 || true
+            OUTERSHELL_HOME="$outershell_home" "$outerctl_path" app clear --backend "$service_id" >/dev/null 2>&1 || true
+            OUTERSHELL_HOME="$outershell_home" "$outerctl_path" log clear --backend "$service_id" >/dev/null 2>&1 || true
+            OUTERSHELL_HOME="$outershell_home" "$outerctl_path" launchd clear --backend "$service_id" >/dev/null 2>&1 || true
+            OUTERSHELL_HOME="$outershell_home" "$outerctl_path" backend remove --backend "$service_id" >/dev/null 2>&1 || true
         fi
         rm -rf "$install_root"
         cleanup_legacy_home_screen
@@ -203,11 +203,11 @@ if [ "$os_name" = "Darwin" ]; then
         exit 0
     fi
 
-    mkdir -p "$install_root" "$outerwebapps_home/bin" "$launch_agent_dir" "$log_dir"
+    mkdir -p "$install_root" "$outershell_home/bin" "$launch_agent_dir" "$log_dir"
     archive_path="$(mktemp)"
     download "${public_base_url%/}/latest/outer-shell-macos.tar.gz?v=__ASSET_VERSION__" "$archive_path"
     rm -rf "$install_root"
-    mkdir -p "$install_root" "$outerwebapps_home/bin" "$log_dir"
+    mkdir -p "$install_root" "$outershell_home/bin" "$log_dir"
     tar -xzf "$archive_path" -C "$install_root" --strip-components=1
     rm -f "$archive_path"
     chmod 0755 "$install_root/Outer Shell.app/Contents/MacOS/Outer Shell"
@@ -274,12 +274,12 @@ EOF
 
     cleanup_legacy_home_screen
     bootstrap_outer_shell
-    OUTERWEBAPPS_HOME="$outerwebapps_home" "$outerctl_path" backend upsert --backend "$service_id" --name "$display_name" --icon-path "$install_root/app-icon.png"
-    OUTERWEBAPPS_HOME="$outerwebapps_home" "$outerctl_path" launchd set --backend "$service_id" --plist "$plist_path" --owns-plist true
-    OUTERWEBAPPS_HOME="$outerwebapps_home" "$outerctl_path" app clear --backend "$service_id"
-    OUTERWEBAPPS_HOME="$outerwebapps_home" "$outerctl_path" app add --backend "$service_id" --socket-path "$socket_path" --name "$display_name" --url "$socket_path" --icon-path "$install_root/app-icon.png"
-    OUTERWEBAPPS_HOME="$outerwebapps_home" "$outerctl_path" log clear --backend "$service_id"
-    OUTERWEBAPPS_HOME="$outerwebapps_home" "$outerctl_path" log add --backend "$service_id" --path "$log_path"
+    OUTERSHELL_HOME="$outershell_home" "$outerctl_path" backend upsert --backend "$service_id" --name "$display_name" --icon-path "$install_root/app-icon.png"
+    OUTERSHELL_HOME="$outershell_home" "$outerctl_path" launchd set --backend "$service_id" --plist "$plist_path" --owns-plist true
+    OUTERSHELL_HOME="$outershell_home" "$outerctl_path" app clear --backend "$service_id"
+    OUTERSHELL_HOME="$outershell_home" "$outerctl_path" app add --backend "$service_id" --socket-path "$socket_path" --name "$display_name" --url "$socket_path" --icon-path "$install_root/app-icon.png"
+    OUTERSHELL_HOME="$outershell_home" "$outerctl_path" log clear --backend "$service_id"
+    OUTERSHELL_HOME="$outershell_home" "$outerctl_path" log add --backend "$service_id" --path "$log_path"
     if [ "$command" = "update" ]; then
         printf 'Outer Shell updated to %s. The new version will run the next time Outer Shell starts.\n' "__OUTER_SHELL_VERSION__"
         exit 0
@@ -301,9 +301,9 @@ fi
 
 runtime_dir="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 state_home="${XDG_STATE_HOME:-$HOME/.local/state}"
-outerwebapps_home="${OUTERWEBAPPS_HOME:-$state_home/outerwebapps}"
-install_root="$outerwebapps_home/outer-shell"
-outerctl_path="$outerwebapps_home/bin/outerctl"
+outershell_home="${OUTERSHELL_HOME:-$state_home/outershell}"
+install_root="$outershell_home/outer-shell"
+outerctl_path="$outershell_home/bin/outerctl"
 unit_dir="$HOME/.config/systemd/user"
 socket_path="$runtime_dir/org.outershell.OuterShell"
 log_dir="$install_root/logs"
@@ -313,7 +313,7 @@ runner_path="$install_root/run-outer-shell.sh"
 broker_runner_path="$install_root/run-outershelld.sh"
 
 cleanup_legacy_home_screen() {
-    legacy_install_root="$outerwebapps_home/home-screen"
+    legacy_install_root="$outershell_home/home-screen"
     legacy_socket_path="$runtime_dir/dev.outergroup.HomeScreen"
     legacy_service_id="dev.outergroup.HomeScreen"
     systemctl --user disable --now dev.outergroup.HomeScreen.socket dev.outergroup.HomeScreen.service >/dev/null 2>&1 || true
@@ -321,20 +321,20 @@ cleanup_legacy_home_screen() {
     systemctl --user daemon-reload >/dev/null 2>&1 || true
     rm -rf "$legacy_install_root"
     if [ -x "$outerctl_path" ]; then
-        OUTERWEBAPPS_HOME="$outerwebapps_home" "$outerctl_path" app clear --backend "$legacy_service_id" >/dev/null 2>&1 || true
-        OUTERWEBAPPS_HOME="$outerwebapps_home" "$outerctl_path" log clear --backend "$legacy_service_id" >/dev/null 2>&1 || true
-        OUTERWEBAPPS_HOME="$outerwebapps_home" "$outerctl_path" systemd clear --backend "$legacy_service_id" >/dev/null 2>&1 || true
-        OUTERWEBAPPS_HOME="$outerwebapps_home" "$outerctl_path" backend remove --backend "$legacy_service_id" >/dev/null 2>&1 || true
+        OUTERSHELL_HOME="$outershell_home" "$outerctl_path" app clear --backend "$legacy_service_id" >/dev/null 2>&1 || true
+        OUTERSHELL_HOME="$outershell_home" "$outerctl_path" log clear --backend "$legacy_service_id" >/dev/null 2>&1 || true
+        OUTERSHELL_HOME="$outershell_home" "$outerctl_path" systemd clear --backend "$legacy_service_id" >/dev/null 2>&1 || true
+        OUTERSHELL_HOME="$outershell_home" "$outerctl_path" backend remove --backend "$legacy_service_id" >/dev/null 2>&1 || true
     fi
 }
 
 if [ "$command" = "uninstall" ]; then
     systemctl --user disable org.outershell.OuterShell.socket outershelld.socket outershelld.service >/dev/null 2>&1 || true
     if [ -x "$outerctl_path" ]; then
-        OUTERWEBAPPS_HOME="$outerwebapps_home" "$outerctl_path" app clear --backend org.outershell.OuterShell >/dev/null 2>&1 || true
-        OUTERWEBAPPS_HOME="$outerwebapps_home" "$outerctl_path" log clear --backend org.outershell.OuterShell >/dev/null 2>&1 || true
-        OUTERWEBAPPS_HOME="$outerwebapps_home" "$outerctl_path" systemd clear --backend org.outershell.OuterShell >/dev/null 2>&1 || true
-        OUTERWEBAPPS_HOME="$outerwebapps_home" "$outerctl_path" backend remove --backend org.outershell.OuterShell >/dev/null 2>&1 || true
+        OUTERSHELL_HOME="$outershell_home" "$outerctl_path" app clear --backend org.outershell.OuterShell >/dev/null 2>&1 || true
+        OUTERSHELL_HOME="$outershell_home" "$outerctl_path" log clear --backend org.outershell.OuterShell >/dev/null 2>&1 || true
+        OUTERSHELL_HOME="$outershell_home" "$outerctl_path" systemd clear --backend org.outershell.OuterShell >/dev/null 2>&1 || true
+        OUTERSHELL_HOME="$outershell_home" "$outerctl_path" backend remove --backend org.outershell.OuterShell >/dev/null 2>&1 || true
     fi
     cleanup_script="$(mktemp)"
     cat > "$cleanup_script" <<EOF
@@ -357,7 +357,7 @@ EOF
     exit 0
 fi
 
-mkdir -p "$install_root" "$outerwebapps_home/bin" "$unit_dir" "$log_dir"
+mkdir -p "$install_root" "$outershell_home/bin" "$unit_dir" "$log_dir"
 cleanup_legacy_home_screen
 archive_path="$(mktemp)"
 download "${public_base_url%/}/latest/outer-shell-${arch}.tar.gz?v=__ASSET_VERSION__" "$archive_path"
@@ -389,7 +389,7 @@ After=outershelld.socket
 Wants=outershelld.socket
 
 [Service]
-Environment=OUTERWEBAPPS_HOME=$outerwebapps_home
+Environment=OUTERSHELL_HOME=$outershell_home
 ExecStart=$runner_path %t/org.outershell.OuterShell
 Restart=no
 EOF
@@ -427,7 +427,7 @@ cat > "$unit_dir/outershelld.service" <<EOF
 Description=Outer Shell daemon
 
 [Service]
-Environment=OUTERWEBAPPS_HOME=$outerwebapps_home
+Environment=OUTERSHELL_HOME=$outershell_home
 ExecStart=$broker_runner_path %t/outershelld-api
 Restart=no
 EOF
@@ -443,12 +443,12 @@ systemctl --user stop org.outershell.OuterShell.service outershelld.service org.
 rm -f "$socket_path" "$runtime_dir/outershelld-api"
 systemctl --user start org.outershell.OuterShell.socket outershelld.socket
 
-OUTERWEBAPPS_HOME="$outerwebapps_home" "$outerctl_path" backend upsert --backend org.outershell.OuterShell --name "Outer Shell" --icon-path "$install_root/app-icon.png"
-OUTERWEBAPPS_HOME="$outerwebapps_home" "$outerctl_path" systemd set --backend org.outershell.OuterShell --unit org.outershell.OuterShell.service
-OUTERWEBAPPS_HOME="$outerwebapps_home" "$outerctl_path" app clear --backend org.outershell.OuterShell
-OUTERWEBAPPS_HOME="$outerwebapps_home" "$outerctl_path" app add --backend org.outershell.OuterShell --socket-path "$socket_path" --name "Outer Shell" --url "$socket_path" --icon-path "$install_root/app-icon.png"
-OUTERWEBAPPS_HOME="$outerwebapps_home" "$outerctl_path" log clear --backend org.outershell.OuterShell
-OUTERWEBAPPS_HOME="$outerwebapps_home" "$outerctl_path" log add --backend org.outershell.OuterShell --path "$log_path"
+OUTERSHELL_HOME="$outershell_home" "$outerctl_path" backend upsert --backend org.outershell.OuterShell --name "Outer Shell" --icon-path "$install_root/app-icon.png"
+OUTERSHELL_HOME="$outershell_home" "$outerctl_path" systemd set --backend org.outershell.OuterShell --unit org.outershell.OuterShell.service
+OUTERSHELL_HOME="$outershell_home" "$outerctl_path" app clear --backend org.outershell.OuterShell
+OUTERSHELL_HOME="$outershell_home" "$outerctl_path" app add --backend org.outershell.OuterShell --socket-path "$socket_path" --name "Outer Shell" --url "$socket_path" --icon-path "$install_root/app-icon.png"
+OUTERSHELL_HOME="$outershell_home" "$outerctl_path" log clear --backend org.outershell.OuterShell
+OUTERSHELL_HOME="$outershell_home" "$outerctl_path" log add --backend org.outershell.OuterShell --path "$log_path"
 
 if [ "$command" = "update" ]; then
     printf 'Outer Shell updated to %s. The new version will run the next time Outer Shell starts.\n' "__OUTER_SHELL_VERSION__"

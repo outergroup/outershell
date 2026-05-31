@@ -116,32 +116,32 @@ descriptor.
 By default the backend reads the user registry. On Linux:
 
 ```text
-${XDG_STATE_HOME:-~/.local/state}/outerwebapps/registry.sqlite3
+${XDG_STATE_HOME:-~/.local/state}/outershell/registry.sqlite3
 ```
 
 On macOS:
 
 ```text
-~/Library/Application Support/outerwebapps/registry.sqlite3
+~/Library/Application Support/outershell/registry.sqlite3
 ```
 
 On Linux it also reads the system/root registry:
 
 ```text
-/var/lib/outerwebapps/registry.sqlite3
+/var/lib/outershell/registry.sqlite3
 ```
 
-Override the user registry path with either `--database`, `OUTERWEBAPPS_REGISTRY`, or `BACKENDS_REGISTRY_DB`. Override the system registry path with `--system-database`, `OUTERWEBAPPS_SYSTEM_REGISTRY`, or `BACKENDS_SYSTEM_REGISTRY_DB`.
+Override the user registry path with either `--database`, `OUTERSHELL_REGISTRY`, or `BACKENDS_REGISTRY_DB`. Override the system registry path with `--system-database`, `OUTERSHELL_SYSTEM_REGISTRY`, or `BACKENDS_SYSTEM_REGISTRY_DB`.
 
 Writable SQLite registries are also exported to the experimental binary
-`registry.orwa` format documented in `outerwebapps-registry.md`. SQLite remains
+`registry.orwa` format documented in `outershell-registry.md`. SQLite remains
 the authoritative registry until the read/write paths are switched over.
 
 ```bash
 ./build/macos/Release/outershelld \
   --port 7354 \
   --bundles-dir ./build/run/bundles \
-  --database ~/.local/state/outerwebapps/registry.sqlite3
+  --database ~/.local/state/outershell/registry.sqlite3
 ```
 
 ## Starter App Catalog
@@ -155,8 +155,8 @@ At runtime, Outer Shell looks for app payloads in `build/run/bundled-apps` next
 to a local build, then in the directory passed with `--bundled-apps-dir` or
 `BACKENDS_BUNDLED_APPS_DIR`. If a Linux starter app payload is not present
 locally, Outer Shell downloads it from the catalog URL into
-`$XDG_CACHE_HOME/outerwebapps/outer-shell/bundled-apps` or
-`~/.cache/outerwebapps/outer-shell/bundled-apps`.
+`$XDG_CACHE_HOME/outershell/outer-shell/bundled-apps` or
+`~/.cache/outershell/outer-shell/bundled-apps`.
 
 Starter app tarballs use this layout:
 
@@ -178,11 +178,11 @@ Linux/SSH, and Top on localhost macOS. `build_run.sh` builds and stages the
 macOS Top payload from the `~/dev/src/Top` checkout for local testing;
 install-time code only copies that prebuilt payload.
 
-On Linux, when a bundled app is installed for the current user, Backends copies the payload into `${XDG_STATE_HOME:-~/.local/state}/outerwebapps/apps/<service id>`, writes its user systemd unit, records the backend/log metadata in the registry, and starts the service. On macOS, localhost installs copy the payload into `~/Library/Application Support/outerwebapps/apps/<service id>`, write a LaunchAgent, record metadata in the registry, and start the service.
+On Linux, when a bundled app is installed for the current user, Backends copies the payload into `${XDG_STATE_HOME:-~/.local/state}/outershell/apps/<service id>`, writes its user systemd unit, records the backend/log metadata in the registry, and starts the service. On macOS, localhost installs copy the payload into `~/Library/Application Support/outershell/apps/<service id>`, write a LaunchAgent, record metadata in the registry, and start the service.
 
-Bundled apps can also be installed as root from the action menu. Root installs use a system systemd unit, copy the payload into `/opt/outergroup/<service id>`, write logs under `/var/log/outergroup`, write registry metadata to `/var/lib/outerwebapps/registry.sqlite3`, and put Unix sockets under the system runtime directory, such as `/run/dev.outergroup.Top`. These operations use `sudo`; if sudo needs a password, the Backends UI prompts and retries the operation.
+Bundled apps can also be installed as root from the action menu. Root installs use a system systemd unit, copy the payload into `/opt/outergroup/<service id>`, write logs under `/var/log/outergroup`, write registry metadata to `/var/lib/outershell/registry.sqlite3`, and put Unix sockets under the system runtime directory, such as `/run/dev.outergroup.Top`. These operations use `sudo`; if sudo needs a password, the Backends UI prompts and retries the operation.
 
-Bundled apps register their own frontend with the `outerctl` installed by Outer Shell. On Linux, the public Outer Shell installer places it at `${XDG_STATE_HOME:-~/.local/state}/outerwebapps/bin/outerctl`; generated user systemd units use that path. Root-installed bundled apps run it through a small wrapper that sets `OUTERWEBAPPS_HOME=/var/lib/outerwebapps`, so frontend and log metadata are recorded in the system registry.
+Bundled apps register their own frontend with the `outerctl` installed by Outer Shell. On Linux, the public Outer Shell installer places it at `${XDG_STATE_HOME:-~/.local/state}/outershell/bin/outerctl`; generated user systemd units use that path. Root-installed bundled apps run it through a small wrapper that sets `OUTERSHELL_HOME=/var/lib/outershell`, so frontend and log metadata are recorded in the system registry.
 
 ## Remote Distribution
 
@@ -196,7 +196,7 @@ $XDG_RUNTIME_DIR/org.outershell.OuterShell
 and expands the matching architecture payload under:
 
 ```text
-${XDG_STATE_HOME:-~/.local/state}/outerwebapps/outer-shell
+${XDG_STATE_HOME:-~/.local/state}/outershell/outer-shell
 ```
 
 See [Resources/README.md](/Users/mrcslws/dev/src/Backends/Resources/README.md)
