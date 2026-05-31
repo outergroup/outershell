@@ -111,7 +111,8 @@ enum {
     ORWA_LEGACY_FIVE_TABLE_HEADER_SIZE = 8 + ORWA_LEGACY_TABLE_COUNT * ORWA_TABLE_DESCRIPTOR_SIZE,
     ORWA_LEGACY_HEADER_SIZE = 168,
     ORWA_LEGACY_TABLE_DESCRIPTOR_SIZE = 24,
-    ORWA_BACKENDS_ROW_SIZE = 84,
+    ORWA_BACKENDS_ROW_SIZE = 68,
+    ORWA_BACKENDS_ROW_SIZE_WITH_ICON = 84,
     ORWA_LEGACY_BACKENDS_ROW_SIZE = 64,
     ORWA_FRONTENDS_ROW_SIZE = 97,
     ORWA_LEGACY_FRONTENDS_ROW_SIZE = 104,
@@ -1480,7 +1481,6 @@ bool ensurePlatformRegistrySchema(sqlite3* database, Buffer& errorMessage) {
 
 bool ensureRegistrySchema(sqlite3* database, Buffer& errorMessage) {
     bool usesLegacyFrontendsTable = false;
-    bool hasBackendIconPathColumn = false;
     bool hasBackendUnitNameColumn = false;
     bool hasBackendUnitPathColumn = false;
     bool hasBackendOwnsUnitColumn = false;
@@ -1498,23 +1498,11 @@ bool ensureRegistrySchema(sqlite3* database, Buffer& errorMessage) {
                             "CREATE TABLE IF NOT EXISTS backends ("
                             "service_id TEXT PRIMARY KEY,"
                             "display_name TEXT NOT NULL DEFAULT '',"
-                            "icon TEXT,"
-                            "icon_path TEXT,"
                             "service_unit TEXT,"
                             "unit_name TEXT NOT NULL DEFAULT '',"
                             "unit_path TEXT NOT NULL DEFAULT '',"
                             "owns_unit INTEGER NOT NULL DEFAULT 0"
                             ");",
-                            errorMessage) &&
-        registryTableHasColumn(database, "backends", "icon_path", hasBackendIconPathColumn, errorMessage) &&
-        (hasBackendIconPathColumn ||
-         sqliteExecWithError(database,
-                             "ALTER TABLE backends ADD COLUMN icon_path TEXT;",
-                             errorMessage)) &&
-        sqliteExecWithError(database,
-                            "UPDATE backends SET icon_path = icon "
-                            "WHERE (icon_path IS NULL OR icon_path = '') "
-                            "AND icon IS NOT NULL AND icon != '' AND substr(icon, 1, 5) != 'data:';",
                             errorMessage) &&
         registryTableHasColumn(database, "backends", "unit_name", hasBackendUnitNameColumn, errorMessage) &&
         (hasBackendUnitNameColumn ||
@@ -1673,23 +1661,20 @@ bool ensureRegistrySchema(sqlite3* database, Buffer& errorMessage) {
 bool upsertBackendRegistryRecord(sqlite3* database,
                                  const char* identifier,
                                  const char* displayName,
-                                 const char* iconPath,
                                  Buffer& errorMessage) {
     sqlite3_stmt* statement = nullptr;
     if (!sqlitePrepareWithError(database,
-                                "INSERT INTO backends(service_id, display_name, icon_path, service_unit) "
-                                "VALUES(?, ?, NULLIF(?, ''), NULL) "
+                                "INSERT INTO backends(service_id, display_name, service_unit) "
+                                "VALUES(?, ?, NULL) "
                                 "ON CONFLICT(service_id) DO UPDATE SET "
-                                "display_name = excluded.display_name, "
-                                "icon_path = COALESCE(excluded.icon_path, backends.icon_path);",
+                                "display_name = excluded.display_name;",
                                 statement,
                                 errorMessage)) {
         return false;
     }
 
     if (sqlite3_bind_text(statement, 1, identifier, -1, SQLITE_TRANSIENT) != SQLITE_OK ||
-        sqlite3_bind_text(statement, 2, displayName, -1, SQLITE_TRANSIENT) != SQLITE_OK ||
-        sqlite3_bind_text(statement, 3, iconPath ? iconPath : "", -1, SQLITE_TRANSIENT) != SQLITE_OK) {
+        sqlite3_bind_text(statement, 2, displayName, -1, SQLITE_TRANSIENT) != SQLITE_OK) {
         sqlite3_finalize(statement);
         return setSqliteError(errorMessage, database, "Failed to bind backend registry values: ");
     }
@@ -2357,12 +2342,11 @@ bool registryBinaryAppendBackendRow(sqlite3_stmt* statement,
                                     OrwaStringPool& pool,
                                     Buffer& variableRegion,
                                     Buffer& rows) {
-    const uint32_t flags = sqlite3_column_int(statement, 5) != 0 ? 1u : 0u;
+    const uint32_t flags = sqlite3_column_int(statement, 4) != 0 ? 1u : 0u;
     return appendRegistryBinaryStringRef(pool, variableRegion, rows, sqliteColumnTextOrEmpty(statement, 0)) &&
         appendRegistryBinaryStringRef(pool, variableRegion, rows, sqliteColumnTextOrEmpty(statement, 1)) &&
         appendRegistryBinaryStringRef(pool, variableRegion, rows, sqliteColumnTextOrEmpty(statement, 2)) &&
         appendRegistryBinaryStringRef(pool, variableRegion, rows, sqliteColumnTextOrEmpty(statement, 3)) &&
-        appendRegistryBinaryStringRef(pool, variableRegion, rows, sqliteColumnTextOrEmpty(statement, 4)) &&
         appendLittleEndianUInt32(rows, flags);
 }
 
@@ -2548,7 +2532,7 @@ bool exportRegistryBinaryFromDatabase(sqlite3* database, Buffer& errorMessage) {
             unitPathExpression = "COALESCE(NULLIF(b.unit_path, ''), l.plist_path, '')";
             ownsUnitExpression = "CASE WHEN COALESCE(b.owns_unit, 0) != 0 THEN 1 WHEN COALESCE(l.plist_path, '') != '' THEN COALESCE(l.owns_plist, 0) WHEN COALESCE(b.service_unit, '') != '' THEN 1 ELSE 0 END";
         }
-        char* sql = ok ? sqlite3_mprintf("SELECT b.service_id, COALESCE(b.display_name, ''), COALESCE(b.icon_path, ''), %s, %s, %s FROM backends b %s %s ORDER BY b.service_id;",
+        char* sql = ok ? sqlite3_mprintf("SELECT b.service_id, COALESCE(b.display_name, ''), %s, %s, %s FROM backends b %s %s ORDER BY b.service_id;",
                                          unitNameExpression,
                                          unitPathExpression,
                                          ownsUnitExpression,
@@ -2560,7 +2544,7 @@ bool exportRegistryBinaryFromDatabase(sqlite3* database, Buffer& errorMessage) {
         if (ok) {
             ok = registryBinaryAppendQuery(database,
                                            sql,
-                                           6,
+                                           5,
                                            registryBinaryAppendBackendRow,
                                            pool,
                                            variableRegion,
@@ -2655,15 +2639,14 @@ bool readRegistryBinaryString(const Buffer& file,
 bool insertRegistryBinaryBackend(sqlite3* database,
                                  const std::string& serviceID,
                                  const std::string& displayName,
-                                 const std::string& iconPath,
                                  const std::string& unitName,
                                  const std::string& unitPath,
                                  bool ownsUnit,
                                  Buffer& errorMessage) {
     sqlite3_stmt* statement = nullptr;
     if (!sqlitePrepareWithError(database,
-                                "INSERT INTO backends(service_id, display_name, icon_path, service_unit, unit_name, unit_path, owns_unit) "
-                                "VALUES(?, ?, NULLIF(?, ''), NULLIF(?, ''), ?, ?, ?);",
+                                "INSERT INTO backends(service_id, display_name, service_unit, unit_name, unit_path, owns_unit) "
+                                "VALUES(?, ?, NULLIF(?, ''), ?, ?, ?);",
                                 statement,
                                 errorMessage)) {
         return false;
@@ -2671,11 +2654,10 @@ bool insertRegistryBinaryBackend(sqlite3* database,
     const bool ok =
         sqlite3_bind_text(statement, 1, serviceID.data(), static_cast<int>(serviceID.size()), SQLITE_TRANSIENT) == SQLITE_OK &&
         sqlite3_bind_text(statement, 2, displayName.data(), static_cast<int>(displayName.size()), SQLITE_TRANSIENT) == SQLITE_OK &&
-        sqlite3_bind_text(statement, 3, iconPath.data(), static_cast<int>(iconPath.size()), SQLITE_TRANSIENT) == SQLITE_OK &&
+        sqlite3_bind_text(statement, 3, unitName.data(), static_cast<int>(unitName.size()), SQLITE_TRANSIENT) == SQLITE_OK &&
         sqlite3_bind_text(statement, 4, unitName.data(), static_cast<int>(unitName.size()), SQLITE_TRANSIENT) == SQLITE_OK &&
-        sqlite3_bind_text(statement, 5, unitName.data(), static_cast<int>(unitName.size()), SQLITE_TRANSIENT) == SQLITE_OK &&
-        sqlite3_bind_text(statement, 6, unitPath.data(), static_cast<int>(unitPath.size()), SQLITE_TRANSIENT) == SQLITE_OK &&
-        sqlite3_bind_int(statement, 7, ownsUnit ? 1 : 0) == SQLITE_OK &&
+        sqlite3_bind_text(statement, 5, unitPath.data(), static_cast<int>(unitPath.size()), SQLITE_TRANSIENT) == SQLITE_OK &&
+        sqlite3_bind_int(statement, 6, ownsUnit ? 1 : 0) == SQLITE_OK &&
         sqliteStepDone(statement, errorMessage);
     if (!ok && errorMessage.size == 0) {
         setSqliteError(errorMessage, database, "Failed to import backend registry row: ");
@@ -2740,7 +2722,7 @@ bool importRegistryBinaryIntoDatabaseIfPresent(sqlite3* database, Buffer& errorM
         descriptors[i].rowSize = readLittleEndianUInt32(bytes + descriptorOffset + 16);
         uint32_t expectedRowSize = 0;
         if (i == ORWA_TABLE_BACKENDS) {
-            expectedRowSize = tableCount == ORWA_TABLE_COUNT ? ORWA_BACKENDS_ROW_SIZE : ORWA_LEGACY_BACKENDS_ROW_SIZE;
+            expectedRowSize = ORWA_BACKENDS_ROW_SIZE;
         } else if (i == ORWA_TABLE_FRONTENDS) {
             expectedRowSize = ORWA_FRONTENDS_ROW_SIZE;
         } else if (i == ORWA_TABLE_FRONTEND_LAYOUTS && tableCount == ORWA_TABLE_COUNT) {
@@ -2754,6 +2736,8 @@ bool importRegistryBinaryIntoDatabaseIfPresent(sqlite3* database, Buffer& errorM
             expectedRowSize = ORWA_LAUNCHD_BACKENDS_ROW_SIZE;
         }
         const bool rowSizeMatches = descriptors[i].rowSize == expectedRowSize ||
+            (i == ORWA_TABLE_BACKENDS && descriptors[i].rowSize == ORWA_BACKENDS_ROW_SIZE_WITH_ICON) ||
+            (i == ORWA_TABLE_BACKENDS && descriptors[i].rowSize == ORWA_LEGACY_BACKENDS_ROW_SIZE) ||
             (i == ORWA_TABLE_FRONTENDS && descriptors[i].rowSize == ORWA_LEGACY_FRONTENDS_ROW_SIZE) ||
             (i == ORWA_LEGACY_TABLE_SYSTEMD_BACKENDS && descriptors[i].rowSize == ORWA_LEGACY_SYSTEMD_BACKENDS_ROW_SIZE);
         if (!rowSizeMatches ||
@@ -2797,20 +2781,23 @@ bool importRegistryBinaryIntoDatabaseIfPresent(sqlite3* database, Buffer& errorM
         const uint64_t rowOffset = backendTable.offset + row * backendTable.rowSize;
         const uint8_t* rowBytes = bytes + rowOffset;
         ok = readRegistryBinaryString(file, variableOffset, readLittleEndianUInt64(rowBytes), readLittleEndianUInt64(rowBytes + 8), a, errorMessage) &&
-            readRegistryBinaryString(file, variableOffset, readLittleEndianUInt64(rowBytes + 16), readLittleEndianUInt64(rowBytes + 24), b, errorMessage) &&
-            readRegistryBinaryString(file, variableOffset, readLittleEndianUInt64(rowBytes + 32), readLittleEndianUInt64(rowBytes + 40), c, errorMessage) &&
-            readRegistryBinaryString(file, variableOffset, readLittleEndianUInt64(rowBytes + 48), readLittleEndianUInt64(rowBytes + 56), d, errorMessage);
+            readRegistryBinaryString(file, variableOffset, readLittleEndianUInt64(rowBytes + 16), readLittleEndianUInt64(rowBytes + 24), b, errorMessage);
+        if (ok && backendTable.rowSize == ORWA_BACKENDS_ROW_SIZE_WITH_ICON) {
+            ok = readRegistryBinaryString(file, variableOffset, readLittleEndianUInt64(rowBytes + 48), readLittleEndianUInt64(rowBytes + 56), d, errorMessage) &&
+                readRegistryBinaryString(file, variableOffset, readLittleEndianUInt64(rowBytes + 64), readLittleEndianUInt64(rowBytes + 72), e, errorMessage);
+        } else if (ok && backendTable.rowSize == ORWA_LEGACY_BACKENDS_ROW_SIZE) {
+            ok = readRegistryBinaryString(file, variableOffset, readLittleEndianUInt64(rowBytes + 48), readLittleEndianUInt64(rowBytes + 56), d, errorMessage);
+            e.clear();
+        } else if (ok) {
+            ok = readRegistryBinaryString(file, variableOffset, readLittleEndianUInt64(rowBytes + 32), readLittleEndianUInt64(rowBytes + 40), d, errorMessage) &&
+                readRegistryBinaryString(file, variableOffset, readLittleEndianUInt64(rowBytes + 48), readLittleEndianUInt64(rowBytes + 56), e, errorMessage);
+        }
         bool ownsUnit = !d.empty();
-        e.clear();
-        if (ok && backendTable.rowSize == ORWA_BACKENDS_ROW_SIZE) {
-            ok = readRegistryBinaryString(file, variableOffset, readLittleEndianUInt64(rowBytes + 64), readLittleEndianUInt64(rowBytes + 72), e, errorMessage);
-            ownsUnit = (readLittleEndianUInt32(rowBytes + 80) & 1u) != 0;
+        if (ok && backendTable.rowSize != ORWA_LEGACY_BACKENDS_ROW_SIZE) {
+            ownsUnit = (readLittleEndianUInt32(rowBytes + (backendTable.rowSize == ORWA_BACKENDS_ROW_SIZE_WITH_ICON ? 80 : 64)) & 1u) != 0;
         }
-        if (c.rfind("data:", 0) == 0) {
-            c.clear();
-        }
-        ok = ok && insertRegistryBinaryBackend(database, a, b, c, d, e, ownsUnit, errorMessage);
-        if (ok && backendTable.rowSize == ORWA_BACKENDS_ROW_SIZE && !d.empty()) {
+        ok = ok && insertRegistryBinaryBackend(database, a, b, d, e, ownsUnit, errorMessage);
+        if (ok && !d.empty()) {
             if (registrySupportsLaunchdBackends() && !e.empty()) {
                 ok = upsertLaunchdBackendRegistryRecord(database, a.c_str(), e.c_str(), ownsUnit, errorMessage);
             } else if (registrySupportsSystemdBackends()) {
@@ -2989,11 +2976,9 @@ bool printRegistryList(sqlite3* database,
                        bool includeIconValues,
                        Buffer& errorMessage) {
     if (strcmp(resource, "backend") == 0) {
+        (void)includeIconValues;
         return printRegistryQuery(database,
-                                  includeIconValues ?
-                                  "SELECT service_id, display_name, COALESCE(icon_path, '') AS icon_path, COALESCE(unit_name, '') AS unit_name, COALESCE(unit_path, '') AS unit_path, COALESCE(owns_unit, 0) AS owns_unit "
-                                  "FROM backends WHERE (?1 IS NULL OR service_id = ?1) ORDER BY service_id;" :
-                                  "SELECT service_id, display_name, COALESCE(icon_path, '') AS icon_path, COALESCE(unit_name, '') AS unit_name, COALESCE(unit_path, '') AS unit_path, COALESCE(owns_unit, 0) AS owns_unit "
+                                  "SELECT service_id, display_name, COALESCE(unit_name, '') AS unit_name, COALESCE(unit_path, '') AS unit_path, COALESCE(owns_unit, 0) AS owns_unit "
                                   "FROM backends WHERE (?1 IS NULL OR service_id = ?1) ORDER BY service_id;",
                                   backendIdentifier,
                                   errorMessage);
@@ -3083,7 +3068,6 @@ bool migrateLegacyRegistryIfNeeded(sqlite3* database, Buffer& errorMessage) {
         ok = upsertBackendRegistryRecord(database,
                                          identifier,
                                          displayName && displayName->size != 0 ? displayName->data : identifier,
-                                         nullptr,
                                          errorMessage) &&
             upsertLogFileRecord(database, identifier, errorMessage) &&
             clearFrontendRegistryRecords(database, identifier, errorMessage);
@@ -3381,14 +3365,12 @@ bool requireRegisteredBackend(sqlite3* database,
 void printUsage() {
     fprintf(stderr,
             "Usage:\n"
-            "  outerctl backend list [--backend <identifier>] [--icons]\n"
-            "  outerctl backend upsert --backend <identifier> [--name <name>] [--icon-path <path>]\n"
+            "  outerctl backend list [--backend <identifier>]\n"
+            "  outerctl backend upsert --backend <identifier> [--name <name>] [--systemd-unit <name> | --launchd-plist <path> [--owns-plist <true|false>]]\n"
             "  outerctl backend remove --backend <identifier>\n"
             "  outerctl systemd list [--backend <identifier>]\n"
-            "  outerctl systemd set --backend <identifier> --unit <name>\n"
             "  outerctl systemd clear --backend <identifier>\n"
             "  outerctl launchd list [--backend <identifier>]\n"
-            "  outerctl launchd set --backend <identifier> --plist <path> [--owns-plist <true|false>]\n"
             "  outerctl launchd clear --backend <identifier>\n"
             "  outerctl log list [--backend <identifier>]\n"
             "  outerctl log add --backend <identifier> --path <path>\n"

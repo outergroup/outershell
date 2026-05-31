@@ -3709,13 +3709,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         openLauncherEndpoint(item.primaryEndpoint, displayName: item.displayName, opensInNewTab: opensInNewTab)
     }
 
-    private func canOpenStoppedSocketActivatedFrontend(_ endpoint: AppLauncherEndpoint) -> Bool {
-        !endpoint.frontend.socketPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-    }
-
     private func openLauncherEndpoint(_ endpoint: AppLauncherEndpoint, displayName: String, opensInNewTab: Bool) {
-        if !endpoint.frontend.isRunning,
-           !canOpenStoppedSocketActivatedFrontend(endpoint) {
+        if !endpointIsReadyToOpen(endpoint) {
             startAndOpenLauncherEndpoint(endpoint, displayName: displayName, opensInNewTab: opensInNewTab)
             return
         }
@@ -3792,7 +3787,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                                                     serviceScope: endpoint.backend.serviceScope,
                                                                     frontendID: endpoint.frontend.id),
                        let url = self.frontendNavigationURL(nextEndpoint.frontend),
-                       nextEndpoint.frontend.isRunning || self.canOpenStoppedSocketActivatedFrontend(nextEndpoint) {
+                       self.endpointIsReadyToOpen(nextEndpoint) {
                         self.backendError = ""
                         self.updateLayout()
                         if opensInNewTab {
@@ -5758,6 +5753,11 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
     private func endpointIsRunning(_ endpoint: AppLauncherEndpoint) -> Bool {
         endpoint.frontend.isRunning || endpoint.backend.status == "running"
+    }
+
+    private func endpointIsReadyToOpen(_ endpoint: AppLauncherEndpoint) -> Bool {
+        endpointIsRunning(endpoint) ||
+            (endpoint.backend.status == "available" && endpoint.frontend.hasEndpoint)
     }
 
     private func renderRunningBadges(for item: AppLauncherItem,

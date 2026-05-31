@@ -274,8 +274,7 @@ EOF
 
     cleanup_legacy_home_screen
     bootstrap_outer_shell
-    OUTERSHELL_HOME="$outershell_home" "$outerctl_path" backend upsert --backend "$service_id" --name "$display_name" --icon-path "$install_root/app-icon.png"
-    OUTERSHELL_HOME="$outershell_home" "$outerctl_path" launchd set --backend "$service_id" --plist "$plist_path" --owns-plist true
+    OUTERSHELL_HOME="$outershell_home" "$outerctl_path" backend upsert --backend "$service_id" --name "$display_name" --launchd-plist "$plist_path" --owns-plist true
     OUTERSHELL_HOME="$outershell_home" "$outerctl_path" app clear --backend "$service_id"
     OUTERSHELL_HOME="$outershell_home" "$outerctl_path" app add --backend "$service_id" --socket-path "$socket_path" --name "$display_name" --url "$socket_path" --icon-path "$install_root/app-icon.png"
     OUTERSHELL_HOME="$outershell_home" "$outerctl_path" log clear --backend "$service_id"
@@ -443,8 +442,7 @@ systemctl --user stop org.outershell.OuterShell.service outershelld.service org.
 rm -f "$socket_path" "$runtime_dir/outershelld-api"
 systemctl --user start org.outershell.OuterShell.socket outershelld.socket
 
-OUTERSHELL_HOME="$outershell_home" "$outerctl_path" backend upsert --backend org.outershell.OuterShell --name "Outer Shell" --icon-path "$install_root/app-icon.png"
-OUTERSHELL_HOME="$outershell_home" "$outerctl_path" systemd set --backend org.outershell.OuterShell --unit org.outershell.OuterShell.service
+OUTERSHELL_HOME="$outershell_home" "$outerctl_path" backend upsert --backend org.outershell.OuterShell --name "Outer Shell" --systemd-unit org.outershell.OuterShell.service
 OUTERSHELL_HOME="$outershell_home" "$outerctl_path" app clear --backend org.outershell.OuterShell
 OUTERSHELL_HOME="$outershell_home" "$outerctl_path" app add --backend org.outershell.OuterShell --socket-path "$socket_path" --name "Outer Shell" --url "$socket_path" --icon-path "$install_root/app-icon.png"
 OUTERSHELL_HOME="$outershell_home" "$outerctl_path" log clear --backend org.outershell.OuterShell

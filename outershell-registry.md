@@ -63,21 +63,20 @@ The variable region starts immediately after the last table.
 
 ### `backends`
 
-Row size: 84 bytes.
+Row size: 68 bytes.
 
 ```text
 bytes 0..15:   StringRef64 service_id
 bytes 16..31:  StringRef64 display_name
-bytes 32..47:  StringRef64 icon_path
-bytes 48..63:  StringRef64 unit_name
-bytes 64..79:  StringRef64 unit_path
-bytes 80..83:  UInt32 flags
+bytes 32..47:  StringRef64 unit_name
+bytes 48..63:  StringRef64 unit_path
+bytes 64..67:  UInt32 flags
                 bit 0 = owns_unit
 ```
 
 ### `frontends`
 
-Row size: 97 bytes.
+Row size: 113 bytes.
 
 ```text
 bytes 0..15:    StringRef64 url
@@ -90,6 +89,7 @@ byte 80:        UInt8 endpoint_kind
                  1 = port
                  2 = socket_path
 bytes 81..96:   EndpointPayload
+bytes 97..112:  StringRef64 frontend_id
 
 EndpointPayload when endpoint_kind = 1:
 bytes 81..84:    UInt32 port
@@ -98,6 +98,10 @@ bytes 85..96:    zero-filled
 EndpointPayload when endpoint_kind = 2:
 bytes 81..96:    StringRef64 socket_path
 ```
+
+The registry stores app metadata and endpoint hints, not runtime status. Outer
+Shell derives whether an app is running from the registered service manager
+unit.
 
 `suggested_list` is announced by the backend. User placement is stored in
 `frontend_layouts`; when a layout row exists for a URL, it overrides
@@ -126,16 +130,16 @@ bytes 16..31:  StringRef64 service_id
 The migration/export step reads these SQLite tables:
 
 ```text
-backends(service_id, display_name, icon_path, unit_name, unit_path, owns_unit)
-frontends(url, service_id, display_name, port, socket_path, icon_path, suggested_list)
+backends(service_id, display_name, unit_name, unit_path, owns_unit)
+frontends(url, service_id, display_name, port, socket_path, icon_path, suggested_list, frontend_id)
 frontend_layouts(url, list)
 log_files(path, service_id)
 ```
 
 Current migration code also understands older SQLite registries that keep
 systemd and launchd metadata in side tables. Those values are folded into the
-backend row during export. Older icon columns are interpreted as paths only
-when they are not `data:` URLs.
+backend row during export. Older backend icon columns are ignored; app/frontend
+icons remain part of the `frontends` table.
 
 Missing optional string values become empty references. Missing boolean values
 become zero.
