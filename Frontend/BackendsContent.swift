@@ -5799,8 +5799,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             chipLayer.shadowOffset = CGSize(width: 0, height: 1)
 
             let symbolLayer = CALayer()
-            symbolLayer.frame = CGRect(x: floor((chipFrame.width - chip.badge.size.width) / 2),
-                                       y: floor((chipFrame.height - chip.badge.size.height) / 2),
+            symbolLayer.frame = CGRect(x: (chipFrame.width - chip.badge.size.width) / 2,
+                                       y: (chipFrame.height - chip.badge.size.height) / 2,
                                        width: chip.badge.size.width,
                                        height: chip.badge.size.height)
             symbolLayer.contentsGravity = .resizeAspect
