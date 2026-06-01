@@ -36,24 +36,29 @@ mkdir -p "${OUTPUT_DIR}"
 cc -std=gnu17 -Os -ffunction-sections -fdata-sections -flto \
     -I"${SQLITE_DIR}" \
     -o "${OUTPUT_DIR}/outershelld" \
-    "${REPO_ROOT}/Backend/main.c" \
+    "${REPO_ROOT}/Backend/OuterShellBuffer.c" \
+    "${REPO_ROOT}/Backend/OuterShellAPI.c" \
+    "${REPO_ROOT}/Backend/OuterShellPlatform.c" \
+    "${REPO_ROOT}/OuterShelld/outershelld.c" \
     "${SQLITE_DIR}/sqlite3.c" \
     -ldl -lpthread -lm
 
 cc -std=gnu17 -Os -ffunction-sections -fdata-sections -flto \
-    -I"${SQLITE_DIR}" \
-    -c "${SQLITE_DIR}/sqlite3.c" \
-    -o "${OUTPUT_DIR}/sqlite3.o"
+    -DOUTER_SHELL_BACKEND_STANDALONE=1 \
+    -o "${OUTPUT_DIR}/OuterShellBackend" \
+    "${REPO_ROOT}/Backend/OuterShellBuffer.c" \
+    "${REPO_ROOT}/Backend/OuterShellAPI.c" \
+    "${REPO_ROOT}/Backend/OuterShellPlatform.c" \
+    "${REPO_ROOT}/Backend/OuterShellBackend.c" \
+    -ldl -lpthread -lm
 
 c++ -std=c++17 -Os -ffunction-sections -fdata-sections -flto \
-    -I"${SQLITE_DIR}" \
     -o "${OUTPUT_DIR}/outerctl" \
-    "${RESOURCES_DIR}/outerctl.cpp" \
-    "${OUTPUT_DIR}/sqlite3.o" \
-    -ldl -lpthread -lm
+    "${RESOURCES_DIR}/outerctl.cpp"
 
 if command -v strip >/dev/null 2>&1; then
     strip --strip-unneeded "${OUTPUT_DIR}/outershelld" || true
+    strip --strip-unneeded "${OUTPUT_DIR}/OuterShellBackend" || true
     strip --strip-unneeded "${OUTPUT_DIR}/outerctl" || true
 fi
 

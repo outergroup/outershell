@@ -117,8 +117,8 @@ rm -rf "${BUILD_ROOT}/${CONFIGURATION}/Outer Shell.app/Contents/Resources/bundle
 cp -R "${RUN_ROOT}/bundled-apps" \
     "${BUILD_ROOT}/${CONFIGURATION}/Outer Shell.app/Contents/Resources/bundled-apps"
 
-ln -sf outershelld "${BUILD_ROOT}/${CONFIGURATION}/BackendsBackend"
-ln -sf outershelld "${BUILD_ROOT}/${CONFIGURATION}/NavigatorBackend"
+ln -sf "Outer Shell.app/Contents/MacOS/Outer Shell" "${BUILD_ROOT}/${CONFIGURATION}/BackendsBackend"
+ln -sf "Outer Shell.app/Contents/MacOS/Outer Shell" "${BUILD_ROOT}/${CONFIGURATION}/NavigatorBackend"
 
 echo "Built:"
 echo "  ${BUILD_ROOT}/${CONFIGURATION}/outershelld"
@@ -127,5 +127,7 @@ echo "  ${RUN_ROOT}/bundles"
 echo "  ${TOP_PAYLOAD_ROOT}"
 echo
 echo "Run:"
-echo "  \"${BUILD_ROOT}/${CONFIGURATION}/outershelld\" --port 7354 --bundles-dir \"${RUN_ROOT}/bundles\" --bundled-apps-dir \"${RUN_ROOT}/bundled-apps\""
+echo "  API_SOCKET=\"$(getconf DARWIN_USER_TEMP_DIR)outershelld-api\""
+echo "  \"${BUILD_ROOT}/${CONFIGURATION}/outershelld\" --api-socket-path \"\$API_SOCKET\" &"
+echo "  cc -std=gnu17 -DOUTER_SHELL_BACKEND_STANDALONE=1 Backend/OuterShellBuffer.c Backend/OuterShellAPI.c Backend/OuterShellPlatform.c Backend/OuterShellBackend.c -o /tmp/OuterShellBackend && /tmp/OuterShellBackend --port 7354 --api-socket-path \"\$API_SOCKET\" --bundles-dir \"${RUN_ROOT}/bundles\""
 echo "  \"${BUILD_ROOT}/${CONFIGURATION}/Outer Shell.app/Contents/MacOS/Outer Shell\" --socket-path \"$(getconf DARWIN_USER_TEMP_DIR)org.outershell.OuterShell\" --bundles-dir \"${RUN_ROOT}/bundles\" --bundled-apps-dir \"${RUN_ROOT}/bundled-apps\""

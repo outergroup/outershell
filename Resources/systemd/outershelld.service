@@ -4,7 +4,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/outershelld --broker-only --api-socket-path %t/outershelld-api
+ExecStart=/usr/bin/outershelld --api-socket-path %t/outershelld-api
 Restart=on-failure
 
 [Install]

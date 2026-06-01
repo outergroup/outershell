@@ -28,6 +28,8 @@ require_file() {
 
 require_file "${PACKAGE_ROOT}/RemoteLinuxBinaries/aarch64/outershelld"
 require_file "${PACKAGE_ROOT}/RemoteLinuxBinaries/x86_64/outershelld"
+require_file "${PACKAGE_ROOT}/RemoteLinuxBinaries/aarch64/OuterShellBackend"
+require_file "${PACKAGE_ROOT}/RemoteLinuxBinaries/x86_64/OuterShellBackend"
 require_file "${PACKAGE_ROOT}/RemoteLinuxBinaries/aarch64/outerctl"
 require_file "${PACKAGE_ROOT}/RemoteLinuxBinaries/x86_64/outerctl"
 require_file "${RUN_ROOT}/bundles/BackendsContent.bundle.macos-arm.aar"
@@ -52,7 +54,7 @@ stage_home_screen() {
     local root="${STAGING_ROOT}/outer-shell-${arch}/OuterShell"
     mkdir -p "${root}/bin" "${root}/bundles"
     install -m 0755 "${PACKAGE_ROOT}/RemoteLinuxBinaries/${arch}/outershelld" "${root}/outershelld"
-    ln -s outershelld "${root}/OuterShellBackend"
+    install -m 0755 "${PACKAGE_ROOT}/RemoteLinuxBinaries/${arch}/OuterShellBackend" "${root}/OuterShellBackend"
     install -m 0755 "${PACKAGE_ROOT}/RemoteLinuxBinaries/${arch}/outerctl" "${root}/bin/outerctl"
     install -m 0644 "${REPO_ROOT}/app-icon.png" "${root}/app-icon.png"
     install -m 0644 "${RUN_ROOT}/bundles/BackendsContent.bundle.macos-arm.aar" "${root}/bundles/BackendsContent.bundle.macos-arm.aar"
@@ -71,7 +73,7 @@ stage_home_screen_macos() {
         ditto "${RUN_ROOT}/bundled-apps" "${root}/bundled-apps"
     fi
     clang++ -std=c++17 "${REPO_ROOT}/Resources/outerctl.cpp" \
-        -lsqlite3 -framework CoreFoundation -o "${root}/bin/outerctl"
+        -o "${root}/bin/outerctl"
     chmod 0755 "${root}/bin/outerctl"
     tar --format ustar --no-xattrs -C "${STAGING_ROOT}/outer-shell-macos" -czf "${OUTPUT_ROOT}/latest/outer-shell-macos.tar.gz" OuterShell
 }
@@ -360,10 +362,11 @@ mkdir -p "$install_root" "$outershell_home/bin" "$unit_dir" "$log_dir"
 cleanup_legacy_home_screen
 archive_path="$(mktemp)"
 download "${public_base_url%/}/latest/outer-shell-${arch}.tar.gz?v=__ASSET_VERSION__" "$archive_path"
+rm -f "$install_root/outershelld" "$install_root/OuterShellBackend"
 tar -xzf "$archive_path" -C "$install_root" --strip-components=1
 rm -f "$archive_path"
 chmod 0755 "$install_root/outershelld"
-ln -sfn outershelld "$install_root/OuterShellBackend"
+chmod 0755 "$install_root/OuterShellBackend"
 chmod 0755 "$install_root/bin/outerctl"
 install -m 0755 "$install_root/bin/outerctl" "$outerctl_path"
 printf '%s\n' "__OUTER_SHELL_VERSION__" > "$install_root/version"
@@ -371,13 +374,13 @@ touch "$log_path" "$broker_log_path"
 
 cat > "$runner_path" <<EOF
 #!/bin/sh
-exec "$install_root/OuterShellBackend" --http-only --socket-path "\${1:-$socket_path}" --bundles-dir "$install_root/bundles" --bundled-apps-dir "$install_root/bundled-apps" --app-base-url "$app_base_url" --public-base-url "$public_base_url" >> "$log_path" 2>&1
+exec "$install_root/OuterShellBackend" --socket-path "\${1:-$socket_path}" --api-socket-path "$runtime_dir/outershelld-api" --bundles-dir "$install_root/bundles" --bundled-apps-dir "$install_root/bundled-apps" --app-base-url "$app_base_url" --public-base-url "$public_base_url" >> "$log_path" 2>&1
 EOF
 chmod 0755 "$runner_path"
 
 cat > "$broker_runner_path" <<EOF
 #!/bin/sh
-exec "$install_root/outershelld" --broker-only --api-socket-path "\${1:-$runtime_dir/outershelld-api}" >> "$broker_log_path" 2>&1
+exec "$install_root/outershelld" --api-socket-path "\${1:-$runtime_dir/outershelld-api}" --bundled-apps-dir "$install_root/bundled-apps" --app-base-url "$app_base_url" --public-base-url "$public_base_url" >> "$broker_log_path" 2>&1
 EOF
 chmod 0755 "$broker_runner_path"
 

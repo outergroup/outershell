@@ -1,13 +1,18 @@
 import AppKit
 import Darwin
 import Foundation
-import SQLite3
 
 @_silgen_name("OuterShellBackendMain")
 private func OuterShellBackendMain(_ argc: Int32, _ argv: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?) -> Int32
 
+@_silgen_name("OuterShelldMain")
+private func OuterShelldMain(_ argc: Int32, _ argv: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?) -> Int32
+
 @_silgen_name("OuterShellBackendRequestShutdown")
 private func OuterShellBackendRequestShutdown()
+
+@_silgen_name("OuterShelldRequestShutdown")
+private func OuterShelldRequestShutdown()
 
 private struct HostedFrontend: Equatable {
     let serviceID: String
@@ -132,20 +137,50 @@ private enum OuterShellRegistry {
         var frontends: [HostedFrontend] = []
     }
 
+    private struct OrwaDescriptor {
+        let offset: Int
+        let rowCount: Int
+        let rowSize: Int
+    }
+
+    private static let orwaDescriptorSize = 20
+    private static let orwaTableCount = 5
+    private static let orwaLegacyFourTableCount = 4
+    private static let orwaLegacyThreeTableCount = 3
+    private static let orwaHeaderSize = 8 + orwaTableCount * orwaDescriptorSize
+    private static let orwaLegacyFourTableHeaderSize = 8 + orwaLegacyFourTableCount * orwaDescriptorSize
+    private static let orwaLegacyThreeTableHeaderSize = 8 + orwaLegacyThreeTableCount * orwaDescriptorSize
+    private static let orwaBackendsRowSize = 68
+    private static let orwaLegacyBackendsRowSize = 84
+    private static let orwaLegacyFrontendsRowSize = 97
+    private static let orwaFrontendsRowSize = 113
+    private static let orwaFrontendsRowSizeWithFlags = 117
+    private static let orwaFrontendLayoutsRowSize = 32
+    private static let orwaLogFilesRowSize = 32
+    private static let orwaFileOpenersRowSize = 88
+
     private static func registryPaths() -> [String] {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
         var paths: [String] = []
         if let override = ProcessInfo.processInfo.environment["OUTERSHELL_REGISTRY"], !override.isEmpty {
-            paths.append((override as NSString).expandingTildeInPath)
+            paths.append(orwaPath(for: (override as NSString).expandingTildeInPath))
         } else {
-            paths.append((home as NSString).appendingPathComponent("Library/Application Support/outershell/registry.sqlite3"))
+            paths.append((home as NSString).appendingPathComponent("Library/Application Support/outershell/registry.orwa"))
         }
         if let override = ProcessInfo.processInfo.environment["OUTERSHELL_SYSTEM_REGISTRY"], !override.isEmpty {
-            paths.append((override as NSString).expandingTildeInPath)
+            paths.append(orwaPath(for: (override as NSString).expandingTildeInPath))
         } else {
-            paths.append("/Library/Application Support/outershell/registry.sqlite3")
+            paths.append("/Library/Application Support/outershell/registry.orwa")
         }
         return Array(Set(paths))
+    }
+
+    private static func orwaPath(for registryPath: String) -> String {
+        let path = registryPath as NSString
+        if path.lastPathComponent == "registry.orwa" {
+            return registryPath
+        }
+        return (path.deletingLastPathComponent as NSString).appendingPathComponent("registry.orwa")
     }
 
     private static func isOuterShellServiceID(_ serviceID: String) -> Bool {
@@ -156,76 +191,150 @@ private enum OuterShellRegistry {
     }
 
     private static func loadRegistry(at path: String, into merged: inout [String: PartialBackend]) throws {
-        var database: OpaquePointer?
-        let flags = SQLITE_OPEN_READONLY | SQLITE_OPEN_URI
-        let uri = "file:" + path.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed)! + "?mode=ro&immutable=1"
-        guard sqlite3_open_v2(uri, &database, flags, nil) == SQLITE_OK, let database else {
+        let data = try Data(contentsOf: URL(fileURLWithPath: path), options: [.mappedIfSafe])
+        guard data.count >= orwaLegacyThreeTableHeaderSize,
+              data.starts(with: [0x4f, 0x52, 0x57, 0x41]),
+              readUInt32(data, 4) == 1 else {
             return
         }
-        defer { sqlite3_close(database) }
 
-        try query(database,
-                  """
-                  SELECT b.service_id,
-                         COALESCE(b.display_name, ''),
-                         COALESCE(l.plist_path, ''),
-                         COALESCE(f.path, '')
-                  FROM backends b
-                  LEFT JOIN launchd_backends l ON l.service_id = b.service_id
-                  LEFT JOIN log_files f ON f.service_id = b.service_id;
-                  """) { statement in
-            let serviceID = columnText(statement, 0)
-            guard !serviceID.isEmpty else { return }
+        let firstTableOffset = readUInt64(data, 8)
+        let tableCount: Int
+        if firstTableOffset == UInt64(orwaHeaderSize) {
+            tableCount = orwaTableCount
+        } else if firstTableOffset == UInt64(orwaLegacyFourTableHeaderSize) {
+            tableCount = orwaLegacyFourTableCount
+        } else if firstTableOffset == UInt64(orwaLegacyThreeTableHeaderSize) {
+            tableCount = orwaLegacyThreeTableCount
+        } else {
+            return
+        }
+        guard data.count >= 8 + tableCount * orwaDescriptorSize else { return }
+
+        var descriptors: [OrwaDescriptor] = []
+        var variableOffset = 0
+        for tableIndex in 0..<tableCount {
+            let descriptorOffset = 8 + tableIndex * orwaDescriptorSize
+            let offset = Int(readUInt64(data, descriptorOffset))
+            let rowCount = Int(readUInt64(data, descriptorOffset + 8))
+            let rowSize = Int(readUInt32(data, descriptorOffset + 16))
+            guard rowSize > 0,
+                  offset >= 0,
+                  rowCount >= 0,
+                  rowCount <= (Int.max / rowSize),
+                  offset <= data.count,
+                  rowCount * rowSize <= data.count - offset,
+                  rowSizeIsValid(rowSize, tableIndex: tableIndex, tableCount: tableCount) else {
+                return
+            }
+            descriptors.append(OrwaDescriptor(offset: offset, rowCount: rowCount, rowSize: rowSize))
+            variableOffset = max(variableOffset, offset + rowCount * rowSize)
+        }
+
+        let backends = descriptors[0]
+        for row in 0..<backends.rowCount {
+            let rowOffset = backends.offset + row * backends.rowSize
+            let serviceID = readString(data, variableOffset, rowOffset)
+            guard !serviceID.isEmpty else { continue }
             var partial = merged[serviceID] ?? PartialBackend(serviceID: serviceID)
-            let displayName = columnText(statement, 1)
-            let plistPath = columnText(statement, 2)
-            let logPath = columnText(statement, 3)
+            let displayName = readString(data, variableOffset, rowOffset + 16)
+            let plistPath: String
+            if backends.rowSize >= orwaLegacyBackendsRowSize {
+                plistPath = readString(data, variableOffset, rowOffset + 64)
+            } else {
+                plistPath = readString(data, variableOffset, rowOffset + 48)
+            }
             if !displayName.isEmpty { partial.displayName = displayName }
             if !plistPath.isEmpty { partial.plistPath = plistPath }
-            if !logPath.isEmpty { partial.logFiles.insert(logPath) }
             merged[serviceID] = partial
         }
 
-        try query(database,
-                  """
-                  SELECT COALESCE(service_id, ''),
-                         COALESCE(display_name, ''),
-                         COALESCE(port, 0),
-                         COALESCE(socket_path, ''),
-                         COALESCE(url, '')
-                  FROM frontends;
-                  """) { statement in
-            let serviceID = columnText(statement, 0)
-            guard !serviceID.isEmpty else { return }
+        let frontends = descriptors[1]
+        for row in 0..<frontends.rowCount {
+            let rowOffset = frontends.offset + row * frontends.rowSize
+            let url = readString(data, variableOffset, rowOffset)
+            let serviceID = readString(data, variableOffset, rowOffset + 16)
+            guard !serviceID.isEmpty else { continue }
+            let displayName = readString(data, variableOffset, rowOffset + 32)
+            var port = 0
+            var socketPath = ""
+            if rowOffset + 81 < data.count {
+                let endpointKind = data[rowOffset + 80]
+                if endpointKind == 1 {
+                    port = Int(readUInt32(data, rowOffset + 81))
+                } else if endpointKind == 2 {
+                    socketPath = readString(data, variableOffset, rowOffset + 81)
+                }
+            }
             var partial = merged[serviceID] ?? PartialBackend(serviceID: serviceID)
             let frontend = HostedFrontend(serviceID: serviceID,
-                                          name: columnText(statement, 1),
-                                          port: Int(sqlite3_column_int(statement, 2)),
-                                          socketPath: columnText(statement, 3),
-                                          url: columnText(statement, 4))
+                                          name: displayName,
+                                          port: port,
+                                          socketPath: socketPath,
+                                          url: url)
             if !partial.frontends.contains(frontend) {
                 partial.frontends.append(frontend)
             }
             merged[serviceID] = partial
         }
+
+        let logTableIndex = tableCount == orwaLegacyThreeTableCount ? 2 : 3
+        guard logTableIndex < descriptors.count else { return }
+        let logs = descriptors[logTableIndex]
+        for row in 0..<logs.rowCount {
+            let rowOffset = logs.offset + row * logs.rowSize
+            let path = readString(data, variableOffset, rowOffset)
+            let serviceID = readString(data, variableOffset, rowOffset + 16)
+            guard !serviceID.isEmpty, !path.isEmpty else { continue }
+            var partial = merged[serviceID] ?? PartialBackend(serviceID: serviceID)
+            partial.logFiles.insert(path)
+            merged[serviceID] = partial
+        }
     }
 
-    private static func query(_ database: OpaquePointer,
-                              _ sql: String,
-                              row: (OpaquePointer) -> Void) throws {
-        var statement: OpaquePointer?
-        guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK, let statement else {
-            return
-        }
-        defer { sqlite3_finalize(statement) }
-        while sqlite3_step(statement) == SQLITE_ROW {
-            row(statement)
+    private static func rowSizeIsValid(_ rowSize: Int, tableIndex: Int, tableCount: Int) -> Bool {
+        switch tableIndex {
+        case 0:
+            return rowSize == orwaBackendsRowSize || rowSize == orwaLegacyBackendsRowSize
+        case 1:
+            return rowSize == orwaFrontendsRowSize || rowSize == orwaFrontendsRowSizeWithFlags || rowSize == orwaLegacyFrontendsRowSize
+        case 2 where tableCount != orwaLegacyThreeTableCount:
+            return rowSize == orwaFrontendLayoutsRowSize
+        case 4:
+            return rowSize == orwaFileOpenersRowSize
+        default:
+            return rowSize == orwaLogFilesRowSize
         }
     }
 
-    private static func columnText(_ statement: OpaquePointer, _ index: Int32) -> String {
-        guard let text = sqlite3_column_text(statement, index) else { return "" }
-        return String(cString: text)
+    private static func readString(_ data: Data, _ variableOffset: Int, _ refOffset: Int) -> String {
+        guard refOffset >= 0, refOffset + 16 <= data.count else { return "" }
+        let offset = Int(readUInt64(data, refOffset))
+        let length = Int(readUInt64(data, refOffset + 8))
+        guard length > 0,
+              offset >= variableOffset,
+              offset <= data.count,
+              length <= data.count - offset else {
+            return ""
+        }
+        return String(data: data.subdata(in: offset..<(offset + length)), encoding: .utf8) ?? ""
+    }
+
+    private static func readUInt32(_ data: Data, _ offset: Int) -> UInt32 {
+        guard offset + 4 <= data.count else { return 0 }
+        return UInt32(data[offset]) |
+            (UInt32(data[offset + 1]) << 8) |
+            (UInt32(data[offset + 2]) << 16) |
+            (UInt32(data[offset + 3]) << 24)
+    }
+
+    private static func readUInt64(_ data: Data, _ offset: Int) -> UInt64 {
+        guard offset + 8 <= data.count else { return 0 }
+        var value: UInt64 = 0
+        for i in 0..<8 {
+            value |= UInt64(data[offset + i]) << UInt64(i * 8)
+        }
+        return value
     }
 
     private static func launchdState(serviceID: String, plistPath: String) -> ManagedBackend.State {
@@ -618,6 +727,7 @@ private final class OuterShellAgentDelegate: NSObject, NSApplicationDelegate, NS
     private var followUpRefreshTask: Task<Void, Never>?
     private var pendingLifecycleActions: [String: PendingLifecycleAction] = [:]
     private var serviceExitMonitors: [String: (pid: pid_t, source: DispatchSourceProcess)] = [:]
+    private var brokerThread: Thread?
     private var backendThread: Thread?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -637,6 +747,7 @@ private final class OuterShellAgentDelegate: NSObject, NSApplicationDelegate, NS
         followUpRefreshTask?.cancel()
         cancelAllServiceExitMonitors()
         OuterShellBackendRequestShutdown()
+        OuterShelldRequestShutdown()
     }
 
     func menuWillOpen(_ menu: NSMenu) {
@@ -644,12 +755,40 @@ private final class OuterShellAgentDelegate: NSObject, NSApplicationDelegate, NS
     }
 
     private func startBackend() {
+        let brokerArguments = brokerArguments()
+        brokerThread = Thread {
+            _ = runBroker(arguments: brokerArguments)
+        }
+        brokerThread?.name = "outershelld"
+        brokerThread?.start()
+
         let arguments = backendArguments()
         backendThread = Thread {
             _ = runBackend(arguments: arguments)
         }
-        backendThread?.name = "outershelld"
+        backendThread?.name = "OuterShellBackend"
         backendThread?.start()
+    }
+
+    private func brokerArguments() -> [String] {
+        var args = [CommandLine.arguments.first ?? "outershelld"]
+        if !CommandLine.arguments.contains("--stay-alive") {
+            args.append("--stay-alive")
+        }
+        if !containsOption(CommandLine.arguments, "--api-socket-path") {
+            args.append("--api-socket-path")
+            args.append(defaultApiSocketPath())
+        }
+        appendOptionIfPresent("--database", from: CommandLine.arguments, to: &args)
+        appendOptionIfPresent("--system-database", from: CommandLine.arguments, to: &args)
+        appendOptionIfPresent("--bundled-apps-dir", from: CommandLine.arguments, to: &args)
+        appendOptionIfPresent("--app-base-url", from: CommandLine.arguments, to: &args)
+        appendOptionIfPresent("--public-base-url", from: CommandLine.arguments, to: &args)
+        if !containsOption(args, "--bundled-apps-dir") && !containsOption(args, "--app-base-url") {
+            args.append("--bundled-apps-dir")
+            args.append(defaultBundledAppsPath())
+        }
+        return args
     }
 
     private func backendArguments() -> [String] {
@@ -664,6 +803,10 @@ private final class OuterShellAgentDelegate: NSObject, NSApplicationDelegate, NS
         if !containsOption(args, "--launchd-socket-name") {
             args.append("--launchd-socket-name")
             args.append("Listener")
+        }
+        if !containsOption(args, "--api-socket-path") {
+            args.append("--api-socket-path")
+            args.append(defaultApiSocketPath())
         }
         if !containsOption(args, "--bundles-dir") {
             args.append("--bundles-dir")
@@ -1075,6 +1218,19 @@ private func runBackend(arguments: [String]) -> Int32 {
     }
 }
 
+private func runBroker(arguments: [String]) -> Int32 {
+    var cStrings = arguments.map { strdup($0) }
+    cStrings.append(nil)
+    defer {
+        for pointer in cStrings where pointer != nil {
+            free(pointer)
+        }
+    }
+    return cStrings.withUnsafeMutableBufferPointer { buffer in
+        OuterShelldMain(Int32(arguments.count), buffer.baseAddress)
+    }
+}
+
 private func runLifecycleCommand(for service: ManagedBackend) -> Bool {
     if service.isSystemService || service.plistPath.isEmpty {
         return false
@@ -1095,6 +1251,14 @@ private func containsOption(_ args: [String], _ option: String) -> Bool {
     args.contains(option)
 }
 
+private func appendOptionIfPresent(_ option: String, from source: [String], to destination: inout [String]) {
+    guard let index = source.firstIndex(of: option), index + 1 < source.count else {
+        return
+    }
+    destination.append(option)
+    destination.append(source[index + 1])
+}
+
 private func defaultSocketPath() -> String {
     var buffer = [CChar](repeating: 0, count: Int(PATH_MAX))
     let result = confstr(_CS_DARWIN_USER_TEMP_DIR, &buffer, buffer.count)
@@ -1105,6 +1269,18 @@ private func defaultSocketPath() -> String {
         directory = NSTemporaryDirectory()
     }
     return (directory as NSString).appendingPathComponent("org.outershell.OuterShell")
+}
+
+private func defaultApiSocketPath() -> String {
+    var buffer = [CChar](repeating: 0, count: Int(PATH_MAX))
+    let result = confstr(_CS_DARWIN_USER_TEMP_DIR, &buffer, buffer.count)
+    let directory: String
+    if result > 0, let terminator = buffer.firstIndex(of: 0) {
+        directory = String(decoding: buffer[..<terminator].map { UInt8(bitPattern: $0) }, as: UTF8.self)
+    } else {
+        directory = NSTemporaryDirectory()
+    }
+    return (directory as NSString).appendingPathComponent("outershelld-api")
 }
 
 private func defaultBundlesPath() -> String {
