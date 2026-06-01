@@ -6891,14 +6891,18 @@ static bool make_blank_script(const char *service_id, const char *display_name, 
 static bool make_fixed_port_script(const char *service_id,
                                    const char *display_name,
                                    const char *port,
+                                   const char *socket_path,
+                                   bool use_unix_socket,
                                    const char *command,
                                    StringBuilder *builder) {
     char quoted_id[512];
     char quoted_name[1024];
     char quoted_port[64];
+    char quoted_socket_path[PATH_MAX * 2];
     shell_quote(service_id, quoted_id, sizeof(quoted_id));
     shell_quote(display_name, quoted_name, sizeof(quoted_name));
-    shell_quote(port, quoted_port, sizeof(quoted_port));
+    shell_quote(port ? port : "", quoted_port, sizeof(quoted_port));
+    shell_quote(socket_path ? socket_path : "", quoted_socket_path, sizeof(quoted_socket_path));
     return sb_append(builder,
         "#!/bin/sh\n"
         "set -eu\n"
@@ -6909,7 +6913,12 @@ static bool make_fixed_port_script(const char *service_id,
         sb_append(builder, quoted_name) &&
         sb_append(builder, "\nPORT=") &&
         sb_append(builder, quoted_port) &&
+        sb_append(builder, "\nSOCKET_PATH=") &&
+        sb_append(builder, quoted_socket_path) &&
+        sb_append(builder, "\nENDPOINT_KIND=") &&
+        sb_append(builder, use_unix_socket ? "unixSocket" : "port") &&
         sb_append(builder,
+        "\nexport BACKEND_ID DISPLAY_NAME PORT SOCKET_PATH ENDPOINT_KIND\n"
         "\nCMD_PID=''\n"
         "\n"
         "cleanup() {\n"
@@ -6917,8 +6926,19 @@ static bool make_fixed_port_script(const char *service_id,
         "        kill -TERM \"$CMD_PID\" 2>/dev/null || true\n"
         "        wait \"$CMD_PID\" 2>/dev/null || true\n"
         "    fi\n"
+        "    if [ \"$ENDPOINT_KIND\" = unixSocket ] && [ -n \"$SOCKET_PATH\" ]; then\n"
+        "        rm -f \"$SOCKET_PATH\"\n"
+        "    fi\n"
         "}\n"
         "trap cleanup EXIT INT TERM\n"
+        "\n"
+        "if [ \"$ENDPOINT_KIND\" = unixSocket ]; then\n"
+        "    socket_dir=${SOCKET_PATH%/*}\n"
+        "    if [ -n \"$socket_dir\" ] && [ \"$socket_dir\" != \"$SOCKET_PATH\" ]; then\n"
+        "        mkdir -p \"$socket_dir\"\n"
+        "    fi\n"
+        "    rm -f \"$SOCKET_PATH\"\n"
+        "fi\n"
         "\n") &&
         sb_append(builder, command) &&
         sb_append(builder,
@@ -9867,16 +9887,20 @@ static void send_recipes_response(int fd) {
         {.title = "Port", .value = "port"},
         {.title = "Unix Socket", .value = "unixSocket"},
     };
+    char command_socket_placeholder[PATH_MAX];
+    runtime_socket_path("my-service.sock", command_socket_placeholder, sizeof(command_socket_placeholder));
     BinaryPayloadList fields = {0};
     ok = ok &&
          append_field_payload(&fields, "command", "Command", "", "text", "bundle exec jekyll serve --host 0.0.0.0", NULL, NULL, 0) &&
          append_field_payload(&fields, "workdir", "Working Dir", "~", "directory", "~", NULL, NULL, 0) &&
          append_field_payload(&fields, "scriptPath", "Script Path", "", "file", "~/dev/run-service.sh", NULL, NULL, 0) &&
+         append_field_payload(&fields, "frontendTransport", "Connection", "port", "choice", "", NULL, connection_choices, 2) &&
          append_field_payload(&fields, "port", "Port", "", "text", "4000", NULL, NULL, 0) &&
+         append_field_payload(&fields, "socketPath", "Socket Path", "", "text", command_socket_placeholder, NULL, NULL, 0) &&
          append_field_payload(&fields, "name", "Display Name", "", "text", "My Service", NULL, NULL, 0) &&
          append_field_payload(&fields, "identifier", "Identifier", "", "text", "my-service", NULL, NULL, 0) &&
-         append_recipe_payload(&recipes, "command-port", "Run a command, use a hardcoded port number",
-                               "Create a script that runs a command you choose and registers a frontend on a hardcoded port number.",
+         append_recipe_payload(&recipes, "command-port", "Run a command, use a fixed endpoint",
+                               "Create a script that runs a command you choose and registers a frontend on a port or Unix socket.",
                                &fields);
     binary_payload_list_free(&fields);
     fields = (BinaryPayloadList){0};
@@ -10111,17 +10135,43 @@ static void send_create_response(int fd, const char *query) {
 
         if (strcmp(recipe, "command-port") == 0) {
             char port[32] = "";
+            char transport[64] = "port";
+            char socket_path_raw[PATH_MAX] = "";
+            char socket_path[PATH_MAX] = "";
             query_value(query, "command", command, sizeof(command));
+            query_value_or_default(query, "frontendTransport", "port", transport, sizeof(transport));
             query_value(query, "port", port, sizeof(port));
-            if (!command[0] || !valid_port_text(port)) {
-                send_action_response(fd, 400, false, "Command and a valid port are required.");
+            query_value(query, "socketPath", socket_path_raw, sizeof(socket_path_raw));
+            bool use_unix_socket = strcmp(transport, "unixSocket") == 0;
+            if (!command[0]) {
+                send_action_response(fd, 400, false, "Command is required.");
                 return;
             }
             snprintf(initial_frontend_id, sizeof(initial_frontend_id), "%s:main", service_id);
-            snprintf(initial_frontend_url, sizeof(initial_frontend_url), "127.0.0.1:%s/", port);
-            initial_frontend_port = atoi(port);
+            if (use_unix_socket) {
+                expand_tilde_path(socket_path_raw, socket_path, sizeof(socket_path));
+                if (!socket_path[0] || socket_path[0] != '/') {
+                    send_action_response(fd, 400, false, "Socket Path must be an absolute path.");
+                    return;
+                }
+                snprintf(initial_frontend_url, sizeof(initial_frontend_url), "/");
+                snprintf(initial_frontend_socket_path, sizeof(initial_frontend_socket_path), "%s", socket_path);
+            } else {
+                if (!valid_port_text(port)) {
+                    send_action_response(fd, 400, false, "A valid port is required.");
+                    return;
+                }
+                snprintf(initial_frontend_url, sizeof(initial_frontend_url), "127.0.0.1:%s/", port);
+                initial_frontend_port = atoi(port);
+            }
             StringBuilder script = {0};
-            if (!make_fixed_port_script(service_id, display_name, port, command, &script)) {
+            if (!make_fixed_port_script(service_id,
+                                        display_name,
+                                        use_unix_socket ? "" : port,
+                                        use_unix_socket ? socket_path : "",
+                                        use_unix_socket,
+                                        command,
+                                        &script)) {
                 free(script.data);
                 send_action_response(fd, 500, false, "Failed to generate script.");
                 return;

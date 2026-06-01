@@ -5601,6 +5601,11 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
            createValues["frontendTransport", default: "port"] == "unixSocket" {
             return true
         }
+        if field.key == "socketPath",
+           recipe.fields.contains(where: { $0.key == "frontendTransport" }),
+           createValues["frontendTransport", default: "port"] != "unixSocket" {
+            return true
+        }
         return false
     }
 
