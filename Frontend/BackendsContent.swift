@@ -2067,6 +2067,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                       isInstalled installed: Bool,
                                       frame: CGRect) {
         let iconSize: CGFloat = 46
+        let symbolPointSize: CGFloat = 40
         let iconFrame = CGRect(x: frame.minX + floor((frame.width - iconSize) / 2),
                                y: frame.maxY - iconSize - 10,
                                width: iconSize,
@@ -2077,7 +2078,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         icon.contentsScale = 2
         if let symbolName = catalogIconSymbolName(for: backend),
            !symbolName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            icon.contents = symbolCGImage(named: symbolName, pointSize: iconSize)
+            icon.contents = symbolCGImage(named: symbolName, pointSize: symbolPointSize)
         } else {
             icon.contents = letterIconCGImage(for: backend.displayName)
         }
@@ -2088,7 +2089,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         name.string = backend.displayName
         name.isWrapped = true
         name.truncationMode = .none
-        name.frame = CGRect(x: frame.minX, y: frame.minY + (installed ? 20 : 8), width: frame.width, height: installed ? 28 : 32)
+        name.frame = CGRect(x: frame.minX, y: frame.minY + 20, width: frame.width, height: 28)
         addCreateFormSublayer(name)
 
         if installed {
