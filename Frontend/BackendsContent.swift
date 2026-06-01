@@ -827,6 +827,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private let logTextSelectionLayer = CALayer()
     private let dividerLayer = CALayer()
     private let createLayer = CALayer()
+    private let createFormContentLayer = CALayer()
     private let iconTransitionLayer = CALayer()
     private let installOverlayLayer = CALayer()
     private let passwordOverlayLayer = CALayer()
@@ -860,6 +861,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private var createChoiceFrames: [(frame: CGRect, key: String, value: String)] = []
     private var createSuggestionFrames: [(frame: CGRect, key: String, value: String)] = []
     private var createDirectorySelectFrames: [(frame: CGRect, key: String)] = []
+    private var createContentClipFrame = CGRect.zero
+    private var createDismissFrame = CGRect.zero
     private var createButtonFrame = CGRect.zero
     private var cancelCreateFrame = CGRect.zero
     private var passwordFieldFrame = CGRect.zero
@@ -1120,6 +1123,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func applyMode(_ nextMode: BackendsViewMode) {
+        let previousMode = mode
         if mode == .create && nextMode != .create {
             blurCreateField()
         }
@@ -1131,6 +1135,14 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             clampScrollOffsets()
         }
         updateColors()
+        if previousMode != .create && nextMode == .create {
+            let animation = CABasicAnimation(keyPath: "opacity")
+            animation.fromValue = 0
+            animation.toValue = 1
+            animation.duration = 0.14
+            animation.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            createLayer.add(animation, forKey: "create-overlay-fade-in")
+        }
     }
 
     private func returnToAppsFromCreate() {
@@ -1138,6 +1150,18 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             outerframeHost.goBackInHistory()
         } else {
             navigateToMode(.apps, pushHistory: false)
+        }
+    }
+
+    private func dismissCreateOverlay() {
+        let animation = CABasicAnimation(keyPath: "opacity")
+        animation.fromValue = 1
+        animation.toValue = 0
+        animation.duration = 0.12
+        animation.timingFunction = CAMediaTimingFunction(name: .easeIn)
+        createLayer.add(animation, forKey: "create-overlay-fade-out")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.10) { [weak self] in
+            self?.returnToAppsFromCreate()
         }
     }
 
@@ -1223,6 +1247,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         rootLayer.addSublayer(toolbarLayer)
         rootLayer.addSublayer(contentLayer)
         rootLayer.addSublayer(iconTransitionLayer)
+        rootLayer.addSublayer(createLayer)
         rootLayer.addSublayer(installOverlayLayer)
         rootLayer.addSublayer(passwordOverlayLayer)
         toolbarLayer.addSublayer(titleLayer)
@@ -1245,7 +1270,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                                              scrollOffsetOrigin: .bottom)
         scrollbar.delegate = self
         logScrollbarController = scrollbar
-        contentLayer.addSublayer(createLayer)
         createLayer.addSublayer(filePickerOverlayLayer)
 
         titleLayer.string = ""
@@ -1297,9 +1321,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 toolbarLayer.frame = CGRect(x: 0, y: max(height - toolbarHeight, 0), width: width, height: toolbarHeight)
                 contentLayer.frame = CGRect(x: 0, y: 0, width: width, height: max(height - toolbarHeight, 0))
                 iconTransitionLayer.frame = rootLayer.bounds
+                createLayer.frame = rootLayer.bounds
 
                 titleLayer.frame = .zero
-                outerShellActionFrame = mode == .apps && outerShellBackend() != nil
+                outerShellActionFrame = (mode == .apps || mode == .create) && outerShellBackend() != nil
                     ? CGRect(x: max(width - horizontalInset - 28, horizontalInset),
                              y: 10,
                              width: 28,
@@ -1311,7 +1336,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 statusLayer.frame = CGRect(x: horizontalInset, y: 14, width: max(width - horizontalInset * 2 - 36, 1), height: 18)
 
                 let contentHeight = contentLayer.bounds.height
-                if mode == .apps {
+                if mode == .apps || mode == .create {
                     outerframeHost.sendTextCursorUpdate(cursors: [])
                     appsLayer.isHidden = false
                     tableHeaderLayer.isHidden = true
@@ -1319,7 +1344,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                     dividerLayer.isHidden = selectedServiceID == nil
                     logHeaderLayer.isHidden = selectedServiceID == nil
                     logRowsClipLayer.isHidden = selectedServiceID == nil
-                    createLayer.isHidden = true
+                    createLayer.isHidden = mode != .create
                     let appWidth = selectedServiceID == nil ? width : max(floor(width * 0.42), 320)
                     appsLayer.frame = CGRect(x: 0, y: 0, width: appWidth, height: contentHeight)
                     updateAppsScrollLayerFrames()
@@ -1333,6 +1358,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                         renderLogRows()
                     }
                     renderAppsPage()
+                    if mode == .create {
+                        hideAllMatchedLayers()
+                        renderCreateForm()
+                    }
                 } else {
                     appsLayer.isHidden = true
                     tableHeaderLayer.isHidden = true
@@ -1782,6 +1811,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         appsScrollContentLayer.addSublayer(title)
     }
 
+    private func addCreateFormSublayer(_ layer: CALayer) {
+        createFormContentLayer.addSublayer(layer)
+    }
+
     private func renderAddableAppsSection(apps: [BackendRecord],
                                           left: CGFloat,
                                           top: CGFloat,
@@ -1789,7 +1822,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         let title = makeTextLayer(size: 13, weight: .semibold, color: .secondaryLabelColor)
         title.string = "App Catalog"
         title.frame = CGRect(x: left, y: top, width: width, height: 18)
-        createLayer.addSublayer(title)
+        addCreateFormSublayer(title)
 
         let itemHeight: CGFloat = 94
         let itemGap: CGFloat = 12
@@ -1831,14 +1864,14 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         } else {
             icon.contents = letterIconCGImage(for: backend.displayName)
         }
-        createLayer.addSublayer(icon)
+        addCreateFormSublayer(icon)
 
         let name = makeTextLayer(size: 12, weight: .medium, color: .labelColor, alignment: .center)
         name.string = backend.displayName
         name.isWrapped = true
         name.truncationMode = .none
         name.frame = CGRect(x: frame.minX, y: frame.minY + 6, width: frame.width, height: 32)
-        createLayer.addSublayer(name)
+        addCreateFormSublayer(name)
 
         bundledAppInstallFrames.append((frame, backend))
     }
@@ -3135,6 +3168,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
     private func renderCreateForm() {
         createLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
+        createFormContentLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
         recipeFrames.removeAll()
         bundledAppInstallFrames.removeAll()
         bundledAppMenuFrames.removeAll()
@@ -3143,16 +3177,55 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         createChoiceFrames.removeAll()
         createSuggestionFrames.removeAll()
         createDirectorySelectFrames.removeAll()
+        createContentClipFrame = .zero
+        createDismissFrame = .zero
 
         let availableWidth = max(createLayer.bounds.width - horizontalInset * 2, 1)
         let pageWidth = min(availableWidth, 980)
         let left = horizontalInset + floor((availableWidth - pageWidth) / 2)
-        let top = max(createLayer.bounds.height - 58, 0) + createScroll
+        let overlay = CALayer()
+        overlay.frame = createLayer.bounds
+        overlay.backgroundColor = resolvedCGColor(NSColor.black.withAlphaComponent(0.18))
+        createLayer.addSublayer(overlay)
+
+        let panelFrame = CGRect(x: max(left - 24, 12),
+                                y: 20,
+                                width: min(pageWidth + 48, createLayer.bounds.width - 24),
+                                height: max(createLayer.bounds.height - 44, 80))
+        let panel = CALayer()
+        panel.frame = panelFrame
+        panel.cornerRadius = 12
+        panel.borderWidth = 1
+        panel.borderColor = resolvedCGColor(.separatorColor)
+        panel.backgroundColor = resolvedCGColor(.windowBackgroundColor)
+        createLayer.addSublayer(panel)
+
+        let contentClipFrame = panelFrame.insetBy(dx: 1, dy: 1)
+        createContentClipFrame = contentClipFrame
+        let contentClipLayer = CALayer()
+        contentClipLayer.frame = contentClipFrame
+        contentClipLayer.masksToBounds = true
+        createLayer.addSublayer(contentClipLayer)
+        createFormContentLayer.frame = CGRect(x: -contentClipFrame.minX,
+                                              y: -contentClipFrame.minY,
+                                              width: createLayer.bounds.width,
+                                              height: createLayer.bounds.height)
+        contentClipLayer.addSublayer(createFormContentLayer)
+
+        createDismissFrame = CGRect(x: panelFrame.maxX - 38,
+                                    y: panelFrame.maxY - 38,
+                                    width: 28,
+                                    height: 28)
+        let dismiss = makeSymbolButtonLayer(symbolName: "x.circle", accessibilityTitle: "Close Add Apps")
+        dismiss.frame = createDismissFrame
+        createLayer.addSublayer(dismiss)
+
+        let top = max(panelFrame.maxY - 62, 0) + createScroll
 
         let pageTitle = makeTextLayer(size: 22, weight: .semibold, color: .labelColor)
         pageTitle.string = "Add Apps"
-        pageTitle.frame = CGRect(x: left, y: top, width: pageWidth, height: 28)
-        createLayer.addSublayer(pageTitle)
+        pageTitle.frame = CGRect(x: left, y: top, width: max(pageWidth - 48, 1), height: 28)
+        addCreateFormSublayer(pageTitle)
 
         var contentTop = top - 50
         let addableApps = bundledPlaceholderBackends()
@@ -3166,18 +3239,18 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         let title = makeTextLayer(size: 13, weight: .semibold, color: .secondaryLabelColor)
         title.string = "Command Recipes"
         title.frame = CGRect(x: left, y: contentTop, width: pageWidth, height: 18)
-        createLayer.addSublayer(title)
+        addCreateFormSublayer(title)
 
         let subtitle = makeTextLayer(size: 12, weight: .regular, color: .secondaryLabelColor)
         subtitle.string = "Run something that is already on this device."
         subtitle.frame = CGRect(x: left, y: contentTop - 24, width: pageWidth, height: 18)
-        createLayer.addSublayer(subtitle)
+        addCreateFormSublayer(subtitle)
 
         if recipes.isEmpty {
             let empty = makeTextLayer(size: 13, weight: .regular, color: .secondaryLabelColor)
             empty.string = isLoadingRecipes ? "Loading recipes..." : "No recipes loaded."
             empty.frame = CGRect(x: left, y: contentTop - 58, width: pageWidth, height: 20)
-            createLayer.addSublayer(empty)
+            addCreateFormSublayer(empty)
             createContentBottom = contentTop - 58
             if clampCreateScrollUsingRenderedContent() {
                 renderCreateForm()
@@ -3205,7 +3278,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             card.borderWidth = selected ? 1.5 : 1
             card.borderColor = selected ? resolvedCGColor(.controlAccentColor) : resolvedCGColor(.separatorColor)
             card.backgroundColor = selected ? resolvedCGColor(NSColor.controlAccentColor.withAlphaComponent(0.12)) : resolvedCGColor(NSColor.controlBackgroundColor.withAlphaComponent(0.45))
-            createLayer.addSublayer(card)
+            addCreateFormSublayer(card)
 
             let name = makeTextLayer(size: 12, weight: .semibold, color: .labelColor)
             name.string = recipe.displayName
@@ -3224,7 +3297,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         summary.string = recipe.summary
         let formTop = usesTwoPaneLayout ? listTop - 18 : recipeListBottom - 34
         summary.frame = CGRect(x: detailLeft, y: formTop, width: detailWidth, height: 18)
-        createLayer.addSublayer(summary)
+        addCreateFormSublayer(summary)
 
         var y = formTop - 58
         for field in visibleCreateFields(for: recipe) {
@@ -3241,19 +3314,16 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         }
 
         createButtonFrame = CGRect(x: detailLeft, y: y + 14, width: 96, height: 30)
-        cancelCreateFrame = CGRect(x: detailLeft + 106, y: y + 14, width: 78, height: 30)
+        cancelCreateFrame = .zero
         let createButton = makeButtonLayer(title: isPerformingAction ? "Creating..." : "Create", emphasized: true)
         createButton.frame = createButtonFrame
-        createLayer.addSublayer(createButton)
-        let cancelButton = makeButtonLayer(title: "Cancel", emphasized: false)
-        cancelButton.frame = cancelCreateFrame
-        createLayer.addSublayer(cancelButton)
+        addCreateFormSublayer(createButton)
 
         if !createMessage.isEmpty {
             let message = makeTextLayer(size: 12, weight: .regular, color: createMessage.hasPrefix("Created") ? .secondaryLabelColor : .systemRed)
             message.string = createMessage
             message.frame = CGRect(x: detailLeft, y: y - 26, width: detailWidth, height: 18)
-            createLayer.addSublayer(message)
+            addCreateFormSublayer(message)
         }
         let formBottom = !createMessage.isEmpty ? y - 26 : y + 14
         createContentBottom = min(recipeListBottom, formBottom)
@@ -3271,7 +3341,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         let labelLayer = makeTextLayer(size: 11, weight: .medium, color: .secondaryLabelColor)
         labelLayer.string = field.label
         labelLayer.frame = CGRect(x: frame.minX, y: frame.maxY - 16, width: frame.width, height: 14)
-        createLayer.addSublayer(labelLayer)
+        addCreateFormSublayer(labelLayer)
 
         let hasDirectoryPicker = field.fieldType == "directory"
         let selectButtonWidth: CGFloat = 68
@@ -3292,7 +3362,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         box.borderWidth = focused ? 1.5 : 1
         box.borderColor = focused ? resolvedCGColor(.keyboardFocusIndicatorColor) : resolvedCGColor(.separatorColor)
         box.backgroundColor = resolvedCGColor(.textBackgroundColor)
-        createLayer.addSublayer(box)
+        addCreateFormSublayer(box)
 
         if focused,
            let selectionRange = createInputController.selectionRange,
@@ -3327,7 +3397,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             createDirectorySelectFrames.append((selectFrame, field.key))
             let selectButton = makeButtonLayer(title: "Select", emphasized: false)
             selectButton.frame = selectFrame
-            createLayer.addSublayer(selectButton)
+            addCreateFormSublayer(selectButton)
         }
 
         if !field.suggestions.isEmpty {
@@ -3343,7 +3413,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                 backgroundCGColor: resolvedCGColor(NSColor.controlAccentColor.withAlphaComponent(0.12)),
                                 font: NSFont.systemFont(ofSize: 10, weight: .medium))
                 chip.frame = chipFrame
-                createLayer.addSublayer(chip)
+                addCreateFormSublayer(chip)
                 chipX += chipWidth + 8
             }
         }
@@ -3353,7 +3423,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         let labelLayer = makeTextLayer(size: 11, weight: .medium, color: .secondaryLabelColor)
         labelLayer.string = field.label
         labelLayer.frame = CGRect(x: frame.minX, y: frame.maxY - 16, width: frame.width, height: 14)
-        createLayer.addSublayer(labelLayer)
+        addCreateFormSublayer(labelLayer)
 
         var x = frame.minX
         let value = createValue(for: field)
@@ -3364,7 +3434,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             let selected = value == choice.value
             let button = makeButtonLayer(title: choice.title, emphasized: selected)
             button.frame = choiceFrame
-            createLayer.addSublayer(button)
+            addCreateFormSublayer(button)
             x += width + 8
         }
     }
@@ -4182,7 +4252,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         case 36, 76:
             submitCreateForm()
         case 53:
-            returnToAppsFromCreate()
+            dismissCreateOverlay()
         default:
             if let characters, !characters.isEmpty {
                 insertCreateText(characters)
@@ -4343,7 +4413,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             if pendingFilePicker != nil {
                 dismissFilePicker()
             } else {
-                returnToAppsFromCreate()
+                dismissCreateOverlay()
             }
             return
         }
@@ -4667,6 +4737,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             guard filePickerFilenameFrame.contains(createPoint) else { return nil }
             return (Self.filePickerFilenameKey, createPoint)
         }
+        guard createContentClipFrame.contains(createPoint) else { return nil }
         guard let key = createFieldFrames.first(where: { $0.frame.contains(createPoint) })?.key else { return nil }
         return (key, createPoint)
     }
@@ -5043,7 +5114,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         case .bundledInstall(let backend):
             showInstallPrompt(for: backend)
         case .createCancel:
-            returnToAppsFromCreate()
+            dismissCreateOverlay()
         case .createChoice(let key, let value):
             createValues[key] = value
             if createInputController.isFocused, activeCreateFieldKey == key {
@@ -5225,8 +5296,14 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         if pendingPasswordAction == nil, mode == .create {
             let contentPoint = contentLayer.convert(point, from: rootLayer)
             let createPoint = createLayer.convert(contentPoint, from: contentLayer)
-            isOverBundledApp = bundledAppInstallFrames.contains { $0.frame.contains(createPoint) }
-            isOverDirectorySelect = createDirectorySelectFrames.contains { $0.frame.contains(createPoint) }
+            let isInCreateContent = createContentClipFrame.contains(createPoint)
+            isOverBundledApp = isInCreateContent && bundledAppInstallFrames.contains { $0.frame.contains(createPoint) }
+            isOverDirectorySelect = isInCreateContent && createDirectorySelectFrames.contains { $0.frame.contains(createPoint) }
+            isOverAppTile = createDismissFrame.contains(createPoint) ||
+                            (isInCreateContent && (recipeFrames.contains { $0.frame.contains(createPoint) } ||
+                                                   createButtonFrame.contains(createPoint) ||
+                                                   createChoiceFrames.contains { $0.frame.contains(createPoint) } ||
+                                                   createSuggestionFrames.contains { $0.frame.contains(createPoint) }))
         } else if pendingPasswordAction == nil, mode == .apps {
             let contentPoint = contentLayer.convert(point, from: rootLayer)
             let appsPoint = appsScrollContentLayer.convert(contentPoint, from: contentLayer)
@@ -5463,6 +5540,18 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             }
         } else if mode == .create {
             let createPoint = createLayer.convert(contentPoint, from: contentLayer)
+            if createDismissFrame.contains(createPoint) {
+                armButtonClick(frame: rootFrame(createDismissFrame, from: createLayer),
+                               action: .createCancel)
+                return
+            }
+            guard createContentClipFrame.contains(createPoint) else {
+                if createInputController.isFocused {
+                    blurCreateField()
+                    updateLayout()
+                }
+                return
+            }
             if let menu = bundledAppMenuFrames.first(where: { $0.frame.contains(createPoint) }) {
                 showBackendActionsMenu(for: menu.backend, at: point)
                 return
@@ -6270,7 +6359,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func clampCreateScrollUsingRenderedContent() -> Bool {
-        let maxScroll = max(createScroll + createBottomInset - createContentBottom, 0)
+        let visibleBottom = createContentClipFrame.isEmpty ? createBottomInset : createContentClipFrame.minY + createBottomInset
+        let maxScroll = max(createScroll + visibleBottom - createContentBottom, 0)
         let clamped = min(max(createScroll, 0), maxScroll)
         if abs(clamped - createScroll) > 0.5 {
             createScroll = clamped
