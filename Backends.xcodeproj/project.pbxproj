@@ -8,13 +8,12 @@
 
 /* Begin PBXBuildFile section */
 		37B4F9D12FA1B00100873894 /* outershelld.c in Sources */ = {isa = PBXBuildFile; fileRef = 37B4F9D02FA1B00100873894 /* outershelld.c */; };
-		37B4F9ED2FA1B00100873894 /* OuterShellBackend.c in Sources */ = {isa = PBXBuildFile; fileRef = 37B4F9EC2FA1B00100873894 /* OuterShellBackend.c */; };
 		37B4F9DE2FA1B00100873894 /* OuterShellBuffer.c in Sources */ = {isa = PBXBuildFile; fileRef = 37B4F9DC2FA1B00100873894 /* OuterShellBuffer.c */; };
 		37B4F9DF2FA1B00100873894 /* OuterShellAPI.c in Sources */ = {isa = PBXBuildFile; fileRef = 37B4F9E02FA1B00100873894 /* OuterShellAPI.c */; };
 		37B4F9E42FA1B00100873894 /* OuterShellPlatform.c in Sources */ = {isa = PBXBuildFile; fileRef = 37B4F9E22FA1B00100873894 /* OuterShellPlatform.c */; };
+		37B4F9EE2FA1B00100873894 /* OuterShellBackend.c in Sources */ = {isa = PBXBuildFile; fileRef = 37B4F9EC2FA1B00100873894 /* OuterShellBackend.c */; };
 		AG0000000000000000000004 /* OuterShellAgent.swift in Sources */ = {isa = PBXBuildFile; fileRef = AG0000000000000000000003 /* OuterShellAgent.swift */; };
 		AG0000000000000000000005 /* outershelld.c in Sources */ = {isa = PBXBuildFile; fileRef = 37B4F9D02FA1B00100873894 /* outershelld.c */; };
-		37B4F9EE2FA1B00100873894 /* OuterShellBackend.c in Sources */ = {isa = PBXBuildFile; fileRef = 37B4F9EC2FA1B00100873894 /* OuterShellBackend.c */; };
 		AG0000000000000000000018 /* OuterShellBuffer.c in Sources */ = {isa = PBXBuildFile; fileRef = 37B4F9DC2FA1B00100873894 /* OuterShellBuffer.c */; };
 		AG0000000000000000000019 /* OuterShellAPI.c in Sources */ = {isa = PBXBuildFile; fileRef = 37B4F9E02FA1B00100873894 /* OuterShellAPI.c */; };
 		AG0000000000000000000020 /* OuterShellPlatform.c in Sources */ = {isa = PBXBuildFile; fileRef = 37B4F9E22FA1B00100873894 /* OuterShellPlatform.c */; };
@@ -43,13 +42,13 @@
 		37B4F9C22FA18C1E00873894 /* LICENSE */ = {isa = PBXFileReference; lastKnownFileType = text; path = LICENSE; sourceTree = "<group>"; };
 		37B4F9CF2FA1B00100873894 /* outershelld */ = {isa = PBXFileReference; explicitFileType = "compiled.mach-o.executable"; includeInIndex = 0; path = outershelld; sourceTree = BUILT_PRODUCTS_DIR; };
 		37B4F9D02FA1B00100873894 /* outershelld.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = outershelld.c; sourceTree = "<group>"; };
-		37B4F9EC2FA1B00100873894 /* OuterShellBackend.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = OuterShellBackend.c; sourceTree = "<group>"; };
 		37B4F9DC2FA1B00100873894 /* OuterShellBuffer.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = OuterShellBuffer.c; sourceTree = "<group>"; };
 		37B4F9DD2FA1B00100873894 /* OuterShellBuffer.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = OuterShellBuffer.h; sourceTree = "<group>"; };
 		37B4F9E02FA1B00100873894 /* OuterShellAPI.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = OuterShellAPI.c; sourceTree = "<group>"; };
 		37B4F9E12FA1B00100873894 /* OuterShellAPI.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = OuterShellAPI.h; sourceTree = "<group>"; };
 		37B4F9E22FA1B00100873894 /* OuterShellPlatform.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = OuterShellPlatform.c; sourceTree = "<group>"; };
 		37B4F9E32FA1B00100873894 /* OuterShellPlatform.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = OuterShellPlatform.h; sourceTree = "<group>"; };
+		37B4F9EC2FA1B00100873894 /* OuterShellBackend.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = OuterShellBackend.c; sourceTree = "<group>"; };
 		AG0000000000000000000001 /* Outer Shell.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "Outer Shell.app"; sourceTree = BUILT_PRODUCTS_DIR; };
 		AG0000000000000000000003 /* OuterShellAgent.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OuterShellAgent.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
@@ -103,7 +102,7 @@
 				AG0000000000000000000002 /* Agent */,
 				0F0000000000000000000004 /* Frontend */,
 				37B4F9CE2FA1B00100873894 /* Backend */,
-				37B4F9EA2FA1B00100873894 /* OuterShelld */,
+				37B4F9EA2FA1B00100873894 /* outershelld */,
 				0F0000000000000000000005 /* Vendor */,
 				0F0000000000000000000006 /* Scripts */,
 				0F0000000000000000000007 /* Info.plist */,
@@ -140,12 +139,12 @@
 			path = Backend;
 			sourceTree = "<group>";
 		};
-		37B4F9EA2FA1B00100873894 /* OuterShelld */ = {
+		37B4F9EA2FA1B00100873894 /* outershelld */ = {
 			isa = PBXGroup;
 			children = (
 				37B4F9D02FA1B00100873894 /* outershelld.c */,
 			);
-			path = OuterShelld;
+			path = outershelld;
 			sourceTree = "<group>";
 		};
 		AG0000000000000000000002 /* Agent */ = {

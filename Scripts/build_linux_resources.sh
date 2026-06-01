@@ -39,7 +39,7 @@ cc -std=gnu17 -Os -ffunction-sections -fdata-sections -flto \
     "${REPO_ROOT}/Backend/OuterShellBuffer.c" \
     "${REPO_ROOT}/Backend/OuterShellAPI.c" \
     "${REPO_ROOT}/Backend/OuterShellPlatform.c" \
-    "${REPO_ROOT}/OuterShelld/outershelld.c" \
+    "${REPO_ROOT}/outershelld/outershelld.c" \
     "${SQLITE_DIR}/sqlite3.c" \
     -ldl -lpthread -lm
 
