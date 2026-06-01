@@ -538,6 +538,7 @@ private struct LogVisualLineMetrics {
 
 private struct PendingPasswordAction {
     let serviceID: String
+    let serviceScope: String
     let operation: String
     let displayName: String
 }
@@ -3542,7 +3543,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                     self.backendError = "Control request failed."
                 }
                 if actionCompleted {
-                    self.applyOptimisticStatus(for: backend.serviceID, operation: operation)
+                    self.applyOptimisticStatus(for: backend.serviceID,
+                                               serviceScope: backend.serviceScope,
+                                               operation: operation)
                     self.scheduleBackendsRefreshes()
                 }
                 self.fetchBackends()
@@ -3614,7 +3617,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         }
     }
 
-    private func applyOptimisticStatus(for serviceID: String, operation: String) {
+    private func applyOptimisticStatus(for serviceID: String, serviceScope: String, operation: String) {
         let status: String
         switch operation {
         case "stop":
@@ -3625,7 +3628,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             return
         }
         backends = backends.map { backend in
-            guard backend.serviceID == serviceID else { return backend }
+            guard backend.serviceID == serviceID,
+                  backend.serviceScope == serviceScope else { return backend }
             return BackendRecord(serviceID: backend.serviceID,
                                  displayName: backend.displayName,
                                  serviceUnit: backend.serviceUnit,
@@ -5451,6 +5455,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
     private func showPasswordPrompt(for backend: BackendRecord, operation: String, message: String) {
         pendingPasswordAction = PendingPasswordAction(serviceID: backend.serviceID,
+                                                      serviceScope: backend.serviceScope,
                                                       operation: operation,
                                                       displayName: backend.displayName)
         sudoPasswordInput = ""
@@ -5469,7 +5474,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
     private func submitPasswordPrompt() {
         guard let pendingPasswordAction,
-              let backend = backends.first(where: { $0.serviceID == pendingPasswordAction.serviceID }) else {
+              let backend = backends.first(where: {
+                  $0.serviceID == pendingPasswordAction.serviceID &&
+                      $0.serviceScope == pendingPasswordAction.serviceScope
+              }) else {
             dismissPasswordPrompt()
             return
         }

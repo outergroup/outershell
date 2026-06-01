@@ -4291,8 +4291,29 @@ static bool run_launchd_operation(const char *label,
     shell_quote(target, quoted_target, sizeof(quoted_target));
 
     if (strcmp(operation, "stop") == 0) {
-        char command[512];
-        snprintf(command, sizeof(command), "launchctl bootout %s 2>&1", quoted_target);
+        char command[2048];
+        snprintf(command,
+                 sizeof(command),
+                 "launchctl kill TERM %s 2>&1 || true; "
+                 "i=0; "
+                 "while [ $i -lt 20 ]; do "
+                 "  launchctl print %s 2>/dev/null | grep -q 'state = running' || exit 0; "
+                 "  sleep 0.1; "
+                 "  i=$((i + 1)); "
+                 "done; "
+                 "launchctl kill KILL %s 2>&1 || true; "
+                 "i=0; "
+                 "while [ $i -lt 20 ]; do "
+                 "  launchctl print %s 2>/dev/null | grep -q 'state = running' || exit 0; "
+                 "  sleep 0.1; "
+                 "  i=$((i + 1)); "
+                 "done; "
+                 "echo 'Launchd service is still running.'; "
+                 "exit 1",
+                 quoted_target,
+                 quoted_target,
+                 quoted_target,
+                 quoted_target);
         if (run_launchctl_capture(command, message, message_size)) {
             if (message[0] == '\0') snprintf(message, message_size, "ok");
             return true;
@@ -4362,9 +4383,30 @@ static bool run_launchd_operation_privileged(const char *label,
     snprintf(target, sizeof(target), "system/%s", label);
     shell_quote(target, quoted_target, sizeof(quoted_target));
 
-    char command[PATH_MAX + 640];
+    char command[4096];
     if (strcmp(operation, "stop") == 0) {
-        snprintf(command, sizeof(command), "launchctl bootout %s 2>&1 || true", quoted_target);
+        snprintf(command,
+                 sizeof(command),
+                 "launchctl kill TERM %s 2>&1 || true; "
+                 "i=0; "
+                 "while [ $i -lt 20 ]; do "
+                 "  launchctl print %s 2>/dev/null | grep -q 'state = running' || exit 0; "
+                 "  sleep 0.1; "
+                 "  i=$((i + 1)); "
+                 "done; "
+                 "launchctl kill KILL %s 2>&1 || true; "
+                 "i=0; "
+                 "while [ $i -lt 20 ]; do "
+                 "  launchctl print %s 2>/dev/null | grep -q 'state = running' || exit 0; "
+                 "  sleep 0.1; "
+                 "  i=$((i + 1)); "
+                 "done; "
+                 "echo 'Launchd service is still running.'; "
+                 "exit 1",
+                 quoted_target,
+                 quoted_target,
+                 quoted_target,
+                 quoted_target);
     } else if (strcmp(operation, "start") == 0 || strcmp(operation, "restart") == 0) {
         if (!plist_path || !plist_path[0]) {
             snprintf(message, message_size, "LaunchDaemon plist path is missing.");
@@ -4599,6 +4641,36 @@ static bool lookup_launchd_backend_any(const char *service_id,
         registry_store_free(&store);
         if (found) return true;
     }
+    return false;
+}
+
+static bool lookup_launchd_backend_any_for_scope(const char *service_id,
+                                                 const char *requested_scope,
+                                                 char *plist_path,
+                                                 size_t plist_path_size,
+                                                 int *owns_plist) {
+    bool wants_system = requested_scope && strcmp(requested_scope, "system") == 0;
+    bool wants_user = requested_scope && strcmp(requested_scope, "user") == 0;
+    char error[512] = "";
+
+    if (!wants_system) {
+        RegistryStore store;
+        if (registry_store_open_user_readonly(&store, error, sizeof(error))) {
+            bool found = lookup_launchd_backend(&store, service_id, plist_path, plist_path_size, owns_plist);
+            registry_store_free(&store);
+            if (found) return true;
+        }
+    }
+
+    if (!wants_user) {
+        RegistryStore store;
+        if (registry_store_open_system_readonly(&store, error, sizeof(error))) {
+            bool found = lookup_launchd_backend(&store, service_id, plist_path, plist_path_size, owns_plist);
+            registry_store_free(&store);
+            if (found) return true;
+        }
+    }
+
     return false;
 }
 #endif
@@ -5634,7 +5706,7 @@ static void send_control_response(int fd, const char *query, const char *body) {
 #ifdef __APPLE__
     char plist_path[PATH_MAX] = "";
     int owns_plist = 0;
-    if (lookup_launchd_backend_any(service_id, plist_path, sizeof(plist_path), &owns_plist)) {
+    if (lookup_launchd_backend_any_for_scope(service_id, requested_scope, plist_path, sizeof(plist_path), &owns_plist)) {
         (void)owns_plist;
         char message[4096] = "";
         bool needs_password = false;
