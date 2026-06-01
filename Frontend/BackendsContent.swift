@@ -571,6 +571,15 @@ private struct PendingCreateTextDrag {
     let selectedText: String
 }
 
+private enum TextSelectionDragTarget {
+    case createField(String)
+    case password
+}
+
+private struct PendingTextSelectionDrag {
+    let target: TextSelectionDragTarget
+}
+
 private enum AppDropTarget: Equatable {
     case unlisted
     case list(String)
@@ -751,6 +760,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private var isSynchronizingCreateInput = false
     private var isSynchronizingPasswordInput = false
     private var pendingCreateTextDrag: PendingCreateTextDrag?
+    private var pendingTextSelectionDrag: PendingTextSelectionDrag?
     private var currentCursor: PluginCursorType = .arrow
     private var pendingPasswordAction: PendingPasswordAction?
     private static let passwordFieldInputID = UUID()
@@ -4118,20 +4128,28 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         updateLayout()
     }
 
-    private func handleCreateKeyDown(keyCode: UInt16, characters: String?) {
+    private func handleCreateKeyDown(keyCode: UInt16, characters: String?, modifierFlags: NSEvent.ModifierFlags) {
         if pendingFilePicker != nil {
             handleFilePickerKeyDown(keyCode: keyCode, characters: characters)
             return
         }
         if createInputController.isFocused {
             if keyCode == 48 {
-                advanceCreateField()
+                if modifierFlags.contains(.shift) {
+                    retreatCreateField()
+                } else {
+                    advanceCreateField()
+                }
             }
             return
         }
         switch keyCode {
         case 48:
-            advanceCreateField()
+            if modifierFlags.contains(.shift) {
+                retreatCreateField()
+            } else {
+                advanceCreateField()
+            }
         case 51, 117:
             focusActiveCreateField()
             createInputController.deleteBackward()
@@ -4179,6 +4197,20 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         let currentKey = activeCreateFieldKey ?? fields[0].key
         let index = fields.firstIndex(where: { $0.key == currentKey }) ?? 0
         focusCreateField(fields[(index + 1) % fields.count].key)
+        updateLayout()
+    }
+
+    private func retreatCreateField() {
+        if pendingFilePicker != nil {
+            focusCreateField(Self.filePickerFilenameKey)
+            updateLayout()
+            return
+        }
+        let fields = selectedRecipe().map { visibleCreateFields(for: $0).filter { $0.fieldType != "choice" } } ?? []
+        guard !fields.isEmpty else { return }
+        let currentKey = activeCreateFieldKey ?? fields[0].key
+        let index = fields.firstIndex(where: { $0.key == currentKey }) ?? 0
+        focusCreateField(fields[(index + fields.count - 1) % fields.count].key)
         updateLayout()
     }
 
@@ -4273,8 +4305,12 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         }
 
         guard mode == .create, createInputController.isFocused else { return }
-        if command == "insertTab" || command == "insertBacktab" {
+        if command == "insertTab" {
             advanceCreateField()
+            return
+        }
+        if command == "insertBacktab" {
+            retreatCreateField()
             return
         }
         if command == "cancelOperation" {
@@ -4959,6 +4995,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         if handleLogMouseDragged(to: point) {
             return
         }
+        if handleTextSelectionMouseDragged(to: point) {
+            return
+        }
         if var pendingAppDrag {
             pendingAppDrag.currentPoint = point
             let dx = point.x - pendingAppDrag.startPoint.x
@@ -4981,10 +5020,44 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         beginDraggingSelectedCreateText(pendingCreateTextDrag.selectedText)
     }
 
+    private func handleTextSelectionMouseDragged(to point: CGPoint) -> Bool {
+        guard let pendingTextSelectionDrag else {
+            return false
+        }
+        switch pendingTextSelectionDrag.target {
+        case .password:
+            guard pendingPasswordAction != nil,
+                  passwordInputController.isFocused else {
+                self.pendingTextSelectionDrag = nil
+                return false
+            }
+            let index = characterIndexForPasswordField(xPosition: point.x)
+            passwordInputController.setCursorPosition(index, modifySelection: true)
+            sendPasswordFieldCursorUpdate()
+            updateLayout()
+            return true
+        case .createField(let key):
+            guard mode == .create,
+                  createInputController.isFocused,
+                  activeCreateFieldKey == key else {
+                self.pendingTextSelectionDrag = nil
+                return false
+            }
+            let contentPoint = contentLayer.convert(point, from: rootLayer)
+            let createPoint = createLayer.convert(contentPoint, from: contentLayer)
+            let index = characterIndexForCreateField(key: key, xPosition: createPoint.x)
+            createInputController.setCursorPosition(index, modifySelection: true)
+            sendCreateFieldCursorUpdate()
+            updateLayout()
+            return true
+        }
+    }
+
     private func handleMouseUp(at point: CGPoint, modifierFlags: NSEvent.ModifierFlags) {
         logDragAnchorOffset = nil
         logHeaderDetailDragAnchorOffset = nil
         lastLogDragTextPoint = nil
+        pendingTextSelectionDrag = nil
         _ = logScrollbarController?.handleMouseUp(at: rootLayer.convert(point, to: logRowsClipLayer))
         if let pendingAppDrag {
             self.pendingAppDrag = nil
@@ -5177,6 +5250,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                  modifierFlags: NSEvent.ModifierFlags = [],
                                  clickCount: Int = 1) {
         pendingCreateTextDrag = nil
+        pendingTextSelectionDrag = nil
         if pendingInstallBackend != nil {
             if installConfirmFrame.contains(point) {
                 pendingInstallOperation = "run"
@@ -5204,6 +5278,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 default:
                     passwordInputController.setCursorPosition(index,
                                                               modifySelection: modifierFlags.contains(.shift) && wasFocused)
+                    pendingTextSelectionDrag = PendingTextSelectionDrag(target: .password)
                 }
                 updateLayout()
             } else if passwordCancelFrame.contains(point) || !passwordPanelFrame.contains(point) {
@@ -5334,6 +5409,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 default:
                     createInputController.setCursorPosition(index,
                                                             modifySelection: modifierFlags.contains(.shift) && wasFocused)
+                    pendingTextSelectionDrag = PendingTextSelectionDrag(target: .createField(field))
                 }
                 updateLayout()
                 return
@@ -5367,6 +5443,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             default:
                 createInputController.setCursorPosition(index,
                                                         modifySelection: modifierFlags.contains(.shift) && wasFocused)
+                pendingTextSelectionDrag = PendingTextSelectionDrag(target: .createField(Self.filePickerFilenameKey))
             }
             updateLayout()
             return
@@ -5395,7 +5472,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                modifierFlags: NSEvent.ModifierFlags,
                                isARepeat: Bool) {
         _ = charactersIgnoringModifiers
-        _ = modifierFlags
         _ = isARepeat
         if pendingInstallBackend != nil {
             handleInstallPromptKeyDown(keyCode: keyCode)
@@ -5406,7 +5482,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             return
         }
         if mode == .create {
-            handleCreateKeyDown(keyCode: keyCode, characters: characters)
+            handleCreateKeyDown(keyCode: keyCode, characters: characters, modifierFlags: modifierFlags)
             return
         }
         switch keyCode {
