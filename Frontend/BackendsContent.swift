@@ -5757,7 +5757,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
     private func endpointIsReadyToOpen(_ endpoint: AppLauncherEndpoint) -> Bool {
         endpointIsRunning(endpoint) ||
-            (endpoint.backend.status == "available" && endpoint.frontend.hasEndpoint)
+            ((endpoint.backend.status == "available" || endpoint.backend.status == "awaiting") && endpoint.frontend.hasEndpoint)
     }
 
     private func renderRunningBadges(for item: AppLauncherItem,

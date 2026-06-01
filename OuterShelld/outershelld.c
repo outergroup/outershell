@@ -4229,7 +4229,7 @@ static void launchd_status(const char *label,
     snprintf(command, sizeof(command), "launchctl print %s 2>/dev/null | grep -q 'passive = 1'", quoted_target);
     result = system(command);
     if (result == 0) {
-        snprintf(out, out_size, "awaiting");
+        snprintf(out, out_size, "available");
         return;
     }
 
@@ -9060,8 +9060,6 @@ static bool make_bundled_launchd_plist(const char *label,
                          "</integer>\n"
                          "        </dict>\n"
                          "    </dict>\n"
-                         "    <key>RunAtLoad</key>\n"
-                         "    <true/>\n"
                          "</dict>\n"
                          "</plist>\n");
     return ok;
@@ -9231,8 +9229,7 @@ static bool install_bundled_app_macos(const BundledAppDefinition *app,
                 "chmod 0644 %s\n"
                 "touch %s\n"
                 "chmod 0644 %s\n"
-                "launchctl bootstrap system %s\n"
-                "launchctl kickstart -k system/%s\n",
+                "launchctl bootstrap system %s\n",
                 quoted_wrapper_path,
                 wrapper_contents,
                 quoted_wrapper_path,
@@ -9241,8 +9238,7 @@ static bool install_bundled_app_macos(const BundledAppDefinition *app,
                 quoted_plist_path,
                 quoted_log_path,
                 quoted_log_path,
-                quoted_plist_path,
-                app->service_id);
+                quoted_plist_path);
         fclose(script);
         free(plist.data);
         chmod(script_template, 0700);
@@ -9361,10 +9357,13 @@ static bool install_bundled_app_macos(const BundledAppDefinition *app,
         return false;
     }
 
-    char start_message[4096] = "";
-    bool started = run_launchd_operation(app->service_id, plist_path, "start", start_message, sizeof(start_message));
-    if (!started) {
-        snprintf(message, message_size, "Installed %s, but failed to start it: %s", app->display_name, start_message);
+    char quoted_plist[PATH_MAX + 8];
+    shell_quote(plist_path, quoted_plist, sizeof(quoted_plist));
+    char bootstrap_message[4096] = "";
+    char bootstrap_command[PATH_MAX + 128];
+    snprintf(bootstrap_command, sizeof(bootstrap_command), "launchctl bootstrap gui/%d %s 2>&1", (int)getuid(), quoted_plist);
+    if (!run_launchctl_capture(bootstrap_command, bootstrap_message, sizeof(bootstrap_message))) {
+        snprintf(message, message_size, "Installed %s, but failed to bootstrap its socket: %s", app->display_name, bootstrap_message);
         return false;
     }
 
