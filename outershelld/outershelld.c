@@ -6776,13 +6776,88 @@ static bool valid_port_text(const char *value) {
     return end && *end == '\0' && port >= 1 && port <= 65535;
 }
 
+static bool append_inline_startup_file(StringBuilder *builder, const char *name) {
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s/%s", home_directory(), name);
+    struct stat st;
+    if (stat(path, &st) != 0 || !S_ISREG(st.st_mode)) return true;
+    if (st.st_size > 128 * 1024) {
+        return sb_append(builder, "\n# Outer Shell skipped ") &&
+               sb_append(builder, name) &&
+               sb_append(builder, " because it is larger than 128 KiB.\n");
+    }
+    size_t size = 0;
+    char *contents = read_text_file_alloc(path, &size);
+    if (!contents) return true;
+    bool ok = sb_append(builder, "\n# --- Begin inline ") &&
+              sb_append(builder, name) &&
+              sb_append(builder, " ---\n") &&
+              sb_append_n(builder, contents, size);
+    if (ok && (size == 0 || contents[size - 1] != '\n')) {
+        ok = sb_append(builder, "\n");
+    }
+    ok = ok &&
+         sb_append(builder, "# --- End inline ") &&
+         sb_append(builder, name) &&
+         sb_append(builder, " ---\n");
+    free(contents);
+    return ok;
+}
+
+static bool append_inline_shell_startup_snapshot(StringBuilder *builder) {
+#ifdef __APPLE__
+    const char *shell_name = "zsh";
+    const char *files[] = {".zprofile", ".zshrc"};
+#else
+    const char *shell_name = "bash";
+    const char *files[] = {".bash_profile", ".bash_login", ".profile", ".bashrc"};
+#endif
+    bool ok = sb_append(builder,
+        "\n"
+        "# Outer Shell inlined a snapshot of common startup files so this\n"
+        "# script behaves more like commands pasted into an interactive ") &&
+        sb_append(builder, shell_name) &&
+        sb_append(builder,
+        " window.\n"
+        "__outershell_inline_startup() {\n");
+    for (size_t i = 0; ok && i < sizeof(files) / sizeof(files[0]); i++) {
+        ok = append_inline_startup_file(builder, files[i]);
+    }
+    return ok && sb_append(builder,
+        "}\n"
+        "__outershell_inline_startup_had_nounset=0\n"
+        "case $- in *u*) __outershell_inline_startup_had_nounset=1; set +u ;; esac\n"
+        "__outershell_inline_startup\n"
+        "if [ \"$__outershell_inline_startup_had_nounset\" = 1 ]; then set -u; fi\n"
+        "unset __outershell_inline_startup_had_nounset\n"
+        "unset -f __outershell_inline_startup 2>/dev/null || true\n");
+}
+
+static bool append_generated_script_log_redirect(StringBuilder *builder) {
+    return sb_append(builder,
+        "\n"
+        "if [ -n \"${OUTERSHELL_LOG_PATH:-}\" ]; then\n"
+        "    log_dir=${OUTERSHELL_LOG_PATH%/*}\n"
+        "    if [ -n \"$log_dir\" ] && [ \"$log_dir\" != \"$OUTERSHELL_LOG_PATH\" ]; then\n"
+        "        mkdir -p \"$log_dir\"\n"
+        "    fi\n"
+        "    exec >> \"$OUTERSHELL_LOG_PATH\" 2>&1\n"
+        "fi\n");
+}
+
 static bool make_blank_script(const char *service_id, const char *display_name, StringBuilder *builder) {
     char quoted_id[512];
     char quoted_name[1024];
     shell_quote(service_id, quoted_id, sizeof(quoted_id));
     shell_quote(display_name, quoted_name, sizeof(quoted_name));
+#ifdef __APPLE__
+    const char *script_shebang = "#!/bin/zsh\n";
+#else
+    const char *script_shebang = "#!/usr/bin/env bash\n";
+#endif
     return sb_append(builder,
-        "#!/bin/sh\n"
+        script_shebang) &&
+        sb_append(builder,
         "set -eu\n"
         "\n"
         "BACKEND_ID=") &&
@@ -6790,7 +6865,11 @@ static bool make_blank_script(const char *service_id, const char *display_name, 
         sb_append(builder, "\nDISPLAY_NAME=") &&
         sb_append(builder, quoted_name) &&
         sb_append(builder,
-        "\n\n"
+        "\nexport BACKEND_ID DISPLAY_NAME\n"
+        ) &&
+        append_generated_script_log_redirect(builder) &&
+        sb_append(builder,
+        "\n"
         "# Outer Loop sets OUTERCTL_PATH before this script runs.\n"
         "# Keep your own startup logic here, in a file you control.\n"
         "# If your app chooses a dynamic port or URL, announce it after it starts:\n"
@@ -6814,8 +6893,14 @@ static bool make_fixed_port_script(const char *service_id,
     shell_quote(display_name, quoted_name, sizeof(quoted_name));
     shell_quote(port ? port : "", quoted_port, sizeof(quoted_port));
     shell_quote(socket_path ? socket_path : "", quoted_socket_path, sizeof(quoted_socket_path));
+#ifdef __APPLE__
+    const char *script_shebang = "#!/bin/zsh\n";
+#else
+    const char *script_shebang = "#!/usr/bin/env bash\n";
+#endif
     return sb_append(builder,
-        "#!/bin/sh\n"
+        script_shebang) &&
+        sb_append(builder,
         "set -eu\n"
         "\n"
         "BACKEND_ID=") &&
@@ -6830,18 +6915,10 @@ static bool make_fixed_port_script(const char *service_id,
         sb_append(builder, use_unix_socket ? "unixSocket" : "port") &&
         sb_append(builder,
         "\nexport BACKEND_ID DISPLAY_NAME PORT SOCKET_PATH ENDPOINT_KIND\n"
-        "\nCMD_PID=''\n"
-        "\n"
-        "cleanup() {\n"
-        "    if [ -n \"$CMD_PID\" ]; then\n"
-        "        kill -TERM \"$CMD_PID\" 2>/dev/null || true\n"
-        "        wait \"$CMD_PID\" 2>/dev/null || true\n"
-        "    fi\n"
-        "    if [ \"$ENDPOINT_KIND\" = unixSocket ] && [ -n \"$SOCKET_PATH\" ]; then\n"
-        "        rm -f \"$SOCKET_PATH\"\n"
-        "    fi\n"
-        "}\n"
-        "trap cleanup EXIT INT TERM\n"
+        ) &&
+        append_generated_script_log_redirect(builder) &&
+        append_inline_shell_startup_snapshot(builder) &&
+        sb_append(builder,
         "\n"
         "if [ \"$ENDPOINT_KIND\" = unixSocket ]; then\n"
         "    socket_dir=${SOCKET_PATH%/*}\n"
@@ -6852,17 +6929,7 @@ static bool make_fixed_port_script(const char *service_id,
         "fi\n"
         "\n") &&
         sb_append(builder, command) &&
-        sb_append(builder,
-        " &\n"
-        "CMD_PID=$!\n"
-        "\n"
-        "if wait \"$CMD_PID\"; then\n"
-        "    status=0\n"
-        "else\n"
-        "    status=$?\n"
-        "fi\n"
-        "CMD_PID=''\n"
-        "exit \"$status\"\n");
+        sb_append(builder, "\n");
 }
 
 static bool make_jupyter_script(const char *service_id,
@@ -7110,6 +7177,7 @@ static bool register_created_backend(const char *service_id,
                                      const char *frontend_url,
                                      int frontend_port,
                                      const char *frontend_socket_path,
+                                     const char *frontend_icon_path,
                                      const char *frontend_list,
                                      char *error,
                                      size_t error_size) {
@@ -7147,7 +7215,7 @@ static bool register_created_backend(const char *service_id,
                                             display_name,
                                             frontend_port,
                                             frontend_socket_path ? frontend_socket_path : "",
-                                            "",
+                                            frontend_icon_path ? frontend_icon_path : "",
                                             frontend_list ? frontend_list : "",
                                             false);
         if (!ok) snprintf(error, error_size, "Out of memory.");
@@ -9036,6 +9104,11 @@ static bool make_bundled_launchd_plist(const char *label,
     ok = ok && sb_append_xml_escaped(builder, outerctl_path);
     ok = ok && sb_append(builder,
                          "</string>\n"
+                         "        <key>OUTERSHELL_LOG_PATH</key>\n"
+                         "        <string>");
+    ok = ok && sb_append_xml_escaped(builder, log_path);
+    ok = ok && sb_append(builder,
+                         "</string>\n"
                          "    </dict>\n"
                          "    <key>WorkingDirectory</key>\n"
                          "    <string>");
@@ -10016,8 +10089,10 @@ static void send_create_response(int fd, const char *query) {
     char initial_frontend_id[PATH_MAX * 2] = "";
     char initial_frontend_url[PATH_MAX * 2] = "";
     char initial_frontend_socket_path[PATH_MAX] = "";
+    char initial_frontend_icon_path[PATH_MAX] = "";
     char initial_frontend_list[PATH_MAX] = "";
     int initial_frontend_port = 0;
+    query_value(query, "iconPath", initial_frontend_icon_path, sizeof(initial_frontend_icon_path));
     default_user_outershell_app_root(service_id, backend_dir, sizeof(backend_dir));
 #ifdef __APPLE__
     snprintf(log_path, sizeof(log_path), "%s/Library/Logs/%s/output.log", home_directory(), service_id);
@@ -10067,6 +10142,7 @@ static void send_create_response(int fd, const char *query) {
                 return;
             }
             snprintf(initial_frontend_id, sizeof(initial_frontend_id), "%s:main", service_id);
+            snprintf(initial_frontend_list, sizeof(initial_frontend_list), "bash commands");
             if (use_unix_socket) {
                 expand_tilde_path(socket_path_raw, socket_path, sizeof(socket_path));
                 if (!socket_path[0] || socket_path[0] != '/') {
@@ -10228,6 +10304,7 @@ static void send_create_response(int fd, const char *query) {
              "Type=simple\n"
              "WorkingDirectory=%s\n"
              "Environment=OUTERCTL_PATH=%s\n"
+             "Environment=OUTERSHELL_LOG_PATH=%s\n"
              "ExecStart=/bin/sh -lc %s\n"
              "Restart=on-failure\n"
              "RestartSec=2\n"
@@ -10240,6 +10317,7 @@ static void send_create_response(int fd, const char *query) {
              description,
              working_directory,
              outerctl_path,
+             log_path,
              quoted_command,
              log_path,
              log_path);
@@ -10298,6 +10376,7 @@ static void send_create_response(int fd, const char *query) {
                                   initial_frontend_url,
                                   initial_frontend_port,
                                   initial_frontend_socket_path,
+                                  initial_frontend_icon_path,
                                   initial_frontend_list,
                                   error,
                                   sizeof(error))) {

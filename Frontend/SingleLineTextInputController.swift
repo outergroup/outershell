@@ -12,6 +12,7 @@ final class SingleLineTextInputController<DelegateClass: SingleLineTextInputCont
     let identifier: UUID
     weak var delegate: DelegateClass?
     var onSubmit: (() -> Void)?
+    var allowsNewlines = false
 
     private(set) var text: String
     private(set) var cursorPosition: Int
@@ -89,7 +90,7 @@ final class SingleLineTextInputController<DelegateClass: SingleLineTextInputCont
         } else if value == "\u{2192}" {
             moveCursorRight()
             return
-        } else if value == "\n" || value == "\r" {
+        } else if (value == "\n" || value == "\r") && !allowsNewlines {
             onSubmit?()
             return
         }
@@ -181,7 +182,11 @@ final class SingleLineTextInputController<DelegateClass: SingleLineTextInputCont
         case "deleteToMark":
             deleteToBeginning()
         case "insertNewline":
-            onSubmit?()
+            if allowsNewlines {
+                insertText("\n")
+            } else {
+                onSubmit?()
+            }
         default:
             break
         }

@@ -46,6 +46,10 @@ private struct BackendRecord: Decodable {
         (isBundled ?? false) && !(isInstalled ?? true)
     }
 
+    var isBundledCatalogEntry: Bool {
+        isBundled ?? false
+    }
+
     var canUninstallBackend: Bool {
         canUninstall ?? false
     }
@@ -71,6 +75,11 @@ private struct BackendRecord: Decodable {
         }
         return "--"
     }
+}
+
+private struct BundledCatalogEntry {
+    let backend: BackendRecord
+    let isInstalled: Bool
 }
 
 private struct FrontendRecord: Decodable {
@@ -563,6 +572,14 @@ private struct CreateFieldLayout {
     let textFrame: CGRect
     let key: String
     let monospaced: Bool
+    let multiline: Bool
+}
+
+private struct CreateTextLineFragment {
+    let text: String
+    let start: Int
+    let end: Int
+    let y: CGFloat
 }
 
 private struct PendingCreateTextDrag {
@@ -580,6 +597,12 @@ private struct PendingTextSelectionDrag {
     let target: TextSelectionDragTarget
 }
 
+private enum CreateSection: String {
+    case appCatalog
+    case bashCommands
+    case otherRecipes
+}
+
 private enum PendingButtonAction {
     case addApp
     case appBadge(AppLauncherEndpoint, displayName: String, opensInNewTab: Bool)
@@ -588,6 +611,7 @@ private enum PendingButtonAction {
     case createChoice(key: String, value: String)
     case createSubmit
     case createSuggestion(key: String, value: String)
+    case chooseBashIcon
     case directorySelect(String)
     case filePickerCancel
     case filePickerEntry(FilePickerEntryRecord)
@@ -598,6 +622,7 @@ private enum PendingButtonAction {
     case passwordCancel
     case passwordSubmit
     case recipe(String)
+    case createSection(CreateSection)
 }
 
 private struct PendingButtonClick {
@@ -629,6 +654,7 @@ private struct PendingAppDrag {
 private enum FilePickerMode {
     case saveFile
     case chooseDirectory
+    case chooseFile
 }
 
 private final class LogTextFragmentLayer: CALayer {
@@ -727,6 +753,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private var mode: BackendsViewMode = .apps
     private var recipes: [RecipeRecord] = []
     private var selectedRecipeID = "command-port"
+    private var selectedCreateSection: CreateSection = .appCatalog
     private var createValues: [String: String] = [:]
     private var activeCreateFieldKey: String?
     private static let createFieldInputID = UUID()
@@ -853,6 +880,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private var pendingAppMenuActions: [UUID: (item: AppLauncherItem, operationByItemID: [String: String])] = [:]
     private var pendingLogMenuSelections: [UUID: (serviceID: String, logIndexByItemID: [String: Int])] = [:]
     private var logSelectorFrame = CGRect.zero
+    private var createSectionFrames: [(frame: CGRect, section: CreateSection)] = []
     private var recipeFrames: [(frame: CGRect, recipeID: String)] = []
     private var bundledAppInstallFrames: [(frame: CGRect, backend: BackendRecord)] = []
     private var bundledAppMenuFrames: [(frame: CGRect, backend: BackendRecord)] = []
@@ -865,6 +893,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private var createDismissFrame = CGRect.zero
     private var createButtonFrame = CGRect.zero
     private var cancelCreateFrame = CGRect.zero
+    private var bashIconSelectFrame = CGRect.zero
     private var passwordFieldFrame = CGRect.zero
     private var passwordTextFrame = CGRect.zero
     private var passwordSubmitFrame = CGRect.zero
@@ -1815,23 +1844,209 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         createFormContentLayer.addSublayer(layer)
     }
 
-    private func renderAddableAppsSection(apps: [BackendRecord],
+    private func renderCreateSectionCards(left: CGFloat,
+                                          top: CGFloat,
+                                          width: CGFloat) -> CGFloat {
+        let gap: CGFloat = 12
+        let cardHeight: CGFloat = 72
+        let columns: CGFloat = width >= 620 ? 3 : 1
+        let cardWidth = floor((width - gap * (columns - 1)) / columns)
+        let sections: [(CreateSection, String, String)] = [
+            (.appCatalog, "Outer Shell app catalog", "square.grid.2x2"),
+            (.bashCommands, "Run bash commands", "terminal"),
+            (.otherRecipes, "Other recipes", "list.bullet.rectangle")
+        ]
+
+        var x = left
+        var y = top - cardHeight
+        for (index, section) in sections.enumerated() {
+            if columns == 1 {
+                if index > 0 {
+                    y -= cardHeight + gap
+                }
+                x = left
+            } else {
+                x = left + CGFloat(index) * (cardWidth + gap)
+            }
+            let frame = CGRect(x: x, y: y, width: cardWidth, height: cardHeight)
+            renderCreateSectionCard(section: section.0,
+                                    title: section.1,
+                                    symbolName: section.2,
+                                    frame: frame)
+        }
+
+        return y - 34
+    }
+
+    private func renderCreateSectionCard(section: CreateSection,
+                                         title: String,
+                                         symbolName: String,
+                                         frame: CGRect) {
+        createSectionFrames.append((frame, section))
+        let selected = selectedCreateSection == section
+        let card = CALayer()
+        card.frame = frame
+        card.cornerRadius = 8
+        card.borderWidth = selected ? 1.5 : 1
+        card.borderColor = selected ? resolvedCGColor(.controlAccentColor) : resolvedCGColor(.separatorColor)
+        card.backgroundColor = selected ? resolvedCGColor(NSColor.controlAccentColor.withAlphaComponent(0.12)) : resolvedCGColor(NSColor.controlBackgroundColor.withAlphaComponent(0.45))
+        addCreateFormSublayer(card)
+
+        let iconSize: CGFloat = 24
+        let icon = CALayer()
+        icon.frame = CGRect(x: 14, y: floor((frame.height - iconSize) / 2), width: iconSize, height: iconSize)
+        icon.contentsGravity = .resizeAspect
+        icon.contentsScale = 2
+        icon.contents = symbolCGImage(named: symbolName, pointSize: iconSize)
+        card.addSublayer(icon)
+
+        let titleLayer = makeTextLayer(size: 12, weight: .semibold, color: .labelColor)
+        titleLayer.string = title
+        titleLayer.frame = CGRect(x: 48, y: floor((frame.height - 16) / 2), width: max(frame.width - 62, 1), height: 16)
+        card.addSublayer(titleLayer)
+    }
+
+    private func renderCreateEmptyMessage(_ message: String,
+                                          left: CGFloat,
+                                          top: CGFloat,
+                                          width: CGFloat) {
+        let empty = makeTextLayer(size: 13, weight: .regular, color: .secondaryLabelColor)
+        empty.string = message
+        empty.frame = CGRect(x: left, y: top - 24, width: width, height: 20)
+        addCreateFormSublayer(empty)
+    }
+
+    private func renderBashCommandsSection(left: CGFloat,
+                                           top: CGFloat,
+                                           width: CGFloat) -> CGFloat {
+        ensureBashDefaults()
+
+        let detailWidth = min(width, 680)
+        let detailLeft = left
+        let transportWidth: CGFloat = min(260, detailWidth)
+        var y = top - 18
+
+        let help = makeTextLayer(size: 12, weight: .regular, color: .secondaryLabelColor)
+        help.string = "Run a script that launches a web app on some port or socket"
+        help.frame = CGRect(x: detailLeft, y: y, width: detailWidth, height: 18)
+        addCreateFormSublayer(help)
+        y -= 58
+
+        addCreateField(RecipeFieldRecord(key: "bashDisplayName",
+                                         label: "Display Name",
+                                         defaultValue: "",
+                                         fieldType: "text",
+                                         placeholder: "My App",
+                                         suggestions: [],
+                                         choices: []),
+                       value: createValues["bashDisplayName", default: ""],
+                       frame: CGRect(x: detailLeft, y: y, width: detailWidth, height: 46))
+        y -= 26
+
+        addCreateTextArea(key: "bashCommands",
+                          label: "Bash commands",
+                          placeholder: "Paste commands here",
+                          frame: CGRect(x: detailLeft, y: y - 132, width: detailWidth, height: 132))
+        y -= 194
+
+        let transportField = RecipeFieldRecord(key: "bashFrontendTransport",
+                                                label: "Connection",
+                                                defaultValue: "port",
+                                                fieldType: "choice",
+                                                placeholder: "",
+                                                suggestions: [],
+                                               choices: [
+                                                    RecipeChoiceRecord(title: "Port", value: "port"),
+                                                    RecipeChoiceRecord(title: "Unix Socket", value: "unixSocket")
+                                                ])
+        addCreateChoiceField(transportField, frame: CGRect(x: detailLeft, y: y, width: transportWidth, height: 50))
+        let endpointFieldX = detailLeft + transportWidth + 18
+        let endpointFieldWidth = max(detailWidth - transportWidth - 18, 180)
+
+        if createValues["bashFrontendTransport", default: "port"] == "unixSocket" {
+            addCreateField(RecipeFieldRecord(key: "bashSocketPath",
+                                             label: "Socket Path",
+                                             defaultValue: "",
+                                             fieldType: "text",
+                                             placeholder: "/tmp/my-service.sock",
+                                             suggestions: [],
+                                             choices: []),
+                           value: createValues["bashSocketPath", default: ""],
+                           frame: CGRect(x: endpointFieldX, y: y, width: endpointFieldWidth, height: 46),
+                           monospaced: true)
+        } else {
+            addCreateField(RecipeFieldRecord(key: "bashPort",
+                                             label: "Port",
+                                             defaultValue: "",
+                                             fieldType: "text",
+                                             placeholder: "4000",
+                                             suggestions: [],
+                                             choices: []),
+                           value: createValues["bashPort", default: ""],
+                           frame: CGRect(x: endpointFieldX, y: y, width: min(endpointFieldWidth, 180), height: 46),
+                           monospaced: true)
+        }
+        y -= 72
+
+        let iconButtonWidth: CGFloat = 70
+        addCreateField(RecipeFieldRecord(key: "bashIconPath",
+                                         label: "Icon Path",
+                                         defaultValue: "",
+                                         fieldType: "text",
+                                         placeholder: "Optional",
+                                         suggestions: [],
+                                         choices: []),
+                       value: createValues["bashIconPath", default: ""],
+                       frame: CGRect(x: detailLeft, y: y, width: max(detailWidth - iconButtonWidth - 10, 160), height: 46),
+                       monospaced: true)
+        bashIconSelectFrame = CGRect(x: detailLeft + max(detailWidth - iconButtonWidth, 160),
+                                     y: y,
+                                     width: iconButtonWidth,
+                                     height: 30)
+        let iconSelect = makeButtonLayer(title: "Select", emphasized: false)
+        iconSelect.frame = bashIconSelectFrame
+        addCreateFormSublayer(iconSelect)
+        y -= 72
+
+        addCreateField(RecipeFieldRecord(key: "bashIdentifier",
+                                         label: "ID",
+                                         defaultValue: "",
+                                         fieldType: "text",
+                                         placeholder: "my-app",
+                                         suggestions: [],
+                                         choices: []),
+                       value: createValues["bashIdentifier", default: ""],
+                       frame: CGRect(x: detailLeft, y: y, width: detailWidth, height: 46),
+                       monospaced: true)
+        y -= 58
+
+        createButtonFrame = CGRect(x: detailLeft, y: y, width: 76, height: 30)
+        let save = makeButtonLayer(title: isPerformingAction ? "Saving..." : "Save", emphasized: true)
+        save.frame = createButtonFrame
+        addCreateFormSublayer(save)
+
+        if !createMessage.isEmpty {
+            let message = makeTextLayer(size: 12, weight: .regular, color: createMessage.hasPrefix("Created") ? .secondaryLabelColor : .systemRed)
+            message.string = createMessage
+            message.frame = CGRect(x: detailLeft + 88, y: y + 6, width: max(detailWidth - 88, 1), height: 18)
+            addCreateFormSublayer(message)
+        }
+
+        return y - 26
+    }
+
+    private func renderAddableAppsSection(apps: [BundledCatalogEntry],
                                           left: CGFloat,
                                           top: CGFloat,
                                           width: CGFloat) -> CGFloat {
-        let title = makeTextLayer(size: 13, weight: .semibold, color: .secondaryLabelColor)
-        title.string = "App Catalog"
-        title.frame = CGRect(x: left, y: top, width: width, height: 18)
-        addCreateFormSublayer(title)
-
-        let itemHeight: CGFloat = 94
+        let itemHeight: CGFloat = 108
         let itemGap: CGFloat = 12
         let itemWidth: CGFloat = 112
         let columns = max(Int((width + itemGap) / (itemWidth + itemGap)), 1)
         let usedWidth = CGFloat(columns) * itemWidth + CGFloat(max(columns - 1, 0)) * itemGap
         let startX = left + max(floor((width - usedWidth) / 2), 0)
         var x = left
-        var y = top - itemHeight - 22
+        var y = top - itemHeight
 
         for (index, app) in apps.enumerated() {
             if index == 0 {
@@ -1841,39 +2056,49 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 y -= itemHeight + itemGap
             }
             let frame = CGRect(x: x, y: y, width: itemWidth, height: itemHeight)
-            renderAddableAppTile(app, frame: frame)
+            renderAddableAppTile(app.backend, isInstalled: app.isInstalled, frame: frame)
             x += itemWidth + itemGap
         }
 
         return y - 34
     }
 
-    private func renderAddableAppTile(_ backend: BackendRecord, frame: CGRect) {
+    private func renderAddableAppTile(_ backend: BackendRecord,
+                                      isInstalled installed: Bool,
+                                      frame: CGRect) {
         let iconSize: CGFloat = 46
         let iconFrame = CGRect(x: frame.minX + floor((frame.width - iconSize) / 2),
-                               y: frame.maxY - iconSize - 8,
+                               y: frame.maxY - iconSize - 10,
                                width: iconSize,
                                height: iconSize)
         let icon = CALayer()
         icon.frame = iconFrame
         icon.contentsGravity = .resizeAspect
         icon.contentsScale = 2
-        if let symbolName = backend.iconSymbolName,
+        if let symbolName = catalogIconSymbolName(for: backend),
            !symbolName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             icon.contents = symbolCGImage(named: symbolName, pointSize: iconSize)
         } else {
             icon.contents = letterIconCGImage(for: backend.displayName)
         }
+        icon.opacity = installed ? 0.62 : 1
         addCreateFormSublayer(icon)
 
-        let name = makeTextLayer(size: 12, weight: .medium, color: .labelColor, alignment: .center)
+        let name = makeTextLayer(size: 12, weight: .medium, color: installed ? .secondaryLabelColor : .labelColor, alignment: .center)
         name.string = backend.displayName
         name.isWrapped = true
         name.truncationMode = .none
-        name.frame = CGRect(x: frame.minX, y: frame.minY + 6, width: frame.width, height: 32)
+        name.frame = CGRect(x: frame.minX, y: frame.minY + (installed ? 20 : 8), width: frame.width, height: installed ? 28 : 32)
         addCreateFormSublayer(name)
 
-        bundledAppInstallFrames.append((frame, backend))
+        if installed {
+            let installedLayer = makeTextLayer(size: 10, weight: .medium, color: .secondaryLabelColor, alignment: .center)
+            installedLayer.string = "Installed"
+            installedLayer.frame = CGRect(x: frame.minX, y: frame.minY + 3, width: frame.width, height: 14)
+            addCreateFormSublayer(installedLayer)
+        } else {
+            bundledAppInstallFrames.append((frame, backend))
+        }
     }
 
     private func renderAppListGroups(groups: [(name: String, items: [AppLauncherItem])],
@@ -2514,6 +2739,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         filePickerPanelFrame = panelFrame
 
         let isSaveFile = picker.mode == .saveFile
+        let isChooseFile = picker.mode == .chooseFile
         let bottomControlsHeight: CGFloat = isSaveFile ? 86 : 52
         let buttonTitle = isSaveFile ? "Save" : "Choose"
         let panel = CALayer()
@@ -2525,7 +2751,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         filePickerOverlayLayer.addSublayer(panel)
 
         let title = makeTextLayer(size: 15, weight: .semibold, color: .labelColor)
-        title.string = isSaveFile ? "Save Script" : "Choose Folder"
+        title.string = isSaveFile ? "Save Script" : (isChooseFile ? "Choose Icon" : "Choose Folder")
         title.frame = CGRect(x: 18, y: panelHeight - 38, width: panelWidth - 36, height: 20)
         panel.addSublayer(title)
 
@@ -2547,7 +2773,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
         let rowHeight: CGFloat = 28
         let parentEntry = FilePickerEntryRecord(name: "..", path: picker.parent, isDirectory: true, size: 0, modified: 0)
-        let allEntries = [parentEntry] + picker.entries
+        let showSaveFolderPlaceholder = isSaveFile && !picker.error.isEmpty
+        let allEntries = showSaveFolderPlaceholder ? [parentEntry] : [parentEntry] + picker.entries
         filePickerContentHeight = CGFloat(allEntries.count) * rowHeight
         let maxPickerScroll = max(filePickerContentHeight - listFrame.height, 0)
         filePickerScroll = min(max(filePickerScroll, 0), maxPickerScroll)
@@ -2557,12 +2784,21 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             loading.string = "Loading..."
             loading.frame = CGRect(x: 0, y: max((listFrame.height - 18) / 2, 0), width: listFrame.width, height: 18)
             list.addSublayer(loading)
-        } else if !picker.error.isEmpty {
-            let error = makeTextLayer(size: 12, weight: .regular, color: .systemRed, alignment: .center)
-            error.string = picker.error
-            error.frame = CGRect(x: 10, y: max((listFrame.height - 18) / 2, 0), width: listFrame.width - 20, height: 18)
-            list.addSublayer(error)
+        } else if !picker.error.isEmpty && !showSaveFolderPlaceholder {
+            let message = makeTextLayer(size: 12,
+                                        weight: .regular,
+                                        color: .systemRed,
+                                        alignment: .center)
+            message.string = picker.error
+            message.frame = CGRect(x: 10, y: max((listFrame.height - 18) / 2, 0), width: listFrame.width - 20, height: 18)
+            list.addSublayer(message)
         } else {
+            if showSaveFolderPlaceholder {
+                let message = makeTextLayer(size: 12, weight: .regular, color: .secondaryLabelColor, alignment: .center)
+                message.string = "(New folder)"
+                message.frame = CGRect(x: 10, y: max((listFrame.height - 18) / 2, 0), width: listFrame.width - 20, height: 18)
+                list.addSublayer(message)
+            }
             let visibleStart = max(Int(floor(filePickerScroll / rowHeight)), 0)
             let visibleEnd = min(allEntries.count, visibleStart + Int(ceil(listFrame.height / rowHeight)) + 2)
             for index in visibleStart..<visibleEnd {
@@ -2588,7 +2824,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             createFieldLayouts[Self.filePickerFilenameKey] = CreateFieldLayout(fieldFrame: filePickerFilenameFrame,
                                                                                textFrame: textFrame,
                                                                                key: Self.filePickerFilenameKey,
-                                                                               monospaced: true)
+                                                                               monospaced: true,
+                                                                               multiline: false)
 
             let field = CALayer()
             field.frame = fieldFrame
@@ -3169,6 +3406,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private func renderCreateForm() {
         createLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
         createFormContentLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
+        createSectionFrames.removeAll()
         recipeFrames.removeAll()
         bundledAppInstallFrames.removeAll()
         bundledAppMenuFrames.removeAll()
@@ -3179,6 +3417,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         createDirectorySelectFrames.removeAll()
         createContentClipFrame = .zero
         createDismissFrame = .zero
+        bashIconSelectFrame = .zero
 
         let availableWidth = max(createLayer.bounds.width - horizontalInset * 2, 1)
         let pageWidth = min(availableWidth, 980)
@@ -3227,31 +3466,51 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         pageTitle.frame = CGRect(x: left, y: top, width: max(pageWidth - 48, 1), height: 28)
         addCreateFormSublayer(pageTitle)
 
-        var contentTop = top - 50
-        let addableApps = bundledPlaceholderBackends()
-        if !addableApps.isEmpty {
-            contentTop = renderAddableAppsSection(apps: addableApps,
-                                                  left: left,
-                                                  top: contentTop,
+        let contentTop = renderCreateSectionCards(left: left,
+                                                  top: top - 50,
                                                   width: pageWidth)
+
+        switch selectedCreateSection {
+        case .appCatalog:
+            let addableApps = bundledCatalogBackends()
+            if addableApps.isEmpty {
+                renderCreateEmptyMessage("No apps are currently available.",
+                                         left: left,
+                                         top: contentTop,
+                                         width: pageWidth)
+                createContentBottom = contentTop - 20
+            } else {
+                createContentBottom = renderAddableAppsSection(apps: addableApps,
+                                                               left: left,
+                                                               top: contentTop,
+                                                               width: pageWidth)
+            }
+            if clampCreateScrollUsingRenderedContent() {
+                renderCreateForm()
+            }
+            renderFilePickerIfNeeded(width: createLayer.bounds.width, height: createLayer.bounds.height)
+            return
+        case .bashCommands:
+            createContentBottom = renderBashCommandsSection(left: left,
+                                                            top: contentTop,
+                                                            width: pageWidth)
+            if clampCreateScrollUsingRenderedContent() {
+                renderCreateForm()
+            }
+            renderFilePickerIfNeeded(width: createLayer.bounds.width, height: createLayer.bounds.height)
+            sendCreateFieldCursorUpdate()
+            return
+        case .otherRecipes:
+            break
         }
 
-        let title = makeTextLayer(size: 13, weight: .semibold, color: .secondaryLabelColor)
-        title.string = "Command Recipes"
-        title.frame = CGRect(x: left, y: contentTop, width: pageWidth, height: 18)
-        addCreateFormSublayer(title)
-
-        let subtitle = makeTextLayer(size: 12, weight: .regular, color: .secondaryLabelColor)
-        subtitle.string = "Run something that is already on this device."
-        subtitle.frame = CGRect(x: left, y: contentTop - 24, width: pageWidth, height: 18)
-        addCreateFormSublayer(subtitle)
-
-        if recipes.isEmpty {
+        let visibleRecipes = otherRecipeRecords()
+        if visibleRecipes.isEmpty {
             let empty = makeTextLayer(size: 13, weight: .regular, color: .secondaryLabelColor)
             empty.string = isLoadingRecipes ? "Loading recipes..." : "No recipes loaded."
-            empty.frame = CGRect(x: left, y: contentTop - 58, width: pageWidth, height: 20)
+            empty.frame = CGRect(x: left, y: contentTop, width: pageWidth, height: 20)
             addCreateFormSublayer(empty)
-            createContentBottom = contentTop - 58
+            createContentBottom = contentTop
             if clampCreateScrollUsingRenderedContent() {
                 renderCreateForm()
             }
@@ -3265,13 +3524,14 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         let detailWidth = usesTwoPaneLayout ? pageWidth - selectorWidth - paneGap : pageWidth
 
         let cardHeight: CGFloat = 58
-        let listTop = contentTop - 58
+        let listTop = contentTop
         var cardY = listTop - cardHeight
         let cardWidth = selectorWidth
-        for recipe in recipes {
+        let selectedVisibleRecipe = selectedRecipe()
+        for recipe in visibleRecipes {
             let frame = CGRect(x: left, y: cardY, width: cardWidth, height: cardHeight)
             recipeFrames.append((frame, recipe.identifier))
-            let selected = recipe.identifier == selectedRecipeID
+            let selected = recipe.identifier == selectedVisibleRecipe?.identifier
             let card = CALayer()
             card.frame = frame
             card.cornerRadius = 7
@@ -3292,7 +3552,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         }
         let recipeListBottom = cardY + cardHeight + 10
 
-        guard let recipe = selectedRecipe() else { return }
+        guard let recipe = selectedVisibleRecipe else { return }
         let summary = makeTextLayer(size: 12, weight: .regular, color: .secondaryLabelColor)
         summary.string = recipe.summary
         let formTop = usesTwoPaneLayout ? listTop - 18 : recipeListBottom - 34
@@ -3307,7 +3567,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             } else {
                 addCreateField(field,
                                value: createValue(for: field),
-                               frame: CGRect(x: detailLeft, y: y, width: detailWidth, height: field.suggestions.isEmpty ? 46 : 68),
+                               frame: CGRect(x: detailLeft, y: y, width: detailWidth, height: 46),
                                monospaced: field.key == "command" || field.key == "executablePath" || field.key == "python")
                 y -= field.suggestions.isEmpty ? 62 : 84
             }
@@ -3353,7 +3613,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         createFieldLayouts[field.key] = CreateFieldLayout(fieldFrame: boxFrame,
                                                           textFrame: textFrame,
                                                           key: field.key,
-                                                          monospaced: monospaced)
+                                                          monospaced: monospaced,
+                                                          multiline: false)
         let box = CALayer()
         box.frame = boxFrame
         box.masksToBounds = true
@@ -3416,6 +3677,87 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 addCreateFormSublayer(chip)
                 chipX += chipWidth + 8
             }
+        }
+    }
+
+    private func addCreateTextArea(key: String,
+                                   label: String,
+                                   placeholder: String,
+                                   frame: CGRect) {
+        let labelLayer = makeTextLayer(size: 11, weight: .medium, color: .secondaryLabelColor)
+        labelLayer.string = label
+        labelLayer.frame = CGRect(x: frame.minX, y: frame.maxY - 16, width: frame.width, height: 14)
+        addCreateFormSublayer(labelLayer)
+
+        let boxFrame = CGRect(x: frame.minX, y: frame.minY, width: frame.width, height: max(frame.height - 20, 80))
+        createFieldFrames.append((boxFrame, key))
+        let textFrame = CGRect(x: boxFrame.minX + 10, y: boxFrame.minY + 9, width: max(boxFrame.width - 20, 1), height: max(boxFrame.height - 18, 1))
+        createFieldLayouts[key] = CreateFieldLayout(fieldFrame: boxFrame,
+                                                    textFrame: textFrame,
+                                                    key: key,
+                                                    monospaced: true,
+                                                    multiline: true)
+
+        let box = CALayer()
+        box.frame = boxFrame
+        box.masksToBounds = true
+        box.cornerRadius = 6
+        let focused = createInputController.isFocused && activeCreateFieldKey == key
+        box.borderWidth = focused ? 1.5 : 1
+        box.borderColor = focused ? resolvedCGColor(.keyboardFocusIndicatorColor) : resolvedCGColor(.separatorColor)
+        box.backgroundColor = resolvedCGColor(.textBackgroundColor)
+        addCreateFormSublayer(box)
+
+        let value = createValues[key, default: ""]
+        let textOriginX = textFrame.minX - boxFrame.minX
+        if value.isEmpty {
+            let text = makeTextLayer(size: 12, weight: .regular, color: .tertiaryLabelColor, monospaced: true)
+            text.string = placeholder
+            text.frame = CGRect(x: textOriginX,
+                                y: textFrame.maxY - boxFrame.minY - 16,
+                                width: max(boxFrame.width - 20, 1),
+                                height: 16)
+            box.addSublayer(text)
+            return
+        }
+
+        guard let layout = createFieldLayouts[key] else { return }
+        let fragments = createTextAreaLineFragments(text: value, layout: layout)
+        if focused,
+           let selectionRange = createInputController.selectionRange {
+            for fragment in fragments {
+                let lower = max(selectionRange.lowerBound, fragment.start)
+                let upper = min(selectionRange.upperBound, fragment.end)
+                guard upper > lower else { continue }
+                let line = makeCreateFieldLine(for: fragment.text, monospaced: true)
+                let offsets = selectionOffsets(line: line,
+                                               text: fragment.text,
+                                               range: (lower - fragment.start)..<(upper - fragment.start),
+                                               maxWidth: textFrame.width)
+                let selectionWidth = max(0, offsets.end - offsets.start)
+                guard selectionWidth > 0.5 else { continue }
+                let selection = CALayer()
+                selection.frame = CGRect(x: textOriginX + offsets.start,
+                                         y: fragment.y - boxFrame.minY - 1,
+                                         width: selectionWidth,
+                                         height: 18)
+                selection.backgroundColor = resolvedCGColor(windowIsActive ? .selectedTextBackgroundColor : .unemphasizedSelectedTextBackgroundColor)
+                box.addSublayer(selection)
+            }
+        }
+
+        for fragment in fragments {
+            let lineBottom = fragment.y
+            if lineBottom + 16 < textFrame.minY || lineBottom > textFrame.maxY {
+                continue
+            }
+            let text = makeTextLayer(size: 12, weight: .regular, color: .labelColor, monospaced: true)
+            text.string = fragment.text
+            text.frame = CGRect(x: textOriginX,
+                                y: lineBottom - boxFrame.minY,
+                                width: max(boxFrame.width - 20, 1),
+                                height: 16)
+            box.addSublayer(text)
         }
     }
 
@@ -3966,6 +4308,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func submitCreateForm() {
+        if selectedCreateSection == .bashCommands {
+            submitBashCommandsForm()
+            return
+        }
         guard !isPerformingAction, let createEndpoint, let urlSession else { return }
         guard let recipe = selectedRecipe() else {
             createMessage = "Choose a recipe."
@@ -3988,6 +4334,39 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             return
         }
         performCreateRequest(recipe: recipe, createEndpoint: createEndpoint, urlSession: urlSession)
+    }
+
+    private func submitBashCommandsForm() {
+        ensureBashDefaults()
+        let displayName = createValues["bashDisplayName", default: ""].trimmingCharacters(in: .whitespacesAndNewlines)
+        if displayName.isEmpty {
+            createMessage = "Display Name is required."
+            updateLayout()
+            return
+        }
+        let commands = createValues["bashCommands", default: ""].trimmingCharacters(in: .whitespacesAndNewlines)
+        if commands.isEmpty {
+            createMessage = "Bash commands are required."
+            updateLayout()
+            return
+        }
+        let transport = createValues["bashFrontendTransport", default: "port"]
+        if transport == "unixSocket" {
+            let socketPath = createValues["bashSocketPath", default: ""].trimmingCharacters(in: .whitespacesAndNewlines)
+            if socketPath.isEmpty {
+                createMessage = "Socket Path is required."
+                updateLayout()
+                return
+            }
+        } else {
+            let port = createValues["bashPort", default: ""].trimmingCharacters(in: .whitespacesAndNewlines)
+            if port.isEmpty {
+                createMessage = "Port is required."
+                updateLayout()
+                return
+            }
+        }
+        showBashScriptFilePicker()
     }
 
     private func performCreateRequest(recipe: RecipeRecord, createEndpoint: URL, urlSession: URLSession) {
@@ -4036,6 +4415,110 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 self.updateColors()
             }
         }.resume()
+    }
+
+    private func performBashCreateRequest(scriptPath: String) {
+        guard !isPerformingAction, let createEndpoint, let urlSession else { return }
+        ensureBashDefaults()
+        isPerformingAction = true
+        createMessage = "Creating..."
+        updateLayout()
+
+        let identifier = normalizedBashIdentifier()
+        let transport = createValues["bashFrontendTransport", default: "port"]
+        var queryItems: [URLQueryItem] = [
+            URLQueryItem(name: "recipe", value: "command-port"),
+            URLQueryItem(name: "command", value: createValues["bashCommands", default: ""]),
+            URLQueryItem(name: "workdir", value: "~"),
+            URLQueryItem(name: "scriptPath", value: scriptPath),
+            URLQueryItem(name: "frontendTransport", value: transport),
+            URLQueryItem(name: "name", value: createValues["bashDisplayName", default: ""].trimmingCharacters(in: .whitespacesAndNewlines)),
+            URLQueryItem(name: "identifier", value: identifier)
+        ]
+        if transport == "unixSocket" {
+            queryItems.append(URLQueryItem(name: "socketPath", value: createValues["bashSocketPath", default: ""].trimmingCharacters(in: .whitespacesAndNewlines)))
+        } else {
+            queryItems.append(URLQueryItem(name: "port", value: createValues["bashPort", default: ""].trimmingCharacters(in: .whitespacesAndNewlines)))
+        }
+        let iconPath = createValues["bashIconPath", default: ""].trimmingCharacters(in: .whitespacesAndNewlines)
+        if !iconPath.isEmpty {
+            queryItems.append(URLQueryItem(name: "iconPath", value: iconPath))
+        }
+
+        var components = URLComponents(url: createEndpoint, resolvingAgainstBaseURL: false)
+        components?.queryItems = queryItems
+        guard let url = components?.url else {
+            isPerformingAction = false
+            createMessage = "Could not build create request."
+            updateLayout()
+            return
+        }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        urlSession.dataTask(with: request) { [weak self] data, _, error in
+            Task { @MainActor in
+                guard let self else { return }
+                self.isPerformingAction = false
+                if let error {
+                    self.createMessage = error.localizedDescription
+                } else if let data,
+                          let response = try? ActionResponse.decodeBinary(data) {
+                    self.createMessage = response.message
+                    if response.ok {
+                        self.createValues.removeAll()
+                        self.ensureBashDefaults()
+                        self.pendingFilePicker = nil
+                        self.navigateToMode(.apps, pushHistory: false)
+                        self.fetchBackends()
+                    }
+                } else {
+                    self.createMessage = "Create request failed."
+                }
+                self.updateColors()
+            }
+        }.resume()
+    }
+
+    private func showBashScriptFilePicker() {
+        blurCreateField()
+        ensureBashDefaults()
+        let identifier = normalizedBashIdentifier()
+        createValues["bashIdentifier"] = identifier
+        let filename = defaultScriptFilename(for: identifier, extension: ".sh")
+        filePickerScroll = 0
+        pendingFilePicker = PendingFilePicker(mode: .saveFile,
+                                              recipeID: nil,
+                                              targetFieldKey: "bashScriptPath",
+                                              fileExtension: ".sh",
+                                              directory: "~/outershell",
+                                              parent: "~",
+                                              filename: filename,
+                                              entries: [],
+                                              isLoading: true,
+                                              error: "")
+        createValues[Self.filePickerFilenameKey] = filename
+        focusCreateField(Self.filePickerFilenameKey)
+        fetchFilePickerDirectory(path: "~/outershell")
+        updateLayout()
+    }
+
+    private func showBashIconFilePicker() {
+        blurCreateField()
+        let current = createValues["bashIconPath", default: ""].trimmingCharacters(in: .whitespacesAndNewlines)
+        let split = splitScriptPath(current.isEmpty ? "~" : current)
+        filePickerScroll = 0
+        pendingFilePicker = PendingFilePicker(mode: .chooseFile,
+                                              recipeID: nil,
+                                              targetFieldKey: "bashIconPath",
+                                              fileExtension: "",
+                                              directory: split.directory,
+                                              parent: split.directory,
+                                              filename: "",
+                                              entries: [],
+                                              isLoading: true,
+                                              error: "")
+        fetchFilePickerDirectory(path: split.directory)
+        updateLayout()
     }
 
     private func showFilePicker(for recipe: RecipeRecord) {
@@ -4137,21 +4620,25 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
     private func confirmFilePickerSave() {
         guard var picker = pendingFilePicker else { return }
-        if picker.mode == .chooseDirectory {
+        if picker.mode == .chooseDirectory || picker.mode == .chooseFile {
             guard let targetFieldKey = picker.targetFieldKey else { return }
-            createValues[targetFieldKey] = picker.directory
+            if picker.mode == .chooseFile,
+               picker.filename.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                pendingFilePicker?.error = "Choose a file."
+                updateLayout()
+                return
+            }
+            createValues[targetFieldKey] = picker.mode == .chooseFile
+                ? joinPath(directory: picker.directory, filename: picker.filename)
+                : picker.directory
             createValues.removeValue(forKey: Self.filePickerFilenameKey)
             pendingFilePicker = nil
             filePickerScroll = 0
-            focusCreateField(targetFieldKey, cursorPosition: picker.directory.count)
+            focusCreateField(targetFieldKey, cursorPosition: createValues[targetFieldKey, default: ""].count)
             createMessage = ""
             updateLayout()
             return
         }
-        guard let recipeID = picker.recipeID,
-              let recipe = recipes.first(where: { $0.identifier == recipeID }),
-              let createEndpoint,
-              let urlSession else { return }
         var filename = picker.filename.trimmingCharacters(in: .whitespacesAndNewlines)
         if filename.isEmpty {
             pendingFilePicker?.error = "Enter a filename."
@@ -4167,6 +4654,18 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             filename += picker.fileExtension
         }
         picker.filename = filename
+        if picker.targetFieldKey == "bashScriptPath" {
+            let scriptPath = joinPath(directory: picker.directory, filename: filename)
+            createValues.removeValue(forKey: Self.filePickerFilenameKey)
+            pendingFilePicker = nil
+            blurCreateField()
+            performBashCreateRequest(scriptPath: scriptPath)
+            return
+        }
+        guard let recipeID = picker.recipeID,
+              let recipe = recipes.first(where: { $0.identifier == recipeID }),
+              let createEndpoint,
+              let urlSession else { return }
         createValues["scriptPath"] = joinPath(directory: picker.directory, filename: filename)
         createValues.removeValue(forKey: Self.filePickerFilenameKey)
         pendingFilePicker = nil
@@ -4216,6 +4715,14 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             let identifier = createValues["identifier", default: ""]
             if identifier.isEmpty || identifier == oldNameSuggestion {
                 createValues["identifier"] = suggestedIdentifier(from: createValues["name", default: ""])
+            }
+        }
+        if key == "bashDisplayName" {
+            createValues["bashIdentifier"] = uniqueBashIdentifier(from: createValues["bashDisplayName", default: ""])
+        } else if key == "bashIdentifier" {
+            let sanitized = suggestedIdentifier(from: createInputController.text)
+            if sanitized != createInputController.text {
+                createValues["bashIdentifier"] = sanitized
             }
         }
         createMessage = ""
@@ -4288,6 +4795,15 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             updateLayout()
             return
         }
+        if selectedCreateSection == .bashCommands {
+            let fields = visibleBashCreateFieldKeys()
+            guard !fields.isEmpty else { return }
+            let currentKey = activeCreateFieldKey ?? fields[0]
+            let index = fields.firstIndex(of: currentKey) ?? 0
+            focusCreateField(fields[(index + 1) % fields.count])
+            updateLayout()
+            return
+        }
         let fields = selectedRecipe().map { visibleCreateFields(for: $0).filter { $0.fieldType != "choice" } } ?? []
         guard !fields.isEmpty else { return }
         let currentKey = activeCreateFieldKey ?? fields[0].key
@@ -4299,6 +4815,15 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private func retreatCreateField() {
         if pendingFilePicker != nil {
             focusCreateField(Self.filePickerFilenameKey)
+            updateLayout()
+            return
+        }
+        if selectedCreateSection == .bashCommands {
+            let fields = visibleBashCreateFieldKeys()
+            guard !fields.isEmpty else { return }
+            let currentKey = activeCreateFieldKey ?? fields[0]
+            let index = fields.firstIndex(of: currentKey) ?? 0
+            focusCreateField(fields[(index + fields.count - 1) % fields.count])
             updateLayout()
             return
         }
@@ -4323,7 +4848,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             let end = Int(replacementLocation + replacementLength)
             createInputController.setCursorPosition(end, modifySelection: true)
         }
-        let cleaned = cleanSingleLineText(text)
+        let cleaned = activeCreateFieldKey == "bashCommands" ? cleanBashCommandText(text) : cleanSingleLineText(text)
         guard !cleaned.isEmpty else { return }
         createInputController.insertText(cleaned)
     }
@@ -4334,10 +4859,20 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         }
     }
 
-    private func focusActiveCreateField(selectAll: Bool = false) {
-        let firstVisibleKey = selectedRecipe().flatMap { recipe in
-            visibleCreateFields(for: recipe).first(where: { $0.fieldType != "choice" })?.key
+    private func cleanBashCommandText(_ text: String) -> String {
+        var normalized = text.replacingOccurrences(of: "\r\n", with: "\n")
+        normalized = normalized.replacingOccurrences(of: "\r", with: "\n")
+        return normalized.filter { character in
+            character == "\n" || character == "\t" || character.unicodeScalars.allSatisfy { $0.value >= 0x20 && $0.value != 0x7f }
         }
+    }
+
+    private func focusActiveCreateField(selectAll: Bool = false) {
+        let firstVisibleKey = selectedCreateSection == .bashCommands
+            ? visibleBashCreateFieldKeys().first
+            : selectedRecipe().flatMap { recipe in
+                visibleCreateFields(for: recipe).first(where: { $0.fieldType != "choice" })?.key
+            }
         let key = pendingFilePicker != nil ? Self.filePickerFilenameKey : activeCreateFieldKey ?? firstVisibleKey
         guard let key else { return }
         focusCreateField(key, selectAll: selectAll)
@@ -4372,6 +4907,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         activeCreateFieldKey = key
         let value = createValues[key] ?? (key == Self.filePickerFilenameKey ? pendingFilePicker?.filename : nil) ?? selectedRecipe()?.fields.first(where: { $0.key == key })?.defaultValue ?? ""
         isSynchronizingCreateInput = true
+        createInputController.allowsNewlines = key == "bashCommands"
         createInputController.setText(value)
         createInputController.focus(selectAll: selectAll)
         if let cursorPosition {
@@ -4384,6 +4920,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func blurCreateField() {
+        createInputController.allowsNewlines = false
         createInputController.blur()
         updateInputMode()
         updateEditingAndPasteboardState()
@@ -4402,6 +4939,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
         guard mode == .create, createInputController.isFocused else { return }
         if command == "insertTab" {
+            if activeCreateFieldKey == "bashCommands" {
+                createInputController.insertText("\t")
+                return
+            }
             advanceCreateField()
             return
         }
@@ -4485,6 +5026,29 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         return CTLineCreateWithAttributedString(attributed)
     }
 
+    private func createTextAreaLineFragments(text: String, layout: CreateFieldLayout) -> [CreateTextLineFragment] {
+        let lineHeight: CGFloat = 16
+        let lineCount = max(text.components(separatedBy: "\n").count, 1)
+        var fragments: [CreateTextLineFragment] = []
+        fragments.reserveCapacity(lineCount)
+
+        var start = 0
+        let parts = text.split(separator: "\n", omittingEmptySubsequences: false)
+        if parts.isEmpty {
+            return [CreateTextLineFragment(text: "", start: 0, end: 0, y: layout.textFrame.maxY - lineHeight)]
+        }
+        for (index, part) in parts.enumerated() {
+            let lineText = String(part)
+            let end = start + lineText.count
+            fragments.append(CreateTextLineFragment(text: lineText,
+                                                    start: start,
+                                                    end: end,
+                                                    y: layout.textFrame.maxY - CGFloat(index + 1) * lineHeight))
+            start = end + 1
+        }
+        return fragments
+    }
+
     private func makePasswordFieldLine(for text: String) -> CTLine {
         let attributed = NSAttributedString(string: text, attributes: [.font: NSFont.systemFont(ofSize: 14, weight: .regular)])
         return CTLineCreateWithAttributedString(attributed)
@@ -4504,11 +5068,25 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         return (min(start, maxWidth), min(max(end, start), maxWidth))
     }
 
-    private func characterIndexForCreateField(key: String, xPosition: CGFloat) -> Int {
+    private func characterIndexForCreateField(key: String, at point: CGPoint) -> Int {
         guard let layout = createFieldLayouts[key] else { return 0 }
         let text = createValues[key] ?? selectedRecipe()?.fields.first(where: { $0.key == key })?.defaultValue ?? ""
-        let localX = max(0, min(xPosition - layout.textFrame.minX, layout.textFrame.width))
         guard !text.isEmpty, layout.textFrame.width > 0 else { return 0 }
+
+        if layout.multiline {
+            let fragments = createTextAreaLineFragments(text: text, layout: layout)
+            let lineHeight: CGFloat = 16
+            let row = max(0, min(Int(floor((layout.textFrame.maxY - point.y) / lineHeight)), fragments.count - 1))
+            let fragment = fragments[row]
+            let localX = max(0, min(point.x - layout.textFrame.minX, layout.textFrame.width))
+            guard !fragment.text.isEmpty else { return fragment.start }
+            let line = makeCreateFieldLine(for: fragment.text, monospaced: layout.monospaced)
+            let utf16Index = CTLineGetStringIndexForPosition(line, CGPoint(x: localX, y: 0))
+            if utf16Index == kCFNotFound { return fragment.end }
+            return fragment.start + characterIndex(forUTF16: utf16Index, in: fragment.text)
+        }
+
+        let localX = max(0, min(point.x - layout.textFrame.minX, layout.textFrame.width))
         let line = makeCreateFieldLine(for: text, monospaced: layout.monospaced)
         let utf16Index = CTLineGetStringIndexForPosition(line, CGPoint(x: localX, y: 0))
         if utf16Index == kCFNotFound { return text.count }
@@ -4541,6 +5119,35 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         let text = createInputController.text
         let cursorWidth: CGFloat = 1
         let maxWidth = max(layout.textFrame.width, 0)
+
+        if layout.multiline {
+            let fragments = createTextAreaLineFragments(text: text, layout: layout)
+            let cursorPosition = createInputController.cursorPosition
+            let fragment = fragments.first { cursorPosition >= $0.start && cursorPosition <= $0.end } ?? fragments.last
+            guard let fragment else {
+                return CGRect(x: layout.textFrame.minX,
+                              y: layout.textFrame.maxY - 16,
+                              width: cursorWidth,
+                              height: 16)
+            }
+            let offset: CGFloat
+            if !fragment.text.isEmpty && maxWidth > 0 {
+                let line = makeCreateFieldLine(for: fragment.text, monospaced: layout.monospaced)
+                offset = offsetForCreateFieldCharacter(line: line,
+                                                       text: fragment.text,
+                                                       index: cursorPosition - fragment.start,
+                                                       maxWidth: maxWidth)
+            } else {
+                offset = 0
+            }
+            let proposedX = min(max(layout.textFrame.minX + offset, layout.textFrame.minX), layout.textFrame.maxX)
+            let maxCursorX = layout.fieldFrame.maxX - 2 - cursorWidth
+            return CGRect(x: max(layout.textFrame.minX, min(proposedX, maxCursorX)),
+                          y: max(layout.textFrame.minY, min(fragment.y - 1, layout.textFrame.maxY - 16)),
+                          width: cursorWidth,
+                          height: 18)
+        }
+
         let offset: CGFloat
         if let cachedLine, !text.isEmpty && maxWidth > 0 {
             offset = offsetForCreateFieldCharacter(line: cachedLine,
@@ -4696,18 +5303,22 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         for item in items {
             if let representation = item.representations.first(where: { $0.typeIdentifier == NSPasteboard.PasteboardType.string.rawValue }),
                let stringValue = String(data: representation.data, encoding: .utf8) {
-                createInputController.insertText(cleanSingleLineText(stringValue))
+                createInputController.insertText(cleanTextForActiveCreateField(stringValue))
                 return true
             }
             if let representation = item.representations.first(where: { $0.typeIdentifier == NSPasteboard.PasteboardType.rtf.rawValue }),
                let attributed = try? NSAttributedString(data: representation.data,
                                                         options: [.documentType: NSAttributedString.DocumentType.rtf],
                                                         documentAttributes: nil) {
-                createInputController.insertText(cleanSingleLineText(attributed.string))
+                createInputController.insertText(cleanTextForActiveCreateField(attributed.string))
                 return true
             }
         }
         return false
+    }
+
+    private func cleanTextForActiveCreateField(_ text: String) -> String {
+        activeCreateFieldKey == "bashCommands" ? cleanBashCommandText(text) : cleanSingleLineText(text)
     }
 
     @discardableResult
@@ -4772,7 +5383,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         }
 
         guard let drop = createFieldDropPoint(point) else { return }
-        let index = characterIndexForCreateField(key: drop.key, xPosition: drop.point.x)
+        let index = characterIndexForCreateField(key: drop.key, at: drop.point)
         focusCreateField(drop.key, cursorPosition: index)
         _ = insertPasteboardItemsIntoCreateField(items)
     }
@@ -5124,6 +5735,14 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             updateLayout()
         case .createSubmit:
             submitCreateForm()
+        case .createSection(let section):
+            blurCreateField()
+            selectedCreateSection = section
+            if section == .bashCommands {
+                ensureBashDefaults()
+            }
+            createMessage = ""
+            updateLayout()
         case .createSuggestion(let key, let value):
             createValues[key] = value
             if createInputController.isFocused, activeCreateFieldKey == key {
@@ -5131,6 +5750,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             }
             createMessage = ""
             updateLayout()
+        case .chooseBashIcon:
+            showBashIconFilePicker()
         case .directorySelect(let key):
             showDirectoryPicker(for: key)
         case .filePickerCancel:
@@ -5139,6 +5760,15 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             blurCreateField()
             if entry.isDirectory {
                 fetchFilePickerDirectory(path: entry.path)
+            } else if pendingFilePicker?.mode == .chooseFile,
+                      let targetFieldKey = pendingFilePicker?.targetFieldKey {
+                createValues[targetFieldKey] = entry.path
+                createValues.removeValue(forKey: Self.filePickerFilenameKey)
+                pendingFilePicker = nil
+                filePickerScroll = 0
+                focusCreateField(targetFieldKey, cursorPosition: entry.path.count)
+                createMessage = ""
+                updateLayout()
             } else {
                 pendingFilePicker?.filename = entry.name
                 createValues[Self.filePickerFilenameKey] = entry.name
@@ -5228,7 +5858,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             }
             let contentPoint = contentLayer.convert(point, from: rootLayer)
             let createPoint = createLayer.convert(contentPoint, from: contentLayer)
-            let index = characterIndexForCreateField(key: key, xPosition: createPoint.x)
+            let index = characterIndexForCreateField(key: key, at: createPoint)
             createInputController.setCursorPosition(index, modifySelection: true)
             sendCreateFieldCursorUpdate()
             updateLayout()
@@ -5300,8 +5930,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             isOverBundledApp = isInCreateContent && bundledAppInstallFrames.contains { $0.frame.contains(createPoint) }
             isOverDirectorySelect = isInCreateContent && createDirectorySelectFrames.contains { $0.frame.contains(createPoint) }
             isOverAppTile = createDismissFrame.contains(createPoint) ||
-                            (isInCreateContent && (recipeFrames.contains { $0.frame.contains(createPoint) } ||
+                            (isInCreateContent && (createSectionFrames.contains { $0.frame.contains(createPoint) } ||
+                                                   recipeFrames.contains { $0.frame.contains(createPoint) } ||
                                                    createButtonFrame.contains(createPoint) ||
+                                                   bashIconSelectFrame.contains(createPoint) ||
                                                    createChoiceFrames.contains { $0.frame.contains(createPoint) } ||
                                                    createSuggestionFrames.contains { $0.frame.contains(createPoint) }))
         } else if pendingPasswordAction == nil, mode == .apps {
@@ -5358,7 +5990,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             let contentPoint = contentLayer.convert(point, from: rootLayer)
             let createPoint = createLayer.convert(contentPoint, from: contentLayer)
             guard filePickerFilenameFrame.contains(createPoint) else { return }
-            let index = characterIndexForCreateField(key: Self.filePickerFilenameKey, xPosition: createPoint.x)
+            let index = characterIndexForCreateField(key: Self.filePickerFilenameKey, at: createPoint)
             focusCreateField(Self.filePickerFilenameKey)
             if !createInputController.hasSelection {
                 createInputController.setCursorPosition(index, modifySelection: false)
@@ -5389,7 +6021,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         guard pendingPasswordAction == nil, mode == .create else { return }
         let createPoint = createLayer.convert(contentPoint, from: contentLayer)
         guard let key = createFieldFrames.first(where: { $0.frame.contains(createPoint) })?.key else { return }
-        let index = characterIndexForCreateField(key: key, xPosition: createPoint.x)
+        let index = characterIndexForCreateField(key: key, at: createPoint)
         focusCreateField(key)
         if !createInputController.hasSelection {
             createInputController.setCursorPosition(index, modifySelection: false)
@@ -5552,6 +6184,11 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 }
                 return
             }
+            if let sectionFrame = createSectionFrames.first(where: { $0.frame.contains(createPoint) }) {
+                armButtonClick(frame: rootFrame(sectionFrame.frame, from: createLayer),
+                               action: .createSection(sectionFrame.section))
+                return
+            }
             if let menu = bundledAppMenuFrames.first(where: { $0.frame.contains(createPoint) }) {
                 showBackendActionsMenu(for: menu.backend, at: point)
                 return
@@ -5576,6 +6213,11 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                action: .createSubmit)
                 return
             }
+            if bashIconSelectFrame.contains(createPoint) {
+                armButtonClick(frame: rootFrame(bashIconSelectFrame, from: createLayer),
+                               action: .chooseBashIcon)
+                return
+            }
             if cancelCreateFrame.contains(createPoint) {
                 armButtonClick(frame: rootFrame(cancelCreateFrame, from: createLayer),
                                action: .createCancel)
@@ -5593,7 +6235,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             }
             if let field = createFieldFrames.first(where: { $0.frame.contains(createPoint) })?.key {
                 let wasFocused = createInputController.isFocused && activeCreateFieldKey == field
-                let index = characterIndexForCreateField(key: field, xPosition: createPoint.x)
+                let index = characterIndexForCreateField(key: field, at: createPoint)
                 if wasFocused,
                    clickCount == 1,
                    !modifierFlags.contains(.shift),
@@ -5641,7 +6283,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         }
         if filePickerFilenameFrame.contains(createPoint) {
             let wasFocused = createInputController.isFocused && activeCreateFieldKey == Self.filePickerFilenameKey
-            let index = characterIndexForCreateField(key: Self.filePickerFilenameKey, xPosition: createPoint.x)
+            let index = characterIndexForCreateField(key: Self.filePickerFilenameKey, at: createPoint)
             focusCreateField(Self.filePickerFilenameKey, selectAll: clickCount >= 3)
             switch clickCount {
             case 3...:
@@ -5861,12 +6503,29 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         updateLayout()
     }
 
+    private func otherRecipeRecords() -> [RecipeRecord] {
+        recipes.filter { $0.identifier == "jupyter" || $0.identifier == "jupyter-uv" }
+    }
+
     private func selectedRecipe() -> RecipeRecord? {
-        recipes.first { $0.identifier == selectedRecipeID } ?? recipes.first
+        let visibleRecipes = selectedCreateSection == .otherRecipes ? otherRecipeRecords() : recipes
+        return visibleRecipes.first { $0.identifier == selectedRecipeID } ?? visibleRecipes.first
     }
 
     private func visibleCreateFields(for recipe: RecipeRecord) -> [RecipeFieldRecord] {
         recipe.fields.filter { !isCreateFieldHidden($0, in: recipe) }
+    }
+
+    private func visibleBashCreateFieldKeys() -> [String] {
+        var keys = ["bashDisplayName", "bashCommands"]
+        if createValues["bashFrontendTransport", default: "port"] == "unixSocket" {
+            keys.append("bashSocketPath")
+        } else {
+            keys.append("bashPort")
+        }
+        keys.append("bashIconPath")
+        keys.append("bashIdentifier")
+        return keys
     }
 
     private func isCreateFieldHidden(_ field: RecipeFieldRecord, in recipe: RecipeRecord) -> Bool {
@@ -5897,6 +6556,43 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         default:
             return ".sh"
         }
+    }
+
+    private func ensureBashDefaults() {
+        if createValues["bashFrontendTransport", default: ""].trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            createValues["bashFrontendTransport"] = "port"
+        }
+        let displayName = createValues["bashDisplayName", default: ""]
+        if !displayName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+           createValues["bashIdentifier", default: ""].trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            createValues["bashIdentifier"] = uniqueBashIdentifier(from: displayName)
+        }
+    }
+
+    private func normalizedBashIdentifier() -> String {
+        let explicit = createValues["bashIdentifier", default: ""].trimmingCharacters(in: .whitespacesAndNewlines)
+        if !explicit.isEmpty {
+            let sanitized = suggestedIdentifier(from: explicit)
+            return uniqueBashIdentifier(base: sanitized.isEmpty ? "bash-app" : sanitized)
+        }
+        return uniqueBashIdentifier(from: createValues["bashDisplayName", default: ""])
+    }
+
+    private func uniqueBashIdentifier(from displayName: String) -> String {
+        let base = suggestedIdentifier(from: displayName)
+        return uniqueBashIdentifier(base: base.isEmpty ? "bash-app" : base)
+    }
+
+    private func uniqueBashIdentifier(base: String) -> String {
+        let existing = Set(backends.map { suggestedIdentifier(from: $0.serviceID) })
+        if !existing.contains(base) {
+            return base
+        }
+        var index = 2
+        while existing.contains("\(base)-\(index)") {
+            index += 1
+        }
+        return "\(base)-\(index)"
     }
 
     private func defaultScriptFilename(for recipeIdentifier: String, extension fileExtension: String) -> String {
@@ -6018,10 +6714,39 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         updateLayout()
     }
 
-    private func bundledPlaceholderBackends() -> [BackendRecord] {
-        backends
-            .filter { $0.isBundledPlaceholder }
-            .sorted { $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending }
+    private func bundledCatalogBackends() -> [BundledCatalogEntry] {
+        let grouped = Dictionary(grouping: backends.filter { $0.isBundledCatalogEntry }, by: \.serviceID)
+        return grouped.values.compactMap { records in
+            guard let displayRecord = records.first(where: { $0.isBundledPlaceholder }) ??
+                    records.first(where: { ($0.iconSymbolName ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false }) ??
+                    records.first else {
+                return nil
+            }
+            return BundledCatalogEntry(backend: displayRecord,
+                                       isInstalled: records.contains { $0.isInstalled ?? false })
+        }
+        .sorted { $0.backend.displayName.localizedCaseInsensitiveCompare($1.backend.displayName) == .orderedAscending }
+    }
+
+    private func catalogIconSymbolName(for backend: BackendRecord) -> String? {
+        if let symbolName = backend.iconSymbolName,
+           !symbolName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return symbolName
+        }
+        switch backend.serviceID {
+        case "dev.outergroup.Files":
+            return "folder"
+        case "dev.outergroup.Firehose":
+            return "text.line.last.and.arrowtriangle.forward"
+        case "dev.outergroup.NetworkInspector":
+            return "network"
+        case "dev.outergroup.Plaintext":
+            return "doc.plaintext"
+        case "dev.outergroup.Top":
+            return "chart.bar.xaxis"
+        default:
+            return nil
+        }
     }
 
     private func appLauncherItems() -> [AppLauncherItem] {
@@ -6472,7 +7197,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             return path == "/" ? frontend.socketPath : "\(frontend.socketPath)\(path)"
         }
         if frontend.port > 0 {
-            return frontend.url.isEmpty ? "127.0.0.1:\(frontend.port)/" : frontend.url
+            let path = pathAndQuery(fromFrontendURL: frontend.url, socketPath: nil)
+            return "127.0.0.1:\(frontend.port)\(path)"
         }
         return frontend.url.isEmpty ? "--" : frontend.url
     }
@@ -6730,12 +7456,12 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         }
 
         let rawURL = frontend.url.trimmingCharacters(in: .whitespacesAndNewlines)
-        if let parsed = URL(string: rawURL), parsed.scheme != nil {
-            return parsed
-        }
         if frontend.port > 0 {
             let path = pathAndQuery(fromFrontendURL: rawURL, socketPath: nil)
             return URL(string: "http://127.0.0.1:\(frontend.port)\(path)")
+        }
+        if let parsed = URL(string: rawURL), parsed.scheme != nil {
+            return parsed
         }
         return URL(string: rawURL)
     }
