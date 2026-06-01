@@ -35,6 +35,7 @@ require_file "${PACKAGE_ROOT}/RemoteLinuxBinaries/x86_64/outerctl"
 require_file "${RUN_ROOT}/bundles/BackendsContent.bundle.macos-arm.aar"
 require_file "${RUN_ROOT}/bundles/BackendsContent.bundle.macos-x86.aar"
 require_file "${MACOS_BUILD_ROOT}/Outer Shell.app/Contents/MacOS/Outer Shell"
+require_file "${MACOS_BUILD_ROOT}/outershelld"
 require_file "${REPO_ROOT}/app-icon.png"
 if [[ -n "${APP_CATALOG_PATH}" ]]; then
     require_file "${APP_CATALOG_PATH}"
@@ -66,6 +67,7 @@ stage_home_screen_macos() {
     local root="${STAGING_ROOT}/outer-shell-macos/OuterShell"
     mkdir -p "${root}/bin" "${root}/bundles"
     ditto "${MACOS_BUILD_ROOT}/Outer Shell.app" "${root}/Outer Shell.app"
+    install -m 0755 "${MACOS_BUILD_ROOT}/outershelld" "${root}/outershelld"
     install -m 0644 "${REPO_ROOT}/app-icon.png" "${root}/app-icon.png"
     install -m 0644 "${RUN_ROOT}/bundles/BackendsContent.bundle.macos-arm.aar" "${root}/bundles/BackendsContent.bundle.macos-arm.aar"
     install -m 0644 "${RUN_ROOT}/bundles/BackendsContent.bundle.macos-x86.aar" "${root}/bundles/BackendsContent.bundle.macos-x86.aar"
@@ -213,6 +215,7 @@ if [ "$os_name" = "Darwin" ]; then
     tar -xzf "$archive_path" -C "$install_root" --strip-components=1
     rm -f "$archive_path"
     chmod 0755 "$install_root/Outer Shell.app/Contents/MacOS/Outer Shell"
+    chmod 0755 "$install_root/outershelld"
     chmod 0755 "$install_root/bin/outerctl"
     install -m 0755 "$install_root/bin/outerctl" "$outerctl_path"
     printf '%s\n' "__OUTER_SHELL_VERSION__" > "$install_root/version"

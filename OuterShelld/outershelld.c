@@ -1065,7 +1065,6 @@ static void send_events_response(int fd,
                                  bool timed_out,
                                  uint64_t backends_version,
                                  uint64_t log_version);
-#ifndef __APPLE__
 static bool ensure_root_helper_installed(const char *sudo_password, bool *needs_password, char *message, size_t message_size);
 static bool root_helper_outerctl(int argc,
                                  char **argv,
@@ -1073,6 +1072,7 @@ static bool root_helper_outerctl(int argc,
                                  bool *needs_password,
                                  char *message,
                                  size_t message_size);
+#ifndef __APPLE__
 static bool root_helper_registry_upsert_systemd(const char *service_id,
                                                 const char *display_name,
                                                 const char *unit_name,
@@ -1093,6 +1093,22 @@ static bool remove_bundled_root_support(const BundledAppDefinition *app,
                                         bool *needs_password,
                                         char *message,
                                         size_t message_size);
+#else
+static bool root_helper_registry_upsert_launchd(const char *service_id,
+                                                const char *display_name,
+                                                const char *plist_path,
+                                                const char *socket_path,
+                                                const char *log_path,
+                                                const char *icon_path,
+                                                const char *sudo_password,
+                                                bool *needs_password,
+                                                char *message,
+                                                size_t message_size);
+static bool root_helper_registry_remove_backend(const char *service_id,
+                                                const char *sudo_password,
+                                                bool *needs_password,
+                                                char *message,
+                                                size_t message_size);
 #endif
 
 static const BundledAppDefinition *bundled_app_for_service_id(const char *service_id) {
@@ -1259,6 +1275,28 @@ static bool parent_directory(const char *path, char *out, size_t out_size) {
     }
     return out[0] != '\0';
 }
+
+#ifdef __APPLE__
+static bool macos_root_tool_source_path(const char *executable, char *out, size_t out_size) {
+    char directory[PATH_MAX];
+    if (!parent_directory(executable, directory, sizeof(directory))) return false;
+
+    for (int depth = 0; depth < 5; depth++) {
+        char candidate[PATH_MAX];
+        snprintf(candidate, sizeof(candidate), "%s/outershelld", directory);
+        struct stat st;
+        if (stat(candidate, &st) == 0 && S_ISREG(st.st_mode) && access(candidate, X_OK) == 0) {
+            snprintf(out, out_size, "%s", candidate);
+            return out[0] != '\0';
+        }
+        char parent[PATH_MAX];
+        if (!parent_directory(directory, parent, sizeof(parent)) || strcmp(parent, directory) == 0) break;
+        snprintf(directory, sizeof(directory), "%s", parent);
+    }
+
+    return false;
+}
+#endif
 
 static void bundled_apps_root(char *out, size_t out_size) {
     if (g_bundled_apps_directory[0]) {
@@ -4779,18 +4817,20 @@ static bool append_registered_backend_payloads(const RegistryStore *database,
             snprintf(effective_service_scope, sizeof(effective_service_scope), "system");
         }
 #endif
-        const BundledAppDefinition *bundled_app = bundled_app_for_service_id(service_id);
         bool is_self = is_home_screen_service_id(service_id);
-        if (bundled_app) {
-            size_t bundled_index = (size_t)(bundled_app - kBundledApps);
-            if (bundled_index < bundled_installed_count) bundled_installed[bundled_index] = true;
-        }
+        const BundledAppDefinition *bundled_app = bundled_app_for_service_id(service_id);
 
         char status[32] = "unknown";
         bool has_launchd_unit = plist_path[0];
         bool has_systemd_unit = service_unit[0];
 #ifdef __APPLE__
-        if (has_launchd_unit) has_systemd_unit = false;
+        has_systemd_unit = false;
+#endif
+        if (bundled_app && (has_launchd_unit || has_systemd_unit)) {
+            size_t bundled_index = (size_t)(bundled_app - kBundledApps);
+            if (bundled_index < bundled_installed_count) bundled_installed[bundled_index] = true;
+        }
+#ifdef __APPLE__
         if (has_launchd_unit) {
             snprintf(effective_service_scope,
                      sizeof(effective_service_scope),
@@ -5509,22 +5549,25 @@ static void send_control_response(int fd, const char *query, const char *body) {
             send_action_response(fd, 400, false, "This app can only run as root.");
             return;
         }
+        bool ok = install_bundled_app(app, scope, sudo_password, &needs_password, message, sizeof(message));
 #ifdef __APPLE__
-        if (strcmp(scope, "user") == 0) {
-            char existing_plist[PATH_MAX] = "";
-            int owns_existing_plist = 0;
-            if (lookup_launchd_backend_any(service_id, existing_plist, sizeof(existing_plist), &owns_existing_plist) &&
-                strncmp(existing_plist, "/Library/LaunchDaemons/", 23) == 0) {
-                bool removed = uninstall_backend(service_id, sudo_password, &needs_password, message, sizeof(message));
-                if (!removed) {
-                    log_event("Failed to remove existing root launchd install before installing %s: %s", service_id, message);
-                    send_action_response_ex(fd, needs_password ? 401 : 500, false, message, needs_password);
-                    return;
-                }
+        if (ok && strcmp(scope, "system") == 0 && !app->root_only) {
+            char user_message[4096] = "";
+            bool user_ok = install_bundled_app(app, "user", NULL, NULL, user_message, sizeof(user_message));
+            log_event("%s app %s as user after root install: %s",
+                      user_ok ? "Installed" : "Failed to install",
+                      app->service_id,
+                      user_message);
+            if (user_ok) {
+                snprintf(message, sizeof(message), "Installed %s for user and root.", app->display_name);
+            } else {
+                snprintf(message, sizeof(message), "Installed %s as root, but failed to install it for the user: %s",
+                         app->display_name,
+                         user_message);
+                ok = false;
             }
         }
 #endif
-        bool ok = install_bundled_app(app, scope, sudo_password, &needs_password, message, sizeof(message));
         log_event("%s app %s as %s: %s",
                   ok ? "Installed" : "Failed to install",
                   app->service_id,
@@ -6227,7 +6270,6 @@ static bool run_root_script(const char *script_path, const char *sudo_password, 
     return ok;
 }
 
-#ifndef __APPLE__
 static bool ensure_root_helper_installed(const char *sudo_password, bool *needs_password, char *message, size_t message_size) {
     if (needs_password) *needs_password = false;
 
@@ -6245,19 +6287,19 @@ static bool ensure_root_helper_installed(const char *sudo_password, bool *needs_
         return false;
     }
 
-    char service_name[256];
-    char socket_name[256];
-    root_helper_unit_name_for_uid(owner_uid, "service", service_name, sizeof(service_name));
-    root_helper_unit_name_for_uid(owner_uid, "socket", socket_name, sizeof(socket_name));
-
     char quoted_executable[PATH_MAX + 8];
-    char quoted_service_name[320];
-    char quoted_socket_name[320];
+    char quoted_system_root[PATH_MAX + 8];
+#ifdef __APPLE__
+    char helper_source[PATH_MAX];
+    if (!macos_root_tool_source_path(executable, helper_source, sizeof(helper_source))) {
+        snprintf(message, message_size, "Could not resolve standalone outershelld helper path.");
+        return false;
+    }
+    shell_quote(helper_source, quoted_executable, sizeof(quoted_executable));
+#else
     shell_quote(executable, quoted_executable, sizeof(quoted_executable));
-    shell_quote(service_name, quoted_service_name, sizeof(quoted_service_name));
-    shell_quote(socket_name, quoted_socket_name, sizeof(quoted_socket_name));
-    (void)owner_name;
-
+#endif
+    shell_quote(kSystemOuterShellRoot, quoted_system_root, sizeof(quoted_system_root));
     char script_template[] = "/tmp/outershelld-root-helper-install-XXXXXX";
     int script_fd = mkstemp(script_template);
     if (script_fd < 0) {
@@ -6271,6 +6313,18 @@ static bool ensure_root_helper_installed(const char *sudo_password, bool *needs_
         snprintf(message, message_size, "Failed to write root helper install script: %s", strerror(errno));
         return false;
     }
+#ifndef __APPLE__
+    char service_name[256];
+    char socket_name[256];
+    root_helper_unit_name_for_uid(owner_uid, "service", service_name, sizeof(service_name));
+    root_helper_unit_name_for_uid(owner_uid, "socket", socket_name, sizeof(socket_name));
+
+    char quoted_service_name[320];
+    char quoted_socket_name[320];
+    shell_quote(service_name, quoted_service_name, sizeof(quoted_service_name));
+    shell_quote(socket_name, quoted_socket_name, sizeof(quoted_socket_name));
+    (void)owner_name;
+
     fprintf(script,
             "set -eu\n"
             "systemctl --system disable --now %s >/dev/null 2>&1 || true\n"
@@ -6285,8 +6339,20 @@ static bool ensure_root_helper_installed(const char *sudo_password, bool *needs_
             quoted_socket_name,
             service_name,
             socket_name,
-            kSystemOuterShellRoot,
+            quoted_system_root,
             quoted_executable);
+#else
+    (void)owner_uid;
+    (void)owner_name;
+    fprintf(script,
+            "set -eu\n"
+            "mkdir -p /usr/local/libexec %s\n"
+            "rm -f /usr/local/libexec/outershelld-root-helper\n"
+            "install -m 0755 %s /usr/local/libexec/outershelld-root-tool\n"
+            "chmod 0755 /usr/local/libexec/outershelld-root-tool\n",
+            quoted_system_root,
+            quoted_executable);
+#endif
     fclose(script);
     chmod(script_template, 0700);
 
@@ -6297,26 +6363,6 @@ static bool ensure_root_helper_installed(const char *sudo_password, bool *needs_
     snprintf(message, message_size, "Root helper installed.");
     return true;
 }
-#else
-static bool ensure_root_helper_installed(const char *sudo_password, bool *needs_password, char *message, size_t message_size) {
-    (void)sudo_password;
-    if (needs_password) *needs_password = false;
-    snprintf(message, message_size, "Root helper is only implemented on Linux.");
-    return false;
-}
-
-static bool root_helper_registry_remove_backend(const char *service_id,
-                                                const char *sudo_password,
-                                                bool *needs_password,
-                                                char *message,
-                                                size_t message_size) {
-    (void)service_id;
-    (void)sudo_password;
-    if (needs_password) *needs_password = false;
-    snprintf(message, message_size, "Root helper is only implemented on Linux.");
-    return false;
-}
-#endif
 
 static bool run_root_outershell_migration(const char *sudo_password, bool *needs_password, char *message, size_t message_size) {
     if (needs_password) *needs_password = false;
@@ -7593,7 +7639,9 @@ static int outershelld_handle_outerctl(int argc, char **argv, StringBuilder *std
             ok = false;
         } else if (strcmp(action, "clear") == 0) {
             RegistryBackendRecord *record = registry_store_find_backend(&database, backend);
-            ok = !record || registry_assign_string(&record->unit_path, "");
+            ok = !record ||
+                 (registry_assign_string(&record->unit_name, "") &&
+                  registry_assign_string(&record->unit_path, ""));
             if (!ok) snprintf(error, sizeof(error), "Out of memory.");
             changed = ok;
         } else {
@@ -9066,6 +9114,10 @@ static bool install_bundled_app_macos(const BundledAppDefinition *app,
     bundled_socket_path_for_scope(app, install_as_root ? "system" : "user", socket_path, sizeof(socket_path));
 
     if (install_as_root) {
+        if (!ensure_root_helper_installed(sudo_password, needs_password, message, message_size)) {
+            return false;
+        }
+
         char install_root[PATH_MAX];
         snprintf(install_root, sizeof(install_root), "%s/apps/%s", kSystemOuterShellRoot, app->install_directory_name);
         char bundles_dir[PATH_MAX];
@@ -9085,18 +9137,12 @@ static bool install_bundled_app_macos(const BundledAppDefinition *app,
         char plist_path[PATH_MAX];
         snprintf(plist_path, sizeof(plist_path), "/Library/LaunchDaemons/%s.plist", app->service_id);
 
-        char outerctl_path[PATH_MAX];
-        default_user_outerctl_path(outerctl_path, sizeof(outerctl_path));
         char quoted_system_root[PATH_MAX + 8];
-        char quoted_outerctl[PATH_MAX + 8];
         shell_quote(kSystemOuterShellRoot, quoted_system_root, sizeof(quoted_system_root));
-        shell_quote(outerctl_path, quoted_outerctl, sizeof(quoted_outerctl));
         char wrapper_contents[4096];
         snprintf(wrapper_contents, sizeof(wrapper_contents),
                  "#!/bin/sh\n"
-                 "exec env OUTERSHELL_HOME=%s %s \"$@\"\n",
-                 quoted_system_root,
-                 quoted_outerctl);
+                 "exec /usr/local/libexec/outershelld-root-tool --root-helper-outerctl \"$@\"\n");
 
         StringBuilder plist = {0};
         if (!make_bundled_launchd_plist(app->service_id,
@@ -9127,9 +9173,6 @@ static bool install_bundled_app_macos(const BundledAppDefinition *app,
         char quoted_wrapper_path[PATH_MAX + 8];
         char quoted_log_path[PATH_MAX + 8];
         char quoted_plist_path[PATH_MAX + 8];
-        char quoted_service_id[512];
-        char quoted_display_name[512];
-        char quoted_socket_path[PATH_MAX + 8];
         shell_quote(source_binary, quoted_source_binary, sizeof(quoted_source_binary));
         shell_quote(source_bundle_arm, quoted_source_bundle_arm, sizeof(quoted_source_bundle_arm));
         shell_quote(source_bundle_x86, quoted_source_bundle_x86, sizeof(quoted_source_bundle_x86));
@@ -9143,18 +9186,6 @@ static bool install_bundled_app_macos(const BundledAppDefinition *app,
         shell_quote(wrapper_path, quoted_wrapper_path, sizeof(quoted_wrapper_path));
         shell_quote(log_path, quoted_log_path, sizeof(quoted_log_path));
         shell_quote(plist_path, quoted_plist_path, sizeof(quoted_plist_path));
-        shell_quote(app->service_id, quoted_service_id, sizeof(quoted_service_id));
-        shell_quote(app->display_name, quoted_display_name, sizeof(quoted_display_name));
-        shell_quote(socket_path, quoted_socket_path, sizeof(quoted_socket_path));
-
-        char user_plist_path[PATH_MAX];
-        snprintf(user_plist_path, sizeof(user_plist_path), "%s/Library/LaunchAgents/%s.plist", home_directory(), app->service_id);
-        char user_install_root[PATH_MAX];
-        default_user_outershell_app_root(app->install_directory_name, user_install_root, sizeof(user_install_root));
-        char quoted_user_plist_path[PATH_MAX + 8];
-        char quoted_user_install_root[PATH_MAX + 8];
-        shell_quote(user_plist_path, quoted_user_plist_path, sizeof(quoted_user_plist_path));
-        shell_quote(user_install_root, quoted_user_install_root, sizeof(quoted_user_install_root));
 
         char script_template[] = "/tmp/backends-root-install-XXXXXX";
         int script_fd = mkstemp(script_template);
@@ -9200,12 +9231,6 @@ static bool install_bundled_app_macos(const BundledAppDefinition *app,
                 "chmod 0644 %s\n"
                 "touch %s\n"
                 "chmod 0644 %s\n"
-                "OUTERSHELL_HOME=%s %s backend upsert --backend %s --name %s --launchd-plist %s --owns-plist true\n"
-                "OUTERSHELL_HOME=%s %s app clear --backend %s\n"
-                "if [ -n %s ]; then OUTERSHELL_HOME=%s %s app add --backend %s --socket-path %s --name %s --icon-path %s; fi\n"
-                "OUTERSHELL_HOME=%s %s log clear --backend %s\n"
-                "OUTERSHELL_HOME=%s %s log add --backend %s --path %s\n"
-                "chmod 0666 %s/registry.orwa.lock 2>/dev/null || true\n"
                 "launchctl bootstrap system %s\n"
                 "launchctl kickstart -k system/%s\n",
                 quoted_wrapper_path,
@@ -9216,29 +9241,6 @@ static bool install_bundled_app_macos(const BundledAppDefinition *app,
                 quoted_plist_path,
                 quoted_log_path,
                 quoted_log_path,
-                quoted_system_root,
-                quoted_wrapper_path,
-                quoted_service_id,
-                quoted_display_name,
-                quoted_plist_path,
-                quoted_system_root,
-                quoted_wrapper_path,
-                quoted_service_id,
-                quoted_socket_path,
-                quoted_system_root,
-                quoted_wrapper_path,
-                quoted_service_id,
-                quoted_socket_path,
-                quoted_display_name,
-                quoted_target_icon[0] ? quoted_target_icon : "''",
-                quoted_system_root,
-                quoted_wrapper_path,
-                quoted_service_id,
-                quoted_system_root,
-                quoted_wrapper_path,
-                quoted_service_id,
-                quoted_log_path,
-                quoted_system_root,
                 quoted_plist_path,
                 app->service_id);
         fclose(script);
@@ -9249,21 +9251,16 @@ static bool install_bundled_app_macos(const BundledAppDefinition *app,
         unlink(script_template);
         if (!root_ok) return false;
 
-        char stop_user_target[384];
-        char quoted_stop_user_target[512];
-        snprintf(stop_user_target, sizeof(stop_user_target), "gui/%d/%s", (int)getuid(), app->service_id);
-        shell_quote(stop_user_target, quoted_stop_user_target, sizeof(quoted_stop_user_target));
-        char cleanup_command[PATH_MAX * 2 + 512];
-        snprintf(cleanup_command,
-                 sizeof(cleanup_command),
-                 "launchctl bootout %s >/dev/null 2>&1 || true; rm -f -- %s; rm -rf -- %s",
-                 quoted_stop_user_target,
-                 quoted_user_plist_path,
-                 quoted_user_install_root);
-        run_shell_ignored(cleanup_command);
-        char error[1024] = "";
-        if (!unregister_backend_records(app->service_id, error, sizeof(error))) {
-            snprintf(message, message_size, "%s", error);
+        if (!root_helper_registry_upsert_launchd(app->service_id,
+                                                 app->display_name,
+                                                 plist_path,
+                                                 socket_path,
+                                                 log_path,
+                                                 target_icon,
+                                                 sudo_password,
+                                                 needs_password,
+                                                 message,
+                                                 message_size)) {
             return false;
         }
 
@@ -9388,6 +9385,10 @@ static bool uninstall_backend(const char *service_id, const char *sudo_password,
     int owns_plist = 0;
     if (!found && lookup_launchd_backend_any(service_id, plist_path, sizeof(plist_path), &owns_plist)) {
         if (strncmp(plist_path, "/Library/LaunchDaemons/", 23) == 0) {
+            if (!ensure_root_helper_installed(sudo_password, needs_password, message, message_size)) {
+                return false;
+            }
+
             const BundledAppDefinition *app = bundled_app_for_service_id(service_id);
             char install_name[PATH_MAX];
             snprintf(install_name, sizeof(install_name), "%s", app ? app->install_directory_name : service_id);
@@ -9406,18 +9407,10 @@ static bool uninstall_backend(const char *service_id, const char *sudo_password,
             char quoted_install_root[PATH_MAX + 8] = "";
             char quoted_log_path[PATH_MAX + 8];
             char quoted_socket_path[PATH_MAX + 8] = "";
-            char quoted_system_root[PATH_MAX + 8];
-            char quoted_service_id[512];
-            char outerctl_path[PATH_MAX];
-            char quoted_outerctl_path[PATH_MAX + 8];
             shell_quote(plist_path, quoted_plist_path, sizeof(quoted_plist_path));
             if (install_root[0]) shell_quote(install_root, quoted_install_root, sizeof(quoted_install_root));
             shell_quote(log_path, quoted_log_path, sizeof(quoted_log_path));
             if (socket_path[0]) shell_quote(socket_path, quoted_socket_path, sizeof(quoted_socket_path));
-            shell_quote(kSystemOuterShellRoot, quoted_system_root, sizeof(quoted_system_root));
-            shell_quote(service_id, quoted_service_id, sizeof(quoted_service_id));
-            default_user_outerctl_path(outerctl_path, sizeof(outerctl_path));
-            shell_quote(outerctl_path, quoted_outerctl_path, sizeof(quoted_outerctl_path));
 
             char script_template[] = "/tmp/backends-root-uninstall-XXXXXX";
             int script_fd = mkstemp(script_template);
@@ -9435,26 +9428,10 @@ static bool uninstall_backend(const char *service_id, const char *sudo_password,
             fprintf(script,
                     "set -eu\n"
                     "launchctl bootout system/%s >/dev/null 2>&1 || true\n"
-                    "rm -f -- %s %s\n"
-                    "OUTERSHELL_HOME=%s %s app clear --backend %s >/dev/null 2>&1 || true\n"
-                    "OUTERSHELL_HOME=%s %s log clear --backend %s >/dev/null 2>&1 || true\n"
-                    "OUTERSHELL_HOME=%s %s launchd clear --backend %s >/dev/null 2>&1 || true\n"
-                    "OUTERSHELL_HOME=%s %s backend remove --backend %s >/dev/null 2>&1 || true\n",
+                    "rm -f -- %s %s\n",
                     service_id,
                     owns_plist && plist_path[0] ? quoted_plist_path : "''",
-                    quoted_socket_path[0] ? quoted_socket_path : "''",
-                    quoted_system_root,
-                    quoted_outerctl_path,
-                    quoted_service_id,
-                    quoted_system_root,
-                    quoted_outerctl_path,
-                    quoted_service_id,
-                    quoted_system_root,
-                    quoted_outerctl_path,
-                    quoted_service_id,
-                    quoted_system_root,
-                    quoted_outerctl_path,
-                    quoted_service_id);
+                    quoted_socket_path[0] ? quoted_socket_path : "''");
             if (quoted_install_root[0]) {
                 fprintf(script, "rm -rf -- %s\n", quoted_install_root);
             }
@@ -9464,6 +9441,9 @@ static bool uninstall_backend(const char *service_id, const char *sudo_password,
             bool root_ok = run_root_script(script_template, sudo_password, needs_password, message, message_size);
             unlink(script_template);
             if (!root_ok) return false;
+            if (!root_helper_registry_remove_backend(service_id, sudo_password, needs_password, message, message_size)) {
+                return false;
+            }
         } else {
             char stop_message[1024] = "";
             (void)run_launchd_operation(service_id, plist_path, "stop", stop_message, sizeof(stop_message));
@@ -10489,7 +10469,6 @@ static bool process_api_ui_request(ReactorClient *client, const unsigned char *m
     return false;
 }
 
-#ifndef __APPLE__
 static bool root_helper_outerctl(int argc,
                                  char **argv,
                                  const char *sudo_password,
@@ -10528,6 +10507,7 @@ static bool root_helper_outerctl(int argc,
     return ok;
 }
 
+#ifndef __APPLE__
 static bool root_helper_registry_upsert_systemd(const char *service_id,
                                                 const char *display_name,
                                                 const char *unit_name,
@@ -10573,7 +10553,54 @@ static bool root_helper_registry_remove_backend(const char *service_id,
     if (root_helper_outerctl(5, backend_remove_argv, sudo_password, needs_password, message, message_size)) return true;
     return contains_case_insensitive(message, "Backend not registered");
 }
+#else
+static bool root_helper_registry_upsert_launchd(const char *service_id,
+                                                const char *display_name,
+                                                const char *plist_path,
+                                                const char *socket_path,
+                                                const char *log_path,
+                                                const char *icon_path,
+                                                const char *sudo_password,
+                                                bool *needs_password,
+                                                char *message,
+                                                size_t message_size) {
+    char *backend_argv[] = {"outerctl", "backend", "upsert", "--backend", (char *)service_id, "--name", (char *)display_name, "--launchd-plist", (char *)plist_path, "--owns-plist", "true", NULL};
+    if (!root_helper_outerctl(11, backend_argv, sudo_password, needs_password, message, message_size)) return false;
 
+    char *app_clear_argv[] = {"outerctl", "app", "clear", "--backend", (char *)service_id, NULL};
+    if (!root_helper_outerctl(5, app_clear_argv, sudo_password, needs_password, message, message_size)) return false;
+
+    if (socket_path && socket_path[0]) {
+        char *app_add_argv[] = {"outerctl", "app", "add", "--backend", (char *)service_id, "--socket-path", (char *)socket_path, "--name", (char *)display_name, "--icon-path", (char *)(icon_path ? icon_path : ""), NULL};
+        if (!root_helper_outerctl(11, app_add_argv, sudo_password, needs_password, message, message_size)) return false;
+    }
+
+    char *log_clear_argv[] = {"outerctl", "log", "clear", "--backend", (char *)service_id, NULL};
+    if (!root_helper_outerctl(5, log_clear_argv, sudo_password, needs_password, message, message_size)) return false;
+
+    char *log_add_argv[] = {"outerctl", "log", "add", "--backend", (char *)service_id, "--path", (char *)log_path, NULL};
+    return root_helper_outerctl(7, log_add_argv, sudo_password, needs_password, message, message_size);
+}
+
+static bool root_helper_registry_remove_backend(const char *service_id,
+                                                const char *sudo_password,
+                                                bool *needs_password,
+                                                char *message,
+                                                size_t message_size) {
+    char *app_clear_argv[] = {"outerctl", "app", "clear", "--backend", (char *)service_id, NULL};
+    (void)root_helper_outerctl(5, app_clear_argv, sudo_password, needs_password, message, message_size);
+    char *log_clear_argv[] = {"outerctl", "log", "clear", "--backend", (char *)service_id, NULL};
+    (void)root_helper_outerctl(5, log_clear_argv, sudo_password, needs_password, message, message_size);
+    char *opener_clear_argv[] = {"outerctl", "opener", "clear", "--backend", (char *)service_id, NULL};
+    (void)root_helper_outerctl(5, opener_clear_argv, sudo_password, needs_password, message, message_size);
+    char *launchd_clear_argv[] = {"outerctl", "launchd", "clear", "--backend", (char *)service_id, NULL};
+    (void)root_helper_outerctl(5, launchd_clear_argv, sudo_password, needs_password, message, message_size);
+    char *systemd_clear_argv[] = {"outerctl", "systemd", "clear", "--backend", (char *)service_id, NULL};
+    (void)root_helper_outerctl(5, systemd_clear_argv, sudo_password, needs_password, message, message_size);
+    char *backend_remove_argv[] = {"outerctl", "backend", "remove", "--backend", (char *)service_id, NULL};
+    if (root_helper_outerctl(5, backend_remove_argv, sudo_password, needs_password, message, message_size)) return true;
+    return contains_case_insensitive(message, "Backend not registered");
+}
 #endif
 
 static void api_send_outerctl_response(int fd, int status, StringBuilder *stdout_buffer, StringBuilder *stderr_buffer) {
@@ -11303,10 +11330,10 @@ static void initialize_runtime_paths(char *api_socket_path, size_t api_socket_pa
 
 int OuterShelldMain(int argc, char **argv) {
     char api_socket_path[PATH_MAX] = "";
+    initialize_runtime_paths(api_socket_path, sizeof(api_socket_path));
 #ifndef __APPLE__
     bool root_helper_mode = false;
-
-    initialize_runtime_paths(api_socket_path, sizeof(api_socket_path));
+#endif
 
     if (argc >= 2 && strcmp(argv[1], "--root-helper-outerctl") == 0) {
         if (geteuid() != 0) {
@@ -11327,9 +11354,6 @@ int OuterShelldMain(int argc, char **argv) {
         free(stderr_buffer.data);
         return status;
     }
-#else
-    initialize_runtime_paths(api_socket_path, sizeof(api_socket_path));
-#endif
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--api-socket-path") == 0 && i + 1 < argc) {

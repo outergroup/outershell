@@ -3714,7 +3714,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             startAndOpenLauncherEndpoint(endpoint, displayName: displayName, opensInNewTab: opensInNewTab)
             return
         }
-        guard let url = frontendNavigationURL(endpoint.frontend) else {
+        guard let url = frontendNavigationURL(endpoint) else {
             startAndOpenLauncherEndpoint(endpoint, displayName: displayName, opensInNewTab: opensInNewTab)
             return
         }
@@ -3786,7 +3786,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                     if let nextEndpoint = self.findLauncherEndpoint(serviceID: endpoint.backend.serviceID,
                                                                     serviceScope: endpoint.backend.serviceScope,
                                                                     frontendID: endpoint.frontend.id),
-                       let url = self.frontendNavigationURL(nextEndpoint.frontend),
+                       let url = self.frontendNavigationURL(nextEndpoint),
                        self.endpointIsReadyToOpen(nextEndpoint) {
                         self.backendError = ""
                         self.updateLayout()
@@ -3842,7 +3842,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             if let userEndpoint = item.userEndpoint {
                 openLauncherEndpoint(userEndpoint, displayName: item.displayName, opensInNewTab: false)
             } else {
-                openLauncherItem(item, opensInNewTab: false)
+                performControlAction(for: item.backend, operation: "run")
             }
         case "runRoot":
             if let rootEndpoint = item.rootEndpoint {
@@ -6299,12 +6299,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                                    title: "Run as root",
                                                    isEnabled: true))
         } else {
-            if item.userEndpoint != nil || item.rootEndpoint == nil {
-                operationByItemID["run"] = "run"
-                items.append(OuterframeContextMenuItem(id: "run",
-                                                       title: "Run",
-                                                       isEnabled: true))
-            }
+            operationByItemID["run"] = "run"
+            items.append(OuterframeContextMenuItem(id: "run",
+                                                   title: "Run",
+                                                   isEnabled: true))
         }
         if ((item.backend.supportsRoot ?? false) || item.rootEndpoint != nil) && !(item.backend.rootOnly ?? false) {
             operationByItemID["runRoot"] = "runRoot"
@@ -6410,6 +6408,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             return
         }
         performControlAction(for: backend, operation: operation)
+    }
+
+    private func frontendNavigationURL(_ endpoint: AppLauncherEndpoint) -> URL? {
+        frontendNavigationURL(endpoint.frontend)
     }
 
     private func frontendNavigationURL(_ frontend: FrontendRecord) -> URL? {
