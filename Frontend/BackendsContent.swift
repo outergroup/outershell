@@ -580,6 +580,31 @@ private struct PendingTextSelectionDrag {
     let target: TextSelectionDragTarget
 }
 
+private enum PendingButtonAction {
+    case addApp
+    case appBadge(AppLauncherEndpoint, displayName: String, opensInNewTab: Bool)
+    case bundledInstall(BackendRecord)
+    case createCancel
+    case createChoice(key: String, value: String)
+    case createSubmit
+    case createSuggestion(key: String, value: String)
+    case directorySelect(String)
+    case filePickerCancel
+    case filePickerEntry(FilePickerEntryRecord)
+    case filePickerSave
+    case installCancel
+    case installConfirm(operation: String)
+    case logDismiss
+    case passwordCancel
+    case passwordSubmit
+    case recipe(String)
+}
+
+private struct PendingButtonClick {
+    let frame: CGRect
+    let action: PendingButtonAction
+}
+
 private enum AppDropTarget: Equatable {
     case unlisted
     case list(String)
@@ -816,6 +841,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private var outerShellActionFrame = CGRect.zero
     private var appsContentBottom: CGFloat = 0
     private var pendingAppDrag: PendingAppDrag?
+    private var pendingButtonClick: PendingButtonClick?
     private var backendRowFrames: [(frame: CGRect, row: BackendListRow)] = []
     private var backendActionFrames: [(frame: CGRect, row: BackendListRow, operation: String)] = []
     private var iconMatchStates: [String: IconMatchState] = [:]
@@ -4686,7 +4712,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                           clickCount: Int) -> Bool {
         _ = modifierFlags
         if isPointInLogDismissButton(point) {
-            dismissLogViewer()
+            let frame = rootFrame(logDismissFrame.insetBy(dx: -2, dy: -2), from: logHeaderLayer)
+            armButtonClick(frame: frame, action: .logDismiss)
             return true
         }
         if isPointInLogSelector(point) {
@@ -4984,6 +5011,91 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                                    previewSize: nil)
     }
 
+    private func armButtonClick(frame: CGRect, action: PendingButtonAction) {
+        pendingButtonClick = PendingButtonClick(frame: frame, action: action)
+    }
+
+    private func rootFrame(_ frame: CGRect, from layer: CALayer) -> CGRect {
+        rootLayer.convert(frame, from: layer)
+    }
+
+    @discardableResult
+    private func handlePendingButtonMouseUp(at point: CGPoint) -> Bool {
+        guard let pendingButtonClick else {
+            return false
+        }
+        self.pendingButtonClick = nil
+        guard pendingButtonClick.frame.contains(point) else {
+            return true
+        }
+        performPendingButtonAction(pendingButtonClick.action)
+        return true
+    }
+
+    private func performPendingButtonAction(_ action: PendingButtonAction) {
+        switch action {
+        case .addApp:
+            navigateToMode(.create, pushHistory: true)
+        case .appBadge(let endpoint, let displayName, let opensInNewTab):
+            openLauncherEndpoint(endpoint,
+                                 displayName: displayName,
+                                 opensInNewTab: opensInNewTab)
+        case .bundledInstall(let backend):
+            showInstallPrompt(for: backend)
+        case .createCancel:
+            returnToAppsFromCreate()
+        case .createChoice(let key, let value):
+            createValues[key] = value
+            if createInputController.isFocused, activeCreateFieldKey == key {
+                focusCreateField(key)
+            }
+            createMessage = ""
+            updateLayout()
+        case .createSubmit:
+            submitCreateForm()
+        case .createSuggestion(let key, let value):
+            createValues[key] = value
+            if createInputController.isFocused, activeCreateFieldKey == key {
+                focusCreateField(key)
+            }
+            createMessage = ""
+            updateLayout()
+        case .directorySelect(let key):
+            showDirectoryPicker(for: key)
+        case .filePickerCancel:
+            dismissFilePicker()
+        case .filePickerEntry(let entry):
+            blurCreateField()
+            if entry.isDirectory {
+                fetchFilePickerDirectory(path: entry.path)
+            } else {
+                pendingFilePicker?.filename = entry.name
+                createValues[Self.filePickerFilenameKey] = entry.name
+                focusCreateField(Self.filePickerFilenameKey, cursorPosition: entry.name.count)
+                updateLayout()
+            }
+        case .filePickerSave:
+            confirmFilePickerSave()
+        case .installCancel:
+            dismissInstallPrompt()
+        case .installConfirm(let operation):
+            pendingInstallOperation = operation
+            confirmPendingInstall()
+        case .logDismiss:
+            dismissLogViewer()
+        case .passwordCancel:
+            dismissPasswordPrompt()
+        case .passwordSubmit:
+            submitPasswordPrompt()
+        case .recipe(let recipeID):
+            blurCreateField()
+            selectedRecipeID = recipeID
+            applyRecipeDefaults(overwrite: true)
+            createMessage = ""
+            updateLayout()
+        }
+    }
+
     private func handleMouseDragged(to point: CGPoint, modifierFlags: NSEvent.ModifierFlags) {
         _ = modifierFlags
         if logScrollbarController?.handleMouseDragged(to: rootLayer.convert(point, to: logRowsClipLayer)) == true {
@@ -5059,6 +5171,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         lastLogDragTextPoint = nil
         pendingTextSelectionDrag = nil
         _ = logScrollbarController?.handleMouseUp(at: rootLayer.convert(point, to: logRowsClipLayer))
+        if handlePendingButtonMouseUp(at: point) {
+            return
+        }
         if let pendingAppDrag {
             self.pendingAppDrag = nil
             if pendingAppDrag.isDragging {
@@ -5251,21 +5366,24 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                  clickCount: Int = 1) {
         pendingCreateTextDrag = nil
         pendingTextSelectionDrag = nil
+        pendingButtonClick = nil
         if pendingInstallBackend != nil {
             if installConfirmFrame.contains(point) {
-                pendingInstallOperation = "run"
-                confirmPendingInstall()
+                armButtonClick(frame: installConfirmFrame, action: .installConfirm(operation: "run"))
             } else if installRootConfirmFrame.contains(point) {
-                pendingInstallOperation = "runRoot"
-                confirmPendingInstall()
+                armButtonClick(frame: installRootConfirmFrame, action: .installConfirm(operation: "runRoot"))
             } else if installCancelFrame.contains(point) || !installPanelFrame.contains(point) {
-                dismissInstallPrompt()
+                if installCancelFrame.contains(point) {
+                    armButtonClick(frame: installCancelFrame, action: .installCancel)
+                } else {
+                    dismissInstallPrompt()
+                }
             }
             return
         }
         if pendingPasswordAction != nil {
             if passwordSubmitFrame.contains(point) {
-                submitPasswordPrompt()
+                armButtonClick(frame: passwordSubmitFrame, action: .passwordSubmit)
             } else if passwordFieldFrame.contains(point) {
                 let wasFocused = passwordInputController.isFocused
                 let index = characterIndexForPasswordField(xPosition: point.x)
@@ -5282,7 +5400,11 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 }
                 updateLayout()
             } else if passwordCancelFrame.contains(point) || !passwordPanelFrame.contains(point) {
-                dismissPasswordPrompt()
+                if passwordCancelFrame.contains(point) {
+                    armButtonClick(frame: passwordCancelFrame, action: .passwordCancel)
+                } else {
+                    dismissPasswordPrompt()
+                }
             }
             return
         }
@@ -5317,13 +5439,15 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             }
             let appsPoint = appsScrollContentLayer.convert(contentPoint, from: contentLayer)
             if let badge = appBadgeFrames.first(where: { $0.frame.contains(appsPoint) }) {
-                openLauncherEndpoint(badge.endpoint,
-                                     displayName: badge.displayName,
-                                     opensInNewTab: modifierFlags.contains(.command))
+                armButtonClick(frame: rootFrame(badge.frame, from: appsScrollContentLayer),
+                               action: .appBadge(badge.endpoint,
+                                                 displayName: badge.displayName,
+                                                 opensInNewTab: modifierFlags.contains(.command)))
                 return
             }
             if addAppFrame.contains(appsPoint) {
-                navigateToMode(.create, pushHistory: true)
+                armButtonClick(frame: rootFrame(addAppFrame, from: appsScrollContentLayer),
+                               action: .addApp)
                 return
             }
             if let card = appCardFrames.first(where: { $0.frame.contains(appsPoint) }) {
@@ -5344,45 +5468,38 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 return
             }
             if let install = bundledAppInstallFrames.first(where: { $0.frame.contains(createPoint) }) {
-                showInstallPrompt(for: install.backend)
+                armButtonClick(frame: rootFrame(install.frame, from: createLayer),
+                               action: .bundledInstall(install.backend))
                 return
             }
             if let select = createDirectorySelectFrames.first(where: { $0.frame.contains(createPoint) }) {
-                showDirectoryPicker(for: select.key)
+                armButtonClick(frame: rootFrame(select.frame, from: createLayer),
+                               action: .directorySelect(select.key))
                 return
             }
             if let recipeFrame = recipeFrames.first(where: { $0.frame.contains(createPoint) }) {
-                blurCreateField()
-                selectedRecipeID = recipeFrame.recipeID
-                applyRecipeDefaults(overwrite: true)
-                createMessage = ""
-                updateLayout()
+                armButtonClick(frame: rootFrame(recipeFrame.frame, from: createLayer),
+                               action: .recipe(recipeFrame.recipeID))
                 return
             }
             if createButtonFrame.contains(createPoint) {
-                submitCreateForm()
+                armButtonClick(frame: rootFrame(createButtonFrame, from: createLayer),
+                               action: .createSubmit)
                 return
             }
             if cancelCreateFrame.contains(createPoint) {
-                returnToAppsFromCreate()
+                armButtonClick(frame: rootFrame(cancelCreateFrame, from: createLayer),
+                               action: .createCancel)
                 return
             }
             if let choice = createChoiceFrames.first(where: { $0.frame.contains(createPoint) }) {
-                createValues[choice.key] = choice.value
-                if createInputController.isFocused, activeCreateFieldKey == choice.key {
-                    focusCreateField(choice.key)
-                }
-                createMessage = ""
-                updateLayout()
+                armButtonClick(frame: rootFrame(choice.frame, from: createLayer),
+                               action: .createChoice(key: choice.key, value: choice.value))
                 return
             }
             if let suggestion = createSuggestionFrames.first(where: { $0.frame.contains(createPoint) }) {
-                createValues[suggestion.key] = suggestion.value
-                if createInputController.isFocused, activeCreateFieldKey == suggestion.key {
-                    focusCreateField(suggestion.key)
-                }
-                createMessage = ""
-                updateLayout()
+                armButtonClick(frame: rootFrame(suggestion.frame, from: createLayer),
+                               action: .createSuggestion(key: suggestion.key, value: suggestion.value))
                 return
             }
             if let field = createFieldFrames.first(where: { $0.frame.contains(createPoint) })?.key {
@@ -5424,11 +5541,13 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                            modifierFlags: NSEvent.ModifierFlags,
                                            clickCount: Int) {
         if filePickerSaveFrame.contains(createPoint) {
-            confirmFilePickerSave()
+            armButtonClick(frame: rootFrame(filePickerSaveFrame, from: createLayer),
+                           action: .filePickerSave)
             return
         }
         if filePickerCancelFrame.contains(createPoint) {
-            dismissFilePicker()
+            armButtonClick(frame: rootFrame(filePickerCancelFrame, from: createLayer),
+                           action: .filePickerCancel)
             return
         }
         if filePickerFilenameFrame.contains(createPoint) {
@@ -5449,15 +5568,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             return
         }
         if let hit = filePickerEntryFrames.first(where: { $0.frame.contains(createPoint) }) {
-            blurCreateField()
-            if hit.entry.isDirectory {
-                fetchFilePickerDirectory(path: hit.entry.path)
-            } else {
-                pendingFilePicker?.filename = hit.entry.name
-                createValues[Self.filePickerFilenameKey] = hit.entry.name
-                focusCreateField(Self.filePickerFilenameKey, cursorPosition: hit.entry.name.count)
-                updateLayout()
-            }
+            armButtonClick(frame: rootFrame(hit.frame, from: createLayer),
+                           action: .filePickerEntry(hit.entry))
             return
         }
         if !filePickerPanelFrame.contains(createPoint), createInputController.isFocused {
@@ -6389,18 +6501,18 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         if item.backend.rootOnly ?? false {
             operationByItemID["runRoot"] = "runRoot"
             items.append(OuterframeContextMenuItem(id: "runRoot",
-                                                   title: "Run as root",
+                                                   title: appRunTitle(for: item.rootEndpoint, root: true),
                                                    isEnabled: true))
         } else {
             operationByItemID["run"] = "run"
             items.append(OuterframeContextMenuItem(id: "run",
-                                                   title: "Run",
+                                                   title: appRunTitle(for: item.userEndpoint, root: false),
                                                    isEnabled: true))
         }
         if ((item.backend.supportsRoot ?? false) || item.rootEndpoint != nil) && !(item.backend.rootOnly ?? false) {
             operationByItemID["runRoot"] = "runRoot"
             items.append(OuterframeContextMenuItem(id: "runRoot",
-                                                   title: "Run as root",
+                                                   title: appRunTitle(for: item.rootEndpoint, root: true),
                                                    isEnabled: true))
         }
         for stopEndpoint in appStopEndpoints(for: item) {
@@ -6427,6 +6539,13 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         outerframeHost.showContextMenu(menuID: menuID,
                                        items: items,
                                        at: point)
+    }
+
+    private func appRunTitle(for endpoint: AppLauncherEndpoint?, root: Bool) -> String {
+        if let endpoint, endpointIsRunning(endpoint) {
+            return root ? "Open (root)" : "Open"
+        }
+        return root ? "Run as root" : "Run"
     }
 
     private func appStopEndpoints(for item: AppLauncherItem) -> [(itemID: String, title: String, endpoint: AppLauncherEndpoint, isEnabled: Bool)] {
