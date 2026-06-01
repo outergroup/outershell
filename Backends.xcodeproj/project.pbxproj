@@ -14,6 +14,8 @@
 		37B4F9EE2FA1B00100873894 /* OuterShellBackend.c in Sources */ = {isa = PBXBuildFile; fileRef = 37B4F9EC2FA1B00100873894 /* OuterShellBackend.c */; };
 		AG0000000000000000000004 /* OuterShellAgent.swift in Sources */ = {isa = PBXBuildFile; fileRef = AG0000000000000000000003 /* OuterShellAgent.swift */; };
 		AG0000000000000000000005 /* outershelld.c in Sources */ = {isa = PBXBuildFile; fileRef = 37B4F9D02FA1B00100873894 /* outershelld.c */; };
+		AG0000000000000000000021 /* OuterShellDownloader.c in Sources */ = {isa = PBXBuildFile; fileRef = 37B4F9F12FA1B00100873894 /* OuterShellDownloader.c */; };
+		AG0000000000000000000022 /* OuterShellDownloaderApple.m in Sources */ = {isa = PBXBuildFile; fileRef = 37B4F9F22FA1B00100873894 /* OuterShellDownloaderApple.m */; };
 		AG0000000000000000000018 /* OuterShellBuffer.c in Sources */ = {isa = PBXBuildFile; fileRef = 37B4F9DC2FA1B00100873894 /* OuterShellBuffer.c */; };
 		AG0000000000000000000019 /* OuterShellAPI.c in Sources */ = {isa = PBXBuildFile; fileRef = 37B4F9E02FA1B00100873894 /* OuterShellAPI.c */; };
 		AG0000000000000000000020 /* OuterShellPlatform.c in Sources */ = {isa = PBXBuildFile; fileRef = 37B4F9E22FA1B00100873894 /* OuterShellPlatform.c */; };
@@ -42,6 +44,9 @@
 		37B4F9C22FA18C1E00873894 /* LICENSE */ = {isa = PBXFileReference; lastKnownFileType = text; path = LICENSE; sourceTree = "<group>"; };
 		37B4F9CF2FA1B00100873894 /* outershelld */ = {isa = PBXFileReference; explicitFileType = "compiled.mach-o.executable"; includeInIndex = 0; path = outershelld; sourceTree = BUILT_PRODUCTS_DIR; };
 		37B4F9D02FA1B00100873894 /* outershelld.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = outershelld.c; sourceTree = "<group>"; };
+		37B4F9F02FA1B00100873894 /* OuterShellDownloader.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = OuterShellDownloader.h; sourceTree = "<group>"; };
+		37B4F9F12FA1B00100873894 /* OuterShellDownloader.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = OuterShellDownloader.c; sourceTree = "<group>"; };
+		37B4F9F22FA1B00100873894 /* OuterShellDownloaderApple.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = OuterShellDownloaderApple.m; sourceTree = "<group>"; };
 		37B4F9DC2FA1B00100873894 /* OuterShellBuffer.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = OuterShellBuffer.c; sourceTree = "<group>"; };
 		37B4F9DD2FA1B00100873894 /* OuterShellBuffer.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = OuterShellBuffer.h; sourceTree = "<group>"; };
 		37B4F9E02FA1B00100873894 /* OuterShellAPI.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = OuterShellAPI.c; sourceTree = "<group>"; };
@@ -135,6 +140,9 @@
 				37B4F9E12FA1B00100873894 /* OuterShellAPI.h */,
 				37B4F9E22FA1B00100873894 /* OuterShellPlatform.c */,
 				37B4F9E32FA1B00100873894 /* OuterShellPlatform.h */,
+				37B4F9F02FA1B00100873894 /* OuterShellDownloader.h */,
+				37B4F9F12FA1B00100873894 /* OuterShellDownloader.c */,
+				37B4F9F22FA1B00100873894 /* OuterShellDownloaderApple.m */,
 			);
 			path = Backend;
 			sourceTree = "<group>";
@@ -308,6 +316,8 @@
 				AG0000000000000000000018 /* OuterShellBuffer.c in Sources */,
 				AG0000000000000000000019 /* OuterShellAPI.c in Sources */,
 				AG0000000000000000000020 /* OuterShellPlatform.c in Sources */,
+				AG0000000000000000000021 /* OuterShellDownloader.c in Sources */,
+				AG0000000000000000000022 /* OuterShellDownloaderApple.m in Sources */,
 				AG0000000000000000000005 /* outershelld.c in Sources */,
 				37B4F9EE2FA1B00100873894 /* OuterShellBackend.c in Sources */,
 			);
@@ -573,6 +583,11 @@
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
+				OTHER_LDFLAGS = (
+					"$(inherited)",
+					"-framework",
+					Foundation,
+				);
 				MACOSX_DEPLOYMENT_TARGET = 14.6;
 				MARKETING_VERSION = 1.0;
 				PRODUCT_BUNDLE_IDENTIFIER = org.outershell.OuterShell.Agent;
@@ -604,6 +619,11 @@
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",
+				);
+				OTHER_LDFLAGS = (
+					"$(inherited)",
+					"-framework",
+					Foundation,
 				);
 				MACOSX_DEPLOYMENT_TARGET = 14.6;
 				MARKETING_VERSION = 1.0;

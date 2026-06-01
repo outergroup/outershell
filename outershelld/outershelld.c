@@ -584,7 +584,6 @@ static const char *kSystemOuterShellRoot = "/var/lib/outershell";
 static char g_registry_database_path[PATH_MAX] = "";
 static char g_system_registry_database_path[PATH_MAX] = "";
 static char g_bundled_apps_directory[PATH_MAX] = "";
-static char g_bundled_apps_base_url[2048] = "";
 static char g_home_screen_public_base_url[2048] = "";
 static char g_listen_socket_path[PATH_MAX] = "";
 static char g_api_socket_path[PATH_MAX] = "";
@@ -921,18 +920,6 @@ static bool sb_append_python_list(StringBuilder *builder, const char *const *ite
         if (!sb_append_python_string(builder, items[i])) return false;
     }
     return sb_append(builder, "]");
-}
-
-static void join_url_path(char *out, size_t out_size, const char *base_url, const char *path) {
-    if (!out_size) return;
-    out[0] = '\0';
-    if (!base_url || !base_url[0] || !path || !path[0]) return;
-
-    size_t base_length = strlen(base_url);
-    while (base_length > 0 && base_url[base_length - 1] == '/') {
-        base_length--;
-    }
-    snprintf(out, out_size, "%.*s/%s", (int)base_length, base_url, path);
 }
 
 static bool sb_append_xml_escaped(StringBuilder *builder, const char *text) {
@@ -1412,94 +1399,32 @@ static bool bundled_app_stage_has_expected_files(const BundledAppDefinition *app
 #endif
 }
 
-static bool download_bundled_app_stage(const BundledAppDefinition *app,
-                                       char *out_stage_root,
-                                       size_t out_stage_root_size,
-                                       char *message,
-                                       size_t message_size) {
-    char archive_url[2048];
-    join_url_path(archive_url, sizeof(archive_url), g_bundled_apps_base_url, app->archive_name);
-    if (!archive_url[0]) {
-        snprintf(message, message_size,
-                 "No app download URL is configured for %s. Pass --app-base-url or set OUTER_SHELL_APP_BASE_URL.",
-                 app->display_name);
-        return false;
-    }
-
-    log_event("Downloading app %s from %s.",
-              app->display_name,
-              archive_url);
-
-    const char *cache_home = getenv("XDG_CACHE_HOME");
-    char cache_root[PATH_MAX];
-    if (cache_home && cache_home[0]) {
-        snprintf(cache_root, sizeof(cache_root), "%s/outershell/outer-shell/bundled-apps", cache_home);
-    } else {
-        snprintf(cache_root, sizeof(cache_root), "%s/.cache/outershell/outer-shell/bundled-apps", home_directory());
-    }
-    if (!mkdir_p(cache_root)) {
-        snprintf(message, message_size, "Failed to create app download cache at %s: %s", cache_root, strerror(errno));
-        return false;
-    }
-
-    char archive_path[PATH_MAX];
-    snprintf(archive_path, sizeof(archive_path), "%s/%s.tar.gz", cache_root, app->stage_directory_name);
-
-    char quoted_archive_path[PATH_MAX + 8];
-    char quoted_cache_root[PATH_MAX + 8];
-    char quoted_archive_url[2048];
-    shell_quote(archive_path, quoted_archive_path, sizeof(quoted_archive_path));
-    shell_quote(cache_root, quoted_cache_root, sizeof(quoted_cache_root));
-    shell_quote(archive_url, quoted_archive_url, sizeof(quoted_archive_url));
-
-    char command[4096];
-    snprintf(command, sizeof(command),
-             "set -eu; "
-             "if command -v curl >/dev/null 2>&1; then "
-             "curl -fsSL -o %s %s; "
-             "elif command -v wget >/dev/null 2>&1; then "
-             "wget -qO %s %s; "
-             "else echo 'curl or wget is required' >&2; exit 127; fi; "
-             "tar -xzf %s -C %s",
-             quoted_archive_path, quoted_archive_url,
-             quoted_archive_path, quoted_archive_url,
-             quoted_archive_path, quoted_cache_root);
-
-    int status = system(command);
-    if (status != 0) {
-        log_event("Failed to download app %s.", app->display_name);
-        snprintf(message, message_size, "Failed to download %s from %s.",
-                 app->display_name, archive_url);
-        return false;
-    }
-
-    snprintf(out_stage_root, out_stage_root_size, "%s/%s", cache_root, app->stage_directory_name);
-    if (!bundled_app_stage_has_expected_files(app, out_stage_root)) {
-        log_event("Downloaded app %s, but its payload is incomplete.", app->display_name);
-        snprintf(message, message_size, "Downloaded %s, but its payload is incomplete.", app->display_name);
-        return false;
-    }
-    log_event("Downloaded app %s to %s.", app->display_name, out_stage_root);
-    return true;
-}
-
 static bool resolve_bundled_app_stage_root(const BundledAppDefinition *app,
+                                           const char *requested_stage_root,
                                            char *out_stage_root,
                                            size_t out_stage_root_size,
                                            char *message,
                                            size_t message_size) {
+    if (requested_stage_root && requested_stage_root[0]) {
+        expand_tilde_path(requested_stage_root, out_stage_root, out_stage_root_size);
+        if (bundled_app_stage_has_expected_files(app, out_stage_root)) {
+            return true;
+        }
+        snprintf(message, message_size, "Staged %s payload is incomplete at %s.", app->display_name, out_stage_root);
+        return false;
+    }
+
     bundled_app_stage_root(app, out_stage_root, out_stage_root_size);
     if (bundled_app_stage_has_expected_files(app, out_stage_root)) {
         return true;
     }
 
-    const char *disable_download = getenv("BACKENDS_DISABLE_BUNDLED_APP_DOWNLOADS");
-    if (disable_download && disable_download[0]) {
-        snprintf(message, message_size, "Missing %s payload at %s.", app->display_name, out_stage_root);
-        return false;
-    }
-
-    return download_bundled_app_stage(app, out_stage_root, out_stage_root_size, message, message_size);
+    snprintf(message,
+             message_size,
+             "Missing %s payload at %s. OuterShellBackend must stage the app before requesting installation.",
+             app->display_name,
+             out_stage_root);
+    return false;
 }
 
 static void default_registry_database_path(char *out, size_t out_size) {
@@ -4691,12 +4616,16 @@ static bool lookup_launchd_backend_any_for_scope(const char *service_id,
 
 static bool root_outershell_migration_pending(void);
 static bool installed_home_screen_version(char *out, size_t out_size);
-static bool fetch_home_screen_available_version(const char *heartbeat, char *out, size_t out_size, char *message, size_t message_size);
+static bool accept_home_screen_available_version(const char *provided_version, char *out, size_t out_size, char *message, size_t message_size);
 static void mark_update_check_completed(void);
 static int compare_versions(const char *installed, const char *available);
 static bool home_screen_base_url(char *out, size_t out_size);
 static bool home_screen_update_available(char *available, size_t available_size);
-static bool run_home_screen_install_script(const char *subcommand, char *message, size_t message_size);
+static bool run_home_screen_install_script(const char *subcommand,
+                                           const char *script_path,
+                                           const char *archive_path,
+                                           char *message,
+                                           size_t message_size);
 static bool uninstall_local_home_screen(char *message, size_t message_size);
 
 static bool build_frontend_payload(const char *name,
@@ -5397,7 +5326,13 @@ static void send_action_response(int fd, int status, bool ok_value, const char *
     send_action_response_ex(fd, status, ok_value, message, false);
 }
 
-static bool install_bundled_app(const BundledAppDefinition *app, const char *scope, const char *sudo_password, bool *needs_password, char *message, size_t message_size);
+static bool install_bundled_app(const BundledAppDefinition *app,
+                                const char *scope,
+                                const char *stage_root,
+                                const char *sudo_password,
+                                bool *needs_password,
+                                char *message,
+                                size_t message_size);
 static bool uninstall_backend(const char *service_id, const char *sudo_password, bool *needs_password, char *message, size_t message_size);
 static bool run_root_outershell_migration(const char *sudo_password, bool *needs_password, char *message, size_t message_size);
 
@@ -5503,6 +5438,10 @@ static void send_control_response(int fd, const char *query, const char *body) {
     char operation[32] = "";
     char requested_scope[32] = "";
     char sudo_password[PATH_MAX] = "";
+    char bundled_stage_root[PATH_MAX] = "";
+    char available_version[128] = "";
+    char installer_script_path[PATH_MAX] = "";
+    char installer_archive_path[PATH_MAX] = "";
     if (!query_value_any(query, body, "serviceID", service_id, sizeof(service_id)) ||
         !query_value_any(query, body, "operation", operation, sizeof(operation))) {
         send_action_response(fd, 400, false, "Missing serviceID or operation.");
@@ -5510,6 +5449,10 @@ static void send_control_response(int fd, const char *query, const char *body) {
     }
     query_value_any(query, body, "scope", requested_scope, sizeof(requested_scope));
     query_value_any(query, body, "sudoPassword", sudo_password, sizeof(sudo_password));
+    query_value_any(query, body, "bundledStageRoot", bundled_stage_root, sizeof(bundled_stage_root));
+    query_value_any(query, body, "availableVersion", available_version, sizeof(available_version));
+    query_value_any(query, body, "installerScriptPath", installer_script_path, sizeof(installer_script_path));
+    query_value_any(query, body, "installerArchivePath", installer_archive_path, sizeof(installer_archive_path));
     trim_whitespace_in_place(service_id);
     trim_whitespace_in_place(operation);
     trim_whitespace_in_place(requested_scope);
@@ -5560,7 +5503,7 @@ static void send_control_response(int fd, const char *query, const char *body) {
             char installed[128] = "";
             char latest[128] = "";
             installed_home_screen_version(installed, sizeof(installed));
-            bool ok = fetch_home_screen_available_version("manual", latest, sizeof(latest), message, sizeof(message));
+            bool ok = accept_home_screen_available_version(available_version, latest, sizeof(latest), message, sizeof(message));
             if (ok) {
                 mark_update_check_completed();
                 if (compare_versions(installed, latest) < 0) {
@@ -5590,7 +5533,11 @@ static void send_control_response(int fd, const char *query, const char *body) {
             } else
 #endif
             {
-                ok = run_home_screen_install_script(installer_command, message, sizeof(message));
+                ok = run_home_screen_install_script(installer_command,
+                                                    installer_script_path,
+                                                    installer_archive_path,
+                                                    message,
+                                                    sizeof(message));
             }
             log_event("%s Outer Shell %s: %s", ok ? "Completed" : "Failed", installer_command, message);
             if (ok) mark_backend_event_changed();
@@ -5621,11 +5568,11 @@ static void send_control_response(int fd, const char *query, const char *body) {
             send_action_response(fd, 400, false, "This app can only run as root.");
             return;
         }
-        bool ok = install_bundled_app(app, scope, sudo_password, &needs_password, message, sizeof(message));
+        bool ok = install_bundled_app(app, scope, bundled_stage_root, sudo_password, &needs_password, message, sizeof(message));
 #ifdef __APPLE__
         if (ok && strcmp(scope, "system") == 0 && !app->root_only) {
             char user_message[4096] = "";
-            bool user_ok = install_bundled_app(app, "user", NULL, NULL, user_message, sizeof(user_message));
+            bool user_ok = install_bundled_app(app, "user", bundled_stage_root, NULL, NULL, user_message, sizeof(user_message));
             log_event("%s app %s as user after root install: %s",
                       user_ok ? "Installed" : "Failed to install",
                       app->service_id,
@@ -5661,7 +5608,7 @@ static void send_control_response(int fd, const char *query, const char *body) {
         bool needs_password = false;
         bool ok = false;
         if (strcmp(operation, "addRootSupport") == 0) {
-            ok = install_bundled_app(app, "system", sudo_password, &needs_password, message, sizeof(message));
+            ok = install_bundled_app(app, "system", bundled_stage_root, sudo_password, &needs_password, message, sizeof(message));
         } else {
             if (!app->root_only) {
                 char user_unit[256] = "";
@@ -5673,7 +5620,7 @@ static void send_control_response(int fd, const char *query, const char *body) {
                     registry_store_free(&database);
                 }
                 if (has_user_install) {
-                    ok = install_bundled_app(app, "user", NULL, NULL, message, sizeof(message));
+                    ok = install_bundled_app(app, "user", bundled_stage_root, NULL, NULL, message, sizeof(message));
                     if (!ok) {
                         log_event("Failed to restore user install before removing root support for %s: %s", service_id, message);
                         send_action_response(fd, 500, false, message);
@@ -6012,100 +5959,64 @@ static int compare_versions(const char *installed, const char *available) {
     return 0;
 }
 
-static bool fetch_home_screen_available_version(const char *heartbeat, char *out, size_t out_size, char *message, size_t message_size) {
+static bool accept_home_screen_available_version(const char *provided_version, char *out, size_t out_size, char *message, size_t message_size) {
     if (out && out_size > 0) out[0] = '\0';
-    char base_url[2048];
-    if (!home_screen_base_url(base_url, sizeof(base_url))) {
-        snprintf(message, message_size, "No Outer Shell update URL is configured.");
+    if (!provided_version || !provided_version[0]) {
+        snprintf(message, message_size, "OuterShellBackend did not provide an available version.");
         return false;
     }
-    StringBuilder url = {0};
-    bool ok = sb_append(&url, base_url) &&
-              sb_append(&url, "/latest/version.txt?heartbeat=") &&
-              (append_url_encoded(&url, heartbeat && heartbeat[0] ? heartbeat : "manual"), true);
-    if (!ok) {
-        free(url.data);
-        snprintf(message, message_size, "Failed to build update URL.");
-        return false;
-    }
-
-    char quoted_url[4096];
-    shell_quote(url.data, quoted_url, sizeof(quoted_url));
-    free(url.data);
-    char command[8192];
-    snprintf(command,
-             sizeof(command),
-             "if command -v curl >/dev/null 2>&1; then "
-             "curl -fsSL %s; "
-             "elif command -v wget >/dev/null 2>&1; then "
-             "wget -qO- %s; "
-             "else echo 'curl or wget is required' >&2; exit 127; fi",
-             quoted_url,
-             quoted_url);
-    FILE *pipe = popen(command, "r");
-    if (!pipe) {
-        snprintf(message, message_size, "Failed to run update check: %s", strerror(errno));
-        return false;
-    }
-    char buffer[256] = "";
-    bool got = fgets(buffer, sizeof(buffer), pipe) != NULL;
-    int status = pclose(pipe);
-    if (status != 0 || !got) {
-        snprintf(message, message_size, "Could not fetch Outer Shell version.");
-        return false;
-    }
-    trim_whitespace_in_place(buffer);
-    if (!buffer[0]) {
+    snprintf(out, out_size, "%s", provided_version);
+    trim_whitespace_in_place(out);
+    if (!out[0]) {
         snprintf(message, message_size, "Outer Shell version file was empty.");
         return false;
     }
-    snprintf(out, out_size, "%s", buffer);
     return true;
 }
 
 static bool home_screen_update_available(char *available, size_t available_size) {
     if (!update_check_due()) return false;
-    char base_url[2048] = "";
-    if (!home_screen_base_url(base_url, sizeof(base_url))) return false;
-    char installed[128] = "";
-    char latest[128] = "";
-    char message[256] = "";
-    if (!installed_home_screen_version(installed, sizeof(installed))) return false;
-    if (!fetch_home_screen_available_version("daily", latest, sizeof(latest), message, sizeof(message))) {
-        log_event("Outer Shell update check failed: %s", message);
-        return false;
-    }
-    mark_update_check_completed();
-    if (compare_versions(installed, latest) < 0) {
-        snprintf(available, available_size, "%s", latest);
-        return true;
-    }
+    (void)available;
+    (void)available_size;
     return false;
 }
 
-static bool run_home_screen_install_script(const char *subcommand, char *message, size_t message_size) {
-    char base_url[2048];
-    if (!home_screen_base_url(base_url, sizeof(base_url))) {
-        snprintf(message, message_size, "No Outer Shell update URL is configured.");
+static bool run_home_screen_install_script(const char *subcommand,
+                                           const char *script_path,
+                                           const char *archive_path,
+                                           char *message,
+                                           size_t message_size) {
+    if (!script_path || !script_path[0]) {
+        snprintf(message, message_size, "OuterShellBackend did not provide an installer script.");
         return false;
     }
-    char script_url[4096];
-    snprintf(script_url, sizeof(script_url), "%s/latest/install.sh?heartbeat=manual", base_url);
-    char quoted_url[4096];
+    if (!archive_path || !archive_path[0]) {
+        snprintf(message, message_size, "OuterShellBackend did not provide an installer archive.");
+        return false;
+    }
+
+    struct stat st;
+    if (stat(script_path, &st) != 0 || !S_ISREG(st.st_mode)) {
+        snprintf(message, message_size, "Installer script is missing at %s.", script_path);
+        return false;
+    }
+    if (stat(archive_path, &st) != 0 || !S_ISREG(st.st_mode)) {
+        snprintf(message, message_size, "Installer archive is missing at %s.", archive_path);
+        return false;
+    }
+
+    char quoted_script_path[PATH_MAX + 8];
+    char quoted_archive_path[PATH_MAX + 8];
     char quoted_subcommand[64];
-    shell_quote(script_url, quoted_url, sizeof(quoted_url));
+    shell_quote(script_path, quoted_script_path, sizeof(quoted_script_path));
+    shell_quote(archive_path, quoted_archive_path, sizeof(quoted_archive_path));
     shell_quote(subcommand && subcommand[0] ? subcommand : "install", quoted_subcommand, sizeof(quoted_subcommand));
     char command[8192];
     snprintf(command,
              sizeof(command),
-             "if command -v curl >/dev/null 2>&1; then "
-             "curl -fsSL %s | sh -s -- %s; "
-             "elif command -v wget >/dev/null 2>&1; then "
-             "wget -qO- %s | sh -s -- %s; "
-             "else echo 'curl or wget is required' >&2; exit 127; fi",
-             quoted_url,
-             quoted_subcommand,
-             quoted_url,
+             "OUTERSHELL_INSTALL_ARCHIVE=%s sh %s %s",
+             quoted_archive_path,
+             quoted_script_path,
              quoted_subcommand);
 
     if (strcmp(subcommand, "update") == 0 || strcmp(subcommand, "uninstall") == 0) {
@@ -8310,6 +8221,7 @@ static bool install_bundled_user_systemd_unit_from_paths(const BundledAppDefinit
 
 static bool install_bundled_app_macos(const BundledAppDefinition *app,
                                       const char *scope,
+                                      const char *requested_stage_root,
                                       const char *sudo_password,
                                       bool *needs_password,
                                       char *message,
@@ -8322,9 +8234,15 @@ static bool remove_bundled_root_support(const BundledAppDefinition *app,
                                         size_t message_size);
 #endif
 
-static bool install_bundled_app(const BundledAppDefinition *app, const char *scope, const char *sudo_password, bool *needs_password, char *message, size_t message_size) {
+static bool install_bundled_app(const BundledAppDefinition *app,
+                                const char *scope,
+                                const char *requested_stage_root,
+                                const char *sudo_password,
+                                bool *needs_password,
+                                char *message,
+                                size_t message_size) {
 #ifdef __APPLE__
-    return install_bundled_app_macos(app, scope, sudo_password, needs_password, message, message_size);
+    return install_bundled_app_macos(app, scope, requested_stage_root, sudo_password, needs_password, message, message_size);
 #else
     if (needs_password) *needs_password = false;
     if (!app) {
@@ -8347,7 +8265,7 @@ static bool install_bundled_app(const BundledAppDefinition *app, const char *sco
     }
 
     char stage_root[PATH_MAX];
-    if (!resolve_bundled_app_stage_root(app, stage_root, sizeof(stage_root), message, message_size)) {
+    if (!resolve_bundled_app_stage_root(app, requested_stage_root, stage_root, sizeof(stage_root), message, message_size)) {
         return false;
     }
     char source_binary[PATH_MAX];
@@ -9159,6 +9077,7 @@ static bool make_bundled_launchd_plist(const char *label,
 
 static bool install_bundled_app_macos(const BundledAppDefinition *app,
                                       const char *scope,
+                                      const char *requested_stage_root,
                                       const char *sudo_password,
                                       bool *needs_password,
                                       char *message,
@@ -9171,7 +9090,7 @@ static bool install_bundled_app_macos(const BundledAppDefinition *app,
 
     bool install_as_root = scope && strcmp(scope, "system") == 0;
     char stage_root[PATH_MAX];
-    if (!resolve_bundled_app_stage_root(app, stage_root, sizeof(stage_root), message, message_size)) {
+    if (!resolve_bundled_app_stage_root(app, requested_stage_root, stage_root, sizeof(stage_root), message, message_size)) {
         return false;
     }
     char source_binary[PATH_MAX];
@@ -11428,15 +11347,11 @@ static void run_root_helper_api_loop(int api_listener) {
 #endif
 
 static void outershelld_usage(const char *program) {
-    fprintf(stderr, "Usage: %s [--api-socket-path PATH] [--database PATH] [--system-database PATH] [--bundled-apps-dir DIR] [--app-base-url URL] [--public-base-url URL] [--stay-alive] [--root-helper --root-helper-owner-uid UID]\n", program);
+    fprintf(stderr, "Usage: %s [--api-socket-path PATH] [--database PATH] [--system-database PATH] [--bundled-apps-dir DIR] [--public-base-url URL] [--stay-alive] [--root-helper --root-helper-owner-uid UID]\n", program);
 }
 
 static void initialize_runtime_paths(char *api_socket_path, size_t api_socket_path_size) {
-    const char *app_base_url = getenv("OUTER_SHELL_APP_BASE_URL");
     const char *public_base_url = getenv("OUTER_SHELL_PUBLIC_BASE_URL");
-    if (app_base_url && app_base_url[0]) {
-        snprintf(g_bundled_apps_base_url, sizeof(g_bundled_apps_base_url), "%s", app_base_url);
-    }
     if (public_base_url && public_base_url[0]) {
         snprintf(g_home_screen_public_base_url, sizeof(g_home_screen_public_base_url), "%s", public_base_url);
     }
@@ -11482,7 +11397,7 @@ int OuterShelldMain(int argc, char **argv) {
         } else if (strcmp(argv[i], "--bundled-apps-dir") == 0 && i + 1 < argc) {
             expand_tilde_path(argv[++i], g_bundled_apps_directory, sizeof(g_bundled_apps_directory));
         } else if (strcmp(argv[i], "--app-base-url") == 0 && i + 1 < argc) {
-            snprintf(g_bundled_apps_base_url, sizeof(g_bundled_apps_base_url), "%s", argv[++i]);
+            i++;
         } else if (strcmp(argv[i], "--public-base-url") == 0 && i + 1 < argc) {
             snprintf(g_home_screen_public_base_url, sizeof(g_home_screen_public_base_url), "%s", argv[++i]);
         } else if (strcmp(argv[i], "--database") == 0 && i + 1 < argc) {

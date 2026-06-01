@@ -115,6 +115,16 @@ download() {
     fi
 }
 
+stage_archive() {
+    url="$1"
+    out="$2"
+    if [ -n "${OUTERSHELL_INSTALL_ARCHIVE:-}" ]; then
+        cp "$OUTERSHELL_INSTALL_ARCHIVE" "$out"
+    else
+        download "$url" "$out"
+    fi
+}
+
 timestamp() {
     date -u '+%Y-%m-%dT%H:%M:%SZ'
 }
@@ -138,6 +148,7 @@ if [ "$os_name" = "Darwin" ]; then
     launch_agent_dir="$HOME/Library/LaunchAgents"
     plist_path="$launch_agent_dir/org.outershell.OuterShell.plist"
     socket_path="$(getconf DARWIN_USER_TEMP_DIR)org.outershell.OuterShell"
+    api_socket_path="$(getconf DARWIN_USER_TEMP_DIR)outershelld-api"
     log_dir="$HOME/Library/Logs/org.outershell.OuterShell"
     log_path="$log_dir/output.log"
     service_id="org.outershell.OuterShell"
@@ -173,21 +184,19 @@ if [ "$os_name" = "Darwin" ]; then
     }
 
     bootstrap_outer_shell() {
-        if launchctl bootstrap "gui/$(id -u)" "$plist_path"; then
-            return 0
-        fi
-        first_error="$(launchctl bootstrap "gui/$(id -u)" "$plist_path" 2>&1 >/dev/null || true)"
-        unload_outer_shell
-        rm -f "$socket_path"
-        if launchctl bootstrap "gui/$(id -u)" "$plist_path"; then
-            return 0
-        fi
-        second_error="$(launchctl bootstrap "gui/$(id -u)" "$plist_path" 2>&1 >/dev/null || true)"
-        if [ -n "$first_error" ]; then
-            printf '%s\n' "$first_error" >&2
-        fi
-        if [ -n "$second_error" ]; then
-            printf '%s\n' "$second_error" >&2
+        attempts=20
+        last_error=""
+        while [ "$attempts" -gt 0 ]; do
+            if last_error="$(launchctl bootstrap "gui/$(id -u)" "$plist_path" 2>&1)"; then
+                return 0
+            fi
+            unload_outer_shell
+            rm -f "$socket_path" "$api_socket_path"
+            sleep 0.1
+            attempts=$((attempts - 1))
+        done
+        if [ -n "$last_error" ]; then
+            printf '%s\n' "$last_error" >&2
         fi
         return 1
     }
@@ -209,7 +218,7 @@ if [ "$os_name" = "Darwin" ]; then
 
     mkdir -p "$install_root" "$outershell_home/bin" "$launch_agent_dir" "$log_dir"
     archive_path="$(mktemp)"
-    download "${public_base_url%/}/latest/outer-shell-macos.tar.gz?v=__ASSET_VERSION__" "$archive_path"
+    stage_archive "${public_base_url%/}/latest/outer-shell-macos.tar.gz?v=__ASSET_VERSION__" "$archive_path"
     rm -rf "$install_root"
     mkdir -p "$install_root" "$outershell_home/bin" "$log_dir"
     tar -xzf "$archive_path" -C "$install_root" --strip-components=1
@@ -222,7 +231,7 @@ if [ "$os_name" = "Darwin" ]; then
     touch "$log_path"
 
     unload_outer_shell
-    rm -f "$socket_path"
+    rm -f "$socket_path" "$api_socket_path"
 
     app_executable="$install_root/Outer Shell.app/Contents/MacOS/Outer Shell"
     bundles_dir="$install_root/bundles"
@@ -279,6 +288,15 @@ EOF
 
     cleanup_legacy_home_screen
     bootstrap_outer_shell
+    launchctl kickstart -k "gui/$(id -u)/$service_id" >/dev/null 2>&1 || true
+    attempts=50
+    while [ "$attempts" -gt 0 ]; do
+        if [ -S "$api_socket_path" ]; then
+            break
+        fi
+        sleep 0.1
+        attempts=$((attempts - 1))
+    done
     OUTERSHELL_HOME="$outershell_home" "$outerctl_path" backend upsert --backend "$service_id" --name "$display_name" --launchd-plist "$plist_path" --owns-plist true
     OUTERSHELL_HOME="$outershell_home" "$outerctl_path" app clear --backend "$service_id"
     OUTERSHELL_HOME="$outershell_home" "$outerctl_path" app add --backend "$service_id" --socket-path "$socket_path" --name "$display_name" --url "$socket_path" --icon-path "$install_root/app-icon.png"
@@ -364,7 +382,7 @@ fi
 mkdir -p "$install_root" "$outershell_home/bin" "$unit_dir" "$log_dir"
 cleanup_legacy_home_screen
 archive_path="$(mktemp)"
-download "${public_base_url%/}/latest/outer-shell-${arch}.tar.gz?v=__ASSET_VERSION__" "$archive_path"
+stage_archive "${public_base_url%/}/latest/outer-shell-${arch}.tar.gz?v=__ASSET_VERSION__" "$archive_path"
 rm -f "$install_root/outershelld" "$install_root/OuterShellBackend"
 tar -xzf "$archive_path" -C "$install_root" --strip-components=1
 rm -f "$archive_path"
@@ -383,7 +401,7 @@ chmod 0755 "$runner_path"
 
 cat > "$broker_runner_path" <<EOF
 #!/bin/sh
-exec "$install_root/outershelld" --api-socket-path "\${1:-$runtime_dir/outershelld-api}" --bundled-apps-dir "$install_root/bundled-apps" --app-base-url "$app_base_url" --public-base-url "$public_base_url" >> "$broker_log_path" 2>&1
+exec "$install_root/outershelld" --api-socket-path "\${1:-$runtime_dir/outershelld-api}" --bundled-apps-dir "$install_root/bundled-apps" --public-base-url "$public_base_url" >> "$broker_log_path" 2>&1
 EOF
 chmod 0755 "$broker_runner_path"
 
