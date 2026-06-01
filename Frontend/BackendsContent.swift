@@ -6235,6 +6235,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         var operationByItemID: [String: String] = [:]
         var items: [OuterframeContextMenuItem] = []
         if backend.isBackendsSelf {
+            operationByItemID["showLogs"] = "showLogs:\(backend.serviceID)"
+            items.append(OuterframeContextMenuItem(id: "showLogs",
+                                                   title: "View Logs for Outer Shell",
+                                                   isEnabled: true))
             operationByItemID["checkUpdate"] = "checkUpdate"
             items.append(OuterframeContextMenuItem(id: "checkUpdate",
                                                    title: "Check for Updates",
@@ -6405,6 +6409,12 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         guard let menuAction = pendingMenuActions.removeValue(forKey: menuID),
               let operation = menuAction.operationByItemID[itemID],
               let backend = backends.first(where: { $0.serviceID == menuAction.serviceID }) else {
+            return
+        }
+        if operation.hasPrefix("showLogs:") {
+            let serviceID = String(operation.dropFirst("showLogs:".count))
+            guard let backend = backends.first(where: { $0.serviceID == serviceID }) else { return }
+            showLogs(for: backend)
             return
         }
         performControlAction(for: backend, operation: operation)
