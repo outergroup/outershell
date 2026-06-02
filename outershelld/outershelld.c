@@ -9915,7 +9915,7 @@ static void send_recipes_response(int fd) {
          append_field_payload(&fields, "name", "Display Name", "Jupyter Lab", "text", "Jupyter Lab", NULL, NULL, 0) &&
          append_field_payload(&fields, "identifier", "Identifier", "jupyter", "text", "jupyter", NULL, NULL, 0) &&
          append_recipe_payload(&recipes, "jupyter", "Jupyter Lab",
-                               "Create a script that launches Jupyter Lab and finds its browser URL with jupyter server list.",
+                               "Create a script that launches Jupyter Lab and finds its browser URL with `jupyter server list`.",
                                &fields);
     binary_payload_list_free(&fields);
     fields = (BinaryPayloadList){0};
@@ -9927,7 +9927,7 @@ static void send_recipes_response(int fd) {
          append_field_payload(&fields, "name", "Display Name", "Jupyter Lab", "text", "Jupyter Lab", NULL, NULL, 0) &&
          append_field_payload(&fields, "identifier", "Identifier", "jupyter-uv", "text", "jupyter-uv", NULL, NULL, 0) &&
          append_recipe_payload(&recipes, "jupyter-uv", "Jupyter Lab (uv or .venv)",
-                               "Create a script that launches Jupyter Lab from .venv and finds its browser URL with jupyter server list.",
+                               "Create a script that launches Jupyter Lab from .venv and finds its browser URL with `jupyter server list`.",
                                &fields);
     binary_payload_list_free(&fields);
     fields = (BinaryPayloadList){0};
