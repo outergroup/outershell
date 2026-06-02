@@ -555,6 +555,7 @@ private struct PendingPasswordAction {
 private struct IconMatchState {
     let frame: CGRect
     let image: NSImage?
+    let symbolName: String?
     let title: String
 }
 
@@ -1505,6 +1506,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             let frame = state.frame.offsetBy(dx: 0, dy: deltaY)
             iconMatchStates[key] = IconMatchState(frame: frame,
                                                   image: state.image,
+                                                  symbolName: state.symbolName,
                                                   title: state.title)
             iconMatchLayers[key]?.frame = frame
         }
@@ -1791,7 +1793,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
             recordMatchedIcon(key: item.iconKey,
                               frame: rootLayer.convert(iconFrame, from: appsScrollContentLayer),
-                              image: item.iconImage,
+                              image: launcherIconImage(for: item),
+                              symbolName: launcherIconSymbolName(for: item),
+                              symbolColor: appIconTintColor(for: item.backend),
                               title: item.displayName)
             visibleIconKeys.insert(item.iconKey)
             let titleFrame = CGRect(x: frame.minX, y: frame.minY + 26, width: itemWidth, height: 28)
@@ -2085,9 +2089,11 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         icon.frame = iconFrame
         icon.contentsGravity = .resizeAspect
         icon.contentsScale = 2
-        if let symbolName = catalogIconSymbolName(for: backend),
+        if let symbolName = appIconSymbolName(for: backend),
            !symbolName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            icon.contents = symbolCGImage(named: symbolName, pointSize: symbolPointSize)
+            icon.contents = symbolCGImage(named: symbolName,
+                                          pointSize: symbolPointSize,
+                                          color: appIconTintColor(for: backend))
         } else {
             icon.contents = letterIconCGImage(for: backend.displayName)
         }
@@ -2184,7 +2190,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                    height: iconSize)
             recordMatchedIcon(key: item.iconKey,
                               frame: rootLayer.convert(iconFrame, from: appsScrollContentLayer),
-                              image: item.iconImage,
+                              image: launcherIconImage(for: item),
+                              symbolName: launcherIconSymbolName(for: item),
+                              symbolColor: appIconTintColor(for: item.backend),
                               title: item.displayName)
             visibleIconKeys.insert(item.iconKey)
             let hasRunningBadges = !runningEndpoints(for: item).isEmpty
@@ -2232,7 +2240,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                y: appsPoint.y - iconSize / 2 + 12,
                                width: iconSize,
                                height: iconSize)
-        let icon = makeLauncherIconLayer(image: drag.item.iconImage,
+        let icon = makeLauncherIconLayer(image: launcherIconImage(for: drag.item),
+                                         symbolName: launcherIconSymbolName(for: drag.item),
+                                         symbolColor: appIconTintColor(for: drag.item.backend),
                                          title: drag.item.displayName,
                                          iconSize: iconSize)
         icon.frame = iconFrame
@@ -2286,25 +2296,37 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                                               height: iconSize),
                                                        from: rowLayer),
                               image: row.frontend?.iconImage,
+                              symbolName: appIconSymbolName(for: row.backend),
+                              symbolColor: appIconTintColor(for: row.backend),
                               title: title)
             visibleIconKeys.insert(key)
         }
         return 48
     }
 
-    private func makeLauncherIconLayer(image: NSImage?, title: String, iconSize: CGFloat) -> CALayer {
+    private func makeLauncherIconLayer(image: NSImage?,
+                                       symbolName: String?,
+                                       symbolColor: NSColor = .controlAccentColor,
+                                       title: String,
+                                       iconSize: CGFloat) -> CALayer {
         let icon = CALayer()
         icon.cornerRadius = iconCornerRadius(for: iconSize)
         icon.masksToBounds = true
         icon.contentsGravity = .resizeAspect
         icon.contentsScale = 2
-        configureLauncherIconLayer(icon, image: image, symbolName: nil, title: title, iconSize: iconSize)
+        configureLauncherIconLayer(icon,
+                                   image: image,
+                                   symbolName: symbolName,
+                                   symbolColor: symbolColor,
+                                   title: title,
+                                   iconSize: iconSize)
         return icon
     }
 
     private func configureLauncherIconLayer(_ icon: CALayer,
                                             image: NSImage?,
                                             symbolName: String?,
+                                            symbolColor: NSColor = .controlAccentColor,
                                             title: String,
                                             iconSize: CGFloat) {
         icon.cornerRadius = iconCornerRadius(for: iconSize)
@@ -2314,7 +2336,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             icon.backgroundColor = resolvedCGColor(.clear)
         } else if let symbolName,
                   !symbolName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-                  let cgImage = symbolAppIconCGImage(named: symbolName) {
+                  let cgImage = symbolAppIconCGImage(named: symbolName, color: symbolColor) {
             icon.contents = cgImage
             icon.backgroundColor = resolvedCGColor(.clear)
         } else {
@@ -2362,19 +2384,14 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         return cgImage(for: image)
     }
 
-    private func symbolAppIconCGImage(named symbolName: String) -> CGImage? {
+    private func symbolAppIconCGImage(named symbolName: String, color: NSColor = .controlAccentColor) -> CGImage? {
         let imageSize: CGFloat = 96
         let image = NSImage(size: NSSize(width: imageSize, height: imageSize))
         image.lockFocus()
         withEffectiveAppearance {
-            NSColor.controlAccentColor.withAlphaComponent(0.18).setFill()
-            NSBezierPath(roundedRect: NSRect(x: 0, y: 0, width: imageSize, height: imageSize),
-                         xRadius: 22,
-                         yRadius: 22).fill()
-
             if let symbol = NSImage(systemSymbolName: symbolName, accessibilityDescription: nil)?
-                .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 42, weight: .regular)
-                    .applying(NSImage.SymbolConfiguration(hierarchicalColor: .controlAccentColor))) {
+                .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 84, weight: .regular)
+                    .applying(NSImage.SymbolConfiguration(hierarchicalColor: color))) {
                 let drawSize = symbol.size
                 symbol.draw(in: NSRect(x: floor((imageSize - drawSize.width) / 2),
                                        y: floor((imageSize - drawSize.height) / 2),
@@ -2393,18 +2410,33 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         iconSize >= 44 ? 13 : 5
     }
 
-    private func recordMatchedIcon(key: String, frame: CGRect, image: NSImage?, title: String) {
+    private func recordMatchedIcon(key: String,
+                                   frame: CGRect,
+                                   image: NSImage?,
+                                   symbolName: String?,
+                                   symbolColor: NSColor = .controlAccentColor,
+                                   title: String) {
         let existingLayer = iconMatchLayers[key]
-        let layer = existingLayer ?? makeLauncherIconLayer(image: image, title: title, iconSize: frame.width)
+        let layer = existingLayer ?? makeLauncherIconLayer(image: image,
+                                                           symbolName: symbolName,
+                                                           symbolColor: symbolColor,
+                                                           title: title,
+                                                           iconSize: frame.width)
         if layer.superlayer == nil {
             iconTransitionLayer.addSublayer(layer)
         }
-        configureLauncherIconLayer(layer, image: image, symbolName: nil, title: title, iconSize: frame.width)
+        configureLauncherIconLayer(layer,
+                                   image: image,
+                                   symbolName: symbolName,
+                                   symbolColor: symbolColor,
+                                   title: title,
+                                   iconSize: frame.width)
         layer.frame = frame
         layer.isHidden = false
         layer.opacity = 1
         iconMatchStates[key] = IconMatchState(frame: frame,
                                               image: image,
+                                              symbolName: symbolName,
                                               title: title)
         iconMatchLayers[key] = layer
     }
@@ -6856,7 +6888,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         .sorted { $0.backend.displayName.localizedCaseInsensitiveCompare($1.backend.displayName) == .orderedAscending }
     }
 
-    private func catalogIconSymbolName(for backend: BackendRecord) -> String? {
+    private func appIconSymbolName(for backend: BackendRecord) -> String? {
         if let symbolName = backend.iconSymbolName,
            !symbolName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             return symbolName
@@ -6874,6 +6906,28 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             return "chart.bar.xaxis"
         default:
             return nil
+        }
+    }
+
+    private func appIconTintColor(for backend: BackendRecord) -> NSColor {
+        switch backend.serviceID {
+        case "dev.outergroup.Firehose":
+            return NSColor(calibratedRed: 1.0, green: 0.53, blue: 0.13, alpha: 1.0)
+        default:
+            return .controlAccentColor
+        }
+    }
+
+    private func launcherIconSymbolName(for item: AppLauncherItem) -> String? {
+        appIconSymbolName(for: item.backend)
+    }
+
+    private func launcherIconImage(for item: AppLauncherItem) -> NSImage? {
+        switch item.backend.serviceID {
+        case "dev.outergroup.Top", "dev.outergroup.Plaintext":
+            return nil
+        default:
+            return item.iconImage
         }
     }
 
@@ -7020,6 +7074,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 item.backend.serviceID,
                 item.backend.serviceScope,
                 item.backend.displayName,
+                item.backend.iconSymbolName ?? "",
                 item.frontend.url,
                 item.frontend.id,
                 item.frontend.name,
@@ -7843,7 +7898,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         return image.cgImage(forProposedRect: &rect, context: nil, hints: nil)
     }
 
-    private func symbolCGImage(named symbolName: String, pointSize: CGFloat) -> CGImage? {
+    private func symbolCGImage(named symbolName: String,
+                               pointSize: CGFloat,
+                               color: NSColor = .controlAccentColor) -> CGImage? {
         var output: CGImage?
         withEffectiveAppearance {
             let scale: CGFloat = 2
@@ -7854,7 +7911,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             }
             let canvas = NSImage(size: NSSize(width: pixelSize, height: pixelSize))
             canvas.lockFocus()
-            NSColor.controlAccentColor.setFill()
+            color.setFill()
             NSRect(origin: .zero, size: canvas.size).fill()
             image.draw(in: NSRect(origin: .zero, size: canvas.size),
                        from: .zero,
