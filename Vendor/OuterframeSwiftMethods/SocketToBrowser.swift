@@ -97,6 +97,22 @@ actor SocketToBrowser {
         enqueueWrite(data)
     }
 
+    nonisolated func sendBlocking(_ data: Data) throws {
+        guard !data.isEmpty else { return }
+        var result: Result<Void, Error> = .success(())
+        queue.sync {
+            assumeIsolatedHack { actor in
+                do {
+                    try actor.writeImmediatelyOrEnqueue(data)
+                    result = .success(())
+                } catch {
+                    result = .failure(error)
+                }
+            }
+        }
+        try result.get()
+    }
+
     private func handleReadable() {
         guard socketFD >= 0 else { return }
 
@@ -154,6 +170,44 @@ actor SocketToBrowser {
         writeSource?.safeResume()
     }
 
+    private func writeImmediatelyOrEnqueue(_ data: Data) throws {
+        guard socketFD >= 0 else {
+            throw SocketToBrowserError.disconnected
+        }
+
+        guard pendingWriteBuffer.isEmpty else {
+            pendingWriteBuffer.append(data)
+            writeSource?.safeResume()
+            return
+        }
+
+        let written = data.withUnsafeBytes { buffer -> Int in
+            guard let baseAddress = buffer.baseAddress else { return 0 }
+            return write(socketFD, baseAddress, buffer.count)
+        }
+
+        if written == data.count {
+            return
+        }
+
+        if written > 0 {
+            pendingWriteBuffer.append(data.subdata(in: written..<data.count))
+            writeSource?.safeResume()
+            return
+        }
+
+        if written == -1 && (errno == EWOULDBLOCK || errno == EAGAIN) {
+            pendingWriteBuffer.append(data)
+            writeSource?.safeResume()
+            return
+        }
+
+        let code = errno
+        cleanupConnection()
+        notifyClosed()
+        throw SocketToBrowserError.writeFailed(code)
+    }
+
     private func cleanupConnection() {
         readSource?.cancel()
         readSource = nil
@@ -203,4 +257,5 @@ actor SocketToBrowser {
 
 enum SocketToBrowserError: Error {
     case disconnected
+    case writeFailed(Int32)
 }

@@ -836,6 +836,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private var sudoPasswordMessage = ""
     private var pendingFilePicker: PendingFilePicker?
     private static let filePickerFilenameKey = "__filePickerFilename"
+    private var accessibilityNotificationScheduled = false
 
     private let rootLayer = CALayer()
     private let toolbarLayer = CALayer()
@@ -1062,7 +1063,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
         case .accessibilitySnapshotRequest(let requestID):
             outerframeHost.sendAccessibilitySnapshotResponse(requestID: requestID,
-                                                             snapshot: OuterframeAccessibilitySnapshot.notImplementedSnapshot())
+                                                             snapshot: buildAccessibilitySnapshot())
 
         case .shutdown:
             stopEventWatch()
@@ -1337,6 +1338,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         guard !didRegisterLayer, let registerLayer = appConnection.registerLayer else { return }
         registerLayer(rootLayer)
         didRegisterLayer = true
+        notifyAccessibilityLayoutChanged()
     }
 
     private func withEffectiveAppearance(_ body: () -> Void) {
@@ -1418,6 +1420,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 updateStatusText()
                 renderInstallPromptIfNeeded(width: width, height: height)
                 renderPasswordPromptIfNeeded(width: width, height: height)
+                notifyAccessibilityLayoutChanged()
             }
         }
     }
@@ -3862,6 +3865,492 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             button.frame = choiceFrame
             addCreateFormSublayer(button)
             x += width + 8
+        }
+    }
+
+    private func buildAccessibilitySnapshot() -> OuterframeAccessibilitySnapshot {
+        var nextIdentifier: UInt32 = 1
+        var children: [OuterframeAccessibilityNode] = []
+
+        if pendingInstallBackend != nil {
+            children.append(contentsOf: buildInstallPromptAccessibilityNodes(nextIdentifier: &nextIdentifier))
+        } else if pendingPasswordAction != nil {
+            children.append(contentsOf: buildPasswordPromptAccessibilityNodes(nextIdentifier: &nextIdentifier))
+        } else if pendingFilePicker != nil {
+            children.append(contentsOf: buildFilePickerAccessibilityNodes(nextIdentifier: &nextIdentifier))
+        } else {
+            children.append(contentsOf: buildToolbarAccessibilityNodes(nextIdentifier: &nextIdentifier))
+            switch mode {
+            case .apps:
+                children.append(contentsOf: buildAppsAccessibilityNodes(nextIdentifier: &nextIdentifier))
+                children.append(contentsOf: buildLogAccessibilityNodes(nextIdentifier: &nextIdentifier))
+            case .create:
+                children.append(contentsOf: buildCreateAccessibilityNodes(nextIdentifier: &nextIdentifier))
+            }
+        }
+
+        let root = OuterframeAccessibilityNode(identifier: 0,
+                                               role: .container,
+                                               frame: rootLayer.bounds,
+                                               label: "Outer Shell",
+                                               children: children)
+        return OuterframeAccessibilitySnapshot(rootNodes: [root])
+    }
+
+    private func accessibilityNode(nextIdentifier: inout UInt32,
+                                   role: OuterframeAccessibilityRole,
+                                   frame: CGRect,
+                                   label: String? = nil,
+                                   value: String? = nil,
+                                   hint: String? = nil,
+                                   children: [OuterframeAccessibilityNode] = [],
+                                   rowCount: Int? = nil,
+                                   columnCount: Int? = nil,
+                                   isEnabled: Bool = true) -> OuterframeAccessibilityNode {
+        let identifier = nextIdentifier
+        nextIdentifier = nextIdentifier == UInt32.max ? 1 : nextIdentifier + 1
+        return OuterframeAccessibilityNode(identifier: identifier,
+                                           role: role,
+                                           frame: frame,
+                                           label: label,
+                                           value: value,
+                                           hint: hint,
+                                           children: children,
+                                           rowCount: rowCount,
+                                           columnCount: columnCount,
+                                           isEnabled: isEnabled)
+    }
+
+    private func accessibilityFrame(_ frame: CGRect,
+                                    from layer: CALayer,
+                                    clippedBy clipFrame: CGRect? = nil) -> CGRect? {
+        var rootFrame = rootLayer.convert(frame, from: layer)
+        if let clipFrame {
+            rootFrame = rootFrame.intersection(clipFrame)
+        }
+        guard !rootFrame.isNull,
+              rootFrame.width > 0.5,
+              rootFrame.height > 0.5 else {
+            return nil
+        }
+        return rootFrame
+    }
+
+    private func accessibilityFrame(_ frame: CGRect,
+                                    clippedBy clipFrame: CGRect? = nil) -> CGRect? {
+        accessibilityFrame(frame, from: rootLayer, clippedBy: clipFrame)
+    }
+
+    private func accessibilityPreview(_ text: String, maximumLength: Int = 4096) -> String {
+        if text.count <= maximumLength {
+            return text
+        }
+        let end = text.index(text.startIndex, offsetBy: maximumLength)
+        return String(text[..<end])
+    }
+
+    private func buildToolbarAccessibilityNodes(nextIdentifier: inout UInt32) -> [OuterframeAccessibilityNode] {
+        var nodes: [OuterframeAccessibilityNode] = []
+        if let status = statusLayer.string as? String,
+           !status.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+           let frame = accessibilityFrame(statusLayer.frame, from: toolbarLayer) {
+            nodes.append(accessibilityNode(nextIdentifier: &nextIdentifier,
+                                           role: .staticText,
+                                           frame: frame,
+                                           label: status))
+        }
+        if !outerShellActionLayer.isHidden,
+           let frame = accessibilityFrame(outerShellActionFrame, from: toolbarLayer) {
+            nodes.append(accessibilityNode(nextIdentifier: &nextIdentifier,
+                                           role: .button,
+                                           frame: frame,
+                                           label: "Outer Shell Actions"))
+        }
+        return nodes
+    }
+
+    private func buildAppsAccessibilityNodes(nextIdentifier: inout UInt32) -> [OuterframeAccessibilityNode] {
+        var nodes: [OuterframeAccessibilityNode] = []
+        let clipFrame = rootLayer.convert(appsLayer.bounds, from: appsLayer)
+
+        for card in appCardFrames {
+            guard let frame = accessibilityFrame(card.frame, from: appsScrollContentLayer, clippedBy: clipFrame) else { continue }
+            let status = endpointIsRunning(card.item.primaryEndpoint) ? "Running" : "Not running"
+            nodes.append(accessibilityNode(nextIdentifier: &nextIdentifier,
+                                           role: .button,
+                                           frame: frame,
+                                           label: "Open \(card.item.displayName)",
+                                           value: status,
+                                           hint: card.item.subtitle))
+        }
+
+        for badge in appBadgeFrames {
+            guard let frame = accessibilityFrame(badge.frame, from: appsScrollContentLayer, clippedBy: clipFrame) else { continue }
+            let scope = badge.endpoint.backend.serviceScope == "system" ? " as root" : ""
+            nodes.append(accessibilityNode(nextIdentifier: &nextIdentifier,
+                                           role: .button,
+                                           frame: frame,
+                                           label: "Open \(badge.displayName)\(scope)",
+                                           value: "Running"))
+        }
+
+        if let frame = accessibilityFrame(addAppFrame, from: appsScrollContentLayer, clippedBy: clipFrame) {
+            nodes.append(accessibilityNode(nextIdentifier: &nextIdentifier,
+                                           role: .button,
+                                           frame: frame,
+                                           label: "Add app"))
+        }
+
+        if nodes.isEmpty,
+           let frame = accessibilityFrame(appsLayer.bounds, from: appsLayer) {
+            let message = isLoadingBackends ? "Loading apps" : (backendError.isEmpty ? "No apps available" : backendError)
+            nodes.append(accessibilityNode(nextIdentifier: &nextIdentifier,
+                                           role: .staticText,
+                                           frame: frame,
+                                           label: message))
+        }
+        return nodes
+    }
+
+    private func buildLogAccessibilityNodes(nextIdentifier: inout UInt32) -> [OuterframeAccessibilityNode] {
+        guard mode == .apps,
+              selectedServiceID != nil,
+              !logHeaderLayer.isHidden else {
+            return []
+        }
+
+        var nodes: [OuterframeAccessibilityNode] = []
+        if let frame = accessibilityFrame(logHeaderDetailFrame, from: logHeaderLayer) {
+            nodes.append(accessibilityNode(nextIdentifier: &nextIdentifier,
+                                           role: .staticText,
+                                           frame: frame,
+                                           label: logHeaderDetailText()))
+        }
+        if let frame = accessibilityFrame(logSelectorFrame, from: logHeaderLayer),
+           let backend = selectedBackend(),
+           backend.logFiles.count > 1 {
+            nodes.append(accessibilityNode(nextIdentifier: &nextIdentifier,
+                                           role: .button,
+                                           frame: frame,
+                                           label: "Choose log"))
+        }
+        if let frame = accessibilityFrame(logDismissFrame, from: logHeaderLayer) {
+            nodes.append(accessibilityNode(nextIdentifier: &nextIdentifier,
+                                           role: .button,
+                                           frame: frame,
+                                           label: "Close logs"))
+        }
+
+        let logText = currentLogText()
+        if !logText.isEmpty,
+           let frame = accessibilityFrame(logRowsClipLayer.bounds, from: logRowsClipLayer) {
+            nodes.append(accessibilityNode(nextIdentifier: &nextIdentifier,
+                                           role: .staticText,
+                                           frame: frame,
+                                           label: "Log output",
+                                           value: accessibilityPreview(logText)))
+        }
+        return nodes
+    }
+
+    private func buildCreateAccessibilityNodes(nextIdentifier: inout UInt32) -> [OuterframeAccessibilityNode] {
+        var nodes: [OuterframeAccessibilityNode] = []
+        let clipFrame = rootLayer.convert(createContentClipFrame, from: createLayer)
+
+        if let frame = accessibilityFrame(createDismissFrame, from: createLayer) {
+            nodes.append(accessibilityNode(nextIdentifier: &nextIdentifier,
+                                           role: .button,
+                                           frame: frame,
+                                           label: "Close Add Apps"))
+        }
+
+        for section in createSectionFrames {
+            guard let frame = accessibilityFrame(section.frame, from: createLayer, clippedBy: clipFrame) else { continue }
+            nodes.append(accessibilityNode(nextIdentifier: &nextIdentifier,
+                                           role: .button,
+                                           frame: frame,
+                                           label: createSectionAccessibilityLabel(section.section),
+                                           value: selectedCreateSection == section.section ? "Selected" : nil))
+        }
+
+        for app in bundledAppInstallFrames {
+            guard let frame = accessibilityFrame(app.frame, from: createLayer, clippedBy: clipFrame) else { continue }
+            nodes.append(accessibilityNode(nextIdentifier: &nextIdentifier,
+                                           role: .button,
+                                           frame: frame,
+                                           label: "Install \(app.backend.displayName)"))
+        }
+
+        for recipe in recipeFrames {
+            guard let frame = accessibilityFrame(recipe.frame, from: createLayer, clippedBy: clipFrame),
+                  let record = recipes.first(where: { $0.identifier == recipe.recipeID }) else { continue }
+            nodes.append(accessibilityNode(nextIdentifier: &nextIdentifier,
+                                           role: .button,
+                                           frame: frame,
+                                           label: record.displayName,
+                                           value: selectedRecipeID == recipe.recipeID ? "Selected" : nil,
+                                           hint: record.summary))
+        }
+
+        for field in createFieldFrames {
+            guard field.key != Self.filePickerFilenameKey,
+                  let frame = accessibilityFrame(field.frame, from: createLayer, clippedBy: clipFrame) else { continue }
+            let description = createFieldAccessibilityDescription(key: field.key)
+            nodes.append(accessibilityNode(nextIdentifier: &nextIdentifier,
+                                           role: .textField,
+                                           frame: frame,
+                                           label: description.label,
+                                           value: description.value,
+                                           hint: description.hint))
+        }
+
+        for choice in createChoiceFrames {
+            guard let frame = accessibilityFrame(choice.frame, from: createLayer, clippedBy: clipFrame) else { continue }
+            nodes.append(accessibilityNode(nextIdentifier: &nextIdentifier,
+                                           role: .button,
+                                           frame: frame,
+                                           label: createChoiceAccessibilityTitle(key: choice.key, value: choice.value),
+                                           value: createValue(forCreateKey: choice.key) == choice.value ? "Selected" : nil))
+        }
+
+        for suggestion in createSuggestionFrames {
+            guard let frame = accessibilityFrame(suggestion.frame, from: createLayer, clippedBy: clipFrame) else { continue }
+            let field = createFieldAccessibilityDescription(key: suggestion.key)
+            nodes.append(accessibilityNode(nextIdentifier: &nextIdentifier,
+                                           role: .button,
+                                           frame: frame,
+                                           label: "Use \(suggestion.value)",
+                                           hint: field.label))
+        }
+
+        for select in createDirectorySelectFrames {
+            guard let frame = accessibilityFrame(select.frame, from: createLayer, clippedBy: clipFrame) else { continue }
+            let field = createFieldAccessibilityDescription(key: select.key)
+            nodes.append(accessibilityNode(nextIdentifier: &nextIdentifier,
+                                           role: .button,
+                                           frame: frame,
+                                           label: "Select \(field.label)"))
+        }
+
+        if let frame = accessibilityFrame(bashIconSelectFrame, from: createLayer, clippedBy: clipFrame) {
+            nodes.append(accessibilityNode(nextIdentifier: &nextIdentifier,
+                                           role: .button,
+                                           frame: frame,
+                                           label: "Select icon"))
+        }
+
+        if let frame = accessibilityFrame(createButtonFrame, from: createLayer, clippedBy: clipFrame) {
+            let title = selectedCreateSection == .bashCommands ? "Save" : "Create"
+            nodes.append(accessibilityNode(nextIdentifier: &nextIdentifier,
+                                           role: .button,
+                                           frame: frame,
+                                           label: isPerformingAction ? "\(title) in progress" : title,
+                                           isEnabled: !isPerformingAction))
+        }
+
+        if !createMessage.isEmpty,
+           let frame = accessibilityFrame(CGRect(x: horizontalInset,
+                                                 y: createContentBottom,
+                                                 width: max(createLayer.bounds.width - horizontalInset * 2, 1),
+                                                 height: 22),
+                                          from: createLayer,
+                                          clippedBy: clipFrame) {
+            nodes.append(accessibilityNode(nextIdentifier: &nextIdentifier,
+                                           role: .staticText,
+                                           frame: frame,
+                                           label: createMessage))
+        }
+
+        return nodes
+    }
+
+    private func buildInstallPromptAccessibilityNodes(nextIdentifier: inout UInt32) -> [OuterframeAccessibilityNode] {
+        guard let backend = pendingInstallBackend else { return [] }
+        var children: [OuterframeAccessibilityNode] = []
+        if let frame = accessibilityFrame(installConfirmFrame) {
+            children.append(accessibilityNode(nextIdentifier: &nextIdentifier,
+                                              role: .button,
+                                              frame: frame,
+                                              label: "Enable for user"))
+        }
+        if let frame = accessibilityFrame(installRootConfirmFrame) {
+            let label = (backend.supportsRoot ?? false) && !(backend.rootOnly ?? false)
+                ? "Enable for user and root"
+                : "Enable for root"
+            children.append(accessibilityNode(nextIdentifier: &nextIdentifier,
+                                              role: .button,
+                                              frame: frame,
+                                              label: label))
+        }
+        if let frame = accessibilityFrame(installCancelFrame) {
+            children.append(accessibilityNode(nextIdentifier: &nextIdentifier,
+                                              role: .button,
+                                              frame: frame,
+                                              label: "Cancel"))
+        }
+        guard let frame = accessibilityFrame(installPanelFrame) else { return children }
+        return [
+            accessibilityNode(nextIdentifier: &nextIdentifier,
+                              role: .container,
+                              frame: frame,
+                              label: "Install \(backend.displayName)",
+                              value: "Outer Shell will download this app.",
+                              children: children)
+        ]
+    }
+
+    private func buildPasswordPromptAccessibilityNodes(nextIdentifier: inout UInt32) -> [OuterframeAccessibilityNode] {
+        guard let action = pendingPasswordAction else { return [] }
+        var children: [OuterframeAccessibilityNode] = []
+        if let frame = accessibilityFrame(passwordFieldFrame) {
+            children.append(accessibilityNode(nextIdentifier: &nextIdentifier,
+                                              role: .textField,
+                                              frame: frame,
+                                              label: "Administrator password",
+                                              hint: "\(action.displayName): \(sudoPasswordMessage)"))
+        }
+        if let frame = accessibilityFrame(passwordCancelFrame) {
+            children.append(accessibilityNode(nextIdentifier: &nextIdentifier,
+                                              role: .button,
+                                              frame: frame,
+                                              label: "Cancel"))
+        }
+        if let frame = accessibilityFrame(passwordSubmitFrame) {
+            children.append(accessibilityNode(nextIdentifier: &nextIdentifier,
+                                              role: .button,
+                                              frame: frame,
+                                              label: "Continue"))
+        }
+        guard let frame = accessibilityFrame(passwordPanelFrame) else { return children }
+        return [
+            accessibilityNode(nextIdentifier: &nextIdentifier,
+                              role: .container,
+                              frame: frame,
+                              label: "Administrator Password",
+                              value: "\(action.displayName): \(sudoPasswordMessage)",
+                              children: children)
+        ]
+    }
+
+    private func buildFilePickerAccessibilityNodes(nextIdentifier: inout UInt32) -> [OuterframeAccessibilityNode] {
+        guard let picker = pendingFilePicker else { return [] }
+        var children: [OuterframeAccessibilityNode] = []
+
+        for entry in filePickerEntryFrames {
+            guard let frame = accessibilityFrame(entry.frame, from: createLayer) else { continue }
+            children.append(accessibilityNode(nextIdentifier: &nextIdentifier,
+                                              role: .button,
+                                              frame: frame,
+                                              label: entry.entry.isDirectory ? "\(entry.entry.name) folder" : entry.entry.name,
+                                              value: entry.entry.path))
+        }
+
+        if picker.mode == .saveFile,
+           let frame = accessibilityFrame(filePickerFilenameFrame, from: createLayer) {
+            children.append(accessibilityNode(nextIdentifier: &nextIdentifier,
+                                              role: .textField,
+                                              frame: frame,
+                                              label: "Filename",
+                                              value: picker.filename))
+        }
+
+        if let frame = accessibilityFrame(filePickerCancelFrame, from: createLayer) {
+            children.append(accessibilityNode(nextIdentifier: &nextIdentifier,
+                                              role: .button,
+                                              frame: frame,
+                                              label: "Cancel"))
+        }
+        if let frame = accessibilityFrame(filePickerSaveFrame, from: createLayer) {
+            let label = picker.mode == .saveFile ? "Save" : "Choose"
+            children.append(accessibilityNode(nextIdentifier: &nextIdentifier,
+                                              role: .button,
+                                              frame: frame,
+                                              label: label))
+        }
+
+        guard let frame = accessibilityFrame(filePickerPanelFrame, from: createLayer) else { return children }
+        let title: String
+        switch picker.mode {
+        case .saveFile:
+            title = "Save Script"
+        case .chooseFile:
+            title = "Choose Icon"
+        case .chooseDirectory:
+            title = "Choose Folder"
+        }
+        return [
+            accessibilityNode(nextIdentifier: &nextIdentifier,
+                              role: .container,
+                              frame: frame,
+                              label: title,
+                              value: picker.error.isEmpty ? picker.directory : picker.error,
+                              children: children)
+        ]
+    }
+
+    private func createSectionAccessibilityLabel(_ section: CreateSection) -> String {
+        switch section {
+        case .appCatalog:
+            return "Outer Shell app catalog"
+        case .bashCommands:
+            return "Run bash commands"
+        case .otherRecipes:
+            return "Other recipes"
+        }
+    }
+
+    private func createFieldAccessibilityDescription(key: String) -> (label: String, value: String?, hint: String?) {
+        if key == Self.filePickerFilenameKey {
+            return ("Filename", pendingFilePicker?.filename, nil)
+        }
+        let bashLabels: [String: (String, String)] = [
+            "bashDisplayName": ("Display Name", "My App"),
+            "bashCommands": ("Bash commands", "Paste commands here"),
+            "bashFrontendTransport": ("Connection", ""),
+            "bashSocketPath": ("Socket Path", "/tmp/my-service.sock"),
+            "bashPort": ("Port", "4000"),
+            "bashIconPath": ("Icon Path", "Optional"),
+            "bashIdentifier": ("ID", "my-app")
+        ]
+        if let description = bashLabels[key] {
+            return (description.0, createValues[key], description.1.isEmpty ? nil : description.1)
+        }
+        if let field = selectedRecipe()?.fields.first(where: { $0.key == key }) {
+            return (field.label, createValue(for: field), field.placeholder.isEmpty ? nil : field.placeholder)
+        }
+        return (key, createValues[key], nil)
+    }
+
+    private func createChoiceAccessibilityTitle(key: String, value: String) -> String {
+        if key == "bashFrontendTransport" {
+            switch value {
+            case "port":
+                return "Port"
+            case "unixSocket":
+                return "Unix Socket"
+            default:
+                return value
+            }
+        }
+        return selectedRecipe()?.fields.first(where: { $0.key == key })?.choices.first(where: { $0.value == value })?.title ?? value
+    }
+
+    private func createValue(forCreateKey key: String) -> String {
+        if key == "bashFrontendTransport" {
+            return createValues[key, default: "port"]
+        }
+        if let field = selectedRecipe()?.fields.first(where: { $0.key == key }) {
+            return createValue(for: field)
+        }
+        return createValues[key, default: ""]
+    }
+
+    private func notifyAccessibilityLayoutChanged() {
+        guard didRegisterLayer, !accessibilityNotificationScheduled else { return }
+        accessibilityNotificationScheduled = true
+        Task { @MainActor in
+            accessibilityNotificationScheduled = false
+            outerframeHost.notifyAccessibilityTreeChanged(.layoutChanged)
         }
     }
 

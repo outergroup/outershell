@@ -533,11 +533,13 @@ final class OuterframeHost: SocketToBrowserDelegate {
     }
 
     func sendAccessibilitySnapshotResponse(requestID: UUID, snapshotData: Data?) {
-        Task {
-            try? await socket.send(ContentToBrowserMessage.accessibilitySnapshotResponse(
+        do {
+            try socket.sendBlocking(ContentToBrowserMessage.accessibilitySnapshotResponse(
                 requestID: requestID,
                 snapshotData: snapshotData
             ).encode())
+        } catch {
+            print("OuterframeHost: Failed to send accessibility snapshot response: \(error)")
         }
     }
 
@@ -546,6 +548,14 @@ final class OuterframeHost: SocketToBrowserDelegate {
             requestID: requestID,
             snapshotData: (snapshot ?? OuterframeAccessibilitySnapshot.notImplementedSnapshot()).serializedData()
         )
+    }
+
+    func notifyAccessibilityTreeChanged(_ notifications: OuterframeAccessibilityNotification = .layoutChanged) {
+        Task {
+            try? await socket.send(ContentToBrowserMessage.accessibilityTreeChanged(
+                notificationMask: notifications.rawValue
+            ).encode())
+        }
     }
 
     // MARK: - Pasteboard
