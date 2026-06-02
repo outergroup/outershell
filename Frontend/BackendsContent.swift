@@ -1163,8 +1163,15 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         if mode == .create || mode == .apps {
             clampScrollOffsets()
         }
+        let shouldAnimateCreateIn = previousMode != .create && nextMode == .create
+        if shouldAnimateCreateIn {
+            createLayer.removeAnimation(forKey: "create-overlay-fade-out")
+            withoutImplicitAnimations {
+                createLayer.opacity = 1
+            }
+        }
         updateColors()
-        if previousMode != .create && nextMode == .create {
+        if shouldAnimateCreateIn {
             let animation = CABasicAnimation(keyPath: "opacity")
             animation.fromValue = 0
             animation.toValue = 1
@@ -1183,13 +1190,18 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func dismissCreateOverlay() {
+        let currentOpacity = createLayer.presentation()?.opacity ?? createLayer.opacity
+        createLayer.removeAnimation(forKey: "create-overlay-fade-in")
+        withoutImplicitAnimations {
+            createLayer.opacity = 0
+        }
         let animation = CABasicAnimation(keyPath: "opacity")
-        animation.fromValue = 1
+        animation.fromValue = currentOpacity
         animation.toValue = 0
         animation.duration = 0.12
         animation.timingFunction = CAMediaTimingFunction(name: .easeIn)
         createLayer.add(animation, forKey: "create-overlay-fade-out")
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.10) { [weak self] in
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.13) { [weak self] in
             self?.returnToAppsFromCreate()
         }
     }
@@ -1388,7 +1400,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                     }
                     renderAppsPage()
                     if mode == .create {
-                        hideAllMatchedLayers()
                         renderCreateForm()
                     }
                 } else {
@@ -1400,7 +1411,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                     logRowsClipLayer.isHidden = true
                     createLayer.isHidden = false
                     createLayer.frame = CGRect(x: 0, y: 0, width: width, height: contentHeight)
-                    hideAllMatchedLayers()
                     renderCreateForm()
                 }
                 updateStatusText()
@@ -1469,10 +1479,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private func updateMatchedLayerVisibility() {
         let clipLayer: CALayer?
         switch mode {
-        case .apps:
+        case .apps, .create:
             clipLayer = appsLayer
-        case .create:
-            clipLayer = nil
         }
         guard let clipLayer else {
             hideAllMatchedLayers()
