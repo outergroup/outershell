@@ -7375,13 +7375,22 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         let menuID = UUID()
         var operationByItemID: [String: String] = [:]
         var items: [OuterframeContextMenuItem] = []
+        let sectionLabelStyle = OuterframeContextMenuItemStyle(height: 23,
+                                                               topInset: 4,
+                                                               leftInset: 16,
+                                                               bottomInset: 4,
+                                                               rightInset: 8,
+                                                               fontSize: 11,
+                                                               fontWeight: Float32(NSFont.Weight.semibold.rawValue),
+                                                               textColorRGBA: 0,
+                                                               alignment: .left)
 
         func appendSeparatorIfNeeded() {
-            guard !items.isEmpty, items.last?.isSeparator != true else { return }
+            guard !items.isEmpty, items.last?.kind != .separator else { return }
             items.append(OuterframeContextMenuItem(id: "separator-\(items.count)",
                                                    title: "",
-                                                   isEnabled: false,
-                                                   isSeparator: true))
+                                                   kind: .separator,
+                                                   isEnabled: false))
         }
 
         func appendEndpointSection(title: String,
@@ -7394,26 +7403,30 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             appendSeparatorIfNeeded()
             items.append(OuterframeContextMenuItem(id: "\(idPrefix)-heading",
                                                    title: title,
+                                                   kind: .label,
                                                    isEnabled: false,
-                                                   isHeading: true))
+                                                   style: sectionLabelStyle))
 
             let openItemID = "\(idPrefix)-open"
             operationByItemID[openItemID] = openOperation
             items.append(OuterframeContextMenuItem(id: openItemID,
                                                    title: "Open",
-                                                   isEnabled: true))
+                                                   isEnabled: true,
+                                                   systemImageName: "arrow.up.forward"))
 
             let openNewTabItemID = "\(idPrefix)-open-new-tab"
             operationByItemID[openNewTabItemID] = openNewTabOperation
             items.append(OuterframeContextMenuItem(id: openNewTabItemID,
                                                    title: "Open in New Tab",
-                                                   isEnabled: true))
+                                                   isEnabled: true,
+                                                   systemImageName: "plus.square.on.square"))
 
             let openNewWindowItemID = "\(idPrefix)-open-new-window"
             operationByItemID[openNewWindowItemID] = openNewWindowOperation
             items.append(OuterframeContextMenuItem(id: openNewWindowItemID,
                                                    title: "Open in New Window",
-                                                   isEnabled: true))
+                                                   isEnabled: true,
+                                                   systemImageName: "macwindow.badge.plus"))
 
             if endpoint.backend.canControl {
                 let isRunning = endpointIsRunning(endpoint)
@@ -7422,14 +7435,16 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 operationByItemID[controlItemID] = "\(controlOperation):\(endpoint.backend.serviceScope)"
                 items.append(OuterframeContextMenuItem(id: controlItemID,
                                                        title: isRunning ? "Stop" : "Start",
-                                                       isEnabled: true))
+                                                       isEnabled: true,
+                                                       systemImageName: isRunning ? "stop.fill" : "play.fill"))
             }
 
             let logsItemID = "\(idPrefix)-logs"
             operationByItemID[logsItemID] = "showLogs:\(endpoint.backend.serviceID)"
             items.append(OuterframeContextMenuItem(id: logsItemID,
                                                    title: "Show logs",
-                                                   isEnabled: true))
+                                                   isEnabled: true,
+                                                   systemImageName: "doc.plaintext"))
         }
 
         if item.backend.rootOnly ?? false {
