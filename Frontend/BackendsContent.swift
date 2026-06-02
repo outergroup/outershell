@@ -4075,12 +4075,14 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func applyOptimisticStatus(for serviceID: String, serviceScope: String, operation: String) {
-        let status: String
+        let status: String?
         switch operation {
         case "stop":
             status = "stopped"
         case "start", "restart", "run", "install", "runUser", "installUser", "runRoot", "installRoot", "addRootSupport":
             status = "running"
+        case "removeRootSupport":
+            status = nil
         default:
             return
         }
@@ -4092,7 +4094,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                  serviceUnit: backend.serviceUnit,
                                  serviceUnitPath: backend.serviceUnitPath,
                                  serviceScope: backend.serviceScope,
-                                 status: status,
+                                 status: status ?? backend.status,
                                  canControl: backend.canControl,
                                  canUninstall: backend.canUninstall,
                                  isBundled: backend.isBundled,
@@ -4170,24 +4172,38 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         openLauncherEndpoint(item.primaryEndpoint, displayName: item.displayName, opensInNewTab: opensInNewTab)
     }
 
-    private func openLauncherEndpoint(_ endpoint: AppLauncherEndpoint, displayName: String, opensInNewTab: Bool) {
+    private func openLauncherEndpoint(_ endpoint: AppLauncherEndpoint,
+                                      displayName: String,
+                                      opensInNewTab: Bool,
+                                      opensInNewWindow: Bool = false) {
         if !endpointIsReadyToOpen(endpoint) {
-            startAndOpenLauncherEndpoint(endpoint, displayName: displayName, opensInNewTab: opensInNewTab)
+            startAndOpenLauncherEndpoint(endpoint,
+                                         displayName: displayName,
+                                         opensInNewTab: opensInNewTab,
+                                         opensInNewWindow: opensInNewWindow)
             return
         }
         guard let url = frontendNavigationURL(endpoint) else {
-            startAndOpenLauncherEndpoint(endpoint, displayName: displayName, opensInNewTab: opensInNewTab)
+            startAndOpenLauncherEndpoint(endpoint,
+                                         displayName: displayName,
+                                         opensInNewTab: opensInNewTab,
+                                         opensInNewWindow: opensInNewWindow)
             return
         }
 
-        if opensInNewTab {
+        if opensInNewWindow {
+            outerframeHost.openNewWindow(with: url, displayString: displayName, preferredSize: nil)
+        } else if opensInNewTab {
             outerframeHost.openNewTab(with: url, displayString: displayName)
         } else {
             outerframeHost.navigate(to: url)
         }
     }
 
-    private func startAndOpenLauncherEndpoint(_ endpoint: AppLauncherEndpoint, displayName: String, opensInNewTab: Bool) {
+    private func startAndOpenLauncherEndpoint(_ endpoint: AppLauncherEndpoint,
+                                              displayName: String,
+                                              opensInNewTab: Bool,
+                                              opensInNewWindow: Bool) {
         guard !isPerformingAction, let controlEndpoint, let urlSession else { return }
         isPerformingAction = true
         backendError = "Starting \(displayName)..."
@@ -4226,6 +4242,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 self.waitForLauncherEndpoint(endpoint,
                                              displayName: displayName,
                                              opensInNewTab: opensInNewTab,
+                                             opensInNewWindow: opensInNewWindow,
                                              attempt: 0)
             }
         }.resume()
@@ -4234,6 +4251,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private func waitForLauncherEndpoint(_ endpoint: AppLauncherEndpoint,
                                          displayName: String,
                                          opensInNewTab: Bool,
+                                         opensInNewWindow: Bool,
                                          attempt: Int) {
         guard let backendsEndpoint, let urlSession else { return }
         backendError = "Waiting for \(displayName)..."
@@ -4251,7 +4269,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                        self.endpointIsReadyToOpen(nextEndpoint) {
                         self.backendError = ""
                         self.updateLayout()
-                        if opensInNewTab {
+                        if opensInNewWindow {
+                            self.outerframeHost.openNewWindow(with: url, displayString: displayName, preferredSize: nil)
+                        } else if opensInNewTab {
                             self.outerframeHost.openNewTab(with: url, displayString: displayName)
                         } else {
                             self.outerframeHost.navigate(to: url)
@@ -4268,6 +4288,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                     self.waitForLauncherEndpoint(endpoint,
                                                  displayName: displayName,
                                                  opensInNewTab: opensInNewTab,
+                                                 opensInNewWindow: opensInNewWindow,
                                                  attempt: attempt + 1)
                 }
             }
@@ -4290,11 +4311,13 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             showLogs(for: backend)
             return
         }
-        if operation.hasPrefix("stop:") {
-            let scope = String(operation.dropFirst("stop:".count))
+        if operation.hasPrefix("start:") || operation.hasPrefix("stop:") {
+            let controlOperation = operation.hasPrefix("start:") ? "start" : "stop"
+            let prefix = "\(controlOperation):"
+            let scope = String(operation.dropFirst(prefix.count))
             let endpoint = scope == "system" ? item.rootEndpoint : item.userEndpoint
             guard let endpoint else { return }
-            performControlAction(for: endpoint.backend, operation: "stop")
+            performControlAction(for: endpoint.backend, operation: controlOperation)
             return
         }
 
@@ -4305,9 +4328,39 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             } else {
                 performControlAction(for: item.backend, operation: "run")
             }
+        case "runNewTab":
+            if let userEndpoint = item.userEndpoint {
+                openLauncherEndpoint(userEndpoint, displayName: item.displayName, opensInNewTab: true)
+            } else {
+                performControlAction(for: item.backend, operation: "run")
+            }
+        case "runNewWindow":
+            if let userEndpoint = item.userEndpoint {
+                openLauncherEndpoint(userEndpoint,
+                                     displayName: item.displayName,
+                                     opensInNewTab: false,
+                                     opensInNewWindow: true)
+            } else {
+                performControlAction(for: item.backend, operation: "run")
+            }
         case "runRoot":
             if let rootEndpoint = item.rootEndpoint {
                 openLauncherEndpoint(rootEndpoint, displayName: item.displayName, opensInNewTab: false)
+            } else {
+                performControlAction(for: item.backend, operation: "runRoot")
+            }
+        case "runRootNewTab":
+            if let rootEndpoint = item.rootEndpoint {
+                openLauncherEndpoint(rootEndpoint, displayName: item.displayName, opensInNewTab: true)
+            } else {
+                performControlAction(for: item.backend, operation: "runRoot")
+            }
+        case "runRootNewWindow":
+            if let rootEndpoint = item.rootEndpoint {
+                openLauncherEndpoint(rootEndpoint,
+                                     displayName: item.displayName,
+                                     opensInNewTab: false,
+                                     opensInNewWindow: true)
             } else {
                 performControlAction(for: item.backend, operation: "runRoot")
             }
@@ -7291,11 +7344,11 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                                            title: "Run as root",
                                                            isEnabled: true))
                 }
-            } else if (backend.supportsRoot ?? false) {
+            } else if (backend.supportsRoot ?? false) && !(backend.rootOnly ?? false) {
                 let hasRootSupport = backend.hasRootSupport ?? (backend.serviceScope == "system")
                 operationByItemID["rootSupport"] = hasRootSupport ? "removeRootSupport" : "addRootSupport"
                 items.append(OuterframeContextMenuItem(id: "rootSupport",
-                                                       title: hasRootSupport ? "Remove Root Support" : "Add Root Support",
+                                                       title: hasRootSupport ? "Reinstall as user-only" : "Reinstall with root support",
                                                        isEnabled: true))
             }
         }
@@ -7323,38 +7376,103 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         var operationByItemID: [String: String] = [:]
         var items: [OuterframeContextMenuItem] = []
 
+        func appendSeparatorIfNeeded() {
+            guard !items.isEmpty, items.last?.isSeparator != true else { return }
+            items.append(OuterframeContextMenuItem(id: "separator-\(items.count)",
+                                                   title: "",
+                                                   isEnabled: false,
+                                                   isSeparator: true))
+        }
+
+        func appendEndpointSection(title: String,
+                                   idPrefix: String,
+                                   endpoint: AppLauncherEndpoint?,
+                                   openOperation: String,
+                                   openNewTabOperation: String,
+                                   openNewWindowOperation: String) {
+            guard let endpoint else { return }
+            appendSeparatorIfNeeded()
+            items.append(OuterframeContextMenuItem(id: "\(idPrefix)-heading",
+                                                   title: title,
+                                                   isEnabled: false,
+                                                   isHeading: true))
+
+            let openItemID = "\(idPrefix)-open"
+            operationByItemID[openItemID] = openOperation
+            items.append(OuterframeContextMenuItem(id: openItemID,
+                                                   title: "Open",
+                                                   isEnabled: true))
+
+            let openNewTabItemID = "\(idPrefix)-open-new-tab"
+            operationByItemID[openNewTabItemID] = openNewTabOperation
+            items.append(OuterframeContextMenuItem(id: openNewTabItemID,
+                                                   title: "Open in New Tab",
+                                                   isEnabled: true))
+
+            let openNewWindowItemID = "\(idPrefix)-open-new-window"
+            operationByItemID[openNewWindowItemID] = openNewWindowOperation
+            items.append(OuterframeContextMenuItem(id: openNewWindowItemID,
+                                                   title: "Open in New Window",
+                                                   isEnabled: true))
+
+            if endpoint.backend.canControl {
+                let isRunning = endpointIsRunning(endpoint)
+                let controlOperation = isRunning ? "stop" : "start"
+                let controlItemID = "\(idPrefix)-\(controlOperation)"
+                operationByItemID[controlItemID] = "\(controlOperation):\(endpoint.backend.serviceScope)"
+                items.append(OuterframeContextMenuItem(id: controlItemID,
+                                                       title: isRunning ? "Stop" : "Start",
+                                                       isEnabled: true))
+            }
+
+            let logsItemID = "\(idPrefix)-logs"
+            operationByItemID[logsItemID] = "showLogs:\(endpoint.backend.serviceID)"
+            items.append(OuterframeContextMenuItem(id: logsItemID,
+                                                   title: "Show logs",
+                                                   isEnabled: true))
+        }
+
         if item.backend.rootOnly ?? false {
-            operationByItemID["runRoot"] = "runRoot"
-            items.append(OuterframeContextMenuItem(id: "runRoot",
-                                                   title: appRunTitle(for: item.rootEndpoint, root: true),
-                                                   isEnabled: true))
+            appendEndpointSection(title: "Root",
+                                  idPrefix: "root",
+                                  endpoint: item.rootEndpoint,
+                                  openOperation: "runRoot",
+                                  openNewTabOperation: "runRootNewTab",
+                                  openNewWindowOperation: "runRootNewWindow")
         } else {
-            operationByItemID["run"] = "run"
-            items.append(OuterframeContextMenuItem(id: "run",
-                                                   title: appRunTitle(for: item.userEndpoint, root: false),
-                                                   isEnabled: true))
+            appendEndpointSection(title: "User",
+                                  idPrefix: "user",
+                                  endpoint: item.userEndpoint,
+                                  openOperation: "run",
+                                  openNewTabOperation: "runNewTab",
+                                  openNewWindowOperation: "runNewWindow")
+            appendEndpointSection(title: "Root",
+                                  idPrefix: "root",
+                                  endpoint: item.rootEndpoint,
+                                  openOperation: "runRoot",
+                                  openNewTabOperation: "runRootNewTab",
+                                  openNewWindowOperation: "runRootNewWindow")
         }
-        if ((item.backend.supportsRoot ?? false) || item.rootEndpoint != nil) && !(item.backend.rootOnly ?? false) {
-            operationByItemID["runRoot"] = "runRoot"
-            items.append(OuterframeContextMenuItem(id: "runRoot",
-                                                   title: appRunTitle(for: item.rootEndpoint, root: true),
-                                                   isEnabled: true))
-        }
-        for stopEndpoint in appStopEndpoints(for: item) {
-            operationByItemID[stopEndpoint.itemID] = "stop:\(stopEndpoint.endpoint.backend.serviceScope)"
-            items.append(OuterframeContextMenuItem(id: stopEndpoint.itemID,
-                                                   title: stopEndpoint.title,
-                                                   isEnabled: stopEndpoint.isEnabled))
-        }
-        for logEndpoint in appLogEndpoints(for: item) {
-            operationByItemID[logEndpoint.itemID] = "showLogs:\(logEndpoint.endpoint.backend.serviceID)"
-            items.append(OuterframeContextMenuItem(id: logEndpoint.itemID,
-                                                   title: logEndpoint.title,
-                                                   isEnabled: true))
-        }
+
         let management = backendManagementMenuItems(for: item.backend, includePlaceholderRunActions: false)
-        for menuItem in management.items where operationByItemID[menuItem.id] == nil {
-            guard let operation = management.operationByItemID[menuItem.id] else { continue }
+        var managementOperationByItemID = management.operationByItemID
+        var managementItems = management.items
+        if (item.backend.isBundled ?? false),
+           (item.backend.supportsRoot ?? false),
+           !(item.backend.rootOnly ?? false) {
+            let hasRootSupport = item.rootEndpoint != nil || (item.backend.hasRootSupport ?? false)
+            managementOperationByItemID["rootSupport"] = hasRootSupport ? "removeRootSupport" : "addRootSupport"
+            managementItems.removeAll { $0.id == "rootSupport" }
+            managementItems.append(OuterframeContextMenuItem(id: "rootSupport",
+                                                             title: hasRootSupport ? "Reinstall as user-only" : "Reinstall with root support",
+                                                             isEnabled: true))
+        }
+        managementItems = managementItems.filter { $0.id == "uninstall" } + managementItems.filter { $0.id != "uninstall" }
+        if !managementItems.isEmpty {
+            appendSeparatorIfNeeded()
+        }
+        for menuItem in managementItems where operationByItemID[menuItem.id] == nil {
+            guard let operation = managementOperationByItemID[menuItem.id] else { continue }
             operationByItemID[menuItem.id] = operation
             items.append(menuItem)
         }
@@ -7364,47 +7482,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         outerframeHost.showContextMenu(menuID: menuID,
                                        items: items,
                                        at: point)
-    }
-
-    private func appRunTitle(for endpoint: AppLauncherEndpoint?, root: Bool) -> String {
-        if let endpoint, endpointIsRunning(endpoint) {
-            return root ? "Open (root)" : "Open"
-        }
-        return root ? "Run as root" : "Run"
-    }
-
-    private func appStopEndpoints(for item: AppLauncherItem) -> [(itemID: String, title: String, endpoint: AppLauncherEndpoint, isEnabled: Bool)] {
-        let endpoints = [item.userEndpoint, item.rootEndpoint].compactMap { $0 }
-        guard !endpoints.isEmpty else { return [] }
-
-        let hasMultipleInstalls = endpoints.count > 1
-        return endpoints.compactMap { endpoint in
-            guard endpoint.backend.canControl else { return nil }
-            let isRoot = endpoint.backend.serviceScope == "system"
-            let itemID = isRoot ? "stopRoot" : "stopUser"
-            let title: String
-            if hasMultipleInstalls {
-                title = isRoot ? "Stop (root)" : "Stop (user)"
-            } else {
-                title = "Stop"
-            }
-            let isRunning = endpoint.frontend.isRunning || endpoint.backend.status == "running"
-            return (itemID: itemID, title: title, endpoint: endpoint, isEnabled: isRunning)
-        }
-    }
-
-    private func appLogEndpoints(for item: AppLauncherItem) -> [(itemID: String, title: String, endpoint: AppLauncherEndpoint)] {
-        let endpoints = [item.userEndpoint, item.rootEndpoint].compactMap { $0 }
-        guard !endpoints.isEmpty else { return [] }
-
-        let hasMultipleInstalls = endpoints.count > 1
-        return endpoints.map { endpoint in
-            let isRoot = endpoint.backend.serviceScope == "system"
-            let prefix = hasMultipleInstalls && isRoot ? "root/" : ""
-            let title = "Show logs for \(prefix)\(item.displayName)"
-            let itemID = isRoot ? "showRootLogs" : "showLogs"
-            return (itemID: itemID, title: title, endpoint: endpoint)
-        }
     }
 
     private func showLogSelectorMenu(at point: CGPoint) {

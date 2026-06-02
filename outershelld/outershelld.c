@@ -1096,6 +1096,11 @@ static bool root_helper_registry_remove_backend(const char *service_id,
                                                 bool *needs_password,
                                                 char *message,
                                                 size_t message_size);
+static bool remove_bundled_root_support(const BundledAppDefinition *app,
+                                        const char *sudo_password,
+                                        bool *needs_password,
+                                        char *message,
+                                        size_t message_size);
 #endif
 
 static const BundledAppDefinition *bundled_app_for_service_id(const char *service_id) {
@@ -5597,7 +5602,6 @@ static void send_control_response(int fd, const char *query, const char *body) {
         return;
     }
 
-#ifndef __APPLE__
     if (strcmp(operation, "addRootSupport") == 0 || strcmp(operation, "removeRootSupport") == 0) {
         const BundledAppDefinition *app = bundled_app_for_service_id(service_id);
         if (!app || !app->supports_root) {
@@ -5610,6 +5614,7 @@ static void send_control_response(int fd, const char *query, const char *body) {
         if (strcmp(operation, "addRootSupport") == 0) {
             ok = install_bundled_app(app, "system", bundled_stage_root, sudo_password, &needs_password, message, sizeof(message));
         } else {
+#ifndef __APPLE__
             if (!app->root_only) {
                 char user_unit[256] = "";
                 char user_scope[32] = "user";
@@ -5628,6 +5633,7 @@ static void send_control_response(int fd, const char *query, const char *body) {
                     }
                 }
             }
+#endif
             ok = remove_bundled_root_support(app, sudo_password, &needs_password, message, sizeof(message));
         }
         log_event("%s root support for app %s: %s",
@@ -5638,7 +5644,6 @@ static void send_control_response(int fd, const char *query, const char *body) {
         send_action_response_ex(fd, ok ? 200 : (needs_password ? 401 : 500), ok, message, needs_password);
         return;
     }
-#endif
 
     if (strcmp(operation, "uninstall") == 0) {
         char message[4096] = "";
@@ -9052,6 +9057,79 @@ static bool remove_bundled_root_support(const BundledAppDefinition *app,
 #endif
 
 #ifdef __APPLE__
+static bool remove_bundled_root_support(const BundledAppDefinition *app,
+                                        const char *sudo_password,
+                                        bool *needs_password,
+                                        char *message,
+                                        size_t message_size) {
+    if (needs_password) *needs_password = false;
+    if (!app || !app->supports_root) {
+        snprintf(message, message_size, "This app does not have root support.");
+        return false;
+    }
+    if (!ensure_root_helper_installed(sudo_password, needs_password, message, message_size)) {
+        return false;
+    }
+
+    char install_root[PATH_MAX];
+    snprintf(install_root, sizeof(install_root), "%s/apps/%s", kSystemOuterShellRoot, app->install_directory_name);
+    char log_path[PATH_MAX];
+    snprintf(log_path, sizeof(log_path), "/Library/Logs/%s.log", app->service_id);
+    char plist_path[PATH_MAX];
+    snprintf(plist_path, sizeof(plist_path), "/Library/LaunchDaemons/%s.plist", app->service_id);
+    char socket_path[PATH_MAX] = "";
+    bundled_socket_path_for_scope(app, "system", socket_path, sizeof(socket_path));
+
+    char target[320];
+    char quoted_target[384];
+    char quoted_install_root[PATH_MAX + 8];
+    char quoted_log_path[PATH_MAX + 8];
+    char quoted_plist_path[PATH_MAX + 8];
+    char quoted_socket_path[PATH_MAX + 8] = "";
+    snprintf(target, sizeof(target), "system/%s", app->service_id);
+    shell_quote(target, quoted_target, sizeof(quoted_target));
+    shell_quote(install_root, quoted_install_root, sizeof(quoted_install_root));
+    shell_quote(log_path, quoted_log_path, sizeof(quoted_log_path));
+    shell_quote(plist_path, quoted_plist_path, sizeof(quoted_plist_path));
+    if (socket_path[0]) shell_quote(socket_path, quoted_socket_path, sizeof(quoted_socket_path));
+
+    char script_template[] = "/tmp/backends-root-uninstall-XXXXXX";
+    int script_fd = mkstemp(script_template);
+    if (script_fd < 0) {
+        snprintf(message, message_size, "Failed to create privileged uninstall script: %s", strerror(errno));
+        return false;
+    }
+    FILE *script = fdopen(script_fd, "w");
+    if (!script) {
+        close(script_fd);
+        unlink(script_template);
+        snprintf(message, message_size, "Failed to write privileged uninstall script: %s", strerror(errno));
+        return false;
+    }
+    fprintf(script,
+            "set -eu\n"
+            "launchctl bootout %s >/dev/null 2>&1 || true\n"
+            "rm -f -- %s %s\n"
+            "rm -rf -- %s\n"
+            "rm -f -- %s\n",
+            quoted_target,
+            quoted_plist_path,
+            quoted_socket_path[0] ? quoted_socket_path : "''",
+            quoted_install_root,
+            quoted_log_path);
+    fclose(script);
+    chmod(script_template, 0700);
+
+    bool root_ok = run_root_script(script_template, sudo_password, needs_password, message, message_size);
+    unlink(script_template);
+    if (!root_ok) return false;
+    if (!root_helper_registry_remove_backend(app->service_id, sudo_password, needs_password, message, message_size)) {
+        return false;
+    }
+    snprintf(message, message_size, "Removed root support for %s.", app->display_name);
+    return true;
+}
+
 static bool append_xml_string_element(StringBuilder *builder, const char *value) {
     return sb_append(builder, "        <string>") &&
            sb_append_xml_escaped(builder, value ? value : "") &&
@@ -9459,14 +9537,17 @@ static bool install_bundled_app_macos(const BundledAppDefinition *app,
 static bool uninstall_backend(const char *service_id, const char *sudo_password, bool *needs_password, char *message, size_t message_size) {
     if (needs_password) *needs_password = false;
     char error[1024] = "";
-    char unit_name[256] = "";
-    char scope[32] = "user";
-    bool found = lookup_systemd_backend_any(service_id, unit_name, sizeof(unit_name), scope, sizeof(scope));
+    bool found_any = false;
 
 #ifdef __APPLE__
-    char plist_path[PATH_MAX] = "";
-    int owns_plist = 0;
-    if (!found && lookup_launchd_backend_any(service_id, plist_path, sizeof(plist_path), &owns_plist)) {
+    const char *launchd_scopes[] = {"system", "user"};
+    for (size_t i = 0; i < sizeof(launchd_scopes) / sizeof(launchd_scopes[0]); i++) {
+        char plist_path[PATH_MAX] = "";
+        int owns_plist = 0;
+        if (!lookup_launchd_backend_any_for_scope(service_id, launchd_scopes[i], plist_path, sizeof(plist_path), &owns_plist)) {
+            continue;
+        }
+        found_any = true;
         if (strncmp(plist_path, "/Library/LaunchDaemons/", 23) == 0) {
             if (!ensure_root_helper_installed(sudo_password, needs_password, message, message_size)) {
                 return false;
@@ -9537,7 +9618,15 @@ static bool uninstall_backend(const char *service_id, const char *sudo_password,
     }
 #endif
 
-    if (found && safe_unit_name(unit_name)) {
+    const char *systemd_scopes[] = {"system", "user"};
+    for (size_t i = 0; i < sizeof(systemd_scopes) / sizeof(systemd_scopes[0]); i++) {
+        char unit_name[256] = "";
+        char scope[32] = "";
+        if (!lookup_systemd_backend_any_for_scope(service_id, systemd_scopes[i], unit_name, sizeof(unit_name), scope, sizeof(scope)) ||
+            !safe_unit_name(unit_name)) {
+            continue;
+        }
+        found_any = true;
         char quoted_unit[320];
         shell_quote(unit_name, quoted_unit, sizeof(quoted_unit));
         if (strcmp(scope, "system") == 0) {
@@ -9634,7 +9723,7 @@ static bool uninstall_backend(const char *service_id, const char *sudo_password,
     }
 
     const BundledAppDefinition *bundled_app = bundled_app_for_service_id(service_id);
-    if (!found && bundled_app) {
+    if (!found_any && bundled_app) {
         cleanup_user_systemd_bundled_app(bundled_app, true, false);
     }
 

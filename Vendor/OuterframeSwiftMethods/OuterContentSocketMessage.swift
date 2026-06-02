@@ -974,6 +974,7 @@ enum ContentToBrowserMessage {
                 var flags: UInt8 = 0
                 if item.isEnabled { flags |= 1 << 0 }
                 if item.isSeparator { flags |= 1 << 1 }
+                if item.isHeading { flags |= 1 << 2 }
                 payload.append(uint8: flags)
                 payload.append(uint8: item.action.rawValue)
                 try payload.append(stringReference: item.id)
@@ -1209,7 +1210,8 @@ enum ContentToBrowserMessage {
                                                        title: title,
                                                        action: OuterframeContextMenuItemAction(rawValue: actionRawValue) ?? .contentCommand,
                                                        isEnabled: flags & (1 << 0) != 0,
-                                                       isSeparator: flags & (1 << 1) != 0))
+                                                       isSeparator: flags & (1 << 1) != 0,
+                                                       isHeading: flags & (1 << 2) != 0))
             }
             return .showContextMenuItems(menuID: menuID,
                                          locationX: locationX,
@@ -1498,17 +1500,20 @@ public struct OuterframeContextMenuItem: Sendable {
     public let action: OuterframeContextMenuItemAction
     public let isEnabled: Bool
     public let isSeparator: Bool
+    public let isHeading: Bool
 
     public init(id: String,
                 title: String,
                 action: OuterframeContextMenuItemAction = .contentCommand,
                 isEnabled: Bool = true,
-                isSeparator: Bool = false) {
+                isSeparator: Bool = false,
+                isHeading: Bool = false) {
         self.id = id
         self.title = title
         self.action = action
         self.isEnabled = isEnabled
         self.isSeparator = isSeparator
+        self.isHeading = isHeading
     }
 }
 
