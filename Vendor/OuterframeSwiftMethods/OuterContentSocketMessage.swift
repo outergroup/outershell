@@ -901,7 +901,7 @@ enum ContentToBrowserMessage {
                               attributedTextData: Data?,
                               items: [OuterframeContextMenuItem])
     case showDefinition(attributedTextData: Data, locationX: CGFloat, locationY: CGFloat)
-    case textCursorUpdate(cursors: [OuterframeContentTextCursorSnapshot])
+    case textInputGeometryUpdate(geometry: OuterframeContentTextInputGeometry?)
     case selectionToPasteboardResponse(requestID: UUID, items: [OuterframeContentPasteboardItem])
     case pasteboardAccessRequest(requestID: UUID,
                                  operation: OuterframePasteboardAccessOperation,
@@ -982,19 +982,19 @@ enum ContentToBrowserMessage {
             try payload.append(dataReference: attributedTextData)
             return makeContentToBrowserFrame(type: .showDefinition, payload: try payload.finalize())
 
-        case .textCursorUpdate(let cursors):
+        case .textInputGeometryUpdate(let geometry):
             var payload = Data()
-            let countValue = UInt32(max(0, min(cursors.count, Int(UInt32.max))))
-            payload.append(uint32: countValue)
-            for cursor in cursors {
-                payload.append(uuid: cursor.fieldID)
-                payload.append(float64: cursor.rect.origin.x)
-                payload.append(float64: cursor.rect.origin.y)
-                payload.append(float64: cursor.rect.size.width)
-                payload.append(float64: cursor.rect.size.height)
-                payload.append(uint8: cursor.visible ? 1 << 0 : 0)
+            if let geometry {
+                payload.append(uint8: 1 << 0)
+                payload.append(uuid: geometry.fieldID)
+                payload.append(float64: geometry.rect.origin.x)
+                payload.append(float64: geometry.rect.origin.y)
+                payload.append(float64: geometry.rect.size.width)
+                payload.append(float64: geometry.rect.size.height)
+            } else {
+                payload.append(uint8: 0)
             }
-            return makeContentToBrowserFrame(type: .textCursorUpdate, payload: payload)
+            return makeContentToBrowserFrame(type: .textInputGeometryUpdate, payload: payload)
 
         case .selectionToPasteboardResponse(let requestID, let items):
             var payload = OffsetPayloadBuilder()
@@ -1210,29 +1210,25 @@ enum ContentToBrowserMessage {
             return .showDefinition(attributedTextData: attributedTextData,
                                    locationX: locationX, locationY: locationY)
 
-        case .textCursorUpdate:
-            guard let cursorCount = cursor.readUInt32() else {
+        case .textInputGeometryUpdate:
+            guard let flags = cursor.readUInt8() else {
                 throw OuterframeContentSocketMessageError.truncatedPayload
             }
-            var entries: [OuterframeContentTextCursorSnapshot] = []
-            entries.reserveCapacity(Int(cursorCount))
-            for _ in 0..<cursorCount {
+            if flags & (1 << 0) != 0 {
                 guard let fieldID = cursor.readUUID(),
                       let rectX = cursor.readFloat64(),
                       let rectY = cursor.readFloat64(),
                       let rectWidth = cursor.readFloat64(),
-                      let rectHeight = cursor.readFloat64(),
-                      let flags = cursor.readUInt8() else {
+                      let rectHeight = cursor.readFloat64() else {
                     throw OuterframeContentSocketMessageError.truncatedPayload
                 }
-                entries.append(OuterframeContentTextCursorSnapshot(fieldID: fieldID,
-                                                                   rect: CGRect(x: rectX,
-                                                                                y: rectY,
-                                                                                width: rectWidth,
-                                                                                height: rectHeight),
-                                                                   visible: flags & (1 << 0) != 0))
+                return .textInputGeometryUpdate(geometry: OuterframeContentTextInputGeometry(fieldID: fieldID,
+                                                                                             rect: CGRect(x: rectX,
+                                                                                                          y: rectY,
+                                                                                                          width: rectWidth,
+                                                                                                          height: rectHeight)))
             }
-            return .textCursorUpdate(cursors: entries)
+            return .textInputGeometryUpdate(geometry: nil)
 
         case .selectionToPasteboardResponse:
             guard let requestID = cursor.readUUID() else {
@@ -1415,10 +1411,9 @@ enum ContentToBrowserMessage {
 
 // MARK: - Supporting Types
 
-struct OuterframeContentTextCursorSnapshot: Sendable {
+struct OuterframeContentTextInputGeometry: Sendable {
     let fieldID: UUID
     let rect: CGRect
-    let visible: Bool
 }
 
 struct OuterframeContentPasteboardRepresentation: Sendable {
@@ -1459,7 +1454,7 @@ struct OuterframeContentDraggingItem: Sendable {
 typealias OuterContentPasteboardItem = OuterframeContentPasteboardItem
 typealias OuterContentPasteboardRepresentation = OuterframeContentPasteboardRepresentation
 typealias OuterContentDraggingItem = OuterframeContentDraggingItem
-typealias OuterContentTextCursorSnapshot = OuterframeContentTextCursorSnapshot
+typealias OuterContentTextInputGeometry = OuterframeContentTextInputGeometry
 
 public enum OuterframePasteboardAccessOperation: UInt8, Sendable {
     case read = 0
@@ -1626,7 +1621,7 @@ private enum ContentToBrowserMessageKind: UInt16 {
     case stopDisplayLink = 2001
     case cursorUpdate = 2002
     case inputModeUpdate = 2003
-    case textCursorUpdate = 2004
+    case textInputGeometryUpdate = 2004
     case showContextMenu = 2005
     case showDefinition = 2006
     case hapticFeedback = 2007

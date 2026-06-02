@@ -923,6 +923,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private let logScrollLineHeight: CGFloat = 18
     private let horizontalInset: CGFloat = 18
     private let createBottomInset: CGFloat = 18
+    private let textCaretBlinkAnimationKey = "textCaretBlink"
     init(outerframeHost: OuterframeHost, appConnection: OuterframeAppConnection) {
         self.outerframeHost = outerframeHost
         self.appConnection = appConnection
@@ -1378,7 +1379,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
                 let contentHeight = contentLayer.bounds.height
                 if mode == .apps || mode == .create {
-                    outerframeHost.sendTextCursorUpdate(cursors: [])
+                    outerframeHost.sendTextInputGeometryUpdate(nil)
                     appsLayer.isHidden = false
                     tableHeaderLayer.isHidden = true
                     rowsClipLayer.isHidden = true
@@ -2703,6 +2704,11 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         bullets.string = bulletString
         bullets.frame = CGRect(x: 10, y: 8, width: max(localFieldFrame.width - 20, 1), height: 18)
         field.addSublayer(bullets)
+        if let cursorFrame = passwordFieldCursorRect(), windowIsActive {
+            addBlinkingTextCaret(to: field,
+                                 frame: cursorFrame.offsetBy(dx: -passwordFieldFrame.minX,
+                                                             dy: -passwordFieldFrame.minY))
+        }
 
         let cancel = makeButtonLayer(title: "Cancel", emphasized: false)
         let submit = makeButtonLayer(title: "Continue", emphasized: true)
@@ -2716,7 +2722,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         panel.addSublayer(submit)
         passwordCancelFrame = cancelLocal.offsetBy(dx: panelFrame.minX, dy: panelFrame.minY)
         passwordSubmitFrame = submitLocal.offsetBy(dx: panelFrame.minX, dy: panelFrame.minY)
-        sendPasswordFieldCursorUpdate()
+        sendPasswordFieldTextInputGeometryUpdate()
     }
 
     private func renderFilePickerIfNeeded(width: CGFloat, height: CGFloat) {
@@ -2871,6 +2877,16 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             filenameText.string = picker.filename.isEmpty ? defaultScriptFilename(for: picker.recipeID ?? "", extension: picker.fileExtension) : picker.filename
             filenameText.frame = CGRect(x: 9, y: 7, width: max(fieldFrame.width - 18, 1), height: 16)
             field.addSublayer(filenameText)
+            if focused,
+               windowIsActive,
+               !createInputController.hasSelection,
+               let layout = createFieldLayouts[Self.filePickerFilenameKey] {
+                let line = filenameValue.isEmpty ? nil : makeCreateFieldLine(for: filenameValue, monospaced: true)
+                let cursorFrame = createFieldCursorRect(layout: layout, cachedLine: line)
+                addBlinkingTextCaret(to: field,
+                                     frame: cursorFrame.offsetBy(dx: -layout.fieldFrame.minX,
+                                                                 dy: -layout.fieldFrame.minY))
+            }
         } else {
             filePickerFilenameFrame = .zero
         }
@@ -2886,7 +2902,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         let save = makeButtonLayer(title: buttonTitle, emphasized: true)
         save.frame = saveLocal
         panel.addSublayer(save)
-        sendCreateFieldCursorUpdate()
+        sendCreateFieldTextInputGeometryUpdate()
     }
 
     private func renderFilePickerRow(_ entry: FilePickerEntryRecord,
@@ -3507,7 +3523,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 renderCreateForm()
             }
             renderFilePickerIfNeeded(width: createLayer.bounds.width, height: createLayer.bounds.height)
-            sendCreateFieldCursorUpdate()
+            sendCreateFieldTextInputGeometryUpdate()
             return
         case .otherRecipes:
             break
@@ -3596,7 +3612,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         }
         let formBottom = !createMessage.isEmpty ? y - 26 : y + 14
         createContentBottom = min(recipeListBottom, formBottom)
-        sendCreateFieldCursorUpdate()
+        sendCreateFieldTextInputGeometryUpdate()
         if clampCreateScrollUsingRenderedContent() {
             renderCreateForm()
         }
@@ -3658,6 +3674,16 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         text.string = value.isEmpty ? field.placeholder : value
         text.frame = CGRect(x: 9, y: 7, width: max(boxFrame.width - 18, 1), height: 16)
         box.addSublayer(text)
+        if focused,
+           windowIsActive,
+           !createInputController.hasSelection,
+           let layout = createFieldLayouts[field.key] {
+            let line = value.isEmpty ? nil : makeCreateFieldLine(for: value, monospaced: monospaced)
+            let cursorFrame = createFieldCursorRect(layout: layout, cachedLine: line)
+            addBlinkingTextCaret(to: box,
+                                 frame: cursorFrame.offsetBy(dx: -layout.fieldFrame.minX,
+                                                             dy: -layout.fieldFrame.minY))
+        }
 
         if hasDirectoryPicker {
             let selectFrame = CGRect(x: boxFrame.maxX + selectGap,
@@ -3727,6 +3753,15 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                 width: max(boxFrame.width - 20, 1),
                                 height: 16)
             box.addSublayer(text)
+            if focused,
+               windowIsActive,
+               !createInputController.hasSelection,
+               let layout = createFieldLayouts[key] {
+                let cursorFrame = createFieldCursorRect(layout: layout, cachedLine: nil)
+                addBlinkingTextCaret(to: box,
+                                     frame: cursorFrame.offsetBy(dx: -layout.fieldFrame.minX,
+                                                                 dy: -layout.fieldFrame.minY))
+            }
             return
         }
 
@@ -3767,6 +3802,14 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                 width: max(boxFrame.width - 20, 1),
                                 height: 16)
             box.addSublayer(text)
+        }
+        if focused,
+           windowIsActive,
+           !createInputController.hasSelection {
+            let cursorFrame = createFieldCursorRect(layout: layout, cachedLine: nil)
+            addBlinkingTextCaret(to: box,
+                                 frame: cursorFrame.offsetBy(dx: -layout.fieldFrame.minX,
+                                                             dy: -layout.fieldFrame.minY))
         }
     }
 
@@ -4760,7 +4803,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
               let key = activeCreateFieldKey else {
             updateInputMode()
             updateEditingAndPasteboardState()
-            sendFocusedTextCursorUpdate()
+            sendFocusedTextInputGeometryUpdate()
             return
         }
 
@@ -4952,7 +4995,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         isSynchronizingPasswordInput = false
         updateInputMode()
         updateEditingAndPasteboardState()
-        sendPasswordFieldCursorUpdate()
+        sendPasswordFieldTextInputGeometryUpdate()
     }
 
     private func blurPasswordField() {
@@ -4960,7 +5003,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         updateInputMode()
         updateEditingAndPasteboardState()
         if !createInputController.isFocused {
-            outerframeHost.sendTextCursorUpdate(cursors: [])
+            outerframeHost.sendTextInputGeometryUpdate(nil)
         }
     }
 
@@ -4978,7 +5021,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         isSynchronizingCreateInput = false
         updateInputMode()
         updateEditingAndPasteboardState()
-        sendCreateFieldCursorUpdate()
+        sendCreateFieldTextInputGeometryUpdate()
     }
 
     private func blurCreateField() {
@@ -4986,7 +5029,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         createInputController.blur()
         updateInputMode()
         updateEditingAndPasteboardState()
-        outerframeHost.sendTextCursorUpdate(cursors: [])
+        outerframeHost.sendTextInputGeometryUpdate(nil)
     }
 
     private func handleTextCommand(_ command: String) {
@@ -5227,39 +5270,53 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                       height: layout.textFrame.height + 2)
     }
 
-    private func sendCreateFieldCursorUpdate() {
+    private func addBlinkingTextCaret(to layer: CALayer, frame: CGRect) {
+        let caret = CALayer()
+        caret.frame = frame
+        caret.backgroundColor = resolvedCGColor(.textColor)
+        caret.opacity = 1
+        let animation = CABasicAnimation(keyPath: "opacity")
+        animation.fromValue = 1
+        animation.toValue = 0
+        animation.duration = 0.55
+        animation.beginTime = CACurrentMediaTime() + 0.55
+        animation.autoreverses = true
+        animation.repeatCount = .infinity
+        animation.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+        caret.add(animation, forKey: textCaretBlinkAnimationKey)
+        layer.addSublayer(caret)
+    }
+
+    private func sendCreateFieldTextInputGeometryUpdate() {
         guard mode == .create,
+              windowIsActive,
               createInputController.isFocused,
               !createInputController.hasSelection,
               let key = activeCreateFieldKey,
               let layout = createFieldLayouts[key] else {
-            outerframeHost.sendTextCursorUpdate(cursors: [])
+            outerframeHost.sendTextInputGeometryUpdate(nil)
             return
         }
         let line = createInputController.text.isEmpty ? nil : makeCreateFieldLine(for: createInputController.text, monospaced: layout.monospaced)
         let cursorFrame = createFieldCursorRect(layout: layout, cachedLine: line)
         let rootPosition = createLayer.convert(cursorFrame.origin, to: rootLayer)
         let topLeftY = rootLayer.bounds.height - rootPosition.y - cursorFrame.height
-        let cursor = OuterframeContentTextCursorSnapshot(fieldID: Self.createFieldInputID,
-                                                         rect: CGRect(x: rootPosition.x,
-                                                                      y: topLeftY,
-                                                                      width: cursorFrame.width,
-                                                                      height: cursorFrame.height),
-                                                         visible: true)
-        outerframeHost.sendTextCursorUpdate(cursors: [cursor])
+        let geometry = OuterframeContentTextInputGeometry(fieldID: Self.createFieldInputID,
+                                                          rect: CGRect(x: rootPosition.x,
+                                                                       y: topLeftY,
+                                                                       width: cursorFrame.width,
+                                                                       height: cursorFrame.height))
+        outerframeHost.sendTextInputGeometryUpdate(geometry)
     }
 
-    private func sendPasswordFieldCursorUpdate() {
+    private func passwordFieldCursorRect() -> CGRect? {
         let bulletString = String(repeating: "\u{2022}", count: passwordInputController.text.count)
         guard pendingPasswordAction != nil,
               passwordInputController.isFocused,
               !passwordInputController.hasSelection,
               passwordFieldFrame != .zero,
               passwordTextFrame != .zero else {
-            if !createInputController.isFocused {
-                outerframeHost.sendTextCursorUpdate(cursors: [])
-            }
-            return
+            return nil
         }
 
         let cursorWidth: CGFloat = 1
@@ -5277,25 +5334,34 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
         let proposedX = min(max(passwordTextFrame.minX + offset, passwordTextFrame.minX), passwordTextFrame.maxX)
         let maxCursorX = passwordFieldFrame.maxX - 2 - cursorWidth
-        let cursorFrame = CGRect(x: max(passwordTextFrame.minX, min(proposedX, maxCursorX)),
-                                 y: passwordTextFrame.minY - 1,
-                                 width: cursorWidth,
-                                 height: passwordTextFrame.height + 2)
-        let topLeftY = rootLayer.bounds.height - cursorFrame.minY - cursorFrame.height
-        let cursor = OuterframeContentTextCursorSnapshot(fieldID: Self.passwordFieldInputID,
-                                                         rect: CGRect(x: cursorFrame.minX,
-                                                                      y: topLeftY,
-                                                                      width: cursorFrame.width,
-                                                                      height: cursorFrame.height),
-                                                         visible: true)
-        outerframeHost.sendTextCursorUpdate(cursors: [cursor])
+        return CGRect(x: max(passwordTextFrame.minX, min(proposedX, maxCursorX)),
+                      y: passwordTextFrame.minY - 1,
+                      width: cursorWidth,
+                      height: passwordTextFrame.height + 2)
     }
 
-    private func sendFocusedTextCursorUpdate() {
+    private func sendPasswordFieldTextInputGeometryUpdate() {
+        guard windowIsActive,
+              let cursorFrame = passwordFieldCursorRect() else {
+            if !createInputController.isFocused {
+                outerframeHost.sendTextInputGeometryUpdate(nil)
+            }
+            return
+        }
+        let topLeftY = rootLayer.bounds.height - cursorFrame.minY - cursorFrame.height
+        let geometry = OuterframeContentTextInputGeometry(fieldID: Self.passwordFieldInputID,
+                                                          rect: CGRect(x: cursorFrame.minX,
+                                                                       y: topLeftY,
+                                                                       width: cursorFrame.width,
+                                                                       height: cursorFrame.height))
+        outerframeHost.sendTextInputGeometryUpdate(geometry)
+    }
+
+    private func sendFocusedTextInputGeometryUpdate() {
         if passwordInputController.isFocused {
-            sendPasswordFieldCursorUpdate()
+            sendPasswordFieldTextInputGeometryUpdate()
         } else {
-            sendCreateFieldCursorUpdate()
+            sendCreateFieldTextInputGeometryUpdate()
         }
     }
 
@@ -5908,7 +5974,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             }
             let index = characterIndexForPasswordField(xPosition: point.x)
             passwordInputController.setCursorPosition(index, modifySelection: true)
-            sendPasswordFieldCursorUpdate()
+            sendPasswordFieldTextInputGeometryUpdate()
             updateLayout()
             return true
         case .createField(let key):
@@ -5922,7 +5988,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             let createPoint = createLayer.convert(contentPoint, from: contentLayer)
             let index = characterIndexForCreateField(key: key, at: createPoint)
             createInputController.setCursorPosition(index, modifySelection: true)
-            sendCreateFieldCursorUpdate()
+            sendCreateFieldTextInputGeometryUpdate()
             updateLayout()
             return true
         }

@@ -404,11 +404,11 @@ final class OuterframeHost: SocketToBrowserDelegate {
         }
     }
 
-    // MARK: - Text Cursor
+    // MARK: - Text Input Geometry
 
-    func sendTextCursorUpdate(cursors: [OuterContentTextCursorSnapshot]) {
+    func sendTextInputGeometryUpdate(_ geometry: OuterContentTextInputGeometry?) {
         Task {
-            try? await socket.send(ContentToBrowserMessage.textCursorUpdate(cursors: cursors).encode())
+            try? await socket.send(ContentToBrowserMessage.textInputGeometryUpdate(geometry: geometry).encode())
         }
     }
 
