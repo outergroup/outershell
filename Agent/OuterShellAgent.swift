@@ -16,10 +16,14 @@ private func OuterShelldRequestShutdown()
 
 private typealias MenuBarVisibilityCallback = @convention(c) (Int32) -> Void
 private typealias MenuBarVisibilityGetter = @convention(c) () -> Int32
+private typealias BackendEventChangedCallback = @convention(c) () -> Void
 
 @_silgen_name("OuterShelldSetMenuBarVisibilityCallbacks")
 private func OuterShelldSetMenuBarVisibilityCallbacks(_ callback: MenuBarVisibilityCallback?,
                                                       _ getter: MenuBarVisibilityGetter?)
+
+@_silgen_name("OuterShelldSetBackendEventChangedCallback")
+private func OuterShelldSetBackendEventChangedCallback(_ callback: BackendEventChangedCallback?)
 
 @_silgen_name("OuterShelldMarkBackendEventChanged")
 private func OuterShelldMarkBackendEventChanged()
@@ -151,6 +155,12 @@ private let menuBarVisibilityCallback: MenuBarVisibilityCallback = { enabled in
 
 private let menuBarVisibilityGetter: MenuBarVisibilityGetter = {
     MenuBarVisibilityPreference.isEnabled ? 1 : 0
+}
+
+private let backendEventChangedCallback: BackendEventChangedCallback = {
+    Task { @MainActor in
+        activeOuterShellAgentDelegate?.backendEventChanged()
+    }
 }
 
 private enum OuterShellRegistry {
@@ -842,6 +852,7 @@ private final class OuterShellAgentDelegate: NSObject, NSApplicationDelegate, NS
     func applicationDidFinishLaunching(_ notification: Notification) {
         activeOuterShellAgentDelegate = self
         OuterShelldSetMenuBarVisibilityCallbacks(menuBarVisibilityCallback, menuBarVisibilityGetter)
+        OuterShelldSetBackendEventChangedCallback(backendEventChangedCallback)
         NSApplication.shared.setActivationPolicy(.accessory)
         startBackend()
         configureStatusItem()
@@ -863,6 +874,7 @@ private final class OuterShellAgentDelegate: NSObject, NSApplicationDelegate, NS
         cancelAllServiceExitMonitors()
         activeOuterShellAgentDelegate = nil
         OuterShelldSetMenuBarVisibilityCallbacks(nil, nil)
+        OuterShelldSetBackendEventChangedCallback(nil)
         DistributedNotificationCenter.default().removeObserver(self)
         OuterShellBackendRequestShutdown()
         OuterShelldRequestShutdown()
@@ -1079,6 +1091,11 @@ private final class OuterShellAgentDelegate: NSObject, NSApplicationDelegate, NS
     fileprivate func menuBarVisibilitySettingDidChange() {
         refresh()
         updateStatusItem()
+    }
+
+    fileprivate func backendEventChanged() {
+        scheduleFollowUpRefreshes()
+        refresh()
     }
 
     private func menuImage(systemSymbolName: String) -> NSImage? {

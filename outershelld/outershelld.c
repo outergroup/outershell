@@ -787,13 +787,19 @@ static bool is_home_screen_service_id(const char *service_id) {
 
 typedef void (*OuterShelldMenuBarVisibilityCallback)(int enabled);
 typedef int (*OuterShelldMenuBarVisibilityGetter)(void);
+typedef void (*OuterShelldBackendEventChangedCallback)(void);
 static OuterShelldMenuBarVisibilityCallback g_menu_bar_visibility_callback = NULL;
 static OuterShelldMenuBarVisibilityGetter g_menu_bar_visibility_getter = NULL;
+static OuterShelldBackendEventChangedCallback g_backend_event_changed_callback = NULL;
 
 void OuterShelldSetMenuBarVisibilityCallbacks(OuterShelldMenuBarVisibilityCallback callback,
                                               OuterShelldMenuBarVisibilityGetter getter) {
     g_menu_bar_visibility_callback = callback;
     g_menu_bar_visibility_getter = getter;
+}
+
+void OuterShelldSetBackendEventChangedCallback(OuterShelldBackendEventChangedCallback callback) {
+    g_backend_event_changed_callback = callback;
 }
 
 void OuterShelldMarkBackendEventChanged(void) {
@@ -5156,6 +5162,9 @@ static uint64_t current_log_event_version(const char *service_id, int log_index)
 static void mark_backend_event_changed(void) {
     g_backend_event_sequence++;
     if (g_backend_event_sequence == 0) g_backend_event_sequence = 1;
+    if (g_backend_event_changed_callback) {
+        g_backend_event_changed_callback();
+    }
 }
 
 static bool try_connect_tcp_port(int port) {
