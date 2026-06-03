@@ -14,6 +14,16 @@ private func OuterShellBackendRequestShutdown()
 @_silgen_name("OuterShelldRequestShutdown")
 private func OuterShelldRequestShutdown()
 
+private typealias MenuBarVisibilityCallback = @convention(c) (Int32) -> Void
+private typealias MenuBarVisibilityGetter = @convention(c) () -> Int32
+
+@_silgen_name("OuterShelldSetMenuBarVisibilityCallbacks")
+private func OuterShelldSetMenuBarVisibilityCallbacks(_ callback: MenuBarVisibilityCallback?,
+                                                      _ getter: MenuBarVisibilityGetter?)
+
+@_silgen_name("OuterShelldMarkBackendEventChanged")
+private func OuterShelldMarkBackendEventChanged()
+
 private struct HostedFrontend: Equatable {
     let serviceID: String
     let name: String
@@ -99,6 +109,43 @@ private struct PendingLifecycleAction: Equatable {
 private enum RefreshMode {
     case prominent
     case background
+}
+
+private enum MenuBarVisibilityPreference {
+    static let suiteName = "org.outershell.OuterShell"
+    static let key = "ShowMenuBarItemWhenBackendsAreRunning"
+    static let changedNotification = Notification.Name("org.outershell.OuterShell.MenuBarVisibilityPreferenceChanged")
+
+    static var isEnabled: Bool {
+        let defaults = UserDefaults(suiteName: suiteName) ?? .standard
+        defaults.synchronize()
+        guard defaults.object(forKey: key) != nil else { return true }
+        return defaults.bool(forKey: key)
+    }
+
+    static func setEnabled(_ enabled: Bool) {
+        let defaults = UserDefaults(suiteName: suiteName) ?? .standard
+        defaults.set(enabled, forKey: key)
+        defaults.synchronize()
+        DistributedNotificationCenter.default().postNotificationName(changedNotification,
+                                                                     object: nil,
+                                                                     userInfo: ["enabled": enabled],
+                                                                     deliverImmediately: true)
+    }
+}
+
+@MainActor
+private weak var activeOuterShellAgentDelegate: OuterShellAgentDelegate?
+
+private let menuBarVisibilityCallback: MenuBarVisibilityCallback = { enabled in
+    MenuBarVisibilityPreference.setEnabled(enabled != 0)
+    Task { @MainActor in
+        activeOuterShellAgentDelegate?.menuBarVisibilitySettingDidChange()
+    }
+}
+
+private let menuBarVisibilityGetter: MenuBarVisibilityGetter = {
+    MenuBarVisibilityPreference.isEnabled ? 1 : 0
 }
 
 private enum OuterShellRegistry {
@@ -596,6 +643,43 @@ private final class BackendHeadingMenuItemView: NSView {
     }
 }
 
+private final class SectionHeadingMenuItemView: NSView {
+    private let label: NSTextField
+
+    init(title: String) {
+        self.label = NSTextField(labelWithString: title)
+
+        super.init(frame: NSRect(x: 0, y: 0, width: 260, height: 23))
+        autoresizingMask = [.width]
+
+        label.font = NSFont.systemFont(ofSize: 11, weight: .semibold)
+        label.textColor = .secondaryLabelColor
+        label.translatesAutoresizingMaskIntoConstraints = false
+
+        addSubview(label)
+        NSLayoutConstraint.activate([
+            label.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 16),
+            label.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -8),
+            label.centerYAnchor.constraint(equalTo: centerYAnchor, constant: 0),
+        ])
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func layout() {
+        super.layout()
+
+        guard let superview else { return }
+        let targetWidth = max(frame.width, superview.bounds.width)
+        if frame.width != targetWidth {
+            frame.size.width = targetWidth
+        }
+    }
+}
+
 private final class ServiceActionMenuItemView: NSView {
     private weak var menuItem: NSMenuItem?
     private let iconView = NSImageView()
@@ -731,9 +815,15 @@ private final class OuterShellAgentDelegate: NSObject, NSApplicationDelegate, NS
     private var backendThread: Thread?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        activeOuterShellAgentDelegate = self
+        OuterShelldSetMenuBarVisibilityCallbacks(menuBarVisibilityCallback, menuBarVisibilityGetter)
         NSApplication.shared.setActivationPolicy(.accessory)
         startBackend()
         configureStatusItem()
+        DistributedNotificationCenter.default().addObserver(self,
+                                                            selector: #selector(menuBarVisibilityPreferenceChanged(_:)),
+                                                            name: MenuBarVisibilityPreference.changedNotification,
+                                                            object: nil)
         refresh()
         refreshTimer = Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in
@@ -746,6 +836,9 @@ private final class OuterShellAgentDelegate: NSObject, NSApplicationDelegate, NS
         refreshTimer?.invalidate()
         followUpRefreshTask?.cancel()
         cancelAllServiceExitMonitors()
+        activeOuterShellAgentDelegate = nil
+        OuterShelldSetMenuBarVisibilityCallbacks(nil, nil)
+        DistributedNotificationCenter.default().removeObserver(self)
         OuterShellBackendRequestShutdown()
         OuterShelldRequestShutdown()
     }
@@ -819,6 +912,45 @@ private final class OuterShellAgentDelegate: NSObject, NSApplicationDelegate, NS
     }
 
     private func configureStatusItem() {
+        menu.delegate = self
+        updateStatusItem()
+        rebuildMenu()
+    }
+
+    private func refresh() {
+        let previousServices = services
+        let previousError = lastError
+        do {
+            services = try OuterShellRegistry.loadBackends().filter(\.state.isRunning)
+            lastError = nil
+            reconcileServiceExitMonitors()
+        } catch {
+            lastError = error.localizedDescription
+        }
+        guard previousServices != services ||
+                previousError != lastError else {
+            return
+        }
+        updateStatusItem()
+        rebuildMenu()
+    }
+
+    private func updateStatusItem() {
+        let running = services.filter(\.state.isRunning).count
+        let shouldShow = MenuBarVisibilityPreference.isEnabled && running > 0
+        if shouldShow {
+            ensureStatusItem()
+        } else if let statusItem {
+            NSStatusBar.system.removeStatusItem(statusItem)
+            self.statusItem = nil
+        }
+        guard let button = statusItem?.button else { return }
+        button.title = " \(running)"
+        button.toolTip = lastError ?? "\(running) running backend\(running == 1 ? "" : "s")"
+    }
+
+    private func ensureStatusItem() {
+        guard statusItem == nil else { return }
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         item.menu = menu
         statusItem = item
@@ -828,35 +960,6 @@ private final class OuterShellAgentDelegate: NSObject, NSApplicationDelegate, NS
             button.image = image
             button.imagePosition = .imageLeading
         }
-        menu.delegate = self
-        rebuildMenu()
-    }
-
-    private func refresh() {
-        let previousServices = services
-        let previousError = lastError
-        let previousPendingActions = pendingLifecycleActions
-        do {
-            services = mergePendingLifecycleActions(into: try OuterShellRegistry.loadBackends())
-            lastError = nil
-            reconcileServiceExitMonitors()
-        } catch {
-            lastError = error.localizedDescription
-        }
-        guard previousServices != services ||
-                previousError != lastError ||
-                previousPendingActions != pendingLifecycleActions else {
-            return
-        }
-        updateStatusItem()
-        rebuildMenu()
-    }
-
-    private func updateStatusItem() {
-        guard let button = statusItem?.button else { return }
-        let running = services.filter(\.state.isRunning).count
-        button.title = running > 0 ? " \(running)" : ""
-        button.toolTip = lastError ?? "\(running) running out of \(services.count) localhost backends"
     }
 
     private func rebuildMenu() {
@@ -867,77 +970,74 @@ private final class OuterShellAgentDelegate: NSObject, NSApplicationDelegate, NS
             menu.addItem(item)
             menu.addItem(.separator())
         }
-        if services.isEmpty {
-            let item = NSMenuItem(title: "No tracked localhost backends", action: nil, keyEquivalent: "")
-            item.isEnabled = false
-            menu.addItem(item)
-        } else {
-            for (index, service) in services.enumerated() {
-                append(service, isLast: index == services.index(before: services.endIndex))
-            }
+        for (index, service) in services.enumerated() {
+            append(service, isLast: index == services.index(before: services.endIndex))
         }
-        menu.addItem(.separator())
-        let manage = NSMenuItem(title: "Open Outer Shell in Outer Loop",
-                                action: #selector(openOuterShell(_:)),
-                                keyEquivalent: "")
-        manage.target = self
-        menu.addItem(manage)
-        let refresh = NSMenuItem(title: "Refresh",
-                                 action: #selector(refreshMenuItem(_:)),
-                                 keyEquivalent: "")
-        refresh.target = self
-        menu.addItem(refresh)
+        if !menu.items.isEmpty {
+            menu.addItem(.separator())
+        }
         let quit = NSMenuItem(title: "Stop showing this in menu bar",
                               action: #selector(quit(_:)),
                               keyEquivalent: "")
         quit.target = self
         menu.addItem(quit)
+        quit.image = menuImage(systemSymbolName: "eye.slash")
+        let manage = NSMenuItem(title: "View in Outer Shell",
+                                action: #selector(openOuterShell(_:)),
+                                keyEquivalent: "")
+        manage.target = self
+        manage.image = menuImage(systemSymbolName: "arrow.up.forward")
+        menu.addItem(manage)
     }
 
     private func append(_ service: ManagedBackend, isLast: Bool) {
-        let isLifecyclePending = pendingLifecycleActions[service.serviceID] != nil
-        let heading = NSMenuItem()
-        heading.target = self
-        heading.action = #selector(serviceLifecycleMenuItemClicked(_:))
-        heading.representedObject = BackendMenuItemPayload(service: service)
-        heading.isEnabled = lifecycleItemEnabled(for: service) && !isLifecyclePending
-        heading.view = BackendHeadingMenuItemView(menuItem: heading,
-                                                  title: service.displayName,
-                                                  statusSymbolName: lifecycleSymbolName(for: service),
-                                                  statusColor: lifecycleSymbolColor(for: service),
-                                                  showsProgress: isLifecyclePending)
+        let heading = NSMenuItem(title: service.displayName, action: nil, keyEquivalent: "")
+        heading.isEnabled = false
+        heading.view = SectionHeadingMenuItemView(title: service.displayName)
         menu.addItem(heading)
 
-        if service.state.isRunning {
-            if service.frontends.isEmpty && !isLifecyclePending {
-                let emptyItem = NSMenuItem(title: "No frontends", action: nil, keyEquivalent: "")
-                emptyItem.isEnabled = false
-                emptyItem.indentationLevel = 1
-                menu.addItem(emptyItem)
-            } else {
-                for frontend in service.frontends {
-                    let item = NSMenuItem(title: openTitle(for: frontend, service: service),
-                                          action: #selector(openFrontendMenuItemClicked(_:)),
-                                          keyEquivalent: "")
-                    item.target = self
-                    item.representedObject = FrontendMenuItemPayload(frontend: frontend)
-                    applyCustomChildItemView(to: item, symbolName: "arrow.up.forward")
-                    menu.addItem(item)
-                }
-            }
-        }
-
-        let logs = NSMenuItem(title: "View logs",
-                              action: #selector(openLogsMenuItemClicked(_:)),
+        let frontend = preferredFrontend(for: service)
+        let open = NSMenuItem(title: "Open",
+                              action: #selector(openFrontendMenuItemClicked(_:)),
                               keyEquivalent: "")
-        logs.target = self
-        logs.representedObject = BackendMenuItemPayload(service: service)
-        applyCustomChildItemView(to: logs, symbolName: "doc.plaintext")
-        menu.addItem(logs)
+        open.target = self
+        open.isEnabled = frontend != nil
+        if let frontend {
+            open.representedObject = FrontendMenuItemPayload(frontend: frontend)
+        }
+        open.image = menuImage(systemSymbolName: "arrow.up.forward")
+        menu.addItem(open)
+
+        if let frontend,
+           copyableURL(for: frontend) != nil {
+            let copy = NSMenuItem(title: "Copy URL",
+                                  action: #selector(copyFrontendURLMenuItemClicked(_:)),
+                                  keyEquivalent: "")
+            copy.target = self
+            copy.representedObject = FrontendMenuItemPayload(frontend: frontend)
+            copy.image = menuImage(systemSymbolName: "doc.on.doc")
+            menu.addItem(copy)
+        }
 
         if !isLast {
             menu.addItem(.separator())
         }
+    }
+
+    fileprivate func setMenuBarVisibilityEnabled(_ enabled: Bool) {
+        MenuBarVisibilityPreference.setEnabled(enabled)
+        menuBarVisibilitySettingDidChange()
+    }
+
+    fileprivate func menuBarVisibilitySettingDidChange() {
+        refresh()
+        updateStatusItem()
+    }
+
+    private func menuImage(systemSymbolName: String) -> NSImage? {
+        let image = NSImage(systemSymbolName: systemSymbolName, accessibilityDescription: nil)
+        image?.isTemplate = true
+        return image
     }
 
     @objc private func refreshMenuItem(_ sender: Any?) {
@@ -945,14 +1045,9 @@ private final class OuterShellAgentDelegate: NSObject, NSApplicationDelegate, NS
     }
 
     @objc private func quit(_ sender: Any?) {
-        NSApplication.shared.terminate(sender)
-    }
-
-    @objc private func serviceLifecycleMenuItemClicked(_ sender: NSMenuItem) {
-        guard let payload = sender.representedObject as? BackendMenuItemPayload else {
-            return
-        }
-        performLifecycleAction(for: payload.service)
+        MenuBarVisibilityPreference.setEnabled(false)
+        OuterShelldMarkBackendEventChanged()
+        updateStatusItem()
     }
 
     @objc private func openFrontendMenuItemClicked(_ sender: NSMenuItem) {
@@ -962,11 +1057,17 @@ private final class OuterShellAgentDelegate: NSObject, NSApplicationDelegate, NS
         openFrontend(payload.frontend)
     }
 
-    @objc private func openLogsMenuItemClicked(_ sender: NSMenuItem) {
-        guard let payload = sender.representedObject as? BackendMenuItemPayload else {
+    @objc private func copyFrontendURLMenuItemClicked(_ sender: NSMenuItem) {
+        guard let payload = sender.representedObject as? FrontendMenuItemPayload,
+              let url = copyableURL(for: payload.frontend) else {
             return
         }
-        openLogs(payload.service)
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(url.absoluteString, forType: .string)
+    }
+
+    @objc private func menuBarVisibilityPreferenceChanged(_ notification: Notification) {
+        updateStatusItem()
     }
 
     private func openFrontend(_ frontend: HostedFrontend) {
@@ -986,6 +1087,41 @@ private final class OuterShellAgentDelegate: NSObject, NSApplicationDelegate, NS
         if let url = components.url {
             NSWorkspace.shared.open(url)
         }
+    }
+
+    private func preferredFrontend(for service: ManagedBackend) -> HostedFrontend? {
+        service.frontends.first { !$0.url.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty } ??
+            service.frontends.first
+    }
+
+    private func copyableURL(for frontend: HostedFrontend) -> URL? {
+        guard frontend.port > 0 else { return nil }
+        var components = URLComponents()
+        components.scheme = "http"
+        components.host = "127.0.0.1"
+        components.port = frontend.port
+        let pathAndQuery = pathAndQuery(fromFrontendURL: frontend.url)
+        if let questionIndex = pathAndQuery.firstIndex(of: "?") {
+            components.path = String(pathAndQuery[..<questionIndex])
+            components.query = String(pathAndQuery[pathAndQuery.index(after: questionIndex)...])
+        } else {
+            components.path = pathAndQuery
+        }
+        return components.url
+    }
+
+    private func pathAndQuery(fromFrontendURL rawURL: String) -> String {
+        let trimmed = rawURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return "/" }
+        if let components = URLComponents(string: trimmed), components.scheme != nil {
+            var path = components.path.isEmpty ? "/" : components.path
+            if let query = components.query, !query.isEmpty {
+                path += "?\(query)"
+            }
+            return path
+        }
+        guard let slashIndex = trimmed.firstIndex(of: "/") else { return "/" }
+        return String(trimmed[slashIndex...])
     }
 
     private func performLifecycleAction(for service: ManagedBackend) {

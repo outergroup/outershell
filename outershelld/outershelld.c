@@ -785,6 +785,32 @@ static bool is_home_screen_service_id(const char *service_id) {
             strcmp(service_id, kLegacyBackendsServiceID) == 0);
 }
 
+typedef void (*OuterShelldMenuBarVisibilityCallback)(int enabled);
+typedef int (*OuterShelldMenuBarVisibilityGetter)(void);
+static OuterShelldMenuBarVisibilityCallback g_menu_bar_visibility_callback = NULL;
+static OuterShelldMenuBarVisibilityGetter g_menu_bar_visibility_getter = NULL;
+
+void OuterShelldSetMenuBarVisibilityCallbacks(OuterShelldMenuBarVisibilityCallback callback,
+                                              OuterShelldMenuBarVisibilityGetter getter) {
+    g_menu_bar_visibility_callback = callback;
+    g_menu_bar_visibility_getter = getter;
+}
+
+void OuterShelldMarkBackendEventChanged(void) {
+    mark_backend_event_changed();
+}
+
+static bool set_agent_menu_bar_visibility(bool enabled) {
+    if (!g_menu_bar_visibility_callback) return false;
+    g_menu_bar_visibility_callback(enabled ? 1 : 0);
+    return true;
+}
+
+static bool get_agent_menu_bar_visibility(void) {
+    if (!g_menu_bar_visibility_getter) return true;
+    return g_menu_bar_visibility_getter() != 0;
+}
+
 static UiApiResponse *g_captured_ui_response = NULL;
 
 static void handle_shutdown_signal(int signal_number) {
@@ -4614,6 +4640,7 @@ static bool lookup_launchd_backend_any_for_scope(const char *service_id,
 #define BACKEND_FLAG_SUPPORTS_ROOT 0x40u
 #define BACKEND_FLAG_ROOT_ONLY 0x80u
 #define BACKEND_FLAG_HAS_ROOT_SUPPORT 0x100u
+#define BACKEND_FLAG_MENU_BAR_VISIBILITY_ENABLED 0x200u
 #define LOG_FILE_FLAG_READABLE 0x01u
 #define FILE_PICKER_FLAG_IS_DIRECTORY 0x01u
 #define ACTION_FLAG_OK 0x01u
@@ -4865,6 +4892,7 @@ static bool append_registered_backend_payloads(const RegistryStore *database,
         if ((has_systemd_unit || has_launchd_unit) && !is_self) flags |= BACKEND_FLAG_CAN_CONTROL | BACKEND_FLAG_CAN_UNINSTALL;
         if (is_self) {
             flags |= BACKEND_FLAG_CAN_UNINSTALL;
+            if (get_agent_menu_bar_visibility()) flags |= BACKEND_FLAG_MENU_BAR_VISIBILITY_ENABLED;
             char available_version[128] = "";
             if (home_screen_update_available(available_version, sizeof(available_version))) {
                 snprintf(status, sizeof(status), "update available");
@@ -5504,6 +5532,21 @@ static void send_control_response(int fd, const char *query, const char *body) {
 
     if (is_home_screen_service_id(service_id)) {
         char message[4096] = "";
+        if (strcmp(operation, "showMenuBarWhenRunning") == 0 ||
+            strcmp(operation, "hideMenuBarWhenRunning") == 0) {
+            bool enabled = strcmp(operation, "showMenuBarWhenRunning") == 0;
+            if (set_agent_menu_bar_visibility(enabled)) {
+                mark_backend_event_changed();
+                snprintf(message,
+                         sizeof(message),
+                         enabled ? "Outer Shell will show in the menu bar when backends are running."
+                                 : "Outer Shell will not show in the menu bar when backends are running.");
+                send_action_response(fd, 200, true, message);
+                return;
+            }
+            send_action_response(fd, 400, false, "Menu bar visibility is only available on macOS.");
+            return;
+        }
         if (strcmp(operation, "checkUpdate") == 0 || strcmp(operation, "checkOuterShellUpdate") == 0) {
             char installed[128] = "";
             char latest[128] = "";

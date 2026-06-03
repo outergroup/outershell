@@ -39,6 +39,7 @@ private struct BackendRecord: Decodable {
     let iconSymbolName: String?
     let launchdPlistPath: String
     let ownsLaunchdPlist: Bool
+    let menuBarVisibilityEnabled: Bool?
     let frontends: [FrontendRecord]
     let logFiles: [LogFileRecord]
 
@@ -295,6 +296,7 @@ private extension BackendRecord {
                              iconSymbolName: emptyToNil(try reader.stringRef(at: 48)),
                              launchdPlistPath: try reader.stringRef(at: 56),
                              ownsLaunchdPlist: (flags & 0x20) != 0,
+                             menuBarVisibilityEnabled: (flags & 0x200) != 0,
                              frontends: try reader.child(at: 68).payloadArray().map(FrontendRecord.decodeBinary),
                              logFiles: try reader.child(at: 76).payloadArray().map(LogFileRecord.decodeBinary))
     }
@@ -4670,6 +4672,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                  iconSymbolName: backend.iconSymbolName,
                                  launchdPlistPath: backend.launchdPlistPath,
                                  ownsLaunchdPlist: backend.ownsLaunchdPlist,
+                                 menuBarVisibilityEnabled: backend.menuBarVisibilityEnabled,
                                  frontends: backend.frontends,
                                  logFiles: backend.logFiles)
         }
@@ -4708,6 +4711,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                  iconSymbolName: backend.iconSymbolName,
                                  launchdPlistPath: backend.launchdPlistPath,
                                  ownsLaunchdPlist: backend.ownsLaunchdPlist,
+                                 menuBarVisibilityEnabled: backend.menuBarVisibilityEnabled,
                                  frontends: frontends,
                                  logFiles: backend.logFiles)
         }
@@ -7928,6 +7932,11 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             items.append(OuterframeContextMenuItem(id: "showLogs",
                                                    title: "View Logs for Outer Shell",
                                                    isEnabled: true))
+            operationByItemID["menuBarVisibility"] = "toggleMenuBarVisibility"
+            items.append(OuterframeContextMenuItem(id: "menuBarVisibility",
+                                                   title: "Show in macOS menu bar when backends are running",
+                                                   isEnabled: true,
+                                                   state: (backend.menuBarVisibilityEnabled ?? true) ? .on : .off))
             operationByItemID["checkUpdate"] = "checkUpdate"
             items.append(OuterframeContextMenuItem(id: "checkUpdate",
                                                    title: "Check for Updates",
@@ -8152,6 +8161,11 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             showLogs(for: backend)
             return
         }
+        if operation == "toggleMenuBarVisibility" {
+            let enabled = !(backend.menuBarVisibilityEnabled ?? true)
+            performControlAction(for: backend, operation: enabled ? "showMenuBarWhenRunning" : "hideMenuBarWhenRunning")
+            return
+        }
         performControlAction(for: backend, operation: operation)
     }
 
@@ -8241,6 +8255,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             return "Checking \(backend.displayName) for updates..."
         case "update":
             return "Updating \(backend.displayName)..."
+        case "showMenuBarWhenRunning":
+            return "Showing \(backend.displayName) in the menu bar..."
+        case "hideMenuBarWhenRunning":
+            return "Hiding \(backend.displayName) from the menu bar..."
         case "migrateRoot":
             return "Migrating \(backend.displayName)..."
         case "start":
