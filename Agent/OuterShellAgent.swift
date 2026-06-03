@@ -63,6 +63,7 @@ private struct ManagedBackend: Equatable {
 
     let serviceID: String
     let displayName: String
+    let registryScope: String
     let plistPath: String
     let logFiles: [String]
     let frontends: [HostedFrontend]
@@ -70,6 +71,10 @@ private struct ManagedBackend: Equatable {
 
     var launchdDomain: String {
         plistPath.hasPrefix("/Library/LaunchDaemons/") ? "system" : "gui/\(getuid())"
+    }
+
+    var identityKey: String {
+        "\(registryScope):\(serviceID)"
     }
 
     var isSystemService: Bool {
@@ -152,7 +157,7 @@ private enum OuterShellRegistry {
     static func loadBackends() throws -> [ManagedBackend] {
         var merged: [String: PartialBackend] = [:]
         for path in registryPaths() where FileManager.default.isReadableFile(atPath: path) {
-            try loadRegistry(at: path, into: &merged)
+            try loadRegistry(at: path, registryScope: registryScope(for: path), into: &merged)
         }
         return merged.values
             .filter { !isOuterShellServiceID($0.serviceID) }
@@ -160,6 +165,7 @@ private enum OuterShellRegistry {
                 let state = launchdState(serviceID: partial.serviceID, plistPath: partial.plistPath)
                 return ManagedBackend(serviceID: partial.serviceID,
                                       displayName: partial.displayName.isEmpty ? partial.serviceID : partial.displayName,
+                                      registryScope: partial.registryScope,
                                       plistPath: partial.plistPath,
                                       logFiles: partial.logFiles.sorted(),
                                       frontends: partial.frontends.sorted { lhs, rhs in
@@ -170,7 +176,11 @@ private enum OuterShellRegistry {
             .sorted { lhs, rhs in
                 let order = lhs.displayName.localizedCaseInsensitiveCompare(rhs.displayName)
                 if order == .orderedSame {
-                    return lhs.serviceID.localizedCaseInsensitiveCompare(rhs.serviceID) == .orderedAscending
+                    let serviceIDOrder = lhs.serviceID.localizedCaseInsensitiveCompare(rhs.serviceID)
+                    if serviceIDOrder == .orderedSame {
+                        return lhs.registryScope.localizedCaseInsensitiveCompare(rhs.registryScope) == .orderedDescending
+                    }
+                    return serviceIDOrder == .orderedAscending
                 }
                 return order == .orderedAscending
             }
@@ -178,6 +188,7 @@ private enum OuterShellRegistry {
 
     private struct PartialBackend {
         let serviceID: String
+        let registryScope: String
         var displayName: String = ""
         var plistPath: String = ""
         var logFiles: Set<String> = []
@@ -222,6 +233,15 @@ private enum OuterShellRegistry {
         return Array(Set(paths))
     }
 
+    private static func registryScope(for path: String) -> String {
+        let normalized = (path as NSString).standardizingPath
+        return normalized.hasPrefix("/Library/Application Support/outershell/") ? "system" : "user"
+    }
+
+    private static func registryKey(serviceID: String, registryScope: String) -> String {
+        "\(registryScope):\(serviceID)"
+    }
+
     private static func orwaPath(for registryPath: String) -> String {
         let path = registryPath as NSString
         if path.lastPathComponent == "registry.orwa" {
@@ -237,7 +257,9 @@ private enum OuterShellRegistry {
             value == "dev.outergroup.Backends"
     }
 
-    private static func loadRegistry(at path: String, into merged: inout [String: PartialBackend]) throws {
+    private static func loadRegistry(at path: String,
+                                     registryScope: String,
+                                     into merged: inout [String: PartialBackend]) throws {
         let data = try Data(contentsOf: URL(fileURLWithPath: path), options: [.mappedIfSafe])
         guard data.count >= orwaLegacyThreeTableHeaderSize,
               data.starts(with: [0x4f, 0x52, 0x57, 0x41]),
@@ -283,7 +305,8 @@ private enum OuterShellRegistry {
             let rowOffset = backends.offset + row * backends.rowSize
             let serviceID = readString(data, variableOffset, rowOffset)
             guard !serviceID.isEmpty else { continue }
-            var partial = merged[serviceID] ?? PartialBackend(serviceID: serviceID)
+            let key = registryKey(serviceID: serviceID, registryScope: registryScope)
+            var partial = merged[key] ?? PartialBackend(serviceID: serviceID, registryScope: registryScope)
             let displayName = readString(data, variableOffset, rowOffset + 16)
             let plistPath: String
             if backends.rowSize >= orwaLegacyBackendsRowSize {
@@ -293,7 +316,7 @@ private enum OuterShellRegistry {
             }
             if !displayName.isEmpty { partial.displayName = displayName }
             if !plistPath.isEmpty { partial.plistPath = plistPath }
-            merged[serviceID] = partial
+            merged[key] = partial
         }
 
         let frontends = descriptors[1]
@@ -302,6 +325,7 @@ private enum OuterShellRegistry {
             let url = readString(data, variableOffset, rowOffset)
             let serviceID = readString(data, variableOffset, rowOffset + 16)
             guard !serviceID.isEmpty else { continue }
+            let key = registryKey(serviceID: serviceID, registryScope: registryScope)
             let displayName = readString(data, variableOffset, rowOffset + 32)
             var port = 0
             var socketPath = ""
@@ -313,7 +337,7 @@ private enum OuterShellRegistry {
                     socketPath = readString(data, variableOffset, rowOffset + 81)
                 }
             }
-            var partial = merged[serviceID] ?? PartialBackend(serviceID: serviceID)
+            var partial = merged[key] ?? PartialBackend(serviceID: serviceID, registryScope: registryScope)
             let frontend = HostedFrontend(serviceID: serviceID,
                                           name: displayName,
                                           port: port,
@@ -322,7 +346,7 @@ private enum OuterShellRegistry {
             if !partial.frontends.contains(frontend) {
                 partial.frontends.append(frontend)
             }
-            merged[serviceID] = partial
+            merged[key] = partial
         }
 
         let logTableIndex = tableCount == orwaLegacyThreeTableCount ? 2 : 3
@@ -333,9 +357,10 @@ private enum OuterShellRegistry {
             let path = readString(data, variableOffset, rowOffset)
             let serviceID = readString(data, variableOffset, rowOffset + 16)
             guard !serviceID.isEmpty, !path.isEmpty else { continue }
-            var partial = merged[serviceID] ?? PartialBackend(serviceID: serviceID)
+            let key = registryKey(serviceID: serviceID, registryScope: registryScope)
+            var partial = merged[key] ?? PartialBackend(serviceID: serviceID, registryScope: registryScope)
             partial.logFiles.insert(path)
-            merged[serviceID] = partial
+            merged[key] = partial
         }
     }
 
@@ -970,8 +995,11 @@ private final class OuterShellAgentDelegate: NSObject, NSApplicationDelegate, NS
             menu.addItem(item)
             menu.addItem(.separator())
         }
+        let duplicateDisplayNameKeys = duplicateMenuDisplayNameKeys(for: services)
         for (index, service) in services.enumerated() {
-            append(service, isLast: index == services.index(before: services.endIndex))
+            let displayName = menuDisplayName(for: service,
+                                              showsScope: duplicateDisplayNameKeys.contains(menuDisplayNameKey(for: service)))
+            append(service, displayName: displayName, isLast: index == services.index(before: services.endIndex))
         }
         if !menu.items.isEmpty {
             menu.addItem(.separator())
@@ -990,10 +1018,10 @@ private final class OuterShellAgentDelegate: NSObject, NSApplicationDelegate, NS
         menu.addItem(manage)
     }
 
-    private func append(_ service: ManagedBackend, isLast: Bool) {
-        let heading = NSMenuItem(title: service.displayName, action: nil, keyEquivalent: "")
+    private func append(_ service: ManagedBackend, displayName: String, isLast: Bool) {
+        let heading = NSMenuItem(title: displayName, action: nil, keyEquivalent: "")
         heading.isEnabled = false
-        heading.view = SectionHeadingMenuItemView(title: service.displayName)
+        heading.view = SectionHeadingMenuItemView(title: displayName)
         menu.addItem(heading)
 
         let frontend = preferredFrontend(for: service)
@@ -1022,6 +1050,25 @@ private final class OuterShellAgentDelegate: NSObject, NSApplicationDelegate, NS
         if !isLast {
             menu.addItem(.separator())
         }
+    }
+
+    private func duplicateMenuDisplayNameKeys(for services: [ManagedBackend]) -> Set<String> {
+        let counts = services.reduce(into: [String: Int]()) { result, service in
+            result[menuDisplayNameKey(for: service), default: 0] += 1
+        }
+        return Set(counts.compactMap { key, count in count > 1 ? key : nil })
+    }
+
+    private func menuDisplayNameKey(for service: ManagedBackend) -> String {
+        let displayName = service.displayName.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return "\(service.serviceID.lowercased())\u{1f}\(displayName)"
+    }
+
+    private func menuDisplayName(for service: ManagedBackend, showsScope: Bool) -> String {
+        let base = service.displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let displayName = base.isEmpty ? service.serviceID : base
+        guard showsScope else { return displayName }
+        return "\(displayName) (\(service.registryScope == "system" ? "root" : "user"))"
     }
 
     fileprivate func setMenuBarVisibilityEnabled(_ enabled: Bool) {
@@ -1127,7 +1174,7 @@ private final class OuterShellAgentDelegate: NSObject, NSApplicationDelegate, NS
     private func performLifecycleAction(for service: ManagedBackend) {
         let pendingAction = PendingLifecycleAction(desiredState: nextLifecycleState(for: service),
                                                    expiresAt: Date().addingTimeInterval(5))
-        pendingLifecycleActions[service.serviceID] = pendingAction
+        pendingLifecycleActions[service.identityKey] = pendingAction
         applyOptimisticLifecycleState(for: service, desiredState: pendingAction.desiredState)
         lastError = nil
         updateStatusItem()
@@ -1138,7 +1185,7 @@ private final class OuterShellAgentDelegate: NSObject, NSApplicationDelegate, NS
             await MainActor.run {
                 if !success {
                     self.lastError = "Could not \(service.state.isRunning ? "stop" : "start") \(service.displayName)."
-                    self.pendingLifecycleActions.removeValue(forKey: service.serviceID)
+                    self.pendingLifecycleActions.removeValue(forKey: service.identityKey)
                 }
                 self.scheduleFollowUpRefreshes()
                 self.refresh()
@@ -1149,9 +1196,10 @@ private final class OuterShellAgentDelegate: NSObject, NSApplicationDelegate, NS
     private func applyOptimisticLifecycleState(for service: ManagedBackend, desiredState: ManagedBackend.State) {
         services = services
             .map { current in
-                guard current.serviceID == service.serviceID else { return current }
+                guard current.identityKey == service.identityKey else { return current }
                 return ManagedBackend(serviceID: current.serviceID,
                                       displayName: current.displayName,
+                                      registryScope: current.registryScope,
                                       plistPath: current.plistPath,
                                       logFiles: current.logFiles,
                                       frontends: desiredState.isRunning ? current.frontends : [],
@@ -1164,29 +1212,31 @@ private final class OuterShellAgentDelegate: NSObject, NSApplicationDelegate, NS
         let now = Date()
         pendingLifecycleActions = pendingLifecycleActions.filter { $0.value.expiresAt > now }
 
-        let currentServicesByID = Dictionary(uniqueKeysWithValues: services.map { ($0.serviceID, $0) })
-        let fetchedIDs = Set(fetchedServices.map(\.serviceID))
+        let currentServicesByKey = Dictionary(uniqueKeysWithValues: services.map { ($0.identityKey, $0) })
+        let fetchedKeys = Set(fetchedServices.map(\.identityKey))
         var mergedServices = fetchedServices.map { service in
-            guard let pendingAction = pendingLifecycleActions[service.serviceID] else {
+            guard let pendingAction = pendingLifecycleActions[service.identityKey] else {
                 return service
             }
             if shouldClearPendingLifecycleAction(pendingAction, for: service) {
-                pendingLifecycleActions.removeValue(forKey: service.serviceID)
+                pendingLifecycleActions.removeValue(forKey: service.identityKey)
                 return service
             }
-            let fallbackFrontends = currentServicesByID[service.serviceID]?.frontends ?? service.frontends
+            let fallbackFrontends = currentServicesByKey[service.identityKey]?.frontends ?? service.frontends
             return ManagedBackend(serviceID: service.serviceID,
                                   displayName: service.displayName,
+                                  registryScope: service.registryScope,
                                   plistPath: service.plistPath,
                                   logFiles: service.logFiles,
                                   frontends: pendingAction.desiredState.isRunning ? fallbackFrontends : [],
                                   state: pendingAction.desiredState)
         }
 
-        for (serviceID, pendingAction) in pendingLifecycleActions where !fetchedIDs.contains(serviceID) {
-            guard let current = currentServicesByID[serviceID] else { continue }
+        for (serviceKey, pendingAction) in pendingLifecycleActions where !fetchedKeys.contains(serviceKey) {
+            guard let current = currentServicesByKey[serviceKey] else { continue }
             mergedServices.append(ManagedBackend(serviceID: current.serviceID,
                                                  displayName: current.displayName,
+                                                 registryScope: current.registryScope,
                                                  plistPath: current.plistPath,
                                                  logFiles: current.logFiles,
                                                  frontends: pendingAction.desiredState.isRunning ? current.frontends : [],
@@ -1227,39 +1277,39 @@ private final class OuterShellAgentDelegate: NSObject, NSApplicationDelegate, NS
                   pid > 0 else {
                 return nil
             }
-            return (service.serviceID, pid_t(pid))
+            return (service.identityKey, pid_t(pid))
         })
 
-        let identifiersToRemove = serviceExitMonitors.compactMap { serviceID, existing in
-            desiredPIDs[serviceID] == existing.pid ? nil : serviceID
+        let identifiersToRemove = serviceExitMonitors.compactMap { serviceKey, existing in
+            desiredPIDs[serviceKey] == existing.pid ? nil : serviceKey
         }
-        for serviceID in identifiersToRemove {
-            serviceExitMonitors[serviceID]?.source.cancel()
-            serviceExitMonitors.removeValue(forKey: serviceID)
+        for serviceKey in identifiersToRemove {
+            serviceExitMonitors[serviceKey]?.source.cancel()
+            serviceExitMonitors.removeValue(forKey: serviceKey)
         }
 
-        for (serviceID, pid) in desiredPIDs {
-            if serviceExitMonitors[serviceID]?.pid == pid {
+        for (serviceKey, pid) in desiredPIDs {
+            if serviceExitMonitors[serviceKey]?.pid == pid {
                 continue
             }
 
             let source = DispatchSource.makeProcessSource(identifier: pid, eventMask: .exit, queue: .main)
             source.setEventHandler { [weak self] in
-                self?.handleServiceExit(serviceID: serviceID, pid: pid)
+                self?.handleServiceExit(serviceKey: serviceKey, pid: pid)
             }
             source.resume()
-            serviceExitMonitors[serviceID] = (pid: pid, source: source)
+            serviceExitMonitors[serviceKey] = (pid: pid, source: source)
         }
     }
 
-    private func handleServiceExit(serviceID: String, pid: pid_t) {
-        guard let monitor = serviceExitMonitors[serviceID],
+    private func handleServiceExit(serviceKey: String, pid: pid_t) {
+        guard let monitor = serviceExitMonitors[serviceKey],
               monitor.pid == pid else {
             return
         }
 
         monitor.source.cancel()
-        serviceExitMonitors.removeValue(forKey: serviceID)
+        serviceExitMonitors.removeValue(forKey: serviceKey)
         refresh()
     }
 
@@ -1300,7 +1350,11 @@ private final class OuterShellAgentDelegate: NSObject, NSApplicationDelegate, NS
     private func sortServicesForDisplay(lhs: ManagedBackend, rhs: ManagedBackend) -> Bool {
         let displayNameOrder = lhs.displayName.localizedCaseInsensitiveCompare(rhs.displayName)
         if displayNameOrder == .orderedSame {
-            return lhs.serviceID.localizedCaseInsensitiveCompare(rhs.serviceID) == .orderedAscending
+            let serviceIDOrder = lhs.serviceID.localizedCaseInsensitiveCompare(rhs.serviceID)
+            if serviceIDOrder == .orderedSame {
+                return lhs.registryScope.localizedCaseInsensitiveCompare(rhs.registryScope) == .orderedDescending
+            }
+            return serviceIDOrder == .orderedAscending
         }
         return displayNameOrder == .orderedAscending
     }
