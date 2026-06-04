@@ -10,6 +10,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <poll.h>
+#include <pthread.h>
 #include <pwd.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -32,6 +33,9 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+#ifndef __APPLE__
+#include <dlfcn.h>
+#endif
 
 #include "../Backend/OuterShellAPI.h"
 #include "../Backend/OuterShellBuffer.h"
@@ -643,7 +647,9 @@ typedef struct {
 #define FRONTEND_FLAG_RUNNING 0x01u
 
 static SystemdStatusCache g_systemd_status_cache = {0};
+static pthread_mutex_t g_systemd_status_cache_mutex = PTHREAD_MUTEX_INITIALIZER;
 static uint64_t g_backend_event_sequence = 1;
+static pthread_mutex_t g_backend_event_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 typedef struct {
     const char *service_id;
@@ -4019,7 +4025,9 @@ static bool registry_store_open_user_readwrite(RegistryStore *store, char *error
     return registry_store_open_at(store, g_registry_database_path, true, error, error_size);
 }
 
-static void append_systemd_status_scope(const char *scope) {
+static size_t collect_systemd_status_scope_via_systemctl(const char *scope,
+                                                         SystemdStatusEntry *entries,
+                                                         size_t capacity) {
     const char *scope_argument = (scope && strcmp(scope, "system") == 0) ? "--system" : "--user";
     char command[256];
     snprintf(command,
@@ -4028,11 +4036,11 @@ static void append_systemd_status_scope(const char *scope) {
              scope_argument);
 
     FILE *pipe = popen(command, "r");
-    if (!pipe) return;
+    if (!pipe) return 0;
 
+    size_t count = 0;
     char line[2048];
-    while (g_systemd_status_cache.count < MAX_SYSTEMD_STATUS_ENTRIES &&
-           fgets(line, sizeof(line), pipe)) {
+    while (count < capacity && fgets(line, sizeof(line), pipe)) {
         char unit_name[256] = "";
         char load_state[32] = "";
         char active_state[32] = "";
@@ -4042,41 +4050,411 @@ static void append_systemd_status_scope(const char *scope) {
         if (!safe_unit_name(unit_name)) {
             continue;
         }
-        SystemdStatusEntry *entry = &g_systemd_status_cache.entries[g_systemd_status_cache.count++];
+        SystemdStatusEntry *entry = &entries[count++];
         snprintf(entry->unit_name, sizeof(entry->unit_name), "%s", unit_name);
         snprintf(entry->scope, sizeof(entry->scope), "%s", scope && scope[0] ? scope : "user");
         snprintf(entry->active_state, sizeof(entry->active_state), "%s", active_state);
     }
     pclose(pipe);
+    return count;
 }
 
-static void refresh_systemd_status_cache_if_needed(void) {
-    int64_t now = monotonic_milliseconds();
-    if (g_systemd_status_cache.refreshed_at_ms > 0 &&
-        now - g_systemd_status_cache.refreshed_at_ms < SYSTEMD_STATUS_CACHE_TTL_MS) {
-        return;
+static void replace_systemd_status_cache(const SystemdStatusEntry *entries, size_t count) {
+    pthread_mutex_lock(&g_systemd_status_cache_mutex);
+    if (count > MAX_SYSTEMD_STATUS_ENTRIES) count = MAX_SYSTEMD_STATUS_ENTRIES;
+    if (entries && count > 0) {
+        memcpy(g_systemd_status_cache.entries, entries, count * sizeof(SystemdStatusEntry));
+    }
+    g_systemd_status_cache.count = count;
+    g_systemd_status_cache.refreshed_at_ms = monotonic_milliseconds();
+    pthread_mutex_unlock(&g_systemd_status_cache_mutex);
+}
+
+static void invalidate_systemd_status_cache(void) {
+    pthread_mutex_lock(&g_systemd_status_cache_mutex);
+    g_systemd_status_cache.refreshed_at_ms = 0;
+    pthread_mutex_unlock(&g_systemd_status_cache_mutex);
+}
+
+#ifndef __APPLE__
+static void replace_systemd_status_scope_cache(const char *scope, const SystemdStatusEntry *entries, size_t count) {
+    const char *normalized_scope = (scope && strcmp(scope, "system") == 0) ? "system" : "user";
+    pthread_mutex_lock(&g_systemd_status_cache_mutex);
+    size_t write_index = 0;
+    for (size_t i = 0; i < g_systemd_status_cache.count; i++) {
+        if (strcmp(g_systemd_status_cache.entries[i].scope, normalized_scope) == 0) {
+            continue;
+        }
+        if (write_index != i) {
+            g_systemd_status_cache.entries[write_index] = g_systemd_status_cache.entries[i];
+        }
+        write_index++;
+    }
+    size_t available = MAX_SYSTEMD_STATUS_ENTRIES - write_index;
+    if (count > available) count = available;
+    if (entries && count > 0) {
+        memcpy(g_systemd_status_cache.entries + write_index, entries, count * sizeof(SystemdStatusEntry));
+    }
+    g_systemd_status_cache.count = write_index + count;
+    g_systemd_status_cache.refreshed_at_ms = monotonic_milliseconds();
+    pthread_mutex_unlock(&g_systemd_status_cache_mutex);
+}
+
+typedef struct OuterSdBus OuterSdBus;
+typedef struct OuterSdBusMessage OuterSdBusMessage;
+typedef struct OuterSdBusSlot OuterSdBusSlot;
+
+typedef struct {
+    const char *name;
+    const char *message;
+    int _need_free;
+} OuterSdBusError;
+
+typedef int (*OuterSdBusMessageHandler)(OuterSdBusMessage *message, void *userdata, OuterSdBusError *ret_error);
+
+typedef struct {
+    void *handle;
+    int (*open_user)(OuterSdBus **bus);
+    int (*open_system)(OuterSdBus **bus);
+    int (*call_method)(OuterSdBus *bus,
+                       const char *destination,
+                       const char *path,
+                       const char *interface,
+                       const char *member,
+                       OuterSdBusError *ret_error,
+                       OuterSdBusMessage **reply,
+                       const char *types,
+                       ...);
+    int (*add_match)(OuterSdBus *bus,
+                     OuterSdBusSlot **slot,
+                     const char *match,
+                     OuterSdBusMessageHandler callback,
+                     void *userdata);
+    int (*message_enter_container)(OuterSdBusMessage *message, char type, const char *contents);
+    int (*message_exit_container)(OuterSdBusMessage *message);
+    int (*message_read)(OuterSdBusMessage *message, const char *types, ...);
+    OuterSdBusMessage *(*message_unref)(OuterSdBusMessage *message);
+    void (*error_free)(OuterSdBusError *error);
+    int (*process)(OuterSdBus *bus, OuterSdBusMessage **message);
+    int (*wait)(OuterSdBus *bus, uint64_t timeout_usec);
+    OuterSdBus *(*unref)(OuterSdBus *bus);
+} SystemdBusApi;
+
+typedef struct {
+    const char *scope;
+    OuterSdBus *bus;
+    bool dirty;
+    bool active;
+} SystemdBusWatch;
+
+static SystemdBusApi g_systemd_bus_api = {0};
+static pthread_mutex_t g_systemd_status_watcher_mutex = PTHREAD_MUTEX_INITIALIZER;
+static bool g_systemd_status_watcher_started = false;
+static bool g_systemd_status_event_cache_failed = false;
+
+static bool load_systemd_bus_api(SystemdBusApi *api) {
+    if (api->handle) return true;
+    void *handle = dlopen("libsystemd.so.0", RTLD_NOW | RTLD_LOCAL);
+    if (!handle) return false;
+    api->handle = handle;
+#define LOAD_SYSTEMD_BUS_SYMBOL(field, symbol) do { \
+        *(void **)(&api->field) = dlsym(handle, symbol); \
+        if (!api->field) { \
+            dlclose(handle); \
+            memset(api, 0, sizeof(*api)); \
+            return false; \
+        } \
+    } while (0)
+    LOAD_SYSTEMD_BUS_SYMBOL(open_user, "sd_bus_open_user");
+    LOAD_SYSTEMD_BUS_SYMBOL(open_system, "sd_bus_open_system");
+    LOAD_SYSTEMD_BUS_SYMBOL(call_method, "sd_bus_call_method");
+    LOAD_SYSTEMD_BUS_SYMBOL(add_match, "sd_bus_add_match");
+    LOAD_SYSTEMD_BUS_SYMBOL(message_enter_container, "sd_bus_message_enter_container");
+    LOAD_SYSTEMD_BUS_SYMBOL(message_exit_container, "sd_bus_message_exit_container");
+    LOAD_SYSTEMD_BUS_SYMBOL(message_read, "sd_bus_message_read");
+    LOAD_SYSTEMD_BUS_SYMBOL(message_unref, "sd_bus_message_unref");
+    LOAD_SYSTEMD_BUS_SYMBOL(error_free, "sd_bus_error_free");
+    LOAD_SYSTEMD_BUS_SYMBOL(process, "sd_bus_process");
+    LOAD_SYSTEMD_BUS_SYMBOL(wait, "sd_bus_wait");
+    LOAD_SYSTEMD_BUS_SYMBOL(unref, "sd_bus_unref");
+#undef LOAD_SYSTEMD_BUS_SYMBOL
+    return true;
+}
+
+static void set_systemd_status_event_cache_failed(bool failed) {
+    pthread_mutex_lock(&g_systemd_status_watcher_mutex);
+    g_systemd_status_event_cache_failed = failed;
+    pthread_mutex_unlock(&g_systemd_status_watcher_mutex);
+}
+
+static bool should_skip_systemd_status_polling(void) {
+    bool skip = false;
+    pthread_mutex_lock(&g_systemd_status_watcher_mutex);
+    skip = g_systemd_status_watcher_started && !g_systemd_status_event_cache_failed;
+    pthread_mutex_unlock(&g_systemd_status_watcher_mutex);
+    return skip;
+}
+
+static int systemd_bus_signal_handler(OuterSdBusMessage *message, void *userdata, OuterSdBusError *ret_error) {
+    (void)message;
+    (void)ret_error;
+    SystemdBusWatch *watch = userdata;
+    if (watch) watch->dirty = true;
+    return 0;
+}
+
+static bool subscribe_systemd_bus_watch(SystemdBusWatch *watch) {
+    if (!watch || !watch->bus) return false;
+    const char *manager_match =
+        "type='signal',sender='org.freedesktop.systemd1',"
+        "path='/org/freedesktop/systemd1',"
+        "interface='org.freedesktop.systemd1.Manager'";
+    const char *unit_properties_match =
+        "type='signal',sender='org.freedesktop.systemd1',"
+        "interface='org.freedesktop.DBus.Properties',"
+        "member='PropertiesChanged',"
+        "path_namespace='/org/freedesktop/systemd1/unit'";
+    if (g_systemd_bus_api.add_match(watch->bus, NULL, manager_match, systemd_bus_signal_handler, watch) < 0) {
+        return false;
+    }
+    if (g_systemd_bus_api.add_match(watch->bus, NULL, unit_properties_match, systemd_bus_signal_handler, watch) < 0) {
+        return false;
     }
 
-    g_systemd_status_cache.count = 0;
-    g_systemd_status_cache.refreshed_at_ms = now;
-    append_systemd_status_scope("user");
-#ifndef __APPLE__
-    append_systemd_status_scope("system");
-#endif
+    OuterSdBusError error = {0};
+    OuterSdBusMessage *reply = NULL;
+    int result = g_systemd_bus_api.call_method(watch->bus,
+                                               "org.freedesktop.systemd1",
+                                               "/org/freedesktop/systemd1",
+                                               "org.freedesktop.systemd1.Manager",
+                                               "Subscribe",
+                                               &error,
+                                               &reply,
+                                               "");
+    if (reply) g_systemd_bus_api.message_unref(reply);
+    g_systemd_bus_api.error_free(&error);
+    return result >= 0;
 }
 
-static const char *cached_systemd_active_state(const char *unit_name, const char *scope) {
-    if (!safe_unit_name(unit_name)) return NULL;
+static bool collect_systemd_status_scope_via_dbus(SystemdBusWatch *watch,
+                                                  SystemdStatusEntry *entries,
+                                                  size_t capacity,
+                                                  size_t *out_count) {
+    if (out_count) *out_count = 0;
+    if (!watch || !watch->bus || !entries) return false;
+
+    OuterSdBusError error = {0};
+    OuterSdBusMessage *reply = NULL;
+    int result = g_systemd_bus_api.call_method(watch->bus,
+                                               "org.freedesktop.systemd1",
+                                               "/org/freedesktop/systemd1",
+                                               "org.freedesktop.systemd1.Manager",
+                                               "ListUnits",
+                                               &error,
+                                               &reply,
+                                               "");
+    if (result < 0 || !reply) {
+        if (reply) g_systemd_bus_api.message_unref(reply);
+        g_systemd_bus_api.error_free(&error);
+        return false;
+    }
+
+    size_t count = 0;
+    result = g_systemd_bus_api.message_enter_container(reply, 'a', "(ssssssouso)");
+    while (result > 0) {
+        result = g_systemd_bus_api.message_enter_container(reply, 'r', "ssssssouso");
+        if (result <= 0) break;
+
+        const char *unit_name = NULL;
+        const char *description = NULL;
+        const char *load_state = NULL;
+        const char *active_state = NULL;
+        const char *sub_state = NULL;
+        const char *following = NULL;
+        const char *object_path = NULL;
+        uint32_t job_id = 0;
+        const char *job_type = NULL;
+        const char *job_path = NULL;
+        int read_result = g_systemd_bus_api.message_read(reply,
+                                                         "ssssssouso",
+                                                         &unit_name,
+                                                         &description,
+                                                         &load_state,
+                                                         &active_state,
+                                                         &sub_state,
+                                                         &following,
+                                                         &object_path,
+                                                         &job_id,
+                                                         &job_type,
+                                                         &job_path);
+        (void)description;
+        (void)load_state;
+        (void)sub_state;
+        (void)following;
+        (void)object_path;
+        (void)job_id;
+        (void)job_type;
+        (void)job_path;
+        g_systemd_bus_api.message_exit_container(reply);
+        if (read_result < 0) continue;
+        if (!safe_unit_name(unit_name) || !active_state || !active_state[0]) continue;
+        if (count >= capacity) continue;
+        SystemdStatusEntry *entry = &entries[count++];
+        snprintf(entry->unit_name, sizeof(entry->unit_name), "%s", unit_name);
+        snprintf(entry->scope, sizeof(entry->scope), "%s", watch->scope);
+        snprintf(entry->active_state, sizeof(entry->active_state), "%s", active_state);
+    }
+    g_systemd_bus_api.message_exit_container(reply);
+    g_systemd_bus_api.message_unref(reply);
+    g_systemd_bus_api.error_free(&error);
+    if (out_count) *out_count = count;
+    return true;
+}
+
+static bool refresh_systemd_bus_watch(SystemdBusWatch *watch, bool notify) {
+    SystemdStatusEntry entries[MAX_SYSTEMD_STATUS_ENTRIES];
+    size_t count = 0;
+    if (!collect_systemd_status_scope_via_dbus(watch, entries, MAX_SYSTEMD_STATUS_ENTRIES, &count)) {
+        return false;
+    }
+    replace_systemd_status_scope_cache(watch->scope, entries, count);
+    if (notify) mark_backend_event_changed();
+    return true;
+}
+
+static bool open_systemd_bus_watch(SystemdBusWatch *watch, const char *scope) {
+    memset(watch, 0, sizeof(*watch));
+    watch->scope = scope;
+    int result = strcmp(scope, "system") == 0
+        ? g_systemd_bus_api.open_system(&watch->bus)
+        : g_systemd_bus_api.open_user(&watch->bus);
+    if (result < 0 || !watch->bus) return false;
+    if (!subscribe_systemd_bus_watch(watch)) {
+        g_systemd_bus_api.unref(watch->bus);
+        watch->bus = NULL;
+        return false;
+    }
+    watch->active = refresh_systemd_bus_watch(watch, false);
+    watch->dirty = false;
+    if (!watch->active) {
+        g_systemd_bus_api.unref(watch->bus);
+        watch->bus = NULL;
+    }
+    return watch->active;
+}
+
+static void process_systemd_bus_watch(SystemdBusWatch *watch) {
+    if (!watch || !watch->active || !watch->bus) return;
+    while (!g_shutdown_requested) {
+        int result = g_systemd_bus_api.process(watch->bus, NULL);
+        if (result <= 0) break;
+    }
+    if (watch->dirty) {
+        watch->dirty = false;
+        if (!refresh_systemd_bus_watch(watch, true)) {
+            watch->active = false;
+            g_systemd_bus_api.unref(watch->bus);
+            watch->bus = NULL;
+            mark_backend_event_changed();
+        }
+    }
+}
+
+static void *systemd_status_watcher_main(void *context) {
+    (void)context;
+    if (!load_systemd_bus_api(&g_systemd_bus_api)) {
+        set_systemd_status_event_cache_failed(true);
+        return NULL;
+    }
+
+    SystemdBusWatch user_watch;
+    SystemdBusWatch system_watch;
+    bool user_active = open_systemd_bus_watch(&user_watch, "user");
+    bool system_active = open_systemd_bus_watch(&system_watch, "system");
+    bool any_active = user_active || system_active;
+    set_systemd_status_event_cache_failed(!any_active);
+    if (!any_active) return NULL;
+    mark_backend_event_changed();
+
+    while (!g_shutdown_requested && (user_watch.active || system_watch.active)) {
+        process_systemd_bus_watch(&user_watch);
+        process_systemd_bus_watch(&system_watch);
+        if (user_watch.active && user_watch.bus) {
+            g_systemd_bus_api.wait(user_watch.bus, 500000);
+        } else if (system_watch.active && system_watch.bus) {
+            g_systemd_bus_api.wait(system_watch.bus, 500000);
+        } else {
+            usleep(500000);
+        }
+    }
+
+    if (user_watch.bus) g_systemd_bus_api.unref(user_watch.bus);
+    if (system_watch.bus) g_systemd_bus_api.unref(system_watch.bus);
+    set_systemd_status_event_cache_failed(true);
+    return NULL;
+}
+
+static void start_systemd_status_watcher(void) {
+    pthread_mutex_lock(&g_systemd_status_watcher_mutex);
+    if (g_systemd_status_watcher_started) {
+        pthread_mutex_unlock(&g_systemd_status_watcher_mutex);
+        return;
+    }
+    g_systemd_status_watcher_started = true;
+    g_systemd_status_event_cache_failed = false;
+    pthread_mutex_unlock(&g_systemd_status_watcher_mutex);
+
+    pthread_t thread;
+    int result = pthread_create(&thread, NULL, systemd_status_watcher_main, NULL);
+    if (result == 0) {
+        pthread_detach(thread);
+    } else {
+        set_systemd_status_event_cache_failed(true);
+    }
+}
+#endif
+
+static void refresh_systemd_status_cache_if_needed(void) {
+#ifndef __APPLE__
+    if (should_skip_systemd_status_polling()) return;
+#endif
+    int64_t now = monotonic_milliseconds();
+    pthread_mutex_lock(&g_systemd_status_cache_mutex);
+    if (g_systemd_status_cache.refreshed_at_ms > 0 &&
+        now - g_systemd_status_cache.refreshed_at_ms < SYSTEMD_STATUS_CACHE_TTL_MS) {
+        pthread_mutex_unlock(&g_systemd_status_cache_mutex);
+        return;
+    }
+    pthread_mutex_unlock(&g_systemd_status_cache_mutex);
+
+    SystemdStatusEntry entries[MAX_SYSTEMD_STATUS_ENTRIES];
+    size_t count = collect_systemd_status_scope_via_systemctl("user", entries, MAX_SYSTEMD_STATUS_ENTRIES);
+#ifndef __APPLE__
+    count += collect_systemd_status_scope_via_systemctl("system",
+                                                        entries + count,
+                                                        MAX_SYSTEMD_STATUS_ENTRIES - count);
+#endif
+    replace_systemd_status_cache(entries, count);
+}
+
+static bool cached_systemd_active_state(const char *unit_name, const char *scope, char *out, size_t out_size) {
+    if (out_size > 0) out[0] = '\0';
+    if (!safe_unit_name(unit_name) || !out || out_size == 0) return false;
     const char *normalized_scope = (scope && strcmp(scope, "system") == 0) ? "system" : "user";
     refresh_systemd_status_cache_if_needed();
+    bool found = false;
+    pthread_mutex_lock(&g_systemd_status_cache_mutex);
     for (size_t i = 0; i < g_systemd_status_cache.count; i++) {
         SystemdStatusEntry *entry = &g_systemd_status_cache.entries[i];
         if (strcmp(entry->scope, normalized_scope) == 0 &&
             strcmp(entry->unit_name, unit_name) == 0) {
-            return entry->active_state;
+            snprintf(out, out_size, "%s", entry->active_state);
+            found = true;
+            break;
         }
     }
-    return NULL;
+    pthread_mutex_unlock(&g_systemd_status_cache_mutex);
+    return found;
 }
 
 static void systemd_status(const char *unit_name, const char *scope, char *out, size_t out_size) {
@@ -4084,10 +4462,11 @@ static void systemd_status(const char *unit_name, const char *scope, char *out, 
         snprintf(out, out_size, "unknown");
         return;
     }
-    const char *active_state = cached_systemd_active_state(unit_name, scope);
-    if (active_state && strcmp(active_state, "active") == 0) {
+    char active_state[32] = "";
+    bool has_active_state = cached_systemd_active_state(unit_name, scope, active_state, sizeof(active_state));
+    if (has_active_state && strcmp(active_state, "active") == 0) {
         snprintf(out, out_size, "running");
-    } else if (!active_state ||
+    } else if (!has_active_state ||
                strcmp(active_state, "inactive") == 0 ||
                strcmp(active_state, "failed") == 0) {
         for (size_t i = 0; i < sizeof(kBundledApps) / sizeof(kBundledApps[0]); i++) {
@@ -4097,8 +4476,9 @@ static void systemd_status(const char *unit_name, const char *scope, char *out, 
             char socket_unit[256];
             systemd_socket_unit_name(unit_name, socket_unit, sizeof(socket_unit));
             if (safe_unit_name(socket_unit)) {
-                const char *socket_active_state = cached_systemd_active_state(socket_unit, scope);
-                if (socket_active_state && strcmp(socket_active_state, "active") == 0) {
+                char socket_active_state[32] = "";
+                if (cached_systemd_active_state(socket_unit, scope, socket_active_state, sizeof(socket_active_state)) &&
+                    strcmp(socket_active_state, "active") == 0) {
                     snprintf(out, out_size, "available");
                     return;
                 }
@@ -4114,12 +4494,14 @@ static uint64_t systemd_status_state_token(void) {
     uint64_t token = 1;
 #ifndef __APPLE__
     refresh_systemd_status_cache_if_needed();
+    pthread_mutex_lock(&g_systemd_status_cache_mutex);
     for (size_t i = 0; i < g_systemd_status_cache.count; i++) {
         SystemdStatusEntry *entry = &g_systemd_status_cache.entries[i];
         token = mix_u64(token, string_state_token(entry->unit_name));
         token = mix_u64(token, string_state_token(entry->scope));
         token = mix_u64(token, string_state_token(entry->active_state));
     }
+    pthread_mutex_unlock(&g_systemd_status_cache_mutex);
 #endif
     return token;
 }
@@ -5140,7 +5522,9 @@ static uint64_t registry_file_state_token(const char *sqlite_path) {
 }
 
 static uint64_t current_backends_event_version(void) {
+    pthread_mutex_lock(&g_backend_event_mutex);
     uint64_t version = g_backend_event_sequence;
+    pthread_mutex_unlock(&g_backend_event_mutex);
     version = mix_u64(version, registry_file_state_token(g_registry_database_path));
     version = mix_u64(version, registry_file_state_token(g_system_registry_database_path));
     version = mix_u64(version, systemd_status_state_token());
@@ -5160,8 +5544,10 @@ static uint64_t current_log_event_version(const char *service_id, int log_index)
 }
 
 static void mark_backend_event_changed(void) {
+    pthread_mutex_lock(&g_backend_event_mutex);
     g_backend_event_sequence++;
     if (g_backend_event_sequence == 0) g_backend_event_sequence = 1;
+    pthread_mutex_unlock(&g_backend_event_mutex);
     if (g_backend_event_changed_callback) {
         g_backend_event_changed_callback();
     }
@@ -5816,7 +6202,7 @@ static void send_control_response(int fd, const char *query, const char *body) {
         ok = run_systemd_operation(unit_name, scope, operation, sudo_password, &needs_password, message, sizeof(message));
     }
     if (ok) {
-        g_systemd_status_cache.refreshed_at_ms = 0;
+        invalidate_systemd_status_cache();
     }
     if (ok && strcmp(operation, "start") == 0) {
         char wait_message[1024] = "";
@@ -11702,6 +12088,9 @@ int OuterShelldMain(int argc, char **argv) {
     if (g_system_registry_database_path[0]) {
         fprintf(stderr, "System registry database: %s\n", g_system_registry_database_path);
     }
+#ifndef __APPLE__
+    start_systemd_status_watcher();
+#endif
     run_api_reactor(api_listener);
     close(api_listener);
     g_api_listener_fd = -1;
