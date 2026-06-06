@@ -781,6 +781,24 @@ static const BundledAppDefinition kBundledApps[] = {
         .root_only = true,
         .archive_name = "Firehose.tar.gz",
         .version = "1"
+    },
+    {
+        .service_id = "dev.outergroup.Profile",
+        .display_name = "Profile",
+        .unit_name = "dev.outergroup.Profile.service",
+        .stage_directory_name = "Profile",
+        .install_directory_name = "dev.outergroup.Profile",
+        .binary_name = "ProfileBackend",
+        .bundle_prefix = "ProfileContent",
+        .icon_symbol_name = "flame",
+        .icon_name = "app-icon.png",
+        .source_name = "ProfileBackend.c",
+        .socket_name = "dev.outergroup.Profile",
+        .socket_activated = true,
+        .supports_root = true,
+        .root_only = true,
+        .archive_name = "Profile.tar.gz",
+        .version = "1"
     }
 };
 
@@ -2282,8 +2300,9 @@ enum {
     ORWA_TABLE_FRONTENDS = 1,
     ORWA_TABLE_FRONTEND_LAYOUTS = 2,
     ORWA_TABLE_LOG_FILES = 3,
-    ORWA_TABLE_FILE_OPENERS = 4,
-    ORWA_TABLE_COUNT = 5,
+    ORWA_TABLE_CONTENT_TYPES = 4,
+    ORWA_TABLE_FILE_OPENERS = 5,
+    ORWA_TABLE_COUNT = 6,
     ORWA_LEGACY_FOUR_TABLE_COUNT = 4,
     ORWA_LEGACY_THREE_TABLE_COUNT = 3,
     ORWA_TABLE_DESCRIPTOR_SIZE = 20,
@@ -2297,6 +2316,7 @@ enum {
     ORWA_FRONTENDS_ROW_SIZE_WITH_FLAGS = 117,
     ORWA_FRONTEND_LAYOUTS_ROW_SIZE = 32,
     ORWA_LOG_FILES_ROW_SIZE = 32,
+    ORWA_CONTENT_TYPES_ROW_SIZE = 96,
     ORWA_FILE_OPENERS_ROW_SIZE = 88
 };
 
@@ -2954,6 +2974,7 @@ static bool import_registry_binary_into_sqlite(sqlite3 *database, const char *sq
         uint32_t expected_row_size = i == ORWA_TABLE_BACKENDS ? ORWA_BACKENDS_ROW_SIZE :
                                      i == ORWA_TABLE_FRONTENDS ? descriptors[i].row_size :
                                      i == ORWA_TABLE_FRONTEND_LAYOUTS && table_count != ORWA_LEGACY_THREE_TABLE_COUNT ? ORWA_FRONTEND_LAYOUTS_ROW_SIZE :
+                                     i == ORWA_TABLE_CONTENT_TYPES ? ORWA_CONTENT_TYPES_ROW_SIZE :
                                      i == ORWA_TABLE_FILE_OPENERS ? ORWA_FILE_OPENERS_ROW_SIZE :
                                      ORWA_LOG_FILES_ROW_SIZE;
         if ((i == ORWA_TABLE_BACKENDS
@@ -3130,6 +3151,7 @@ static bool export_registry_binary_from_sqlite(sqlite3 *database, const char *sq
         {.row_count = registry_binary_count_rows(database, "frontends"), .row_size = ORWA_FRONTENDS_ROW_SIZE},
         {.row_count = registry_binary_count_rows(database, "frontend_layouts"), .row_size = ORWA_FRONTEND_LAYOUTS_ROW_SIZE},
         {.row_count = registry_binary_count_rows(database, "log_files"), .row_size = ORWA_LOG_FILES_ROW_SIZE},
+        {.row_count = 0, .row_size = ORWA_CONTENT_TYPES_ROW_SIZE},
         {.row_count = registry_binary_count_rows(database, "file_openers"), .row_size = ORWA_FILE_OPENERS_ROW_SIZE},
     };
 
@@ -3305,6 +3327,15 @@ typedef struct {
 } RegistryLogFileRecord;
 
 typedef struct {
+    char *identifier;
+    char *display_name;
+    char *conforms_to;
+    char *extensions;
+    char *filenames;
+    char *mime_types;
+} RegistryContentTypeRecord;
+
+typedef struct {
     char *extension;
     char *service_id;
     char *display_name;
@@ -3326,6 +3357,9 @@ typedef struct {
     RegistryLogFileRecord *logs;
     size_t log_count;
     size_t log_capacity;
+    RegistryContentTypeRecord *content_types;
+    size_t content_type_count;
+    size_t content_type_capacity;
     RegistryFileOpenerRecord *openers;
     size_t opener_count;
     size_t opener_capacity;
@@ -3375,6 +3409,15 @@ static void registry_store_free(RegistryStore *store) {
         free(store->logs[i].service_id);
     }
     free(store->logs);
+    for (size_t i = 0; i < store->content_type_count; i++) {
+        free(store->content_types[i].identifier);
+        free(store->content_types[i].display_name);
+        free(store->content_types[i].conforms_to);
+        free(store->content_types[i].extensions);
+        free(store->content_types[i].filenames);
+        free(store->content_types[i].mime_types);
+    }
+    free(store->content_types);
     for (size_t i = 0; i < store->opener_count; i++) {
         free(store->openers[i].extension);
         free(store->openers[i].service_id);
@@ -3440,6 +3483,20 @@ static const RegistryFrontendLayoutRecord *registry_store_find_layout_const(cons
 static RegistryLogFileRecord *registry_store_find_log_by_path(RegistryStore *store, const char *path) {
     for (size_t i = 0; i < store->log_count; i++) {
         if (strcmp(store->logs[i].path, path ? path : "") == 0) return &store->logs[i];
+    }
+    return NULL;
+}
+
+static RegistryContentTypeRecord *registry_store_find_content_type(RegistryStore *store, const char *identifier) {
+    for (size_t i = 0; i < store->content_type_count; i++) {
+        if (strcmp(store->content_types[i].identifier, identifier ? identifier : "") == 0) return &store->content_types[i];
+    }
+    return NULL;
+}
+
+static const RegistryContentTypeRecord *registry_store_find_content_type_const(const RegistryStore *store, const char *identifier) {
+    for (size_t i = 0; i < store->content_type_count; i++) {
+        if (strcmp(store->content_types[i].identifier, identifier ? identifier : "") == 0) return &store->content_types[i];
     }
     return NULL;
 }
@@ -3535,6 +3592,27 @@ static bool registry_store_upsert_log(RegistryStore *store, const char *path, co
     return registry_assign_string(&record->service_id, service_id);
 }
 
+static bool registry_store_upsert_content_type(RegistryStore *store,
+                                               const char *identifier,
+                                               const char *display_name,
+                                               const char *conforms_to,
+                                               const char *extensions,
+                                               const char *filenames,
+                                               const char *mime_types) {
+    RegistryContentTypeRecord *record = registry_store_find_content_type(store, identifier);
+    if (!record) {
+        REGISTRY_ENSURE_CAPACITY(store, content_type, RegistryContentTypeRecord);
+        record = &store->content_types[store->content_type_count++];
+        memset(record, 0, sizeof(*record));
+        if (!registry_assign_string(&record->identifier, identifier)) return false;
+    }
+    return registry_assign_string(&record->display_name, display_name) &&
+           registry_assign_string(&record->conforms_to, conforms_to) &&
+           registry_assign_string(&record->extensions, extensions) &&
+           registry_assign_string(&record->filenames, filenames) &&
+           registry_assign_string(&record->mime_types, mime_types);
+}
+
 static bool registry_store_upsert_opener(RegistryStore *store,
                                          const char *extension,
                                          const char *service_id,
@@ -3597,6 +3675,19 @@ static void registry_store_remove_log_at(RegistryStore *store, size_t index) {
     store->log_count--;
 }
 
+static void registry_store_remove_content_type_at(RegistryStore *store, size_t index) {
+    if (index >= store->content_type_count) return;
+    RegistryContentTypeRecord *record = &store->content_types[index];
+    free(record->identifier);
+    free(record->display_name);
+    free(record->conforms_to);
+    free(record->extensions);
+    free(record->filenames);
+    free(record->mime_types);
+    memmove(record, record + 1, (store->content_type_count - index - 1) * sizeof(*record));
+    store->content_type_count--;
+}
+
 static void registry_store_remove_opener_at(RegistryStore *store, size_t index) {
     if (index >= store->opener_count) return;
     RegistryFileOpenerRecord *record = &store->openers[index];
@@ -3645,6 +3736,12 @@ static void registry_store_clear_backend_openers(RegistryStore *store, const cha
         if (strcmp(store->openers[i - 1].service_id, service_id ? service_id : "") == 0) {
             registry_store_remove_opener_at(store, i - 1);
         }
+    }
+}
+
+static void registry_store_clear_content_types(RegistryStore *store) {
+    while (store->content_type_count > 0) {
+        registry_store_remove_content_type_at(store, store->content_type_count - 1);
     }
 }
 
@@ -3712,6 +3809,7 @@ static bool registry_store_load_orwa_file(RegistryStore *store, const char *path
         uint32_t expected_row_size = i == ORWA_TABLE_BACKENDS ? ORWA_BACKENDS_ROW_SIZE :
                                      i == ORWA_TABLE_FRONTENDS ? descriptors[i].row_size :
                                      i == ORWA_TABLE_FRONTEND_LAYOUTS && table_count != ORWA_LEGACY_THREE_TABLE_COUNT ? ORWA_FRONTEND_LAYOUTS_ROW_SIZE :
+                                     i == ORWA_TABLE_CONTENT_TYPES ? ORWA_CONTENT_TYPES_ROW_SIZE :
                                      i == ORWA_TABLE_FILE_OPENERS ? ORWA_FILE_OPENERS_ROW_SIZE :
                                      ORWA_LOG_FILES_ROW_SIZE;
         if ((i == ORWA_TABLE_BACKENDS
@@ -3845,6 +3943,35 @@ static bool registry_store_load_orwa_file(RegistryStore *store, const char *path
     }
 
     if (ok && table_count == ORWA_TABLE_COUNT) {
+        for (uint64_t row = 0; ok && row < descriptors[ORWA_TABLE_CONTENT_TYPES].row_count; row++) {
+            const unsigned char *row_bytes = bytes + descriptors[ORWA_TABLE_CONTENT_TYPES].offset + row * ORWA_CONTENT_TYPES_ROW_SIZE;
+            char *identifier = NULL, *display_name = NULL, *conforms_to = NULL, *extensions = NULL, *filenames = NULL, *mime_types = NULL;
+            ok = registry_store_read_string(bytes, file_size, variable_offset, row_bytes, 0, &identifier, error, error_size) &&
+                 registry_store_read_string(bytes, file_size, variable_offset, row_bytes, 16, &display_name, error, error_size) &&
+                 registry_store_read_string(bytes, file_size, variable_offset, row_bytes, 32, &conforms_to, error, error_size) &&
+                 registry_store_read_string(bytes, file_size, variable_offset, row_bytes, 48, &extensions, error, error_size) &&
+                 registry_store_read_string(bytes, file_size, variable_offset, row_bytes, 64, &filenames, error, error_size) &&
+                 registry_store_read_string(bytes, file_size, variable_offset, row_bytes, 80, &mime_types, error, error_size);
+            if (ok) {
+                ok = registry_store_upsert_content_type(store,
+                                                        identifier,
+                                                        display_name,
+                                                        conforms_to,
+                                                        extensions,
+                                                        filenames,
+                                                        mime_types);
+                if (!ok) snprintf(error, error_size, "Out of memory.");
+            }
+            free(identifier);
+            free(display_name);
+            free(conforms_to);
+            free(extensions);
+            free(filenames);
+            free(mime_types);
+        }
+    }
+
+    if (ok && table_count == ORWA_TABLE_COUNT) {
         for (uint64_t row = 0; ok && row < descriptors[ORWA_TABLE_FILE_OPENERS].row_count; row++) {
             const unsigned char *row_bytes = bytes + descriptors[ORWA_TABLE_FILE_OPENERS].offset + row * ORWA_FILE_OPENERS_ROW_SIZE;
             char *extension = NULL, *service_id = NULL, *display_name = NULL, *socket_path = NULL, *url_template = NULL;
@@ -3881,6 +4008,7 @@ static bool registry_store_write_orwa_file(RegistryStore *store, const char *pat
         {.row_count = store->frontend_count, .row_size = ORWA_FRONTENDS_ROW_SIZE},
         {.row_count = store->layout_count, .row_size = ORWA_FRONTEND_LAYOUTS_ROW_SIZE},
         {.row_count = store->log_count, .row_size = ORWA_LOG_FILES_ROW_SIZE},
+        {.row_count = store->content_type_count, .row_size = ORWA_CONTENT_TYPES_ROW_SIZE},
         {.row_count = store->opener_count, .row_size = ORWA_FILE_OPENERS_ROW_SIZE},
     };
     uint64_t offset = ORWA_HEADER_SIZE;
@@ -3931,6 +4059,14 @@ static bool registry_store_write_orwa_file(RegistryStore *store, const char *pat
     for (size_t i = 0; ok && i < store->log_count; i++) {
         ok = registry_binary_append_string_ref(&pool, &variable_region, &rows, store->logs[i].path) &&
              registry_binary_append_string_ref(&pool, &variable_region, &rows, store->logs[i].service_id);
+    }
+    for (size_t i = 0; ok && i < store->content_type_count; i++) {
+        ok = registry_binary_append_string_ref(&pool, &variable_region, &rows, store->content_types[i].identifier) &&
+             registry_binary_append_string_ref(&pool, &variable_region, &rows, store->content_types[i].display_name) &&
+             registry_binary_append_string_ref(&pool, &variable_region, &rows, store->content_types[i].conforms_to) &&
+             registry_binary_append_string_ref(&pool, &variable_region, &rows, store->content_types[i].extensions) &&
+             registry_binary_append_string_ref(&pool, &variable_region, &rows, store->content_types[i].filenames) &&
+             registry_binary_append_string_ref(&pool, &variable_region, &rows, store->content_types[i].mime_types);
     }
     for (size_t i = 0; ok && i < store->opener_count; i++) {
         unsigned char padding[4] = {0};
@@ -7694,7 +7830,7 @@ static bool outerctl_make_frontend_url(const char *raw_url,
     if (safe_url[0]) {
         snprintf(out, out_size, "%s", safe_url);
     } else if (safe_socket_path[0]) {
-        snprintf(out, out_size, "%s", safe_socket_path);
+        snprintf(out, out_size, "/");
     } else if (port > 0) {
         snprintf(out, out_size, "http://127.0.0.1:%d", port);
     } else {
@@ -7726,6 +7862,47 @@ static bool outerctl_make_frontend_url(const char *raw_url,
     return true;
 }
 
+typedef struct {
+    const char *identifier;
+    const char *display_name;
+    const char *conforms_to;
+    const char *extensions;
+    const char *filenames;
+    const char *mime_types;
+} BuiltInContentType;
+
+static const BuiltInContentType kBuiltInContentTypes[] = {
+    {"public.data", "Data", "", "", "", "application/octet-stream"},
+    {"public.text", "Text", "public.data", "txt,text,log,conf,ini,cfg", "README,LICENSE,Makefile,Dockerfile,.gitignore,.env,CMakeLists.txt", "text/plain"},
+    {"public.plain-text", "Plain Text", "public.text", "txt,text,log,conf,ini,cfg", "README,LICENSE,.gitignore,.env", "text/plain"},
+    {"public.markdown", "Markdown", "public.text", "md,markdown,mdown,mkdn", "README.md", "text/markdown"},
+    {"public.json", "JSON", "public.text", "json", "", "application/json"},
+    {"public.xml", "XML", "public.text", "xml", "", "application/xml,text/xml"},
+    {"public.shell-script", "Shell Script", "public.text", "sh,bash,zsh,fish,command", "", "text/x-shellscript"},
+    {"public.python-script", "Python Script", "public.text", "py", "", "text/x-python"},
+    {"public.javascript", "JavaScript", "public.text", "js,mjs,cjs", "", "text/javascript,application/javascript"},
+    {"public.html", "HTML", "public.text", "html,htm", "", "text/html"},
+    {"public.css", "CSS", "public.text", "css", "", "text/css"},
+    {"public.image", "Image", "public.data", "", "", "image/*"},
+    {"public.png", "PNG", "public.image", "png", "", "image/png"},
+    {"public.jpeg", "JPEG", "public.image", "jpg,jpeg,jpe", "", "image/jpeg"},
+    {"public.gif", "GIF", "public.image", "gif", "", "image/gif"},
+    {"public.pdf", "PDF", "public.data", "pdf", "", "application/pdf"},
+    {"public.zip-archive", "ZIP Archive", "public.data", "zip", "", "application/zip"}
+};
+
+static bool normalize_content_type_identifier(const char *raw, char *out, size_t out_size) {
+    if (!raw || !raw[0] || !out || out_size == 0) return false;
+    size_t offset = 0;
+    for (const unsigned char *p = (const unsigned char *)raw; *p && offset + 1 < out_size; p++) {
+        if (!isalnum(*p) && *p != '-' && *p != '_' && *p != '.') return false;
+        out[offset++] = (char)tolower(*p);
+    }
+    if (raw[offset] != '\0') return false;
+    out[offset] = '\0';
+    return offset > 0 && strchr(out, '.') != NULL;
+}
+
 static bool normalize_file_extension(const char *raw, char *out, size_t out_size) {
     if (!raw || !raw[0] || !out || out_size == 0) return false;
     while (*raw == '.') raw++;
@@ -7740,23 +7917,226 @@ static bool normalize_file_extension(const char *raw, char *out, size_t out_size
     return offset > 0;
 }
 
-static bool normalize_opener_kind(const char *raw, char *out, size_t out_size) {
-    if (!raw || !raw[0] || !out || out_size == 0) return false;
-    size_t offset = 0;
-    for (const unsigned char *p = (const unsigned char *)raw; *p && offset + 1 < out_size; p++) {
-        if (!isalnum(*p) && *p != '-' && *p != '_') return false;
-        out[offset++] = (char)tolower(*p);
+typedef struct {
+    char values[32][160];
+    size_t count;
+} ContentTypeList;
+
+static bool content_type_list_contains(const ContentTypeList *list, const char *identifier) {
+    if (!list || !identifier || !identifier[0]) return false;
+    for (size_t i = 0; i < list->count; i++) {
+        if (strcmp(list->values[i], identifier) == 0) return true;
     }
-    if (raw[offset] != '\0') return false;
-    out[offset] = '\0';
-    return offset > 0;
+    return false;
 }
 
-static bool make_file_opener_kind_key(const char *raw_kind, char *out, size_t out_size) {
-    char normalized[128];
-    if (!normalize_opener_kind(raw_kind, normalized, sizeof(normalized))) return false;
-    int written = snprintf(out, out_size, "kind:%s", normalized);
-    return written > 0 && (size_t)written < out_size;
+static bool content_type_list_append(ContentTypeList *list, const char *identifier) {
+    if (!list || !identifier || !identifier[0]) return true;
+    char normalized[160];
+    if (!normalize_content_type_identifier(identifier, normalized, sizeof(normalized))) return true;
+    if (content_type_list_contains(list, normalized)) return true;
+    if (list->count >= sizeof(list->values) / sizeof(list->values[0])) return false;
+    snprintf(list->values[list->count++], sizeof(list->values[0]), "%s", normalized);
+    return true;
+}
+
+static bool csv_contains_token(const char *csv, const char *token, bool case_sensitive) {
+    if (!csv || !csv[0] || !token || !token[0]) return false;
+    const char *cursor = csv;
+    size_t token_len = strlen(token);
+    while (*cursor) {
+        while (*cursor == ',' || isspace((unsigned char)*cursor)) cursor++;
+        const char *end = cursor;
+        while (*end && *end != ',') end++;
+        const char *trim_end = end;
+        while (trim_end > cursor && isspace((unsigned char)trim_end[-1])) trim_end--;
+        size_t len = (size_t)(trim_end - cursor);
+        if (len == token_len) {
+            if (case_sensitive ? strncmp(cursor, token, len) == 0 : strncasecmp(cursor, token, len) == 0) {
+                return true;
+            }
+        }
+        cursor = end;
+    }
+    return false;
+}
+
+static const BuiltInContentType *builtin_content_type_for_identifier(const char *identifier) {
+    for (size_t i = 0; i < sizeof(kBuiltInContentTypes) / sizeof(kBuiltInContentTypes[0]); i++) {
+        if (strcmp(kBuiltInContentTypes[i].identifier, identifier ? identifier : "") == 0) {
+            return &kBuiltInContentTypes[i];
+        }
+    }
+    return NULL;
+}
+
+static bool append_content_type_parents(const RegistryStore *store, ContentTypeList *list, const char *identifier, int depth);
+
+static bool append_content_type_and_parents(const RegistryStore *store, ContentTypeList *list, const char *identifier) {
+    return content_type_list_append(list, identifier) &&
+           append_content_type_parents(store, list, identifier, 0);
+}
+
+static bool append_parent_csv(const RegistryStore *store, ContentTypeList *list, const char *parents, int depth) {
+    if (!parents || !parents[0]) return true;
+    const char *cursor = parents;
+    while (*cursor) {
+        while (*cursor == ',' || isspace((unsigned char)*cursor)) cursor++;
+        const char *end = cursor;
+        while (*end && *end != ',') end++;
+        const char *trim_end = end;
+        while (trim_end > cursor && isspace((unsigned char)trim_end[-1])) trim_end--;
+        if (trim_end > cursor) {
+            char parent[160];
+            size_t len = (size_t)(trim_end - cursor);
+            if (len >= sizeof(parent)) len = sizeof(parent) - 1;
+            memcpy(parent, cursor, len);
+            parent[len] = '\0';
+            if (!content_type_list_append(list, parent) ||
+                !append_content_type_parents(store, list, parent, depth + 1)) {
+                return false;
+            }
+        }
+        cursor = end;
+        if (depth > 16) break;
+    }
+    return true;
+}
+
+static bool append_content_type_parents(const RegistryStore *store, ContentTypeList *list, const char *identifier, int depth) {
+    if (depth > 16) return true;
+    const RegistryContentTypeRecord *custom = store ? registry_store_find_content_type_const(store, identifier) : NULL;
+    if (custom && !append_parent_csv(store, list, custom->conforms_to, depth + 1)) return false;
+    const BuiltInContentType *builtin = builtin_content_type_for_identifier(identifier);
+    if (builtin && !append_parent_csv(store, list, builtin->conforms_to, depth + 1)) return false;
+    return true;
+}
+
+static bool content_type_matches_extension(const RegistryStore *store, const char *identifier, const char *extension) {
+    if (!identifier || !extension || !extension[0]) return false;
+    const RegistryContentTypeRecord *custom = store ? registry_store_find_content_type_const(store, identifier) : NULL;
+    if (custom && csv_contains_token(custom->extensions, extension, false)) return true;
+    const BuiltInContentType *builtin = builtin_content_type_for_identifier(identifier);
+    return builtin && csv_contains_token(builtin->extensions, extension, false);
+}
+
+static bool content_type_matches_filename(const RegistryStore *store, const char *identifier, const char *filename) {
+    if (!identifier || !filename || !filename[0]) return false;
+    const RegistryContentTypeRecord *custom = store ? registry_store_find_content_type_const(store, identifier) : NULL;
+    if (custom && csv_contains_token(custom->filenames, filename, true)) return true;
+    const BuiltInContentType *builtin = builtin_content_type_for_identifier(identifier);
+    return builtin && csv_contains_token(builtin->filenames, filename, true);
+}
+
+static bool path_file_extension(const char *path, char *out, size_t out_size) {
+    if (!out || out_size == 0) return false;
+    out[0] = '\0';
+    const char *name = strrchr(path ? path : "", '/');
+    name = name ? name + 1 : (path ? path : "");
+    const char *dot = strrchr(name, '.');
+    if (!dot || dot == name || !dot[1]) return false;
+    return normalize_file_extension(dot + 1, out, out_size);
+}
+
+static const char *path_file_name(const char *path) {
+    const char *name = strrchr(path ? path : "", '/');
+    return name ? name + 1 : (path ? path : "");
+}
+
+static bool file_sample(const char *path, unsigned char *buffer, size_t capacity, size_t *out_count) {
+    if (out_count) *out_count = 0;
+    if (!path || !path[0] || !buffer || capacity == 0) return false;
+    FILE *file = fopen(path, "rb");
+    if (!file) return false;
+    size_t count = fread(buffer, 1, capacity, file);
+    fclose(file);
+    if (out_count) *out_count = count;
+    return true;
+}
+
+static bool sample_looks_like_text(const unsigned char *bytes, size_t count) {
+    if (!bytes) return false;
+    if (count == 0) return true;
+    size_t suspicious = 0;
+    for (size_t i = 0; i < count; i++) {
+        unsigned char c = bytes[i];
+        if (c == 0) return false;
+        if (c < 0x20 && c != '\n' && c != '\r' && c != '\t' && c != '\f' && c != '\b') suspicious++;
+    }
+    return suspicious * 8 <= count;
+}
+
+static bool sample_contains_ascii(const unsigned char *bytes, size_t count, const char *needle) {
+    if (!bytes || !needle || !needle[0]) return false;
+    size_t needle_len = strlen(needle);
+    if (needle_len > count) return false;
+    for (size_t i = 0; i <= count - needle_len; i++) {
+        bool match = true;
+        for (size_t j = 0; j < needle_len; j++) {
+            unsigned char a = (unsigned char)tolower(bytes[i + j]);
+            unsigned char b = (unsigned char)tolower((unsigned char)needle[j]);
+            if (a != b) {
+                match = false;
+                break;
+            }
+        }
+        if (match) return true;
+    }
+    return false;
+}
+
+static bool infer_content_types_for_path(const RegistryStore *store, const char *path, ContentTypeList *list) {
+    if (!list) return false;
+    const char *filename = path_file_name(path);
+    char extension[128] = "";
+    (void)path_file_extension(path, extension, sizeof(extension));
+
+    for (size_t i = 0; i < sizeof(kBuiltInContentTypes) / sizeof(kBuiltInContentTypes[0]); i++) {
+        const char *identifier = kBuiltInContentTypes[i].identifier;
+        if ((extension[0] && content_type_matches_extension(store, identifier, extension)) ||
+            (filename[0] && content_type_matches_filename(store, identifier, filename))) {
+            if (!append_content_type_and_parents(store, list, identifier)) return false;
+        }
+    }
+    if (store) {
+        for (size_t i = 0; i < store->content_type_count; i++) {
+            const char *identifier = store->content_types[i].identifier;
+            if ((extension[0] && content_type_matches_extension(store, identifier, extension)) ||
+                (filename[0] && content_type_matches_filename(store, identifier, filename))) {
+                if (!append_content_type_and_parents(store, list, identifier)) return false;
+            }
+        }
+    }
+
+    unsigned char sample[4096];
+    size_t count = 0;
+    if (file_sample(path, sample, sizeof(sample), &count)) {
+        if (count >= 4 && memcmp(sample, "%PDF", 4) == 0) {
+            if (!append_content_type_and_parents(store, list, "public.pdf")) return false;
+        } else if (count >= 8 && memcmp(sample, "\x89PNG\r\n\x1a\n", 8) == 0) {
+            if (!append_content_type_and_parents(store, list, "public.png")) return false;
+        } else if (count >= 3 && sample[0] == 0xff && sample[1] == 0xd8 && sample[2] == 0xff) {
+            if (!append_content_type_and_parents(store, list, "public.jpeg")) return false;
+        } else if (count >= 6 && (memcmp(sample, "GIF87a", 6) == 0 || memcmp(sample, "GIF89a", 6) == 0)) {
+            if (!append_content_type_and_parents(store, list, "public.gif")) return false;
+        } else if (count >= 4 && memcmp(sample, "PK\x03\x04", 4) == 0) {
+            if (!append_content_type_and_parents(store, list, "public.zip-archive")) return false;
+        }
+        if (count >= 2 && sample[0] == '#' && sample[1] == '!') {
+            if (sample_contains_ascii(sample, count, "python")) {
+                if (!append_content_type_and_parents(store, list, "public.python-script")) return false;
+            } else {
+                if (!append_content_type_and_parents(store, list, "public.shell-script")) return false;
+            }
+        } else if (sample_looks_like_text(sample, count)) {
+            if (!append_content_type_and_parents(store, list, "public.text")) return false;
+        }
+    }
+
+    if (list->count == 0) {
+        if (!append_content_type_and_parents(store, list, "public.data")) return false;
+    }
+    return true;
 }
 
 static bool append_file_opener_url(StringBuilder *out,
@@ -7799,7 +8179,7 @@ static bool outerctl_print_headers(StringBuilder *out, const char *const *header
 static bool outerctl_print_registry_list(const RegistryStore *database,
                                          const char *resource,
                                          const char *backend_filter,
-                                         const char *extension_filter,
+                                         const char *content_type_filter,
                                          const char *file_path,
                                          StringBuilder *out,
                                          char *error,
@@ -7892,13 +8272,36 @@ static bool outerctl_print_registry_list(const RegistryStore *database,
             }
             if (ok && !sb_append(out, "\n")) ok = false;
         }
+    } else if (strcmp(resource, "content-type") == 0 || strcmp(resource, "type") == 0) {
+        const char *headers[] = {"identifier", "display_name", "conforms_to", "extensions", "filenames", "mime_types"};
+        ok = outerctl_print_headers(out, headers, sizeof(headers) / sizeof(headers[0]));
+        for (size_t i = 0; ok && i < sizeof(kBuiltInContentTypes) / sizeof(kBuiltInContentTypes[0]); i++) {
+            const BuiltInContentType *record = &kBuiltInContentTypes[i];
+            if (content_type_filter && content_type_filter[0] && strcmp(record->identifier, content_type_filter) != 0) continue;
+            const char *fields[] = {record->identifier, record->display_name, record->conforms_to, record->extensions, record->filenames, record->mime_types};
+            for (size_t column = 0; ok && column < sizeof(fields) / sizeof(fields[0]); column++) {
+                if (column > 0 && !sb_append(out, "\t")) ok = false;
+                if (ok && !outerctl_tsv_field(out, fields[column])) ok = false;
+            }
+            if (ok && !sb_append(out, "\n")) ok = false;
+        }
+        for (size_t i = 0; ok && i < database->content_type_count; i++) {
+            const RegistryContentTypeRecord *record = &database->content_types[i];
+            if (content_type_filter && content_type_filter[0] && strcmp(record->identifier, content_type_filter) != 0) continue;
+            const char *fields[] = {record->identifier, record->display_name, record->conforms_to, record->extensions, record->filenames, record->mime_types};
+            for (size_t column = 0; ok && column < sizeof(fields) / sizeof(fields[0]); column++) {
+                if (column > 0 && !sb_append(out, "\t")) ok = false;
+                if (ok && !outerctl_tsv_field(out, fields[column])) ok = false;
+            }
+            if (ok && !sb_append(out, "\n")) ok = false;
+        }
     } else if (strcmp(resource, "opener") == 0) {
-        const char *headers[] = {"extension", "service_id", "display_name", "socket_path", "url_template", "rank", "url"};
+        const char *headers[] = {"content_type", "service_id", "display_name", "socket_path", "url_template", "rank", "url"};
         ok = outerctl_print_headers(out, headers, sizeof(headers) / sizeof(headers[0]));
         for (size_t i = 0; ok && i < database->opener_count; i++) {
             const RegistryFileOpenerRecord *record = &database->openers[i];
             if (backend_filter && backend_filter[0] && strcmp(record->service_id, backend_filter) != 0) continue;
-            if (extension_filter && extension_filter[0] && strcmp(record->extension, extension_filter) != 0) continue;
+            if (content_type_filter && content_type_filter[0] && strcmp(record->extension, content_type_filter) != 0) continue;
             char rank_buffer[32];
             snprintf(rank_buffer, sizeof(rank_buffer), "%d", record->rank);
             const char *fields[] = {record->extension, record->service_id, record->display_name, record->socket_path, record->url_template, rank_buffer};
@@ -7951,8 +8354,11 @@ static int outershelld_handle_outerctl(int argc, char **argv, StringBuilder *std
     const char *icon_path = NULL;
     const char *frontend_list = NULL;
     const char *socket_path = NULL;
-    const char *extension = NULL;
-    const char *opener_kind = NULL;
+    const char *content_type = NULL;
+    const char *conforms_to = NULL;
+    const char *extensions = NULL;
+    const char *filenames = NULL;
+    const char *mime_types = NULL;
     const char *url_template = NULL;
     const char *file_path = NULL;
     int port = 0;
@@ -7990,10 +8396,16 @@ static int outershelld_handle_outerctl(int argc, char **argv, StringBuilder *std
             REQUIRE_VALUE("--list", frontend_list);
         } else if (strcmp(arg, "--socket-path") == 0) {
             REQUIRE_VALUE("--socket-path", socket_path);
-        } else if (strcmp(arg, "--extension") == 0 || strcmp(arg, "--ext") == 0) {
-            REQUIRE_VALUE("--extension", extension);
-        } else if (strcmp(arg, "--kind") == 0) {
-            REQUIRE_VALUE("--kind", opener_kind);
+        } else if (strcmp(arg, "--content-type") == 0 || strcmp(arg, "--type") == 0) {
+            REQUIRE_VALUE("--content-type", content_type);
+        } else if (strcmp(arg, "--conforms-to") == 0) {
+            REQUIRE_VALUE("--conforms-to", conforms_to);
+        } else if (strcmp(arg, "--extensions") == 0) {
+            REQUIRE_VALUE("--extensions", extensions);
+        } else if (strcmp(arg, "--filenames") == 0) {
+            REQUIRE_VALUE("--filenames", filenames);
+        } else if (strcmp(arg, "--mime-types") == 0) {
+            REQUIRE_VALUE("--mime-types", mime_types);
         } else if (strcmp(arg, "--url-template") == 0) {
             REQUIRE_VALUE("--url-template", url_template);
         } else if (strcmp(arg, "--file") == 0) {
@@ -8033,7 +8445,8 @@ static int outershelld_handle_outerctl(int argc, char **argv, StringBuilder *std
     }
 
     bool is_list = strcmp(action, "list") == 0;
-    if (!is_list && (!backend || !backend[0])) {
+    bool is_content_type_resource = strcmp(resource, "content-type") == 0 || strcmp(resource, "type") == 0;
+    if (!is_list && !is_content_type_resource && (!backend || !backend[0])) {
         sb_append(stderr_buffer, "Missing backend identifier.\n");
         return 1;
     }
@@ -8054,27 +8467,15 @@ static int outershelld_handle_outerctl(int argc, char **argv, StringBuilder *std
 
     if (is_list) {
         (void)include_icons;
-        char normalized_extension[128] = "";
-        char opener_key[160] = "";
-        if (strcmp(resource, "opener") == 0) {
-            if (extension && extension[0] && opener_kind && opener_kind[0]) {
-                snprintf(error, sizeof(error), "Specify either opener extension or kind, not both.");
+        char normalized_content_type[160] = "";
+        if ((strcmp(resource, "opener") == 0 || strcmp(resource, "content-type") == 0 || strcmp(resource, "type") == 0) &&
+            content_type && content_type[0]) {
+            if (!normalize_content_type_identifier(content_type, normalized_content_type, sizeof(normalized_content_type))) {
+                snprintf(error, sizeof(error), "Invalid content type.");
                 ok = false;
-            } else if (extension && extension[0]) {
-                if (!normalize_file_extension(extension, normalized_extension, sizeof(normalized_extension))) {
-                    snprintf(error, sizeof(error), "Invalid file extension.");
-                    ok = false;
-                } else {
-                    snprintf(opener_key, sizeof(opener_key), "%s", normalized_extension);
-                }
-            } else if (opener_kind && opener_kind[0]) {
-                if (!make_file_opener_kind_key(opener_kind, opener_key, sizeof(opener_key))) {
-                    snprintf(error, sizeof(error), "Invalid opener kind.");
-                    ok = false;
-                }
             }
         }
-        if (ok) ok = outerctl_print_registry_list(&database, resource, backend, opener_key[0] ? opener_key : NULL, file_path, stdout_buffer, error, sizeof(error));
+        if (ok) ok = outerctl_print_registry_list(&database, resource, backend, normalized_content_type[0] ? normalized_content_type : NULL, file_path, stdout_buffer, error, sizeof(error));
         registry_store_free(&database);
         if (!ok) {
             sb_append(stderr_buffer, error[0] ? error : "Failed to list registry rows.");
@@ -8119,7 +8520,7 @@ static int outershelld_handle_outerctl(int argc, char **argv, StringBuilder *std
             snprintf(error, sizeof(error), "Unknown backend action.");
             ok = false;
         }
-    } else if (ok) {
+    } else if (ok && !is_content_type_resource) {
         bool backend_exists = registry_store_find_backend(&database, backend) != NULL;
         bool can_clear_orphaned_records =
             strcmp(action, "clear") == 0 &&
@@ -8228,8 +8629,11 @@ static int outershelld_handle_outerctl(int argc, char **argv, StringBuilder *std
                 if (!ok) snprintf(error, sizeof(error), "Out of memory.");
             }
             if (ok) {
+                const char *layout_key = (has_socket && (!url || !url[0]))
+                    ? stable_frontend_id
+                    : (frontend_url[0] ? frontend_url : stable_frontend_id);
                 ok = registry_store_upsert_layout(&database,
-                                                  frontend_url[0] ? frontend_url : stable_frontend_id,
+                                                  layout_key,
                                                   frontend_list ? frontend_list : "");
                 if (!ok) snprintf(error, sizeof(error), "Out of memory.");
             }
@@ -8270,24 +8674,49 @@ static int outershelld_handle_outerctl(int argc, char **argv, StringBuilder *std
             snprintf(error, sizeof(error), "Unknown app action.");
             ok = false;
         }
+    } else if (ok && is_content_type_resource) {
+        char normalized_content_type[160] = "";
+        if (strcmp(action, "clear") != 0) {
+            if (!content_type || !content_type[0]) {
+                snprintf(error, sizeof(error), "Missing content type.");
+                ok = false;
+            } else if (!normalize_content_type_identifier(content_type, normalized_content_type, sizeof(normalized_content_type))) {
+                snprintf(error, sizeof(error), "Invalid content type.");
+                ok = false;
+            }
+        }
+        if (ok && strcmp(action, "add") == 0) {
+            ok = registry_store_upsert_content_type(&database,
+                                                    normalized_content_type,
+                                                    (display_name && display_name[0]) ? display_name : normalized_content_type,
+                                                    conforms_to ? conforms_to : "",
+                                                    extensions ? extensions : "",
+                                                    filenames ? filenames : "",
+                                                    mime_types ? mime_types : "");
+            if (!ok) snprintf(error, sizeof(error), "Out of memory.");
+            changed = ok;
+        } else if (ok && strcmp(action, "remove") == 0) {
+            for (size_t i = database.content_type_count; i > 0; i--) {
+                if (strcmp(database.content_types[i - 1].identifier, normalized_content_type) == 0) {
+                    registry_store_remove_content_type_at(&database, i - 1);
+                }
+            }
+            changed = ok;
+        } else if (ok && strcmp(action, "clear") == 0) {
+            registry_store_clear_content_types(&database);
+            changed = ok;
+        } else if (ok) {
+            snprintf(error, sizeof(error), "Unknown content-type action.");
+            ok = false;
+        }
     } else if (ok && strcmp(resource, "opener") == 0) {
         char opener_key[160] = "";
         if (strcmp(action, "clear") != 0) {
-            if (extension && extension[0] && opener_kind && opener_kind[0]) {
-                snprintf(error, sizeof(error), "Specify either opener extension or kind, not both.");
+            if (!content_type || !content_type[0]) {
+                snprintf(error, sizeof(error), "Missing opener content type.");
                 ok = false;
-            } else if (extension && extension[0]) {
-                if (!normalize_file_extension(extension, opener_key, sizeof(opener_key))) {
-                    snprintf(error, sizeof(error), "Invalid file extension.");
-                    ok = false;
-                }
-            } else if (opener_kind && opener_kind[0]) {
-                if (!make_file_opener_kind_key(opener_kind, opener_key, sizeof(opener_key))) {
-                    snprintf(error, sizeof(error), "Invalid opener kind.");
-                    ok = false;
-                }
-            } else {
-                snprintf(error, sizeof(error), "Missing opener extension or kind.");
+            } else if (!normalize_content_type_identifier(content_type, opener_key, sizeof(opener_key))) {
+                snprintf(error, sizeof(error), "Invalid content type.");
                 ok = false;
             }
         }
@@ -11303,7 +11732,7 @@ static bool unix_socket_path_accessible_to_current_user(const char *socket_path)
 }
 
 static bool api_append_file_openers_from_database(const RegistryStore *database,
-                                                  const char *extension,
+                                                  const ContentTypeList *content_types,
                                                   const char *file_path,
                                                   bool require_socket_access,
                                                   StringBuilder *rows,
@@ -11314,7 +11743,7 @@ static bool api_append_file_openers_from_database(const RegistryStore *database,
     bool ok = true;
     for (size_t i = 0; ok && database && i < database->opener_count; i++) {
         const RegistryFileOpenerRecord *record = &database->openers[i];
-        if (strcmp(record->extension ? record->extension : "", extension ? extension : "") != 0) continue;
+        if (!content_type_list_contains(content_types, record->extension ? record->extension : "")) continue;
         const char *socket_path = record->socket_path ? record->socket_path : "";
         if (require_socket_access && !unix_socket_path_accessible_to_current_user(socket_path)) {
             continue;
@@ -11336,49 +11765,44 @@ static bool api_append_file_openers_from_database(const RegistryStore *database,
     return ok;
 }
 
-static bool api_query_file_openers(const char *extension_filter,
-                                   const char *detected_kind,
-                                   const char *file_path,
+static bool content_type_list_for_opener_query(const RegistryStore *database,
+                                               const char *file_path,
+                                               const char *content_type,
+                                               ContentTypeList *list,
+                                               char *error,
+                                               size_t error_size) {
+    if (content_type && content_type[0]) {
+        char normalized[160];
+        if (!normalize_content_type_identifier(content_type, normalized, sizeof(normalized))) {
+            snprintf(error, error_size, "Invalid content type.");
+            return false;
+        }
+        return append_content_type_and_parents(database, list, normalized);
+    }
+    if (file_path && file_path[0]) {
+        return infer_content_types_for_path(database, file_path, list);
+    }
+    snprintf(error, error_size, "Missing file opener query.");
+    return false;
+}
+
+static bool api_query_file_openers(const char *file_path,
+                                   const char *content_type,
                                    StringBuilder *rows,
                                    StringBuilder *variable,
                                    uint32_t *row_count,
                                    char *error,
                                    size_t error_size) {
     if (row_count) *row_count = 0;
-    char extension[128] = "";
-    char kind_key[160] = "";
-    if (extension_filter && extension_filter[0] &&
-        !normalize_file_extension(extension_filter, extension, sizeof(extension))) {
-        snprintf(error, error_size, "Invalid file extension.");
-        return false;
-    }
-    if (detected_kind && detected_kind[0] &&
-        !make_file_opener_kind_key(detected_kind, kind_key, sizeof(kind_key))) {
-        snprintf(error, error_size, "Invalid opener kind.");
-        return false;
-    }
-    if (!extension[0] && !kind_key[0]) {
-        snprintf(error, error_size, "Missing file opener query.");
-        return false;
-    }
 
     RegistryStore database;
     if (!registry_store_open_user_readonly(&database, error, error_size)) return false;
     bool ok = true;
-    if (extension[0]) {
+    ContentTypeList user_types = {0};
+    ok = content_type_list_for_opener_query(&database, file_path, content_type, &user_types, error, error_size);
+    if (ok) {
         ok = api_append_file_openers_from_database(&database,
-                                                  extension,
-                                                  file_path,
-                                                  false,
-                                                  rows,
-                                                  variable,
-                                                  row_count,
-                                                  error,
-                                                  error_size);
-    }
-    if (ok && kind_key[0]) {
-        ok = api_append_file_openers_from_database(&database,
-                                                  kind_key,
+                                                  &user_types,
                                                   file_path,
                                                   false,
                                                   rows,
@@ -11393,20 +11817,11 @@ static bool api_query_file_openers(const char *extension_filter,
         char system_error[512] = "";
         RegistryStore system_database;
         if (registry_store_open_system_readonly(&system_database, system_error, sizeof(system_error))) {
-            if (extension[0]) {
+            ContentTypeList system_types = {0};
+            ok = content_type_list_for_opener_query(&system_database, file_path, content_type, &system_types, error, error_size);
+            if (ok) {
                 ok = api_append_file_openers_from_database(&system_database,
-                                                          extension,
-                                                          file_path,
-                                                          true,
-                                                          rows,
-                                                          variable,
-                                                          row_count,
-                                                          error,
-                                                          error_size);
-            }
-            if (ok && kind_key[0]) {
-                ok = api_append_file_openers_from_database(&system_database,
-                                                          kind_key,
+                                                          &system_types,
                                                           file_path,
                                                           true,
                                                           rows,
@@ -11422,30 +11837,20 @@ static bool api_query_file_openers(const char *extension_filter,
 }
 
 static bool process_api_file_openers_request(ReactorClient *client, const unsigned char *message, size_t message_length) {
-    char *extension = NULL;
-    char *detected_kind = NULL;
     char *file_path = NULL;
+    char *content_type = NULL;
     char error[512] = "";
     StringBuilder rows = {0};
     StringBuilder variable = {0};
     uint32_t row_count = 0;
     bool ok = message_length >= 18 &&
-              api_read_string_ref(message, message_length, 2, &extension) &&
-              api_read_string_ref(message, message_length, 10, &file_path);
-    if (ok) {
-        if (message_length >= 26) {
-            ok = api_read_string_ref(message, message_length, 18, &detected_kind);
-        } else {
-            detected_kind = strdup("");
-            ok = detected_kind != NULL;
-        }
-    }
-    ok = ok && api_query_file_openers(extension, detected_kind, file_path, &rows, &variable, &row_count, error, sizeof(error));
+              api_read_string_ref(message, message_length, 2, &file_path) &&
+              api_read_string_ref(message, message_length, 10, &content_type);
+    ok = ok && api_query_file_openers(file_path, content_type, &rows, &variable, &row_count, error, sizeof(error));
     if (!ok && !error[0]) snprintf(error, sizeof(error), "Invalid file openers request.");
     api_send_file_openers_response(client->fd, ok ? 0u : 1u, error, &rows, &variable, ok ? row_count : 0);
-    free(extension);
-    free(detected_kind);
     free(file_path);
+    free(content_type);
     free(rows.data);
     free(variable.data);
     return false;

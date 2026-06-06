@@ -131,8 +131,6 @@ static int connect_unix_stream(const char *socket_path, char *error, size_t erro
 #define CLIENT_IDLE_TIMEOUT_MS 10000
 
 static const char *kBundleUrlPath = "/bundles/BackendsContent";
-static const char *kBundleUrlPathMacosArm = "/bundles/BackendsContent/macos-arm";
-static const char *kBundleUrlPathMacosX86 = "/bundles/BackendsContent/macos-x86";
 static const char *kBundleFilePathMacosArm = "bundles/BackendsContent.bundle.macos-arm.aar";
 static const char *kBundleFilePathMacosX86 = "bundles/BackendsContent.bundle.macos-x86.aar";
 
@@ -160,6 +158,34 @@ typedef struct {
     bool waiting_for_api_response;
     int api_response_fd;
 } ReactorClient;
+
+static const char *bundle_arm_path(void) {
+    return g_bundle_file_path_macos_arm[0] ? g_bundle_file_path_macos_arm : kBundleFilePathMacosArm;
+}
+
+static const char *bundle_x86_path(void) {
+    return g_bundle_file_path_macos_x86[0] ? g_bundle_file_path_macos_x86 : kBundleFilePathMacosX86;
+}
+
+static void bundle_url_path(char *out, size_t out_size) {
+    struct stat arm_st;
+    struct stat x86_st;
+    if (stat(bundle_arm_path(), &arm_st) == 0 &&
+        stat(bundle_x86_path(), &x86_st) == 0 &&
+        arm_st.st_size >= 0 &&
+        x86_st.st_size >= 0) {
+        snprintf(out,
+                 out_size,
+                 "%s-%lld-%lld-%lld-%lld",
+                 kBundleUrlPath,
+                 (long long)arm_st.st_mtime,
+                 (long long)arm_st.st_size,
+                 (long long)x86_st.st_mtime,
+                 (long long)x86_st.st_size);
+        return;
+    }
+    snprintf(out, out_size, "%s", kBundleUrlPath);
+}
 
 typedef struct {
     const char *service_id;
@@ -217,11 +243,21 @@ static const BundledAppDefinition kBundledApps[] = {
         .service_id = "dev.outergroup.Firehose",
         .display_name = "Firehose",
         .stage_directory_name = "Firehose",
-        .binary_name = "FirehoseBackend",
-        .bundle_prefix = "FirehoseContent",
+        .binary_name = "TraceBackend",
+        .bundle_prefix = "TraceContent",
         .icon_name = "app-icon.png",
-        .source_name = "FirehoseBackend.c",
+        .source_name = "TraceBackend.c",
         .archive_name = "Firehose.tar.gz"
+    },
+    {
+        .service_id = "dev.outergroup.Profile",
+        .display_name = "Profile",
+        .stage_directory_name = "Profile",
+        .binary_name = "ProfileBackend",
+        .bundle_prefix = "ProfileContent",
+        .icon_name = "app-icon.png",
+        .source_name = "ProfileBackend.c",
+        .archive_name = "Profile.tar.gz"
     }
 };
 
@@ -273,7 +309,9 @@ static void send_text_response(int fd, int status, const char *message) {
 
 static void send_outer_descriptor(int fd) {
     const char *plugin_json = "{\"backendsAPIPath\":\"/api/backends\",\"logsAPIPath\":\"/api/logs\",\"controlAPIPath\":\"/api/control\",\"createAPIPath\":\"/api/create\",\"recipesAPIPath\":\"/api/recipes\",\"filePickerAPIPath\":\"/api/file-picker\"}";
-    size_t path_len = strlen(kBundleUrlPath);
+    char bundle_path[PATH_MAX];
+    bundle_url_path(bundle_path, sizeof(bundle_path));
+    size_t path_len = strlen(bundle_path);
     size_t plugin_len = strlen(plugin_json);
     size_t header_len = 40;
     size_t data_offset = header_len + path_len;
@@ -293,7 +331,7 @@ static void send_outer_descriptor(int fd) {
     write_uint64_le(payload + 16, (uint64_t)path_len);
     write_uint64_le(payload + 24, (uint64_t)data_offset);
     write_uint64_le(payload + 32, (uint64_t)plugin_len);
-    memcpy(payload + header_len, kBundleUrlPath, path_len);
+    memcpy(payload + header_len, bundle_path, path_len);
     memcpy(payload + data_offset, plugin_json, plugin_len);
 
     send_response(fd, 200, "OK", "application/vnd.outerframe", payload, total_len);
@@ -1087,16 +1125,22 @@ static bool process_http_client_request(ReactorClient *client, char *request, si
         send_text_response(fd, 404, "not found\n");
     } else if (is_navigator_route(target)) {
         send_outer_descriptor(fd);
-    } else if (strcmp(target, kBundleUrlPath) == 0) {
-        send_text_response(fd, 200, "macos-arm\nmacos-x86\n");
-    } else if (strcmp(target, kBundleUrlPathMacosArm) == 0) {
-        const char *path = g_bundle_file_path_macos_arm[0] ? g_bundle_file_path_macos_arm : kBundleFilePathMacosArm;
-        send_bundle_file(fd, path);
-    } else if (strcmp(target, kBundleUrlPathMacosX86) == 0) {
-        const char *path = g_bundle_file_path_macos_x86[0] ? g_bundle_file_path_macos_x86 : kBundleFilePathMacosX86;
-        send_bundle_file(fd, path);
     } else {
-        send_text_response(fd, 404, "not found\n");
+        char bundle_path[PATH_MAX];
+        char bundle_path_macos_arm[PATH_MAX];
+        char bundle_path_macos_x86[PATH_MAX];
+        bundle_url_path(bundle_path, sizeof(bundle_path));
+        snprintf(bundle_path_macos_arm, sizeof(bundle_path_macos_arm), "%s/macos-arm", bundle_path);
+        snprintf(bundle_path_macos_x86, sizeof(bundle_path_macos_x86), "%s/macos-x86", bundle_path);
+        if (strcmp(target, bundle_path) == 0) {
+        send_text_response(fd, 200, "macos-arm\nmacos-x86\n");
+        } else if (strcmp(target, bundle_path_macos_arm) == 0) {
+            send_bundle_file(fd, bundle_arm_path());
+        } else if (strcmp(target, bundle_path_macos_x86) == 0) {
+            send_bundle_file(fd, bundle_x86_path());
+        } else {
+            send_text_response(fd, 404, "not found\n");
+        }
     }
     return false;
 }

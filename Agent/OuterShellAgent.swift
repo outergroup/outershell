@@ -212,10 +212,12 @@ private enum OuterShellRegistry {
     }
 
     private static let orwaDescriptorSize = 20
-    private static let orwaTableCount = 5
+    private static let orwaTableCount = 6
+    private static let orwaLegacyFiveTableCount = 5
     private static let orwaLegacyFourTableCount = 4
     private static let orwaLegacyThreeTableCount = 3
     private static let orwaHeaderSize = 8 + orwaTableCount * orwaDescriptorSize
+    private static let orwaLegacyFiveTableHeaderSize = 8 + orwaLegacyFiveTableCount * orwaDescriptorSize
     private static let orwaLegacyFourTableHeaderSize = 8 + orwaLegacyFourTableCount * orwaDescriptorSize
     private static let orwaLegacyThreeTableHeaderSize = 8 + orwaLegacyThreeTableCount * orwaDescriptorSize
     private static let orwaBackendsRowSize = 68
@@ -225,6 +227,7 @@ private enum OuterShellRegistry {
     private static let orwaFrontendsRowSizeWithFlags = 117
     private static let orwaFrontendLayoutsRowSize = 32
     private static let orwaLogFilesRowSize = 32
+    private static let orwaContentTypesRowSize = 96
     private static let orwaFileOpenersRowSize = 88
 
     private static func registryPaths() -> [String] {
@@ -281,6 +284,8 @@ private enum OuterShellRegistry {
         let tableCount: Int
         if firstTableOffset == UInt64(orwaHeaderSize) {
             tableCount = orwaTableCount
+        } else if firstTableOffset == UInt64(orwaLegacyFiveTableHeaderSize) {
+            tableCount = orwaLegacyFiveTableCount
         } else if firstTableOffset == UInt64(orwaLegacyFourTableHeaderSize) {
             tableCount = orwaLegacyFourTableCount
         } else if firstTableOffset == UInt64(orwaLegacyThreeTableHeaderSize) {
@@ -382,7 +387,9 @@ private enum OuterShellRegistry {
             return rowSize == orwaFrontendsRowSize || rowSize == orwaFrontendsRowSizeWithFlags || rowSize == orwaLegacyFrontendsRowSize
         case 2 where tableCount != orwaLegacyThreeTableCount:
             return rowSize == orwaFrontendLayoutsRowSize
-        case 4:
+        case 4 where tableCount == orwaTableCount:
+            return rowSize == orwaContentTypesRowSize
+        case 4, 5:
             return rowSize == orwaFileOpenersRowSize
         default:
             return rowSize == orwaLogFilesRowSize

@@ -7428,15 +7428,15 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         appLauncherItems(from: backends)
     }
 
-    private func runningEndpoints(for item: AppLauncherItem) -> [(endpoint: AppLauncherEndpoint, symbolName: String)] {
-        var endpoints: [(endpoint: AppLauncherEndpoint, symbolName: String)] = []
+    private func runningEndpoints(for item: AppLauncherItem) -> [(endpoint: AppLauncherEndpoint, symbolName: String, isRoot: Bool)] {
+        var endpoints: [(endpoint: AppLauncherEndpoint, symbolName: String, isRoot: Bool)] = []
         if let userEndpoint = item.userEndpoint,
            endpointIsRunning(userEndpoint) {
-            endpoints.append((userEndpoint, "person.fill"))
+            endpoints.append((userEndpoint, "person.fill", false))
         }
         if let rootEndpoint = item.rootEndpoint,
            endpointIsRunning(rootEndpoint) {
-            endpoints.append((rootEndpoint, "checkmark.shield.fill"))
+            endpoints.append((rootEndpoint, "checkmark.shield.fill", true))
         }
         return endpoints
     }
@@ -7456,9 +7456,18 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                      pointSize: CGFloat,
                                      circleDiameter: CGFloat,
                                      gap: CGFloat) {
-        let badges = runningEndpoints(for: item).compactMap { badge -> (endpoint: AppLauncherEndpoint, image: CGImage, size: CGSize)? in
-            guard let symbol = naturalSymbolCGImage(named: badge.symbolName, pointSize: pointSize) else { return nil }
-            return (badge.endpoint, symbol.image, symbol.size)
+        let rootBadgeColor = NSColor(calibratedRed: 0.00, green: 0.34, blue: 0.14, alpha: 1.0)
+        let badges = runningEndpoints(for: item).compactMap { badge -> (endpoint: AppLauncherEndpoint, image: CGImage, size: CGSize, backgroundColor: NSColor?, shadowColor: NSColor)? in
+            if badge.isRoot {
+                guard let symbol = naturalSymbolCGImage(named: badge.symbolName,
+                                                        pointSize: circleDiameter,
+                                                        color: rootBadgeColor) else { return nil }
+                return (badge.endpoint, symbol.image, symbol.size, nil, rootBadgeColor)
+            }
+            guard let symbol = naturalSymbolCGImage(named: badge.symbolName,
+                                                    pointSize: pointSize,
+                                                    color: .white) else { return nil }
+            return (badge.endpoint, symbol.image, symbol.size, .systemGreen, .systemGreen)
         }
         guard !badges.isEmpty else { return }
 
@@ -7480,10 +7489,15 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             let chipLayer = CALayer()
             chipLayer.frame = chipFrame
             chipLayer.cornerRadius = floor(chipFrame.height / 2)
-            chipLayer.backgroundColor = resolvedCGColor(NSColor.systemGreen.withAlphaComponent(0.95))
-            chipLayer.borderWidth = 0.5
-            chipLayer.borderColor = resolvedCGColor(NSColor.white.withAlphaComponent(0.8))
-            chipLayer.shadowColor = resolvedCGColor(NSColor.systemGreen.withAlphaComponent(0.4))
+            if let backgroundColor = chip.badge.backgroundColor {
+                chipLayer.backgroundColor = resolvedCGColor(backgroundColor.withAlphaComponent(0.95))
+                chipLayer.borderWidth = 0.5
+                chipLayer.borderColor = resolvedCGColor(NSColor.white.withAlphaComponent(0.8))
+            } else {
+                chipLayer.backgroundColor = resolvedCGColor(.clear)
+                chipLayer.borderWidth = 0
+            }
+            chipLayer.shadowColor = resolvedCGColor(chip.badge.shadowColor.withAlphaComponent(0.4))
             chipLayer.shadowOpacity = 0.22
             chipLayer.shadowRadius = 3
             chipLayer.shadowOffset = CGSize(width: 0, height: 1)

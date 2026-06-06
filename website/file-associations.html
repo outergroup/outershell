@@ -1,0 +1,184 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>File Associations - Outer Shell</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <header class="site-header">
+        <div class="site-header-inner">
+            <a class="brand" href="index.html">Outer Shell</a>
+            <nav class="site-nav" aria-label="Main">
+                <a href="index.html">Overview</a>
+                <a href="file-associations.html" aria-current="page">File Associations</a>
+            </nav>
+        </div>
+    </header>
+
+    <main>
+        <p class="eyebrow">File Associations</p>
+        <h1>How Outer Shell chooses apps for files</h1>
+        <p class="lede">
+            Outer Shell treats file opening as a daemon service: apps describe
+            the kinds of files they support, and <code>outershelld</code> resolves
+            a file path into matching openers.
+        </p>
+
+        <div class="draft-note">
+            Draft space: this page has working explanatory copy, but it is meant
+            to be easy to rewrite while evaluating the design.
+        </div>
+
+        <section class="section" aria-labelledby="model-heading">
+            <h2 id="model-heading">The Model</h2>
+            <p>
+                This is loosely similar to how macOS thinks about document
+                types and app handlers. The difference is that Outer Shell apps
+                do not declare their file associations in static app metadata or
+                an XML property list. They register content types and openers
+                through the Outer Shell API.
+            </p>
+            <p>
+                Outer Shell uses content type identifiers such as
+                <code>public.text</code>, <code>public.markdown</code>, and
+                <code>public.image</code>. A content type can name parent types it
+                conforms to, so a Markdown file can be treated as both
+                <code>public.markdown</code> and <code>public.text</code>.
+            </p>
+            <p>
+                Apps register themselves as openers for content types. An app
+                that registers for <code>public.text</code> can be offered for
+                files that are known to be text, including more specific text
+                types that conform to it.
+            </p>
+
+            <div class="flow" aria-label="File opener lookup flow">
+                <div class="flow-step">
+                    <strong>1. Define types</strong>
+                    <span>Content types describe names, extensions, exact filenames, MIME hints, and parent types.</span>
+                </div>
+                <div class="flow-step">
+                    <strong>2. Register apps</strong>
+                    <span>Apps register opener records for the content types they can handle.</span>
+                </div>
+                <div class="flow-step">
+                    <strong>3. Infer a file</strong>
+                    <span>Given a path, <code>outershelld</code> infers the content type from file evidence.</span>
+                </div>
+                <div class="flow-step">
+                    <strong>4. Return openers</strong>
+                    <span>The daemon returns apps whose registered types match the inferred type graph.</span>
+                </div>
+            </div>
+        </section>
+
+        <section class="section" aria-labelledby="types-heading">
+            <h2 id="types-heading">Registered Content Types</h2>
+            <p>
+                A content type definition gives Outer Shell enough information to
+                recognize files without making every app repeat the same logic.
+                Built-in definitions cover common types such as text, Markdown,
+                JSON, images, PDF, and ZIP archives.
+            </p>
+            <p>
+                Custom apps can add more definitions at install time or runtime
+                by calling the API. A type definition can include:
+            </p>
+            <ul class="content-list">
+                <li>a stable identifier, such as <code>public.text</code> or <code>dev.example.source</code></li>
+                <li>a display name for people</li>
+                <li>parent content types it conforms to</li>
+                <li>filename extensions, without leading dots</li>
+                <li>exact filename matches, such as <code>Makefile</code> or <code>README</code></li>
+                <li>MIME type hints</li>
+            </ul>
+            <pre><code>outerctl content-type add \
+  --content-type dev.example.source \
+  --name "Example Source" \
+  --conforms-to public.text \
+  --extensions example,exs \
+  --filenames Examplefile \
+  --mime-types text/x-example</code></pre>
+        </section>
+
+        <section class="section" aria-labelledby="inference-heading">
+            <h2 id="inference-heading">Inferring a File's Type</h2>
+            <p>
+                Clients can ask for openers by path instead of deciding the type
+                themselves. When a path is provided, <code>outershelld</code>
+                looks at exact filename, filename extension, file magic, shebang,
+                and text sniffing. This keeps type inference centralized.
+            </p>
+            <p>
+                The result is not just one label. Outer Shell expands the inferred
+                type through its parent types, so a specific match can still use
+                a more general opener.
+            </p>
+        </section>
+
+        <section class="section" aria-labelledby="openers-heading">
+            <h2 id="openers-heading">Registering Apps as Openers</h2>
+            <p>
+                An opener registration says: this backend can open files of this
+                content type. It also provides the user-facing app name, the app's
+                socket path, and a URL template used to build the final navigation
+                URL.
+            </p>
+            <p>
+                In macOS terms, this plays a similar role to declaring document
+                handlers in an app bundle. In Outer Shell, that relationship is
+                registered programmatically with <code>outershelld</code> instead.
+            </p>
+            <pre><code>outerctl opener add \
+  --backend dev.outergroup.Plaintext \
+  --content-type public.text \
+  --socket-path "$XDG_RUNTIME_DIR/dev.outergroup.Plaintext" \
+  --name Plaintext \
+  --url-template "?file={file}"</code></pre>
+            <p>
+                The <code>{file}</code> placeholder is replaced with the
+                percent-encoded file path. If the opener has a socket path,
+                Outer Shell uses it to route the navigation to the app backend.
+            </p>
+        </section>
+
+        <section class="section" aria-labelledby="lookup-heading">
+            <h2 id="lookup-heading">Looking Up Openers</h2>
+            <p>
+                A caller can query by file path or by explicit content type. Path
+                queries are the normal case for file browsers: the caller passes
+                the path, and <code>outershelld</code> returns matching apps with
+                resolved URLs.
+            </p>
+            <pre><code>outerctl opener list --content-type public.text --file /path/to/README</code></pre>
+            <p>
+                The Files app uses this model when it builds its "Open With" menu.
+                It does not need to know whether a file is text, Markdown, or a
+                shell script. It asks the daemon for openers and then navigates to
+                the selected app URL.
+            </p>
+        </section>
+
+        <section class="section" aria-labelledby="design-heading">
+            <h2 id="design-heading">Why Centralize This?</h2>
+            <p>
+                Centralizing file associations lets Outer Shell behave more like a
+                local environment. Apps describe what they can open, file browsers
+                ask one service for answers, and specialized type logic lives in
+                one place.
+            </p>
+            <div class="callout">
+                The important design boundary: apps register capabilities, but
+                <code>outershelld</code> owns the decision of what kind of file a
+                path represents.
+            </div>
+        </section>
+    </main>
+
+    <footer class="site-footer">
+        Outer Shell website draft.
+    </footer>
+</body>
+</html>

@@ -299,7 +299,7 @@ EOF
     done
     OUTERSHELL_HOME="$outershell_home" "$outerctl_path" backend upsert --backend "$service_id" --name "$display_name" --launchd-plist "$plist_path" --owns-plist true
     OUTERSHELL_HOME="$outershell_home" "$outerctl_path" app clear --backend "$service_id"
-    OUTERSHELL_HOME="$outershell_home" "$outerctl_path" app add --backend "$service_id" --socket-path "$socket_path" --name "$display_name" --url "$socket_path" --icon-path "$install_root/app-icon.png"
+    OUTERSHELL_HOME="$outershell_home" "$outerctl_path" app add --backend "$service_id" --socket-path "$socket_path" --name "$display_name" --url "/" --icon-path "$install_root/app-icon.png"
     OUTERSHELL_HOME="$outershell_home" "$outerctl_path" log clear --backend "$service_id"
     OUTERSHELL_HOME="$outershell_home" "$outerctl_path" log add --backend "$service_id" --path "$log_path"
     if [ "$command" = "update" ]; then
@@ -468,7 +468,7 @@ systemctl --user start org.outershell.OuterShell.socket outershelld.socket
 
 OUTERSHELL_HOME="$outershell_home" "$outerctl_path" backend upsert --backend org.outershell.OuterShell --name "Outer Shell" --systemd-unit org.outershell.OuterShell.service
 OUTERSHELL_HOME="$outershell_home" "$outerctl_path" app clear --backend org.outershell.OuterShell
-OUTERSHELL_HOME="$outershell_home" "$outerctl_path" app add --backend org.outershell.OuterShell --socket-path "$socket_path" --name "Outer Shell" --url "$socket_path" --icon-path "$install_root/app-icon.png"
+OUTERSHELL_HOME="$outershell_home" "$outerctl_path" app add --backend org.outershell.OuterShell --socket-path "$socket_path" --name "Outer Shell" --url "/" --icon-path "$install_root/app-icon.png"
 OUTERSHELL_HOME="$outershell_home" "$outerctl_path" log clear --backend org.outershell.OuterShell
 OUTERSHELL_HOME="$outershell_home" "$outerctl_path" log add --backend org.outershell.OuterShell --path "$log_path"
 
