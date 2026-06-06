@@ -796,7 +796,7 @@ static const BundledAppDefinition kBundledApps[] = {
         .socket_name = "dev.outergroup.Profile",
         .socket_activated = true,
         .supports_root = true,
-        .root_only = true,
+        .root_only = false,
         .archive_name = "Profile.tar.gz",
         .version = "1"
     }

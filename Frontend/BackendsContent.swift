@@ -7456,7 +7456,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                      pointSize: CGFloat,
                                      circleDiameter: CGFloat,
                                      gap: CGFloat) {
-        let rootBadgeColor = NSColor(calibratedRed: 0.00, green: 0.34, blue: 0.14, alpha: 1.0)
+        let rootBadgeColor = NSColor.systemGreen
         let badges = runningEndpoints(for: item).compactMap { badge -> (endpoint: AppLauncherEndpoint, image: CGImage, size: CGSize, backgroundColor: NSColor?, shadowColor: NSColor)? in
             if badge.isRoot {
                 guard let symbol = naturalSymbolCGImage(named: badge.symbolName,
