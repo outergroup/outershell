@@ -12,6 +12,7 @@
 		37B4F9DF2FA1B00100873894 /* OuterShellAPI.c in Sources */ = {isa = PBXBuildFile; fileRef = 37B4F9E02FA1B00100873894 /* OuterShellAPI.c */; };
 		37B4F9E42FA1B00100873894 /* OuterShellPlatform.c in Sources */ = {isa = PBXBuildFile; fileRef = 37B4F9E22FA1B00100873894 /* OuterShellPlatform.c */; };
 		37B4F9EE2FA1B00100873894 /* OuterShellBackend.c in Sources */ = {isa = PBXBuildFile; fileRef = 37B4F9EC2FA1B00100873894 /* OuterShellBackend.c */; };
+		37AA00012FEA000000000009 /* app-icon.png in Resources */ = {isa = PBXBuildFile; fileRef = 37AA00022FEA000000000009 /* app-icon.png */; };
 		AG0000000000000000000004 /* OuterShellAgent.swift in Sources */ = {isa = PBXBuildFile; fileRef = AG0000000000000000000003 /* OuterShellAgent.swift */; };
 		AG0000000000000000000005 /* outershelld.c in Sources */ = {isa = PBXBuildFile; fileRef = 37B4F9D02FA1B00100873894 /* outershelld.c */; };
 		AG0000000000000000000021 /* OuterShellDownloader.c in Sources */ = {isa = PBXBuildFile; fileRef = 37B4F9F12FA1B00100873894 /* OuterShellDownloader.c */; };
@@ -40,6 +41,7 @@
 		0F0000000000000000000008 /* README.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = README.md; sourceTree = "<group>"; };
 		0F0000000000000000000009 /* build_site.sh */ = {isa = PBXFileReference; lastKnownFileType = text.script.sh; path = build_site.sh; sourceTree = "<group>"; };
 		0F000000000000000000000A /* .gitignore */ = {isa = PBXFileReference; lastKnownFileType = text; path = .gitignore; sourceTree = "<group>"; };
+		37AA00022FEA000000000009 /* app-icon.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = "app-icon.png"; sourceTree = "<group>"; };
 		37B4F9C12FA189AB00873894 /* AGENTS.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = AGENTS.md; sourceTree = "<group>"; };
 		37B4F9C22FA18C1E00873894 /* LICENSE */ = {isa = PBXFileReference; lastKnownFileType = text; path = LICENSE; sourceTree = "<group>"; };
 		37B4F9CF2FA1B00100873894 /* outershelld */ = {isa = PBXFileReference; explicitFileType = "compiled.mach-o.executable"; includeInIndex = 0; path = outershelld; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -110,6 +112,7 @@
 				37B4F9EA2FA1B00100873894 /* outershelld */,
 				0F0000000000000000000005 /* Vendor */,
 				0F0000000000000000000006 /* Scripts */,
+				37AA00022FEA000000000009 /* app-icon.png */,
 				0F0000000000000000000007 /* Info.plist */,
 				0F0000000000000000000008 /* README.md */,
 				37B4F9C12FA189AB00873894 /* AGENTS.md */,
@@ -277,6 +280,7 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				37AA00012FEA000000000009 /* app-icon.png in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

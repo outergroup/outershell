@@ -949,6 +949,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                      proxyPort: arguments.proxy?.port ?? 0,
                                      proxyUsername: arguments.proxy?.username,
                                      proxyPassword: arguments.proxy?.password)
+            outerframeHost.setTitle("Outer Shell")
+            outerframeHost.setIcon(.bundleResource(path: "Contents/Resources/app-icon.png"))
             mode = modeFromURL(arguments.url)
             appearance = arguments.appearance ?? NSAppearance.currentDrawing()
             currentSize = arguments.contentSize ?? currentSize
