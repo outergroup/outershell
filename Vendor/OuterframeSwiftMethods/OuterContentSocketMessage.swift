@@ -104,6 +104,7 @@ enum BrowserToContentMessage {
     case viewFocusChanged(isFocused: Bool)
     case selectionToPasteboardCopyRequest(requestID: UUID)
     case selectionToPasteboardCutRequest(requestID: UUID)
+    case editCommandValidationRequest(requestID: UUID, commands: OuterframeEditCommandSet)
     case pasteboardContentPasted(items: [OuterframeContentPasteboardItem])
     case pasteboardContentDropped(point: CGPoint, items: [OuterframeContentPasteboardItem])
     case pasteboardDropHitTestRequest(requestID: UUID,
@@ -375,6 +376,12 @@ enum BrowserToContentMessage {
             var payload = Data(capacity: 16)
             payload.append(uuid: requestID)
             return makeBrowserToContentFrame(type: .selectionToPasteboardCutRequest, payload: payload)
+
+        case .editCommandValidationRequest(let requestID, let commands):
+            var payload = Data(capacity: 20)
+            payload.append(uuid: requestID)
+            payload.append(uint32: commands.rawValue)
+            return makeBrowserToContentFrame(type: .editCommandValidationRequest, payload: payload)
 
         case .pasteboardContentPasted(let items):
             let payload = try encodePasteboardItems(items)
@@ -783,6 +790,14 @@ enum BrowserToContentMessage {
             }
             return .selectionToPasteboardCutRequest(requestID: requestID)
 
+        case .editCommandValidationRequest:
+            guard let requestID = cursor.readUUID(),
+                  let commandsRaw = cursor.readUInt32() else {
+                throw OuterframeContentSocketMessageError.truncatedPayload
+            }
+            return .editCommandValidationRequest(requestID: requestID,
+                                                 commands: OuterframeEditCommandSet(rawValue: commandsRaw))
+
         case .pasteboardContentPasted:
             let items = try readPasteboardItems(cursor: &cursor)
             return .pasteboardContentPasted(items: items)
@@ -918,7 +933,7 @@ enum ContentToBrowserMessage {
     case openNewWindow(url: String, displayString: String?, preferredSize: CGSize?)
     case navigate(url: String)
     case openNewTab(url: String, displayString: String?)
-    case setEditingCapabilities(canCopy: Bool, canCut: Bool)
+    case editCommandValidationResponse(requestID: UUID, enabledCommands: OuterframeEditCommandSet)
     case setPasteboardDropBehaviorUniform([String])
     case setAcceptedPasteboardPasteTypes([String])
     case setPasteboardDropBehaviorHitTest
@@ -1065,13 +1080,11 @@ enum ContentToBrowserMessage {
             try payload.append(stringReference: displayString ?? "")
             return makeContentToBrowserFrame(type: .openNewTab, payload: try payload.finalize())
 
-        case .setEditingCapabilities(let canCopy, let canCut):
-            var payload = Data(capacity: 1)
-            var flags: UInt8 = 0
-            if canCopy { flags |= 1 << 0 }
-            if canCut { flags |= 1 << 1 }
-            payload.append(uint8: flags)
-            return makeContentToBrowserFrame(type: .setEditingCapabilities, payload: payload)
+        case .editCommandValidationResponse(let requestID, let enabledCommands):
+            var payload = Data(capacity: 20)
+            payload.append(uuid: requestID)
+            payload.append(uint32: enabledCommands.rawValue)
+            return makeContentToBrowserFrame(type: .editCommandValidationResponse, payload: payload)
 
         case .setPasteboardDropBehaviorUniform(let pasteboardTypes):
             var payload = OffsetPayloadBuilder()
@@ -1288,12 +1301,13 @@ enum ContentToBrowserMessage {
                                              deleteWhenDone: flags & (1 << 1) != 0,
                                              errorMessage: errorMessage.isEmpty ? nil : errorMessage)
 
-        case .setEditingCapabilities:
-            guard let flags = cursor.readUInt8() else {
+        case .editCommandValidationResponse:
+            guard let requestID = cursor.readUUID(),
+                  let enabledCommandsRaw = cursor.readUInt32() else {
                 throw OuterframeContentSocketMessageError.truncatedPayload
             }
-            return .setEditingCapabilities(canCopy: flags & (1 << 0) != 0,
-                                           canCut: flags & (1 << 1) != 0)
+            return .editCommandValidationResponse(requestID: requestID,
+                                                  enabledCommands: OuterframeEditCommandSet(rawValue: enabledCommandsRaw))
 
         case .setPasteboardDropBehaviorUniform:
             guard let count = cursor.readUInt16() else {
@@ -1461,6 +1475,20 @@ public enum OuterframePasteboardAccessOperation: UInt8, Sendable {
     case write = 1
 }
 
+public struct OuterframeEditCommandSet: OptionSet, Sendable {
+    public let rawValue: UInt32
+
+    public init(rawValue: UInt32) {
+        self.rawValue = rawValue
+    }
+
+    public static let copy = OuterframeEditCommandSet(rawValue: 1 << 0)
+    public static let cut = OuterframeEditCommandSet(rawValue: 1 << 1)
+    public static let paste = OuterframeEditCommandSet(rawValue: 1 << 2)
+    public static let selectAll = OuterframeEditCommandSet(rawValue: 1 << 3)
+    public static let standard: OuterframeEditCommandSet = [.copy, .cut, .paste, .selectAll]
+}
+
 public enum OuterframeContextMenuItemAction: UInt8, Sendable {
     case contentCommand = 0
     case standardCopy = 1
@@ -1612,6 +1640,7 @@ private enum BrowserToContentMessageKind: UInt16 {
     case selectionToPasteboardCutRequest = 1037
     case pasteboardDropHitTestRequest = 1038
     case filePromiseWriteRequest = 1039
+    case editCommandValidationRequest = 1040
 
     // Assign new indices in contiguous blocks to make the switch statement more efficient
 }
@@ -1626,7 +1655,7 @@ private enum ContentToBrowserMessageKind: UInt16 {
     case showDefinition = 2006
     case hapticFeedback = 2007
     case selectionToPasteboardResponse = 2008
-    case setEditingCapabilities = 2009
+    case editCommandValidationResponse = 2009
     case accessibilitySnapshotResponse = 2010
     case accessibilityTreeChanged = 2011
     case openNewWindow = 2012

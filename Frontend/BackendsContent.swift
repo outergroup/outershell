@@ -1043,6 +1043,12 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             outerframeHost.sendCopySelectedPasteboardResponse(requestID: requestID,
                                                               items: pasteboardItemsForCut())
 
+        case .editCommandValidationRequest(let requestID, let commands):
+            outerframeHost.sendEditCommandValidationResponse(
+                requestID: requestID,
+                enabledCommands: enabledEditCommands(in: commands)
+            )
+
         case .pasteboardContentPasted(let items):
             handlePasteboardItemsForPaste(items)
 
@@ -5629,22 +5635,38 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
     private func updateEditingAndPasteboardState() {
         if passwordInputController.isFocused {
-            outerframeHost.setEditingCapabilities(canCopy: false, canCut: false)
             outerframeHost.setAcceptedPasteboardPasteTypes(Self.passwordFieldPasteboardTypes)
             return
         }
 
         if createInputController.isFocused {
-            let capabilities = createInputController.currentEditingCapabilities()
-            outerframeHost.setEditingCapabilities(canCopy: capabilities.canCopy, canCut: capabilities.canCut)
             outerframeHost.setAcceptedPasteboardPasteTypes(createInputController.currentAcceptedPasteboardTypeIdentifiers())
             return
         }
 
-        outerframeHost.setEditingCapabilities(canCopy: (logHeaderDetailSelectionRange?.length ?? 0) > 0 ||
-                                              (logTextSelectionRange?.length ?? 0) > 0,
-                                              canCut: false)
         outerframeHost.setAcceptedPasteboardPasteTypes([])
+    }
+
+    private func enabledEditCommands(in requestedCommands: OuterframeEditCommandSet) -> OuterframeEditCommandSet {
+        if passwordInputController.isFocused {
+            var enabledCommands: OuterframeEditCommandSet = []
+            if requestedCommands.contains(.paste) {
+                enabledCommands.insert(.paste)
+            }
+            return enabledCommands
+        }
+
+        if createInputController.isFocused {
+            return createInputController.enabledEditCommands(in: requestedCommands)
+        }
+
+        var enabledCommands: OuterframeEditCommandSet = []
+        if requestedCommands.contains(.copy),
+           (logHeaderDetailSelectionRange?.length ?? 0) > 0 ||
+            (logTextSelectionRange?.length ?? 0) > 0 {
+            enabledCommands.insert(.copy)
+        }
+        return enabledCommands
     }
 
     private func createInputFont(monospaced: Bool) -> NSFont {
@@ -6635,7 +6657,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             let index = characterIndexForPasswordField(xPosition: point.x)
             focusPasswordField(cursorPosition: index)
             updateEditingAndPasteboardState()
-            outerframeHost.showContextMenu(for: NSAttributedString(string: ""), at: point)
+            showPasswordFieldContextMenu(at: point)
             return
         }
 
@@ -6649,10 +6671,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 createInputController.setCursorPosition(index, modifySelection: false)
             }
             updateEditingAndPasteboardState()
-            let selectedText = createInputController.selectedTextContent() ?? ""
-            let attributedText = NSAttributedString(string: selectedText,
-                                                    attributes: [.font: createInputFont(monospaced: true)])
-            outerframeHost.showContextMenu(for: attributedText, at: point)
+            showCreateFieldContextMenu(at: point, monospaced: true)
             return
         }
 
@@ -6680,10 +6699,48 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             createInputController.setCursorPosition(index, modifySelection: false)
         }
         updateEditingAndPasteboardState()
+        showCreateFieldContextMenu(at: point, monospaced: createFieldLayouts[key]?.monospaced ?? false)
+    }
+
+    private func showPasswordFieldContextMenu(at point: CGPoint) {
+        let items = [
+            OuterframeContextMenuItem(id: "paste",
+                                      title: "Paste",
+                                      action: .standardPaste,
+                                      isEnabled: passwordInputController.isFocused)
+        ]
+
+        outerframeHost.showContextMenu(menuID: UUID(),
+                                       items: items,
+                                       at: point)
+    }
+
+    private func showCreateFieldContextMenu(at point: CGPoint, monospaced: Bool) {
         let selectedText = createInputController.selectedTextContent() ?? ""
-        let attributedText = NSAttributedString(string: selectedText,
-                                                attributes: [.font: createInputFont(monospaced: createFieldLayouts[key]?.monospaced ?? false)])
-        outerframeHost.showContextMenu(for: attributedText, at: point)
+        let hasSelection = !selectedText.isEmpty
+        let items = [
+            OuterframeContextMenuItem(id: "cut",
+                                      title: "Cut",
+                                      action: .standardCut,
+                                      isEnabled: hasSelection),
+            OuterframeContextMenuItem(id: "copy",
+                                      title: "Copy",
+                                      action: .standardCopy,
+                                      isEnabled: hasSelection),
+            OuterframeContextMenuItem(id: "paste",
+                                      title: "Paste",
+                                      action: .standardPaste,
+                                      isEnabled: createInputController.isFocused)
+        ]
+
+        let attributedText = hasSelection
+            ? NSAttributedString(string: selectedText,
+                                 attributes: [.font: createInputFont(monospaced: monospaced)])
+            : nil
+        outerframeHost.showContextMenu(menuID: UUID(),
+                                       items: items,
+                                       at: point,
+                                       attributedText: attributedText)
     }
 
     private func handleScroll(at point: CGPoint, delta: CGPoint, precise: Bool) {
