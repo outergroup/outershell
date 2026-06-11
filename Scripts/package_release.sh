@@ -412,14 +412,65 @@ remove_system_binaries_if_unused() {
     systemctl --system disable --now outershelld.socket outershelld.service >/dev/null 2>&1 || true
     rm -f /etc/systemd/system/outershelld.service /etc/systemd/system/outershelld.socket /run/outershelld-api
     systemctl --system daemon-reload >/dev/null 2>&1 || true
-    rm -f "$system_outershelld_path" "$system_outerctl_path" "$system_install_root/bin/outerctl" "$system_version_path"
-    rmdir "$system_install_root/bin" "$system_install_root" "$system_outershell_home/bin" "$system_binary_users_dir" "$system_outershell_home" >/dev/null 2>&1 || true
+    rm -f "$system_outershelld_path" "$system_outerctl_path" "$system_install_root/bin/outerctl" "$system_version_path" "$system_install_root/run-outer-shell.sh"
+    rm -f /var/log/outergroup/outershelld.log /var/log/outergroup/org.outershell.OuterShell.log
+    if ! find "$system_outershell_home/apps" -mindepth 1 -print -quit 2>/dev/null | grep -q . &&
+       ! find /opt/outergroup -mindepth 1 -print -quit 2>/dev/null | grep -q .; then
+        rm -f "$system_outershell_home/registry.orwa" "$system_outershell_home/registry.orwa.lock"
+        rmdir "$system_outershell_home/apps" /opt/outergroup >/dev/null 2>&1 || true
+    fi
+    rmdir "$system_install_root/bin" "$system_install_root" "$system_outershell_home/bin" "$system_binary_users_dir" "$system_outershell_home" /var/log/outergroup >/dev/null 2>&1 || true
+}
+
+system_binary_cleanup_shell_functions() {
+    cat <<'OUTERSHELL_SYSTEM_BINARY_CLEANUP_SH'
+system_binary_users_empty() {
+    if [ ! -d "$system_binary_users_dir" ]; then
+        return 0
+    fi
+    for marker in "$system_binary_users_dir"/*; do
+        [ -e "$marker" ] || continue
+        name="$(basename "$marker")"
+        case "$name" in
+            root-apps)
+                [ "$(stat -c %u "$marker" 2>/dev/null || echo invalid)" = "0" ] && return 1
+                ;;
+            uid-*)
+                uid="${name#uid-}"
+                case "$uid" in
+                    *[!0-9]*|'') continue ;;
+                esac
+                [ "$(stat -c %u "$marker" 2>/dev/null || echo invalid)" = "$uid" ] && return 1
+                ;;
+        esac
+    done
+    return 0
+}
+
+remove_system_binaries_if_unused() {
+    [ "$(id -u)" -eq 0 ] || return 0
+    system_binary_users_empty || return 0
+    systemctl --system disable --now outershelld.socket outershelld.service >/dev/null 2>&1 || true
+    rm -f /etc/systemd/system/outershelld.service /etc/systemd/system/outershelld.socket /run/outershelld-api
+    systemctl --system daemon-reload >/dev/null 2>&1 || true
+    rm -f "$system_outershelld_path" "$system_outerctl_path" "$system_install_root/bin/outerctl" "$system_version_path" "$system_install_root/run-outer-shell.sh"
+    rm -f /var/log/outergroup/outershelld.log /var/log/outergroup/org.outershell.OuterShell.log
+    if ! find "$system_outershell_home/apps" -mindepth 1 -print -quit 2>/dev/null | grep -q . &&
+       ! find /opt/outergroup -mindepth 1 -print -quit 2>/dev/null | grep -q .; then
+        rm -f "$system_outershell_home/registry.orwa" "$system_outershell_home/registry.orwa.lock"
+        rmdir "$system_outershell_home/apps" /opt/outergroup >/dev/null 2>&1 || true
+    fi
+    rmdir "$system_install_root/bin" "$system_install_root" "$system_outershell_home/bin" "$system_binary_users_dir" "$system_outershell_home" /var/log/outergroup >/dev/null 2>&1 || true
+}
+OUTERSHELL_SYSTEM_BINARY_CLEANUP_SH
 }
 
 remove_system_binary_user_marker_with_sudo() {
     [ "$root_install" = false ] || return 0
     [ -e "$system_binary_user_marker" ] || return 0
-    rm -f "$system_binary_user_marker" 2>/dev/null && return 0
+    if rm -f "$system_binary_user_marker" 2>/dev/null && ! system_binary_users_empty; then
+        return 0
+    fi
 
     cleanup_root_script="$(mktemp)"
     cat > "$cleanup_root_script" <<EOF
@@ -436,8 +487,7 @@ expected_uid="$(id -u)"
 if [ -e "\$marker" ] && [ "\$(stat -c %u "\$marker" 2>/dev/null || echo invalid)" = "\$expected_uid" ]; then
     rm -f "\$marker"
 fi
-$(declare -f system_binary_users_empty)
-$(declare -f remove_system_binaries_if_unused)
+$(system_binary_cleanup_shell_functions)
 remove_system_binaries_if_unused
 EOF
     chmod 0700 "$cleanup_root_script"
@@ -497,12 +547,12 @@ systemctl $systemctl_scope daemon-reload >/dev/null 2>&1 || true
 if [ "$root_install" = true ]; then
     rm -f "$install_root/OuterShellBackend" "$install_root/app-icon.png"
     rm -rf "$install_root/bundles" "$install_root/bundled-apps"
+    rm -f "$log_path"
 else
     rm -rf "$install_root"
 fi
 rm -f "$system_binary_user_marker"
-$(declare -f system_binary_users_empty)
-$(declare -f remove_system_binaries_if_unused)
+$(system_binary_cleanup_shell_functions)
 system_outershell_home="$system_outershell_home"
 system_install_root="$system_install_root"
 system_outershelld_path="$system_outershelld_path"

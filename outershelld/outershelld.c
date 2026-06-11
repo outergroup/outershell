@@ -7047,6 +7047,15 @@ static bool ensure_root_helper_installed(const char *sudo_password, bool *needs_
     }
     shell_quote(helper_source, quoted_executable, sizeof(quoted_executable));
 #else
+    if (strstr(executable, " (deleted)") != NULL || access(executable, X_OK) != 0) {
+        char installed_executable[PATH_MAX];
+        char installed_root[PATH_MAX];
+        default_outershell_install_root(installed_root, sizeof(installed_root));
+        snprintf(installed_executable, sizeof(installed_executable), "%s/outershelld", installed_root);
+        if (access(installed_executable, X_OK) == 0) {
+            snprintf(executable, sizeof(executable), "%s", installed_executable);
+        }
+    }
     shell_quote(executable, quoted_executable, sizeof(quoted_executable));
 #endif
     shell_quote(kSystemOuterShellRoot, quoted_system_root, sizeof(quoted_system_root));
@@ -7315,8 +7324,14 @@ static void write_system_binary_cleanup_shell(FILE *script) {
             "  systemctl --system disable --now outershelld.socket outershelld.service >/dev/null 2>&1 || true\n"
             "  rm -f /etc/systemd/system/outershelld.service /etc/systemd/system/outershelld.socket /run/outershelld-api\n"
             "  systemctl --system daemon-reload >/dev/null 2>&1 || true\n"
-            "  rm -f \"$system_outershelld_path\" \"$system_outerctl_path\" \"$system_install_root/bin/outerctl\" \"$system_version_path\"\n"
-            "  rmdir \"$system_install_root/bin\" \"$system_install_root\" \"$system_outershell_home/bin\" \"$system_binary_users_dir\" \"$system_outershell_home\" >/dev/null 2>&1 || true\n"
+            "  rm -f \"$system_outershelld_path\" \"$system_outerctl_path\" \"$system_install_root/bin/outerctl\" \"$system_version_path\" \"$system_install_root/run-outer-shell.sh\"\n"
+            "  rm -f /var/log/outergroup/outershelld.log /var/log/outergroup/org.outershell.OuterShell.log\n"
+            "  if ! find \"$system_outershell_home/apps\" -mindepth 1 -print -quit 2>/dev/null | grep -q . &&\n"
+            "     ! find /opt/outergroup -mindepth 1 -print -quit 2>/dev/null | grep -q .; then\n"
+            "    rm -f \"$system_outershell_home/registry.orwa\" \"$system_outershell_home/registry.orwa.lock\"\n"
+            "    rmdir \"$system_outershell_home/apps\" /opt/outergroup >/dev/null 2>&1 || true\n"
+            "  fi\n"
+            "  rmdir \"$system_install_root/bin\" \"$system_install_root\" \"$system_outershell_home/bin\" \"$system_binary_users_dir\" \"$system_outershell_home\" /var/log/outergroup >/dev/null 2>&1 || true\n"
             "}\n",
             quoted_system_users_dir,
             quoted_system_root,
@@ -10959,7 +10974,9 @@ static bool uninstall_backend(const char *service_id, const char *sudo_password,
         char quoted_unit[320];
         shell_quote(unit_name, quoted_unit, sizeof(quoted_unit));
         if (strcmp(scope, "system") == 0) {
-            if (!ensure_root_helper_installed(sudo_password, needs_password, message, message_size)) {
+            bool direct_root_uninstall = direct_root_session_uses_system_scope();
+            if (!direct_root_uninstall &&
+                !ensure_root_helper_installed(sudo_password, needs_password, message, message_size)) {
                 return false;
             }
 
@@ -11035,8 +11052,16 @@ static bool uninstall_backend(const char *service_id, const char *sudo_password,
             bool root_ok = run_root_script(script_template, sudo_password, needs_password, message, message_size);
             unlink(script_template);
             if (!root_ok) return false;
-            if (!root_helper_registry_remove_backend(service_id, sudo_password, needs_password, message, message_size)) {
-                return false;
+            if (direct_root_uninstall) {
+                char registry_error[1024] = "";
+                if (!unregister_backend_records(service_id, registry_error, sizeof(registry_error))) {
+                    snprintf(message, message_size, "%s", registry_error);
+                    return false;
+                }
+            } else {
+                if (!root_helper_registry_remove_backend(service_id, sudo_password, needs_password, message, message_size)) {
+                    return false;
+                }
             }
         } else {
             const BundledAppDefinition *app = bundled_app_for_service_id(service_id);

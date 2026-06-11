@@ -228,7 +228,7 @@ Custom backends that use Unix sockets or fixed ports register those frontends in
 
 ## Uninstall Cleanup
 
-Uninstalling Outer Shell removes its service unit, socket unit, launch agent, runtime sockets, registry entries, and Outer Shell frontend payload. It does not delete `<user-state>/registry.orwa` or root-installed bundled app payloads. On Linux, user-scope uninstall removes that user's root-support marker and prompts for a sudo password if elevated cleanup is needed. Direct-root uninstall removes `uid-0`. Shared root support remains while any `system-binary-users` marker is still valid.
+Uninstalling Outer Shell removes its service unit, socket unit, launch agent, runtime sockets, registry entries, and Outer Shell frontend payload. It does not delete root-installed bundled app payloads. On Linux, user-scope uninstall removes that user's root-support marker and prompts for a sudo password if elevated cleanup is needed. Direct-root uninstall removes `uid-0`. Shared root support remains while any `system-binary-users` marker is still valid. When the last valid marker is removed and no root app payloads remain, Linux removes the shared root support files, the system registry, and empty root log/state directories.
 
 Uninstalling a bundled app removes its unit/plist, socket unit when present, app payload directory, registry backend/app/log/opener records, and registered log path for the selected scope. On Linux, uninstalling the last root-installed app removes the `root-apps` marker; if that was the last root-support marker, shared root support is also removed.
 
