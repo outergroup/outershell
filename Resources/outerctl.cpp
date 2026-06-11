@@ -193,6 +193,10 @@ void defaultOuterctlApiSocketPath(char *out, size_t outSize) {
     }
     snprintf(out, outSize, "/tmp/outershelld-api-%d", static_cast<int>(getuid()));
 #else
+    if (geteuid() == 0) {
+        snprintf(out, outSize, "/run/outershelld-api");
+        return;
+    }
     const char *runtime = getenv("XDG_RUNTIME_DIR");
     if (runtime && runtime[0]) {
         snprintf(out, outSize, "%s/outershelld-api", runtime);
@@ -211,6 +215,9 @@ bool outerShellHome(Buffer &path) {
         appendCString(path, home) &&
         appendPathComponent(path, "Library/Application Support/outershell");
 #else
+    if (geteuid() == 0) {
+        return appendCString(path, "/var/lib/outershell");
+    }
     const char *stateHome = getenv("XDG_STATE_HOME");
     if (stateHome && stateHome[0]) {
         return appendCString(path, stateHome) && appendPathComponent(path, "outershell");

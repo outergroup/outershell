@@ -4,7 +4,7 @@ This document lists the persistent files and sockets installed by Outer Shell an
 
 ## Path Variables
 
-- `<user-state>` is `${OUTERSHELL_HOME}` when set. Otherwise it is `$HOME/Library/Application Support/outershell` on macOS and `${XDG_STATE_HOME:-$HOME/.local/state}/outershell` on Linux.
+- `<user-state>` is `${OUTERSHELL_HOME}` when set. Otherwise it is `$HOME/Library/Application Support/outershell` on macOS and `${XDG_STATE_HOME:-$HOME/.local/state}/outershell` on Linux. When `outershelld` is running as effective uid 0 on Linux and `OUTERSHELL_HOME` is not set, it uses `<system-state>` instead of `/root/.local/state/outershell`.
 - `<user-runtime>` is `$(getconf DARWIN_USER_TEMP_DIR)` on macOS and `${XDG_RUNTIME_DIR:-/run/user/$(id -u)}` on Linux.
 - `<system-state>` is `/Library/Application Support/outershell` on macOS and `/var/lib/outershell` on Linux.
 - `<service-id>` is the backend service identifier, such as `dev.outergroup.Profile`.
@@ -33,9 +33,12 @@ API socket:
 
 - `OUTERSHELLD_API_SOCKET` overrides the API socket path.
 - macOS default: `<user-runtime>/outershelld-api`
-- Linux default: `<user-runtime>/outershelld-api`
+- Linux user default: `<user-runtime>/outershelld-api`
+- Linux direct-root default: `/run/outershelld-api`
 
-Outer Shell log views should use the exact `log_files.path` value registered in the registry. A backend service ID can exist in both the user and system registries, so resolving a log by only `serviceID` and `logIndex` can select the wrong scope.
+Outer Shell log views fetch log files by the full path registered in `log_files.path`.
+
+Linux systemd units use `StandardOutput=append:` and `StandardError=append:` for service logs. This requires systemd v240 or newer.
 
 ## Outer Shell User Install
 
@@ -57,17 +60,16 @@ macOS public install:
 Linux public install:
 
 - `<user-state>/outer-shell/OuterShellBackend`
-- `<user-state>/outer-shell/outershelld`
-- `<user-state>/outer-shell/bin/outerctl`
+- `<user-state>/outer-shell/outershelld`, or a symlink to `<system-state>/outer-shell/outershelld` when matching root support is installed
+- `<user-state>/outer-shell/bin/outerctl`, or a symlink to `<system-state>/bin/outerctl` when matching root support is installed
 - `<user-state>/outer-shell/bundles/`
 - `<user-state>/outer-shell/bundled-apps/`
 - `<user-state>/outer-shell/app-icon.png`
 - `<user-state>/outer-shell/version`
 - `<user-state>/outer-shell/run-outer-shell.sh`
-- `<user-state>/outer-shell/run-outershelld.sh`
 - `<user-state>/outer-shell/logs/OuterShellBackend.log`
 - `<user-state>/outer-shell/logs/outershelld.log`
-- `<user-state>/bin/outerctl`
+- `<user-state>/bin/outerctl`, or a symlink to `<system-state>/bin/outerctl` when matching root support is installed
 - `$HOME/.config/systemd/user/org.outershell.OuterShell.service`
 - `$HOME/.config/systemd/user/org.outershell.OuterShell.socket`
 - `$HOME/.config/systemd/user/outershelld.service`
@@ -75,16 +77,56 @@ Linux public install:
 - `<user-runtime>/org.outershell.OuterShell`
 - `<user-runtime>/outershelld-api`
 
-## Root Helper
+Linux public install when connected directly as root:
 
-The root helper is installed the first time Outer Shell needs to install, uninstall, or update root-owned records:
+- `<system-state>/outer-shell/OuterShellBackend`
+- `<system-state>/outer-shell/outershelld`
+- `<system-state>/outer-shell/bin/outerctl`
+- `<system-state>/outer-shell/bundles/`
+- `<system-state>/outer-shell/bundled-apps/`
+- `<system-state>/outer-shell/app-icon.png`
+- `<system-state>/outer-shell/version`
+- `<system-state>/outer-shell/run-outer-shell.sh`
+- `<system-state>/bin/outerctl`
+- `/etc/systemd/system/org.outershell.OuterShell.service`
+- `/etc/systemd/system/org.outershell.OuterShell.socket`
+- `/etc/systemd/system/outershelld.service`
+- `/etc/systemd/system/outershelld.socket`
+- `/var/log/outergroup/org.outershell.OuterShell.log`
+- `/var/log/outergroup/outershelld.log`
+- `/run/org.outershell.OuterShell`
+- `/run/outershelld-api`
+- `<system-state>/system-binary-users/uid-0`
 
-- `/usr/local/libexec/outershelld-root-tool`
+In this direct-root Linux mode, Outer Shell treats bundled app installs as system installs. It should not create `/root/.local/state/outershell` or `$HOME/.config/systemd/user` units for the root account.
 
-Linux also removes old helper units if present while installing the current helper:
+## Linux Root Support
 
+A non-root Linux Outer Shell can promote `outershelld` and `outerctl` into system scope the first time it needs to install, uninstall, or update root-owned records. This installs the system `outershelld` API socket and rewires the user executable paths to the root-owned binaries:
+
+- `<system-state>/outer-shell/outershelld`
+- `<system-state>/outer-shell/version`
+- `<system-state>/bin/outerctl`
+- `/etc/systemd/system/outershelld.service`
+- `/etc/systemd/system/outershelld.socket`
+- `/var/log/outergroup/outershelld.log`
+- `/run/outershelld-api`
+- `<user-state>/outer-shell/outershelld -> <system-state>/outer-shell/outershelld`
+- `<user-state>/outer-shell/bin/outerctl -> <system-state>/bin/outerctl`
+- `<user-state>/bin/outerctl -> <system-state>/bin/outerctl`
+- `<system-state>/system-binary-users/uid-<uid>`
+
+The `system-binary-users` directory contains blank marker files. A valid `uid-<uid>` marker means that user install is using the shared root binaries. A valid `uid-0` marker means the direct-root Outer Shell install is using them. A valid `root-apps` marker means one or more Linux root-installed bundled apps still depend on `<system-state>/bin/outerctl`. The shared Linux root support files are removed only when no valid marker remains.
+
+Linux removes old helper files and units when installing current root support:
+
+- `/usr/local/libexec/outershelld-root-helper`
 - `/etc/systemd/system/outershelld-root-helper-<uid>.service`
 - `/etc/systemd/system/outershelld-root-helper-<uid>.socket`
+
+macOS root app installs still use the privileged helper tool:
+
+- `/usr/local/libexec/outershelld-root-tool`
 
 ## Bundled Apps
 
@@ -130,13 +172,15 @@ Linux root install:
 - `/opt/outergroup/<service-id>/bundles/<bundle-prefix>.bundle.macos-x86.aar`
 - `/opt/outergroup/<service-id>/app-icon.png` when the app has a raster icon
 - `/opt/outergroup/<service-id>/version`
-- `/opt/outergroup/<service-id>/outerctl-as-user`
 - `/etc/systemd/system/<service-id>.service`
 - `/etc/systemd/system/<service-id>.socket` for socket-activated apps
 - `/var/log/outergroup/<service-id>.log`
 - `/run/<service-id>` for socket-activated apps
+- `<system-state>/system-binary-users/root-apps`
 
-When a Linux root install supports both root and user mode, the installer also writes a user systemd unit that points at the root-owned payload:
+Linux root app services use `<system-state>/bin/outerctl` directly. A root install initiated from a non-root Outer Shell session first installs Linux root support, then writes the root app systemd unit with `OUTERCTL_PATH=<system-state>/bin/outerctl`.
+
+When a Linux root install is initiated from a non-root Outer Shell session and the app supports both root and user mode, the installer also writes a user systemd unit that points at the root-owned payload:
 
 - `$HOME/.config/systemd/user/<service-id>.service`
 - `$HOME/.config/systemd/user/<service-id>.socket` for socket-activated apps
@@ -155,7 +199,7 @@ Bundled app table:
 
 ## User-Created Backends
 
-Backends created from the Add Apps UI are user installs.
+Backends created from the Add Apps UI are user installs, except in Linux direct-root mode. In that case they are system installs.
 
 macOS:
 
@@ -173,11 +217,20 @@ Linux:
 
 Custom backends that use Unix sockets or fixed ports register those frontends in `<user-state>/registry.orwa`.
 
+Linux direct-root:
+
+- `<system-state>/apps/<service-id>/`
+- `/var/log/outergroup/<service-id>.log`
+- `/etc/systemd/system/<service-id>.service`
+- Generated recipe scripts live at the user-selected script path.
+
+Custom backends that use Unix sockets or fixed ports register those frontends in `<system-state>/registry.orwa`.
+
 ## Uninstall Cleanup
 
-Uninstalling Outer Shell removes its service unit, socket unit, launch agent, runtime sockets, registry entries, and `<user-state>/outer-shell`. It does not delete `<user-state>/registry.orwa` or root-installed bundled app payloads.
+Uninstalling Outer Shell removes its service unit, socket unit, launch agent, runtime sockets, registry entries, and Outer Shell frontend payload. It does not delete `<user-state>/registry.orwa` or root-installed bundled app payloads. On Linux, user-scope uninstall removes that user's root-support marker and prompts for a sudo password if elevated cleanup is needed. Direct-root uninstall removes `uid-0`. Shared root support remains while any `system-binary-users` marker is still valid.
 
-Uninstalling a bundled app removes its unit/plist, socket unit when present, app payload directory, registry backend/app/log/opener records, and registered log path for the selected scope.
+Uninstalling a bundled app removes its unit/plist, socket unit when present, app payload directory, registry backend/app/log/opener records, and registered log path for the selected scope. On Linux, uninstalling the last root-installed app removes the `root-apps` marker; if that was the last root-support marker, shared root support is also removed.
 
 Legacy paths may be migrated or removed during install:
 

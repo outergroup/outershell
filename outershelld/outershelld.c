@@ -995,6 +995,14 @@ static bool sb_append_xml_escaped(StringBuilder *builder, const char *text) {
     return true;
 }
 
+static bool direct_root_session_uses_system_scope(void) {
+#ifdef __APPLE__
+    return false;
+#else
+    return geteuid() == 0;
+#endif
+}
+
 static void default_user_outershell_root(char *out, size_t out_size) {
     if (!out || out_size == 0) return;
     const char *override_root = getenv("OUTERSHELL_HOME");
@@ -1011,6 +1019,10 @@ static void default_user_outershell_root(char *out, size_t out_size) {
 #ifdef __APPLE__
     snprintf(out, out_size, "%s/Library/Application Support/outershell", home_directory());
 #else
+    if (direct_root_session_uses_system_scope()) {
+        snprintf(out, out_size, "%s", kSystemOuterShellRoot);
+        return;
+    }
     const char *state_home = getenv("XDG_STATE_HOME");
     if (state_home && state_home[0]) {
         snprintf(out, out_size, "%s/outershell", state_home);
@@ -1027,11 +1039,54 @@ static void default_user_outerctl_path(char *out, size_t out_size) {
     snprintf(out, out_size, "%s/bin/outerctl", root);
 }
 
-static void default_user_home_screen_install_root(char *out, size_t out_size) {
+static void default_outershell_install_root(char *out, size_t out_size) {
     if (!out || out_size == 0) return;
     char root[PATH_MAX];
     default_user_outershell_root(root, sizeof(root));
     snprintf(out, out_size, "%s/outer-shell", root);
+}
+
+#ifndef __APPLE__
+static void default_system_outershell_install_root(char *out, size_t out_size) {
+    if (!out || out_size == 0) return;
+    snprintf(out, out_size, "%s/outer-shell", kSystemOuterShellRoot);
+}
+
+static void default_system_outershelld_path(char *out, size_t out_size) {
+    if (!out || out_size == 0) return;
+    char root[PATH_MAX];
+    default_system_outershell_install_root(root, sizeof(root));
+    snprintf(out, out_size, "%s/outershelld", root);
+}
+
+static void default_system_outerctl_path(char *out, size_t out_size) {
+    if (!out || out_size == 0) return;
+    snprintf(out, out_size, "%s/bin/outerctl", kSystemOuterShellRoot);
+}
+
+static void system_binary_users_dir(char *out, size_t out_size) {
+    if (!out || out_size == 0) return;
+    snprintf(out, out_size, "%s/system-binary-users", kSystemOuterShellRoot);
+}
+
+static void system_binary_user_marker_path(uid_t uid, char *out, size_t out_size) {
+    if (!out || out_size == 0) return;
+    char dir[PATH_MAX];
+    system_binary_users_dir(dir, sizeof(dir));
+    snprintf(out, out_size, "%s/uid-%ld", dir, (long)uid);
+}
+
+static void system_binary_root_apps_marker_path(char *out, size_t out_size) {
+    if (!out || out_size == 0) return;
+    char dir[PATH_MAX];
+    system_binary_users_dir(dir, sizeof(dir));
+    snprintf(out, out_size, "%s/root-apps", dir);
+}
+#endif
+
+static void default_user_home_screen_install_root(char *out, size_t out_size) {
+    if (!out || out_size == 0) return;
+    default_outershell_install_root(out, out_size);
 }
 
 static void default_user_outershell_app_root(const char *install_name, char *out, size_t out_size) {
@@ -1230,6 +1285,10 @@ static void bundled_socket_path_for_scope(const BundledAppDefinition *app,
     }
     snprintf(out, out_size, "/tmp/%s", app->socket_name);
 #else
+    if (direct_root_session_uses_system_scope()) {
+        snprintf(out, out_size, "/run/%s", app->socket_name);
+        return;
+    }
     const char *runtime_dir = getenv("XDG_RUNTIME_DIR");
     if (runtime_dir && runtime_dir[0]) {
         snprintf(out, out_size, "%s/%s", runtime_dir, app->socket_name);
@@ -1254,6 +1313,10 @@ static void runtime_socket_path(const char *name, char *out, size_t out_size) {
     }
     snprintf(out, out_size, "/tmp/%s", name);
 #else
+    if (direct_root_session_uses_system_scope()) {
+        snprintf(out, out_size, "/run/%s", name);
+        return;
+    }
     const char *runtime_dir = getenv("XDG_RUNTIME_DIR");
     if (runtime_dir && runtime_dir[0]) {
         snprintf(out, out_size, "%s/%s", runtime_dir, name);
@@ -1356,6 +1419,13 @@ static void bundled_apps_root(char *out, size_t out_size) {
     const char *env_root = getenv("BACKENDS_BUNDLED_APPS_DIR");
     if (env_root && env_root[0]) {
         expand_tilde_path(env_root, out, out_size);
+        return;
+    }
+    const char *outershell_home = getenv("OUTERSHELL_HOME");
+    if (outershell_home && outershell_home[0]) {
+        char install_root[PATH_MAX];
+        append_path_component(install_root, sizeof(install_root), outershell_home, "outer-shell");
+        append_path_component(out, out_size, install_root, "bundled-apps");
         return;
     }
     char cwd[PATH_MAX] = "";
@@ -1531,6 +1601,10 @@ static void default_api_socket_path(char *out, size_t out_size) {
     }
     snprintf(out, out_size, "/tmp/outershelld-api-%d", (int)getuid());
 #else
+    if (direct_root_session_uses_system_scope()) {
+        snprintf(out, out_size, "/run/outershelld-api");
+        return;
+    }
     const char *runtime = getenv("XDG_RUNTIME_DIR");
     if (runtime && runtime[0]) {
         snprintf(out, out_size, "%s/outershelld-api", runtime);
@@ -4566,7 +4640,9 @@ static void refresh_systemd_status_cache_if_needed(void) {
     pthread_mutex_unlock(&g_systemd_status_cache_mutex);
 
     SystemdStatusEntry entries[MAX_SYSTEMD_STATUS_ENTRIES];
-    size_t count = collect_systemd_status_scope_via_systemctl("user", entries, MAX_SYSTEMD_STATUS_ENTRIES);
+    size_t count = direct_root_session_uses_system_scope()
+        ? 0
+        : collect_systemd_status_scope_via_systemctl("user", entries, MAX_SYSTEMD_STATUS_ENTRIES);
 #ifndef __APPLE__
     count += collect_systemd_status_scope_via_systemctl("system",
                                                         entries + count,
@@ -5497,7 +5573,7 @@ static bool append_bundled_backend_placeholder_payload(BinaryPayloadList *payloa
                                     app->display_name,
                                     "",
                                     "",
-                                    "user",
+                                    direct_root_session_uses_system_scope() ? "system" : "user",
                                     "available",
                                     BACKEND_FLAG_CAN_CONTROL |
                                         BACKEND_FLAG_IS_BUNDLED |
@@ -5572,7 +5648,10 @@ static void send_backends_response(int fd) {
     RegistryStore user_database;
     RegistryStore system_database;
     bool have_user_database = registry_store_open_user_readonly(&user_database, user_error, sizeof(user_error));
-    bool have_system_database = registry_store_open_system_readonly(&system_database, system_error, sizeof(system_error));
+    bool user_registry_is_system_registry = strcmp(g_registry_database_path, g_system_registry_database_path) == 0;
+    bool have_system_database = user_registry_is_system_registry
+        ? false
+        : registry_store_open_system_readonly(&system_database, system_error, sizeof(system_error));
 
     bool ok = true;
     const char *error = "";
@@ -5580,10 +5659,11 @@ static void send_backends_response(int fd) {
         error = user_error[0] ? user_error : system_error;
     }
     bool bundled_installed[sizeof(kBundledApps) / sizeof(kBundledApps[0])] = {0};
+    const char *primary_registry_scope = direct_root_session_uses_system_scope() ? "system" : "user";
     if (have_user_database) {
         ok = ok && append_registered_backend_payloads(&user_database, &user_database, &payloads, bundled_installed,
                                                        sizeof(bundled_installed) / sizeof(bundled_installed[0]),
-                                                       "user");
+                                                       primary_registry_scope);
     }
     if (have_system_database) {
         ok = ok && append_registered_backend_payloads(&system_database, have_user_database ? &user_database : NULL, &payloads, bundled_installed,
@@ -6145,7 +6225,9 @@ static void send_control_response(int fd, const char *query, const char *body) {
         }
         char message[4096] = "";
         bool needs_password = false;
-        const char *scope = (strcmp(operation, "runRoot") == 0 || strcmp(operation, "installRoot") == 0) ? "system" : "user";
+        const char *scope = direct_root_session_uses_system_scope()
+            ? "system"
+            : ((strcmp(operation, "runRoot") == 0 || strcmp(operation, "installRoot") == 0) ? "system" : "user");
         if (strcmp(scope, "system") == 0 && !app->supports_root) {
             send_action_response(fd, 400, false, "This app does not support running as root.");
             return;
@@ -6187,6 +6269,10 @@ static void send_control_response(int fd, const char *query, const char *body) {
         const BundledAppDefinition *app = bundled_app_for_service_id(service_id);
         if (!app || !app->supports_root) {
             send_action_response(fd, 404, false, "This app does not support root support.");
+            return;
+        }
+        if (direct_root_session_uses_system_scope()) {
+            send_action_response(fd, 400, false, "Root support is implicit when connected as root.");
             return;
         }
         char message[4096] = "";
@@ -6703,6 +6789,101 @@ static bool run_sudo_shell(const char *command, const char *password, char *outp
     if (output_size > 0) output[0] = '\0';
     if (exit_status) *exit_status = -1;
 
+    if (geteuid() == 0) {
+        int output_pipe[2] = {-1, -1};
+        if (pipe(output_pipe) != 0) {
+            snprintf(output, output_size, "Failed to create command pipe: %s", strerror(errno));
+            return false;
+        }
+        pid_t pid = fork();
+        if (pid < 0) {
+            close(output_pipe[0]);
+            close(output_pipe[1]);
+            snprintf(output, output_size, "Failed to fork command: %s", strerror(errno));
+            return false;
+        }
+        if (pid == 0) {
+            dup2(output_pipe[1], STDOUT_FILENO);
+            dup2(output_pipe[1], STDERR_FILENO);
+            close(output_pipe[0]);
+            close(output_pipe[1]);
+            execlp("sh", "sh", "-c", command, (char *)NULL);
+            _exit(127);
+        }
+        close(output_pipe[1]);
+
+        int status = 0;
+        bool child_exited = false;
+        size_t offset = 0;
+        while (!child_exited) {
+            struct pollfd poll_fds[2];
+            nfds_t poll_count = 0;
+            poll_fds[poll_count++] = (struct pollfd){.fd = output_pipe[0], .events = POLLIN, .revents = 0};
+            if (g_api_listener_fd >= 0) {
+                poll_fds[poll_count++] = (struct pollfd){.fd = (int)g_api_listener_fd, .events = POLLIN, .revents = 0};
+            }
+            int poll_result = poll(poll_fds, poll_count, 100);
+            if (poll_result > 0) {
+                if (poll_fds[0].revents & POLLIN) {
+                    char buffer[1024];
+                    ssize_t got = read(output_pipe[0], buffer, sizeof(buffer));
+                    if (got > 0) {
+                        size_t copy = (size_t)got;
+                        if (output_size > 0 && offset + copy >= output_size) {
+                            copy = output_size - offset - 1;
+                        }
+                        if (copy > 0 && output_size > 0) {
+                            memcpy(output + offset, buffer, copy);
+                            offset += copy;
+                        }
+                    }
+                }
+                if (poll_count > 1 && (poll_fds[1].revents & POLLIN)) {
+                    service_nested_api_client_once();
+                }
+            } else if (poll_result < 0 && errno != EINTR) {
+                break;
+            }
+            pid_t wait_result = waitpid(pid, &status, WNOHANG);
+            if (wait_result == pid) {
+                child_exited = true;
+            } else if (wait_result < 0 && errno != EINTR) {
+                child_exited = true;
+            }
+        }
+        for (;;) {
+            char buffer[1024];
+            ssize_t got = read(output_pipe[0], buffer, sizeof(buffer));
+            if (got < 0) {
+                if (errno == EINTR) continue;
+                break;
+            }
+            if (got == 0) break;
+            size_t copy = (size_t)got;
+            if (output_size > 0 && offset + copy >= output_size) {
+                copy = output_size - offset - 1;
+            }
+            if (copy > 0 && output_size > 0) {
+                memcpy(output + offset, buffer, copy);
+                offset += copy;
+            }
+        }
+        if (output_size > 0) output[offset] = '\0';
+        close(output_pipe[0]);
+
+        if (!child_exited) {
+            while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+        }
+        if (WIFEXITED(status)) {
+            if (exit_status) *exit_status = WEXITSTATUS(status);
+            return WEXITSTATUS(status) == 0;
+        }
+        if (WIFSIGNALED(status)) {
+            if (exit_status) *exit_status = 128 + WTERMSIG(status);
+        }
+        return false;
+    }
+
     int stdin_pipe[2] = {-1, -1};
     int output_pipe[2] = {-1, -1};
     if (pipe(stdin_pipe) != 0 || pipe(output_pipe) != 0) {
@@ -6883,6 +7064,52 @@ static bool ensure_root_helper_installed(const char *sudo_password, bool *needs_
         return false;
     }
 #ifndef __APPLE__
+    char user_outerctl[PATH_MAX];
+    default_user_outerctl_path(user_outerctl, sizeof(user_outerctl));
+    if (access(user_outerctl, X_OK) != 0) {
+        snprintf(message, message_size, "Could not find user outerctl at %s.", user_outerctl);
+        fclose(script);
+        unlink(script_template);
+        return false;
+    }
+
+    char user_install_root[PATH_MAX];
+    default_outershell_install_root(user_install_root, sizeof(user_install_root));
+    char user_install_bin[PATH_MAX];
+    snprintf(user_install_bin, sizeof(user_install_bin), "%s/bin", user_install_root);
+    char user_version[PATH_MAX];
+    snprintf(user_version, sizeof(user_version), "%s/version", user_install_root);
+    char user_outerctl_parent[PATH_MAX];
+    if (!parent_directory(user_outerctl, user_outerctl_parent, sizeof(user_outerctl_parent)) ||
+        !mkdir_p(user_install_root) ||
+        !mkdir_p(user_install_bin) ||
+        !mkdir_p(user_outerctl_parent)) {
+        snprintf(message, message_size, "Could not prepare user Outer Shell executable paths.");
+        fclose(script);
+        unlink(script_template);
+        return false;
+    }
+
+    char system_install_root[PATH_MAX];
+    char system_outershelld[PATH_MAX];
+    char system_outerctl[PATH_MAX];
+    char system_outerctl_parent[PATH_MAX];
+    char system_version[PATH_MAX];
+    char system_users_dir[PATH_MAX];
+    char system_user_marker[PATH_MAX];
+    default_system_outershell_install_root(system_install_root, sizeof(system_install_root));
+    default_system_outershelld_path(system_outershelld, sizeof(system_outershelld));
+    default_system_outerctl_path(system_outerctl, sizeof(system_outerctl));
+    system_binary_users_dir(system_users_dir, sizeof(system_users_dir));
+    system_binary_user_marker_path(owner_uid, system_user_marker, sizeof(system_user_marker));
+    snprintf(system_version, sizeof(system_version), "%s/version", system_install_root);
+    if (!parent_directory(system_outerctl, system_outerctl_parent, sizeof(system_outerctl_parent))) {
+        snprintf(message, message_size, "Could not resolve system outerctl directory.");
+        fclose(script);
+        unlink(script_template);
+        return false;
+    }
+
     char service_name[256];
     char socket_name[256];
     root_helper_unit_name_for_uid(owner_uid, "service", service_name, sizeof(service_name));
@@ -6890,8 +7117,28 @@ static bool ensure_root_helper_installed(const char *sudo_password, bool *needs_
 
     char quoted_service_name[320];
     char quoted_socket_name[320];
+    char quoted_user_install_root[PATH_MAX + 8];
+    char quoted_user_version[PATH_MAX + 8];
+    char quoted_user_outerctl[PATH_MAX + 8];
+    char quoted_system_install_root[PATH_MAX + 8];
+    char quoted_system_outerctl_parent[PATH_MAX + 8];
+    char quoted_system_outershelld[PATH_MAX + 8];
+    char quoted_system_outerctl[PATH_MAX + 8];
+    char quoted_system_version[PATH_MAX + 8];
+    char quoted_system_users_dir[PATH_MAX + 8];
+    char quoted_system_user_marker[PATH_MAX + 8];
     shell_quote(service_name, quoted_service_name, sizeof(quoted_service_name));
     shell_quote(socket_name, quoted_socket_name, sizeof(quoted_socket_name));
+    shell_quote(user_install_root, quoted_user_install_root, sizeof(quoted_user_install_root));
+    shell_quote(user_version, quoted_user_version, sizeof(quoted_user_version));
+    shell_quote(user_outerctl, quoted_user_outerctl, sizeof(quoted_user_outerctl));
+    shell_quote(system_install_root, quoted_system_install_root, sizeof(quoted_system_install_root));
+    shell_quote(system_outerctl_parent, quoted_system_outerctl_parent, sizeof(quoted_system_outerctl_parent));
+    shell_quote(system_outershelld, quoted_system_outershelld, sizeof(quoted_system_outershelld));
+    shell_quote(system_outerctl, quoted_system_outerctl, sizeof(quoted_system_outerctl));
+    shell_quote(system_version, quoted_system_version, sizeof(quoted_system_version));
+    shell_quote(system_users_dir, quoted_system_users_dir, sizeof(quoted_system_users_dir));
+    shell_quote(system_user_marker, quoted_system_user_marker, sizeof(quoted_system_user_marker));
     (void)owner_name;
 
     fprintf(script,
@@ -6900,16 +7147,93 @@ static bool ensure_root_helper_installed(const char *sudo_password, bool *needs_
             "systemctl --system disable --now %s >/dev/null 2>&1 || true\n"
             "rm -f /etc/systemd/system/%s /etc/systemd/system/%s\n"
             "systemctl --system daemon-reload >/dev/null 2>&1 || true\n"
-            "mkdir -p /usr/local/libexec %s\n"
+            "systemctl --system stop outershelld.service >/dev/null 2>&1 || true\n"
+            "mkdir -p %s %s %s %s /etc/systemd/system /var/log/outergroup\n"
+            "chmod 1777 %s\n"
+            "touch %s\n"
+            "chown %ld:%ld %s 2>/dev/null || true\n"
             "rm -f /usr/local/libexec/outershelld-root-helper\n"
-            "install -m 0755 %s /usr/local/libexec/outershelld-root-tool\n"
-            "chmod 0755 /usr/local/libexec/outershelld-root-tool\n",
+            "if [ \"$(readlink -f %s 2>/dev/null || printf '%%s' %s)\" != \"$(readlink -f %s 2>/dev/null || printf '%%s' %s)\" ]; then install -m 0755 %s %s; fi\n"
+            "if [ \"$(readlink -f %s 2>/dev/null || printf '%%s' %s)\" != \"$(readlink -f %s 2>/dev/null || printf '%%s' %s)\" ]; then install -m 0755 %s %s; fi\n"
+            "cat > /etc/systemd/system/outershelld.socket <<'__OUTERSHELLD_SOCKET__'\n"
+            "[Unit]\n"
+            "Description=Outer Shell API Socket\n"
+            "\n"
+            "[Socket]\n"
+            "ListenStream=/run/outershelld-api\n"
+            "FileDescriptorName=api\n"
+            "SocketMode=0600\n"
+            "Service=outershelld.service\n"
+            "\n"
+            "[Install]\n"
+            "WantedBy=sockets.target\n"
+            "__OUTERSHELLD_SOCKET__\n"
+            "cat > /etc/systemd/system/outershelld.service <<'__OUTERSHELLD_SERVICE__'\n"
+            "[Unit]\n"
+            "Description=Outer Shell daemon\n"
+            "\n"
+            "[Service]\n"
+            "Environment=OUTERSHELL_HOME=/var/lib/outershell\n"
+            "Environment=OUTER_SHELL_PUBLIC_BASE_URL=%s\n"
+            "ExecStart=/var/lib/outershell/outer-shell/outershelld\n"
+            "Restart=no\n"
+            "StandardOutput=append:/var/log/outergroup/outershelld.log\n"
+            "StandardError=append:/var/log/outergroup/outershelld.log\n"
+            "\n"
+            "[Install]\n"
+            "WantedBy=multi-user.target\n"
+            "__OUTERSHELLD_SERVICE__\n"
+            "if [ -f %s ]; then cp %s %s; else printf '%%s\\n' 'root-support' > %s; fi\n"
+            "chmod 0644 %s\n"
+            "touch /var/log/outergroup/outershelld.log\n"
+            "chmod 0644 /var/log/outergroup/outershelld.log\n"
+            "rm -f %s/outershelld %s/bin/outerctl %s\n"
+            "ln -s %s %s/outershelld\n"
+            "ln -s %s %s/bin/outerctl\n"
+            "ln -s %s %s\n"
+            "systemctl --system daemon-reload\n"
+            "systemctl --system enable outershelld.socket >/dev/null 2>&1\n"
+            "systemctl --system start outershelld.socket\n",
             quoted_service_name,
             quoted_socket_name,
             service_name,
             socket_name,
+            quoted_system_install_root,
+            quoted_system_outerctl_parent,
             quoted_system_root,
-            quoted_executable);
+            quoted_system_users_dir,
+            quoted_system_users_dir,
+            quoted_system_user_marker,
+            (long)owner_uid,
+            (long)owner_uid,
+            quoted_system_user_marker,
+            quoted_executable,
+            quoted_system_outershelld,
+            quoted_system_outershelld,
+            quoted_system_outershelld,
+            quoted_executable,
+            quoted_system_outershelld,
+            quoted_user_outerctl,
+            quoted_system_outerctl,
+            quoted_system_outerctl,
+            quoted_system_outerctl,
+            quoted_user_outerctl,
+            quoted_system_outerctl,
+            g_home_screen_public_base_url,
+            quoted_user_version,
+            quoted_user_version,
+            quoted_system_version,
+            quoted_system_version,
+            quoted_system_version,
+            quoted_user_install_root,
+            quoted_user_install_root,
+            quoted_user_outerctl,
+            quoted_system_outershelld,
+            quoted_user_install_root,
+            quoted_system_outerctl,
+            quoted_user_install_root,
+            quoted_system_outerctl,
+            quoted_user_outerctl);
 #else
     (void)owner_uid;
     (void)owner_name;
@@ -6929,9 +7253,93 @@ static bool ensure_root_helper_installed(const char *sudo_password, bool *needs_
     unlink(script_template);
     if (!ok) return false;
 
-    snprintf(message, message_size, "Root helper installed.");
+    snprintf(message, message_size, "Root Outer Shell support installed.");
     return true;
 }
+
+#ifndef __APPLE__
+static void write_system_binary_cleanup_shell(FILE *script) {
+    char system_root[PATH_MAX];
+    char system_install_root[PATH_MAX];
+    char system_outershelld[PATH_MAX];
+    char system_outerctl[PATH_MAX];
+    char system_version[PATH_MAX];
+    char system_users_dir[PATH_MAX];
+    default_system_outershell_install_root(system_install_root, sizeof(system_install_root));
+    default_system_outershelld_path(system_outershelld, sizeof(system_outershelld));
+    default_system_outerctl_path(system_outerctl, sizeof(system_outerctl));
+    system_binary_users_dir(system_users_dir, sizeof(system_users_dir));
+    snprintf(system_root, sizeof(system_root), "%s", kSystemOuterShellRoot);
+    snprintf(system_version, sizeof(system_version), "%s/version", system_install_root);
+
+    char quoted_system_root[PATH_MAX + 8];
+    char quoted_system_install_root[PATH_MAX + 8];
+    char quoted_system_outershelld[PATH_MAX + 8];
+    char quoted_system_outerctl[PATH_MAX + 8];
+    char quoted_system_version[PATH_MAX + 8];
+    char quoted_system_users_dir[PATH_MAX + 8];
+    shell_quote(system_root, quoted_system_root, sizeof(quoted_system_root));
+    shell_quote(system_install_root, quoted_system_install_root, sizeof(quoted_system_install_root));
+    shell_quote(system_outershelld, quoted_system_outershelld, sizeof(quoted_system_outershelld));
+    shell_quote(system_outerctl, quoted_system_outerctl, sizeof(quoted_system_outerctl));
+    shell_quote(system_version, quoted_system_version, sizeof(quoted_system_version));
+    shell_quote(system_users_dir, quoted_system_users_dir, sizeof(quoted_system_users_dir));
+
+    fprintf(script,
+            "system_binary_users_dir=%s\n"
+            "system_outershell_home=%s\n"
+            "system_install_root=%s\n"
+            "system_outershelld_path=%s\n"
+            "system_outerctl_path=%s\n"
+            "system_version_path=%s\n"
+            "system_binary_users_empty() {\n"
+            "  if [ ! -d \"$system_binary_users_dir\" ]; then return 0; fi\n"
+            "  for marker in \"$system_binary_users_dir\"/*; do\n"
+            "    [ -e \"$marker\" ] || continue\n"
+            "    name=$(basename \"$marker\")\n"
+            "    case \"$name\" in\n"
+            "      root-apps)\n"
+            "        [ \"$(stat -c %%u \"$marker\" 2>/dev/null || echo invalid)\" = \"0\" ] && return 1\n"
+            "        ;;\n"
+            "      uid-*)\n"
+            "        uid=${name#uid-}\n"
+            "        case \"$uid\" in *[!0-9]*|'') continue ;; esac\n"
+            "        [ \"$(stat -c %%u \"$marker\" 2>/dev/null || echo invalid)\" = \"$uid\" ] && return 1\n"
+            "        ;;\n"
+            "    esac\n"
+            "  done\n"
+            "  return 0\n"
+            "}\n"
+            "remove_system_binaries_if_unused() {\n"
+            "  system_binary_users_empty || return 0\n"
+            "  systemctl --system disable --now outershelld.socket outershelld.service >/dev/null 2>&1 || true\n"
+            "  rm -f /etc/systemd/system/outershelld.service /etc/systemd/system/outershelld.socket /run/outershelld-api\n"
+            "  systemctl --system daemon-reload >/dev/null 2>&1 || true\n"
+            "  rm -f \"$system_outershelld_path\" \"$system_outerctl_path\" \"$system_install_root/bin/outerctl\" \"$system_version_path\"\n"
+            "  rmdir \"$system_install_root/bin\" \"$system_install_root\" \"$system_outershell_home/bin\" \"$system_binary_users_dir\" \"$system_outershell_home\" >/dev/null 2>&1 || true\n"
+            "}\n",
+            quoted_system_users_dir,
+            quoted_system_root,
+            quoted_system_install_root,
+            quoted_system_outershelld,
+            quoted_system_outerctl,
+            quoted_system_version);
+}
+
+static void write_root_apps_marker_cleanup_shell(FILE *script) {
+    char root_apps_marker[PATH_MAX];
+    system_binary_root_apps_marker_path(root_apps_marker, sizeof(root_apps_marker));
+    char quoted_root_apps_marker[PATH_MAX + 8];
+    shell_quote(root_apps_marker, quoted_root_apps_marker, sizeof(quoted_root_apps_marker));
+    fprintf(script,
+            "if ! find /opt/outergroup -mindepth 1 -maxdepth 1 -type d -print -quit 2>/dev/null | grep -q .; then\n"
+            "  rm -f %s\n"
+            "fi\n",
+            quoted_root_apps_marker);
+    write_system_binary_cleanup_shell(script);
+    fprintf(script, "remove_system_binaries_if_unused\n");
+}
+#endif
 
 static bool run_root_outershell_migration(const char *sudo_password, bool *needs_password, char *message, size_t message_size) {
     if (needs_password) *needs_password = false;
@@ -7420,6 +7828,10 @@ static bool append_inline_shell_startup_snapshot(StringBuilder *builder) {
 }
 
 static bool append_generated_script_log_redirect(StringBuilder *builder) {
+#ifndef __APPLE__
+    (void)builder;
+    return true;
+#else
     return sb_append(builder,
         "\n"
         "if [ -n \"${OUTERSHELL_LOG_PATH:-}\" ]; then\n"
@@ -7429,6 +7841,7 @@ static bool append_generated_script_log_redirect(StringBuilder *builder) {
         "    fi\n"
         "    exec >> \"$OUTERSHELL_LOG_PATH\" 2>&1\n"
         "fi\n");
+#endif
 }
 
 static bool make_blank_script(const char *service_id, const char *display_name, StringBuilder *builder) {
@@ -7587,6 +8000,8 @@ static bool make_jupyter_script(const char *service_id,
         "def runtime_socket_directory():\n"
         "    if sys.platform == \"darwin\":\n"
         "        return tempfile.gettempdir()\n"
+        "    if sys.platform.startswith(\"linux\") and os.geteuid() == 0:\n"
+        "        return \"/run\"\n"
         "    runtime_dir = os.environ.get(\"XDG_RUNTIME_DIR\", \"\").strip()\n"
         "    if runtime_dir:\n"
         "        return runtime_dir\n"
@@ -9056,22 +9471,22 @@ static bool install_bundled_user_systemd_unit_from_paths(const BundledAppDefinit
     if (quoted_icon[0]) {
         if (quoted_socket_path[0]) {
             snprintf(run_script, sizeof(run_script),
-                     "exec %s --label %s --socket-path %s --bundles-dir %s --icon-file %s >> %s 2>&1",
-                     quoted_binary, quoted_service_id, quoted_socket_path, quoted_bundles, quoted_icon, quoted_log);
+                     "exec %s --label %s --socket-path %s --bundles-dir %s --icon-file %s",
+                     quoted_binary, quoted_service_id, quoted_socket_path, quoted_bundles, quoted_icon);
         } else {
             snprintf(run_script, sizeof(run_script),
-                     "exec %s --label %s --bundles-dir %s --icon-file %s >> %s 2>&1",
-                     quoted_binary, quoted_service_id, quoted_bundles, quoted_icon, quoted_log);
+                     "exec %s --label %s --bundles-dir %s --icon-file %s",
+                     quoted_binary, quoted_service_id, quoted_bundles, quoted_icon);
         }
     } else {
         if (quoted_socket_path[0]) {
             snprintf(run_script, sizeof(run_script),
-                     "exec %s --label %s --socket-path %s --bundles-dir %s >> %s 2>&1",
-                     quoted_binary, quoted_service_id, quoted_socket_path, quoted_bundles, quoted_log);
+                     "exec %s --label %s --socket-path %s --bundles-dir %s",
+                     quoted_binary, quoted_service_id, quoted_socket_path, quoted_bundles);
         } else {
             snprintf(run_script, sizeof(run_script),
-                     "exec %s --label %s --bundles-dir %s >> %s 2>&1",
-                     quoted_binary, quoted_service_id, quoted_bundles, quoted_log);
+                     "exec %s --label %s --bundles-dir %s",
+                     quoted_binary, quoted_service_id, quoted_bundles);
         }
     }
     char quoted_run_script[sizeof(run_script) + 16];
@@ -9095,6 +9510,8 @@ static bool install_bundled_user_systemd_unit_from_paths(const BundledAppDefinit
              "ExecStart=/bin/sh -lc %s\n"
              "Restart=on-failure\n"
              "KillMode=control-group\n"
+             "StandardOutput=append:%s\n"
+             "StandardError=append:%s\n"
              "\n"
              "[Install]\n"
              "WantedBy=default.target\n",
@@ -9104,7 +9521,9 @@ static bool install_bundled_user_systemd_unit_from_paths(const BundledAppDefinit
              user_name,
              user_name,
              outerctl_path,
-             quoted_run_script);
+             quoted_run_script,
+             log_path,
+             log_path);
     char socket_contents[2048] = "";
     if (app->socket_activated && quoted_socket_path[0]) {
         snprintf(socket_contents, sizeof(socket_contents),
@@ -9196,7 +9615,7 @@ static bool install_bundled_app(const BundledAppDefinition *app,
         snprintf(message, message_size, "Unknown app.");
         return false;
     }
-    bool install_as_root = scope && strcmp(scope, "system") == 0;
+    bool install_as_root = direct_root_session_uses_system_scope() || (scope && strcmp(scope, "system") == 0);
     if (install_as_root && !app->supports_root) {
         snprintf(message, message_size, "%s does not support root installation.", app->display_name);
         return false;
@@ -9253,7 +9672,8 @@ static bool install_bundled_app(const BundledAppDefinition *app,
     }
 
     if (install_as_root) {
-        if (!ensure_root_helper_installed(sudo_password, needs_password, message, message_size)) {
+        const bool direct_root_install = direct_root_session_uses_system_scope();
+        if (!direct_root_install && !ensure_root_helper_installed(sudo_password, needs_password, message, message_size)) {
             return false;
         }
 
@@ -9321,7 +9741,11 @@ static bool install_bundled_app(const BundledAppDefinition *app,
         char version_path[PATH_MAX];
         snprintf(version_path, sizeof(version_path), "%s/version", install_root);
         char wrapper_path[PATH_MAX];
-        snprintf(wrapper_path, sizeof(wrapper_path), "%s/outerctl-as-user", install_root);
+        default_system_outerctl_path(wrapper_path, sizeof(wrapper_path));
+        char system_users_dir[PATH_MAX];
+        char root_apps_marker[PATH_MAX];
+        system_binary_users_dir(system_users_dir, sizeof(system_users_dir));
+        system_binary_root_apps_marker_path(root_apps_marker, sizeof(root_apps_marker));
         char log_path[PATH_MAX];
         snprintf(log_path, sizeof(log_path), "/var/log/outergroup/%s.log", app->service_id);
         char unit_path[PATH_MAX];
@@ -9333,7 +9757,9 @@ static bool install_bundled_app(const BundledAppDefinition *app,
             snprintf(socket_unit_path, sizeof(socket_unit_path), "/etc/systemd/system/%s", socket_unit_name);
         }
 
-        cleanup_user_systemd_bundled_app(app, true, false);
+        if (!direct_root_install) {
+            cleanup_user_systemd_bundled_app(app, true, false);
+        }
 
         char quoted_unit[320];
         shell_quote(app->unit_name, quoted_unit, sizeof(quoted_unit));
@@ -9350,7 +9776,8 @@ static bool install_bundled_app(const BundledAppDefinition *app,
         char quoted_target_bundle_x86[PATH_MAX + 8];
         char quoted_target_icon[PATH_MAX + 8];
         char quoted_version_path[PATH_MAX + 8];
-        char quoted_wrapper_path[PATH_MAX + 8];
+        char quoted_system_users_dir[PATH_MAX + 8];
+        char quoted_root_apps_marker[PATH_MAX + 8];
         char quoted_log_path[PATH_MAX + 8];
         char quoted_unit_path[PATH_MAX + 8];
         char quoted_socket_unit[320] = "";
@@ -9367,7 +9794,8 @@ static bool install_bundled_app(const BundledAppDefinition *app,
         shell_quote(target_bundle_x86, quoted_target_bundle_x86, sizeof(quoted_target_bundle_x86));
         if (target_icon[0]) shell_quote(target_icon, quoted_target_icon, sizeof(quoted_target_icon)); else quoted_target_icon[0] = '\0';
         shell_quote(version_path, quoted_version_path, sizeof(quoted_version_path));
-        shell_quote(wrapper_path, quoted_wrapper_path, sizeof(quoted_wrapper_path));
+        shell_quote(system_users_dir, quoted_system_users_dir, sizeof(quoted_system_users_dir));
+        shell_quote(root_apps_marker, quoted_root_apps_marker, sizeof(quoted_root_apps_marker));
         shell_quote(log_path, quoted_log_path, sizeof(quoted_log_path));
         shell_quote(unit_path, quoted_unit_path, sizeof(quoted_unit_path));
         if (socket_unit_name[0]) shell_quote(socket_unit_name, quoted_socket_unit, sizeof(quoted_socket_unit)); else quoted_socket_unit[0] = '\0';
@@ -9404,22 +9832,22 @@ static bool install_bundled_app(const BundledAppDefinition *app,
         if (quoted_icon[0]) {
             if (quoted_socket_path[0]) {
                 snprintf(run_script, sizeof(run_script),
-                         "exec %s --label %s --socket-path %s --bundles-dir %s --icon-file %s >> %s 2>&1",
-                         quoted_binary, quoted_service_id, quoted_socket_path, quoted_bundles, quoted_icon, quoted_log);
+                         "exec %s --label %s --socket-path %s --bundles-dir %s --icon-file %s",
+                         quoted_binary, quoted_service_id, quoted_socket_path, quoted_bundles, quoted_icon);
             } else {
                 snprintf(run_script, sizeof(run_script),
-                         "exec %s --label %s --bundles-dir %s --icon-file %s >> %s 2>&1",
-                         quoted_binary, quoted_service_id, quoted_bundles, quoted_icon, quoted_log);
+                         "exec %s --label %s --bundles-dir %s --icon-file %s",
+                         quoted_binary, quoted_service_id, quoted_bundles, quoted_icon);
             }
         } else {
             if (quoted_socket_path[0]) {
                 snprintf(run_script, sizeof(run_script),
-                         "exec %s --label %s --socket-path %s --bundles-dir %s >> %s 2>&1",
-                         quoted_binary, quoted_service_id, quoted_socket_path, quoted_bundles, quoted_log);
+                         "exec %s --label %s --socket-path %s --bundles-dir %s",
+                         quoted_binary, quoted_service_id, quoted_socket_path, quoted_bundles);
             } else {
                 snprintf(run_script, sizeof(run_script),
-                         "exec %s --label %s --bundles-dir %s >> %s 2>&1",
-                         quoted_binary, quoted_service_id, quoted_bundles, quoted_log);
+                         "exec %s --label %s --bundles-dir %s",
+                         quoted_binary, quoted_service_id, quoted_bundles);
             }
         }
         char quoted_run_script[sizeof(run_script) + 16];
@@ -9443,6 +9871,8 @@ static bool install_bundled_app(const BundledAppDefinition *app,
                  "ExecStart=/bin/sh -lc %s\n"
                  "Restart=on-failure\n"
                  "KillMode=control-group\n"
+                 "StandardOutput=append:%s\n"
+                 "StandardError=append:%s\n"
                  "\n"
                  "[Install]\n"
                  "WantedBy=multi-user.target\n",
@@ -9452,7 +9882,9 @@ static bool install_bundled_app(const BundledAppDefinition *app,
                  user_name,
                  user_name,
                  wrapper_path,
-                 quoted_run_script);
+                 quoted_run_script,
+                 log_path,
+                 log_path);
 
         char socket_contents[2048] = "";
         if (app->socket_activated && quoted_socket_path[0]) {
@@ -9473,10 +9905,6 @@ static bool install_bundled_app(const BundledAppDefinition *app,
 
         char quoted_system_outershell_root[PATH_MAX + 8];
         shell_quote(kSystemOuterShellRoot, quoted_system_outershell_root, sizeof(quoted_system_outershell_root));
-        char wrapper_contents[4096];
-        snprintf(wrapper_contents, sizeof(wrapper_contents),
-                 "#!/bin/sh\n"
-                 "exec /usr/local/libexec/outershelld-root-tool --root-helper-outerctl \"$@\"\n");
 
         char script_template[] = "/tmp/backends-root-install-XXXXXX";
         int script_fd = mkstemp(script_template);
@@ -9514,6 +9942,15 @@ static bool install_bundled_app(const BundledAppDefinition *app,
                 quoted_target_bundle_arm,
                 quoted_source_bundle_x86,
                 quoted_target_bundle_x86);
+        fprintf(script,
+                "mkdir -p %s\n"
+                "chmod 1777 %s\n"
+                "touch %s\n"
+                "chown 0:0 %s 2>/dev/null || true\n",
+                quoted_system_users_dir,
+                quoted_system_users_dir,
+                quoted_root_apps_marker,
+                quoted_root_apps_marker);
         if (quoted_socket_unit[0]) {
             fprintf(script,
                     "timeout 12s systemctl --system disable --now %s >/dev/null 2>&1 || true\n"
@@ -9531,8 +9968,6 @@ static bool install_bundled_app(const BundledAppDefinition *app,
         fprintf(script,
                 "cat > %s <<'__BACKENDS_VERSION__'\n%s\n__BACKENDS_VERSION__\n"
                 "chmod 0644 %s\n"
-                "cat > %s <<'__BACKENDS_OUTERCTL__'\n%s__BACKENDS_OUTERCTL__\n"
-                "chmod 0755 %s\n"
                 "cat > %s <<'__BACKENDS_UNIT__'\n%s__BACKENDS_UNIT__\n"
                 "chmod 0644 %s\n"
                 "touch %s\n"
@@ -9542,9 +9977,6 @@ static bool install_bundled_app(const BundledAppDefinition *app,
                 quoted_version_path,
                 app->version,
                 quoted_version_path,
-                quoted_wrapper_path,
-                wrapper_contents,
-                quoted_wrapper_path,
                 quoted_unit_path,
                 unit_contents,
                 quoted_unit_path,
@@ -9576,20 +10008,35 @@ static bool install_bundled_app(const BundledAppDefinition *app,
         if (compiled_binary[0]) unlink(compiled_binary);
         if (!root_ok) return false;
 
-        if (!root_helper_registry_upsert_systemd(app->service_id,
+        if (direct_root_install) {
+            if (!upsert_systemd_backend_registry(app->service_id,
                                                  app->display_name,
                                                  app->unit_name,
+                                                 "system",
                                                  actual_socket_path,
                                                  log_path,
                                                  target_icon,
-                                                 sudo_password,
-                                                 needs_password,
-                                                 message,
-                                                 message_size)) {
-            return false;
+                                                 error,
+                                                 sizeof(error))) {
+                snprintf(message, message_size, "%s", error);
+                return false;
+            }
+        } else {
+            if (!root_helper_registry_upsert_systemd(app->service_id,
+                                                     app->display_name,
+                                                     app->unit_name,
+                                                     actual_socket_path,
+                                                     log_path,
+                                                     target_icon,
+                                                     sudo_password,
+                                                     needs_password,
+                                                     message,
+                                                     message_size)) {
+                return false;
+            }
         }
 
-        if (!app->root_only) {
+        if (!app->root_only && !direct_root_install) {
             char user_state_root[PATH_MAX];
             default_user_outershell_app_root(app->install_directory_name, user_state_root, sizeof(user_state_root));
             if (!mkdir_p(user_state_root)) {
@@ -9613,7 +10060,10 @@ static bool install_bundled_app(const BundledAppDefinition *app,
             }
         }
 
-        snprintf(message, message_size, "Installed %s with root support.", app->display_name);
+        snprintf(message,
+                 message_size,
+                 direct_root_install ? "Installed %s." : "Installed %s with root support.",
+                 app->display_name);
         return true;
     }
 
@@ -9731,22 +10181,22 @@ static bool install_bundled_app(const BundledAppDefinition *app,
     if (quoted_icon[0]) {
         if (quoted_socket_path[0]) {
             snprintf(run_script, sizeof(run_script),
-                     "exec %s --label %s --socket-path %s --bundles-dir %s --icon-file %s >> %s 2>&1",
-                     quoted_binary, quoted_service_id, quoted_socket_path, quoted_bundles, quoted_icon, quoted_log);
+                     "exec %s --label %s --socket-path %s --bundles-dir %s --icon-file %s",
+                     quoted_binary, quoted_service_id, quoted_socket_path, quoted_bundles, quoted_icon);
         } else {
             snprintf(run_script, sizeof(run_script),
-                     "exec %s --label %s --bundles-dir %s --icon-file %s >> %s 2>&1",
-                     quoted_binary, quoted_service_id, quoted_bundles, quoted_icon, quoted_log);
+                     "exec %s --label %s --bundles-dir %s --icon-file %s",
+                     quoted_binary, quoted_service_id, quoted_bundles, quoted_icon);
         }
     } else {
         if (quoted_socket_path[0]) {
             snprintf(run_script, sizeof(run_script),
-                     "exec %s --label %s --socket-path %s --bundles-dir %s >> %s 2>&1",
-                     quoted_binary, quoted_service_id, quoted_socket_path, quoted_bundles, quoted_log);
+                     "exec %s --label %s --socket-path %s --bundles-dir %s",
+                     quoted_binary, quoted_service_id, quoted_socket_path, quoted_bundles);
         } else {
             snprintf(run_script, sizeof(run_script),
-                     "exec %s --label %s --bundles-dir %s >> %s 2>&1",
-                     quoted_binary, quoted_service_id, quoted_bundles, quoted_log);
+                     "exec %s --label %s --bundles-dir %s",
+                     quoted_binary, quoted_service_id, quoted_bundles);
         }
     }
     char quoted_run_script[sizeof(run_script) + 16];
@@ -9772,6 +10222,8 @@ static bool install_bundled_app(const BundledAppDefinition *app,
              "ExecStart=/bin/sh -lc %s\n"
              "Restart=on-failure\n"
              "KillMode=control-group\n"
+             "StandardOutput=append:%s\n"
+             "StandardError=append:%s\n"
              "\n"
              "[Install]\n"
              "WantedBy=default.target\n",
@@ -9781,7 +10233,9 @@ static bool install_bundled_app(const BundledAppDefinition *app,
              user_name,
              user_name,
              outerctl_path,
-             quoted_run_script);
+             quoted_run_script,
+             log_path,
+             log_path);
     char socket_contents[2048] = "";
     if (app->socket_activated && quoted_socket_path[0]) {
         snprintf(socket_contents, sizeof(socket_contents),
@@ -9917,6 +10371,7 @@ static bool remove_bundled_root_support(const BundledAppDefinition *app,
             quoted_socket_unit_path[0] ? quoted_socket_unit_path : "''",
             quoted_install_root,
             quoted_log_path);
+    write_root_apps_marker_cleanup_shell(script);
     fclose(script);
     chmod(script_template, 0700);
     bool root_ok = run_root_script(script_template, sudo_password, needs_password, message, message_size);
@@ -10572,6 +11027,9 @@ static bool uninstall_backend(const char *service_id, const char *sudo_password,
                     "rm -f -- %s\n"
                     "systemctl --system daemon-reload\n",
                     quoted_log_path);
+#ifndef __APPLE__
+            write_root_apps_marker_cleanup_shell(script);
+#endif
             fclose(script);
             chmod(script_template, 0700);
             bool root_ok = run_root_script(script_template, sudo_password, needs_password, message, message_size);
@@ -11061,8 +11519,13 @@ static void send_create_response(int fd, const char *query) {
     snprintf(log_path, sizeof(log_path), "%s/Library/Logs/%s/output.log", home_directory(), service_id);
     snprintf(unit_path, sizeof(unit_path), "%s/Library/LaunchAgents/%s.plist", home_directory(), unit_name);
 #else
-    snprintf(log_path, sizeof(log_path), "%s/output.log", backend_dir);
-    snprintf(unit_path, sizeof(unit_path), "%s/.config/systemd/user/%s", home_directory(), unit_name);
+    if (direct_root_session_uses_system_scope()) {
+        snprintf(log_path, sizeof(log_path), "/var/log/outergroup/%s.log", service_id);
+        snprintf(unit_path, sizeof(unit_path), "/etc/systemd/system/%s", unit_name);
+    } else {
+        snprintf(log_path, sizeof(log_path), "%s/output.log", backend_dir);
+        snprintf(unit_path, sizeof(unit_path), "%s/.config/systemd/user/%s", home_directory(), unit_name);
+    }
 #endif
 
     char error[4096] = "";
@@ -11258,6 +11721,7 @@ static void send_create_response(int fd, const char *query) {
     char outerctl_path[PATH_MAX];
     default_user_outerctl_path(outerctl_path, sizeof(outerctl_path));
     char unit_contents[12000];
+    const char *systemd_wanted_by = direct_root_session_uses_system_scope() ? "multi-user.target" : "default.target";
     snprintf(unit_contents, sizeof(unit_contents),
              "[Unit]\n"
              "Description=%s\n"
@@ -11276,14 +11740,15 @@ static void send_create_response(int fd, const char *query) {
              "SuccessExitStatus=143 SIGTERM\n"
              "\n"
              "[Install]\n"
-             "WantedBy=default.target\n",
+             "WantedBy=%s\n",
              description,
              working_directory,
              outerctl_path,
              log_path,
              quoted_command,
              log_path,
-             log_path);
+             log_path,
+             systemd_wanted_by);
 
     if (!mkdir_p(backend_dir)) {
         snprintf(error, sizeof(error), "Failed to create %s: %s", backend_dir, strerror(errno));
@@ -11323,6 +11788,21 @@ static void send_create_response(int fd, const char *query) {
     }
     free(plist.data);
 #else
+    if (direct_root_session_uses_system_scope()) {
+        if (!mkdir_p("/var/log/outergroup")) {
+            snprintf(error, sizeof(error), "Failed to create /var/log/outergroup: %s", strerror(errno));
+            send_action_response(fd, 500, false, error);
+            return;
+        }
+    } else {
+        char user_units_dir[PATH_MAX];
+        snprintf(user_units_dir, sizeof(user_units_dir), "%s/.config/systemd/user", home_directory());
+        if (!mkdir_p(user_units_dir)) {
+            snprintf(error, sizeof(error), "Failed to create %s: %s", user_units_dir, strerror(errno));
+            send_action_response(fd, 500, false, error);
+            return;
+        }
+    }
     if (!write_text_file(unit_path, unit_contents, error, sizeof(error))) {
         send_action_response(fd, 500, false, error);
         return;
@@ -11355,11 +11835,15 @@ static void send_create_response(int fd, const char *query) {
     char quoted_unit[320];
     shell_quote(unit_name, quoted_unit, sizeof(quoted_unit));
     char enable_command[512];
-    snprintf(enable_command, sizeof(enable_command), "systemctl --user enable %s >/dev/null 2>&1", quoted_unit);
-    system("systemctl --user daemon-reload >/dev/null 2>&1");
+    const char *systemd_scope = direct_root_session_uses_system_scope() ? "system" : "user";
+    const char *systemd_scope_arg = direct_root_session_uses_system_scope() ? "--system" : "--user";
+    snprintf(enable_command, sizeof(enable_command), "systemctl %s enable %s >/dev/null 2>&1", systemd_scope_arg, quoted_unit);
+    char daemon_reload_command[128];
+    snprintf(daemon_reload_command, sizeof(daemon_reload_command), "systemctl %s daemon-reload >/dev/null 2>&1", systemd_scope_arg);
+    system(daemon_reload_command);
     system(enable_command);
     char message[4096] = "";
-    bool started = run_systemd_operation(unit_name, "user", "start", NULL, NULL, message, sizeof(message));
+    bool started = run_systemd_operation(unit_name, systemd_scope, "start", NULL, NULL, message, sizeof(message));
 #endif
     if (!started) {
         char response[4600];
@@ -11565,7 +12049,15 @@ static bool root_helper_outerctl(int argc,
     }
 
     StringBuilder command = {0};
+#ifndef __APPLE__
+    char system_outerctl[PATH_MAX];
+    default_system_outerctl_path(system_outerctl, sizeof(system_outerctl));
+    char quoted_outerctl[PATH_MAX + 8];
+    shell_quote(system_outerctl, quoted_outerctl, sizeof(quoted_outerctl));
+    bool ok = sb_append(&command, quoted_outerctl);
+#else
     bool ok = sb_append(&command, "/usr/local/libexec/outershelld-root-tool --root-helper-outerctl");
+#endif
     for (int i = 1; ok && i < argc; i++) {
         char quoted[PATH_MAX * 2];
         shell_quote(argv[i] ? argv[i] : "", quoted, sizeof(quoted));

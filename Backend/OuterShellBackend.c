@@ -1544,6 +1544,10 @@ static void default_api_socket_path(char *out, size_t out_size) {
     }
     snprintf(out, out_size, "/tmp/outershelld-api-%d", (int)getuid());
 #else
+    if (geteuid() == 0) {
+        snprintf(out, out_size, "/run/outershelld-api");
+        return;
+    }
     const char *runtime = getenv("XDG_RUNTIME_DIR");
     if (runtime && runtime[0]) {
         snprintf(out, out_size, "%s/outershelld-api", runtime);

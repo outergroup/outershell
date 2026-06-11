@@ -321,56 +321,200 @@ EOF
     exit 1
 fi
 
-runtime_dir="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
-state_home="${XDG_STATE_HOME:-$HOME/.local/state}"
-outershell_home="${OUTERSHELL_HOME:-$state_home/outershell}"
-install_root="$outershell_home/outer-shell"
-outerctl_path="$outershell_home/bin/outerctl"
-unit_dir="$HOME/.config/systemd/user"
-socket_path="$runtime_dir/org.outershell.OuterShell"
-log_dir="$install_root/logs"
-log_path="$log_dir/OuterShellBackend.log"
-broker_log_path="$log_dir/outershelld.log"
+root_install=false
+if [ "$(id -u)" -eq 0 ]; then
+    root_install=true
+fi
+
+system_outershell_home="/var/lib/outershell"
+system_install_root="$system_outershell_home/outer-shell"
+system_outershelld_path="$system_install_root/outershelld"
+system_outerctl_path="$system_outershell_home/bin/outerctl"
+system_version_path="$system_install_root/version"
+system_binary_users_dir="$system_outershell_home/system-binary-users"
+system_binary_user_marker="$system_binary_users_dir/uid-$(id -u)"
+
+if [ "$root_install" = true ]; then
+    runtime_dir="/run"
+    outershell_home="${OUTERSHELL_HOME:-$system_outershell_home}"
+    install_root="$outershell_home/outer-shell"
+    outerctl_path="$outershell_home/bin/outerctl"
+    unit_dir="/etc/systemd/system"
+    socket_path="/run/org.outershell.OuterShell"
+    api_socket_path="/run/outershelld-api"
+    log_dir="/var/log/outergroup"
+    log_path="$log_dir/org.outershell.OuterShell.log"
+    broker_log_path="$log_dir/outershelld.log"
+    systemctl_scope="--system"
+    service_wanted_by="multi-user.target"
+    outer_shell_listen_stream="$socket_path"
+    api_listen_stream="$api_socket_path"
+else
+    runtime_dir="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+    state_home="${XDG_STATE_HOME:-$HOME/.local/state}"
+    outershell_home="${OUTERSHELL_HOME:-$state_home/outershell}"
+    install_root="$outershell_home/outer-shell"
+    outerctl_path="$outershell_home/bin/outerctl"
+    unit_dir="$HOME/.config/systemd/user"
+    socket_path="$runtime_dir/org.outershell.OuterShell"
+    api_socket_path="$runtime_dir/outershelld-api"
+    log_dir="$install_root/logs"
+    log_path="$log_dir/OuterShellBackend.log"
+    broker_log_path="$log_dir/outershelld.log"
+    systemctl_scope="--user"
+    service_wanted_by="default.target"
+    outer_shell_listen_stream="%t/org.outershell.OuterShell"
+    api_listen_stream="%t/outershelld-api"
+fi
 runner_path="$install_root/run-outer-shell.sh"
-broker_runner_path="$install_root/run-outershelld.sh"
+
+root_binaries_match=false
+if [ "$root_install" = false ] &&
+   [ -x "$system_outershelld_path" ] &&
+   [ -x "$system_outerctl_path" ] &&
+   [ -f "$system_version_path" ] &&
+   [ -f "$system_binary_user_marker" ] &&
+   [ "$(stat -c %u "$system_binary_user_marker" 2>/dev/null || echo invalid)" = "$(id -u)" ] &&
+   [ "$(cat "$system_version_path" 2>/dev/null || true)" = "__OUTER_SHELL_VERSION__" ]; then
+    root_binaries_match=true
+fi
+
+run_outerctl() {
+    OUTERSHELL_HOME="$outershell_home" OUTERSHELLD_API_SOCKET="$api_socket_path" "$outerctl_path" "$@"
+}
+
+system_binary_users_empty() {
+    if [ ! -d "$system_binary_users_dir" ]; then
+        return 0
+    fi
+    for marker in "$system_binary_users_dir"/*; do
+        [ -e "$marker" ] || continue
+        name="$(basename "$marker")"
+        case "$name" in
+            root-apps)
+                [ "$(stat -c %u "$marker" 2>/dev/null || echo invalid)" = "0" ] && return 1
+                ;;
+            uid-*)
+                uid="${name#uid-}"
+                case "$uid" in
+                    *[!0-9]*|'') continue ;;
+                esac
+                [ "$(stat -c %u "$marker" 2>/dev/null || echo invalid)" = "$uid" ] && return 1
+                ;;
+        esac
+    done
+    return 0
+}
+
+remove_system_binaries_if_unused() {
+    [ "$(id -u)" -eq 0 ] || return 0
+    system_binary_users_empty || return 0
+    systemctl --system disable --now outershelld.socket outershelld.service >/dev/null 2>&1 || true
+    rm -f /etc/systemd/system/outershelld.service /etc/systemd/system/outershelld.socket /run/outershelld-api
+    systemctl --system daemon-reload >/dev/null 2>&1 || true
+    rm -f "$system_outershelld_path" "$system_outerctl_path" "$system_install_root/bin/outerctl" "$system_version_path"
+    rmdir "$system_install_root/bin" "$system_install_root" "$system_outershell_home/bin" "$system_binary_users_dir" "$system_outershell_home" >/dev/null 2>&1 || true
+}
+
+remove_system_binary_user_marker_with_sudo() {
+    [ "$root_install" = false ] || return 0
+    [ -e "$system_binary_user_marker" ] || return 0
+    rm -f "$system_binary_user_marker" 2>/dev/null && return 0
+
+    cleanup_root_script="$(mktemp)"
+    cat > "$cleanup_root_script" <<EOF
+#!/bin/sh
+set -eu
+system_outershell_home="$system_outershell_home"
+system_install_root="$system_install_root"
+system_outershelld_path="$system_outershelld_path"
+system_outerctl_path="$system_outerctl_path"
+system_version_path="$system_version_path"
+system_binary_users_dir="$system_binary_users_dir"
+marker="$system_binary_user_marker"
+expected_uid="$(id -u)"
+if [ -e "\$marker" ] && [ "\$(stat -c %u "\$marker" 2>/dev/null || echo invalid)" = "\$expected_uid" ]; then
+    rm -f "\$marker"
+fi
+$(declare -f system_binary_users_empty)
+$(declare -f remove_system_binaries_if_unused)
+remove_system_binaries_if_unused
+EOF
+    chmod 0700 "$cleanup_root_script"
+    if sudo -n sh "$cleanup_root_script" >/dev/null 2>&1; then
+        rm -f "$cleanup_root_script"
+        return 0
+    fi
+    printf 'Administrator password required to remove shared Outer Shell root support for this user.\n' >&2
+    sudo sh "$cleanup_root_script"
+    rm -f "$cleanup_root_script"
+}
 
 cleanup_legacy_home_screen() {
     legacy_install_root="$outershell_home/home-screen"
     legacy_socket_path="$runtime_dir/dev.outergroup.HomeScreen"
     legacy_service_id="dev.outergroup.HomeScreen"
-    systemctl --user disable --now dev.outergroup.HomeScreen.socket dev.outergroup.HomeScreen.service >/dev/null 2>&1 || true
+    systemctl $systemctl_scope disable --now dev.outergroup.HomeScreen.socket dev.outergroup.HomeScreen.service >/dev/null 2>&1 || true
     rm -f "$unit_dir/dev.outergroup.HomeScreen.service" "$unit_dir/dev.outergroup.HomeScreen.socket" "$legacy_socket_path"
-    systemctl --user daemon-reload >/dev/null 2>&1 || true
+    systemctl $systemctl_scope daemon-reload >/dev/null 2>&1 || true
     rm -rf "$legacy_install_root"
     if [ -x "$outerctl_path" ]; then
-        OUTERSHELL_HOME="$outershell_home" "$outerctl_path" app clear --backend "$legacy_service_id" >/dev/null 2>&1 || true
-        OUTERSHELL_HOME="$outershell_home" "$outerctl_path" log clear --backend "$legacy_service_id" >/dev/null 2>&1 || true
-        OUTERSHELL_HOME="$outershell_home" "$outerctl_path" systemd clear --backend "$legacy_service_id" >/dev/null 2>&1 || true
-        OUTERSHELL_HOME="$outershell_home" "$outerctl_path" backend remove --backend "$legacy_service_id" >/dev/null 2>&1 || true
+        run_outerctl app clear --backend "$legacy_service_id" >/dev/null 2>&1 || true
+        run_outerctl log clear --backend "$legacy_service_id" >/dev/null 2>&1 || true
+        run_outerctl systemd clear --backend "$legacy_service_id" >/dev/null 2>&1 || true
+        run_outerctl backend remove --backend "$legacy_service_id" >/dev/null 2>&1 || true
     fi
 }
 
 if [ "$command" = "uninstall" ]; then
-    systemctl --user disable org.outershell.OuterShell.socket outershelld.socket outershelld.service >/dev/null 2>&1 || true
-    if [ -x "$outerctl_path" ]; then
-        OUTERSHELL_HOME="$outershell_home" "$outerctl_path" app clear --backend org.outershell.OuterShell >/dev/null 2>&1 || true
-        OUTERSHELL_HOME="$outershell_home" "$outerctl_path" log clear --backend org.outershell.OuterShell >/dev/null 2>&1 || true
-        OUTERSHELL_HOME="$outershell_home" "$outerctl_path" systemd clear --backend org.outershell.OuterShell >/dev/null 2>&1 || true
-        OUTERSHELL_HOME="$outershell_home" "$outerctl_path" backend remove --backend org.outershell.OuterShell >/dev/null 2>&1 || true
+    if [ "$root_install" = true ]; then
+        systemctl --system disable org.outershell.OuterShell.socket >/dev/null 2>&1 || true
+    else
+        systemctl --user disable org.outershell.OuterShell.socket outershelld.socket outershelld.service >/dev/null 2>&1 || true
     fi
+    if [ -x "$outerctl_path" ]; then
+        run_outerctl app clear --backend org.outershell.OuterShell >/dev/null 2>&1 || true
+        run_outerctl log clear --backend org.outershell.OuterShell >/dev/null 2>&1 || true
+        run_outerctl systemd clear --backend org.outershell.OuterShell >/dev/null 2>&1 || true
+        run_outerctl backend remove --backend org.outershell.OuterShell >/dev/null 2>&1 || true
+    fi
+    remove_system_binary_user_marker_with_sudo
     cleanup_script="$(mktemp)"
     cat > "$cleanup_script" <<EOF
 #!/bin/sh
 sleep 0.25
-    systemctl --user stop org.outershell.OuterShell.socket outershelld.socket org.outershell.OuterShell.service outershelld.service >/dev/null 2>&1 || true
-    rm -f "$unit_dir/org.outershell.OuterShell.service" "$unit_dir/outershelld.service" "$unit_dir/outershelld.socket" "$unit_dir/org.outershell.OuterShell.socket" "$socket_path" "$runtime_dir/outershelld-api"
-systemctl --user daemon-reload >/dev/null 2>&1 || true
-rm -rf "$install_root"
+    if [ "$root_install" = true ]; then
+        systemctl --system stop org.outershell.OuterShell.socket org.outershell.OuterShell.service >/dev/null 2>&1 || true
+    else
+        systemctl --user stop org.outershell.OuterShell.socket outershelld.socket org.outershell.OuterShell.service outershelld.service >/dev/null 2>&1 || true
+    fi
+    if [ "$root_install" = true ]; then
+        rm -f "$unit_dir/org.outershell.OuterShell.service" "$unit_dir/org.outershell.OuterShell.socket" "$socket_path"
+    else
+        rm -f "$unit_dir/org.outershell.OuterShell.service" "$unit_dir/outershelld.service" "$unit_dir/outershelld.socket" "$unit_dir/org.outershell.OuterShell.socket" "$socket_path" "$api_socket_path"
+    fi
+systemctl $systemctl_scope daemon-reload >/dev/null 2>&1 || true
+if [ "$root_install" = true ]; then
+    rm -f "$install_root/OuterShellBackend" "$install_root/app-icon.png"
+    rm -rf "$install_root/bundles" "$install_root/bundled-apps"
+else
+    rm -rf "$install_root"
+fi
+rm -f "$system_binary_user_marker"
+$(declare -f system_binary_users_empty)
+$(declare -f remove_system_binaries_if_unused)
+system_outershell_home="$system_outershell_home"
+system_install_root="$system_install_root"
+system_outershelld_path="$system_outershelld_path"
+system_outerctl_path="$system_outerctl_path"
+system_version_path="$system_version_path"
+system_binary_users_dir="$system_binary_users_dir"
+remove_system_binaries_if_unused
 rm -f "$cleanup_script"
 EOF
     chmod 0755 "$cleanup_script"
-    if command -v systemd-run >/dev/null 2>&1; then
-        systemd-run --user --unit=org.outershell.OuterShell-uninstall --collect "$cleanup_script" >/dev/null 2>&1 || (nohup "$cleanup_script" >/dev/null 2>&1 &)
+    if [ "$root_install" = false ] && command -v systemd-run >/dev/null 2>&1; then
+        systemd-run $systemctl_scope --unit=org.outershell.OuterShell-uninstall --collect "$cleanup_script" >/dev/null 2>&1 || (nohup "$cleanup_script" >/dev/null 2>&1 &)
     else
         nohup "$cleanup_script" >/dev/null 2>&1 &
     fi
@@ -383,27 +527,36 @@ mkdir -p "$install_root" "$outershell_home/bin" "$unit_dir" "$log_dir"
 cleanup_legacy_home_screen
 archive_path="$(mktemp)"
 stage_archive "${public_base_url%/}/latest/outer-shell-${arch}.tar.gz?v=__ASSET_VERSION__" "$archive_path"
-rm -f "$install_root/outershelld" "$install_root/OuterShellBackend"
+rm -f "$install_root/outershelld" "$install_root/bin/outerctl" "$outerctl_path" "$install_root/OuterShellBackend"
 tar -xzf "$archive_path" -C "$install_root" --strip-components=1
 rm -f "$archive_path"
 chmod 0755 "$install_root/outershelld"
 chmod 0755 "$install_root/OuterShellBackend"
 chmod 0755 "$install_root/bin/outerctl"
-install -m 0755 "$install_root/bin/outerctl" "$outerctl_path"
+if [ "$root_install" = true ]; then
+    mkdir -p "$system_binary_users_dir"
+    chmod 1777 "$system_binary_users_dir"
+    touch "$system_binary_user_marker"
+    chown 0:0 "$system_binary_user_marker" 2>/dev/null || true
+    install -m 0755 "$install_root/bin/outerctl" "$outerctl_path"
+    rm -f "$install_root/bin/outerctl"
+    ln -s "$outerctl_path" "$install_root/bin/outerctl"
+elif [ "$root_binaries_match" = true ]; then
+    rm -f "$install_root/outershelld" "$install_root/bin/outerctl" "$outerctl_path"
+    ln -s "$system_outershelld_path" "$install_root/outershelld"
+    ln -s "$system_outerctl_path" "$install_root/bin/outerctl"
+    ln -s "$system_outerctl_path" "$outerctl_path"
+else
+    install -m 0755 "$install_root/bin/outerctl" "$outerctl_path"
+fi
 printf '%s\n' "__OUTER_SHELL_VERSION__" > "$install_root/version"
 touch "$log_path" "$broker_log_path"
 
 cat > "$runner_path" <<EOF
 #!/bin/sh
-exec "$install_root/OuterShellBackend" --socket-path "\${1:-$socket_path}" --api-socket-path "$runtime_dir/outershelld-api" --bundles-dir "$install_root/bundles" --bundled-apps-dir "$install_root/bundled-apps" --app-base-url "$app_base_url" --public-base-url "$public_base_url" >> "$log_path" 2>&1
+exec "$install_root/OuterShellBackend" --socket-path "\${1:-$socket_path}" --api-socket-path "$api_socket_path" --bundles-dir "$install_root/bundles" --bundled-apps-dir "$install_root/bundled-apps" --app-base-url "$app_base_url" --public-base-url "$public_base_url"
 EOF
 chmod 0755 "$runner_path"
-
-cat > "$broker_runner_path" <<EOF
-#!/bin/sh
-exec "$install_root/outershelld" --api-socket-path "\${1:-$runtime_dir/outershelld-api}" --bundled-apps-dir "$install_root/bundled-apps" --public-base-url "$public_base_url" >> "$broker_log_path" 2>&1
-EOF
-chmod 0755 "$broker_runner_path"
 
 cat > "$unit_dir/org.outershell.OuterShell.service" <<EOF
 [Unit]
@@ -413,8 +566,13 @@ Wants=outershelld.socket
 
 [Service]
 Environment=OUTERSHELL_HOME=$outershell_home
-ExecStart=$runner_path %t/org.outershell.OuterShell
+ExecStart=$runner_path $outer_shell_listen_stream
 Restart=no
+StandardOutput=append:$log_path
+StandardError=append:$log_path
+
+[Install]
+WantedBy=$service_wanted_by
 EOF
 
 cat > "$unit_dir/org.outershell.OuterShell.socket" <<EOF
@@ -422,7 +580,7 @@ cat > "$unit_dir/org.outershell.OuterShell.socket" <<EOF
 Description=Outer Group Outer Shell Socket
 
 [Socket]
-ListenStream=%t/org.outershell.OuterShell
+ListenStream=$outer_shell_listen_stream
 FileDescriptorName=http
 SocketMode=0600
 Service=org.outershell.OuterShell.service
@@ -436,7 +594,7 @@ cat > "$unit_dir/outershelld.socket" <<EOF
 Description=Outer Shell API Socket
 
 [Socket]
-ListenStream=%t/outershelld-api
+ListenStream=$api_listen_stream
 FileDescriptorName=api
 SocketMode=0600
 Service=outershelld.service
@@ -451,26 +609,32 @@ Description=Outer Shell daemon
 
 [Service]
 Environment=OUTERSHELL_HOME=$outershell_home
-ExecStart=$broker_runner_path %t/outershelld-api
+Environment=OUTER_SHELL_PUBLIC_BASE_URL=$public_base_url
+ExecStart=$install_root/outershelld
 Restart=no
+StandardOutput=append:$broker_log_path
+StandardError=append:$broker_log_path
+
+[Install]
+WantedBy=$service_wanted_by
 EOF
 
 printf '[%s] %s Outer Shell package %s from %s.\n' "$(timestamp)" "$command" "__OUTER_SHELL_VERSION__" "$public_base_url" >> "$log_path"
 
 if [ "$command" = "install" ]; then
-    systemctl --user stop org.outershell.OuterShell.service >/dev/null 2>&1 || true
+    systemctl $systemctl_scope stop org.outershell.OuterShell.service >/dev/null 2>&1 || true
 fi
-systemctl --user daemon-reload
-systemctl --user enable org.outershell.OuterShell.socket outershelld.socket
-systemctl --user stop org.outershell.OuterShell.service outershelld.service org.outershell.OuterShell.socket outershelld.socket >/dev/null 2>&1 || true
-rm -f "$socket_path" "$runtime_dir/outershelld-api"
-systemctl --user start org.outershell.OuterShell.socket outershelld.socket
+systemctl $systemctl_scope daemon-reload
+systemctl $systemctl_scope enable org.outershell.OuterShell.socket outershelld.socket
+systemctl $systemctl_scope stop org.outershell.OuterShell.service outershelld.service org.outershell.OuterShell.socket outershelld.socket >/dev/null 2>&1 || true
+rm -f "$socket_path" "$api_socket_path"
+systemctl $systemctl_scope start org.outershell.OuterShell.socket outershelld.socket
 
-OUTERSHELL_HOME="$outershell_home" "$outerctl_path" backend upsert --backend org.outershell.OuterShell --name "Outer Shell" --systemd-unit org.outershell.OuterShell.service
-OUTERSHELL_HOME="$outershell_home" "$outerctl_path" app clear --backend org.outershell.OuterShell
-OUTERSHELL_HOME="$outershell_home" "$outerctl_path" app add --backend org.outershell.OuterShell --socket-path "$socket_path" --name "Outer Shell" --url "/" --icon-path "$install_root/app-icon.png"
-OUTERSHELL_HOME="$outershell_home" "$outerctl_path" log clear --backend org.outershell.OuterShell
-OUTERSHELL_HOME="$outershell_home" "$outerctl_path" log add --backend org.outershell.OuterShell --path "$log_path"
+run_outerctl backend upsert --backend org.outershell.OuterShell --name "Outer Shell" --systemd-unit org.outershell.OuterShell.service
+run_outerctl app clear --backend org.outershell.OuterShell
+run_outerctl app add --backend org.outershell.OuterShell --socket-path "$socket_path" --name "Outer Shell" --url "/" --icon-path "$install_root/app-icon.png"
+run_outerctl log clear --backend org.outershell.OuterShell
+run_outerctl log add --backend org.outershell.OuterShell --path "$log_path"
 
 if [ "$command" = "update" ]; then
     printf 'Outer Shell updated to %s. The new version will run the next time Outer Shell starts.\n' "__OUTER_SHELL_VERSION__"

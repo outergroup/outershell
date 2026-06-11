@@ -2577,6 +2577,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         textMatchStates.removeAll()
     }
 
+    private func installsBundledPlaceholderAsSystemOnly(_ backend: BackendRecord) -> Bool {
+        backend.isBundledPlaceholder && backend.serviceScope == "system" && (backend.supportsRoot ?? false)
+    }
+
     private func renderInstallPromptIfNeeded(width: CGFloat, height: CGFloat) {
         installOverlayLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
         guard let backend = pendingInstallBackend else {
@@ -2592,8 +2596,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         installOverlayLayer.frame = CGRect(x: 0, y: 0, width: width, height: height)
         installOverlayLayer.backgroundColor = resolvedCGColor(NSColor.black.withAlphaComponent(0.18))
 
-        let hasRootChoice = (backend.supportsRoot ?? false) && !(backend.rootOnly ?? false)
-        let isRootOnly = backend.rootOnly ?? false
+        let systemOnlyPlaceholder = installsBundledPlaceholderAsSystemOnly(backend)
+        let hasRootChoice = !systemOnlyPlaceholder && (backend.supportsRoot ?? false) && !(backend.rootOnly ?? false)
+        let isRootOnly = systemOnlyPlaceholder || (backend.rootOnly ?? false)
         let preferredPanelWidth: CGFloat = hasRootChoice ? 430 : 360
         let panelWidth = min(max(width - 48, 280), preferredPanelWidth)
         let stacksButtons = hasRootChoice && panelWidth < 398
@@ -2682,7 +2687,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             panel.addSublayer(installButton)
         }
         if hasRootChoice || isRootOnly {
-            let rootButton = makeButtonLayer(title: hasRootChoice ? "Enable for user and root" : "Enable for root", emphasized: true)
+            let rootButtonTitle = systemOnlyPlaceholder ? "Enable" : (hasRootChoice ? "Enable for user and root" : "Enable for root")
+            let rootButton = makeButtonLayer(title: rootButtonTitle, emphasized: true)
             rootButton.frame = rootLocalFrame
             panel.addSublayer(rootButton)
         }
@@ -4204,9 +4210,12 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                               label: "Enable for user"))
         }
         if let frame = accessibilityFrame(installRootConfirmFrame) {
-            let label = (backend.supportsRoot ?? false) && !(backend.rootOnly ?? false)
-                ? "Enable for user and root"
-                : "Enable for root"
+            let systemOnlyPlaceholder = installsBundledPlaceholderAsSystemOnly(backend)
+            let label = systemOnlyPlaceholder
+                ? "Enable"
+                : ((backend.supportsRoot ?? false) && !(backend.rootOnly ?? false)
+                    ? "Enable for user and root"
+                    : "Enable for root")
             children.append(accessibilityNode(nextIdentifier: &nextIdentifier,
                                               role: .button,
                                               frame: frame,
@@ -7090,7 +7099,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private func showInstallPrompt(for backend: BackendRecord) {
         blurCreateField()
         pendingInstallBackend = backend
-        pendingInstallOperation = (backend.rootOnly ?? false) ? "runRoot" : "run"
+        pendingInstallOperation = ((backend.rootOnly ?? false) || installsBundledPlaceholderAsSystemOnly(backend)) ? "runRoot" : "run"
         updateLayout()
     }
 
@@ -7102,7 +7111,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
     private func confirmPendingInstall() {
         guard let backend = pendingInstallBackend else { return }
-        let operation = (backend.rootOnly ?? false) ? "runRoot" : pendingInstallOperation
+        let operation = ((backend.rootOnly ?? false) || installsBundledPlaceholderAsSystemOnly(backend)) ? "runRoot" : pendingInstallOperation
         pendingInstallBackend = nil
         pendingInstallOperation = "run"
         performControlAction(for: backend, operation: operation)
@@ -8014,8 +8023,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             return [("Migrate", "migrateRoot")]
         }
         if backend.isBundledPlaceholder {
-            let operation = (backend.rootOnly ?? false) ? "runRoot" : "run"
-            let title = (backend.rootOnly ?? false) ? "Run as root" : "Run"
+            let systemOnlyPlaceholder = installsBundledPlaceholderAsSystemOnly(backend)
+            let operation = ((backend.rootOnly ?? false) || systemOnlyPlaceholder) ? "runRoot" : "run"
+            let title = (backend.rootOnly ?? false) && !systemOnlyPlaceholder ? "Run as root" : "Run"
             return [(title, operation), ("Actions", "menu")]
         }
         var actions: [(title: String, operation: String)] = []
@@ -8071,11 +8081,12 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         }
         if backend.isBundled ?? false {
             if backend.isBundledPlaceholder && includePlaceholderRunActions {
-                operationByItemID["run"] = (backend.rootOnly ?? false) ? "runRoot" : "run"
+                let systemOnlyPlaceholder = installsBundledPlaceholderAsSystemOnly(backend)
+                operationByItemID["run"] = ((backend.rootOnly ?? false) || systemOnlyPlaceholder) ? "runRoot" : "run"
                 items.append(OuterframeContextMenuItem(id: "run",
-                                                       title: (backend.rootOnly ?? false) ? "Run as root" : "Run",
+                                                       title: (backend.rootOnly ?? false) && !systemOnlyPlaceholder ? "Run as root" : "Run",
                                                        isEnabled: true))
-                if (backend.supportsRoot ?? false) && !(backend.rootOnly ?? false) {
+                if !systemOnlyPlaceholder && (backend.supportsRoot ?? false) && !(backend.rootOnly ?? false) {
                     operationByItemID["runRoot"] = "runRoot"
                     items.append(OuterframeContextMenuItem(id: "runRoot",
                                                            title: "Run as root",
