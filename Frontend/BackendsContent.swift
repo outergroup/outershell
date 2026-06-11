@@ -1367,6 +1367,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         return resolved
     }
 
+    private func resolvedColor(_ color: NSColor) -> NSColor {
+        NSColor(cgColor: resolvedCGColor(color)) ?? color
+    }
+
     private func updateLayout() {
         withEffectiveAppearance {
             withoutImplicitAnimations {
@@ -3239,7 +3243,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         return NSAttributedString(string: text,
                                   attributes: [
                                     .font: logTextFont(),
-                                    .foregroundColor: color,
+                                    .foregroundColor: resolvedColor(color),
                                     .paragraphStyle: paragraph
                                   ])
     }
