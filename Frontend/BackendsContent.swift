@@ -800,7 +800,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private var logTextFragmentLayers: [ObjectIdentifier: LogTextFragmentLayer] = [:]
     private var logTextLayoutWidth: CGFloat = 0
     private var logTextContentGeneration = 0
-    private var logEstimatedContentHeightCache: (generation: Int, textWidth: CGFloat, height: CGFloat)?
+    private var logContentHeightCache: (generation: Int, textWidth: CGFloat, height: CGFloat)?
     private var logVisualLineCache: (generation: Int, textWidth: CGFloat, metrics: LogVisualLineMetrics)?
     private var logTextFragmentCoverage: (generation: Int, textWidth: CGFloat, contentHeight: CGFloat, rect: CGRect)?
     private var logTextSelectionCoverage: (generation: Int, textWidth: CGFloat, contentHeight: CGFloat, range: NSRange, rect: CGRect)?
@@ -925,6 +925,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private let logHeaderHeight: CGFloat = 62
     private let logTextInsetX: CGFloat = 12
     private let logTextInsetY: CGFloat = 10
+    private let logTextMeasurementHeight: CGFloat = 10_000_000
     private let logScrollLineHeight: CGFloat = 18
     private let horizontalInset: CGFloat = 18
     private let createBottomInset: CGFloat = 18
@@ -3081,9 +3082,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             logTextLayoutWidth = textWidth
             clearLogTextFragmentLayers()
         }
-        logTextContainer.size = CGSize(width: textWidth, height: max(logTextContainer.size.height, logRowsClipLayer.bounds.height))
         updateLogTextContentIfNeeded(text: currentLogText())
-        logTextContainer.size = CGSize(width: textWidth, height: max(estimatedLogContentHeight(textWidth: textWidth) - logTextInsetY * 2, logRowsClipLayer.bounds.height))
+        logTextContainer.size = CGSize(width: textWidth, height: max(logContentHeight(textWidth: textWidth) - logTextInsetY * 2, logRowsClipLayer.bounds.height))
         if shouldScrollLogToBottomOnNextLayout && (logSnapshot != nil || !logError.isEmpty) {
             logScroll = clampedLogScroll(.greatestFiniteMagnitude)
             shouldScrollLogToBottomOnNextLayout = false
@@ -3219,7 +3219,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         let previousRange = logTextSelectionRange
         logRenderedText = displayText
         logTextContentGeneration += 1
-        logEstimatedContentHeightCache = nil
+        logContentHeightCache = nil
         logVisualLineCache = nil
         logAttributedText = makeLogAttributedText(displayText)
         logContentStorage.attributedString = logAttributedText
@@ -7727,34 +7727,22 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private func logContentHeight() -> CGFloat {
         guard logRowsClipLayer.bounds.width > 0, logRowsClipLayer.bounds.height > 0 else { return 0 }
         let textWidth = max(logRowsClipLayer.bounds.width - logTextInsetX * 2, 1)
-        return max(estimatedLogContentHeight(textWidth: textWidth), logRowsClipLayer.bounds.height)
+        return logContentHeight(textWidth: textWidth)
     }
 
-    private func estimatedLogContentHeight(textWidth: CGFloat) -> CGFloat {
-        if let cache = logEstimatedContentHeightCache,
+    private func logContentHeight(textWidth: CGFloat) -> CGFloat {
+        if let cache = logContentHeightCache,
            cache.generation == logTextContentGeneration,
            abs(cache.textWidth - textWidth) <= 0.5 {
             return cache.height
         }
 
-        let font = logTextFont()
-        let charWidth = max(("0" as NSString).size(withAttributes: [.font: font]).width, 1)
-        let lineHeight = ceil(font.ascender - font.descender + font.leading + 2)
-        let charactersPerLine = max(Int(floor(textWidth / charWidth)), 1)
-        var visualLineCount = 0
-        var currentLineLength = 0
-        for character in logRenderedText.utf8 {
-            if character == 10 {
-                visualLineCount += max(Int(ceil(Double(currentLineLength) / Double(charactersPerLine))), 1)
-                currentLineLength = 0
-            } else {
-                currentLineLength += 1
-            }
-        }
-        visualLineCount += max(Int(ceil(Double(currentLineLength) / Double(charactersPerLine))), 1)
-
-        let height = CGFloat(max(visualLineCount, 1)) * lineHeight + logTextInsetY * 2
-        logEstimatedContentHeightCache = (generation: logTextContentGeneration, textWidth: textWidth, height: height)
+        logTextContainer.size = CGSize(width: textWidth,
+                                       height: max(logTextMeasurementHeight, logRowsClipLayer.bounds.height))
+        logTextLayoutManager.ensureLayout(for: logTextLayoutManager.documentRange)
+        let height = max(logTextLayoutManager.usageBoundsForTextContainer.maxY + logTextInsetY * 2,
+                         logRowsClipLayer.bounds.height)
+        logContentHeightCache = (generation: logTextContentGeneration, textWidth: textWidth, height: height)
         return height
     }
 
