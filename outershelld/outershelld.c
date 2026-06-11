@@ -620,6 +620,7 @@ typedef struct {
     uint64_t event_since_backends;
     uint64_t event_since_log;
     char event_log_service_id[PATH_MAX];
+    char event_log_path[PATH_MAX];
     int event_log_index;
 } ReactorClient;
 
@@ -1101,6 +1102,7 @@ static bool process_api_client_request(ReactorClient *client, char *request, siz
 static bool prepare_events_response_or_wait(ReactorClient *client, const char *query);
 static bool event_client_ready(ReactorClient *client, bool *timed_out, uint64_t *backends_version, uint64_t *log_version);
 static uint64_t current_backends_event_version(void);
+static uint64_t current_log_path_event_version(const char *raw_path);
 static uint64_t current_log_event_version(const char *service_id, int log_index);
 static void send_events_response(int fd,
                                  bool backends_changed,
@@ -5674,6 +5676,11 @@ static uint64_t current_log_event_version(const char *service_id, int log_index)
     if (!resolve_log_path_any(service_id, log_index, raw_path, sizeof(raw_path), error, sizeof(error))) {
         return mix_u64(current_backends_event_version(), 0);
     }
+    return current_log_path_event_version(raw_path);
+}
+
+static uint64_t current_log_path_event_version(const char *raw_path) {
+    if (!raw_path || !raw_path[0]) return 0;
     char path[PATH_MAX];
     expand_tilde_path(raw_path, path, sizeof(path));
     return mix_u64(current_backends_event_version(), file_state_token(path));
@@ -11935,10 +11942,12 @@ static bool prepare_events_response_or_wait(ReactorClient *client, const char *q
     char since_backends_raw[64] = "";
     char since_log_raw[64] = "";
     char service_id[PATH_MAX] = "";
+    char log_path[PATH_MAX] = "";
     char log_index_raw[64] = "";
     query_value(query, "sinceBackends", since_backends_raw, sizeof(since_backends_raw));
     query_value(query, "sinceLog", since_log_raw, sizeof(since_log_raw));
     query_value(query, "serviceID", service_id, sizeof(service_id));
+    query_value(query, "path", log_path, sizeof(log_path));
     query_value(query, "logIndex", log_index_raw, sizeof(log_index_raw));
     int log_index = log_index_raw[0] ? atoi(log_index_raw) : 0;
     if (log_index < 0) log_index = 0;
@@ -11946,9 +11955,10 @@ static bool prepare_events_response_or_wait(ReactorClient *client, const char *q
     uint64_t since_backends = parse_u64_or_zero(since_backends_raw);
     uint64_t since_log = parse_u64_or_zero(since_log_raw);
     uint64_t backends_version = current_backends_event_version();
-    uint64_t log_version = current_log_event_version(service_id, log_index);
+    uint64_t log_version = log_path[0] ? current_log_path_event_version(log_path) : current_log_event_version(service_id, log_index);
+    bool has_log_selection = log_path[0] || service_id[0];
     bool backends_changed = since_backends == 0 || backends_version != since_backends;
-    bool log_changed = service_id[0] && (since_log == 0 || log_version != since_log);
+    bool log_changed = has_log_selection && (since_log == 0 || log_version != since_log);
     if (backends_changed || log_changed) {
         send_events_response(client->fd, backends_changed, log_changed, false, backends_version, log_version);
         return false;
@@ -11959,6 +11969,7 @@ static bool prepare_events_response_or_wait(ReactorClient *client, const char *q
     client->event_since_backends = since_backends;
     client->event_since_log = since_log;
     snprintf(client->event_log_service_id, sizeof(client->event_log_service_id), "%s", service_id);
+    snprintf(client->event_log_path, sizeof(client->event_log_path), "%s", log_path);
     client->event_log_index = log_index;
     return true;
 }
@@ -12176,9 +12187,12 @@ static bool event_client_ready(ReactorClient *client, bool *timed_out,
                                uint64_t *backends_version, uint64_t *log_version) {
     *timed_out = monotonic_milliseconds() >= client->event_deadline_ms;
     *backends_version = current_backends_event_version();
-    *log_version = current_log_event_version(client->event_log_service_id, client->event_log_index);
+    *log_version = client->event_log_path[0]
+        ? current_log_path_event_version(client->event_log_path)
+        : current_log_event_version(client->event_log_service_id, client->event_log_index);
     bool backends_changed = *backends_version != client->event_since_backends;
-    bool log_changed = client->event_log_service_id[0] && *log_version != client->event_since_log;
+    bool has_log_selection = client->event_log_path[0] || client->event_log_service_id[0];
+    bool log_changed = has_log_selection && *log_version != client->event_since_log;
     return *timed_out || backends_changed || log_changed;
 }
 
@@ -12197,7 +12211,7 @@ static void flush_ready_event_clients(ReactorClient *clients, size_t *client_cou
             g_captured_ui_response = &response;
             send_events_response(-1,
                                  backends_version != client->event_since_backends,
-                                 client->event_log_service_id[0] && log_version != client->event_since_log,
+                                 (client->event_log_path[0] || client->event_log_service_id[0]) && log_version != client->event_since_log,
                                  timed_out,
                                  backends_version,
                                  log_version);
@@ -12207,7 +12221,7 @@ static void flush_ready_event_clients(ReactorClient *clients, size_t *client_cou
         } else {
             send_events_response(client->fd,
                                  backends_version != client->event_since_backends,
-                                 client->event_log_service_id[0] && log_version != client->event_since_log,
+                                 (client->event_log_path[0] || client->event_log_service_id[0]) && log_version != client->event_since_log,
                                  timed_out,
                                  backends_version,
                                  log_version);

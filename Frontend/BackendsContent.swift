@@ -432,6 +432,7 @@ private func emptyToNil(_ value: String) -> String? {
 
 private struct LogSelection: Equatable {
     let serviceID: String
+    let serviceScope: String
     let logIndex: Int
 }
 
@@ -881,9 +882,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private var iconMatchLayers: [String: CALayer] = [:]
     private var textMatchStates: [String: TextMatchState] = [:]
     private var textMatchLayers: [String: CATextLayer] = [:]
-    private var pendingMenuActions: [UUID: (serviceID: String, operationByItemID: [String: String])] = [:]
+    private var pendingMenuActions: [UUID: (serviceID: String, serviceScope: String, operationByItemID: [String: String])] = [:]
     private var pendingAppMenuActions: [UUID: (item: AppLauncherItem, operationByItemID: [String: String])] = [:]
-    private var pendingLogMenuSelections: [UUID: (serviceID: String, logIndexByItemID: [String: Int])] = [:]
+    private var pendingLogMenuSelections: [UUID: (serviceID: String, serviceScope: String, logIndexByItemID: [String: Int])] = [:]
     private var logSelectorFrame = CGRect.zero
     private var createSectionFrames: [(frame: CGRect, section: CreateSection)] = []
     private var recipeFrames: [(frame: CGRect, recipeID: String)] = []
@@ -1234,7 +1235,11 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         ]
         if let selectedLog {
             items.append(URLQueryItem(name: "serviceID", value: selectedLog.serviceID))
-            items.append(URLQueryItem(name: "logIndex", value: String(selectedLog.logIndex)))
+            if let logFile = logFile(for: selectedLog), !logFile.path.isEmpty {
+                items.append(URLQueryItem(name: "path", value: logFile.path))
+            } else {
+                items.append(URLQueryItem(name: "logIndex", value: String(selectedLog.logIndex)))
+            }
         }
         components?.queryItems = items
         guard let url = components?.url else { return }
@@ -4496,11 +4501,16 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             renderLogRows()
         }
         var components = URLComponents(url: logsEndpoint, resolvingAgainstBaseURL: false)
-        components?.queryItems = [
+        var items = [
             URLQueryItem(name: "serviceID", value: selection.serviceID),
-            URLQueryItem(name: "logIndex", value: String(selection.logIndex)),
             URLQueryItem(name: "bytes", value: "262144")
         ]
+        if let logFile = logFile(for: selection), !logFile.path.isEmpty {
+            items.append(URLQueryItem(name: "path", value: logFile.path))
+        } else {
+            items.append(URLQueryItem(name: "logIndex", value: String(selection.logIndex)))
+        }
+        components?.queryItems = items
         guard let url = components?.url else {
             isLoadingLog = false
             logError = "Could not build log request."
@@ -4895,10 +4905,20 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         return nil
     }
 
+    private func backendForShowLogsOperation(_ operation: String) -> BackendRecord? {
+        let value = String(operation.dropFirst("showLogs:".count))
+        let pieces = value.split(separator: ":", maxSplits: 1, omittingEmptySubsequences: false)
+        if pieces.count == 2 {
+            let serviceID = String(pieces[0])
+            let serviceScope = String(pieces[1])
+            return backends.first { $0.serviceID == serviceID && $0.serviceScope == serviceScope }
+        }
+        return backends.first { $0.serviceID == value }
+    }
+
     private func performAppMenuAction(_ item: AppLauncherItem, operation: String) {
         if operation.hasPrefix("showLogs:") {
-            let serviceID = String(operation.dropFirst("showLogs:".count))
-            guard let backend = backends.first(where: { $0.serviceID == serviceID }) else { return }
+            guard let backend = backendForShowLogsOperation(operation) else { return }
             showLogs(for: backend)
             return
         }
@@ -7175,7 +7195,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         guard mode == .apps else { return }
         let selections = backends.compactMap { backend -> LogSelection? in
             guard !backend.logFiles.isEmpty else { return nil }
-            return LogSelection(serviceID: backend.serviceID, logIndex: 0)
+            return LogSelection(serviceID: backend.serviceID, serviceScope: backend.serviceScope, logIndex: 0)
         }
         guard !selections.isEmpty else { return }
         let currentIndex = selectedLog.flatMap { selections.firstIndex(of: $0) } ?? 0
@@ -7191,18 +7211,25 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func ensureLogSelection() {
-        guard let selectedServiceID,
-              let preferred = backends.first(where: { $0.serviceID == selectedServiceID }) else {
+        guard let selectedServiceID else {
+            clearLogSelection()
+            return
+        }
+        let preferred = selectedLog.flatMap { selection in
+            backends.first { $0.serviceID == selection.serviceID && $0.serviceScope == selection.serviceScope }
+        } ?? backends.first { $0.serviceID == selectedServiceID }
+        guard let preferred else {
             clearLogSelection()
             return
         }
         if let selectedLog,
            selectedLog.serviceID == selectedServiceID,
+           selectedLog.serviceScope == preferred.serviceScope,
            preferred.logFiles.indices.contains(selectedLog.logIndex) {
             return
         }
         if !preferred.logFiles.isEmpty {
-            selectedLog = LogSelection(serviceID: preferred.serviceID, logIndex: 0)
+            selectedLog = LogSelection(serviceID: preferred.serviceID, serviceScope: preferred.serviceScope, logIndex: 0)
         } else {
             selectedLog = nil
             logSnapshot = nil
@@ -7376,6 +7403,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
     private func selectedBackend() -> BackendRecord? {
         guard let selectedServiceID else { return nil }
+        if let selectedLog,
+           let backend = backends.first(where: { $0.serviceID == selectedLog.serviceID && $0.serviceScope == selectedLog.serviceScope }) {
+            return backend
+        }
         return backends.first { $0.serviceID == selectedServiceID }
     }
 
@@ -7386,10 +7417,19 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private func currentLogFile(for backend: BackendRecord) -> LogFileRecord? {
         guard let selectedLog,
               selectedLog.serviceID == backend.serviceID,
+              selectedLog.serviceScope == backend.serviceScope,
               backend.logFiles.indices.contains(selectedLog.logIndex) else {
             return backend.logFiles.first
         }
         return backend.logFiles[selectedLog.logIndex]
+    }
+
+    private func logFile(for selection: LogSelection) -> LogFileRecord? {
+        guard let backend = backends.first(where: { $0.serviceID == selection.serviceID && $0.serviceScope == selection.serviceScope }),
+              backend.logFiles.indices.contains(selection.logIndex) else {
+            return nil
+        }
+        return backend.logFiles[selection.logIndex]
     }
 
     private func logSelectorTitle(for logFile: LogFileRecord?, index: Int) -> String {
@@ -7405,10 +7445,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         return "\(baseTitle) - \(logFile.path)"
     }
 
-    private func selectLog(serviceID: String, logIndex: Int) {
-        guard let backend = backends.first(where: { $0.serviceID == serviceID }),
+    private func selectLog(serviceID: String, serviceScope: String, logIndex: Int) {
+        guard let backend = backends.first(where: { $0.serviceID == serviceID && $0.serviceScope == serviceScope }),
               backend.logFiles.indices.contains(logIndex) else { return }
-        let nextSelection = LogSelection(serviceID: serviceID, logIndex: logIndex)
+        let nextSelection = LogSelection(serviceID: serviceID, serviceScope: serviceScope, logIndex: logIndex)
         guard selectedLog != nextSelection else { return }
         selectedServiceID = serviceID
         selectedLog = nextSelection
@@ -7426,7 +7466,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
     private func showLogs(for backend: BackendRecord) {
         selectedServiceID = backend.serviceID
-        ensureLogSelection()
+        selectedLog = backend.logFiles.isEmpty
+            ? nil
+            : LogSelection(serviceID: backend.serviceID, serviceScope: backend.serviceScope, logIndex: 0)
         logSnapshot = nil
         logError = ""
         logScroll = 0
@@ -8004,7 +8046,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         var operationByItemID: [String: String] = [:]
         var items: [OuterframeContextMenuItem] = []
         if backend.isBackendsSelf {
-            operationByItemID["showLogs"] = "showLogs:\(backend.serviceID)"
+            operationByItemID["showLogs"] = "showLogs:\(backend.serviceID):\(backend.serviceScope)"
             items.append(OuterframeContextMenuItem(id: "showLogs",
                                                    title: "View Logs for Outer Shell",
                                                    isEnabled: true))
@@ -8060,7 +8102,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         let menu = backendManagementMenuItems(for: backend, includePlaceholderRunActions: true)
         guard !menu.items.isEmpty else { return }
         let menuID = UUID()
-        pendingMenuActions[menuID] = (backend.serviceID, menu.operationByItemID)
+        pendingMenuActions[menuID] = (backend.serviceID, backend.serviceScope, menu.operationByItemID)
         outerframeHost.showContextMenu(menuID: menuID,
                                        items: menu.items,
                                        at: point)
@@ -8135,7 +8177,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             }
 
             let logsItemID = "\(idPrefix)-logs"
-            operationByItemID[logsItemID] = "showLogs:\(endpoint.backend.serviceID)"
+            operationByItemID[logsItemID] = "showLogs:\(endpoint.backend.serviceID):\(endpoint.backend.serviceScope)"
             items.append(OuterframeContextMenuItem(id: logsItemID,
                                                    title: "Show logs",
                                                    isEnabled: true,
@@ -8207,7 +8249,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 : logMenuTitle(for: logFile, index: index, in: backend.logFiles)
             return OuterframeContextMenuItem(id: itemID, title: title, isEnabled: true)
         }
-        pendingLogMenuSelections[menuID] = (backend.serviceID, logIndexByItemID)
+        pendingLogMenuSelections[menuID] = (backend.serviceID, backend.serviceScope, logIndexByItemID)
         outerframeHost.showContextMenu(menuID: menuID,
                                        items: items,
                                        at: point)
@@ -8216,7 +8258,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private func handleContextMenuSelection(menuID: UUID, itemID: String) {
         if let menuSelection = pendingLogMenuSelections.removeValue(forKey: menuID),
            let logIndex = menuSelection.logIndexByItemID[itemID] {
-            selectLog(serviceID: menuSelection.serviceID, logIndex: logIndex)
+            selectLog(serviceID: menuSelection.serviceID, serviceScope: menuSelection.serviceScope, logIndex: logIndex)
             return
         }
 
@@ -8228,12 +8270,11 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
         guard let menuAction = pendingMenuActions.removeValue(forKey: menuID),
               let operation = menuAction.operationByItemID[itemID],
-              let backend = backends.first(where: { $0.serviceID == menuAction.serviceID }) else {
+              let backend = backends.first(where: { $0.serviceID == menuAction.serviceID && $0.serviceScope == menuAction.serviceScope }) else {
             return
         }
         if operation.hasPrefix("showLogs:") {
-            let serviceID = String(operation.dropFirst("showLogs:".count))
-            guard let backend = backends.first(where: { $0.serviceID == serviceID }) else { return }
+            guard let backend = backendForShowLogsOperation(operation) else { return }
             showLogs(for: backend)
             return
         }
