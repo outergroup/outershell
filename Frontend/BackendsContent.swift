@@ -726,6 +726,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private var retainedSelf: BackendsHandler?
     private var appearance: NSAppearance?
     private var currentSize = CGSize(width: 900, height: 620)
+    private var resizeLayoutUpdateScheduled = false
     private var urlSession: URLSession?
     private var backendsEndpoint: URL?
     private var logsEndpoint: URL?
@@ -968,8 +969,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
         case .resizeContent(let size):
             currentSize = size
-            clampScrollOffsets()
-            updateLayout()
+            scheduleResizeLayoutUpdate()
 
         case .systemAppearanceUpdate(let appearance):
             self.appearance = appearance
@@ -1436,6 +1436,17 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 renderPasswordPromptIfNeeded(width: width, height: height)
                 notifyAccessibilityLayoutChanged()
             }
+        }
+    }
+
+    private func scheduleResizeLayoutUpdate() {
+        guard !resizeLayoutUpdateScheduled else { return }
+        resizeLayoutUpdateScheduled = true
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            resizeLayoutUpdateScheduled = false
+            clampScrollOffsets()
+            updateLayout()
         }
     }
 
