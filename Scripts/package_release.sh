@@ -176,22 +176,6 @@ if [ "$os_name" = "Darwin" ]; then
         return 0
     }
 
-    cleanup_legacy_home_screen() {
-        legacy_service_id="dev.outergroup.HomeScreen"
-        legacy_plist_path="$launch_agent_dir/dev.outergroup.HomeScreen.plist"
-        legacy_socket_path="$(getconf DARWIN_USER_TEMP_DIR)dev.outergroup.HomeScreen"
-        legacy_install_root="$outershell_home/home-screen"
-        launchctl bootout "gui/$(id -u)/$legacy_service_id" >/dev/null 2>&1 || launchctl remove "$legacy_service_id" >/dev/null 2>&1 || true
-        rm -f "$legacy_plist_path" "$legacy_socket_path"
-        rm -rf "$legacy_install_root"
-        if [ -x "$outerctl_path" ]; then
-            OUTERSHELL_HOME="$outershell_home" "$outerctl_path" app clear --backend "$legacy_service_id" >/dev/null 2>&1 || true
-            OUTERSHELL_HOME="$outershell_home" "$outerctl_path" log clear --backend "$legacy_service_id" >/dev/null 2>&1 || true
-            OUTERSHELL_HOME="$outershell_home" "$outerctl_path" launchd clear --backend "$legacy_service_id" >/dev/null 2>&1 || true
-            OUTERSHELL_HOME="$outershell_home" "$outerctl_path" backend remove --backend "$legacy_service_id" >/dev/null 2>&1 || true
-        fi
-    }
-
     bootstrap_outer_shell() {
         attempts=20
         last_error=""
@@ -220,7 +204,6 @@ if [ "$os_name" = "Darwin" ]; then
             OUTERSHELL_HOME="$outershell_home" "$outerctl_path" backend remove --backend "$service_id" >/dev/null 2>&1 || true
         fi
         rm -rf "$install_root"
-        cleanup_legacy_home_screen
         printf 'Outer Shell has been uninstalled. Outer Loop will offer to install it again the next time it connects.\n'
         exit 0
     fi
@@ -295,7 +278,6 @@ EOF
 
     printf '[%s] %s Outer Shell package %s from %s.\n' "$(timestamp)" "$command" "__OUTER_SHELL_VERSION__" "$public_base_url" >> "$log_path"
 
-    cleanup_legacy_home_screen
     bootstrap_outer_shell
     launchctl kickstart -k "gui/$(id -u)/$service_id" >/dev/null 2>&1 || true
     attempts=50
@@ -342,9 +324,22 @@ system_outerctl_path="$system_outershell_home/bin/outerctl"
 system_version_path="$system_daemon_root/version"
 system_binary_users_dir="$system_outershell_home/system-binary-users"
 system_binary_user_marker="$system_binary_users_dir/uid-$(id -u)"
+home_dir="${HOME:-}"
+if [ -z "$home_dir" ]; then
+    if command -v getent >/dev/null 2>&1; then
+        home_dir="$(getent passwd "$(id -u)" | awk -F: '{print $6}')"
+    fi
+    if [ -z "$home_dir" ]; then
+        if [ "$(id -u)" -eq 0 ]; then
+            home_dir="/root"
+        else
+            home_dir="/home/$(id -un)"
+        fi
+    fi
+fi
 
 if [ "$root_install" = true ]; then
-    cache_home="${XDG_CACHE_HOME:-$HOME/.cache}"
+    cache_home="${XDG_CACHE_HOME:-$home_dir/.cache}"
     outershell_cache_home="$cache_home/outershell"
     outer_shell_cache_root="$outershell_cache_home/outer-shell"
     outer_shell_install_cache="$outer_shell_cache_root/install"
@@ -367,12 +362,12 @@ if [ "$root_install" = true ]; then
     service_wanted_by="multi-user.target"
     api_listen_stream="$api_socket_path"
 else
-    cache_home="${XDG_CACHE_HOME:-$HOME/.cache}"
+    cache_home="${XDG_CACHE_HOME:-$home_dir/.cache}"
     outershell_cache_home="$cache_home/outershell"
     outer_shell_cache_root="$outershell_cache_home/outer-shell"
     outer_shell_install_cache="$outer_shell_cache_root/install"
     runtime_dir="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
-    state_home="${XDG_STATE_HOME:-$HOME/.local/state}"
+    state_home="${XDG_STATE_HOME:-$home_dir/.local/state}"
     outershell_home="${OUTERSHELL_HOME:-$state_home/outershell}"
     install_root="$outershell_home/outer-shell"
     daemon_root="$outershell_home/outershelld"
@@ -380,7 +375,7 @@ else
     daemon_version_path="$daemon_root/version"
     app_version_path="$install_root/version"
     outerctl_path="$outershell_home/bin/outerctl"
-    unit_dir="$HOME/.config/systemd/user"
+    unit_dir="$home_dir/.config/systemd/user"
     socket_path="$runtime_dir/org.outershell.OuterShell"
     api_socket_path="$runtime_dir/outershelld-api"
     app_log_dir="$install_root/logs"
@@ -524,22 +519,6 @@ EOF
     rm -f "$cleanup_root_script"
 }
 
-cleanup_legacy_home_screen() {
-    legacy_install_root="$outershell_home/home-screen"
-    legacy_socket_path="$runtime_dir/dev.outergroup.HomeScreen"
-    legacy_service_id="dev.outergroup.HomeScreen"
-    systemctl $systemctl_scope disable --now dev.outergroup.HomeScreen.socket dev.outergroup.HomeScreen.service >/dev/null 2>&1 || true
-    rm -f "$unit_dir/dev.outergroup.HomeScreen.service" "$unit_dir/dev.outergroup.HomeScreen.socket" "$legacy_socket_path"
-    systemctl $systemctl_scope daemon-reload >/dev/null 2>&1 || true
-    rm -rf "$legacy_install_root"
-    if [ -x "$outerctl_path" ]; then
-        run_outerctl app clear --backend "$legacy_service_id" >/dev/null 2>&1 || true
-        run_outerctl log clear --backend "$legacy_service_id" >/dev/null 2>&1 || true
-        run_outerctl systemd clear --backend "$legacy_service_id" >/dev/null 2>&1 || true
-        run_outerctl backend remove --backend "$legacy_service_id" >/dev/null 2>&1 || true
-    fi
-}
-
 if [ "$command" = "uninstall" ]; then
     if [ "$root_install" = true ]; then
         systemctl --system disable org.outershell.OuterShell.socket >/dev/null 2>&1 || true
@@ -597,18 +576,16 @@ rmdir "$outer_shell_cache_root" "$outershell_cache_home" >/dev/null 2>&1 || true
 rm -f "$cleanup_script"
 EOF
     chmod 0755 "$cleanup_script"
-    if [ "$root_install" = false ] && command -v systemd-run >/dev/null 2>&1; then
+    if command -v systemd-run >/dev/null 2>&1; then
         systemd-run $systemctl_scope --unit=org.outershell.OuterShell-uninstall --collect "$cleanup_script" >/dev/null 2>&1 || (nohup "$cleanup_script" >/dev/null 2>&1 &)
     else
         nohup "$cleanup_script" >/dev/null 2>&1 &
     fi
-    cleanup_legacy_home_screen
     printf 'Outer Shell has been uninstalled. Outer Loop will offer to install it again the next time it connects.\n'
     exit 0
 fi
 
 mkdir -p "$install_root" "$daemon_root" "$outershell_home/bin" "$unit_dir" "$app_log_dir" "$daemon_log_dir"
-cleanup_legacy_home_screen
 archive_path="$(mktemp)"
 payload_outerctl_path="$(mktemp)"
 stage_archive "${public_base_url%/}/latest/outer-shell-${arch}.tar.gz?v=__ASSET_VERSION__" "$archive_path"

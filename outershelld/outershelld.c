@@ -1278,7 +1278,7 @@ static void legacy_user_outerctl_path(char *out, size_t out_size) {
 #endif
 }
 
-static void legacy_home_screen_outerctl_path(char *out, size_t out_size) {
+static void legacy_outer_shell_outerctl_path(char *out, size_t out_size) {
 #ifdef __APPLE__
     snprintf(out, out_size, "%s/Library/dev.outergroup.OuterLoop/outerctl", home_directory());
 #else
@@ -1793,9 +1793,27 @@ static sqlite3 *open_legacy_sqlite_registry_at(const char *path, char *error, si
     return database;
 }
 
+static void archive_migrated_sqlite_registry(const char *sqlite_path) {
+    if (!sqlite_path || !sqlite_path[0]) return;
+    char migrated_path[PATH_MAX];
+    int written = snprintf(migrated_path, sizeof(migrated_path), "%s.migrated", sqlite_path);
+    if (written < 0 || (size_t)written >= sizeof(migrated_path)) {
+        log_event("Could not archive migrated registry %s: path is too long.", sqlite_path);
+        return;
+    }
+    (void)unlink(migrated_path);
+    if (rename(sqlite_path, migrated_path) != 0 && errno != ENOENT) {
+        log_event("Could not archive migrated registry %s: %s", sqlite_path, strerror(errno));
+    }
+}
+
 static bool migrate_sqlite_registry_to_binary_if_needed(const char *sqlite_path, const char *binary_path, char *error, size_t error_size) {
     struct stat binary_stat;
     if (stat(binary_path, &binary_stat) == 0 && S_ISREG(binary_stat.st_mode)) {
+        struct stat sqlite_stat;
+        if (stat(sqlite_path, &sqlite_stat) == 0 && S_ISREG(sqlite_stat.st_mode)) {
+            archive_migrated_sqlite_registry(sqlite_path);
+        }
         return true;
     }
     if (errno != ENOENT) {
@@ -1816,6 +1834,7 @@ static bool migrate_sqlite_registry_to_binary_if_needed(const char *sqlite_path,
               export_registry_binary_from_sqlite(database, sqlite_path, error, error_size);
     sqlite3_close(database);
     if (ok) {
+        archive_migrated_sqlite_registry(sqlite_path);
         log_event("Migrated registry.sqlite3 to registry.orwa at %s.", binary_path);
     }
     return ok;
@@ -2388,7 +2407,11 @@ static bool merge_registry_database(const char *old_path,
     }
     sqlite3_free(old_frontends_sql);
     sqlite3_close(old_database);
-    return close_registry_readwrite_at(database, new_path, ok, error, error_size) && ok;
+    ok = close_registry_readwrite_at(database, new_path, ok, error, error_size) && ok;
+    if (ok) {
+        archive_migrated_sqlite_registry(old_path);
+    }
+    return ok;
 }
 
 static void rename_if_possible(const char *old_path, const char *new_path) {
@@ -2437,13 +2460,13 @@ static void migrate_user_outershell_state(void) {
     char old_apps_root[PATH_MAX];
     char new_apps_root[PATH_MAX];
     char old_outerctl[PATH_MAX];
-    char old_home_screen_outerctl[PATH_MAX];
+    char old_outer_shell_outerctl[PATH_MAX];
     char new_outerctl[PATH_MAX];
     legacy_user_registry_database_path(old_registry, sizeof(old_registry));
     legacy_user_apps_root(old_apps_root, sizeof(old_apps_root));
     default_user_outershell_apps_root(new_apps_root, sizeof(new_apps_root));
     legacy_user_outerctl_path(old_outerctl, sizeof(old_outerctl));
-    legacy_home_screen_outerctl_path(old_home_screen_outerctl, sizeof(old_home_screen_outerctl));
+    legacy_outer_shell_outerctl_path(old_outer_shell_outerctl, sizeof(old_outer_shell_outerctl));
     default_user_outerctl_path(new_outerctl, sizeof(new_outerctl));
     char new_root[PATH_MAX];
     default_user_outershell_root(new_root, sizeof(new_root));
@@ -2451,7 +2474,7 @@ static void migrate_user_outershell_state(void) {
     (void)mkdir_p(new_apps_root);
 
     TextReplacement replacements[] = {
-        {old_home_screen_outerctl, new_outerctl},
+        {old_outer_shell_outerctl, new_outerctl},
         {old_outerctl, new_outerctl},
         {old_apps_root, new_apps_root},
         {"outeragent.log", "backend.log"},
@@ -2465,16 +2488,20 @@ static void migrate_user_outershell_state(void) {
                                                                   binary_registry,
                                                                   sizeof(binary_registry)) &&
                                       access(binary_registry, F_OK) == 0;
-    if (!new_binary_registry_exists && access(old_registry, R_OK) == 0) {
-        if (merge_registry_database(old_registry,
-                                    g_registry_database_path,
-                                    replacements,
-                                    sizeof(replacements) / sizeof(replacements[0]),
-                                    error,
-                                    sizeof(error))) {
-            log_event("Migrated user outershell registry from %s to %s.", old_registry, g_registry_database_path);
+    if (access(old_registry, R_OK) == 0) {
+        if (!new_binary_registry_exists) {
+            if (merge_registry_database(old_registry,
+                                        g_registry_database_path,
+                                        replacements,
+                                        sizeof(replacements) / sizeof(replacements[0]),
+                                        error,
+                                        sizeof(error))) {
+                log_event("Migrated user outershell registry from %s to %s.", old_registry, g_registry_database_path);
+            } else {
+                log_event("Failed to migrate user registry from %s: %s", old_registry, error);
+            }
         } else {
-            log_event("Failed to migrate user registry from %s: %s", old_registry, error);
+            archive_migrated_sqlite_registry(old_registry);
         }
     }
 
@@ -6890,17 +6917,45 @@ static bool run_home_screen_install_script(const char *subcommand,
              quoted_script_path,
              quoted_subcommand);
 
+#ifdef __linux__
     if (strcmp(subcommand, "update") == 0 || strcmp(subcommand, "uninstall") == 0) {
-        char async_command[9000];
-        snprintf(async_command, sizeof(async_command), "( %s ) >/dev/null 2>&1 &", command);
-        int status = system(async_command);
+        char quoted_command[18000];
+        shell_quote(command, quoted_command, sizeof(quoted_command));
+        const char *scope = (geteuid() == 0) ? "--system" : "--user";
+        const char *unit_suffix = (strcmp(subcommand, "uninstall") == 0) ? "uninstall" : "update";
+        char launch_command[20000];
+        snprintf(launch_command,
+                 sizeof(launch_command),
+                 "systemd-run %s --unit=org.outershell.OuterShell-installer-%s --collect /bin/sh -c %s",
+                 scope,
+                 unit_suffix,
+                 quoted_command);
+
+        FILE *pipe = popen(launch_command, "r");
+        if (!pipe) {
+            snprintf(message, message_size, "Failed to start Outer Shell %s: %s", subcommand, strerror(errno));
+            return false;
+        }
+        size_t offset = 0;
+        while (offset + 1 < message_size) {
+            size_t got = fread(message + offset, 1, message_size - offset - 1, pipe);
+            offset += got;
+            if (got == 0) break;
+        }
+        message[offset] = '\0';
+        int status = pclose(pipe);
         if (status == 0) {
-            snprintf(message, message_size, "Outer Shell %s started.", subcommand);
+            if (!message[0]) {
+                snprintf(message, message_size, "Outer Shell %s started.", subcommand);
+            }
             return true;
         }
-        snprintf(message, message_size, "Failed to start Outer Shell %s.", subcommand);
+        if (!message[0]) {
+            snprintf(message, message_size, "Failed to start Outer Shell %s.", subcommand);
+        }
         return false;
     }
+#endif
 
     FILE *pipe = popen(command, "r");
     if (!pipe) {
@@ -7556,12 +7611,12 @@ static void write_root_apps_marker_cleanup_shell(FILE *script) {
 static bool run_root_outershell_migration(const char *sudo_password, bool *needs_password, char *message, size_t message_size) {
     if (needs_password) *needs_password = false;
     char old_outerctl[PATH_MAX];
-    char old_home_screen_outerctl[PATH_MAX];
+    char old_outer_shell_outerctl[PATH_MAX];
     char new_outerctl[PATH_MAX];
     char old_user_apps[PATH_MAX];
     char new_user_apps[PATH_MAX];
     legacy_user_outerctl_path(old_outerctl, sizeof(old_outerctl));
-    legacy_home_screen_outerctl_path(old_home_screen_outerctl, sizeof(old_home_screen_outerctl));
+    legacy_outer_shell_outerctl_path(old_outer_shell_outerctl, sizeof(old_outer_shell_outerctl));
     default_user_outerctl_path(new_outerctl, sizeof(new_outerctl));
     legacy_user_apps_root(old_user_apps, sizeof(old_user_apps));
     default_user_outershell_apps_root(new_user_apps, sizeof(new_user_apps));
@@ -7583,7 +7638,7 @@ static bool run_root_outershell_migration(const char *sudo_password, bool *needs
     snprintf(new_system_apps_root, sizeof(new_system_apps_root), "%s/apps", kSystemOuterShellRoot);
 
     char quoted_old_outerctl[PATH_MAX + 8];
-    char quoted_old_home_screen_outerctl[PATH_MAX + 8];
+    char quoted_old_outer_shell_outerctl[PATH_MAX + 8];
     char quoted_new_outerctl[PATH_MAX + 8];
     char quoted_old_user_apps[PATH_MAX + 8];
     char quoted_new_user_apps[PATH_MAX + 8];
@@ -7592,7 +7647,7 @@ static bool run_root_outershell_migration(const char *sudo_password, bool *needs
     char quoted_new_root[PATH_MAX + 8];
     char quoted_new_system_apps_root[PATH_MAX + 8];
     shell_quote(old_outerctl, quoted_old_outerctl, sizeof(quoted_old_outerctl));
-    shell_quote(old_home_screen_outerctl, quoted_old_home_screen_outerctl, sizeof(quoted_old_home_screen_outerctl));
+    shell_quote(old_outer_shell_outerctl, quoted_old_outer_shell_outerctl, sizeof(quoted_old_outer_shell_outerctl));
     shell_quote(new_outerctl, quoted_new_outerctl, sizeof(quoted_new_outerctl));
     shell_quote(old_user_apps, quoted_old_user_apps, sizeof(quoted_old_user_apps));
     shell_quote(new_user_apps, quoted_new_user_apps, sizeof(quoted_new_user_apps));
@@ -7601,7 +7656,7 @@ static bool run_root_outershell_migration(const char *sudo_password, bool *needs
     shell_quote(kSystemOuterShellRoot, quoted_new_root, sizeof(quoted_new_root));
     shell_quote(new_system_apps_root, quoted_new_system_apps_root, sizeof(quoted_new_system_apps_root));
 
-    char script_template[] = "/tmp/homescreen-root-migration-XXXXXX";
+    char script_template[] = "/tmp/outershell-root-migration-XXXXXX";
     int script_fd = mkstemp(script_template);
     if (script_fd < 0) {
         snprintf(message, message_size, "Failed to create privileged migration script: %s", strerror(errno));
@@ -7638,7 +7693,7 @@ static bool run_root_outershell_migration(const char *sudo_password, bool *needs
             "fi\n"
             "find \"$NEW_SYSTEM_APPS\" -name outeragent.log -type f -exec sh -c 'for path do mv \"$path\" \"$(dirname \"$path\")/backend.log\" 2>/dev/null || true; done' sh {} + 2>/dev/null || true\n"
             "export OLD_DB NEW_DB OLD_ROOT NEW_ROOT OLD_SYSTEM_APPS NEW_SYSTEM_APPS OLD_OUTERCTL OLD_OUTER_SHELL_OUTERCTL NEW_OUTERCTL OLD_USER_APPS NEW_USER_APPS\n"
-            "python3 - <<'__HOMESCREEN_ROOT_MIGRATION__'\n"
+            "python3 - <<'__OUTERSHELL_ROOT_MIGRATION__'\n"
             "import os, sqlite3, urllib.parse\n"
             "old_db = os.environ['OLD_DB']\n"
             "new_db = os.environ['NEW_DB']\n"
@@ -7744,7 +7799,7 @@ static bool run_root_outershell_migration(const char *sudo_password, bool *needs
             "            if new_text != text:\n"
             "                with open(path, 'w', encoding='utf-8') as f:\n"
             "                    f.write(new_text)\n"
-            "__HOMESCREEN_ROOT_MIGRATION__\n"
+            "__OUTERSHELL_ROOT_MIGRATION__\n"
             "chmod 0755 \"$NEW_ROOT\" >/dev/null 2>&1 || true\n"
             "if [ -d \"$OLD_ROOT\" ]; then mv \"$OLD_ROOT\" \"$OLD_ROOT.migrated.$(date +%%s)\" >/dev/null 2>&1 || true; fi\n"
             "chmod 0644 \"$NEW_DB\" >/dev/null 2>&1 || true\n"
@@ -7767,7 +7822,7 @@ static bool run_root_outershell_migration(const char *sudo_password, bool *needs
             quoted_legacy_system_apps_root,
             quoted_new_system_apps_root,
             quoted_old_outerctl,
-            quoted_old_home_screen_outerctl,
+            quoted_old_outer_shell_outerctl,
             quoted_new_outerctl,
             quoted_old_user_apps,
             quoted_new_user_apps);
