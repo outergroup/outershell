@@ -63,19 +63,6 @@ private struct BackendRecord: Decodable {
         isMigration ?? false
     }
 
-    var pathText: String {
-        if let serviceUnitPath,
-           !serviceUnitPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            return serviceUnitPath
-        }
-        if !launchdPlistPath.isEmpty {
-            return launchdPlistPath
-        }
-        if !serviceUnit.isEmpty {
-            return serviceUnit
-        }
-        return "--"
-    }
 }
 
 private struct BundledCatalogEntry {
@@ -494,28 +481,6 @@ private struct AppLauncherBadgeTarget {
     let displayName: String
 }
 
-private struct BackendListRow {
-    let backend: BackendRecord
-    let frontend: FrontendRecord?
-    let frontendIndex: Int?
-    let isFrontendChild: Bool
-
-    var serviceID: String { backend.serviceID }
-
-    var iconKey: String? {
-        guard let frontendIndex,
-              let frontend else { return nil }
-        return frontendIdentityKey(backend: backend, frontend: frontend, frontendIndex: frontendIndex)
-    }
-
-    var rowID: String {
-        if let frontendIndex {
-            return "\(backendIdentityKey(backend)):frontend:\(frontendIndex)"
-        }
-        return "\(backendIdentityKey(backend)):backend"
-    }
-}
-
 private func backendIdentityKey(_ backend: BackendRecord) -> String {
     let path = backend.serviceUnitPath ?? backend.serviceUnit
     return "\(backend.serviceID):\(backend.serviceScope):\(path)"
@@ -784,7 +749,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         return controller
     }()
     private var createMessage = ""
-    private var backendScroll: CGFloat = 0
     private var logScroll: CGFloat = 0
     private var shouldScrollLogToBottomOnNextLayout = false
     private var logRenderedText = ""
@@ -851,9 +815,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private let appsLayer = CALayer()
     private let appsScrollContentLayer = CALayer()
     private let appsOverlayLayer = CALayer()
-    private let tableHeaderLayer = CALayer()
-    private let rowsClipLayer = CALayer()
-    private let backendRowsContentLayer = CALayer()
     private let logHeaderLayer = CALayer()
     private let logRowsClipLayer = CALayer()
     private let logTextContentLayer = CALayer()
@@ -866,7 +827,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private let passwordOverlayLayer = CALayer()
     private let filePickerOverlayLayer = CALayer()
 
-    private var newBackendRowFrame = CGRect.zero
     private var appCardFrames: [(frame: CGRect, item: AppLauncherItem)] = []
     private var appBadgeFrames: [AppLauncherBadgeTarget] = []
     private var appListDropFrames: [(frame: CGRect, listName: String)] = []
@@ -876,8 +836,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private var appsContentBottom: CGFloat = 0
     private var pendingAppDrag: PendingAppDrag?
     private var pendingButtonClick: PendingButtonClick?
-    private var backendRowFrames: [(frame: CGRect, row: BackendListRow)] = []
-    private var backendActionFrames: [(frame: CGRect, row: BackendListRow, operation: String)] = []
     private var iconMatchStates: [String: IconMatchState] = [:]
     private var iconMatchLayers: [String: CALayer] = [:]
     private var textMatchStates: [String: TextMatchState] = [:]
@@ -889,7 +847,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private var createSectionFrames: [(frame: CGRect, section: CreateSection)] = []
     private var recipeFrames: [(frame: CGRect, recipeID: String)] = []
     private var bundledAppInstallFrames: [(frame: CGRect, backend: BackendRecord)] = []
-    private var bundledAppMenuFrames: [(frame: CGRect, backend: BackendRecord)] = []
     private var createFieldFrames: [(frame: CGRect, key: String)] = []
     private var createFieldLayouts: [String: CreateFieldLayout] = [:]
     private var createChoiceFrames: [(frame: CGRect, key: String, value: String)] = []
@@ -921,8 +878,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private var filePickerScroll: CGFloat = 0
 
     private let toolbarHeight: CGFloat = 48
-    private let tableHeaderHeight: CGFloat = 30
-    private let backendRowHeight: CGFloat = 44
+    private let wheelScrollLineHeight: CGFloat = 44
     private let logHeaderHeight: CGFloat = 62
     private let logTextInsetX: CGFloat = 12
     private let logTextInsetY: CGFloat = 10
@@ -1316,9 +1272,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         contentLayer.addSublayer(appsLayer)
         appsLayer.addSublayer(appsScrollContentLayer)
         appsLayer.addSublayer(appsOverlayLayer)
-        contentLayer.addSublayer(tableHeaderLayer)
-        contentLayer.addSublayer(rowsClipLayer)
-        rowsClipLayer.addSublayer(backendRowsContentLayer)
         contentLayer.addSublayer(dividerLayer)
         contentLayer.addSublayer(logHeaderLayer)
         contentLayer.addSublayer(logRowsClipLayer)
@@ -1338,7 +1291,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         passwordOverlayLayer.isHidden = true
         filePickerOverlayLayer.isHidden = true
         appsLayer.masksToBounds = true
-        rowsClipLayer.masksToBounds = true
         logRowsClipLayer.masksToBounds = true
 
         for layer in [titleLayer, statusLayer] {
@@ -1404,8 +1356,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 if mode == .apps || mode == .create {
                     outerframeHost.sendTextInputGeometryUpdate(nil)
                     appsLayer.isHidden = false
-                    tableHeaderLayer.isHidden = true
-                    rowsClipLayer.isHidden = true
                     dividerLayer.isHidden = selectedServiceID == nil
                     logHeaderLayer.isHidden = selectedServiceID == nil
                     logRowsClipLayer.isHidden = selectedServiceID == nil
@@ -1428,8 +1378,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                     }
                 } else {
                     appsLayer.isHidden = true
-                    tableHeaderLayer.isHidden = true
-                    rowsClipLayer.isHidden = true
                     dividerLayer.isHidden = true
                     logHeaderLayer.isHidden = true
                     logRowsClipLayer.isHidden = true
@@ -1462,7 +1410,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 rootLayer.backgroundColor = resolvedCGColor(.windowBackgroundColor)
                 toolbarLayer.backgroundColor = resolvedCGColor(.controlBackgroundColor)
                 contentLayer.backgroundColor = resolvedCGColor(.windowBackgroundColor)
-                tableHeaderLayer.backgroundColor = resolvedCGColor(NSColor.controlBackgroundColor.withAlphaComponent(0.9))
                 logHeaderLayer.backgroundColor = resolvedCGColor(NSColor.controlBackgroundColor.withAlphaComponent(0.9))
                 dividerLayer.backgroundColor = resolvedCGColor(.separatorColor)
 
@@ -1486,30 +1433,12 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         }
     }
 
-    private func renderBackendsHeader() {
-        tableHeaderLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
-        let columns = backendColumns(width: tableHeaderLayer.bounds.width)
-        for column in columns {
-            let layer = makeTextLayer(size: 11, weight: .medium, color: .secondaryLabelColor)
-            layer.string = column.title
-            layer.frame = CGRect(x: column.x, y: 8, width: column.width, height: 16)
-            tableHeaderLayer.addSublayer(layer)
-        }
-    }
-
     private func updateAppsScrollLayerFrames() {
         appsScrollContentLayer.frame = CGRect(x: 0,
                                               y: appsScroll,
                                               width: appsLayer.bounds.width,
                                               height: appsLayer.bounds.height)
         appsOverlayLayer.frame = appsLayer.bounds
-    }
-
-    private func updateBackendRowsScrollLayerFrame() {
-        backendRowsContentLayer.frame = CGRect(x: 0,
-                                               y: backendScroll,
-                                               width: rowsClipLayer.bounds.width,
-                                               height: rowsClipLayer.bounds.height)
     }
 
     private func updateMatchedLayerVisibility() {
@@ -1567,153 +1496,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 break
             }
         }
-    }
-
-    private func renderBackendsRows() {
-        for layer in rowsClipLayer.sublayers ?? [] where layer !== backendRowsContentLayer {
-            layer.removeFromSuperlayer()
-        }
-        if backendRowsContentLayer.superlayer == nil {
-            rowsClipLayer.addSublayer(backendRowsContentLayer)
-        }
-        backendRowsContentLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
-        backendRowFrames.removeAll()
-        backendActionFrames.removeAll()
-        newBackendRowFrame = .zero
-        iconMatchStates.removeAll()
-        textMatchStates.removeAll()
-        var visibleIconKeys = Set<String>()
-        var visibleTextKeys = Set<String>()
-
-        let rows = backendListRows()
-        if rows.isEmpty {
-            let empty = makeTextLayer(size: 13, weight: .regular, color: .tertiaryLabelColor, alignment: .center)
-            empty.string = isLoadingBackends ? "Loading backends..." : (backendError.isEmpty ? "No registered backends." : backendError)
-            empty.frame = CGRect(x: horizontalInset, y: max(rowsClipLayer.bounds.midY - 10, 0), width: max(rowsClipLayer.bounds.width - horizontalInset * 2, 1), height: 20)
-            rowsClipLayer.addSublayer(empty)
-        }
-
-        let totalRows = rows.count + 1
-        let columns = backendColumns(width: rowsClipLayer.bounds.width)
-        let selectedBackground = resolvedCGColor(NSColor.controlAccentColor.withAlphaComponent(0.14))
-        let alternating = alternatingRowColors()
-
-        for index in 0..<totalRows {
-            let y = rowsClipLayer.bounds.height - CGFloat(index + 1) * backendRowHeight
-            let rowFrame = CGRect(x: 0, y: y, width: rowsClipLayer.bounds.width, height: backendRowHeight)
-            if index == rows.count {
-                renderNewBackendRow(rowFrame: rowFrame,
-                                    columns: columns,
-                                    backgroundColor: index.isMultiple(of: 2) ? alternating.even : alternating.odd)
-                continue
-            }
-
-            let row = rows[index]
-            let backend = row.backend
-            backendRowFrames.append((rowFrame, row))
-
-            let rowLayer = CALayer()
-            rowLayer.frame = rowFrame
-            if backend.serviceID == selectedServiceID {
-                rowLayer.backgroundColor = selectedBackground
-            } else if index.isMultiple(of: 2) {
-                rowLayer.backgroundColor = alternating.even
-            } else {
-                rowLayer.backgroundColor = alternating.odd
-            }
-            backendRowsContentLayer.addSublayer(rowLayer)
-
-            let italic = backend.isBundledPlaceholder
-            let indent: CGFloat
-            if row.isFrontendChild {
-                indent = addFrontendIcon(for: row,
-                                         rowLayer: rowLayer,
-                                         column: columns[0],
-                                         visibleIconKeys: &visibleIconKeys)
-            } else {
-                indent = 0
-            }
-            let visibleName = rowName(for: row)
-            if !recordBackendNameMatches(for: row,
-                                          visibleName: visibleName,
-                                          rowLayer: rowLayer,
-                                          column: columns[0],
-                                          y: 14,
-                                          xOffset: indent,
-                                          italic: italic,
-                                          visibleTextKeys: &visibleTextKeys) {
-                addCell(to: rowLayer, text: visibleName, column: columns[0], y: 14, xOffset: indent, weight: row.isFrontendChild ? .regular : .medium, italic: italic, emptyPlaceholder: "")
-            }
-            addCell(to: rowLayer, text: rowStatus(for: row), column: columns[1], y: 14, color: row.isFrontendChild ? .secondaryLabelColor : statusColor(backend.status), italic: italic, emptyPlaceholder: "")
-            addCell(to: rowLayer, text: rowPathText(for: row), column: columns[2], y: 14, color: .secondaryLabelColor, italic: italic)
-
-            let actions = rowActions(for: row)
-            if !actions.isEmpty {
-                var x = columns[3].x
-                for action in actions {
-                    let width = actionButtonWidth(for: action.operation)
-                    let actionFrame = CGRect(x: x, y: 8, width: min(width, max(columns[3].x + columns[3].width - x - 6, 1)), height: 28)
-                    backendActionFrames.append((CGRect(x: actionFrame.minX,
-                                                       y: rowFrame.minY + actionFrame.minY,
-                                                       width: actionFrame.width,
-                                                       height: actionFrame.height),
-                                                row,
-                                                action.operation))
-                    let button = makeActionButtonLayer(title: action.title, operation: action.operation)
-                    button.frame = actionFrame
-                    rowLayer.addSublayer(button)
-                    x += width + 6
-                    if x >= columns[3].x + columns[3].width - 6 { break }
-                }
-            } else {
-                addCell(to: rowLayer, text: "--", column: columns[3], y: 14, color: .tertiaryLabelColor, alignment: .center)
-            }
-        }
-        hideUnrenderedMatchedLayers(visibleIconKeys: visibleIconKeys, visibleTextKeys: visibleTextKeys)
-        updateMatchedLayerVisibility()
-    }
-
-    private func renderNewBackendRow(rowFrame: CGRect,
-                                     columns: [(title: String, x: CGFloat, width: CGFloat)],
-                                     backgroundColor: CGColor) {
-        newBackendRowFrame = rowFrame
-
-        let rowLayer = CALayer()
-        rowLayer.frame = rowFrame
-        rowLayer.backgroundColor = backgroundColor
-        backendRowsContentLayer.addSublayer(rowLayer)
-
-        let iconSize: CGFloat = 18
-        let icon = CALayer()
-        icon.frame = CGRect(x: columns[0].x,
-                            y: floor((backendRowHeight - iconSize) / 2),
-                            width: iconSize,
-                            height: iconSize)
-        icon.contentsGravity = .resizeAspect
-        icon.contentsScale = 2
-        icon.contents = symbolCGImage(named: "plus.circle", pointSize: iconSize)
-        rowLayer.addSublayer(icon)
-
-        addCell(to: rowLayer,
-                text: "New",
-                column: columns[0],
-                y: 14,
-                xOffset: iconSize + 8,
-                color: .controlAccentColor,
-                weight: .medium,
-                emptyPlaceholder: "")
-        addCell(to: rowLayer,
-                text: "Create",
-                column: columns[1],
-                y: 14,
-                color: .secondaryLabelColor,
-                emptyPlaceholder: "")
-        addCell(to: rowLayer,
-                text: "Add a backend",
-                column: columns[2],
-                y: 14,
-                color: .secondaryLabelColor,
-                emptyPlaceholder: "")
     }
 
     private func renderAppsPage() {
@@ -2314,30 +2096,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         }
     }
 
-    private func addFrontendIcon(for row: BackendListRow,
-                                 rowLayer: CALayer,
-                                 column: (title: String, x: CGFloat, width: CGFloat),
-                                 visibleIconKeys: inout Set<String>) -> CGFloat {
-        guard row.isFrontendChild else { return 0 }
-        let iconSize: CGFloat = 22
-        let iconX = column.x + 18
-        let title = frontendIconTitle(for: row)
-        if let key = row.iconKey {
-            recordMatchedIcon(key: key,
-                              frame: rootLayer.convert(CGRect(x: iconX,
-                                                              y: floor((backendRowHeight - iconSize) / 2),
-                                                              width: iconSize,
-                                                              height: iconSize),
-                                                       from: rowLayer),
-                              image: row.frontend?.iconImage,
-                              symbolName: appIconSymbolName(for: row.backend),
-                              symbolColor: appIconTintColor(for: row.backend),
-                              title: title)
-            visibleIconKeys.insert(key)
-        }
-        return 48
-    }
-
     private func makeLauncherIconLayer(image: NSImage?,
                                        symbolName: String?,
                                        symbolColor: NSColor = .controlAccentColor,
@@ -2377,15 +2135,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             icon.contents = letterIconCGImage(for: title)
             icon.backgroundColor = resolvedCGColor(.clear)
         }
-    }
-
-    private func frontendIconTitle(for row: BackendListRow) -> String {
-        let frontendName = row.frontend?.name.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        if !frontendName.isEmpty {
-            return frontendName
-        }
-        let backendName = row.backend.displayName.trimmingCharacters(in: .whitespacesAndNewlines)
-        return backendName.isEmpty ? "Frontend" : backendName
     }
 
     private func letterIconCGImage(for title: String) -> CGImage? {
@@ -2475,52 +2224,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         iconMatchLayers[key] = layer
     }
 
-    private func recordBackendNameMatches(for row: BackendListRow,
-                                          visibleName: String,
-                                          rowLayer: CALayer,
-                                          column: (title: String, x: CGFloat, width: CGFloat),
-                                          y: CGFloat,
-                                          xOffset: CGFloat,
-                                          italic: Bool,
-                                          visibleTextKeys: inout Set<String>) -> Bool {
-        if row.isFrontendChild {
-            guard !visibleName.isEmpty,
-                  let key = row.iconKey else {
-                return false
-            }
-            let frame = rootLayer.convert(cellFrame(column: column, y: y, xOffset: xOffset), from: rowLayer)
-            recordMatchedText(key: key,
-                              frame: frame,
-                              title: visibleName,
-                              fontSize: 12,
-                              weight: .regular,
-                              alignment: .left,
-                              isWrapped: false)
-            visibleTextKeys.insert(key)
-            return true
-        }
-
-        let backendName = row.backend.displayName.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let match = row.backend.frontends.enumerated().first(where: { _, frontend in
-            let frontendName = frontend.name.trimmingCharacters(in: .whitespacesAndNewlines)
-            return frontendName.isEmpty || frontendName == backendName
-        }) else {
-            return false
-        }
-        let key = frontendIdentityKey(backend: row.backend, frontend: match.element, frontendIndex: match.offset)
-        let frame = rootLayer.convert(cellFrame(column: column, y: y, xOffset: xOffset), from: rowLayer)
-        recordMatchedText(key: key,
-                          frame: frame,
-                          title: backendName.isEmpty ? row.backend.serviceID : backendName,
-                          fontSize: 12,
-                          weight: .medium,
-                          alignment: .left,
-                          isWrapped: false,
-                          italic: italic)
-        visibleTextKeys.insert(key)
-        return true
-    }
-
     private func recordMatchedText(key: String,
                                    frame: CGRect,
                                    title: String,
@@ -2579,6 +2282,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
     private func installsBundledPlaceholderAsSystemOnly(_ backend: BackendRecord) -> Bool {
         backend.isBundledPlaceholder && backend.serviceScope == "system" && (backend.supportsRoot ?? false)
+    }
+
+    private var isDirectRootSession: Bool {
+        backends.contains { $0.isBackendsSelf && $0.serviceScope == "system" }
     }
 
     private func renderInstallPromptIfNeeded(width: CGFloat, height: CGFloat) {
@@ -3505,7 +3212,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         createSectionFrames.removeAll()
         recipeFrames.removeAll()
         bundledAppInstallFrames.removeAll()
-        bundledAppMenuFrames.removeAll()
         createFieldFrames.removeAll()
         createFieldLayouts.removeAll()
         createChoiceFrames.removeAll()
@@ -4758,24 +4464,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                  logFiles: backend.logFiles)
         }
         updateLayout()
-    }
-
-    private func openFrontend(for row: BackendListRow, opensInNewTab: Bool) {
-        guard let frontend = row.frontend,
-              let url = frontendNavigationURL(frontend) else {
-            backendError = "Could not build frontend URL."
-            updateLayout()
-            return
-        }
-
-        let displayName = frontend.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            ? row.backend.displayName
-            : frontend.name
-        if opensInNewTab {
-            outerframeHost.openNewTab(with: url, displayString: displayName)
-        } else {
-            outerframeHost.navigate(to: url)
-        }
     }
 
     private func openLauncherItem(_ item: AppLauncherItem, opensInNewTab: Bool) {
@@ -6790,7 +6478,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func handleScroll(at point: CGPoint, delta: CGPoint, precise: Bool) {
-        let multiplier: CGFloat = precise ? 1 : backendRowHeight
+        let multiplier: CGFloat = precise ? 1 : wheelScrollLineHeight
         let previousAppsScroll = appsScroll
         if mode == .apps {
             let contentPoint = contentLayer.convert(point, from: rootLayer)
@@ -6943,10 +6631,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             if let sectionFrame = createSectionFrames.first(where: { $0.frame.contains(createPoint) }) {
                 armButtonClick(frame: rootFrame(sectionFrame.frame, from: createLayer),
                                action: .createSection(sectionFrame.section))
-                return
-            }
-            if let menu = bundledAppMenuFrames.first(where: { $0.frame.contains(createPoint) }) {
-                showBackendActionsMenu(for: menu.backend, at: point)
                 return
             }
             if let install = bundledAppInstallFrames.first(where: { $0.frame.contains(createPoint) }) {
@@ -7732,26 +7416,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         return String(first).uppercased()
     }
 
-    private func backendListRows() -> [BackendListRow] {
-        backends.flatMap { backend -> [BackendListRow] in
-            guard !backend.isBundledPlaceholder else { return [] }
-            let parent = BackendListRow(backend: backend,
-                                        frontend: nil,
-                                        frontendIndex: nil,
-                                        isFrontendChild: false)
-            guard !backend.frontends.isEmpty else {
-                return [parent]
-            }
-            let children = backend.frontends.enumerated().map { index, frontend in
-                BackendListRow(backend: backend,
-                               frontend: frontend,
-                               frontendIndex: index,
-                               isFrontendChild: true)
-            }
-            return [parent] + children
-        }
-    }
-
     private func clampScrollOffsets() {
         _ = clampAppsScrollUsingRenderedContent()
         logScroll = clampedLogScroll(logScroll)
@@ -7943,114 +7607,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         return "No logs yet."
     }
 
-    private func backendColumns(width: CGFloat) -> [(title: String, x: CGFloat, width: CGFloat)] {
-        let contentWidth = max(width - horizontalInset * 2, 1)
-        let name = floor(contentWidth * 0.24)
-        let status: CGFloat = 78
-        let action: CGFloat = 112
-        let path = max(contentWidth - name - status - action, 1)
-        let x = horizontalInset
-        return [
-            (title: "Name", x: x, width: name),
-            (title: "Status", x: x + name, width: status),
-            (title: "Path", x: x + name + status, width: path),
-            (title: "Action", x: x + name + status + path, width: action)
-        ]
-    }
-
-    private func statusColor(_ status: String) -> NSColor {
-        switch status {
-        case "running":
-            return .systemGreen
-        case "stopped":
-            return .secondaryLabelColor
-        case "available":
-            return .secondaryLabelColor
-        default:
-            return .systemOrange
-        }
-    }
-
-    private func rowName(for row: BackendListRow) -> String {
-        if row.isFrontendChild {
-            let name = row.frontend?.name.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            if name == row.backend.displayName.trimmingCharacters(in: .whitespacesAndNewlines) {
-                return ""
-            }
-            return name.isEmpty ? "Frontend" : name
-        }
-        return row.backend.displayName
-    }
-
-    private func rowStatus(for row: BackendListRow) -> String {
-        row.isFrontendChild ? "" : row.backend.status.capitalized
-    }
-
-    private func rowPathText(for row: BackendListRow) -> String {
-        if row.isFrontendChild {
-            return frontendPathText(row.frontend)
-        }
-        return row.backend.pathText
-    }
-
-    private func frontendPathText(_ frontend: FrontendRecord?) -> String {
-        guard let frontend else { return "--" }
-        if !frontend.socketPath.isEmpty {
-            let path = pathAndQuery(fromFrontendURL: frontend.url, socketPath: frontend.socketPath)
-            return path == "/" ? frontend.socketPath : "\(frontend.socketPath)\(path)"
-        }
-        if frontend.port > 0 {
-            let path = pathAndQuery(fromFrontendURL: frontend.url, socketPath: nil)
-            return "127.0.0.1:\(frontend.port)\(path)"
-        }
-        return frontend.url.isEmpty ? "--" : frontend.url
-    }
-
-    private func rowActions(for row: BackendListRow) -> [(title: String, operation: String)] {
-        let backend = row.backend
-        if row.isFrontendChild {
-            return row.frontend?.hasEndpoint == true ? [("Open", "open")] : []
-        }
-        if backend.isBackendsSelf {
-            var actions: [(title: String, operation: String)] = []
-            if row.frontend?.hasEndpoint == true {
-                actions.append(("Open", "open"))
-            }
-            actions.append(("Actions", "menu"))
-            return actions
-        }
-        if backend.isMigrationAction {
-            return [("Migrate", "migrateRoot")]
-        }
-        if backend.isBundledPlaceholder {
-            let systemOnlyPlaceholder = installsBundledPlaceholderAsSystemOnly(backend)
-            let operation = ((backend.rootOnly ?? false) || systemOnlyPlaceholder) ? "runRoot" : "run"
-            let title = (backend.rootOnly ?? false) && !systemOnlyPlaceholder ? "Run as root" : "Run"
-            return [(title, operation), ("Actions", "menu")]
-        }
-        var actions: [(title: String, operation: String)] = []
-        if row.frontend?.hasEndpoint == true {
-            actions.append(("Open", "open"))
-        }
-        if backend.canControl {
-            actions.append((backend.status == "running" ? "Stop" : "Start",
-                            backend.status == "running" ? "stop" : "start"))
-        }
-        if backend.canUninstallBackend || (backend.isBundled ?? false) {
-            actions.append(("Actions", "menu"))
-        }
-        return actions
-    }
-
-    private func actionButtonWidth(for operation: String) -> CGFloat {
-        switch operation {
-        case "start", "stop", "menu":
-            return 28
-        default:
-            return 62
-        }
-    }
-
     private func backendManagementMenuItems(for backend: BackendRecord,
                                             includePlaceholderRunActions: Bool) -> (operationByItemID: [String: String], items: [OuterframeContextMenuItem]) {
         var operationByItemID: [String: String] = [:]
@@ -8092,7 +7648,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                                            title: "Run as root",
                                                            isEnabled: true))
                 }
-            } else if (backend.supportsRoot ?? false) && !(backend.rootOnly ?? false) {
+            } else if (backend.supportsRoot ?? false) && !(backend.rootOnly ?? false) && !isDirectRootSession {
                 let hasRootSupport = backend.hasRootSupport ?? (backend.serviceScope == "system")
                 operationByItemID["rootSupport"] = hasRootSupport ? "removeRootSupport" : "addRootSupport"
                 items.append(OuterframeContextMenuItem(id: "rootSupport",
@@ -8222,7 +7778,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         var managementItems = management.items
         if (item.backend.isBundled ?? false),
            (item.backend.supportsRoot ?? false),
-           !(item.backend.rootOnly ?? false) {
+           !(item.backend.rootOnly ?? false),
+           !isDirectRootSession {
             let hasRootSupport = item.rootEndpoint != nil || (item.backend.hasRootSupport ?? false)
             managementOperationByItemID["rootSupport"] = hasRootSupport ? "removeRootSupport" : "addRootSupport"
             managementItems.removeAll { $0.id == "rootSupport" }
@@ -8428,30 +7985,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         return result
     }
 
-    @discardableResult
-    private func addCell(to rowLayer: CALayer,
-                         text: String,
-                         column: (title: String, x: CGFloat, width: CGFloat),
-                         y: CGFloat,
-                         xOffset: CGFloat = 0,
-                         color: NSColor = .labelColor,
-                         weight: NSFont.Weight = .regular,
-                         alignment: CATextLayerAlignmentMode = .left,
-                         italic: Bool = false,
-                         emptyPlaceholder: String = "--") -> CATextLayer {
-        let layer = makeTextLayer(size: 12, weight: weight, color: color, alignment: alignment, italic: italic)
-        layer.string = text.isEmpty ? emptyPlaceholder : text
-        layer.frame = cellFrame(column: column, y: y, xOffset: xOffset)
-        rowLayer.addSublayer(layer)
-        return layer
-    }
-
-    private func cellFrame(column: (title: String, x: CGFloat, width: CGFloat),
-                           y: CGFloat,
-                           xOffset: CGFloat = 0) -> CGRect {
-        CGRect(x: column.x + xOffset, y: y, width: max(column.width - 10 - xOffset, 1), height: 16)
-    }
-
     private func makeTextLayer(size: CGFloat,
                                weight: NSFont.Weight,
                                color: NSColor,
@@ -8506,19 +8039,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                          backgroundCGColor: resolvedCGColor(emphasized ? .controlAccentColor : NSColor.controlAccentColor.withAlphaComponent(0.12)),
                          font: NSFont.systemFont(ofSize: 12, weight: .medium))
         return layer
-    }
-
-    private func makeActionButtonLayer(title: String, operation: String) -> CALayer {
-        switch operation {
-        case "start":
-            return makeSymbolButtonLayer(symbolName: "play.fill", accessibilityTitle: title)
-        case "stop":
-            return makeSymbolButtonLayer(symbolName: "stop.fill", accessibilityTitle: title)
-        case "menu":
-            return makeSymbolButtonLayer(symbolName: "ellipsis.circle", accessibilityTitle: title)
-        default:
-            return makeButtonLayer(title: title, emphasized: false)
-        }
     }
 
     private func makeSymbolButtonLayer(symbolName: String, accessibilityTitle: String) -> SymbolButtonLayer {

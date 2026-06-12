@@ -593,6 +593,10 @@ static void bundled_app_download_cache_root(char *out, size_t out_size) {
 #ifdef __APPLE__
     snprintf(out, out_size, "%s/Library/Caches/outershell/outer-shell/bundled-apps", home_directory());
 #else
+    if (geteuid() == 0) {
+        snprintf(out, out_size, "/var/cache/outershell/outer-shell/bundled-apps");
+        return;
+    }
     const char *cache_home = getenv("XDG_CACHE_HOME");
     if (cache_home && cache_home[0]) {
         snprintf(out, out_size, "%s/outershell/outer-shell/bundled-apps", cache_home);
@@ -686,6 +690,10 @@ static void home_screen_install_cache_root(char *out, size_t out_size) {
 #ifdef __APPLE__
     snprintf(out, out_size, "%s/Library/Caches/outershell/outer-shell/install", home_directory());
 #else
+    if (geteuid() == 0) {
+        snprintf(out, out_size, "/var/cache/outershell/outer-shell/install");
+        return;
+    }
     const char *cache_home = getenv("XDG_CACHE_HOME");
     if (cache_home && cache_home[0]) {
         snprintf(out, out_size, "%s/outershell/outer-shell/install", cache_home);

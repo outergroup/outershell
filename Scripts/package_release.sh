@@ -339,7 +339,7 @@ if [ -z "$home_dir" ]; then
 fi
 
 if [ "$root_install" = true ]; then
-    cache_home="${XDG_CACHE_HOME:-$home_dir/.cache}"
+    cache_home="/var/cache"
     outershell_cache_home="$cache_home/outershell"
     outer_shell_cache_root="$outershell_cache_home/outer-shell"
     outer_shell_install_cache="$outer_shell_cache_root/install"

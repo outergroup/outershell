@@ -160,7 +160,10 @@ to a local build, then in the directory passed with `--bundled-apps-dir` or
 `BACKENDS_BUNDLED_APPS_DIR`. If a Linux starter app payload is not present
 locally, Outer Shell downloads it from the catalog URL into
 `$XDG_CACHE_HOME/outershell/outer-shell/bundled-apps` or
-`~/.cache/outershell/outer-shell/bundled-apps`.
+`~/.cache/outershell/outer-shell/bundled-apps`. When Outer Shell is running
+directly as root on Linux, that cache is
+`/var/cache/outershell/outer-shell/bundled-apps`. Downloaded staging files are
+removed after a successful install.
 
 Starter app tarballs use this layout:
 

@@ -1119,6 +1119,10 @@ static void default_user_outershell_cache_root(char *out, size_t out_size) {
 #ifdef __APPLE__
     snprintf(out, out_size, "%s/Library/Caches/outershell", home_directory());
 #else
+    if (direct_root_session_uses_system_scope()) {
+        snprintf(out, out_size, "/var/cache/outershell");
+        return;
+    }
     const char *cache_home = getenv("XDG_CACHE_HOME");
     if (cache_home && cache_home[0]) {
         snprintf(out, out_size, "%s/outershell", cache_home);
@@ -1138,6 +1142,36 @@ static void default_bundled_app_cache_root(char *out, size_t out_size) {
     char root[PATH_MAX];
     default_outer_shell_cache_root(root, sizeof(root));
     snprintf(out, out_size, "%s/bundled-apps", root);
+}
+
+static void trim_trailing_path_separators(char *path) {
+    if (!path) return;
+    size_t length = strlen(path);
+    while (length > 1 && path[length - 1] == '/') {
+        path[--length] = '\0';
+    }
+}
+
+static bool path_text_equal(const char *a, const char *b) {
+    if (!a || !b) return false;
+    char normalized_a[PATH_MAX];
+    char normalized_b[PATH_MAX];
+    snprintf(normalized_a, sizeof(normalized_a), "%s", a);
+    snprintf(normalized_b, sizeof(normalized_b), "%s", b);
+    trim_trailing_path_separators(normalized_a);
+    trim_trailing_path_separators(normalized_b);
+    return strcmp(normalized_a, normalized_b) == 0;
+}
+
+static bool bundled_app_stage_root_is_download_cache(const BundledAppDefinition *app, const char *stage_root) {
+    if (!app || !app->stage_directory_name || !app->stage_directory_name[0] || !stage_root || !stage_root[0]) return false;
+    char expanded_stage_root[PATH_MAX];
+    char cache_root[PATH_MAX];
+    char expected_stage_root[PATH_MAX];
+    expand_tilde_path(stage_root, expanded_stage_root, sizeof(expanded_stage_root));
+    default_bundled_app_cache_root(cache_root, sizeof(cache_root));
+    snprintf(expected_stage_root, sizeof(expected_stage_root), "%s/%s", cache_root, app->stage_directory_name);
+    return path_text_equal(expanded_stage_root, expected_stage_root);
 }
 
 static void cleanup_bundled_app_cache(const BundledAppDefinition *app) {
@@ -1174,6 +1208,12 @@ static void cleanup_bundled_app_cache(const BundledAppDefinition *app) {
              quoted_outer_shell_cache_root,
              quoted_outershell_cache_root);
     run_shell_ignored(command);
+}
+
+static void cleanup_bundled_app_cache_if_stage_root_is_download_cache(const BundledAppDefinition *app, const char *stage_root) {
+    if (!bundled_app_stage_root_is_download_cache(app, stage_root)) return;
+    cleanup_bundled_app_cache(app);
+    log_event("Removed staged bundled app cache for %s.", app->service_id);
 }
 
 static void default_user_outerctl_path(char *out, size_t out_size) {
@@ -6479,15 +6519,18 @@ static void send_control_response(int fd, const char *query, const char *body) {
             }
         }
 #endif
-        log_event("%s app %s as %s: %s",
-                  ok ? "Installed" : "Failed to install",
-                  app->service_id,
-                  scope,
-                  message);
-        if (ok) mark_backend_event_changed();
-        send_action_response_ex(fd, ok ? 200 : (needs_password ? 401 : 500), ok, message, needs_password);
-        return;
-    }
+	        log_event("%s app %s as %s: %s",
+	                  ok ? "Installed" : "Failed to install",
+	                  app->service_id,
+	                  scope,
+	                  message);
+	        if (ok) {
+	            cleanup_bundled_app_cache_if_stage_root_is_download_cache(app, bundled_stage_root);
+	            mark_backend_event_changed();
+	        }
+	        send_action_response_ex(fd, ok ? 200 : (needs_password ? 401 : 500), ok, message, needs_password);
+	        return;
+	    }
 
     if (strcmp(operation, "addRootSupport") == 0 || strcmp(operation, "removeRootSupport") == 0) {
         const BundledAppDefinition *app = bundled_app_for_service_id(service_id);
@@ -6527,14 +6570,17 @@ static void send_control_response(int fd, const char *query, const char *body) {
 #endif
             ok = remove_bundled_root_support(app, sudo_password, &needs_password, message, sizeof(message));
         }
-        log_event("%s root support for app %s: %s",
-                  ok ? (strcmp(operation, "addRootSupport") == 0 ? "Added" : "Removed") : "Failed to change",
-                  app->service_id,
-                  message);
-        if (ok) mark_backend_event_changed();
-        send_action_response_ex(fd, ok ? 200 : (needs_password ? 401 : 500), ok, message, needs_password);
-        return;
-    }
+	        log_event("%s root support for app %s: %s",
+	                  ok ? (strcmp(operation, "addRootSupport") == 0 ? "Added" : "Removed") : "Failed to change",
+	                  app->service_id,
+	                  message);
+	        if (ok) {
+	            cleanup_bundled_app_cache_if_stage_root_is_download_cache(app, bundled_stage_root);
+	            mark_backend_event_changed();
+	        }
+	        send_action_response_ex(fd, ok ? 200 : (needs_password ? 401 : 500), ok, message, needs_password);
+	        return;
+	    }
 
     if (strcmp(operation, "uninstall") == 0) {
         char message[4096] = "";

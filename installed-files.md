@@ -5,8 +5,10 @@ This document lists the persistent files and sockets installed by Outer Shell an
 ## Path Variables
 
 - `<user-state>` is `${OUTERSHELL_HOME}` when set. Otherwise it is `$HOME/Library/Application Support/outershell` on macOS and `${XDG_STATE_HOME:-$HOME/.local/state}/outershell` on Linux. When `outershelld` is running as effective uid 0 on Linux and `OUTERSHELL_HOME` is not set, it uses `<system-state>` instead of `/root/.local/state/outershell`.
+- `<user-cache>` is `$HOME/Library/Caches/outershell` on macOS and `${XDG_CACHE_HOME:-$HOME/.cache}/outershell` on Linux.
 - `<user-runtime>` is `$(getconf DARWIN_USER_TEMP_DIR)` on macOS and `${XDG_RUNTIME_DIR:-/run/user/$(id -u)}` on Linux.
 - `<system-state>` is `/Library/Application Support/outershell` on macOS and `/var/lib/outershell` on Linux.
+- `<system-cache>` is `/var/cache/outershell` on Linux.
 - `<service-id>` is the backend service identifier, such as `dev.outergroup.Profile`.
 - `<bundle-prefix>` is the outerframe bundle prefix, such as `ProfileContent`.
 
@@ -95,8 +97,12 @@ Linux public install when connected directly as root:
 - `/run/org.outershell.OuterShell`
 - `/run/outershelld-api`
 - `<system-state>/system-binary-users/uid-0`
+- `<system-cache>/outer-shell/install/` for downloaded public install/update artifacts while install or update is in progress
+- `<system-cache>/outer-shell/bundled-apps/` for downloaded bundled app staging while install is in progress
 
 In this direct-root Linux mode, Outer Shell treats bundled app installs as system installs. It should not create `/root/.local/state/outershell` or `$HOME/.config/systemd/user` units for the root account.
+
+Downloaded bundled app staging directories are removed after a successful install. Failed installs can leave staging files behind for inspection or retry.
 
 ## Linux Root Support
 
