@@ -1032,6 +1032,68 @@ static void default_user_outershell_root(char *out, size_t out_size) {
 #endif
 }
 
+static void default_user_outershell_cache_root(char *out, size_t out_size) {
+    if (!out || out_size == 0) return;
+#ifdef __APPLE__
+    snprintf(out, out_size, "%s/Library/Caches/outershell", home_directory());
+#else
+    const char *cache_home = getenv("XDG_CACHE_HOME");
+    if (cache_home && cache_home[0]) {
+        snprintf(out, out_size, "%s/outershell", cache_home);
+    } else {
+        snprintf(out, out_size, "%s/.cache/outershell", home_directory());
+    }
+#endif
+}
+
+static void default_outer_shell_cache_root(char *out, size_t out_size) {
+    char root[PATH_MAX];
+    default_user_outershell_cache_root(root, sizeof(root));
+    snprintf(out, out_size, "%s/outer-shell", root);
+}
+
+static void default_bundled_app_cache_root(char *out, size_t out_size) {
+    char root[PATH_MAX];
+    default_outer_shell_cache_root(root, sizeof(root));
+    snprintf(out, out_size, "%s/bundled-apps", root);
+}
+
+static void cleanup_bundled_app_cache(const BundledAppDefinition *app) {
+    if (!app || !app->stage_directory_name || !app->stage_directory_name[0]) return;
+    char cache_root[PATH_MAX];
+    char app_root[PATH_MAX];
+    char archive_path[PATH_MAX];
+    char outer_shell_cache_root[PATH_MAX];
+    char outershell_cache_root[PATH_MAX];
+    default_bundled_app_cache_root(cache_root, sizeof(cache_root));
+    default_outer_shell_cache_root(outer_shell_cache_root, sizeof(outer_shell_cache_root));
+    default_user_outershell_cache_root(outershell_cache_root, sizeof(outershell_cache_root));
+    snprintf(app_root, sizeof(app_root), "%s/%s", cache_root, app->stage_directory_name);
+    snprintf(archive_path, sizeof(archive_path), "%s/%s.tar.gz", cache_root, app->stage_directory_name);
+
+    char quoted_app_root[PATH_MAX + 8];
+    char quoted_archive_path[PATH_MAX + 8];
+    char quoted_cache_root[PATH_MAX + 8];
+    char quoted_outer_shell_cache_root[PATH_MAX + 8];
+    char quoted_outershell_cache_root[PATH_MAX + 8];
+    shell_quote(app_root, quoted_app_root, sizeof(quoted_app_root));
+    shell_quote(archive_path, quoted_archive_path, sizeof(quoted_archive_path));
+    shell_quote(cache_root, quoted_cache_root, sizeof(quoted_cache_root));
+    shell_quote(outer_shell_cache_root, quoted_outer_shell_cache_root, sizeof(quoted_outer_shell_cache_root));
+    shell_quote(outershell_cache_root, quoted_outershell_cache_root, sizeof(quoted_outershell_cache_root));
+
+    char command[PATH_MAX * 5 + 128];
+    snprintf(command,
+             sizeof(command),
+             "rm -rf -- %s; rm -f -- %s; rmdir -- %s %s %s >/dev/null 2>&1 || true",
+             quoted_app_root,
+             quoted_archive_path,
+             quoted_cache_root,
+             quoted_outer_shell_cache_root,
+             quoted_outershell_cache_root);
+    run_shell_ignored(command);
+}
+
 static void default_user_outerctl_path(char *out, size_t out_size) {
     if (!out || out_size == 0) return;
     char root[PATH_MAX];
@@ -4244,6 +4306,38 @@ static bool registry_store_open_user_readwrite(RegistryStore *store, char *error
     return registry_store_open_at(store, g_registry_database_path, true, error, error_size);
 }
 
+static bool registry_store_only_contains_backend(const RegistryStore *store, const char *service_id) {
+    if (!store || !service_id || !service_id[0]) return false;
+    for (size_t i = 0; i < store->backend_count; i++) {
+        if (strcmp(store->backends[i].service_id, service_id) != 0) return false;
+    }
+    for (size_t i = 0; i < store->frontend_count; i++) {
+        if (strcmp(store->frontends[i].service_id, service_id) != 0) return false;
+    }
+    for (size_t i = 0; i < store->log_count; i++) {
+        if (strcmp(store->logs[i].service_id, service_id) != 0) return false;
+    }
+    for (size_t i = 0; i < store->opener_count; i++) {
+        if (strcmp(store->openers[i].service_id, service_id) != 0) return false;
+    }
+    for (size_t i = 0; i < store->layout_count; i++) {
+        const char *url = store->layouts[i].url ? store->layouts[i].url : "";
+        bool belongs_to_backend = false;
+        for (size_t j = 0; j < store->frontend_count; j++) {
+            const RegistryFrontendRecord *frontend = &store->frontends[j];
+            if (strcmp(frontend->service_id, service_id) != 0) continue;
+            const char *frontend_id = frontend->frontend_id && frontend->frontend_id[0] ? frontend->frontend_id : frontend->url;
+            if (strcmp(url, frontend_id ? frontend_id : "") == 0 ||
+                strcmp(url, frontend->url ? frontend->url : "") == 0) {
+                belongs_to_backend = true;
+                break;
+            }
+        }
+        if (!belongs_to_backend) return false;
+    }
+    return store->content_type_count == 0;
+}
+
 static size_t collect_systemd_status_scope_via_systemctl(const char *scope,
                                                          SystemdStatusEntry *entries,
                                                          size_t capacity) {
@@ -5265,6 +5359,7 @@ static bool home_screen_update_available(char *available, size_t available_size)
 static bool run_home_screen_install_script(const char *subcommand,
                                            const char *script_path,
                                            const char *archive_path,
+                                           bool remove_user_state,
                                            char *message,
                                            size_t message_size);
 static bool uninstall_local_home_screen(char *message, size_t message_size);
@@ -6197,6 +6292,18 @@ static void send_control_response(int fd, const char *query, const char *body) {
         if (strcmp(operation, "update") == 0 || strcmp(operation, "updateOuterShell") == 0 ||
             strcmp(operation, "uninstall") == 0 || strcmp(operation, "uninstallOuterShell") == 0) {
             const char *installer_command = (strncmp(operation, "uninstall", 9) == 0) ? "uninstall" : "update";
+            bool remove_user_state = false;
+            if (strcmp(installer_command, "uninstall") == 0) {
+                RegistryStore database;
+                char registry_error[1024] = "";
+                if (registry_store_open_user_readonly(&database, registry_error, sizeof(registry_error))) {
+                    remove_user_state = registry_store_only_contains_backend(&database, service_id);
+                    registry_store_free(&database);
+                } else {
+                    log_event("Could not inspect registry before Outer Shell uninstall: %s",
+                              registry_error[0] ? registry_error : "unknown error");
+                }
+            }
             bool ok = false;
 #ifdef __APPLE__
             char base_url[2048] = "";
@@ -6209,6 +6316,7 @@ static void send_control_response(int fd, const char *query, const char *body) {
                 ok = run_home_screen_install_script(installer_command,
                                                     installer_script_path,
                                                     installer_archive_path,
+                                                    remove_user_state,
                                                     message,
                                                     sizeof(message));
             }
@@ -6663,6 +6771,7 @@ static bool home_screen_update_available(char *available, size_t available_size)
 static bool run_home_screen_install_script(const char *subcommand,
                                            const char *script_path,
                                            const char *archive_path,
+                                           bool remove_user_state,
                                            char *message,
                                            size_t message_size) {
     if (!script_path || !script_path[0]) {
@@ -6693,8 +6802,9 @@ static bool run_home_screen_install_script(const char *subcommand,
     char command[8192];
     snprintf(command,
              sizeof(command),
-             "OUTERSHELL_INSTALL_ARCHIVE=%s sh %s %s",
+             "OUTERSHELL_INSTALL_ARCHIVE=%s OUTERSHELL_UNINSTALL_REMOVE_USER_STATE=%s sh %s %s",
              quoted_archive_path,
+             remove_user_state ? "1" : "0",
              quoted_script_path,
              quoted_subcommand);
 
@@ -9371,9 +9481,11 @@ static void cleanup_user_systemd_bundled_app(const BundledAppDefinition *app,
 
     char socket_unit[256] = "";
     char quoted_socket_unit[320] = "";
+    char actual_socket_path[PATH_MAX] = "";
     if (app->socket_activated) {
         systemd_socket_unit_name(app->unit_name, socket_unit, sizeof(socket_unit));
         if (safe_unit_name(socket_unit)) {
+            bundled_socket_path_for_scope(app, "user", actual_socket_path, sizeof(actual_socket_path));
             shell_quote(socket_unit, quoted_socket_unit, sizeof(quoted_socket_unit));
             snprintf(command, sizeof(command), "systemctl --user disable --now %s >/dev/null 2>&1 || true", quoted_socket_unit);
             run_shell_ignored(command);
@@ -9391,6 +9503,9 @@ static void cleanup_user_systemd_bundled_app(const BundledAppDefinition *app,
     if (quoted_socket_unit[0]) {
         snprintf(command, sizeof(command), "systemctl --user reset-failed %s >/dev/null 2>&1 || true", quoted_socket_unit);
         run_shell_ignored(command);
+    }
+    if (actual_socket_path[0]) {
+        unlink(actual_socket_path);
     }
 
     if (remove_unit_files) {
@@ -9976,11 +10091,15 @@ static bool install_bundled_app(const BundledAppDefinition *app,
                     "timeout 12s systemctl --system disable --now %s >/dev/null 2>&1 || true\n"
                     "timeout 12s systemctl --system disable %s >/dev/null 2>&1 || true\n"
                     "timeout 12s systemctl --system stop %s >/dev/null 2>&1 || true\n"
-                    "timeout 5s systemctl --system reset-failed %s >/dev/null 2>&1 || true\n",
+                    "timeout 5s systemctl --system reset-failed %s >/dev/null 2>&1 || true\n"
+                    "%s%s%s",
                     quoted_socket_unit,
                     quoted_unit,
                     quoted_unit,
-                    quoted_socket_unit);
+                    quoted_socket_unit,
+                    quoted_actual_socket_path[0] ? "rm -f -- " : "",
+                    quoted_actual_socket_path[0] ? quoted_actual_socket_path : "",
+                    quoted_actual_socket_path[0] ? "\n" : "");
         }
         if (quoted_source_icon[0] && quoted_target_icon[0]) {
             fprintf(script, "install -m 0644 %s %s\n", quoted_source_icon, quoted_target_icon);
@@ -10340,9 +10459,11 @@ static bool remove_bundled_root_support(const BundledAppDefinition *app,
     snprintf(unit_path, sizeof(unit_path), "/etc/systemd/system/%s", app->unit_name);
     char socket_unit_name[256] = "";
     char socket_unit_path[PATH_MAX] = "";
+    char socket_path[PATH_MAX] = "";
     if (app->socket_activated) {
         systemd_socket_unit_name(app->unit_name, socket_unit_name, sizeof(socket_unit_name));
         snprintf(socket_unit_path, sizeof(socket_unit_path), "/etc/systemd/system/%s", socket_unit_name);
+        bundled_socket_path_for_scope(app, "system", socket_path, sizeof(socket_path));
     }
 
     char quoted_unit[320];
@@ -10351,12 +10472,14 @@ static bool remove_bundled_root_support(const BundledAppDefinition *app,
     char quoted_unit_path[PATH_MAX + 8];
     char quoted_socket_unit[320] = "";
     char quoted_socket_unit_path[PATH_MAX + 8] = "";
+    char quoted_socket_path[PATH_MAX + 8] = "";
     shell_quote(app->unit_name, quoted_unit, sizeof(quoted_unit));
     shell_quote(install_root, quoted_install_root, sizeof(quoted_install_root));
     shell_quote(log_path, quoted_log_path, sizeof(quoted_log_path));
     shell_quote(unit_path, quoted_unit_path, sizeof(quoted_unit_path));
     if (socket_unit_name[0]) shell_quote(socket_unit_name, quoted_socket_unit, sizeof(quoted_socket_unit)); else quoted_socket_unit[0] = '\0';
     if (socket_unit_path[0]) shell_quote(socket_unit_path, quoted_socket_unit_path, sizeof(quoted_socket_unit_path)); else quoted_socket_unit_path[0] = '\0';
+    if (socket_path[0]) shell_quote(socket_path, quoted_socket_path, sizeof(quoted_socket_path)); else quoted_socket_path[0] = '\0';
 
     char script_template[] = "/tmp/backends-root-uninstall-XXXXXX";
     int script_fd = mkstemp(script_template);
@@ -10376,7 +10499,7 @@ static bool remove_bundled_root_support(const BundledAppDefinition *app,
             "timeout 12s systemctl --system disable --now %s >/dev/null 2>&1 || true\n"
             "%s%s%s"
             "%s%s%s"
-            "rm -f -- %s %s\n"
+            "rm -f -- %s %s %s\n"
             "rm -rf -- %s\n"
             "rm -f -- %s\n"
             "systemctl --system daemon-reload\n",
@@ -10389,6 +10512,7 @@ static bool remove_bundled_root_support(const BundledAppDefinition *app,
             quoted_socket_unit[0] ? " >/dev/null 2>&1 || true\n" : "",
             quoted_unit_path,
             quoted_socket_unit_path[0] ? quoted_socket_unit_path : "''",
+            quoted_socket_path[0] ? quoted_socket_path : "''",
             quoted_install_root,
             quoted_log_path);
     write_root_apps_marker_cleanup_shell(script);
@@ -10998,19 +11122,23 @@ static bool uninstall_backend(const char *service_id, const char *sudo_password,
             snprintf(unit_path, sizeof(unit_path), "/etc/systemd/system/%s", unit_name);
             char socket_unit_name[256] = "";
             char socket_unit_path[PATH_MAX] = "";
+            char socket_path[PATH_MAX] = "";
             if (app && app->socket_activated) {
                 systemd_socket_unit_name(unit_name, socket_unit_name, sizeof(socket_unit_name));
                 snprintf(socket_unit_path, sizeof(socket_unit_path), "/etc/systemd/system/%s", socket_unit_name);
+                bundled_socket_path_for_scope(app, "system", socket_path, sizeof(socket_path));
             }
 
             char quoted_unit_path[PATH_MAX + 8];
             char quoted_socket_unit[320] = "";
             char quoted_socket_unit_path[PATH_MAX + 8] = "";
+            char quoted_socket_path[PATH_MAX + 8] = "";
             char quoted_install_root[PATH_MAX + 8];
             char quoted_log_path[PATH_MAX + 8];
             shell_quote(unit_path, quoted_unit_path, sizeof(quoted_unit_path));
             if (socket_unit_name[0]) shell_quote(socket_unit_name, quoted_socket_unit, sizeof(quoted_socket_unit)); else quoted_socket_unit[0] = '\0';
             if (socket_unit_path[0]) shell_quote(socket_unit_path, quoted_socket_unit_path, sizeof(quoted_socket_unit_path)); else quoted_socket_unit_path[0] = '\0';
+            if (socket_path[0]) shell_quote(socket_path, quoted_socket_path, sizeof(quoted_socket_path)); else quoted_socket_path[0] = '\0';
             if (install_root[0]) shell_quote(install_root, quoted_install_root, sizeof(quoted_install_root)); else quoted_install_root[0] = '\0';
             shell_quote(log_path, quoted_log_path, sizeof(quoted_log_path));
 
@@ -11032,7 +11160,7 @@ static bool uninstall_backend(const char *service_id, const char *sudo_password,
                     "timeout 12s systemctl --system disable --now %s >/dev/null 2>&1 || true\n"
                     "%s%s%s"
                     "%s%s%s"
-                    "rm -f -- %s %s\n",
+                    "rm -f -- %s %s %s\n",
                     quoted_unit,
                     quoted_socket_unit[0] ? "timeout 12s systemctl --system disable --now " : "",
                     quoted_socket_unit[0] ? quoted_socket_unit : "",
@@ -11041,7 +11169,8 @@ static bool uninstall_backend(const char *service_id, const char *sudo_password,
                     quoted_socket_unit[0] ? quoted_unit : "",
                     quoted_socket_unit[0] ? " >/dev/null 2>&1 || true\n" : "",
                     quoted_unit_path,
-                    quoted_socket_unit_path[0] ? quoted_socket_unit_path : "''");
+                    quoted_socket_unit_path[0] ? quoted_socket_unit_path : "''",
+                    quoted_socket_path[0] ? quoted_socket_path : "''");
             if (quoted_install_root[0]) {
                 fprintf(script, "rm -rf -- %s\n", quoted_install_root);
             }
@@ -11095,6 +11224,9 @@ static bool uninstall_backend(const char *service_id, const char *sudo_password,
     }
 
     const BundledAppDefinition *app = bundled_app_for_service_id(service_id);
+    if (app) {
+        cleanup_bundled_app_cache(app);
+    }
     if (app || safe_service_directory_name(service_id)) {
         char install_name[PATH_MAX];
         snprintf(install_name, sizeof(install_name), "%s", app ? app->install_directory_name : service_id);

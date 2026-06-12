@@ -344,6 +344,10 @@ system_binary_users_dir="$system_outershell_home/system-binary-users"
 system_binary_user_marker="$system_binary_users_dir/uid-$(id -u)"
 
 if [ "$root_install" = true ]; then
+    cache_home="${XDG_CACHE_HOME:-$HOME/.cache}"
+    outershell_cache_home="$cache_home/outershell"
+    outer_shell_cache_root="$outershell_cache_home/outer-shell"
+    outer_shell_install_cache="$outer_shell_cache_root/install"
     runtime_dir="/run"
     outershell_home="${OUTERSHELL_HOME:-$system_outershell_home}"
     install_root="$outershell_home/outer-shell"
@@ -363,6 +367,10 @@ if [ "$root_install" = true ]; then
     service_wanted_by="multi-user.target"
     api_listen_stream="$api_socket_path"
 else
+    cache_home="${XDG_CACHE_HOME:-$HOME/.cache}"
+    outershell_cache_home="$cache_home/outershell"
+    outer_shell_cache_root="$outershell_cache_home/outer-shell"
+    outer_shell_install_cache="$outer_shell_cache_root/install"
     runtime_dir="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
     state_home="${XDG_STATE_HOME:-$HOME/.local/state}"
     outershell_home="${OUTERSHELL_HOME:-$state_home/outershell}"
@@ -577,6 +585,15 @@ system_outerctl_path="$system_outerctl_path"
 system_version_path="$system_version_path"
 system_binary_users_dir="$system_binary_users_dir"
 remove_system_binaries_if_unused
+if [ "$root_install" = false ] && [ "${OUTERSHELL_UNINSTALL_REMOVE_USER_STATE:-0}" = "1" ]; then
+    rm -f "$outershell_home/registry.orwa" "$outershell_home/registry.orwa.lock"
+    rmdir "$outershell_home/apps" >/dev/null 2>&1 || true
+    rmdir "$outershell_home/bin" "$daemon_root" "$install_root" "$outershell_home" >/dev/null 2>&1 || true
+    rm -rf "$outer_shell_cache_root"
+else
+    rm -rf "$outer_shell_install_cache"
+fi
+rmdir "$outer_shell_cache_root" "$outershell_cache_home" >/dev/null 2>&1 || true
 rm -f "$cleanup_script"
 EOF
     chmod 0755 "$cleanup_script"
