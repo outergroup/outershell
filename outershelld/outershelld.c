@@ -1047,15 +1047,22 @@ static void default_outershell_install_root(char *out, size_t out_size) {
 }
 
 #ifndef __APPLE__
-static void default_system_outershell_install_root(char *out, size_t out_size) {
+static void default_outershelld_install_root(char *out, size_t out_size) {
     if (!out || out_size == 0) return;
-    snprintf(out, out_size, "%s/outer-shell", kSystemOuterShellRoot);
+    char root[PATH_MAX];
+    default_user_outershell_root(root, sizeof(root));
+    snprintf(out, out_size, "%s/outershelld", root);
+}
+
+static void default_system_outershelld_install_root(char *out, size_t out_size) {
+    if (!out || out_size == 0) return;
+    snprintf(out, out_size, "%s/outershelld", kSystemOuterShellRoot);
 }
 
 static void default_system_outershelld_path(char *out, size_t out_size) {
     if (!out || out_size == 0) return;
     char root[PATH_MAX];
-    default_system_outershell_install_root(root, sizeof(root));
+    default_system_outershelld_install_root(root, sizeof(root));
     snprintf(out, out_size, "%s/outershelld", root);
 }
 
@@ -7050,7 +7057,7 @@ static bool ensure_root_helper_installed(const char *sudo_password, bool *needs_
     if (strstr(executable, " (deleted)") != NULL || access(executable, X_OK) != 0) {
         char installed_executable[PATH_MAX];
         char installed_root[PATH_MAX];
-        default_outershell_install_root(installed_root, sizeof(installed_root));
+        default_outershelld_install_root(installed_root, sizeof(installed_root));
         snprintf(installed_executable, sizeof(installed_executable), "%s/outershelld", installed_root);
         if (access(installed_executable, X_OK) == 0) {
             snprintf(executable, sizeof(executable), "%s", installed_executable);
@@ -7084,14 +7091,16 @@ static bool ensure_root_helper_installed(const char *sudo_password, bool *needs_
 
     char user_install_root[PATH_MAX];
     default_outershell_install_root(user_install_root, sizeof(user_install_root));
-    char user_install_bin[PATH_MAX];
-    snprintf(user_install_bin, sizeof(user_install_bin), "%s/bin", user_install_root);
+    char user_daemon_root[PATH_MAX];
+    default_outershelld_install_root(user_daemon_root, sizeof(user_daemon_root));
+    char user_outershelld[PATH_MAX];
+    snprintf(user_outershelld, sizeof(user_outershelld), "%s/outershelld", user_daemon_root);
     char user_version[PATH_MAX];
-    snprintf(user_version, sizeof(user_version), "%s/version", user_install_root);
+    snprintf(user_version, sizeof(user_version), "%s/version", user_daemon_root);
     char user_outerctl_parent[PATH_MAX];
     if (!parent_directory(user_outerctl, user_outerctl_parent, sizeof(user_outerctl_parent)) ||
         !mkdir_p(user_install_root) ||
-        !mkdir_p(user_install_bin) ||
+        !mkdir_p(user_daemon_root) ||
         !mkdir_p(user_outerctl_parent)) {
         snprintf(message, message_size, "Could not prepare user Outer Shell executable paths.");
         fclose(script);
@@ -7106,7 +7115,7 @@ static bool ensure_root_helper_installed(const char *sudo_password, bool *needs_
     char system_version[PATH_MAX];
     char system_users_dir[PATH_MAX];
     char system_user_marker[PATH_MAX];
-    default_system_outershell_install_root(system_install_root, sizeof(system_install_root));
+    default_system_outershelld_install_root(system_install_root, sizeof(system_install_root));
     default_system_outershelld_path(system_outershelld, sizeof(system_outershelld));
     default_system_outerctl_path(system_outerctl, sizeof(system_outerctl));
     system_binary_users_dir(system_users_dir, sizeof(system_users_dir));
@@ -7126,7 +7135,7 @@ static bool ensure_root_helper_installed(const char *sudo_password, bool *needs_
 
     char quoted_service_name[320];
     char quoted_socket_name[320];
-    char quoted_user_install_root[PATH_MAX + 8];
+    char quoted_user_outershelld[PATH_MAX + 8];
     char quoted_user_version[PATH_MAX + 8];
     char quoted_user_outerctl[PATH_MAX + 8];
     char quoted_system_install_root[PATH_MAX + 8];
@@ -7138,7 +7147,7 @@ static bool ensure_root_helper_installed(const char *sudo_password, bool *needs_
     char quoted_system_user_marker[PATH_MAX + 8];
     shell_quote(service_name, quoted_service_name, sizeof(quoted_service_name));
     shell_quote(socket_name, quoted_socket_name, sizeof(quoted_socket_name));
-    shell_quote(user_install_root, quoted_user_install_root, sizeof(quoted_user_install_root));
+    shell_quote(user_outershelld, quoted_user_outershelld, sizeof(quoted_user_outershelld));
     shell_quote(user_version, quoted_user_version, sizeof(quoted_user_version));
     shell_quote(user_outerctl, quoted_user_outerctl, sizeof(quoted_user_outerctl));
     shell_quote(system_install_root, quoted_system_install_root, sizeof(quoted_system_install_root));
@@ -7184,7 +7193,7 @@ static bool ensure_root_helper_installed(const char *sudo_password, bool *needs_
             "[Service]\n"
             "Environment=OUTERSHELL_HOME=/var/lib/outershell\n"
             "Environment=OUTER_SHELL_PUBLIC_BASE_URL=%s\n"
-            "ExecStart=/var/lib/outershell/outer-shell/outershelld\n"
+            "ExecStart=/var/lib/outershell/outershelld/outershelld\n"
             "Restart=no\n"
             "StandardOutput=append:/var/log/outergroup/outershelld.log\n"
             "StandardError=append:/var/log/outergroup/outershelld.log\n"
@@ -7196,9 +7205,8 @@ static bool ensure_root_helper_installed(const char *sudo_password, bool *needs_
             "chmod 0644 %s\n"
             "touch /var/log/outergroup/outershelld.log\n"
             "chmod 0644 /var/log/outergroup/outershelld.log\n"
-            "rm -f %s/outershelld %s/bin/outerctl %s\n"
-            "ln -s %s %s/outershelld\n"
-            "ln -s %s %s/bin/outerctl\n"
+            "rm -f %s %s\n"
+            "ln -s %s %s\n"
             "ln -s %s %s\n"
             "systemctl --system daemon-reload\n"
             "systemctl --system enable outershelld.socket >/dev/null 2>&1\n"
@@ -7234,13 +7242,10 @@ static bool ensure_root_helper_installed(const char *sudo_password, bool *needs_
             quoted_system_version,
             quoted_system_version,
             quoted_system_version,
-            quoted_user_install_root,
-            quoted_user_install_root,
+            quoted_user_outershelld,
             quoted_user_outerctl,
             quoted_system_outershelld,
-            quoted_user_install_root,
-            quoted_system_outerctl,
-            quoted_user_install_root,
+            quoted_user_outershelld,
             quoted_system_outerctl,
             quoted_user_outerctl);
 #else
@@ -7274,7 +7279,7 @@ static void write_system_binary_cleanup_shell(FILE *script) {
     char system_outerctl[PATH_MAX];
     char system_version[PATH_MAX];
     char system_users_dir[PATH_MAX];
-    default_system_outershell_install_root(system_install_root, sizeof(system_install_root));
+    default_system_outershelld_install_root(system_install_root, sizeof(system_install_root));
     default_system_outershelld_path(system_outershelld, sizeof(system_outershelld));
     default_system_outerctl_path(system_outerctl, sizeof(system_outerctl));
     system_binary_users_dir(system_users_dir, sizeof(system_users_dir));
@@ -7297,7 +7302,7 @@ static void write_system_binary_cleanup_shell(FILE *script) {
     fprintf(script,
             "system_binary_users_dir=%s\n"
             "system_outershell_home=%s\n"
-            "system_install_root=%s\n"
+            "system_daemon_root=%s\n"
             "system_outershelld_path=%s\n"
             "system_outerctl_path=%s\n"
             "system_version_path=%s\n"
@@ -7324,14 +7329,14 @@ static void write_system_binary_cleanup_shell(FILE *script) {
             "  systemctl --system disable --now outershelld.socket outershelld.service >/dev/null 2>&1 || true\n"
             "  rm -f /etc/systemd/system/outershelld.service /etc/systemd/system/outershelld.socket /run/outershelld-api\n"
             "  systemctl --system daemon-reload >/dev/null 2>&1 || true\n"
-            "  rm -f \"$system_outershelld_path\" \"$system_outerctl_path\" \"$system_install_root/bin/outerctl\" \"$system_version_path\" \"$system_install_root/run-outer-shell.sh\"\n"
+            "  rm -f \"$system_outershelld_path\" \"$system_outerctl_path\" \"$system_version_path\"\n"
             "  rm -f /var/log/outergroup/outershelld.log /var/log/outergroup/org.outershell.OuterShell.log\n"
             "  if ! find \"$system_outershell_home/apps\" -mindepth 1 -print -quit 2>/dev/null | grep -q . &&\n"
             "     ! find /opt/outergroup -mindepth 1 -print -quit 2>/dev/null | grep -q .; then\n"
             "    rm -f \"$system_outershell_home/registry.orwa\" \"$system_outershell_home/registry.orwa.lock\"\n"
             "    rmdir \"$system_outershell_home/apps\" /opt/outergroup >/dev/null 2>&1 || true\n"
             "  fi\n"
-            "  rmdir \"$system_install_root/bin\" \"$system_install_root\" \"$system_outershell_home/bin\" \"$system_binary_users_dir\" \"$system_outershell_home\" /var/log/outergroup >/dev/null 2>&1 || true\n"
+            "  rmdir \"$system_daemon_root\" \"$system_outershell_home/bin\" \"$system_binary_users_dir\" \"$system_outershell_home\" /var/log/outergroup >/dev/null 2>&1 || true\n"
             "}\n",
             quoted_system_users_dir,
             quoted_system_root,

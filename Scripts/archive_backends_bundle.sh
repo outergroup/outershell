@@ -9,8 +9,9 @@ fi
 
 SOURCE_BUNDLE="$1"
 DESTINATION_DIR="$2"
-ARCHIVE_STEM="${3:-BackendsContent.bundle}"
+ARCHIVE_STEM="${3:-OuterShell.bundle}"
 AA_TOOL="${AA_TOOL:-aa}"
+ARCHIVE_BUNDLE_NAME="$ARCHIVE_STEM"
 
 if [[ ! -d "$SOURCE_BUNDLE" ]]; then
     echo "error: source bundle not found at $SOURCE_BUNDLE" >&2
@@ -49,15 +50,18 @@ archive_platform_bundle() {
     local platform="$3"
     local slice_arch="$4"
     local archive_path="$5"
+    local archive_bundle_name="$6"
     local temp_root
     local temp_bundle
     local executable_name
     local executable_path
+    local archived_executable_name
+    local archived_executable_path
     local thinned_executable
     local executable_archs
 
     temp_root="$(mktemp -d)"
-    temp_bundle="$temp_root/$(basename "$source_bundle")"
+    temp_bundle="$temp_root/$archive_bundle_name"
     cp -R "$source_bundle" "$temp_bundle"
 
     executable_name="$(bundle_executable_name "$temp_bundle")"
@@ -85,6 +89,16 @@ archive_platform_bundle() {
         chmod +x "$executable_path"
     fi
 
+    archived_executable_name="${archive_bundle_name%.bundle}"
+    archived_executable_path="$temp_bundle/Contents/MacOS/$archived_executable_name"
+    if [[ "$archived_executable_name" != "$executable_name" ]]; then
+        mv "$executable_path" "$archived_executable_path"
+        chmod +x "$archived_executable_path"
+        if [[ -x /usr/libexec/PlistBuddy ]]; then
+            /usr/libexec/PlistBuddy -c "Set :CFBundleExecutable $archived_executable_name" "$temp_bundle/Contents/Info.plist"
+        fi
+    fi
+
     if command -v /usr/bin/codesign >/dev/null 2>&1; then
         /usr/bin/codesign --force --sign - --timestamp=none "$temp_bundle" >/dev/null
     fi
@@ -100,5 +114,5 @@ archive_platform_bundle() {
 }
 
 mkdir -p "$DESTINATION_DIR"
-archive_platform_bundle "$SOURCE_BUNDLE" "$DESTINATION_DIR" "macos-arm" "arm64" "$DESTINATION_DIR/$ARCHIVE_STEM.macos-arm.aar"
-archive_platform_bundle "$SOURCE_BUNDLE" "$DESTINATION_DIR" "macos-x86" "x86_64" "$DESTINATION_DIR/$ARCHIVE_STEM.macos-x86.aar"
+archive_platform_bundle "$SOURCE_BUNDLE" "$DESTINATION_DIR" "macos-arm" "arm64" "$DESTINATION_DIR/$ARCHIVE_STEM.macos-arm.aar" "$ARCHIVE_BUNDLE_NAME"
+archive_platform_bundle "$SOURCE_BUNDLE" "$DESTINATION_DIR" "macos-x86" "x86_64" "$DESTINATION_DIR/$ARCHIVE_STEM.macos-x86.aar" "$ARCHIVE_BUNDLE_NAME"

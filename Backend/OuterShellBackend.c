@@ -130,9 +130,9 @@ static int connect_unix_stream(const char *socket_path, char *error, size_t erro
 #define MAX_REACTOR_CLIENTS 128
 #define CLIENT_IDLE_TIMEOUT_MS 10000
 
-static const char *kBundleUrlPath = "/bundles/BackendsContent";
-static const char *kBundleFilePathMacosArm = "bundles/BackendsContent.bundle.macos-arm.aar";
-static const char *kBundleFilePathMacosX86 = "bundles/BackendsContent.bundle.macos-x86.aar";
+static const char *kBundleUrlPath = "/bundles/OuterShell";
+static const char *kBundleFilePathMacosArm = "bundles/OuterShell.bundle.macos-arm.aar";
+static const char *kBundleFilePathMacosX86 = "bundles/OuterShell.bundle.macos-x86.aar";
 
 static char g_bundle_file_path_macos_arm[PATH_MAX] = "";
 static char g_bundle_file_path_macos_x86[PATH_MAX] = "";
@@ -1622,9 +1622,9 @@ int OuterShellBackendMain(int argc, char **argv) {
     snprintf(g_http_proxy_api_socket_path, sizeof(g_http_proxy_api_socket_path), "%s", api_socket_path);
 
     snprintf(g_bundle_file_path_macos_arm, sizeof(g_bundle_file_path_macos_arm),
-             "%s/BackendsContent.bundle.macos-arm.aar", bundles_dir);
+             "%s/OuterShell.bundle.macos-arm.aar", bundles_dir);
     snprintf(g_bundle_file_path_macos_x86, sizeof(g_bundle_file_path_macos_x86),
-             "%s/BackendsContent.bundle.macos-x86.aar", bundles_dir);
+             "%s/OuterShell.bundle.macos-x86.aar", bundles_dir);
 
     signal(SIGINT, handle_shutdown_signal);
     signal(SIGTERM, handle_shutdown_signal);

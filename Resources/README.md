@@ -16,8 +16,8 @@ OuterShell/
   bin/
     outerctl
   bundles/
-    BackendsContent.bundle.macos-arm.aar
-    BackendsContent.bundle.macos-x86.aar
+    OuterShell.bundle.macos-arm.aar
+    OuterShell.bundle.macos-x86.aar
 ```
 
 Starter app tarballs are described by an app catalog. See

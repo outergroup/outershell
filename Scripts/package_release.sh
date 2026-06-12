@@ -32,8 +32,8 @@ require_file "${PACKAGE_ROOT}/RemoteLinuxBinaries/aarch64/OuterShellBackend"
 require_file "${PACKAGE_ROOT}/RemoteLinuxBinaries/x86_64/OuterShellBackend"
 require_file "${PACKAGE_ROOT}/RemoteLinuxBinaries/aarch64/outerctl"
 require_file "${PACKAGE_ROOT}/RemoteLinuxBinaries/x86_64/outerctl"
-require_file "${RUN_ROOT}/bundles/BackendsContent.bundle.macos-arm.aar"
-require_file "${RUN_ROOT}/bundles/BackendsContent.bundle.macos-x86.aar"
+require_file "${RUN_ROOT}/bundles/OuterShell.bundle.macos-arm.aar"
+require_file "${RUN_ROOT}/bundles/OuterShell.bundle.macos-x86.aar"
 require_file "${MACOS_BUILD_ROOT}/Outer Shell.app/Contents/MacOS/Outer Shell"
 require_file "${MACOS_BUILD_ROOT}/outershelld"
 require_file "${REPO_ROOT}/app-icon.png"
@@ -58,8 +58,8 @@ stage_home_screen() {
     install -m 0755 "${PACKAGE_ROOT}/RemoteLinuxBinaries/${arch}/OuterShellBackend" "${root}/OuterShellBackend"
     install -m 0755 "${PACKAGE_ROOT}/RemoteLinuxBinaries/${arch}/outerctl" "${root}/bin/outerctl"
     install -m 0644 "${REPO_ROOT}/app-icon.png" "${root}/app-icon.png"
-    install -m 0644 "${RUN_ROOT}/bundles/BackendsContent.bundle.macos-arm.aar" "${root}/bundles/BackendsContent.bundle.macos-arm.aar"
-    install -m 0644 "${RUN_ROOT}/bundles/BackendsContent.bundle.macos-x86.aar" "${root}/bundles/BackendsContent.bundle.macos-x86.aar"
+    install -m 0644 "${RUN_ROOT}/bundles/OuterShell.bundle.macos-arm.aar" "${root}/bundles/OuterShell.bundle.macos-arm.aar"
+    install -m 0644 "${RUN_ROOT}/bundles/OuterShell.bundle.macos-x86.aar" "${root}/bundles/OuterShell.bundle.macos-x86.aar"
     tar --format ustar --no-xattrs -C "${STAGING_ROOT}/outer-shell-${arch}" -czf "${OUTPUT_ROOT}/latest/outer-shell-${arch}.tar.gz" OuterShell
 }
 
@@ -69,8 +69,8 @@ stage_home_screen_macos() {
     ditto "${MACOS_BUILD_ROOT}/Outer Shell.app" "${root}/Outer Shell.app"
     install -m 0755 "${MACOS_BUILD_ROOT}/outershelld" "${root}/outershelld"
     install -m 0644 "${REPO_ROOT}/app-icon.png" "${root}/app-icon.png"
-    install -m 0644 "${RUN_ROOT}/bundles/BackendsContent.bundle.macos-arm.aar" "${root}/bundles/BackendsContent.bundle.macos-arm.aar"
-    install -m 0644 "${RUN_ROOT}/bundles/BackendsContent.bundle.macos-x86.aar" "${root}/bundles/BackendsContent.bundle.macos-x86.aar"
+    install -m 0644 "${RUN_ROOT}/bundles/OuterShell.bundle.macos-arm.aar" "${root}/bundles/OuterShell.bundle.macos-arm.aar"
+    install -m 0644 "${RUN_ROOT}/bundles/OuterShell.bundle.macos-x86.aar" "${root}/bundles/OuterShell.bundle.macos-x86.aar"
     if [[ -d "${RUN_ROOT}/bundled-apps" ]]; then
         ditto "${RUN_ROOT}/bundled-apps" "${root}/bundled-apps"
     fi
@@ -135,6 +135,15 @@ xml_escape() {
         -e 's/</\&lt;/g' \
         -e 's/>/\&gt;/g' \
         -e 's/"/\&quot;/g'
+}
+
+systemd_quote_arg() {
+    printf '"'
+    printf '%s' "$1" | sed \
+        -e 's/\\/\\\\/g' \
+        -e 's/"/\\"/g' \
+        -e 's/%/%%/g'
+    printf '"'
 }
 
 os_name="$(uname -s)"
@@ -327,10 +336,10 @@ if [ "$(id -u)" -eq 0 ]; then
 fi
 
 system_outershell_home="/var/lib/outershell"
-system_install_root="$system_outershell_home/outer-shell"
-system_outershelld_path="$system_install_root/outershelld"
+system_daemon_root="$system_outershell_home/outershelld"
+system_outershelld_path="$system_daemon_root/outershelld"
 system_outerctl_path="$system_outershell_home/bin/outerctl"
-system_version_path="$system_install_root/version"
+system_version_path="$system_daemon_root/version"
 system_binary_users_dir="$system_outershell_home/system-binary-users"
 system_binary_user_marker="$system_binary_users_dir/uid-$(id -u)"
 
@@ -338,35 +347,42 @@ if [ "$root_install" = true ]; then
     runtime_dir="/run"
     outershell_home="${OUTERSHELL_HOME:-$system_outershell_home}"
     install_root="$outershell_home/outer-shell"
+    daemon_root="$outershell_home/outershelld"
+    outershelld_path="$daemon_root/outershelld"
+    daemon_version_path="$daemon_root/version"
+    app_version_path="$install_root/version"
     outerctl_path="$outershell_home/bin/outerctl"
     unit_dir="/etc/systemd/system"
     socket_path="/run/org.outershell.OuterShell"
     api_socket_path="/run/outershelld-api"
-    log_dir="/var/log/outergroup"
-    log_path="$log_dir/org.outershell.OuterShell.log"
-    broker_log_path="$log_dir/outershelld.log"
+    app_log_dir="/var/log/outergroup"
+    daemon_log_dir="/var/log/outergroup"
+    log_path="$app_log_dir/org.outershell.OuterShell.log"
+    broker_log_path="$daemon_log_dir/outershelld.log"
     systemctl_scope="--system"
     service_wanted_by="multi-user.target"
-    outer_shell_listen_stream="$socket_path"
     api_listen_stream="$api_socket_path"
 else
     runtime_dir="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
     state_home="${XDG_STATE_HOME:-$HOME/.local/state}"
     outershell_home="${OUTERSHELL_HOME:-$state_home/outershell}"
     install_root="$outershell_home/outer-shell"
+    daemon_root="$outershell_home/outershelld"
+    outershelld_path="$daemon_root/outershelld"
+    daemon_version_path="$daemon_root/version"
+    app_version_path="$install_root/version"
     outerctl_path="$outershell_home/bin/outerctl"
     unit_dir="$HOME/.config/systemd/user"
     socket_path="$runtime_dir/org.outershell.OuterShell"
     api_socket_path="$runtime_dir/outershelld-api"
-    log_dir="$install_root/logs"
-    log_path="$log_dir/OuterShellBackend.log"
-    broker_log_path="$log_dir/outershelld.log"
+    app_log_dir="$install_root/logs"
+    daemon_log_dir="$daemon_root/logs"
+    log_path="$app_log_dir/OuterShellBackend.log"
+    broker_log_path="$daemon_log_dir/outershelld.log"
     systemctl_scope="--user"
     service_wanted_by="default.target"
-    outer_shell_listen_stream="%t/org.outershell.OuterShell"
     api_listen_stream="%t/outershelld-api"
 fi
-runner_path="$install_root/run-outer-shell.sh"
 
 root_binaries_match=false
 if [ "$root_install" = false ] &&
@@ -412,14 +428,14 @@ remove_system_binaries_if_unused() {
     systemctl --system disable --now outershelld.socket outershelld.service >/dev/null 2>&1 || true
     rm -f /etc/systemd/system/outershelld.service /etc/systemd/system/outershelld.socket /run/outershelld-api
     systemctl --system daemon-reload >/dev/null 2>&1 || true
-    rm -f "$system_outershelld_path" "$system_outerctl_path" "$system_install_root/bin/outerctl" "$system_version_path" "$system_install_root/run-outer-shell.sh"
+    rm -f "$system_outershelld_path" "$system_outerctl_path" "$system_version_path"
     rm -f /var/log/outergroup/outershelld.log /var/log/outergroup/org.outershell.OuterShell.log
     if ! find "$system_outershell_home/apps" -mindepth 1 -print -quit 2>/dev/null | grep -q . &&
        ! find /opt/outergroup -mindepth 1 -print -quit 2>/dev/null | grep -q .; then
         rm -f "$system_outershell_home/registry.orwa" "$system_outershell_home/registry.orwa.lock"
         rmdir "$system_outershell_home/apps" /opt/outergroup >/dev/null 2>&1 || true
     fi
-    rmdir "$system_install_root/bin" "$system_install_root" "$system_outershell_home/bin" "$system_binary_users_dir" "$system_outershell_home" /var/log/outergroup >/dev/null 2>&1 || true
+    rmdir "$system_daemon_root" "$system_outershell_home/bin" "$system_binary_users_dir" "$system_outershell_home" /var/log/outergroup >/dev/null 2>&1 || true
 }
 
 system_binary_cleanup_shell_functions() {
@@ -453,14 +469,14 @@ remove_system_binaries_if_unused() {
     systemctl --system disable --now outershelld.socket outershelld.service >/dev/null 2>&1 || true
     rm -f /etc/systemd/system/outershelld.service /etc/systemd/system/outershelld.socket /run/outershelld-api
     systemctl --system daemon-reload >/dev/null 2>&1 || true
-    rm -f "$system_outershelld_path" "$system_outerctl_path" "$system_install_root/bin/outerctl" "$system_version_path" "$system_install_root/run-outer-shell.sh"
+    rm -f "$system_outershelld_path" "$system_outerctl_path" "$system_version_path"
     rm -f /var/log/outergroup/outershelld.log /var/log/outergroup/org.outershell.OuterShell.log
     if ! find "$system_outershell_home/apps" -mindepth 1 -print -quit 2>/dev/null | grep -q . &&
        ! find /opt/outergroup -mindepth 1 -print -quit 2>/dev/null | grep -q .; then
         rm -f "$system_outershell_home/registry.orwa" "$system_outershell_home/registry.orwa.lock"
         rmdir "$system_outershell_home/apps" /opt/outergroup >/dev/null 2>&1 || true
     fi
-    rmdir "$system_install_root/bin" "$system_install_root" "$system_outershell_home/bin" "$system_binary_users_dir" "$system_outershell_home" /var/log/outergroup >/dev/null 2>&1 || true
+    rmdir "$system_daemon_root" "$system_outershell_home/bin" "$system_binary_users_dir" "$system_outershell_home" /var/log/outergroup >/dev/null 2>&1 || true
 }
 OUTERSHELL_SYSTEM_BINARY_CLEANUP_SH
 }
@@ -477,7 +493,7 @@ remove_system_binary_user_marker_with_sudo() {
 #!/bin/sh
 set -eu
 system_outershell_home="$system_outershell_home"
-system_install_root="$system_install_root"
+system_daemon_root="$system_daemon_root"
 system_outershelld_path="$system_outershelld_path"
 system_outerctl_path="$system_outerctl_path"
 system_version_path="$system_version_path"
@@ -545,16 +561,17 @@ sleep 0.25
     fi
 systemctl $systemctl_scope daemon-reload >/dev/null 2>&1 || true
 if [ "$root_install" = true ]; then
-    rm -f "$install_root/OuterShellBackend" "$install_root/app-icon.png"
-    rm -rf "$install_root/bundles" "$install_root/bundled-apps"
+    rm -rf "$install_root"
     rm -f "$log_path"
 else
     rm -rf "$install_root"
+    rm -rf "$daemon_root"
+    rm -f "$outerctl_path"
 fi
 rm -f "$system_binary_user_marker"
 $(system_binary_cleanup_shell_functions)
 system_outershell_home="$system_outershell_home"
-system_install_root="$system_install_root"
+system_daemon_root="$system_daemon_root"
 system_outershelld_path="$system_outershelld_path"
 system_outerctl_path="$system_outerctl_path"
 system_version_path="$system_version_path"
@@ -573,40 +590,40 @@ EOF
     exit 0
 fi
 
-mkdir -p "$install_root" "$outershell_home/bin" "$unit_dir" "$log_dir"
+mkdir -p "$install_root" "$daemon_root" "$outershell_home/bin" "$unit_dir" "$app_log_dir" "$daemon_log_dir"
 cleanup_legacy_home_screen
 archive_path="$(mktemp)"
+payload_outerctl_path="$(mktemp)"
 stage_archive "${public_base_url%/}/latest/outer-shell-${arch}.tar.gz?v=__ASSET_VERSION__" "$archive_path"
-rm -f "$install_root/outershelld" "$install_root/bin/outerctl" "$outerctl_path" "$install_root/OuterShellBackend"
+rm -f "$outershelld_path" "$outerctl_path" "$install_root/OuterShellBackend" "$install_root/outershelld" "$install_root/bin/outerctl" "$install_root/run-outer-shell.sh"
+rm -rf "$install_root/bin"
 tar -xzf "$archive_path" -C "$install_root" --strip-components=1
 rm -f "$archive_path"
-chmod 0755 "$install_root/outershelld"
+mv "$install_root/outershelld" "$outershelld_path"
+mv "$install_root/bin/outerctl" "$payload_outerctl_path"
+rmdir "$install_root/bin" >/dev/null 2>&1 || true
+chmod 0755 "$outershelld_path"
 chmod 0755 "$install_root/OuterShellBackend"
-chmod 0755 "$install_root/bin/outerctl"
+chmod 0755 "$payload_outerctl_path"
 if [ "$root_install" = true ]; then
     mkdir -p "$system_binary_users_dir"
     chmod 1777 "$system_binary_users_dir"
     touch "$system_binary_user_marker"
     chown 0:0 "$system_binary_user_marker" 2>/dev/null || true
-    install -m 0755 "$install_root/bin/outerctl" "$outerctl_path"
-    rm -f "$install_root/bin/outerctl"
-    ln -s "$outerctl_path" "$install_root/bin/outerctl"
+    install -m 0755 "$payload_outerctl_path" "$outerctl_path"
 elif [ "$root_binaries_match" = true ]; then
-    rm -f "$install_root/outershelld" "$install_root/bin/outerctl" "$outerctl_path"
-    ln -s "$system_outershelld_path" "$install_root/outershelld"
-    ln -s "$system_outerctl_path" "$install_root/bin/outerctl"
+    rm -f "$outershelld_path" "$outerctl_path"
+    ln -s "$system_outershelld_path" "$outershelld_path"
     ln -s "$system_outerctl_path" "$outerctl_path"
 else
-    install -m 0755 "$install_root/bin/outerctl" "$outerctl_path"
+    install -m 0755 "$payload_outerctl_path" "$outerctl_path"
 fi
-printf '%s\n' "__OUTER_SHELL_VERSION__" > "$install_root/version"
+rm -f "$payload_outerctl_path"
+printf '%s\n' "__OUTER_SHELL_VERSION__" > "$app_version_path"
+printf '%s\n' "__OUTER_SHELL_VERSION__" > "$daemon_version_path"
 touch "$log_path" "$broker_log_path"
 
-cat > "$runner_path" <<EOF
-#!/bin/sh
-exec "$install_root/OuterShellBackend" --socket-path "\${1:-$socket_path}" --api-socket-path "$api_socket_path" --bundles-dir "$install_root/bundles" --bundled-apps-dir "$install_root/bundled-apps" --app-base-url "$app_base_url" --public-base-url "$public_base_url"
-EOF
-chmod 0755 "$runner_path"
+outer_shell_exec="$(systemd_quote_arg "$install_root/OuterShellBackend") --socket-path $(systemd_quote_arg "$socket_path") --api-socket-path $(systemd_quote_arg "$api_socket_path") --bundles-dir $(systemd_quote_arg "$install_root/bundles") --bundled-apps-dir $(systemd_quote_arg "$install_root/bundled-apps") --app-base-url $(systemd_quote_arg "$app_base_url") --public-base-url $(systemd_quote_arg "$public_base_url")"
 
 cat > "$unit_dir/org.outershell.OuterShell.service" <<EOF
 [Unit]
@@ -616,7 +633,7 @@ Wants=outershelld.socket
 
 [Service]
 Environment=OUTERSHELL_HOME=$outershell_home
-ExecStart=$runner_path $outer_shell_listen_stream
+ExecStart=$outer_shell_exec
 Restart=no
 StandardOutput=append:$log_path
 StandardError=append:$log_path
@@ -630,7 +647,7 @@ cat > "$unit_dir/org.outershell.OuterShell.socket" <<EOF
 Description=Outer Group Outer Shell Socket
 
 [Socket]
-ListenStream=$outer_shell_listen_stream
+ListenStream=$socket_path
 FileDescriptorName=http
 SocketMode=0600
 Service=org.outershell.OuterShell.service
@@ -660,7 +677,7 @@ Description=Outer Shell daemon
 [Service]
 Environment=OUTERSHELL_HOME=$outershell_home
 Environment=OUTER_SHELL_PUBLIC_BASE_URL=$public_base_url
-ExecStart=$install_root/outershelld
+ExecStart=$outershelld_path
 Restart=no
 StandardOutput=append:$broker_log_path
 StandardError=append:$broker_log_path

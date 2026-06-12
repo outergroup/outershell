@@ -88,13 +88,14 @@ echo "==> Building bundled Top content"
     CODE_SIGNING_REQUIRED=NO \
     build
 
-echo "==> Archiving BackendsContent bundles"
+echo "==> Archiving OuterShell bundles"
 "${SCRIPT_DIR}/Scripts/archive_backends_bundle.sh" \
     "${BUILD_ROOT}/${CONFIGURATION}/Backends.bundle" \
     "${RUN_ROOT}/bundles" \
-    BackendsContent.bundle
+    OuterShell.bundle
+rm -rf "${BUILD_ROOT}/${CONFIGURATION}/Outer Shell.app/Contents/Resources/bundles"
 mkdir -p "${BUILD_ROOT}/${CONFIGURATION}/Outer Shell.app/Contents/Resources/bundles"
-cp "${RUN_ROOT}/bundles"/BackendsContent.bundle.*.aar \
+cp "${RUN_ROOT}/bundles"/OuterShell.bundle.*.aar \
     "${BUILD_ROOT}/${CONFIGURATION}/Outer Shell.app/Contents/Resources/bundles/"
 
 echo "==> Staging bundled Top"

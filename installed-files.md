@@ -60,15 +60,14 @@ macOS public install:
 Linux public install:
 
 - `<user-state>/outer-shell/OuterShellBackend`
-- `<user-state>/outer-shell/outershelld`, or a symlink to `<system-state>/outer-shell/outershelld` when matching root support is installed
-- `<user-state>/outer-shell/bin/outerctl`, or a symlink to `<system-state>/bin/outerctl` when matching root support is installed
 - `<user-state>/outer-shell/bundles/`
 - `<user-state>/outer-shell/bundled-apps/`
 - `<user-state>/outer-shell/app-icon.png`
 - `<user-state>/outer-shell/version`
-- `<user-state>/outer-shell/run-outer-shell.sh`
 - `<user-state>/outer-shell/logs/OuterShellBackend.log`
-- `<user-state>/outer-shell/logs/outershelld.log`
+- `<user-state>/outershelld/outershelld`, or a symlink to `<system-state>/outershelld/outershelld` when matching root support is installed
+- `<user-state>/outershelld/version`
+- `<user-state>/outershelld/logs/outershelld.log`
 - `<user-state>/bin/outerctl`, or a symlink to `<system-state>/bin/outerctl` when matching root support is installed
 - `$HOME/.config/systemd/user/org.outershell.OuterShell.service`
 - `$HOME/.config/systemd/user/org.outershell.OuterShell.socket`
@@ -80,13 +79,12 @@ Linux public install:
 Linux public install when connected directly as root:
 
 - `<system-state>/outer-shell/OuterShellBackend`
-- `<system-state>/outer-shell/outershelld`
-- `<system-state>/outer-shell/bin/outerctl`
 - `<system-state>/outer-shell/bundles/`
 - `<system-state>/outer-shell/bundled-apps/`
 - `<system-state>/outer-shell/app-icon.png`
 - `<system-state>/outer-shell/version`
-- `<system-state>/outer-shell/run-outer-shell.sh`
+- `<system-state>/outershelld/outershelld`
+- `<system-state>/outershelld/version`
 - `<system-state>/bin/outerctl`
 - `/etc/systemd/system/org.outershell.OuterShell.service`
 - `/etc/systemd/system/org.outershell.OuterShell.socket`
@@ -104,15 +102,14 @@ In this direct-root Linux mode, Outer Shell treats bundled app installs as syste
 
 A non-root Linux Outer Shell can promote `outershelld` and `outerctl` into system scope the first time it needs to install, uninstall, or update root-owned records. This installs the system `outershelld` API socket and rewires the user executable paths to the root-owned binaries:
 
-- `<system-state>/outer-shell/outershelld`
-- `<system-state>/outer-shell/version`
+- `<system-state>/outershelld/outershelld`
+- `<system-state>/outershelld/version`
 - `<system-state>/bin/outerctl`
 - `/etc/systemd/system/outershelld.service`
 - `/etc/systemd/system/outershelld.socket`
 - `/var/log/outergroup/outershelld.log`
 - `/run/outershelld-api`
-- `<user-state>/outer-shell/outershelld -> <system-state>/outer-shell/outershelld`
-- `<user-state>/outer-shell/bin/outerctl -> <system-state>/bin/outerctl`
+- `<user-state>/outershelld/outershelld -> <system-state>/outershelld/outershelld`
 - `<user-state>/bin/outerctl -> <system-state>/bin/outerctl`
 - `<system-state>/system-binary-users/uid-<uid>`
 

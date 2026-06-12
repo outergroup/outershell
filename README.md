@@ -4,7 +4,7 @@ Outer Shell is an outerframe app for launching apps and viewing the backends reg
 
 This app will replace the old Outer Loop Services UI and the built-in log viewer. It currently includes:
 
-- A Backends table sourced from `backends`, `frontends`, `log_files`, `systemd_backends`, and `launchd_backends`
+- A backend-services table sourced from `backends`, `frontends`, `log_files`, `systemd_backends`, and `launchd_backends`
 - An inline log viewer for the selected backend
 - Start, stop, uninstall, and create flows for systemd-managed backends
 - User or root installation for bundled systemd backends
@@ -182,9 +182,9 @@ Linux/SSH, and Top on localhost macOS. `build_run.sh` builds and stages the
 macOS Top payload from the `~/dev/src/Top` checkout for local testing;
 install-time code only copies that prebuilt payload.
 
-On Linux, when a bundled app is installed for the current user, Backends copies the payload into `${XDG_STATE_HOME:-~/.local/state}/outershell/apps/<service id>`, writes its user systemd unit, records the backend/log metadata in the registry, and starts the service. On macOS, localhost installs copy the payload into `~/Library/Application Support/outershell/apps/<service id>`, write a LaunchAgent, record metadata in the registry, and start the service.
+On Linux, when a bundled app is installed for the current user, Outer Shell copies the payload into `${XDG_STATE_HOME:-~/.local/state}/outershell/apps/<service id>`, writes its user systemd unit, records the backend/log metadata in the registry, and starts the service. On macOS, localhost installs copy the payload into `~/Library/Application Support/outershell/apps/<service id>`, write a LaunchAgent, record metadata in the registry, and start the service.
 
-Bundled apps can also be installed as root from the action menu. Root installs use a system systemd unit, copy the payload into `/opt/outergroup/<service id>`, write logs under `/var/log/outergroup`, write registry metadata to `/var/lib/outershell/registry.orwa`, and put Unix sockets under the system runtime directory, such as `/run/dev.outergroup.Top`. These operations use `sudo`; if sudo needs a password, the Backends UI prompts and retries the operation.
+Bundled apps can also be installed as root from the action menu. Root installs use a system systemd unit, copy the payload into `/opt/outergroup/<service id>`, write logs under `/var/log/outergroup`, write registry metadata to `/var/lib/outershell/registry.orwa`, and put Unix sockets under the system runtime directory, such as `/run/dev.outergroup.Top`. These operations use `sudo`; if sudo needs a password, the Outer Shell UI prompts and retries the operation.
 
 Bundled apps register their own frontend with the `outerctl` installed by Outer Shell. On Linux, the public Outer Shell installer places it at `${XDG_STATE_HOME:-~/.local/state}/outershell/bin/outerctl`; generated user systemd units use that path. Root-installed bundled apps run it through a small wrapper that sets `OUTERSHELL_HOME=/var/lib/outershell`, so frontend and log metadata are recorded in the system registry.
 
