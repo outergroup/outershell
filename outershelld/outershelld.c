@@ -357,6 +357,88 @@ static void shell_quote(const char *value, char *out, size_t out_size) {
     out[offset] = '\0';
 }
 
+#ifndef __APPLE__
+static void systemd_exec_quote_arg(const char *value, bool preserve_specifiers, char *out, size_t out_size) {
+    size_t offset = 0;
+    if (out_size == 0) return;
+    out[offset++] = '"';
+    for (const char *p = value ? value : ""; *p && offset + 5 < out_size; p++) {
+        unsigned char c = (unsigned char)*p;
+        if (c == '"' || c == '\\') {
+            out[offset++] = '\\';
+            out[offset++] = (char)c;
+        } else if (c == '%' && !preserve_specifiers) {
+            out[offset++] = '%';
+            out[offset++] = '%';
+        } else if (c == '\n') {
+            out[offset++] = '\\';
+            out[offset++] = 'n';
+        } else if (c == '\r') {
+            out[offset++] = '\\';
+            out[offset++] = 'r';
+        } else if (c == '\t') {
+            out[offset++] = '\\';
+            out[offset++] = 't';
+        } else {
+            out[offset++] = (char)c;
+        }
+    }
+    if (offset + 1 < out_size) {
+        out[offset++] = '"';
+    }
+    out[offset] = '\0';
+}
+
+static void bundled_systemd_exec_start(const char *binary_path,
+                                       const char *service_id,
+                                       const char *socket_path,
+                                       const char *bundles_dir,
+                                       const char *icon_path,
+                                       char *out,
+                                       size_t out_size) {
+    char quoted_binary[PATH_MAX * 2 + 16];
+    char quoted_service_id[1024];
+    char quoted_socket_path[PATH_MAX * 2 + 32];
+    char quoted_bundles[PATH_MAX * 2 + 16];
+    char quoted_icon[PATH_MAX * 2 + 16];
+    systemd_exec_quote_arg(binary_path, false, quoted_binary, sizeof(quoted_binary));
+    systemd_exec_quote_arg(service_id, false, quoted_service_id, sizeof(quoted_service_id));
+    if (socket_path && socket_path[0]) {
+        systemd_exec_quote_arg(socket_path, true, quoted_socket_path, sizeof(quoted_socket_path));
+    } else {
+        quoted_socket_path[0] = '\0';
+    }
+    systemd_exec_quote_arg(bundles_dir, false, quoted_bundles, sizeof(quoted_bundles));
+    if (icon_path && icon_path[0]) {
+        systemd_exec_quote_arg(icon_path, false, quoted_icon, sizeof(quoted_icon));
+    } else {
+        quoted_icon[0] = '\0';
+    }
+
+    if (quoted_icon[0]) {
+        if (quoted_socket_path[0]) {
+            snprintf(out, out_size,
+                     "%s --label %s --socket-path %s --bundles-dir %s --icon-file %s",
+                     quoted_binary, quoted_service_id, quoted_socket_path, quoted_bundles, quoted_icon);
+        } else {
+            snprintf(out, out_size,
+                     "%s --label %s --bundles-dir %s --icon-file %s",
+                     quoted_binary, quoted_service_id, quoted_bundles, quoted_icon);
+        }
+    } else {
+        if (quoted_socket_path[0]) {
+            snprintf(out, out_size,
+                     "%s --label %s --socket-path %s --bundles-dir %s",
+                     quoted_binary, quoted_service_id, quoted_socket_path, quoted_bundles);
+        } else {
+            snprintf(out, out_size,
+                     "%s --label %s --bundles-dir %s",
+                     quoted_binary, quoted_service_id, quoted_bundles);
+        }
+    }
+}
+#endif
+
 
 static bool safe_unit_name(const char *unit_name) {
     if (!unit_name || !unit_name[0]) return false;
@@ -9581,19 +9663,9 @@ static bool install_bundled_user_systemd_unit_from_paths(const BundledAppDefinit
     struct passwd *pw = getpwuid(getuid());
     snprintf(user_name, sizeof(user_name), "%s", pw && pw->pw_name ? pw->pw_name : "");
 
-    char quoted_binary[PATH_MAX + 8];
-    char quoted_bundles[PATH_MAX + 8];
-    char quoted_icon[PATH_MAX + 8];
-    char quoted_log[PATH_MAX + 8];
-    char quoted_service_id[512];
     char quoted_socket_path[PATH_MAX + 32];
     char actual_socket_path[PATH_MAX] = "";
     char systemd_socket_path[PATH_MAX] = "";
-    shell_quote(binary_path, quoted_binary, sizeof(quoted_binary));
-    shell_quote(bundles_dir, quoted_bundles, sizeof(quoted_bundles));
-    if (icon_path && icon_path[0]) shell_quote(icon_path, quoted_icon, sizeof(quoted_icon)); else quoted_icon[0] = '\0';
-    shell_quote(log_path, quoted_log, sizeof(quoted_log));
-    shell_quote(app->service_id, quoted_service_id, sizeof(quoted_service_id));
     if (app->socket_name && app->socket_name[0]) {
         snprintf(systemd_socket_path, sizeof(systemd_socket_path), "%%t/%s", app->socket_name);
         shell_quote(systemd_socket_path, quoted_socket_path, sizeof(quoted_socket_path));
@@ -9602,30 +9674,14 @@ static bool install_bundled_user_systemd_unit_from_paths(const BundledAppDefinit
         quoted_socket_path[0] = '\0';
     }
 
-    char run_script[PATH_MAX * 4];
-    if (quoted_icon[0]) {
-        if (quoted_socket_path[0]) {
-            snprintf(run_script, sizeof(run_script),
-                     "exec %s --label %s --socket-path %s --bundles-dir %s --icon-file %s",
-                     quoted_binary, quoted_service_id, quoted_socket_path, quoted_bundles, quoted_icon);
-        } else {
-            snprintf(run_script, sizeof(run_script),
-                     "exec %s --label %s --bundles-dir %s --icon-file %s",
-                     quoted_binary, quoted_service_id, quoted_bundles, quoted_icon);
-        }
-    } else {
-        if (quoted_socket_path[0]) {
-            snprintf(run_script, sizeof(run_script),
-                     "exec %s --label %s --socket-path %s --bundles-dir %s",
-                     quoted_binary, quoted_service_id, quoted_socket_path, quoted_bundles);
-        } else {
-            snprintf(run_script, sizeof(run_script),
-                     "exec %s --label %s --bundles-dir %s",
-                     quoted_binary, quoted_service_id, quoted_bundles);
-        }
-    }
-    char quoted_run_script[sizeof(run_script) + 16];
-    shell_quote(run_script, quoted_run_script, sizeof(quoted_run_script));
+    char exec_start[PATH_MAX * 6];
+    bundled_systemd_exec_start(binary_path,
+                               app->service_id,
+                               systemd_socket_path,
+                               bundles_dir,
+                               icon_path,
+                               exec_start,
+                               sizeof(exec_start));
 
     char description[256];
     unit_description_text(app->display_name, description, sizeof(description));
@@ -9642,7 +9698,7 @@ static bool install_bundled_user_systemd_unit_from_paths(const BundledAppDefinit
              "Environment=USER=%s\n"
              "Environment=LOGNAME=%s\n"
              "Environment=OUTERCTL_PATH=%s\n"
-             "ExecStart=/bin/sh -lc %s\n"
+             "ExecStart=%s\n"
              "Restart=on-failure\n"
              "KillMode=control-group\n"
              "StandardOutput=append:%s\n"
@@ -9656,7 +9712,7 @@ static bool install_bundled_user_systemd_unit_from_paths(const BundledAppDefinit
              user_name,
              user_name,
              outerctl_path,
-             quoted_run_script,
+             exec_start,
              log_path,
              log_path);
     char socket_contents[2048] = "";
@@ -9936,21 +9992,11 @@ static bool install_bundled_app(const BundledAppDefinition *app,
         if (socket_unit_name[0]) shell_quote(socket_unit_name, quoted_socket_unit, sizeof(quoted_socket_unit)); else quoted_socket_unit[0] = '\0';
         if (socket_unit_path[0]) shell_quote(socket_unit_path, quoted_socket_unit_path, sizeof(quoted_socket_unit_path)); else quoted_socket_unit_path[0] = '\0';
 
-        char quoted_binary[PATH_MAX + 8];
-        char quoted_bundles[PATH_MAX + 8];
-        char quoted_icon[PATH_MAX + 8];
-        char quoted_log[PATH_MAX + 8];
-        char quoted_service_id[512];
         char quoted_display_name[512];
         char quoted_target_icon_for_registry[PATH_MAX + 8];
         char quoted_socket_path[PATH_MAX + 32];
         char actual_socket_path[PATH_MAX] = "";
         char systemd_socket_path[PATH_MAX] = "";
-        shell_quote(target_binary, quoted_binary, sizeof(quoted_binary));
-        shell_quote(bundles_dir, quoted_bundles, sizeof(quoted_bundles));
-        if (target_icon[0]) shell_quote(target_icon, quoted_icon, sizeof(quoted_icon)); else quoted_icon[0] = '\0';
-        shell_quote(log_path, quoted_log, sizeof(quoted_log));
-        shell_quote(app->service_id, quoted_service_id, sizeof(quoted_service_id));
         shell_quote(app->display_name, quoted_display_name, sizeof(quoted_display_name));
         shell_quote(target_icon, quoted_target_icon_for_registry, sizeof(quoted_target_icon_for_registry));
         if (app->socket_name && app->socket_name[0]) {
@@ -9963,30 +10009,14 @@ static bool install_bundled_app(const BundledAppDefinition *app,
             quoted_actual_socket_path[0] = '\0';
         }
 
-        char run_script[PATH_MAX * 4];
-        if (quoted_icon[0]) {
-            if (quoted_socket_path[0]) {
-                snprintf(run_script, sizeof(run_script),
-                         "exec %s --label %s --socket-path %s --bundles-dir %s --icon-file %s",
-                         quoted_binary, quoted_service_id, quoted_socket_path, quoted_bundles, quoted_icon);
-            } else {
-                snprintf(run_script, sizeof(run_script),
-                         "exec %s --label %s --bundles-dir %s --icon-file %s",
-                         quoted_binary, quoted_service_id, quoted_bundles, quoted_icon);
-            }
-        } else {
-            if (quoted_socket_path[0]) {
-                snprintf(run_script, sizeof(run_script),
-                         "exec %s --label %s --socket-path %s --bundles-dir %s",
-                         quoted_binary, quoted_service_id, quoted_socket_path, quoted_bundles);
-            } else {
-                snprintf(run_script, sizeof(run_script),
-                         "exec %s --label %s --bundles-dir %s",
-                         quoted_binary, quoted_service_id, quoted_bundles);
-            }
-        }
-        char quoted_run_script[sizeof(run_script) + 16];
-        shell_quote(run_script, quoted_run_script, sizeof(quoted_run_script));
+        char exec_start[PATH_MAX * 6];
+        bundled_systemd_exec_start(target_binary,
+                                   app->service_id,
+                                   systemd_socket_path,
+                                   bundles_dir,
+                                   target_icon,
+                                   exec_start,
+                                   sizeof(exec_start));
 
         char description[256];
         unit_description_text(app->display_name, description, sizeof(description));
@@ -10003,7 +10033,7 @@ static bool install_bundled_app(const BundledAppDefinition *app,
                  "Environment=USER=%s\n"
                  "Environment=LOGNAME=%s\n"
                  "Environment=OUTERCTL_PATH=%s\n"
-                 "ExecStart=/bin/sh -lc %s\n"
+                 "ExecStart=%s\n"
                  "Restart=on-failure\n"
                  "KillMode=control-group\n"
                  "StandardOutput=append:%s\n"
@@ -10017,7 +10047,7 @@ static bool install_bundled_app(const BundledAppDefinition *app,
                  user_name,
                  user_name,
                  wrapper_path,
-                 quoted_run_script,
+                 exec_start,
                  log_path,
                  log_path);
 
@@ -10291,23 +10321,9 @@ static bool install_bundled_app(const BundledAppDefinition *app,
     struct passwd *pw = getpwuid(getuid());
     snprintf(user_name, sizeof(user_name), "%s", pw && pw->pw_name ? pw->pw_name : "");
 
-    char quoted_binary[PATH_MAX + 8];
-    char quoted_bundles[PATH_MAX + 8];
-    char quoted_icon[PATH_MAX + 8];
-    char quoted_log[PATH_MAX + 8];
-    char quoted_service_id[512];
     char quoted_socket_path[PATH_MAX + 32];
     char actual_socket_path[PATH_MAX] = "";
     char systemd_socket_path[PATH_MAX] = "";
-    shell_quote(target_binary, quoted_binary, sizeof(quoted_binary));
-    shell_quote(bundles_dir, quoted_bundles, sizeof(quoted_bundles));
-    if (target_icon[0]) {
-        shell_quote(target_icon, quoted_icon, sizeof(quoted_icon));
-    } else {
-        quoted_icon[0] = '\0';
-    }
-    shell_quote(log_path, quoted_log, sizeof(quoted_log));
-    shell_quote(app->service_id, quoted_service_id, sizeof(quoted_service_id));
     if (app->socket_name && app->socket_name[0]) {
         snprintf(systemd_socket_path, sizeof(systemd_socket_path), "%%t/%s", app->socket_name);
         shell_quote(systemd_socket_path, quoted_socket_path, sizeof(quoted_socket_path));
@@ -10316,30 +10332,14 @@ static bool install_bundled_app(const BundledAppDefinition *app,
         quoted_socket_path[0] = '\0';
     }
 
-    char run_script[PATH_MAX * 4];
-    if (quoted_icon[0]) {
-        if (quoted_socket_path[0]) {
-            snprintf(run_script, sizeof(run_script),
-                     "exec %s --label %s --socket-path %s --bundles-dir %s --icon-file %s",
-                     quoted_binary, quoted_service_id, quoted_socket_path, quoted_bundles, quoted_icon);
-        } else {
-            snprintf(run_script, sizeof(run_script),
-                     "exec %s --label %s --bundles-dir %s --icon-file %s",
-                     quoted_binary, quoted_service_id, quoted_bundles, quoted_icon);
-        }
-    } else {
-        if (quoted_socket_path[0]) {
-            snprintf(run_script, sizeof(run_script),
-                     "exec %s --label %s --socket-path %s --bundles-dir %s",
-                     quoted_binary, quoted_service_id, quoted_socket_path, quoted_bundles);
-        } else {
-            snprintf(run_script, sizeof(run_script),
-                     "exec %s --label %s --bundles-dir %s",
-                     quoted_binary, quoted_service_id, quoted_bundles);
-        }
-    }
-    char quoted_run_script[sizeof(run_script) + 16];
-    shell_quote(run_script, quoted_run_script, sizeof(quoted_run_script));
+    char exec_start[PATH_MAX * 6];
+    bundled_systemd_exec_start(target_binary,
+                               app->service_id,
+                               systemd_socket_path,
+                               bundles_dir,
+                               target_icon,
+                               exec_start,
+                               sizeof(exec_start));
 
     char description[256];
     unit_description_text(app->display_name, description, sizeof(description));
@@ -10358,7 +10358,7 @@ static bool install_bundled_app(const BundledAppDefinition *app,
              "Environment=USER=%s\n"
              "Environment=LOGNAME=%s\n"
              "Environment=OUTERCTL_PATH=%s\n"
-             "ExecStart=/bin/sh -lc %s\n"
+             "ExecStart=%s\n"
              "Restart=on-failure\n"
              "KillMode=control-group\n"
              "StandardOutput=append:%s\n"
@@ -10372,7 +10372,7 @@ static bool install_bundled_app(const BundledAppDefinition *app,
              user_name,
              user_name,
              outerctl_path,
-             quoted_run_script,
+             exec_start,
              log_path,
              log_path);
     char socket_contents[2048] = "";
