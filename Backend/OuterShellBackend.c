@@ -243,10 +243,10 @@ static const BundledAppDefinition kBundledApps[] = {
         .service_id = "dev.outergroup.Firehose",
         .display_name = "Firehose",
         .stage_directory_name = "Firehose",
-        .binary_name = "TraceBackend",
-        .bundle_prefix = "TraceContent",
+        .binary_name = "FirehoseBackend",
+        .bundle_prefix = "FirehoseContent",
         .icon_name = "app-icon.png",
-        .source_name = "TraceBackend.c",
+        .source_name = NULL,
         .archive_name = "Firehose.tar.gz"
     },
     {
@@ -576,11 +576,6 @@ static bool bundled_app_stage_has_expected_files(const BundledAppDefinition *app
     snprintf(macos_binary, sizeof(macos_binary), "%s/MacOS/%s", stage_root, app->binary_name);
     return stat(macos_binary, &st) == 0 && S_ISREG(st.st_mode);
 #else
-    if (app->source_name && app->source_name[0]) {
-        char source_path[PATH_MAX];
-        snprintf(source_path, sizeof(source_path), "%s/Source/%s", stage_root, app->source_name);
-        if (stat(source_path, &st) == 0 && S_ISREG(st.st_mode)) return true;
-    }
     char architecture[64];
     if (!remote_machine_architecture(architecture, sizeof(architecture))) return false;
     char linux_binary[PATH_MAX];

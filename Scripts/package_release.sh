@@ -687,9 +687,12 @@ if [ "$command" = "install" ]; then
 fi
 systemctl $systemctl_scope daemon-reload
 systemctl $systemctl_scope enable org.outershell.OuterShell.socket outershelld.socket
-systemctl $systemctl_scope stop org.outershell.OuterShell.service outershelld.service org.outershell.OuterShell.socket outershelld.socket >/dev/null 2>&1 || true
+systemctl $systemctl_scope stop org.outershell.OuterShell.socket outershelld.socket >/dev/null 2>&1 || true
+systemctl $systemctl_scope stop org.outershell.OuterShell.service outershelld.service >/dev/null 2>&1 || true
+systemctl $systemctl_scope reset-failed org.outershell.OuterShell.socket outershelld.socket org.outershell.OuterShell.service outershelld.service >/dev/null 2>&1 || true
 rm -f "$socket_path" "$api_socket_path"
-systemctl $systemctl_scope start org.outershell.OuterShell.socket outershelld.socket
+systemctl $systemctl_scope start outershelld.socket
+systemctl $systemctl_scope start org.outershell.OuterShell.socket
 
 run_outerctl backend upsert --backend org.outershell.OuterShell --name "Outer Shell" --systemd-unit org.outershell.OuterShell.service
 run_outerctl app clear --backend org.outershell.OuterShell

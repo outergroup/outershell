@@ -854,10 +854,10 @@ static const BundledAppDefinition kBundledApps[] = {
         .stage_directory_name = "Firehose",
         .install_directory_name = "dev.outergroup.Firehose",
         .binary_name = "FirehoseBackend",
-        .bundle_prefix = "TraceContent",
+        .bundle_prefix = "FirehoseContent",
         .icon_symbol_name = "text.line.last.and.arrowtriangle.forward",
         .icon_name = "app-icon.png",
-        .source_name = "TraceBackend.c",
+        .source_name = NULL,
         .socket_name = "dev.outergroup.Firehose",
         .socket_activated = true,
         .supports_root = true,
@@ -1709,12 +1709,6 @@ static bool bundled_app_stage_has_expected_files(const BundledAppDefinition *app
     snprintf(macos_binary, sizeof(macos_binary), "%s/MacOS/%s", stage_root, app->binary_name);
     return stat(macos_binary, &st) == 0 && S_ISREG(st.st_mode);
 #else
-    if (app->source_name && app->source_name[0]) {
-        char source_path[PATH_MAX];
-        snprintf(source_path, sizeof(source_path), "%s/Source/%s", stage_root, app->source_name);
-        if (stat(source_path, &st) == 0 && S_ISREG(st.st_mode)) return true;
-    }
-
     char architecture[64];
     if (!remote_machine_architecture(architecture, sizeof(architecture))) return false;
     char linux_binary[PATH_MAX];
@@ -9928,12 +9922,6 @@ static bool install_bundled_app(const BundledAppDefinition *app,
     }
     char source_binary[PATH_MAX];
     snprintf(source_binary, sizeof(source_binary), "%s/RemoteLinuxBinaries/%s/%s", stage_root, architecture, app->binary_name);
-    char source_code[PATH_MAX];
-    if (app->source_name && app->source_name[0]) {
-        snprintf(source_code, sizeof(source_code), "%s/Source/%s", stage_root, app->source_name);
-    } else {
-        source_code[0] = '\0';
-    }
     char source_bundle_arm[PATH_MAX];
     snprintf(source_bundle_arm, sizeof(source_bundle_arm), "%s/bundles/%s.bundle.macos-arm.aar", stage_root, app->bundle_prefix);
     char source_bundle_x86[PATH_MAX];
@@ -9948,8 +9936,7 @@ static bool install_bundled_app(const BundledAppDefinition *app,
     char error[1024] = "";
     struct stat st;
     bool has_source_binary = stat(source_binary, &st) == 0 && S_ISREG(st.st_mode);
-    bool has_source_code = !has_source_binary && source_code[0] && stat(source_code, &st) == 0 && S_ISREG(st.st_mode);
-    if (!has_source_binary && !has_source_code) {
+    if (!has_source_binary) {
         snprintf(message, message_size, "Missing %s binary for %s at %s.", app->display_name, architecture, source_binary);
         return false;
     }
@@ -9972,47 +9959,6 @@ static bool install_bundled_app(const BundledAppDefinition *app,
         char user_name[128] = "";
         struct passwd *pw = getpwuid(getuid());
         snprintf(user_name, sizeof(user_name), "%s", pw && pw->pw_name ? pw->pw_name : "");
-
-        char compiled_binary[PATH_MAX] = "";
-        if (has_source_code) {
-            char binary_template[] = "/tmp/backends-bundled-binary-XXXXXX";
-            int binary_fd = mkstemp(binary_template);
-            if (binary_fd < 0) {
-                snprintf(message, message_size, "Failed to create temporary binary path: %s", strerror(errno));
-                return false;
-            }
-            close(binary_fd);
-            snprintf(compiled_binary, sizeof(compiled_binary), "%s", binary_template);
-
-            char quoted_source[PATH_MAX + 8];
-            char quoted_binary_tmp[PATH_MAX + 8];
-            shell_quote(source_code, quoted_source, sizeof(quoted_source));
-            shell_quote(compiled_binary, quoted_binary_tmp, sizeof(quoted_binary_tmp));
-            char compile_command[PATH_MAX * 2 + 256];
-            snprintf(compile_command, sizeof(compile_command),
-                     "cc -std=gnu17 -Wall -Wextra -O2 -o %s %s -lm 2>&1",
-                     quoted_binary_tmp, quoted_source);
-            FILE *pipe = popen(compile_command, "r");
-            if (!pipe) {
-                unlink(compiled_binary);
-                snprintf(message, message_size, "Failed to compile %s: %s", app->display_name, strerror(errno));
-                return false;
-            }
-            size_t offset = 0;
-            while (offset + 1 < message_size) {
-                size_t got = fread(message + offset, 1, message_size - offset - 1, pipe);
-                offset += got;
-                if (got == 0) break;
-            }
-            message[offset] = '\0';
-            int status = pclose(pipe);
-            if (status != 0) {
-                if (!message[0]) snprintf(message, message_size, "Failed to compile %s.", app->display_name);
-                unlink(compiled_binary);
-                return false;
-            }
-            chmod(compiled_binary, 0700);
-        }
 
         char install_root[PATH_MAX];
         snprintf(install_root, sizeof(install_root), "/opt/outergroup/%s", app->install_directory_name);
@@ -10056,7 +10002,7 @@ static bool install_bundled_app(const BundledAppDefinition *app,
         char quoted_unit[320];
         shell_quote(app->unit_name, quoted_unit, sizeof(quoted_unit));
 
-        const char *binary_source = has_source_code ? compiled_binary : source_binary;
+        const char *binary_source = source_binary;
         char quoted_binary_source[PATH_MAX + 8];
         char quoted_source_bundle_arm[PATH_MAX + 8];
         char quoted_source_bundle_x86[PATH_MAX + 8];
@@ -10175,7 +10121,6 @@ static bool install_bundled_app(const BundledAppDefinition *app,
         char script_template[] = "/tmp/backends-root-install-XXXXXX";
         int script_fd = mkstemp(script_template);
         if (script_fd < 0) {
-            if (compiled_binary[0]) unlink(compiled_binary);
             snprintf(message, message_size, "Failed to create privileged install script: %s", strerror(errno));
             return false;
         }
@@ -10183,7 +10128,6 @@ static bool install_bundled_app(const BundledAppDefinition *app,
         if (!script) {
             close(script_fd);
             unlink(script_template);
-            if (compiled_binary[0]) unlink(compiled_binary);
             snprintf(message, message_size, "Failed to write privileged install script: %s", strerror(errno));
             return false;
         }
@@ -10191,6 +10135,7 @@ static bool install_bundled_app(const BundledAppDefinition *app,
                 "set -eu\n"
                 "timeout 12s systemctl --system stop %s >/dev/null 2>&1 || true\n"
                 "timeout 5s systemctl --system reset-failed %s >/dev/null 2>&1 || true\n"
+                "rm -rf -- %s\n"
                 "mkdir -p %s %s /var/log/outergroup %s\n"
                 "chmod 0755 %s\n"
                 "install -m 0755 %s %s\n"
@@ -10198,6 +10143,7 @@ static bool install_bundled_app(const BundledAppDefinition *app,
                 "install -m 0644 %s %s\n",
                 quoted_unit,
                 quoted_unit,
+                quoted_bundles_dir,
                 quoted_install_root,
                 quoted_bundles_dir,
                 quoted_system_outershell_root,
@@ -10275,7 +10221,6 @@ static bool install_bundled_app(const BundledAppDefinition *app,
 
         bool root_ok = run_root_script(script_template, sudo_password, needs_password, message, message_size);
         unlink(script_template);
-        if (compiled_binary[0]) unlink(compiled_binary);
         if (!root_ok) return false;
 
         if (direct_root_install) {
@@ -10375,37 +10320,9 @@ static bool install_bundled_app(const BundledAppDefinition *app,
         snprintf(message, message_size, "Failed to create %s: %s", bundles_dir, strerror(errno));
         return false;
     }
-    if (has_source_binary && !copy_file(source_binary, target_binary, 0700, error, sizeof(error))) {
+    if (!copy_file(source_binary, target_binary, 0700, error, sizeof(error))) {
         snprintf(message, message_size, "%s", error);
         return false;
-    }
-    if (!has_source_binary) {
-        char quoted_source[PATH_MAX + 8];
-        char quoted_target[PATH_MAX + 8];
-        shell_quote(source_code, quoted_source, sizeof(quoted_source));
-        shell_quote(target_binary, quoted_target, sizeof(quoted_target));
-        char compile_command[PATH_MAX * 2 + 256];
-        snprintf(compile_command, sizeof(compile_command),
-                 "cc -std=gnu17 -Wall -Wextra -O2 -o %s %s -lm 2>&1",
-                 quoted_target, quoted_source);
-        FILE *pipe = popen(compile_command, "r");
-        if (!pipe) {
-            snprintf(message, message_size, "Failed to compile %s: %s", app->display_name, strerror(errno));
-            return false;
-        }
-        size_t offset = 0;
-        while (offset + 1 < message_size) {
-            size_t got = fread(message + offset, 1, message_size - offset - 1, pipe);
-            offset += got;
-            if (got == 0) break;
-        }
-        message[offset] = '\0';
-        int status = pclose(pipe);
-        if (status != 0) {
-            if (!message[0]) snprintf(message, message_size, "Failed to compile %s.", app->display_name);
-            return false;
-        }
-        chmod(target_binary, 0700);
     }
     if (!copy_file(source_bundle_arm, target_bundle_arm, 0600, error, sizeof(error)) ||
         !copy_file(source_bundle_x86, target_bundle_x86, 0600, error, sizeof(error)) ||

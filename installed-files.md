@@ -197,7 +197,7 @@ Bundled app table:
 | Files | `dev.outergroup.Files` | `FilesBackend` | `FilesContent` | optional |
 | Plaintext | `dev.outergroup.Plaintext` | `PlaintextBackend` | `PlaintextContent` | optional |
 | Network Inspector | `dev.outergroup.NetworkInspector` | `NetworkInspectorBackend` | `NetworkInspectorContent` | optional |
-| Firehose | `dev.outergroup.Firehose` | `FirehoseBackend` | `TraceContent` | required |
+| Firehose | `dev.outergroup.Firehose` | `FirehoseBackend` | `FirehoseContent` | required |
 | Profile | `dev.outergroup.Profile` | `ProfileBackend` | `ProfileContent` | optional |
 
 ## User-Created Backends

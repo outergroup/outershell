@@ -4294,7 +4294,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             request.setValue("application/x-www-form-urlencoded; charset=utf-8", forHTTPHeaderField: "Content-Type")
             request.httpBody = formEncodedBody(["sudoPassword": sudoPassword])
         }
-        urlSession.dataTask(with: request) { [weak self] data, _, error in
+        urlSession.dataTask(with: request) { [weak self] data, urlResponse, error in
             Task { @MainActor in
                 guard let self else { return }
                 self.isPerformingAction = false
@@ -4310,8 +4310,13 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                         self.backendError = response.ok ? "" : response.message
                         actionCompleted = response.ok
                     }
+                } else if let data,
+                          let message = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
+                          !message.isEmpty {
+                    self.backendError = message
                 } else {
-                    self.backendError = "Control request failed."
+                    let statusCode = (urlResponse as? HTTPURLResponse)?.statusCode
+                    self.backendError = statusCode.map { "Control request failed with HTTP \($0)." } ?? "Control request failed."
                 }
                 if actionCompleted {
                     self.applyOptimisticStatus(for: backend.serviceID,
