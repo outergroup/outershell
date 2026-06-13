@@ -6229,6 +6229,11 @@ static bool install_bundled_app(const BundledAppDefinition *app,
                                 bool *needs_password,
                                 char *message,
                                 size_t message_size);
+#ifdef __APPLE__
+static bool install_bundled_app_user_launchagent_for_system_payload(const BundledAppDefinition *app,
+                                                                    char *message,
+                                                                    size_t message_size);
+#endif
 static bool uninstall_backend(const char *service_id, const char *sudo_password, bool *needs_password, char *message, size_t message_size);
 static bool run_root_outershell_migration(const char *sudo_password, bool *needs_password, char *message, size_t message_size);
 
@@ -6498,15 +6503,15 @@ static void send_control_response(int fd, const char *query, const char *body) {
 #ifdef __APPLE__
         if (ok && strcmp(scope, "system") == 0 && !app->root_only) {
             char user_message[4096] = "";
-            bool user_ok = install_bundled_app(app, "user", bundled_stage_root, NULL, NULL, user_message, sizeof(user_message));
-            log_event("%s app %s as user after root install: %s",
+            bool user_ok = install_bundled_app_user_launchagent_for_system_payload(app, user_message, sizeof(user_message));
+            log_event("%s user LaunchAgent for app %s after root install: %s",
                       user_ok ? "Installed" : "Failed to install",
                       app->service_id,
                       user_message);
             if (user_ok) {
                 snprintf(message, sizeof(message), "Installed %s for user and root.", app->display_name);
             } else {
-                snprintf(message, sizeof(message), "Installed %s as root, but failed to install it for the user: %s",
+                snprintf(message, sizeof(message), "Installed %s as root, but failed to install its user LaunchAgent: %s",
                          app->display_name,
                          user_message);
                 ok = false;
@@ -6541,6 +6546,24 @@ static void send_control_response(int fd, const char *query, const char *body) {
         bool ok = false;
         if (strcmp(operation, "addRootSupport") == 0) {
             ok = install_bundled_app(app, "system", bundled_stage_root, sudo_password, &needs_password, message, sizeof(message));
+#ifdef __APPLE__
+            if (ok && !app->root_only) {
+                char user_message[4096] = "";
+                bool user_ok = install_bundled_app_user_launchagent_for_system_payload(app, user_message, sizeof(user_message));
+                log_event("%s user LaunchAgent for app %s after adding root support: %s",
+                          user_ok ? "Installed" : "Failed to install",
+                          app->service_id,
+                          user_message);
+                if (user_ok) {
+                    snprintf(message, sizeof(message), "Added root support for %s.", app->display_name);
+                } else {
+                    snprintf(message, sizeof(message), "Added root support for %s, but failed to update its user LaunchAgent: %s",
+                             app->display_name,
+                             user_message);
+                    ok = false;
+                }
+            }
+#endif
         } else {
 #ifndef __APPLE__
             if (!app->root_only) {
@@ -10715,6 +10738,140 @@ static bool make_bundled_launchd_plist(const char *label,
                          "</dict>\n"
                          "</plist>\n");
     return ok;
+}
+
+static bool install_bundled_app_user_launchagent_for_system_payload(const BundledAppDefinition *app,
+                                                                    char *message,
+                                                                    size_t message_size) {
+    if (!app) {
+        snprintf(message, message_size, "Missing app definition.");
+        return false;
+    }
+
+    char system_install_root[PATH_MAX];
+    snprintf(system_install_root, sizeof(system_install_root), "%s/apps/%s", kSystemOuterShellRoot, app->install_directory_name);
+    char bundles_dir[PATH_MAX];
+    snprintf(bundles_dir, sizeof(bundles_dir), "%s/bundles", system_install_root);
+    char target_binary[PATH_MAX];
+    snprintf(target_binary, sizeof(target_binary), "%s/%s", system_install_root, app->binary_name);
+    char bundle_arm[PATH_MAX];
+    snprintf(bundle_arm, sizeof(bundle_arm), "%s/%s.bundle.macos-arm.aar", bundles_dir, app->bundle_prefix);
+    char bundle_x86[PATH_MAX];
+    snprintf(bundle_x86, sizeof(bundle_x86), "%s/%s.bundle.macos-x86.aar", bundles_dir, app->bundle_prefix);
+    char target_icon[PATH_MAX] = "";
+    if (app->icon_name && app->icon_name[0]) {
+        snprintf(target_icon, sizeof(target_icon), "%s/%s", system_install_root, app->icon_name);
+    }
+
+    struct stat st;
+    if (stat(target_binary, &st) != 0 || !S_ISREG(st.st_mode)) {
+        snprintf(message, message_size, "Missing root-installed %s backend at %s.", app->display_name, target_binary);
+        return false;
+    }
+    if (stat(bundle_arm, &st) != 0 || !S_ISREG(st.st_mode) ||
+        stat(bundle_x86, &st) != 0 || !S_ISREG(st.st_mode)) {
+        snprintf(message, message_size, "Missing root-installed %s content archives under %s.", app->display_name, bundles_dir);
+        return false;
+    }
+    if (target_icon[0] && (stat(target_icon, &st) != 0 || !S_ISREG(st.st_mode))) {
+        snprintf(message, message_size, "Missing root-installed %s icon at %s.", app->display_name, target_icon);
+        return false;
+    }
+
+    char socket_path[PATH_MAX] = "";
+    bundled_socket_path_for_scope(app, "user", socket_path, sizeof(socket_path));
+    char log_path[PATH_MAX];
+    snprintf(log_path, sizeof(log_path), "%s/Library/Logs/%s/output.log", home_directory(), app->service_id);
+    char plist_path[PATH_MAX];
+    snprintf(plist_path, sizeof(plist_path), "%s/Library/LaunchAgents/%s.plist", home_directory(), app->service_id);
+    char outerctl_path[PATH_MAX];
+    default_user_outerctl_path(outerctl_path, sizeof(outerctl_path));
+
+    char log_dir[PATH_MAX];
+    snprintf(log_dir, sizeof(log_dir), "%s", log_path);
+    char *slash = strrchr(log_dir, '/');
+    if (slash) {
+        *slash = '\0';
+        if (!mkdir_p(log_dir)) {
+            snprintf(message, message_size, "Failed to create %s: %s", log_dir, strerror(errno));
+            return false;
+        }
+    }
+    char launch_agents_dir[PATH_MAX];
+    snprintf(launch_agents_dir, sizeof(launch_agents_dir), "%s/Library/LaunchAgents", home_directory());
+    if (!mkdir_p(launch_agents_dir)) {
+        snprintf(message, message_size, "Failed to create %s: %s", launch_agents_dir, strerror(errno));
+        return false;
+    }
+
+    char target[320];
+    char quoted_target[384];
+    snprintf(target, sizeof(target), "gui/%d/%s", (int)getuid(), app->service_id);
+    shell_quote(target, quoted_target, sizeof(quoted_target));
+    char bootout_command[512];
+    snprintf(bootout_command, sizeof(bootout_command), "launchctl bootout %s >/dev/null 2>&1 || true", quoted_target);
+    run_shell_ignored(bootout_command);
+
+    char user_install_root[PATH_MAX];
+    default_user_outershell_app_root(app->install_directory_name, user_install_root, sizeof(user_install_root));
+    char quoted_user_install_root[PATH_MAX + 8];
+    shell_quote(user_install_root, quoted_user_install_root, sizeof(quoted_user_install_root));
+    char cleanup_command[PATH_MAX + 64];
+    snprintf(cleanup_command, sizeof(cleanup_command), "rm -rf -- %s", quoted_user_install_root);
+    run_shell_ignored(cleanup_command);
+
+    StringBuilder plist = {0};
+    if (!make_bundled_launchd_plist(app->service_id,
+                                    target_binary,
+                                    bundles_dir,
+                                    target_icon,
+                                    socket_path,
+                                    0600,
+                                    system_install_root,
+                                    outerctl_path,
+                                    log_path,
+                                    &plist)) {
+        free(plist.data);
+        snprintf(message, message_size, "Failed to generate LaunchAgent plist.");
+        return false;
+    }
+
+    char error[1024] = "";
+    if (!write_text_file(plist_path, plist.data ? plist.data : "", error, sizeof(error))) {
+        free(plist.data);
+        snprintf(message, message_size, "%s", error);
+        return false;
+    }
+    free(plist.data);
+
+    if (!upsert_launchd_backend_registry_at(g_registry_database_path,
+                                            app->service_id,
+                                            app->display_name,
+                                            plist_path,
+                                            socket_path,
+                                            log_path,
+                                            target_icon,
+                                            error,
+                                            sizeof(error))) {
+        unlink(plist_path);
+        snprintf(message, message_size, "%s", error);
+        return false;
+    }
+
+    char quoted_plist[PATH_MAX + 8];
+    shell_quote(plist_path, quoted_plist, sizeof(quoted_plist));
+    char bootstrap_message[4096] = "";
+    char bootstrap_command[PATH_MAX + 128];
+    snprintf(bootstrap_command, sizeof(bootstrap_command), "launchctl bootstrap gui/%d %s 2>&1", (int)getuid(), quoted_plist);
+    if (!run_launchctl_capture(bootstrap_command, bootstrap_message, sizeof(bootstrap_message))) {
+        snprintf(message, message_size, "Installed %s user LaunchAgent, but failed to bootstrap its socket: %s",
+                 app->display_name,
+                 bootstrap_message);
+        return false;
+    }
+
+    snprintf(message, message_size, "Installed %s user LaunchAgent using the root payload.", app->display_name);
+    return true;
 }
 
 static bool install_bundled_app_macos(const BundledAppDefinition *app,

@@ -97,6 +97,7 @@ rm -rf "${BUILD_ROOT}/${CONFIGURATION}/Outer Shell.app/Contents/Resources/bundle
 mkdir -p "${BUILD_ROOT}/${CONFIGURATION}/Outer Shell.app/Contents/Resources/bundles"
 cp "${RUN_ROOT}/bundles"/OuterShell.bundle.*.aar \
     "${BUILD_ROOT}/${CONFIGURATION}/Outer Shell.app/Contents/Resources/bundles/"
+rm -rf "${BUILD_ROOT}/${CONFIGURATION}/Outer Shell.app/Contents/Resources/bundled-apps"
 
 echo "==> Staging bundled Top"
 if [[ ! -f "${TOP_ICON_PATH}" ]]; then
@@ -113,10 +114,6 @@ install -m 0644 \
     "${TOP_BUILD_ROOT}/${CONFIGURATION}/Top.bundle" \
     "${TOP_PAYLOAD_ROOT}/bundles" \
     TopContent.bundle
-mkdir -p "${BUILD_ROOT}/${CONFIGURATION}/Outer Shell.app/Contents/Resources"
-rm -rf "${BUILD_ROOT}/${CONFIGURATION}/Outer Shell.app/Contents/Resources/bundled-apps"
-cp -R "${RUN_ROOT}/bundled-apps" \
-    "${BUILD_ROOT}/${CONFIGURATION}/Outer Shell.app/Contents/Resources/bundled-apps"
 
 ln -sf "Outer Shell.app/Contents/MacOS/Outer Shell" "${BUILD_ROOT}/${CONFIGURATION}/BackendsBackend"
 ln -sf "Outer Shell.app/Contents/MacOS/Outer Shell" "${BUILD_ROOT}/${CONFIGURATION}/NavigatorBackend"

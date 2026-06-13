@@ -67,13 +67,11 @@ stage_home_screen_macos() {
     local root="${STAGING_ROOT}/outer-shell-macos/OuterShell"
     mkdir -p "${root}/bin" "${root}/bundles"
     ditto "${MACOS_BUILD_ROOT}/Outer Shell.app" "${root}/Outer Shell.app"
+    rm -rf "${root}/Outer Shell.app/Contents/Resources/bundled-apps"
     install -m 0755 "${MACOS_BUILD_ROOT}/outershelld" "${root}/outershelld"
     install -m 0644 "${REPO_ROOT}/app-icon.png" "${root}/app-icon.png"
     install -m 0644 "${RUN_ROOT}/bundles/OuterShell.bundle.macos-arm.aar" "${root}/bundles/OuterShell.bundle.macos-arm.aar"
     install -m 0644 "${RUN_ROOT}/bundles/OuterShell.bundle.macos-x86.aar" "${root}/bundles/OuterShell.bundle.macos-x86.aar"
-    if [[ -d "${RUN_ROOT}/bundled-apps" ]]; then
-        ditto "${RUN_ROOT}/bundled-apps" "${root}/bundled-apps"
-    fi
     clang++ -std=c++17 "${REPO_ROOT}/Resources/outerctl.cpp" \
         -o "${root}/bin/outerctl"
     chmod 0755 "${root}/bin/outerctl"

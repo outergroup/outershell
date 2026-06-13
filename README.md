@@ -157,13 +157,14 @@ its own repo.
 
 At runtime, Outer Shell looks for app payloads in `build/run/bundled-apps` next
 to a local build, then in the directory passed with `--bundled-apps-dir` or
-`BACKENDS_BUNDLED_APPS_DIR`. If a Linux starter app payload is not present
-locally, Outer Shell downloads it from the catalog URL into
+`BACKENDS_BUNDLED_APPS_DIR`. If a starter app payload is not present locally,
+Outer Shell downloads it from the catalog URL into
+`$HOME/Library/Caches/outershell/outer-shell/bundled-apps` on macOS,
 `$XDG_CACHE_HOME/outershell/outer-shell/bundled-apps` or
-`~/.cache/outershell/outer-shell/bundled-apps`. When Outer Shell is running
-directly as root on Linux, that cache is
-`/var/cache/outershell/outer-shell/bundled-apps`. Downloaded staging files are
-removed after a successful install.
+`~/.cache/outershell/outer-shell/bundled-apps` on Linux, or
+`/var/cache/outershell/outer-shell/bundled-apps` when Outer Shell is running
+directly as root on Linux. Downloaded staging files are removed after a
+successful install.
 
 Starter app tarballs use this layout:
 
@@ -181,9 +182,11 @@ Starter app tarballs use this layout:
 ```
 
 Outer Shell currently offers Top, Files, Network Inspector, and Firehose on
-Linux/SSH, and Top on localhost macOS. `build_run.sh` builds and stages the
-macOS Top payload from the `~/dev/src/Top` checkout for local testing;
-install-time code only copies that prebuilt payload.
+Linux/SSH, and Top on localhost macOS. Local `build_run.sh` builds and stages
+the macOS Top payload from the `~/dev/src/Top` checkout for local testing.
+Public Outer Shell packages do not embed bundled app payloads; each app archive
+is published independently and must include its own macOS backend when it is
+available on localhost macOS.
 
 On Linux, when a bundled app is installed for the current user, Outer Shell copies the payload into `${XDG_STATE_HOME:-~/.local/state}/outershell/apps/<service id>`, writes its user systemd unit, records the backend/log metadata in the registry, and starts the service. On macOS, localhost installs copy the payload into `~/Library/Application Support/outershell/apps/<service id>`, write a LaunchAgent, record metadata in the registry, and start the service.
 

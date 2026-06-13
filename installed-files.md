@@ -50,7 +50,6 @@ macOS public install:
 - `<user-state>/outer-shell/outershelld`
 - `<user-state>/outer-shell/bin/outerctl`
 - `<user-state>/outer-shell/bundles/`
-- `<user-state>/outer-shell/bundled-apps/`
 - `<user-state>/outer-shell/app-icon.png`
 - `<user-state>/outer-shell/version`
 - `<user-state>/bin/outerctl`
@@ -63,7 +62,6 @@ Linux public install:
 
 - `<user-state>/outer-shell/OuterShellBackend`
 - `<user-state>/outer-shell/bundles/`
-- `<user-state>/outer-shell/bundled-apps/`
 - `<user-state>/outer-shell/app-icon.png`
 - `<user-state>/outer-shell/version`
 - `<user-state>/outer-shell/logs/OuterShellBackend.log`
@@ -82,7 +80,6 @@ Linux public install when connected directly as root:
 
 - `<system-state>/outer-shell/OuterShellBackend`
 - `<system-state>/outer-shell/bundles/`
-- `<system-state>/outer-shell/bundled-apps/`
 - `<system-state>/outer-shell/app-icon.png`
 - `<system-state>/outer-shell/version`
 - `<system-state>/outershelld/outershelld`
@@ -155,6 +152,8 @@ macOS root install:
 - `/Library/LaunchDaemons/<service-id>.plist`
 - `/Library/Logs/<service-id>.log`
 - `/var/run/<service-id>` for socket-activated apps
+
+When root support is installed from a non-root macOS session for an app that also supports user mode, Outer Shell also writes `$HOME/Library/LaunchAgents/<service-id>.plist`, `$HOME/Library/Logs/<service-id>/output.log`, and `<user-runtime>/<service-id>`. That LaunchAgent points at the root-owned payload under `<system-state>/apps/<service-id>`; it does not install another copy under `<user-state>/apps/<service-id>`.
 
 Linux user install:
 
