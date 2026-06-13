@@ -5497,7 +5497,6 @@ static bool installed_home_screen_version(char *out, size_t out_size);
 static bool accept_home_screen_available_version(const char *provided_version, char *out, size_t out_size, char *message, size_t message_size);
 static void mark_update_check_completed(void);
 static int compare_versions(const char *installed, const char *available);
-static bool home_screen_base_url(char *out, size_t out_size);
 static bool home_screen_update_available(char *available, size_t available_size);
 static bool run_home_screen_install_script(const char *subcommand,
                                            const char *script_path,
@@ -5505,7 +5504,11 @@ static bool run_home_screen_install_script(const char *subcommand,
                                            bool remove_user_state,
                                            char *message,
                                            size_t message_size);
-static bool uninstall_local_home_screen(char *message, size_t message_size);
+static bool uninstall_local_home_screen(const char *sudo_password,
+                                        bool *needs_password,
+                                        bool remove_user_state,
+                                        char *message,
+                                        size_t message_size);
 
 static bool build_frontend_payload(const char *name,
                                    const char *frontend_id,
@@ -6454,10 +6457,17 @@ static void send_control_response(int fd, const char *query, const char *body) {
             }
             bool ok = false;
 #ifdef __APPLE__
-            char base_url[2048] = "";
-            if (strcmp(installer_command, "uninstall") == 0 &&
-                !home_screen_base_url(base_url, sizeof(base_url))) {
-                ok = uninstall_local_home_screen(message, sizeof(message));
+            bool needs_password = false;
+            if (strcmp(installer_command, "uninstall") == 0) {
+                ok = uninstall_local_home_screen(sudo_password,
+                                                 &needs_password,
+                                                 remove_user_state,
+                                                 message,
+                                                 sizeof(message));
+                log_event("%s Outer Shell %s: %s", ok ? "Completed" : "Failed", installer_command, message);
+                if (ok) mark_backend_event_changed();
+                send_action_response_ex(fd, ok ? 200 : (needs_password ? 401 : 500), ok, message, needs_password);
+                return;
             } else
 #endif
             {
@@ -6804,20 +6814,6 @@ static void rewrite_files_in_directory_replacing_text(const char *directory,
     closedir(dir);
 }
 #endif
-
-static bool home_screen_base_url(char *out, size_t out_size) {
-    if (!out || out_size == 0) return false;
-    const char *env = getenv("OUTER_SHELL_PUBLIC_BASE_URL");
-    const char *value = env && env[0] ? env : g_home_screen_public_base_url;
-    if (!value || !value[0]) {
-        out[0] = '\0';
-        return false;
-    }
-    snprintf(out, out_size, "%s", value);
-    size_t len = strlen(out);
-    while (len > 0 && out[len - 1] == '/') out[--len] = '\0';
-    return out[0] != '\0';
-}
 
 static void home_screen_install_root(char *out, size_t out_size) {
     default_user_home_screen_install_root(out, out_size);
@@ -9596,22 +9592,84 @@ static bool unregister_backend_records(const char *service_id, char *error, size
     return registry_store_close(&database, true, error, error_size);
 }
 
-static bool uninstall_local_home_screen(char *message, size_t message_size) {
+static bool uninstall_local_home_screen(const char *sudo_password,
+                                        bool *needs_password,
+                                        bool remove_user_state,
+                                        char *message,
+                                        size_t message_size) {
 #ifdef __APPLE__
+    if (needs_password) *needs_password = false;
     char error[1024] = "";
-    bool registry_ok = unregister_backend_records(kOuterShellServiceID, error, sizeof(error));
 
-    const char *home = getenv("HOME");
+    char outershell_root[PATH_MAX];
+    char install_root[PATH_MAX];
+    char outerctl_path[PATH_MAX];
+    char cache_root[PATH_MAX];
+    char outer_shell_cache_root[PATH_MAX];
+    char apps_root[PATH_MAX];
+    default_user_outershell_root(outershell_root, sizeof(outershell_root));
+    default_outershell_install_root(install_root, sizeof(install_root));
+    default_user_outerctl_path(outerctl_path, sizeof(outerctl_path));
+    default_user_outershell_cache_root(cache_root, sizeof(cache_root));
+    default_outer_shell_cache_root(outer_shell_cache_root, sizeof(outer_shell_cache_root));
+    default_user_outershell_apps_root(apps_root, sizeof(apps_root));
+
+    const char *home = home_directory();
     char plist_path[PATH_MAX] = "";
-    if (home && home[0]) {
+    if (home[0]) {
         snprintf(plist_path, sizeof(plist_path), "%s/Library/LaunchAgents/org.outershell.OuterShell.plist", home);
-        unlink(plist_path);
     }
     char socket_path[PATH_MAX] = "";
     snprintf(socket_path, sizeof(socket_path), "%s", g_listen_socket_path);
+    char api_socket_path[PATH_MAX] = "";
+    snprintf(api_socket_path, sizeof(api_socket_path), "%s", g_api_socket_path);
+
+    char system_cleanup_message[1024] = "";
+    if (remove_user_state) {
+        char script_template[] = "/tmp/outershell-system-cleanup-XXXXXX";
+        int script_fd = mkstemp(script_template);
+        if (script_fd < 0) {
+            snprintf(message, message_size, "Failed to create system cleanup script: %s", strerror(errno));
+            return false;
+        }
+        FILE *script = fdopen(script_fd, "w");
+        if (!script) {
+            close(script_fd);
+            unlink(script_template);
+            snprintf(message, message_size, "Failed to write system cleanup script: %s", strerror(errno));
+            return false;
+        }
+        char quoted_system_root[PATH_MAX + 8];
+        shell_quote(kSystemOuterShellRoot, quoted_system_root, sizeof(quoted_system_root));
+        fprintf(script,
+                "set -eu\n"
+                "root=%s\n"
+                "apps=\"$root/apps\"\n"
+                "if [ ! -d \"$apps\" ] || ! find \"$apps\" -mindepth 1 -print -quit 2>/dev/null | grep -q .; then\n"
+                "  rm -f \"$root/registry.orwa\" \"$root/registry.orwa.lock\"\n"
+                "  rmdir \"$apps\" \"$root\" >/dev/null 2>&1 || true\n"
+                "fi\n",
+                quoted_system_root);
+        fclose(script);
+        chmod(script_template, 0700);
+
+        bool root_ok = run_root_script(script_template, sudo_password, needs_password, system_cleanup_message, sizeof(system_cleanup_message));
+        unlink(script_template);
+        if (!root_ok && needs_password && *needs_password) {
+            snprintf(message, message_size, "%s", system_cleanup_message[0] ? system_cleanup_message : "Administrator password required.");
+            return false;
+        }
+        if (!root_ok) {
+            log_event("Outer Shell system cleanup skipped: %s", system_cleanup_message[0] ? system_cleanup_message : "unknown error");
+        }
+    }
 
     pid_t parent_pid = getpid();
     pid_t child = fork();
+    if (child < 0) {
+        snprintf(message, message_size, "Failed to start uninstall cleanup process: %s", strerror(errno));
+        return false;
+    }
     if (child == 0) {
         setsid();
         usleep(300000);
@@ -9637,8 +9695,68 @@ static bool uninstall_local_home_screen(char *message, size_t message_size) {
                 }
             }
         }
+        if (plist_path[0]) {
+            unlink(plist_path);
+        }
         if (socket_path[0]) {
             unlink(socket_path);
+        }
+        if (api_socket_path[0]) {
+            unlink(api_socket_path);
+        }
+        if (remove_user_state) {
+            char quoted_install_root[PATH_MAX + 8];
+            char quoted_outerctl_path[PATH_MAX + 8];
+            char quoted_registry[PATH_MAX + 32];
+            char quoted_registry_lock[PATH_MAX + 32];
+            char quoted_apps_root[PATH_MAX + 8];
+            char quoted_bin_root[PATH_MAX + 8];
+            char quoted_outershell_root[PATH_MAX + 8];
+            char quoted_outer_shell_cache_root[PATH_MAX + 8];
+            char quoted_cache_root[PATH_MAX + 8];
+            char bin_root[PATH_MAX];
+            snprintf(bin_root, sizeof(bin_root), "%s/bin", outershell_root);
+            char registry_path[PATH_MAX];
+            char registry_lock_path[PATH_MAX];
+            snprintf(registry_path, sizeof(registry_path), "%s/registry.orwa", outershell_root);
+            snprintf(registry_lock_path, sizeof(registry_lock_path), "%s/registry.orwa.lock", outershell_root);
+            shell_quote(install_root, quoted_install_root, sizeof(quoted_install_root));
+            shell_quote(outerctl_path, quoted_outerctl_path, sizeof(quoted_outerctl_path));
+            shell_quote(registry_path, quoted_registry, sizeof(quoted_registry));
+            shell_quote(registry_lock_path, quoted_registry_lock, sizeof(quoted_registry_lock));
+            shell_quote(apps_root, quoted_apps_root, sizeof(quoted_apps_root));
+            shell_quote(bin_root, quoted_bin_root, sizeof(quoted_bin_root));
+            shell_quote(outershell_root, quoted_outershell_root, sizeof(quoted_outershell_root));
+            shell_quote(outer_shell_cache_root, quoted_outer_shell_cache_root, sizeof(quoted_outer_shell_cache_root));
+            shell_quote(cache_root, quoted_cache_root, sizeof(quoted_cache_root));
+
+            char cleanup_command[PATH_MAX * 8];
+            snprintf(cleanup_command,
+                     sizeof(cleanup_command),
+                     "rm -rf -- %s %s; rm -f -- %s %s %s; rmdir -- %s %s %s %s >/dev/null 2>&1 || true",
+                     quoted_install_root,
+                     quoted_outer_shell_cache_root,
+                     quoted_outerctl_path,
+                     quoted_registry,
+                     quoted_registry_lock,
+                     quoted_apps_root,
+                     quoted_bin_root,
+                     quoted_outershell_root,
+                     quoted_cache_root);
+            run_shell_ignored(cleanup_command);
+        } else {
+            char quoted_install_root[PATH_MAX + 8];
+            char quoted_outer_shell_cache_root[PATH_MAX + 8];
+            shell_quote(install_root, quoted_install_root, sizeof(quoted_install_root));
+            shell_quote(outer_shell_cache_root, quoted_outer_shell_cache_root, sizeof(quoted_outer_shell_cache_root));
+            char cleanup_command[PATH_MAX * 4];
+            snprintf(cleanup_command,
+                     sizeof(cleanup_command),
+                     "rm -rf -- %s; rm -rf -- %s/install; rmdir -- %s >/dev/null 2>&1 || true",
+                     quoted_install_root,
+                     quoted_outer_shell_cache_root,
+                     quoted_outer_shell_cache_root);
+            run_shell_ignored(cleanup_command);
         }
         usleep(300000);
         if (kill(parent_pid, 0) == 0) {
@@ -9651,6 +9769,7 @@ static bool uninstall_local_home_screen(char *message, size_t message_size) {
         _exit(0);
     }
 
+    bool registry_ok = unregister_backend_records(kOuterShellServiceID, error, sizeof(error));
     if (!registry_ok) {
         snprintf(message,
                  message_size,
@@ -9658,9 +9777,12 @@ static bool uninstall_local_home_screen(char *message, size_t message_size) {
                  error[0] ? error : "unknown error");
         return true;
     }
-    snprintf(message, message_size, "Outer Shell LaunchAgent removed. The app will stop momentarily.");
+    snprintf(message, message_size, "Outer Shell uninstalled. The app will stop momentarily.");
     return true;
 #else
+    (void)sudo_password;
+    (void)needs_password;
+    (void)remove_user_state;
     snprintf(message, message_size, "Local Outer Shell uninstall is only implemented for macOS.");
     return false;
 #endif

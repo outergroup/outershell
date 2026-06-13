@@ -152,6 +152,8 @@ if [ "$os_name" = "Darwin" ]; then
     outershell_home="${OUTERSHELL_HOME:-$HOME/Library/Application Support/outershell}"
     install_root="$outershell_home/outer-shell"
     outerctl_path="$outershell_home/bin/outerctl"
+    outer_shell_cache_root="$HOME/Library/Caches/outershell/outer-shell"
+    outershell_cache_root="$HOME/Library/Caches/outershell"
     launch_agent_dir="$HOME/Library/LaunchAgents"
     plist_path="$launch_agent_dir/org.outershell.OuterShell.plist"
     socket_path="$(getconf DARWIN_USER_TEMP_DIR)org.outershell.OuterShell"
@@ -163,19 +165,19 @@ if [ "$os_name" = "Darwin" ]; then
 
     unload_outer_shell() {
         launchctl bootout "gui/$(id -u)/$service_id" >/dev/null 2>&1 || launchctl remove "$service_id" >/dev/null 2>&1 || true
-        attempts=20
+        attempts=60
         while [ "$attempts" -gt 0 ]; do
             if ! launchctl print "gui/$(id -u)/$service_id" >/dev/null 2>&1; then
                 return 0
             fi
-            sleep 0.1
+            sleep 0.25
             attempts=$((attempts - 1))
         done
         return 0
     }
 
     bootstrap_outer_shell() {
-        attempts=20
+        attempts=60
         last_error=""
         while [ "$attempts" -gt 0 ]; do
             if last_error="$(launchctl bootstrap "gui/$(id -u)" "$plist_path" 2>&1)"; then
@@ -183,7 +185,7 @@ if [ "$os_name" = "Darwin" ]; then
             fi
             unload_outer_shell
             rm -f "$socket_path" "$api_socket_path"
-            sleep 0.1
+            sleep 0.25
             attempts=$((attempts - 1))
         done
         if [ -n "$last_error" ]; then
@@ -194,7 +196,7 @@ if [ "$os_name" = "Darwin" ]; then
 
     if [ "$command" = "uninstall" ]; then
         unload_outer_shell
-        rm -f "$plist_path" "$socket_path"
+        rm -f "$plist_path" "$socket_path" "$api_socket_path"
         if [ -x "$outerctl_path" ]; then
             OUTERSHELL_HOME="$outershell_home" "$outerctl_path" app clear --backend "$service_id" >/dev/null 2>&1 || true
             OUTERSHELL_HOME="$outershell_home" "$outerctl_path" log clear --backend "$service_id" >/dev/null 2>&1 || true
@@ -202,6 +204,29 @@ if [ "$os_name" = "Darwin" ]; then
             OUTERSHELL_HOME="$outershell_home" "$outerctl_path" backend remove --backend "$service_id" >/dev/null 2>&1 || true
         fi
         rm -rf "$install_root"
+        if [ "${OUTERSHELL_UNINSTALL_REMOVE_USER_STATE:-0}" = "1" ]; then
+            rm -f "$outershell_home/registry.orwa" "$outershell_home/registry.orwa.lock" "$outerctl_path"
+            rmdir "$outershell_home/apps" "$outershell_home/bin" "$outershell_home" >/dev/null 2>&1 || true
+            rm -rf "$outer_shell_cache_root"
+            system_root="/Library/Application Support/outershell"
+            cleanup_root_script="$(mktemp)"
+            cat > "$cleanup_root_script" <<EOF
+#!/bin/sh
+set -eu
+root='$system_root'
+apps="\$root/apps"
+if [ ! -d "\$apps" ] || ! find "\$apps" -mindepth 1 -print -quit 2>/dev/null | grep -q .; then
+    rm -f "\$root/registry.orwa" "\$root/registry.orwa.lock"
+    rmdir "\$apps" "\$root" >/dev/null 2>&1 || true
+fi
+EOF
+            chmod 0700 "$cleanup_root_script"
+            sudo -n sh "$cleanup_root_script" >/dev/null 2>&1 || true
+            rm -f "$cleanup_root_script"
+        else
+            rm -rf "$outer_shell_cache_root/install"
+        fi
+        rmdir "$outer_shell_cache_root" "$outershell_cache_root" >/dev/null 2>&1 || true
         printf 'Outer Shell has been uninstalled. Outer Loop will offer to install it again the next time it connects.\n'
         exit 0
     fi
