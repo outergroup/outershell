@@ -217,7 +217,10 @@ root='$system_root'
 apps="\$root/apps"
 if [ ! -d "\$apps" ] || ! find "\$apps" -mindepth 1 -print -quit 2>/dev/null | grep -q .; then
     rm -f "\$root/registry.orwa" "\$root/registry.orwa.lock"
-    rmdir "\$apps" "\$root" >/dev/null 2>&1 || true
+    rm -f /usr/local/libexec/outershelld-root-tool /usr/local/libexec/outershelld-root-helper
+    rm -f "\$root/bin/outerctl"
+    rm -rf "\$root/outershelld"
+    rmdir "\$apps" "\$root/bin" "\$root" >/dev/null 2>&1 || true
 fi
 EOF
             chmod 0700 "$cleanup_root_script"

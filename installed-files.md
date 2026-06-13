@@ -124,9 +124,13 @@ Linux removes old helper files and units when installing current root support:
 - `/etc/systemd/system/outershelld-root-helper-<uid>.service`
 - `/etc/systemd/system/outershelld-root-helper-<uid>.socket`
 
-macOS root app installs still use the privileged helper tool:
+macOS root app installs promote the same `outershelld` binary into system scope. The user helper path and the legacy root-tool path are symlinks to the root-owned binary:
 
-- `/usr/local/libexec/outershelld-root-tool`
+- `<system-state>/outershelld/outershelld`
+- `<system-state>/bin/outerctl`
+- `<user-state>/outer-shell/outershelld -> <system-state>/outershelld/outershelld`
+- `<user-state>/bin/outerctl -> <system-state>/bin/outerctl`
+- `/usr/local/libexec/outershelld-root-tool -> <system-state>/outershelld/outershelld`
 
 ## Bundled Apps
 
@@ -148,10 +152,11 @@ macOS root install:
 - `<system-state>/apps/<service-id>/bundles/<bundle-prefix>.bundle.macos-arm.aar`
 - `<system-state>/apps/<service-id>/bundles/<bundle-prefix>.bundle.macos-x86.aar`
 - `<system-state>/apps/<service-id>/app-icon.png` when the app has a raster icon
-- `<system-state>/apps/<service-id>/outerctl-system`
 - `/Library/LaunchDaemons/<service-id>.plist`
 - `/Library/Logs/<service-id>.log`
 - `/var/run/<service-id>` for socket-activated apps
+
+The LaunchDaemon sets `OUTERCTL_PATH` to `<system-state>/bin/outerctl`.
 
 When root support is installed from a non-root macOS session for an app that also supports user mode, Outer Shell also writes `$HOME/Library/LaunchAgents/<service-id>.plist`, `$HOME/Library/Logs/<service-id>/output.log`, and `<user-runtime>/<service-id>`. That LaunchAgent points at the root-owned payload under `<system-state>/apps/<service-id>`; it does not install another copy under `<user-state>/apps/<service-id>`.
 

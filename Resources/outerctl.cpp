@@ -210,6 +210,9 @@ bool outerShellHome(Buffer &path) {
     const char *override = getenv("OUTERSHELL_HOME");
     if (override && override[0]) return appendCString(path, override);
 #if defined(__APPLE__)
+    if (geteuid() == 0) {
+        return appendCString(path, "/Library/Application Support/outershell");
+    }
     const char *home = getenv("HOME");
     return home && home[0] &&
         appendCString(path, home) &&
@@ -339,6 +342,41 @@ bool tryOuterctlApi(int argc, char *argv[], int &exitStatus, Buffer &errorMessag
     return ok;
 }
 
+#if defined(__APPLE__)
+bool tryMacRootHelperFallback(int argc, char *argv[], Buffer &errorMessage) {
+    if (geteuid() != 0 || argc < 2) return false;
+
+    const char *helper = "/Library/Application Support/outershell/outershelld/outershelld";
+    if (access(helper, X_OK) != 0) {
+        return false;
+    }
+
+    const size_t helperArgc = static_cast<size_t>(argc) + 1;
+    char **helperArgv = static_cast<char **>(calloc(helperArgc + 1, sizeof(char *)));
+    if (!helperArgv) {
+        assignCString(errorMessage, "Out of memory while building root outerctl helper argv.");
+        return true;
+    }
+
+    helperArgv[0] = const_cast<char *>(helper);
+    helperArgv[1] = const_cast<char *>("--root-helper-outerctl");
+    for (int i = 1; i < argc; i += 1) {
+        helperArgv[i + 1] = argv[i];
+    }
+    helperArgv[helperArgc] = nullptr;
+
+    execv(helper, helperArgv);
+    free(helperArgv);
+    errorMessage.size = 0;
+    if (errorMessage.data) errorMessage.data[0] = '\0';
+    appendCString(errorMessage, "Failed to execute ");
+    appendCString(errorMessage, helper);
+    appendCString(errorMessage, ": ");
+    appendCString(errorMessage, strerror(errno));
+    return true;
+}
+#endif
+
 } // namespace
 
 int main(int argc, char *argv[]) {
@@ -348,6 +386,13 @@ int main(int argc, char *argv[]) {
         freeBuffer(apiError);
         return apiExitStatus;
     }
+#if defined(__APPLE__)
+    if (tryMacRootHelperFallback(argc, argv, apiError)) {
+        fprintf(stderr, "%s\n", apiError.data ? apiError.data : "Failed to call root outerctl helper.");
+        freeBuffer(apiError);
+        return 1;
+    }
+#endif
     fprintf(stderr, "%s\n", apiError.data ? apiError.data : "Failed to call outershelld API.");
     freeBuffer(apiError);
     return 1;

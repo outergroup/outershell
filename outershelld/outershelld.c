@@ -1230,14 +1230,6 @@ static void default_outershell_install_root(char *out, size_t out_size) {
     snprintf(out, out_size, "%s/outer-shell", root);
 }
 
-#ifndef __APPLE__
-static void default_outershelld_install_root(char *out, size_t out_size) {
-    if (!out || out_size == 0) return;
-    char root[PATH_MAX];
-    default_user_outershell_root(root, sizeof(root));
-    snprintf(out, out_size, "%s/outershelld", root);
-}
-
 static void default_system_outershelld_install_root(char *out, size_t out_size) {
     if (!out || out_size == 0) return;
     snprintf(out, out_size, "%s/outershelld", kSystemOuterShellRoot);
@@ -1253,6 +1245,14 @@ static void default_system_outershelld_path(char *out, size_t out_size) {
 static void default_system_outerctl_path(char *out, size_t out_size) {
     if (!out || out_size == 0) return;
     snprintf(out, out_size, "%s/bin/outerctl", kSystemOuterShellRoot);
+}
+
+#ifndef __APPLE__
+static void default_outershelld_install_root(char *out, size_t out_size) {
+    if (!out || out_size == 0) return;
+    char root[PATH_MAX];
+    default_user_outershell_root(root, sizeof(root));
+    snprintf(out, out_size, "%s/outershelld", root);
 }
 
 static void system_binary_users_dir(char *out, size_t out_size) {
@@ -7557,14 +7557,100 @@ static bool ensure_root_helper_installed(const char *sudo_password, bool *needs_
 #else
     (void)owner_uid;
     (void)owner_name;
+    char helper_parent[PATH_MAX];
+    if (!parent_directory(helper_source, helper_parent, sizeof(helper_parent))) {
+        snprintf(message, message_size, "Could not resolve standalone outershelld helper directory.");
+        fclose(script);
+        unlink(script_template);
+        return false;
+    }
+    char user_install_root[PATH_MAX];
+    default_outershell_install_root(user_install_root, sizeof(user_install_root));
+    char user_outerctl_source[PATH_MAX];
+    snprintf(user_outerctl_source, sizeof(user_outerctl_source), "%s/bin/outerctl", user_install_root);
+    if (access(user_outerctl_source, X_OK) != 0) {
+        snprintf(message, message_size, "Could not find user outerctl payload at %s.", user_outerctl_source);
+        fclose(script);
+        unlink(script_template);
+        return false;
+    }
+    char user_outerctl[PATH_MAX];
+    default_user_outerctl_path(user_outerctl, sizeof(user_outerctl));
+    char user_outerctl_parent[PATH_MAX];
+    if (!parent_directory(user_outerctl, user_outerctl_parent, sizeof(user_outerctl_parent))) {
+        snprintf(message, message_size, "Could not resolve user outerctl directory.");
+        fclose(script);
+        unlink(script_template);
+        return false;
+    }
+    char system_install_root[PATH_MAX];
+    char system_outershelld[PATH_MAX];
+    char system_outerctl[PATH_MAX];
+    char system_outerctl_parent[PATH_MAX];
+    default_system_outershelld_install_root(system_install_root, sizeof(system_install_root));
+    default_system_outershelld_path(system_outershelld, sizeof(system_outershelld));
+    default_system_outerctl_path(system_outerctl, sizeof(system_outerctl));
+    if (!parent_directory(system_outerctl, system_outerctl_parent, sizeof(system_outerctl_parent))) {
+        snprintf(message, message_size, "Could not resolve system outerctl directory.");
+        fclose(script);
+        unlink(script_template);
+        return false;
+    }
+
+    char quoted_helper_parent[PATH_MAX + 8];
+    char quoted_user_outerctl_source[PATH_MAX + 8];
+    char quoted_user_outerctl[PATH_MAX + 8];
+    char quoted_user_outerctl_parent[PATH_MAX + 8];
+    char quoted_system_install_root[PATH_MAX + 8];
+    char quoted_system_outershelld[PATH_MAX + 8];
+    char quoted_system_outerctl[PATH_MAX + 8];
+    char quoted_system_outerctl_parent[PATH_MAX + 8];
+    shell_quote(helper_parent, quoted_helper_parent, sizeof(quoted_helper_parent));
+    shell_quote(user_outerctl_source, quoted_user_outerctl_source, sizeof(quoted_user_outerctl_source));
+    shell_quote(user_outerctl, quoted_user_outerctl, sizeof(quoted_user_outerctl));
+    shell_quote(user_outerctl_parent, quoted_user_outerctl_parent, sizeof(quoted_user_outerctl_parent));
+    shell_quote(system_install_root, quoted_system_install_root, sizeof(quoted_system_install_root));
+    shell_quote(system_outershelld, quoted_system_outershelld, sizeof(quoted_system_outershelld));
+    shell_quote(system_outerctl, quoted_system_outerctl, sizeof(quoted_system_outerctl));
+    shell_quote(system_outerctl_parent, quoted_system_outerctl_parent, sizeof(quoted_system_outerctl_parent));
+
     fprintf(script,
             "set -eu\n"
-            "mkdir -p /usr/local/libexec %s\n"
+            "mkdir -p /usr/local/libexec %s %s %s %s %s\n"
             "rm -f /usr/local/libexec/outershelld-root-helper\n"
-            "install -m 0755 %s /usr/local/libexec/outershelld-root-tool\n"
-            "chmod 0755 /usr/local/libexec/outershelld-root-tool\n",
+            "if [ ! -e %s ] || ! cmp -s %s %s; then install -m 0755 %s %s; fi\n"
+            "chmod 0755 %s\n"
+            "if [ ! -e %s ] || ! cmp -s %s %s; then install -m 0755 %s %s; fi\n"
+            "chmod 0755 %s\n"
+            "rm -f /usr/local/libexec/outershelld-root-tool\n"
+            "ln -s %s /usr/local/libexec/outershelld-root-tool\n"
+            "rm -f %s %s\n"
+            "ln -s %s %s\n"
+            "ln -s %s %s\n",
             quoted_system_root,
-            quoted_executable);
+            quoted_system_install_root,
+            quoted_helper_parent,
+            quoted_system_outerctl_parent,
+            quoted_user_outerctl_parent,
+            quoted_system_outershelld,
+            quoted_executable,
+            quoted_system_outershelld,
+            quoted_executable,
+            quoted_system_outershelld,
+            quoted_system_outershelld,
+            quoted_system_outerctl,
+            quoted_user_outerctl_source,
+            quoted_system_outerctl,
+            quoted_user_outerctl_source,
+            quoted_system_outerctl,
+            quoted_system_outerctl,
+            quoted_system_outershelld,
+            quoted_executable,
+            quoted_user_outerctl,
+            quoted_system_outershelld,
+            quoted_executable,
+            quoted_system_outerctl,
+            quoted_user_outerctl);
 #endif
     fclose(script);
     chmod(script_template, 0700);
@@ -9647,7 +9733,10 @@ static bool uninstall_local_home_screen(const char *sudo_password,
                 "apps=\"$root/apps\"\n"
                 "if [ ! -d \"$apps\" ] || ! find \"$apps\" -mindepth 1 -print -quit 2>/dev/null | grep -q .; then\n"
                 "  rm -f \"$root/registry.orwa\" \"$root/registry.orwa.lock\"\n"
-                "  rmdir \"$apps\" \"$root\" >/dev/null 2>&1 || true\n"
+                "  rm -f /usr/local/libexec/outershelld-root-tool /usr/local/libexec/outershelld-root-helper\n"
+                "  rm -f \"$root/bin/outerctl\"\n"
+                "  rm -rf \"$root/outershelld\"\n"
+                "  rmdir \"$apps\" \"$root/bin\" \"$root\" >/dev/null 2>&1 || true\n"
                 "fi\n",
                 quoted_system_root);
         fclose(script);
@@ -11060,19 +11149,12 @@ static bool install_bundled_app_macos(const BundledAppDefinition *app,
         snprintf(target_bundle_x86, sizeof(target_bundle_x86), "%s/%s.bundle.macos-x86.aar", bundles_dir, app->bundle_prefix);
         char target_icon[PATH_MAX] = "";
         if (source_icon[0]) snprintf(target_icon, sizeof(target_icon), "%s/%s", install_root, app->icon_name);
-        char wrapper_path[PATH_MAX];
-        snprintf(wrapper_path, sizeof(wrapper_path), "%s/outerctl-system", install_root);
+        char outerctl_path[PATH_MAX];
+        default_system_outerctl_path(outerctl_path, sizeof(outerctl_path));
         char log_path[PATH_MAX];
         snprintf(log_path, sizeof(log_path), "/Library/Logs/%s.log", app->service_id);
         char plist_path[PATH_MAX];
         snprintf(plist_path, sizeof(plist_path), "/Library/LaunchDaemons/%s.plist", app->service_id);
-
-        char quoted_system_root[PATH_MAX + 8];
-        shell_quote(kSystemOuterShellRoot, quoted_system_root, sizeof(quoted_system_root));
-        char wrapper_contents[4096];
-        snprintf(wrapper_contents, sizeof(wrapper_contents),
-                 "#!/bin/sh\n"
-                 "exec /usr/local/libexec/outershelld-root-tool --root-helper-outerctl \"$@\"\n");
 
         StringBuilder plist = {0};
         if (!make_bundled_launchd_plist(app->service_id,
@@ -11082,7 +11164,7 @@ static bool install_bundled_app_macos(const BundledAppDefinition *app,
                                         socket_path,
                                         0600,
                                         install_root,
-                                        wrapper_path,
+                                        outerctl_path,
                                         log_path,
                                         &plist)) {
             free(plist.data);
@@ -11096,11 +11178,11 @@ static bool install_bundled_app_macos(const BundledAppDefinition *app,
         char quoted_source_icon[PATH_MAX + 8] = "";
         char quoted_install_root[PATH_MAX + 8];
         char quoted_bundles_dir[PATH_MAX + 8];
+        char quoted_system_root[PATH_MAX + 8];
         char quoted_target_binary[PATH_MAX + 8];
         char quoted_target_bundle_arm[PATH_MAX + 8];
         char quoted_target_bundle_x86[PATH_MAX + 8];
         char quoted_target_icon[PATH_MAX + 8] = "";
-        char quoted_wrapper_path[PATH_MAX + 8];
         char quoted_log_path[PATH_MAX + 8];
         char quoted_plist_path[PATH_MAX + 8];
         shell_quote(source_binary, quoted_source_binary, sizeof(quoted_source_binary));
@@ -11109,11 +11191,11 @@ static bool install_bundled_app_macos(const BundledAppDefinition *app,
         if (source_icon[0]) shell_quote(source_icon, quoted_source_icon, sizeof(quoted_source_icon));
         shell_quote(install_root, quoted_install_root, sizeof(quoted_install_root));
         shell_quote(bundles_dir, quoted_bundles_dir, sizeof(quoted_bundles_dir));
+        shell_quote(kSystemOuterShellRoot, quoted_system_root, sizeof(quoted_system_root));
         shell_quote(target_binary, quoted_target_binary, sizeof(quoted_target_binary));
         shell_quote(target_bundle_arm, quoted_target_bundle_arm, sizeof(quoted_target_bundle_arm));
         shell_quote(target_bundle_x86, quoted_target_bundle_x86, sizeof(quoted_target_bundle_x86));
         if (target_icon[0]) shell_quote(target_icon, quoted_target_icon, sizeof(quoted_target_icon));
-        shell_quote(wrapper_path, quoted_wrapper_path, sizeof(quoted_wrapper_path));
         shell_quote(log_path, quoted_log_path, sizeof(quoted_log_path));
         shell_quote(plist_path, quoted_plist_path, sizeof(quoted_plist_path));
 
@@ -11155,16 +11237,13 @@ static bool install_bundled_app_macos(const BundledAppDefinition *app,
             fprintf(script, "install -m 0644 %s %s\n", quoted_source_icon, quoted_target_icon);
         }
         fprintf(script,
-                "cat > %s <<'__BACKENDS_OUTERCTL__'\n%s__BACKENDS_OUTERCTL__\n"
-                "chmod 0755 %s\n"
+                "rm -f %s/outerctl-system\n"
                 "cat > %s <<'__BACKENDS_PLIST__'\n%s__BACKENDS_PLIST__\n"
                 "chmod 0644 %s\n"
                 "touch %s\n"
                 "chmod 0644 %s\n"
                 "launchctl bootstrap system %s\n",
-                quoted_wrapper_path,
-                wrapper_contents,
-                quoted_wrapper_path,
+                quoted_install_root,
                 quoted_plist_path,
                 plist.data ? plist.data : "",
                 quoted_plist_path,
@@ -12507,16 +12586,12 @@ static bool root_helper_outerctl(int argc,
         return false;
     }
 
-    StringBuilder command = {0};
-#ifndef __APPLE__
     char system_outerctl[PATH_MAX];
     default_system_outerctl_path(system_outerctl, sizeof(system_outerctl));
     char quoted_outerctl[PATH_MAX + 8];
     shell_quote(system_outerctl, quoted_outerctl, sizeof(quoted_outerctl));
+    StringBuilder command = {0};
     bool ok = sb_append(&command, quoted_outerctl);
-#else
-    bool ok = sb_append(&command, "/usr/local/libexec/outershelld-root-tool --root-helper-outerctl");
-#endif
     for (int i = 1; ok && i < argc; i++) {
         char quoted[PATH_MAX * 2];
         shell_quote(argv[i] ? argv[i] : "", quoted, sizeof(quoted));
