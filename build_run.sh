@@ -126,7 +126,7 @@ cat > "${TOP_APP_ROOT}/Contents/Info.plist" <<'__TOP_INFO_PLIST__'
     <key>CFBundleExecutable</key>
     <string>TopBackend</string>
     <key>CFBundleIdentifier</key>
-    <string>dev.outergroup.Top</string>
+    <string>org.outershell.Top</string>
     <key>CFBundleName</key>
     <string>Top</string>
     <key>CFBundlePackageType</key>
@@ -165,4 +165,4 @@ echo "Run:"
 echo "  API_SOCKET=\"$(getconf DARWIN_USER_TEMP_DIR)outershelld-api\""
 echo "  \"${BUILD_ROOT}/${CONFIGURATION}/outershelld\" --api-socket-path \"\$API_SOCKET\" &"
 echo "  cc -std=gnu17 -DOUTER_SHELL_BACKEND_STANDALONE=1 Backend/OuterShellBuffer.c Backend/OuterShellAPI.c Backend/OuterShellPlatform.c Backend/OuterShellBackend.c -o /tmp/OuterShellBackend && /tmp/OuterShellBackend --port 7354 --api-socket-path \"\$API_SOCKET\" --bundles-dir \"${RUN_ROOT}/bundles\""
-echo "  \"${BUILD_ROOT}/${CONFIGURATION}/Outer Shell.app/Contents/MacOS/Outer Shell\" --socket-path \"$(getconf DARWIN_USER_TEMP_DIR)org.outershell.OuterShell\" --app-base-url \"https://outergroup.dev/outer-shell/apps\""
+echo "  \"${BUILD_ROOT}/${CONFIGURATION}/Outer Shell.app/Contents/MacOS/Outer Shell\" --socket-path \"$(getconf DARWIN_USER_TEMP_DIR)org.outershell.OuterShell\" --app-base-url \"https://outershell.org/outer-shell/apps\""

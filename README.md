@@ -25,7 +25,7 @@ socket and owns the menu bar service-list item from one process:
 SOCKET_PATH="$(getconf DARWIN_USER_TEMP_DIR)org.outershell.OuterShell"
 "./build/macos/Release/Outer Shell.app/Contents/MacOS/Outer Shell" \
   --socket-path "$SOCKET_PATH" \
-  --app-base-url https://outergroup.dev/outer-shell/apps
+  --app-base-url https://outershell.org/outer-shell/apps
 ```
 
 For backend-only development, run the API broker and HTTP backend separately:
@@ -77,7 +77,7 @@ the same process also receives socket-activation traffic:
   <string>--socket-path</string>
   <string>/var/folders/.../T/org.outershell.OuterShell</string>
   <string>--app-base-url</string>
-  <string>https://outergroup.dev/outer-shell/apps</string>
+    <string>https://outershell.org/outer-shell/apps</string>
 </array>
 <key>RunAtLoad</key>
 <true/>
@@ -196,7 +196,7 @@ available on localhost macOS.
 
 On Linux, when a bundled app is installed for the current user, Outer Shell copies the payload into `${XDG_STATE_HOME:-~/.local/state}/outershell/apps/<service id>`, writes its user systemd unit, records the backend/log metadata in the registry, and starts the service. On macOS, localhost installs copy the app bundle into `~/Library/Application Support/outershell/apps/<service id>/<AppName>.app`, write a LaunchAgent that runs the contained executable, record metadata in the registry, and start the service.
 
-Bundled apps can also be installed as root from the action menu. Root installs use a system systemd unit, copy the payload into `/opt/outergroup/<service id>`, write logs under `/var/log/outergroup`, write registry metadata to `/var/lib/outershell/registry.orwa`, and put Unix sockets under the system runtime directory, such as `/run/dev.outergroup.Top`. These operations use `sudo`; if sudo needs a password, the Outer Shell UI prompts and retries the operation.
+Bundled apps can also be installed as root from the action menu. Root installs use a system systemd unit, copy the payload into `/opt/outergroup/<service id>`, write logs under `/var/log/outergroup`, write registry metadata to `/var/lib/outershell/registry.orwa`, and put Unix sockets under the system runtime directory, such as `/run/org.outershell.Top`. These operations use `sudo`; if sudo needs a password, the Outer Shell UI prompts and retries the operation.
 
 Bundled apps register their own frontend with the `outerctl` installed by Outer Shell. On Linux, the public Outer Shell installer places it at `${XDG_STATE_HOME:-~/.local/state}/outershell/bin/outerctl`; generated user systemd units use that path. Root-installed bundled apps run it through a small wrapper that sets `OUTERSHELL_HOME=/var/lib/outershell`, so frontend and log metadata are recorded in the system registry.
 

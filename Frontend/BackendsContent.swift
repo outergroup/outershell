@@ -56,7 +56,7 @@ private struct BackendRecord: Decodable {
     }
 
     var isBackendsSelf: Bool {
-        serviceID == "org.outershell.OuterShell" || serviceID == "dev.outergroup.Navigator" || serviceID == "dev.outergroup.Backends"
+        serviceID == "org.outershell.OuterShell"
     }
 
     var isMigrationAction: Bool {
@@ -7201,15 +7201,15 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             return symbolName
         }
         switch backend.serviceID {
-        case "dev.outergroup.Files":
+        case "org.outershell.Files":
             return "folder"
-        case "dev.outergroup.Firehose":
+        case "org.outershell.Firehose":
             return "text.line.last.and.arrowtriangle.forward"
-        case "dev.outergroup.NetworkInspector":
+        case "org.outershell.NetworkInspector":
             return "network"
-        case "dev.outergroup.Plaintext":
+        case "org.outershell.Plaintext":
             return "doc.plaintext"
-        case "dev.outergroup.Top":
+        case "org.outershell.Top":
             return "chart.bar.xaxis"
         default:
             return nil
@@ -7218,7 +7218,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
     private func appIconTintColor(for backend: BackendRecord) -> NSColor {
         switch backend.serviceID {
-        case "dev.outergroup.Firehose":
+        case "org.outershell.Firehose":
             return NSColor(calibratedRed: 1.0, green: 0.53, blue: 0.13, alpha: 1.0)
         default:
             return .controlAccentColor
@@ -7231,7 +7231,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
     private func launcherIconImage(for item: AppLauncherItem) -> NSImage? {
         switch item.backend.serviceID {
-        case "dev.outergroup.Top", "dev.outergroup.Plaintext":
+        case "org.outershell.Top", "org.outershell.Plaintext":
             return nil
         default:
             return item.iconImage

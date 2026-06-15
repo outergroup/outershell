@@ -9,7 +9,7 @@ This document lists the persistent files and sockets installed by Outer Shell an
 - `<user-runtime>` is `$(getconf DARWIN_USER_TEMP_DIR)` on macOS and `${XDG_RUNTIME_DIR:-/run/user/$(id -u)}` on Linux.
 - `<system-state>` is `/Library/Application Support/outershell` on macOS and `/var/lib/outershell` on Linux.
 - `<system-cache>` is `/var/cache/outershell` on Linux.
-- `<service-id>` is the backend service identifier, such as `dev.outergroup.Profile`.
+- `<service-id>` is the backend service identifier, such as `org.outershell.Profile`.
 - `<bundle-prefix>` is the outerframe bundle prefix, such as `ProfileContent`.
 
 ## Registry And API
@@ -200,12 +200,12 @@ Bundled app table:
 
 | App | Service ID | Binary | Bundle Prefix | Root |
 | --- | --- | --- | --- | --- |
-| Top | `dev.outergroup.Top` | `TopBackend` | `TopContent` | optional |
-| Files | `dev.outergroup.Files` | `FilesBackend` | `FilesContent` | optional |
-| Plaintext | `dev.outergroup.Plaintext` | `PlaintextBackend` | `PlaintextContent` | optional |
-| Network Inspector | `dev.outergroup.NetworkInspector` | `NetworkInspectorBackend` | `NetworkInspectorContent` | optional |
-| Firehose | `dev.outergroup.Firehose` | `FirehoseBackend` | `FirehoseContent` | required |
-| Profile | `dev.outergroup.Profile` | `ProfileBackend` | `ProfileContent` | optional |
+| Top | `org.outershell.Top` | `TopBackend` | `TopContent` | optional |
+| Files | `org.outershell.Files` | `FilesBackend` | `FilesContent` | optional |
+| Plaintext | `org.outershell.Plaintext` | `PlaintextBackend` | `PlaintextContent` | optional |
+| Network Inspector | `org.outershell.NetworkInspector` | `NetworkInspectorBackend` | `NetworkInspectorContent` | optional |
+| Firehose | `org.outershell.Firehose` | `FirehoseBackend` | `FirehoseContent` | required |
+| Profile | `org.outershell.Profile` | `ProfileBackend` | `ProfileContent` | optional |
 
 ## User-Created Backends
 

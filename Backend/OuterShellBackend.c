@@ -200,7 +200,7 @@ typedef struct {
 
 static const BundledAppDefinition kBundledApps[] = {
     {
-        .service_id = "dev.outergroup.Top",
+        .service_id = "org.outershell.Top",
         .display_name = "Top",
         .stage_directory_name = "Top",
         .binary_name = "TopBackend",
@@ -210,7 +210,7 @@ static const BundledAppDefinition kBundledApps[] = {
         .archive_name = "Top.tar.gz"
     },
     {
-        .service_id = "dev.outergroup.Files",
+        .service_id = "org.outershell.Files",
         .display_name = "Files",
         .stage_directory_name = "Files",
         .binary_name = "FilesBackend",
@@ -220,7 +220,7 @@ static const BundledAppDefinition kBundledApps[] = {
         .archive_name = "Files.tar.gz"
     },
     {
-        .service_id = "dev.outergroup.Plaintext",
+        .service_id = "org.outershell.Plaintext",
         .display_name = "Plaintext",
         .stage_directory_name = "Plaintext",
         .binary_name = "PlaintextBackend",
@@ -230,7 +230,7 @@ static const BundledAppDefinition kBundledApps[] = {
         .archive_name = "Plaintext.tar.gz"
     },
     {
-        .service_id = "dev.outergroup.NetworkInspector",
+        .service_id = "org.outershell.NetworkInspector",
         .display_name = "Network Inspector",
         .stage_directory_name = "NetworkInspector",
         .binary_name = "NetworkInspectorBackend",
@@ -240,7 +240,7 @@ static const BundledAppDefinition kBundledApps[] = {
         .archive_name = "NetworkInspector.tar.gz"
     },
     {
-        .service_id = "dev.outergroup.Firehose",
+        .service_id = "org.outershell.Firehose",
         .display_name = "Firehose",
         .stage_directory_name = "Firehose",
         .binary_name = "FirehoseBackend",
@@ -250,7 +250,7 @@ static const BundledAppDefinition kBundledApps[] = {
         .archive_name = "Firehose.tar.gz"
     },
     {
-        .service_id = "dev.outergroup.Profile",
+        .service_id = "org.outershell.Profile",
         .display_name = "Profile",
         .stage_directory_name = "Profile",
         .binary_name = "ProfileBackend",
@@ -450,7 +450,7 @@ static const BundledAppDefinition *bundled_app_for_service_id(const char *servic
     for (size_t i = 0; i < sizeof(kBundledApps) / sizeof(kBundledApps[0]); i++) {
         if (strcmp(kBundledApps[i].service_id, service_id) == 0) {
 #ifdef __APPLE__
-            if (strcmp(kBundledApps[i].service_id, "dev.outergroup.Top") != 0) return NULL;
+            if (strcmp(kBundledApps[i].service_id, "org.outershell.Top") != 0) return NULL;
 #endif
             return &kBundledApps[i];
         }

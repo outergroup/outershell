@@ -170,7 +170,7 @@ private enum OuterShellRegistry {
             try loadRegistry(at: path, registryScope: registryScope(for: path), into: &merged)
         }
         return merged.values
-            .filter { !isOuterShellServiceID($0.serviceID) }
+            .filter { $0.serviceID != "org.outershell.OuterShell" }
             .map { partial in
                 let state = launchdState(serviceID: partial.serviceID, plistPath: partial.plistPath)
                 return ManagedBackend(serviceID: partial.serviceID,
@@ -261,13 +261,6 @@ private enum OuterShellRegistry {
             return registryPath
         }
         return (path.deletingLastPathComponent as NSString).appendingPathComponent("registry.orwa")
-    }
-
-    private static func isOuterShellServiceID(_ serviceID: String) -> Bool {
-        let value = serviceID.trimmingCharacters(in: .whitespacesAndNewlines)
-        return value == "org.outershell.OuterShell" ||
-            value == "dev.outergroup.Navigator" ||
-            value == "dev.outergroup.Backends"
     }
 
     private static func loadRegistry(at path: String,

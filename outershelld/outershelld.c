@@ -658,9 +658,7 @@ static void append_url_encoded(StringBuilder *builder, const char *value) {
 #define MAX_SYSTEMD_STATUS_ENTRIES 512
 
 static const char *kOuterShellServiceID = "org.outershell.OuterShell";
-static const char *kLegacyNavigatorServiceID = "dev.outergroup.Navigator";
-static const char *kLegacyBackendsServiceID = "dev.outergroup.Backends";
-static const char *kMigrationServiceID = "dev.outergroup.OuterShellMigration";
+static const char *kMigrationServiceID = "org.outershell.OuterShellMigration";
 #ifdef __APPLE__
 static const char *kSystemOuterShellRoot = "/Library/Application Support/outershell";
 #else
@@ -776,17 +774,17 @@ static void mark_backend_event_changed(void);
 
 static const BundledAppDefinition kBundledApps[] = {
     {
-        .service_id = "dev.outergroup.Top",
+        .service_id = "org.outershell.Top",
         .display_name = "Top",
-        .unit_name = "dev.outergroup.Top.service",
+        .unit_name = "org.outershell.Top.service",
         .stage_directory_name = "Top",
-        .install_directory_name = "dev.outergroup.Top",
+        .install_directory_name = "org.outershell.Top",
         .binary_name = "TopBackend",
         .bundle_prefix = "TopContent",
         .icon_symbol_name = "chart.bar.xaxis",
         .icon_name = "app-icon.png",
         .source_name = "TopBackend.c",
-        .socket_name = "dev.outergroup.Top",
+        .socket_name = "org.outershell.Top",
         .socket_activated = true,
         .supports_root = true,
         .root_only = false,
@@ -794,17 +792,17 @@ static const BundledAppDefinition kBundledApps[] = {
         .version = "1"
     },
     {
-        .service_id = "dev.outergroup.Files",
+        .service_id = "org.outershell.Files",
         .display_name = "Files",
-        .unit_name = "dev.outergroup.Files.service",
+        .unit_name = "org.outershell.Files.service",
         .stage_directory_name = "Files",
-        .install_directory_name = "dev.outergroup.Files",
+        .install_directory_name = "org.outershell.Files",
         .binary_name = "FilesBackend",
         .bundle_prefix = "FilesContent",
         .icon_symbol_name = "folder",
         .icon_name = "app-icon.png",
         .source_name = "FilesBackend.c",
-        .socket_name = "dev.outergroup.Files",
+        .socket_name = "org.outershell.Files",
         .socket_activated = true,
         .supports_root = true,
         .root_only = false,
@@ -812,17 +810,17 @@ static const BundledAppDefinition kBundledApps[] = {
         .version = "1"
     },
     {
-        .service_id = "dev.outergroup.Plaintext",
+        .service_id = "org.outershell.Plaintext",
         .display_name = "Plaintext",
-        .unit_name = "dev.outergroup.Plaintext.service",
+        .unit_name = "org.outershell.Plaintext.service",
         .stage_directory_name = "Plaintext",
-        .install_directory_name = "dev.outergroup.Plaintext",
+        .install_directory_name = "org.outershell.Plaintext",
         .binary_name = "PlaintextBackend",
         .bundle_prefix = "PlaintextContent",
         .icon_symbol_name = "doc.plaintext",
         .icon_name = NULL,
         .source_name = "PlaintextBackend.c",
-        .socket_name = "dev.outergroup.Plaintext",
+        .socket_name = "org.outershell.Plaintext",
         .socket_activated = true,
         .supports_root = true,
         .root_only = false,
@@ -830,17 +828,17 @@ static const BundledAppDefinition kBundledApps[] = {
         .version = "1"
     },
     {
-        .service_id = "dev.outergroup.NetworkInspector",
+        .service_id = "org.outershell.NetworkInspector",
         .display_name = "Network Inspector",
-        .unit_name = "dev.outergroup.NetworkInspector.service",
+        .unit_name = "org.outershell.NetworkInspector.service",
         .stage_directory_name = "NetworkInspector",
-        .install_directory_name = "dev.outergroup.NetworkInspector",
+        .install_directory_name = "org.outershell.NetworkInspector",
         .binary_name = "NetworkInspectorBackend",
         .bundle_prefix = "NetworkInspectorContent",
         .icon_symbol_name = "network",
         .icon_name = "app-icon.png",
         .source_name = "NetworkInspectorBackend.c",
-        .socket_name = "dev.outergroup.NetworkInspector",
+        .socket_name = "org.outershell.NetworkInspector",
         .socket_activated = true,
         .supports_root = true,
         .root_only = false,
@@ -848,17 +846,17 @@ static const BundledAppDefinition kBundledApps[] = {
         .version = "1"
     },
     {
-        .service_id = "dev.outergroup.Firehose",
+        .service_id = "org.outershell.Firehose",
         .display_name = "Firehose",
-        .unit_name = "dev.outergroup.Firehose.service",
+        .unit_name = "org.outershell.Firehose.service",
         .stage_directory_name = "Firehose",
-        .install_directory_name = "dev.outergroup.Firehose",
+        .install_directory_name = "org.outershell.Firehose",
         .binary_name = "FirehoseBackend",
         .bundle_prefix = "FirehoseContent",
         .icon_symbol_name = "text.line.last.and.arrowtriangle.forward",
         .icon_name = "app-icon.png",
         .source_name = NULL,
-        .socket_name = "dev.outergroup.Firehose",
+        .socket_name = "org.outershell.Firehose",
         .socket_activated = true,
         .supports_root = true,
         .root_only = true,
@@ -866,17 +864,17 @@ static const BundledAppDefinition kBundledApps[] = {
         .version = "1"
     },
     {
-        .service_id = "dev.outergroup.Profile",
+        .service_id = "org.outershell.Profile",
         .display_name = "Profile",
-        .unit_name = "dev.outergroup.Profile.service",
+        .unit_name = "org.outershell.Profile.service",
         .stage_directory_name = "Profile",
-        .install_directory_name = "dev.outergroup.Profile",
+        .install_directory_name = "org.outershell.Profile",
         .binary_name = "ProfileBackend",
         .bundle_prefix = "ProfileContent",
         .icon_symbol_name = "flame",
         .icon_name = "app-icon.png",
         .source_name = "ProfileBackend.c",
-        .socket_name = "dev.outergroup.Profile",
+        .socket_name = "org.outershell.Profile",
         .socket_activated = true,
         .supports_root = true,
         .root_only = false,
@@ -886,10 +884,7 @@ static const BundledAppDefinition kBundledApps[] = {
 };
 
 static bool is_home_screen_service_id(const char *service_id) {
-    return service_id &&
-           (strcmp(service_id, kOuterShellServiceID) == 0 ||
-            strcmp(service_id, kLegacyNavigatorServiceID) == 0 ||
-            strcmp(service_id, kLegacyBackendsServiceID) == 0);
+    return service_id && strcmp(service_id, kOuterShellServiceID) == 0;
 }
 
 typedef void (*OuterShelldMenuBarVisibilityCallback)(int enabled);
@@ -1427,7 +1422,7 @@ static const BundledAppDefinition *bundled_app_for_service_id(const char *servic
     for (size_t i = 0; i < sizeof(kBundledApps) / sizeof(kBundledApps[0]); i++) {
         if (strcmp(kBundledApps[i].service_id, service_id) == 0) {
 #ifdef __APPLE__
-            if (strcmp(kBundledApps[i].service_id, "dev.outergroup.Top") != 0) {
+            if (strcmp(kBundledApps[i].service_id, "org.outershell.Top") != 0) {
                 return NULL;
             }
 #endif
@@ -1440,7 +1435,7 @@ static const BundledAppDefinition *bundled_app_for_service_id(const char *servic
 static bool bundled_app_is_available_on_platform(const BundledAppDefinition *app) {
     if (!app) return false;
 #ifdef __APPLE__
-    return strcmp(app->service_id, "dev.outergroup.Top") == 0;
+    return strcmp(app->service_id, "org.outershell.Top") == 0;
 #else
     return true;
 #endif
