@@ -920,7 +920,7 @@ private final class OuterShellAgentDelegate: NSObject, NSApplicationDelegate, NS
         appendOptionIfPresent("--system-database", from: CommandLine.arguments, to: &args)
         appendOptionIfPresent("--bundled-apps-dir", from: CommandLine.arguments, to: &args)
         appendOptionIfPresent("--public-base-url", from: CommandLine.arguments, to: &args)
-        if !containsOption(args, "--bundled-apps-dir") {
+        if !containsOption(args, "--bundled-apps-dir") && !containsOption(args, "--app-base-url") {
             args.append("--bundled-apps-dir")
             args.append(defaultBundledAppsPath())
         }

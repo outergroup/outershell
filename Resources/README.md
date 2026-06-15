@@ -1,23 +1,33 @@
 # Outer Shell Release Assets
 
-Outer Shell can be packaged as a small Linux installer plus
-architecture-specific backend archives. The public repository only defines the
-generic asset shape; any site-specific publishing belongs in a separate
-deployment repository.
+Outer Shell is packaged as a small installer plus platform-specific native
+archives. The public repository only defines the generic asset shape; any
+site-specific publishing belongs in a separate deployment repository.
 
 ## Expected Payloads
 
-Each architecture-specific Outer Shell tarball expands to:
+Each Outer Shell archive expands to:
 
 ```text
 OuterShell/
-  outershelld
-  app-icon.png
-  bin/
+  tools/
+    outershelld
     outerctl
-  bundles/
-    OuterShell.bundle.macos-arm.aar
-    OuterShell.bundle.macos-x86.aar
+  apps/
+    org.outershell.OuterShell/
+      OuterShellBackend                 # Linux archives
+      app-icon.png                      # Linux archives
+      bundles/
+        OuterShell.bundle.macos-arm.aar
+        OuterShell.bundle.macos-x86.aar
+      Outer Shell.app/                  # macOS archives
+        Contents/
+          MacOS/Outer Shell
+          Resources/
+            app-icon.png
+            bundles/
+              OuterShell.bundle.macos-arm.aar
+              OuterShell.bundle.macos-x86.aar
 ```
 
 Starter app tarballs are described by an app catalog. See
@@ -97,7 +107,9 @@ The script writes assets under:
 ```text
 build/release/outer-shell/latest/install.sh
 build/release/outer-shell/latest/version.txt
-build/release/outer-shell/latest/outer-shell-aarch64.tar.gz
-build/release/outer-shell/latest/outer-shell-x86_64.tar.gz
+build/release/outer-shell/latest/outer-shell-linux-aarch64.tar.gz
+build/release/outer-shell/latest/outer-shell-linux-x86_64.tar.gz
+build/release/outer-shell/latest/outer-shell-macos-arm64.zip
+build/release/outer-shell/latest/outer-shell-macos-x86_64.zip
 build/release/outer-shell/app-catalog.json
 ```

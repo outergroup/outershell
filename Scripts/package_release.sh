@@ -12,6 +12,8 @@ MACOS_BUILD_ROOT="${MACOS_BUILD_ROOT:-${REPO_ROOT}/build/macos/Release}"
 PUBLIC_BASE_URL="${PUBLIC_BASE_URL:-}"
 APP_CATALOG_PATH="${APP_CATALOG_PATH:-}"
 OUTER_SHELL_VERSION="${OUTER_SHELL_VERSION:-0.0.0.DEV}"
+OUTER_SHELL_CODESIGN_IDENTITY="${OUTER_SHELL_CODESIGN_IDENTITY:-${CODE_SIGN_IDENTITY:--}}"
+OUTER_SHELL_NOTARY_PROFILE="${OUTER_SHELL_NOTARY_PROFILE:-}"
 
 if [[ -z "${PUBLIC_BASE_URL}" ]]; then
     echo "error: set PUBLIC_BASE_URL to the public Outer Shell asset base URL" >&2
@@ -50,37 +52,98 @@ fi
 STAGING_ROOT="$(mktemp -d)"
 trap 'rm -rf "${STAGING_ROOT}"' EXIT
 
+macos_codesign_args() {
+    if [[ "${OUTER_SHELL_CODESIGN_IDENTITY}" == "-" ]]; then
+        printf '%s\n' --force --sign - --timestamp=none
+    else
+        printf '%s\n' --force --options runtime --timestamp --sign "${OUTER_SHELL_CODESIGN_IDENTITY}"
+    fi
+}
+
+sign_macos_code() {
+    local path="$1"
+    local identifier="${2:-}"
+    if ! command -v /usr/bin/codesign >/dev/null 2>&1; then
+        return 0
+    fi
+    local args=()
+    while IFS= read -r arg; do
+        args+=("$arg")
+    done < <(macos_codesign_args)
+    if [[ -n "${identifier}" ]]; then
+        args+=(--identifier "${identifier}")
+    fi
+    /usr/bin/codesign "${args[@]}" "$path"
+}
+
+thin_macho() {
+    local input="$1"
+    local arch="$2"
+    local output="$3"
+    /usr/bin/lipo "$input" -thin "$arch" -output "$output"
+    chmod 0755 "$output"
+}
+
+notarize_macos_archive_if_requested() {
+    local archive="$1"
+    if [[ -z "${OUTER_SHELL_NOTARY_PROFILE}" ]]; then
+        return 0
+    fi
+    if [[ "${OUTER_SHELL_CODESIGN_IDENTITY}" == "-" ]]; then
+        echo "error: OUTER_SHELL_NOTARY_PROFILE requires OUTER_SHELL_CODESIGN_IDENTITY" >&2
+        exit 1
+    fi
+    xcrun notarytool submit "$archive" \
+        --keychain-profile "${OUTER_SHELL_NOTARY_PROFILE}" \
+        --wait
+}
+
 stage_home_screen() {
     local arch="$1"
-    local root="${STAGING_ROOT}/outer-shell-${arch}/OuterShell"
-    mkdir -p "${root}/bin" "${root}/bundles"
-    install -m 0755 "${PACKAGE_ROOT}/RemoteLinuxBinaries/${arch}/outershelld" "${root}/outershelld"
-    install -m 0755 "${PACKAGE_ROOT}/RemoteLinuxBinaries/${arch}/OuterShellBackend" "${root}/OuterShellBackend"
-    install -m 0755 "${PACKAGE_ROOT}/RemoteLinuxBinaries/${arch}/outerctl" "${root}/bin/outerctl"
-    install -m 0644 "${REPO_ROOT}/app-icon.png" "${root}/app-icon.png"
-    install -m 0644 "${RUN_ROOT}/bundles/OuterShell.bundle.macos-arm.aar" "${root}/bundles/OuterShell.bundle.macos-arm.aar"
-    install -m 0644 "${RUN_ROOT}/bundles/OuterShell.bundle.macos-x86.aar" "${root}/bundles/OuterShell.bundle.macos-x86.aar"
-    tar --format ustar --no-xattrs -C "${STAGING_ROOT}/outer-shell-${arch}" -czf "${OUTPUT_ROOT}/latest/outer-shell-${arch}.tar.gz" OuterShell
+    local package_name="outer-shell-linux-${arch}"
+    local root="${STAGING_ROOT}/${package_name}/OuterShell"
+    local app_root="${root}/apps/org.outershell.OuterShell"
+    mkdir -p "${root}/tools" "${app_root}/bundles"
+    install -m 0755 "${PACKAGE_ROOT}/RemoteLinuxBinaries/${arch}/outershelld" "${root}/tools/outershelld"
+    install -m 0755 "${PACKAGE_ROOT}/RemoteLinuxBinaries/${arch}/outerctl" "${root}/tools/outerctl"
+    install -m 0755 "${PACKAGE_ROOT}/RemoteLinuxBinaries/${arch}/OuterShellBackend" "${app_root}/OuterShellBackend"
+    install -m 0644 "${REPO_ROOT}/app-icon.png" "${app_root}/app-icon.png"
+    install -m 0644 "${RUN_ROOT}/bundles/OuterShell.bundle.macos-arm.aar" "${app_root}/bundles/OuterShell.bundle.macos-arm.aar"
+    install -m 0644 "${RUN_ROOT}/bundles/OuterShell.bundle.macos-x86.aar" "${app_root}/bundles/OuterShell.bundle.macos-x86.aar"
+    tar --format ustar --no-xattrs -C "${STAGING_ROOT}/${package_name}" -czf "${OUTPUT_ROOT}/latest/${package_name}.tar.gz" OuterShell
 }
 
 stage_home_screen_macos() {
-    local root="${STAGING_ROOT}/outer-shell-macos/OuterShell"
-    mkdir -p "${root}/bin" "${root}/bundles"
-    ditto "${MACOS_BUILD_ROOT}/Outer Shell.app" "${root}/Outer Shell.app"
-    rm -rf "${root}/Outer Shell.app/Contents/Resources/bundled-apps"
-    install -m 0755 "${MACOS_BUILD_ROOT}/outershelld" "${root}/outershelld"
-    install -m 0644 "${REPO_ROOT}/app-icon.png" "${root}/app-icon.png"
-    install -m 0644 "${RUN_ROOT}/bundles/OuterShell.bundle.macos-arm.aar" "${root}/bundles/OuterShell.bundle.macos-arm.aar"
-    install -m 0644 "${RUN_ROOT}/bundles/OuterShell.bundle.macos-x86.aar" "${root}/bundles/OuterShell.bundle.macos-x86.aar"
-    clang++ -std=c++17 -arch arm64 -arch x86_64 "${REPO_ROOT}/Resources/outerctl.cpp" \
-        -o "${root}/bin/outerctl"
-    chmod 0755 "${root}/bin/outerctl"
-    tar --format ustar --no-xattrs -C "${STAGING_ROOT}/outer-shell-macos" -czf "${OUTPUT_ROOT}/latest/outer-shell-macos.tar.gz" OuterShell
+    local package_arch="$1"
+    local macho_arch="$2"
+    local package_name="outer-shell-macos-${package_arch}"
+    local root="${STAGING_ROOT}/${package_name}/OuterShell"
+    local app_root="${root}/apps/org.outershell.OuterShell"
+    local app_bundle="${app_root}/Outer Shell.app"
+    mkdir -p "${root}/tools" "${app_root}"
+    ditto "${MACOS_BUILD_ROOT}/Outer Shell.app" "${app_bundle}"
+    rm -rf "${app_bundle}/Contents/Resources/bundled-apps"
+    rm -rf "${app_bundle}/Contents/Resources/bundles"
+    mkdir -p "${app_bundle}/Contents/Resources/bundles"
+    install -m 0644 "${REPO_ROOT}/app-icon.png" "${app_bundle}/Contents/Resources/app-icon.png"
+    install -m 0644 "${RUN_ROOT}/bundles/OuterShell.bundle.macos-arm.aar" "${app_bundle}/Contents/Resources/bundles/OuterShell.bundle.macos-arm.aar"
+    install -m 0644 "${RUN_ROOT}/bundles/OuterShell.bundle.macos-x86.aar" "${app_bundle}/Contents/Resources/bundles/OuterShell.bundle.macos-x86.aar"
+    thin_macho "${MACOS_BUILD_ROOT}/Outer Shell.app/Contents/MacOS/Outer Shell" "${macho_arch}" "${app_bundle}/Contents/MacOS/Outer Shell"
+    thin_macho "${MACOS_BUILD_ROOT}/outershelld" "${macho_arch}" "${root}/tools/outershelld"
+    clang++ -std=c++17 -arch "${macho_arch}" "${REPO_ROOT}/Resources/outerctl.cpp" \
+        -o "${root}/tools/outerctl"
+    chmod 0755 "${root}/tools/outerctl"
+    sign_macos_code "${root}/tools/outershelld" "org.outershell.outershelld"
+    sign_macos_code "${root}/tools/outerctl" "org.outershell.outerctl"
+    sign_macos_code "${app_bundle}"
+    (cd "${STAGING_ROOT}/${package_name}" && ditto -c -k --norsrc --keepParent OuterShell "${OUTPUT_ROOT}/latest/${package_name}.zip")
+    notarize_macos_archive_if_requested "${OUTPUT_ROOT}/latest/${package_name}.zip"
 }
 
 stage_home_screen aarch64
 stage_home_screen x86_64
-stage_home_screen_macos
+stage_home_screen_macos arm64 arm64
+stage_home_screen_macos x86_64 x86_64
 
 ASSET_VERSION="$(date -u +%Y%m%d%H%M%S)"
 printf '%s\n' "${OUTER_SHELL_VERSION}" > "${OUTPUT_ROOT}/latest/version.txt"
@@ -94,7 +157,8 @@ case "$command" in
     *) echo "Unsupported Outer Shell installer command: $command" >&2; exit 2 ;;
 esac
 
-case "$(uname -m)" in
+machine_arch="$(uname -m)"
+case "$machine_arch" in
     aarch64|arm64) arch="aarch64" ;;
     x86_64|amd64) arch="x86_64" ;;
     *) echo "Unsupported architecture: $(uname -m)" >&2; exit 1 ;;
@@ -150,7 +214,10 @@ app_base_url="${public_base_url%/}/apps"
 
 if [ "$os_name" = "Darwin" ]; then
     outershell_home="${OUTERSHELL_HOME:-$HOME/Library/Application Support/outershell}"
-    install_root="$outershell_home/outer-shell"
+    legacy_install_root="$outershell_home/outer-shell"
+    app_install_root="$outershell_home/apps/org.outershell.OuterShell"
+    tools_install_root="$outershell_home/outershelld"
+    outershelld_path="$tools_install_root/outershelld"
     outerctl_path="$outershell_home/bin/outerctl"
     outer_shell_cache_root="$HOME/Library/Caches/outershell/outer-shell"
     outershell_cache_root="$HOME/Library/Caches/outershell"
@@ -162,6 +229,11 @@ if [ "$os_name" = "Darwin" ]; then
     log_path="$log_dir/output.log"
     service_id="org.outershell.OuterShell"
     display_name="Outer Shell"
+    case "$machine_arch" in
+        arm64|aarch64) package_arch="macos-arm64" ;;
+        x86_64|amd64) package_arch="macos-x86_64" ;;
+        *) echo "Unsupported macOS architecture: $machine_arch" >&2; exit 1 ;;
+    esac
 
     unload_outer_shell() {
         launchctl bootout "gui/$(id -u)/$service_id" >/dev/null 2>&1 || launchctl remove "$service_id" >/dev/null 2>&1 || true
@@ -203,9 +275,10 @@ if [ "$os_name" = "Darwin" ]; then
             OUTERSHELL_HOME="$outershell_home" "$outerctl_path" launchd clear --backend "$service_id" >/dev/null 2>&1 || true
             OUTERSHELL_HOME="$outershell_home" "$outerctl_path" backend remove --backend "$service_id" >/dev/null 2>&1 || true
         fi
-        rm -rf "$install_root"
+        rm -rf "$app_install_root" "$legacy_install_root"
         if [ "${OUTERSHELL_UNINSTALL_REMOVE_USER_STATE:-0}" = "1" ]; then
             rm -f "$outershell_home/registry.orwa" "$outershell_home/registry.orwa.lock" "$outerctl_path"
+            rm -rf "$tools_install_root"
             rmdir "$outershell_home/apps" "$outershell_home/bin" "$outershell_home" >/dev/null 2>&1 || true
             rm -rf "$outer_shell_cache_root"
             system_root="/Library/Application Support/outershell"
@@ -234,30 +307,33 @@ EOF
         exit 0
     fi
 
-    mkdir -p "$install_root" "$outershell_home/bin" "$launch_agent_dir" "$log_dir"
+    mkdir -p "$app_install_root" "$tools_install_root" "$outershell_home/bin" "$launch_agent_dir" "$log_dir"
     archive_path="$(mktemp)"
-    stage_archive "${public_base_url%/}/latest/outer-shell-macos.tar.gz?v=__ASSET_VERSION__" "$archive_path"
-    rm -rf "$install_root"
-    mkdir -p "$install_root" "$outershell_home/bin" "$log_dir"
-    tar -xzf "$archive_path" -C "$install_root" --strip-components=1
+    payload_root="$(mktemp -d)"
+    stage_archive "${public_base_url%/}/latest/outer-shell-${package_arch}.zip?v=__ASSET_VERSION__" "$archive_path"
+    ditto -x -k "$archive_path" "$payload_root"
     rm -f "$archive_path"
-    chmod 0755 "$install_root/Outer Shell.app/Contents/MacOS/Outer Shell"
-    chmod 0755 "$install_root/outershelld"
-    chmod 0755 "$install_root/bin/outerctl"
-    install -m 0755 "$install_root/bin/outerctl" "$outerctl_path"
-    printf '%s\n' "__OUTER_SHELL_VERSION__" > "$install_root/version"
+    payload="$payload_root/OuterShell"
+    rm -rf "$app_install_root" "$legacy_install_root"
+    mkdir -p "$app_install_root" "$tools_install_root" "$outershell_home/bin" "$log_dir"
+    ditto "$payload/apps/$service_id/Outer Shell.app" "$app_install_root/Outer Shell.app"
+    install -m 0755 "$payload/tools/outershelld" "$outershelld_path"
+    install -m 0755 "$payload/tools/outerctl" "$outerctl_path"
+    rm -rf "$payload_root"
+    chmod 0755 "$app_install_root/Outer Shell.app/Contents/MacOS/Outer Shell"
+    chmod 0755 "$outershelld_path"
+    chmod 0755 "$outerctl_path"
+    printf '%s\n' "__OUTER_SHELL_VERSION__" > "$app_install_root/version"
+    printf '%s\n' "__OUTER_SHELL_VERSION__" > "$tools_install_root/version"
     touch "$log_path"
 
     unload_outer_shell
     rm -f "$socket_path" "$api_socket_path"
 
-    app_executable="$install_root/Outer Shell.app/Contents/MacOS/Outer Shell"
-    bundles_dir="$install_root/bundles"
-    bundled_apps_dir="$install_root/bundled-apps"
+    app_executable="$app_install_root/Outer Shell.app/Contents/MacOS/Outer Shell"
+    icon_path="$app_install_root/Outer Shell.app/Contents/Resources/app-icon.png"
     app_executable_xml="$(xml_escape "$app_executable")"
     socket_path_xml="$(xml_escape "$socket_path")"
-    bundles_dir_xml="$(xml_escape "$bundles_dir")"
-    bundled_apps_dir_xml="$(xml_escape "$bundled_apps_dir")"
     app_base_url_xml="$(xml_escape "$app_base_url")"
     public_base_url_xml="$(xml_escape "$public_base_url")"
     log_path_xml="$(xml_escape "$log_path")"
@@ -275,10 +351,6 @@ EOF
     <string>$socket_path_xml</string>
     <string>--launchd-socket-name</string>
     <string>Listener</string>
-    <string>--bundles-dir</string>
-    <string>$bundles_dir_xml</string>
-    <string>--bundled-apps-dir</string>
-    <string>$bundled_apps_dir_xml</string>
     <string>--app-base-url</string>
     <string>$app_base_url_xml</string>
     <string>--public-base-url</string>
@@ -316,7 +388,7 @@ EOF
     done
     OUTERSHELL_HOME="$outershell_home" "$outerctl_path" backend upsert --backend "$service_id" --name "$display_name" --launchd-plist "$plist_path" --owns-plist true
     OUTERSHELL_HOME="$outershell_home" "$outerctl_path" app clear --backend "$service_id"
-    OUTERSHELL_HOME="$outershell_home" "$outerctl_path" app add --backend "$service_id" --socket-path "$socket_path" --name "$display_name" --url "/" --icon-path "$install_root/app-icon.png"
+    OUTERSHELL_HOME="$outershell_home" "$outerctl_path" app add --backend "$service_id" --socket-path "$socket_path" --name "$display_name" --url "/" --icon-path "$icon_path"
     OUTERSHELL_HOME="$outershell_home" "$outerctl_path" log clear --backend "$service_id"
     OUTERSHELL_HOME="$outershell_home" "$outerctl_path" log add --backend "$service_id" --path "$log_path"
     if [ "$command" = "update" ]; then
@@ -632,14 +704,21 @@ cleanup_legacy_outeragent_user_unit
 cleanup_legacy_outeragent_system_unit
 archive_path="$(mktemp)"
 payload_outerctl_path="$(mktemp)"
-stage_archive "${public_base_url%/}/latest/outer-shell-${arch}.tar.gz?v=__ASSET_VERSION__" "$archive_path"
-rm -f "$outershelld_path" "$outerctl_path" "$install_root/OuterShellBackend" "$install_root/outershelld" "$install_root/bin/outerctl" "$install_root/run-outer-shell.sh"
-rm -rf "$install_root/bin"
-tar -xzf "$archive_path" -C "$install_root" --strip-components=1
+payload_root="$(mktemp -d)"
+stage_archive "${public_base_url%/}/latest/outer-shell-linux-${arch}.tar.gz?v=__ASSET_VERSION__" "$archive_path"
+tar -xzf "$archive_path" -C "$payload_root"
 rm -f "$archive_path"
-mv "$install_root/outershelld" "$outershelld_path"
-mv "$install_root/bin/outerctl" "$payload_outerctl_path"
-rmdir "$install_root/bin" >/dev/null 2>&1 || true
+payload="$payload_root/OuterShell"
+app_payload="$payload/apps/org.outershell.OuterShell"
+rm -rf "$install_root"
+mkdir -p "$install_root/bundles" "$daemon_root" "$outershell_home/bin" "$unit_dir" "$app_log_dir" "$daemon_log_dir"
+install -m 0755 "$payload/tools/outershelld" "$outershelld_path"
+install -m 0755 "$payload/tools/outerctl" "$payload_outerctl_path"
+install -m 0755 "$app_payload/OuterShellBackend" "$install_root/OuterShellBackend"
+install -m 0644 "$app_payload/app-icon.png" "$install_root/app-icon.png"
+install -m 0644 "$app_payload/bundles/OuterShell.bundle.macos-arm.aar" "$install_root/bundles/OuterShell.bundle.macos-arm.aar"
+install -m 0644 "$app_payload/bundles/OuterShell.bundle.macos-x86.aar" "$install_root/bundles/OuterShell.bundle.macos-x86.aar"
+rm -rf "$payload_root"
 chmod 0755 "$outershelld_path"
 chmod 0755 "$install_root/OuterShellBackend"
 chmod 0755 "$payload_outerctl_path"

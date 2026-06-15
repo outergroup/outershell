@@ -103,6 +103,8 @@ rm -rf "${BUILD_ROOT}/${CONFIGURATION}/Outer Shell.app/Contents/Resources/bundle
 mkdir -p "${BUILD_ROOT}/${CONFIGURATION}/Outer Shell.app/Contents/Resources/bundles"
 cp "${RUN_ROOT}/bundles"/OuterShell.bundle.*.aar \
     "${BUILD_ROOT}/${CONFIGURATION}/Outer Shell.app/Contents/Resources/bundles/"
+cp "${SCRIPT_DIR}/app-icon.png" \
+    "${BUILD_ROOT}/${CONFIGURATION}/Outer Shell.app/Contents/Resources/app-icon.png"
 rm -rf "${BUILD_ROOT}/${CONFIGURATION}/Outer Shell.app/Contents/Resources/bundled-apps"
 
 echo "==> Staging bundled Top"
@@ -163,4 +165,4 @@ echo "Run:"
 echo "  API_SOCKET=\"$(getconf DARWIN_USER_TEMP_DIR)outershelld-api\""
 echo "  \"${BUILD_ROOT}/${CONFIGURATION}/outershelld\" --api-socket-path \"\$API_SOCKET\" &"
 echo "  cc -std=gnu17 -DOUTER_SHELL_BACKEND_STANDALONE=1 Backend/OuterShellBuffer.c Backend/OuterShellAPI.c Backend/OuterShellPlatform.c Backend/OuterShellBackend.c -o /tmp/OuterShellBackend && /tmp/OuterShellBackend --port 7354 --api-socket-path \"\$API_SOCKET\" --bundles-dir \"${RUN_ROOT}/bundles\""
-echo "  \"${BUILD_ROOT}/${CONFIGURATION}/Outer Shell.app/Contents/MacOS/Outer Shell\" --socket-path \"$(getconf DARWIN_USER_TEMP_DIR)org.outershell.OuterShell\" --bundles-dir \"${RUN_ROOT}/bundles\" --bundled-apps-dir \"${RUN_ROOT}/bundled-apps\""
+echo "  \"${BUILD_ROOT}/${CONFIGURATION}/Outer Shell.app/Contents/MacOS/Outer Shell\" --socket-path \"$(getconf DARWIN_USER_TEMP_DIR)org.outershell.OuterShell\" --app-base-url \"https://outergroup.dev/outer-shell/apps\""

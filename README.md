@@ -25,8 +25,7 @@ socket and owns the menu bar service-list item from one process:
 SOCKET_PATH="$(getconf DARWIN_USER_TEMP_DIR)org.outershell.OuterShell"
 "./build/macos/Release/Outer Shell.app/Contents/MacOS/Outer Shell" \
   --socket-path "$SOCKET_PATH" \
-  --bundles-dir ./build/run/bundles \
-  --bundled-apps-dir ./build/run/bundled-apps
+  --app-base-url https://outergroup.dev/outer-shell/apps
 ```
 
 For backend-only development, run the API broker and HTTP backend separately:
@@ -77,8 +76,8 @@ the same process also receives socket-activation traffic:
   <string>/path/to/Outer Shell.app/Contents/MacOS/Outer Shell</string>
   <string>--socket-path</string>
   <string>/var/folders/.../T/org.outershell.OuterShell</string>
-  <string>--bundles-dir</string>
-  <string>/path/to/bundles</string>
+  <string>--app-base-url</string>
+  <string>https://outergroup.dev/outer-shell/apps</string>
 </array>
 <key>RunAtLoad</key>
 <true/>

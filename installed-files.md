@@ -46,12 +46,13 @@ Linux systemd units use `StandardOutput=append:` and `StandardError=append:` for
 
 macOS public install:
 
-- `<user-state>/outer-shell/Outer Shell.app/`
-- `<user-state>/outer-shell/outershelld`
-- `<user-state>/outer-shell/bin/outerctl`
-- `<user-state>/outer-shell/bundles/`
-- `<user-state>/outer-shell/app-icon.png`
-- `<user-state>/outer-shell/version`
+- `<user-state>/apps/org.outershell.OuterShell/Outer Shell.app/`
+- `<user-state>/apps/org.outershell.OuterShell/Outer Shell.app/Contents/Resources/app-icon.png`
+- `<user-state>/apps/org.outershell.OuterShell/Outer Shell.app/Contents/Resources/bundles/OuterShell.bundle.macos-arm.aar`
+- `<user-state>/apps/org.outershell.OuterShell/Outer Shell.app/Contents/Resources/bundles/OuterShell.bundle.macos-x86.aar`
+- `<user-state>/apps/org.outershell.OuterShell/version`
+- `<user-state>/outershelld/outershelld`
+- `<user-state>/outershelld/version`
 - `<user-state>/bin/outerctl`
 - `$HOME/Library/LaunchAgents/org.outershell.OuterShell.plist`
 - `$HOME/Library/Logs/org.outershell.OuterShell/output.log`
@@ -124,11 +125,11 @@ Linux removes old helper files and units when installing current root support:
 - `/etc/systemd/system/outershelld-root-helper-<uid>.service`
 - `/etc/systemd/system/outershelld-root-helper-<uid>.socket`
 
-macOS root app installs promote the same `outershelld` binary into system scope. The user helper path and the legacy root-tool path are symlinks to the root-owned binary:
+macOS root app installs promote the same `outershelld` and `outerctl` tools into system scope. Outer Shell itself remains a user LaunchAgent and is never installed as a root app. After promotion, user tool paths and the legacy root-tool path are symlinks to root-owned tools:
 
 - `<system-state>/outershelld/outershelld`
 - `<system-state>/bin/outerctl`
-- `<user-state>/outer-shell/outershelld -> <system-state>/outershelld/outershelld`
+- `<user-state>/outershelld/outershelld -> <system-state>/outershelld/outershelld`
 - `<user-state>/bin/outerctl -> <system-state>/bin/outerctl`
 - `/usr/local/libexec/outershelld-root-tool -> <system-state>/outershelld/outershelld`
 

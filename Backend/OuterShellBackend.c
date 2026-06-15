@@ -744,16 +744,21 @@ static bool stage_home_screen_installer(char *script_path, size_t script_path_si
     }
     chmod(script_path, 0755);
 
-    const char *archive_name = "outer-shell-macos.tar.gz";
-#ifndef __APPLE__
+#ifdef __APPLE__
+#if defined(__x86_64__)
+    const char *archive_name = "outer-shell-macos-x86_64.zip";
+#else
+    const char *archive_name = "outer-shell-macos-arm64.zip";
+#endif
+#else
     char architecture[64];
     if (!remote_machine_architecture(architecture, sizeof(architecture))) {
         snprintf(message, message_size, "Unsupported machine architecture.");
         return false;
     }
     char linux_archive_name[128];
-    snprintf(linux_archive_name, sizeof(linux_archive_name), "outer-shell-%s.tar.gz", architecture);
-    archive_name = linux_archive_name;
+    snprintf(linux_archive_name, sizeof(linux_archive_name), "outer-shell-linux-%s.tar.gz", architecture);
+    const char *archive_name = linux_archive_name;
 #endif
     snprintf(archive_path, archive_path_size, "%s/%s", cache_root, archive_name);
     char archive_url[4096];

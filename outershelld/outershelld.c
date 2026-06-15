@@ -1230,6 +1230,15 @@ static void default_outershell_install_root(char *out, size_t out_size) {
     snprintf(out, out_size, "%s/outer-shell", root);
 }
 
+#ifdef __APPLE__
+static void default_user_outershelld_path(char *out, size_t out_size) {
+    if (!out || out_size == 0) return;
+    char root[PATH_MAX];
+    default_user_outershell_root(root, sizeof(root));
+    snprintf(out, out_size, "%s/outershelld/outershelld", root);
+}
+#endif
+
 static void default_system_outershelld_install_root(char *out, size_t out_size) {
     if (!out || out_size == 0) return;
     snprintf(out, out_size, "%s/outershelld", kSystemOuterShellRoot);
@@ -1277,7 +1286,13 @@ static void system_binary_root_apps_marker_path(char *out, size_t out_size) {
 
 static void default_user_home_screen_install_root(char *out, size_t out_size) {
     if (!out || out_size == 0) return;
+#ifdef __APPLE__
+    char root[PATH_MAX];
+    default_user_outershell_root(root, sizeof(root));
+    snprintf(out, out_size, "%s/apps/org.outershell.OuterShell", root);
+#else
     default_outershell_install_root(out, out_size);
+#endif
 }
 
 static void default_user_outershell_app_root(const char *install_name, char *out, size_t out_size) {
@@ -1582,13 +1597,20 @@ static bool parent_directory(const char *path, char *out, size_t out_size) {
 
 #ifdef __APPLE__
 static bool macos_root_tool_source_path(const char *executable, char *out, size_t out_size) {
+    char user_outershelld[PATH_MAX];
+    default_user_outershelld_path(user_outershelld, sizeof(user_outershelld));
+    struct stat st;
+    if (stat(user_outershelld, &st) == 0 && S_ISREG(st.st_mode) && access(user_outershelld, X_OK) == 0) {
+        snprintf(out, out_size, "%s", user_outershelld);
+        return out[0] != '\0';
+    }
+
     char directory[PATH_MAX];
     if (!parent_directory(executable, directory, sizeof(directory))) return false;
 
     for (int depth = 0; depth < 5; depth++) {
         char candidate[PATH_MAX];
         snprintf(candidate, sizeof(candidate), "%s/outershelld", directory);
-        struct stat st;
         if (stat(candidate, &st) == 0 && S_ISREG(st.st_mode) && access(candidate, X_OK) == 0) {
             snprintf(out, out_size, "%s", candidate);
             return out[0] != '\0';
@@ -7630,10 +7652,8 @@ static bool ensure_root_helper_installed(const char *sudo_password, bool *needs_
         unlink(script_template);
         return false;
     }
-    char user_install_root[PATH_MAX];
-    default_outershell_install_root(user_install_root, sizeof(user_install_root));
     char user_outerctl_source[PATH_MAX];
-    snprintf(user_outerctl_source, sizeof(user_outerctl_source), "%s/bin/outerctl", user_install_root);
+    default_user_outerctl_path(user_outerctl_source, sizeof(user_outerctl_source));
     if (access(user_outerctl_source, X_OK) != 0) {
         snprintf(message, message_size, "Could not find user outerctl payload at %s.", user_outerctl_source);
         fclose(script);
