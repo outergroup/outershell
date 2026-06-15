@@ -195,7 +195,7 @@ typedef struct {
     const char *bundle_prefix;
     const char *icon_name;
     const char *source_name;
-    const char *archive_name;
+    bool supports_macos;
 } BundledAppDefinition;
 
 static const BundledAppDefinition kBundledApps[] = {
@@ -207,7 +207,7 @@ static const BundledAppDefinition kBundledApps[] = {
         .bundle_prefix = "TopContent",
         .icon_name = "app-icon.png",
         .source_name = "TopBackend.c",
-        .archive_name = "Top.tar.gz"
+        .supports_macos = true
     },
     {
         .service_id = "org.outershell.Files",
@@ -217,7 +217,7 @@ static const BundledAppDefinition kBundledApps[] = {
         .bundle_prefix = "FilesContent",
         .icon_name = "app-icon.png",
         .source_name = "FilesBackend.c",
-        .archive_name = "Files.tar.gz"
+        .supports_macos = false
     },
     {
         .service_id = "org.outershell.Plaintext",
@@ -227,7 +227,7 @@ static const BundledAppDefinition kBundledApps[] = {
         .bundle_prefix = "PlaintextContent",
         .icon_name = NULL,
         .source_name = "PlaintextBackend.c",
-        .archive_name = "Plaintext.tar.gz"
+        .supports_macos = false
     },
     {
         .service_id = "org.outershell.NetworkInspector",
@@ -237,7 +237,7 @@ static const BundledAppDefinition kBundledApps[] = {
         .bundle_prefix = "NetworkInspectorContent",
         .icon_name = "app-icon.png",
         .source_name = "NetworkInspectorBackend.c",
-        .archive_name = "NetworkInspector.tar.gz"
+        .supports_macos = false
     },
     {
         .service_id = "org.outershell.Firehose",
@@ -247,7 +247,7 @@ static const BundledAppDefinition kBundledApps[] = {
         .bundle_prefix = "FirehoseContent",
         .icon_name = "app-icon.png",
         .source_name = NULL,
-        .archive_name = "Firehose.tar.gz"
+        .supports_macos = false
     },
     {
         .service_id = "org.outershell.Profile",
@@ -257,7 +257,7 @@ static const BundledAppDefinition kBundledApps[] = {
         .bundle_prefix = "ProfileContent",
         .icon_name = "app-icon.png",
         .source_name = "ProfileBackend.c",
-        .archive_name = "Profile.tar.gz"
+        .supports_macos = false
     }
 };
 
@@ -450,7 +450,7 @@ static const BundledAppDefinition *bundled_app_for_service_id(const char *servic
     for (size_t i = 0; i < sizeof(kBundledApps) / sizeof(kBundledApps[0]); i++) {
         if (strcmp(kBundledApps[i].service_id, service_id) == 0) {
 #ifdef __APPLE__
-            if (strcmp(kBundledApps[i].service_id, "org.outershell.Top") != 0) return NULL;
+            if (!kBundledApps[i].supports_macos) return NULL;
 #endif
             return &kBundledApps[i];
         }
@@ -507,6 +507,48 @@ static bool remote_machine_architecture(char *out, size_t out_size) {
     return false;
 }
 #endif
+
+static bool current_bundled_app_archive_platform(const BundledAppDefinition *app, char *out, size_t out_size) {
+    if (!app || !out || out_size == 0) return false;
+#ifdef __APPLE__
+    if (!app->supports_macos) return false;
+#if defined(__aarch64__) || defined(__arm64__)
+    snprintf(out, out_size, "macos-arm64");
+    return true;
+#elif defined(__x86_64__)
+    snprintf(out, out_size, "macos-x86_64");
+    return true;
+#else
+    return false;
+#endif
+#else
+    char architecture[64];
+    if (!remote_machine_architecture(architecture, sizeof(architecture))) return false;
+    if (strcmp(architecture, "aarch64") == 0) {
+        snprintf(out, out_size, "linux-aarch64");
+        return true;
+    }
+    if (strcmp(architecture, "x86_64") == 0) {
+        snprintf(out, out_size, "linux-x86_64");
+        return true;
+    }
+    return false;
+#endif
+}
+
+static bool bundled_app_archive_relative_path(const BundledAppDefinition *app, char *out, size_t out_size) {
+    char platform[64];
+    if (!current_bundled_app_archive_platform(app, platform, sizeof(platform))) return false;
+    snprintf(out, out_size, "%s/%s.tar.gz", app->stage_directory_name, platform);
+    return true;
+}
+
+static bool bundled_app_archive_cache_path(const BundledAppDefinition *app, const char *cache_root, char *out, size_t out_size) {
+    char platform[64];
+    if (!current_bundled_app_archive_platform(app, platform, sizeof(platform))) return false;
+    snprintf(out, out_size, "%s/%s-%s.tar.gz", cache_root, app->stage_directory_name, platform);
+    return true;
+}
 
 static void bundled_apps_root(char *out, size_t out_size) {
     if (g_bundled_apps_directory[0]) {
@@ -624,8 +666,14 @@ static bool stage_bundled_app(const BundledAppDefinition *app, char *out_stage_r
     bundled_app_stage_root(app, out_stage_root, out_stage_root_size);
     if (bundled_app_stage_has_expected_files(app, out_stage_root)) return true;
 
+    char archive_relative_path[PATH_MAX];
+    if (!bundled_app_archive_relative_path(app, archive_relative_path, sizeof(archive_relative_path))) {
+        snprintf(message, message_size, "%s is not available for this platform.", app->display_name);
+        return false;
+    }
+
     char archive_url[2048];
-    join_url_path(archive_url, sizeof(archive_url), g_bundled_apps_base_url, app->archive_name);
+    join_url_path(archive_url, sizeof(archive_url), g_bundled_apps_base_url, archive_relative_path);
     if (!archive_url[0]) {
         snprintf(message, message_size, "No app download URL is configured for %s.", app->display_name);
         return false;
@@ -639,7 +687,10 @@ static bool stage_bundled_app(const BundledAppDefinition *app, char *out_stage_r
     }
 
     char archive_path[PATH_MAX];
-    snprintf(archive_path, sizeof(archive_path), "%s/%s.tar.gz", cache_root, app->stage_directory_name);
+    if (!bundled_app_archive_cache_path(app, cache_root, archive_path, sizeof(archive_path))) {
+        snprintf(message, message_size, "%s is not available for this platform.", app->display_name);
+        return false;
+    }
     char download_error[1024] = "";
     if (!outer_shell_download_url_to_file(archive_url, archive_path, download_error, sizeof(download_error))) {
         snprintf(message, message_size, "Failed to download %s from %s: %s", app->display_name, archive_url, download_error);

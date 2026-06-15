@@ -4,32 +4,58 @@
       "serviceID": "org.outershell.Top",
       "name": "Top",
       "supportsRoot": true,
-      "archiveURL": "https://example.com/outer-shell/apps/Top.tar.gz"
+      "archives": {
+        "linux-aarch64": "https://example.com/outer-shell/apps/Top/linux-aarch64.tar.gz",
+        "linux-x86_64": "https://example.com/outer-shell/apps/Top/linux-x86_64.tar.gz",
+        "macos-arm64": "https://example.com/outer-shell/apps/Top/macos-arm64.tar.gz",
+        "macos-x86_64": "https://example.com/outer-shell/apps/Top/macos-x86_64.tar.gz"
+      }
     },
     {
       "serviceID": "org.outershell.Files",
       "name": "Files",
       "supportsRoot": true,
-      "archiveURL": "https://example.com/outer-shell/apps/Files.tar.gz"
+      "archives": {
+        "linux-aarch64": "https://example.com/outer-shell/apps/Files/linux-aarch64.tar.gz",
+        "linux-x86_64": "https://example.com/outer-shell/apps/Files/linux-x86_64.tar.gz"
+      }
     },
     {
       "serviceID": "org.outershell.Plaintext",
       "name": "Plaintext",
       "supportsRoot": true,
-      "archiveURL": "https://example.com/outer-shell/apps/Plaintext.tar.gz"
+      "archives": {
+        "linux-aarch64": "https://example.com/outer-shell/apps/Plaintext/linux-aarch64.tar.gz",
+        "linux-x86_64": "https://example.com/outer-shell/apps/Plaintext/linux-x86_64.tar.gz"
+      }
     },
     {
       "serviceID": "org.outershell.NetworkInspector",
       "name": "Network Inspector",
       "supportsRoot": true,
-      "archiveURL": "https://example.com/outer-shell/apps/NetworkInspector.tar.gz"
+      "archives": {
+        "linux-aarch64": "https://example.com/outer-shell/apps/NetworkInspector/linux-aarch64.tar.gz",
+        "linux-x86_64": "https://example.com/outer-shell/apps/NetworkInspector/linux-x86_64.tar.gz"
+      }
     },
     {
       "serviceID": "org.outershell.Firehose",
       "name": "Firehose",
       "supportsRoot": true,
       "rootOnly": true,
-      "archiveURL": "https://example.com/outer-shell/apps/Firehose.tar.gz"
+      "archives": {
+        "linux-aarch64": "https://example.com/outer-shell/apps/Firehose/linux-aarch64.tar.gz",
+        "linux-x86_64": "https://example.com/outer-shell/apps/Firehose/linux-x86_64.tar.gz"
+      }
+    },
+    {
+      "serviceID": "org.outershell.Profile",
+      "name": "Profile",
+      "supportsRoot": true,
+      "archives": {
+        "linux-aarch64": "https://example.com/outer-shell/apps/Profile/linux-aarch64.tar.gz",
+        "linux-x86_64": "https://example.com/outer-shell/apps/Profile/linux-x86_64.tar.gz"
+      }
     }
   ]
 }

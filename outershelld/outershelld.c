@@ -747,7 +747,7 @@ typedef struct {
     bool socket_activated;
     bool supports_root;
     bool root_only;
-    const char *archive_name;
+    bool supports_macos;
     const char *version;
 } BundledAppDefinition;
 
@@ -788,7 +788,7 @@ static const BundledAppDefinition kBundledApps[] = {
         .socket_activated = true,
         .supports_root = true,
         .root_only = false,
-        .archive_name = "Top.tar.gz",
+        .supports_macos = true,
         .version = "1"
     },
     {
@@ -806,7 +806,7 @@ static const BundledAppDefinition kBundledApps[] = {
         .socket_activated = true,
         .supports_root = true,
         .root_only = false,
-        .archive_name = "Files.tar.gz",
+        .supports_macos = false,
         .version = "1"
     },
     {
@@ -824,7 +824,7 @@ static const BundledAppDefinition kBundledApps[] = {
         .socket_activated = true,
         .supports_root = true,
         .root_only = false,
-        .archive_name = "Plaintext.tar.gz",
+        .supports_macos = false,
         .version = "1"
     },
     {
@@ -842,7 +842,7 @@ static const BundledAppDefinition kBundledApps[] = {
         .socket_activated = true,
         .supports_root = true,
         .root_only = false,
-        .archive_name = "NetworkInspector.tar.gz",
+        .supports_macos = false,
         .version = "1"
     },
     {
@@ -860,7 +860,7 @@ static const BundledAppDefinition kBundledApps[] = {
         .socket_activated = true,
         .supports_root = true,
         .root_only = true,
-        .archive_name = "Firehose.tar.gz",
+        .supports_macos = false,
         .version = "1"
     },
     {
@@ -878,7 +878,7 @@ static const BundledAppDefinition kBundledApps[] = {
         .socket_activated = true,
         .supports_root = true,
         .root_only = false,
-        .archive_name = "Profile.tar.gz",
+        .supports_macos = false,
         .version = "1"
     }
 };
@@ -1173,32 +1173,52 @@ static void cleanup_bundled_app_cache(const BundledAppDefinition *app) {
     if (!app || !app->stage_directory_name || !app->stage_directory_name[0]) return;
     char cache_root[PATH_MAX];
     char app_root[PATH_MAX];
-    char archive_path[PATH_MAX];
+    char legacy_archive_path[PATH_MAX];
+    char linux_aarch64_archive_path[PATH_MAX];
+    char linux_x86_64_archive_path[PATH_MAX];
+    char macos_arm64_archive_path[PATH_MAX];
+    char macos_x86_64_archive_path[PATH_MAX];
     char outer_shell_cache_root[PATH_MAX];
     char outershell_cache_root[PATH_MAX];
     default_bundled_app_cache_root(cache_root, sizeof(cache_root));
     default_outer_shell_cache_root(outer_shell_cache_root, sizeof(outer_shell_cache_root));
     default_user_outershell_cache_root(outershell_cache_root, sizeof(outershell_cache_root));
     snprintf(app_root, sizeof(app_root), "%s/%s", cache_root, app->stage_directory_name);
-    snprintf(archive_path, sizeof(archive_path), "%s/%s.tar.gz", cache_root, app->stage_directory_name);
+    snprintf(legacy_archive_path, sizeof(legacy_archive_path), "%s/%s.tar.gz", cache_root, app->stage_directory_name);
+    snprintf(linux_aarch64_archive_path, sizeof(linux_aarch64_archive_path), "%s/%s-linux-aarch64.tar.gz", cache_root, app->stage_directory_name);
+    snprintf(linux_x86_64_archive_path, sizeof(linux_x86_64_archive_path), "%s/%s-linux-x86_64.tar.gz", cache_root, app->stage_directory_name);
+    snprintf(macos_arm64_archive_path, sizeof(macos_arm64_archive_path), "%s/%s-macos-arm64.tar.gz", cache_root, app->stage_directory_name);
+    snprintf(macos_x86_64_archive_path, sizeof(macos_x86_64_archive_path), "%s/%s-macos-x86_64.tar.gz", cache_root, app->stage_directory_name);
 
     char quoted_app_root[PATH_MAX + 8];
-    char quoted_archive_path[PATH_MAX + 8];
+    char quoted_legacy_archive_path[PATH_MAX + 8];
+    char quoted_linux_aarch64_archive_path[PATH_MAX + 8];
+    char quoted_linux_x86_64_archive_path[PATH_MAX + 8];
+    char quoted_macos_arm64_archive_path[PATH_MAX + 8];
+    char quoted_macos_x86_64_archive_path[PATH_MAX + 8];
     char quoted_cache_root[PATH_MAX + 8];
     char quoted_outer_shell_cache_root[PATH_MAX + 8];
     char quoted_outershell_cache_root[PATH_MAX + 8];
     shell_quote(app_root, quoted_app_root, sizeof(quoted_app_root));
-    shell_quote(archive_path, quoted_archive_path, sizeof(quoted_archive_path));
+    shell_quote(legacy_archive_path, quoted_legacy_archive_path, sizeof(quoted_legacy_archive_path));
+    shell_quote(linux_aarch64_archive_path, quoted_linux_aarch64_archive_path, sizeof(quoted_linux_aarch64_archive_path));
+    shell_quote(linux_x86_64_archive_path, quoted_linux_x86_64_archive_path, sizeof(quoted_linux_x86_64_archive_path));
+    shell_quote(macos_arm64_archive_path, quoted_macos_arm64_archive_path, sizeof(quoted_macos_arm64_archive_path));
+    shell_quote(macos_x86_64_archive_path, quoted_macos_x86_64_archive_path, sizeof(quoted_macos_x86_64_archive_path));
     shell_quote(cache_root, quoted_cache_root, sizeof(quoted_cache_root));
     shell_quote(outer_shell_cache_root, quoted_outer_shell_cache_root, sizeof(quoted_outer_shell_cache_root));
     shell_quote(outershell_cache_root, quoted_outershell_cache_root, sizeof(quoted_outershell_cache_root));
 
-    char command[PATH_MAX * 5 + 128];
+    char command[PATH_MAX * 9 + 128];
     snprintf(command,
              sizeof(command),
-             "rm -rf -- %s; rm -f -- %s; rmdir -- %s %s %s >/dev/null 2>&1 || true",
+             "rm -rf -- %s; rm -f -- %s %s %s %s %s; rmdir -- %s %s %s >/dev/null 2>&1 || true",
              quoted_app_root,
-             quoted_archive_path,
+             quoted_legacy_archive_path,
+             quoted_linux_aarch64_archive_path,
+             quoted_linux_x86_64_archive_path,
+             quoted_macos_arm64_archive_path,
+             quoted_macos_x86_64_archive_path,
              quoted_cache_root,
              quoted_outer_shell_cache_root,
              quoted_outershell_cache_root);
@@ -1422,7 +1442,7 @@ static const BundledAppDefinition *bundled_app_for_service_id(const char *servic
     for (size_t i = 0; i < sizeof(kBundledApps) / sizeof(kBundledApps[0]); i++) {
         if (strcmp(kBundledApps[i].service_id, service_id) == 0) {
 #ifdef __APPLE__
-            if (strcmp(kBundledApps[i].service_id, "org.outershell.Top") != 0) {
+            if (!kBundledApps[i].supports_macos) {
                 return NULL;
             }
 #endif
@@ -1435,7 +1455,7 @@ static const BundledAppDefinition *bundled_app_for_service_id(const char *servic
 static bool bundled_app_is_available_on_platform(const BundledAppDefinition *app) {
     if (!app) return false;
 #ifdef __APPLE__
-    return strcmp(app->service_id, "org.outershell.Top") == 0;
+    return app->supports_macos;
 #else
     return true;
 #endif
