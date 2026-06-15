@@ -1547,6 +1547,18 @@ static void runtime_socket_path(const char *name, char *out, size_t out_size) {
 #endif
 }
 
+static void unlink_advertised_home_screen_socket(void) {
+    char socket_path[PATH_MAX] = "";
+    if (g_listen_socket_path[0]) {
+        snprintf(socket_path, sizeof(socket_path), "%s", g_listen_socket_path);
+    } else {
+        runtime_socket_path(kOuterShellServiceID, socket_path, sizeof(socket_path));
+    }
+    if (socket_path[0]) {
+        unlink(socket_path);
+    }
+}
+
 static bool safe_service_directory_name(const char *value) {
     if (!value || !value[0] || value[0] == '.') return false;
     for (const char *p = value; *p; p++) {
@@ -6567,16 +6579,21 @@ static void send_control_response(int fd, const char *query, const char *body) {
                 if (ok) mark_backend_event_changed();
                 send_action_response_ex(fd, ok ? 200 : (needs_password ? 401 : 500), ok, message, needs_password);
                 return;
-            } else
+            } else {
+#else
+            if (strcmp(installer_command, "uninstall") == 0) {
+                unlink_advertised_home_screen_socket();
+            }
 #endif
-            {
                 ok = run_home_screen_install_script(installer_command,
                                                     installer_script_path,
                                                     installer_archive_path,
                                                     remove_user_state,
                                                     message,
                                                     sizeof(message));
+#ifdef __APPLE__
             }
+#endif
             log_event("%s Outer Shell %s: %s", ok ? "Completed" : "Failed", installer_command, message);
             if (ok) mark_backend_event_changed();
             send_action_response(fd, ok ? 200 : 500, ok, message);
@@ -9853,6 +9870,8 @@ static bool uninstall_local_home_screen(const char *sudo_password,
             log_event("Outer Shell system cleanup skipped: %s", system_cleanup_message[0] ? system_cleanup_message : "unknown error");
         }
     }
+
+    unlink_advertised_home_screen_socket();
 
     pid_t parent_pid = getpid();
     pid_t child = fork();

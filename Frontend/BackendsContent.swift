@@ -4323,6 +4323,11 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                                serviceScope: backend.serviceScope,
                                                operation: operation)
                     self.scheduleBackendsRefreshes()
+                    if operation == "uninstallOuterShell",
+                       let url = self.outerframeHost.pluginURL() {
+                        self.outerframeHost.navigate(to: url)
+                        return
+                    }
                 }
                 self.fetchBackends()
             }
