@@ -26,10 +26,19 @@ expands to:
 
 ```text
 <AppName>/
+  <AppName>.app/                  # macOS localhost payload, when supported
+    Contents/
+      Info.plist
+      MacOS/<BackendBinary>
+      Resources/
+        app-icon.png
+        bundles/
+          <ContentName>.bundle.macos-arm.aar
+          <ContentName>.bundle.macos-x86.aar
   RemoteLinuxBinaries/
     aarch64/<BackendBinary>
     x86_64/<BackendBinary>
-  bundles/
+  bundles/                        # Linux/SSH payload resources
     <ContentName>.bundle.macos-arm.aar
     <ContentName>.bundle.macos-x86.aar
   app-icon.png

@@ -13,6 +13,7 @@ fi
 TOP_BUILD_ROOT="${TOP_BUILD_ROOT:-${RUN_ROOT}/top-build/macos}"
 TOP_OBJ_ROOT="${TOP_OBJ_ROOT:-${RUN_ROOT}/top-build/intermediates}"
 TOP_PAYLOAD_ROOT="${RUN_ROOT}/bundled-apps/Top"
+TOP_APP_ROOT="${TOP_PAYLOAD_ROOT}/Top.app"
 TOP_ICON_PATH="${TOP_ICON_PATH:-${TOP_PROJECT_DIR}/app-icon.png}"
 
 require_tool() {
@@ -33,7 +34,12 @@ if [[ ! -d "${TOP_PROJECT_DIR}/Top.xcodeproj" ]]; then
 fi
 
 rm -rf "${RUN_ROOT}"
-mkdir -p "${BUILD_ROOT}" "${RUN_ROOT}/bundles" "${TOP_PAYLOAD_ROOT}/MacOS" "${TOP_PAYLOAD_ROOT}/bundles"
+mkdir -p \
+    "${BUILD_ROOT}" \
+    "${RUN_ROOT}/bundles" \
+    "${TOP_PAYLOAD_ROOT}/bundles" \
+    "${TOP_APP_ROOT}/Contents/MacOS" \
+    "${TOP_APP_ROOT}/Contents/Resources/bundles"
 
 echo "==> Building Backends.bundle"
 /usr/bin/xcodebuild \
@@ -106,14 +112,43 @@ if [[ ! -f "${TOP_ICON_PATH}" ]]; then
 fi
 install -m 0755 \
     "${TOP_BUILD_ROOT}/${CONFIGURATION}/TopBackend" \
-    "${TOP_PAYLOAD_ROOT}/MacOS/TopBackend"
+    "${TOP_APP_ROOT}/Contents/MacOS/TopBackend"
 install -m 0644 \
     "${TOP_ICON_PATH}" \
-    "${TOP_PAYLOAD_ROOT}/app-icon.png"
+    "${TOP_APP_ROOT}/Contents/Resources/app-icon.png"
+cat > "${TOP_APP_ROOT}/Contents/Info.plist" <<'__TOP_INFO_PLIST__'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleExecutable</key>
+    <string>TopBackend</string>
+    <key>CFBundleIdentifier</key>
+    <string>dev.outergroup.Top</string>
+    <key>CFBundleName</key>
+    <string>Top</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.0</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>LSBackgroundOnly</key>
+    <true/>
+</dict>
+</plist>
+__TOP_INFO_PLIST__
 "${TOP_PROJECT_DIR}/Scripts/archive_top_bundle.sh" \
     "${TOP_BUILD_ROOT}/${CONFIGURATION}/Top.bundle" \
-    "${TOP_PAYLOAD_ROOT}/bundles" \
+    "${TOP_APP_ROOT}/Contents/Resources/bundles" \
     TopContent.bundle
+cp "${TOP_APP_ROOT}/Contents/Resources/bundles"/TopContent.bundle.*.aar \
+    "${TOP_PAYLOAD_ROOT}/bundles/"
+cp "${TOP_APP_ROOT}/Contents/Resources/app-icon.png" \
+    "${TOP_PAYLOAD_ROOT}/app-icon.png"
+if command -v /usr/bin/codesign >/dev/null 2>&1; then
+    /usr/bin/codesign --force --sign - --timestamp=none "${TOP_APP_ROOT}" >/dev/null
+fi
 
 ln -sf "Outer Shell.app/Contents/MacOS/Outer Shell" "${BUILD_ROOT}/${CONFIGURATION}/BackendsBackend"
 ln -sf "Outer Shell.app/Contents/MacOS/Outer Shell" "${BUILD_ROOT}/${CONFIGURATION}/NavigatorBackend"

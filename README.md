@@ -170,12 +170,19 @@ Starter app tarballs use this layout:
 
 ```text
 <AppName>/
-  MacOS/
-    <BackendBinary>
+  <AppName>.app/                  # macOS localhost payload, when supported
+    Contents/
+      Info.plist
+      MacOS/<BackendBinary>
+      Resources/
+        app-icon.png
+        bundles/
+          <ContentName>.bundle.macos-arm.aar
+          <ContentName>.bundle.macos-x86.aar
   RemoteLinuxBinaries/
     aarch64/<BackendBinary>
     x86_64/<BackendBinary>
-  bundles/
+  bundles/                        # Linux/SSH payload resources
     <ContentName>.bundle.macos-arm.aar
     <ContentName>.bundle.macos-x86.aar
   app-icon.png
@@ -188,7 +195,7 @@ Public Outer Shell packages do not embed bundled app payloads; each app archive
 is published independently and must include its own macOS backend when it is
 available on localhost macOS.
 
-On Linux, when a bundled app is installed for the current user, Outer Shell copies the payload into `${XDG_STATE_HOME:-~/.local/state}/outershell/apps/<service id>`, writes its user systemd unit, records the backend/log metadata in the registry, and starts the service. On macOS, localhost installs copy the payload into `~/Library/Application Support/outershell/apps/<service id>`, write a LaunchAgent, record metadata in the registry, and start the service.
+On Linux, when a bundled app is installed for the current user, Outer Shell copies the payload into `${XDG_STATE_HOME:-~/.local/state}/outershell/apps/<service id>`, writes its user systemd unit, records the backend/log metadata in the registry, and starts the service. On macOS, localhost installs copy the app bundle into `~/Library/Application Support/outershell/apps/<service id>/<AppName>.app`, write a LaunchAgent that runs the contained executable, record metadata in the registry, and start the service.
 
 Bundled apps can also be installed as root from the action menu. Root installs use a system systemd unit, copy the payload into `/opt/outergroup/<service id>`, write logs under `/var/log/outergroup`, write registry metadata to `/var/lib/outershell/registry.orwa`, and put Unix sockets under the system runtime directory, such as `/run/dev.outergroup.Top`. These operations use `sudo`; if sudo needs a password, the Outer Shell UI prompts and retries the operation.
 

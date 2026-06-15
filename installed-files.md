@@ -138,20 +138,22 @@ Bundled app payloads use these generated files.
 
 macOS user install:
 
-- `<user-state>/apps/<service-id>/<binary-name>`
-- `<user-state>/apps/<service-id>/bundles/<bundle-prefix>.bundle.macos-arm.aar`
-- `<user-state>/apps/<service-id>/bundles/<bundle-prefix>.bundle.macos-x86.aar`
-- `<user-state>/apps/<service-id>/app-icon.png` when the app has a raster icon
+- `<user-state>/apps/<service-id>/<app-name>.app`
+- `<user-state>/apps/<service-id>/<app-name>.app/Contents/MacOS/<binary-name>`
+- `<user-state>/apps/<service-id>/<app-name>.app/Contents/Resources/bundles/<bundle-prefix>.bundle.macos-arm.aar`
+- `<user-state>/apps/<service-id>/<app-name>.app/Contents/Resources/bundles/<bundle-prefix>.bundle.macos-x86.aar`
+- `<user-state>/apps/<service-id>/<app-name>.app/Contents/Resources/app-icon.png` when the app has a raster icon
 - `$HOME/Library/LaunchAgents/<service-id>.plist`
 - `$HOME/Library/Logs/<service-id>/output.log`
 - `<user-runtime>/<service-id>` for socket-activated apps
 
 macOS root install:
 
-- `<system-state>/apps/<service-id>/<binary-name>`
-- `<system-state>/apps/<service-id>/bundles/<bundle-prefix>.bundle.macos-arm.aar`
-- `<system-state>/apps/<service-id>/bundles/<bundle-prefix>.bundle.macos-x86.aar`
-- `<system-state>/apps/<service-id>/app-icon.png` when the app has a raster icon
+- `<system-state>/apps/<service-id>/<app-name>.app`
+- `<system-state>/apps/<service-id>/<app-name>.app/Contents/MacOS/<binary-name>`
+- `<system-state>/apps/<service-id>/<app-name>.app/Contents/Resources/bundles/<bundle-prefix>.bundle.macos-arm.aar`
+- `<system-state>/apps/<service-id>/<app-name>.app/Contents/Resources/bundles/<bundle-prefix>.bundle.macos-x86.aar`
+- `<system-state>/apps/<service-id>/<app-name>.app/Contents/Resources/app-icon.png` when the app has a raster icon
 - `/Library/LaunchDaemons/<service-id>.plist`
 - `/Library/Logs/<service-id>.log`
 - `/var/run/<service-id>` for socket-activated apps
