@@ -2386,7 +2386,7 @@ static bool merge_registry_database(const char *old_path,
     const char *old_frontend_display_name_expression = old_frontends_have_display_name
         ? (old_frontends_have_name ? "COALESCE(NULLIF(display_name, ''), name, '')" : "COALESCE(display_name, '')")
         : (old_frontends_have_name ? "COALESCE(name, '')" : "''");
-    char *old_frontends_sql = sqlite3_mprintf("SELECT url, service_id, %s, COALESCE(port, 0), COALESCE(socket_path, ''), icon, CASE WHEN icon IS NOT NULL AND substr(icon, 1, 5) != 'data:' THEN icon ELSE NULL END, list FROM frontends;",
+    char *old_frontends_sql = sqlite3_mprintf("SELECT COALESCE(NULLIF(service_id, ''), 'app') || ':' || rowid, url, service_id, %s, COALESCE(port, 0), COALESCE(socket_path, ''), icon, CASE WHEN icon IS NOT NULL AND substr(icon, 1, 5) != 'data:' THEN icon ELSE NULL END, list FROM frontends;",
                                              old_frontend_display_name_expression);
     if (!old_frontends_sql) {
         snprintf(error, error_size, "Out of memory.");
@@ -2402,7 +2402,7 @@ static bool merge_registry_database(const char *old_path,
                                     error, error_size);
     if (ok) ok = copy_registry_rows(old_database, database,
                                     old_frontends_sql,
-                                    "INSERT OR REPLACE INTO frontends(url, service_id, display_name, port, socket_path, icon, icon_path, list) VALUES (?, ?, ?, ?, ?, ?, ?, ?);",
+                                    "INSERT OR REPLACE INTO frontends(frontend_id, url, service_id, display_name, port, socket_path, icon, icon_path, list) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);",
                                     error, error_size);
     if (ok) ok = sqlite_exec_ok(database,
                                 "INSERT OR REPLACE INTO frontend_layouts(url, list) "
@@ -7467,6 +7467,10 @@ static bool ensure_root_helper_installed(const char *sudo_password, bool *needs_
 
     fprintf(script,
             "set -eu\n"
+            "systemctl --system disable --now outerloop-rootd.service >/dev/null 2>&1 || true\n"
+            "rm -f /etc/systemd/system/outerloop-rootd.service\n"
+            "systemctl --system daemon-reload >/dev/null 2>&1 || true\n"
+            "systemctl --system reset-failed outerloop-rootd.service >/dev/null 2>&1 || true\n"
             "systemctl --system disable --now %s >/dev/null 2>&1 || true\n"
             "systemctl --system disable --now %s >/dev/null 2>&1 || true\n"
             "rm -f /etc/systemd/system/%s /etc/systemd/system/%s\n"
@@ -10367,6 +10371,10 @@ static bool install_bundled_app(const BundledAppDefinition *app,
         }
         fprintf(script,
                 "set -eu\n"
+                "timeout 12s systemctl --system disable --now outerloop-rootd.service >/dev/null 2>&1 || true\n"
+                "rm -f /etc/systemd/system/outerloop-rootd.service\n"
+                "systemctl --system daemon-reload >/dev/null 2>&1 || true\n"
+                "timeout 5s systemctl --system reset-failed outerloop-rootd.service >/dev/null 2>&1 || true\n"
                 "timeout 12s systemctl --system stop %s >/dev/null 2>&1 || true\n"
                 "timeout 5s systemctl --system reset-failed %s >/dev/null 2>&1 || true\n"
                 "rm -rf -- %s\n"

@@ -1145,19 +1145,7 @@ private final class OuterShellAgentDelegate: NSObject, NSApplicationDelegate, NS
         guard let url = outerLoopHostedAppURL(frontend) else {
             return
         }
-        NSWorkspace.shared.open(url)
-    }
-
-    private func openLogs(_ service: ManagedBackend) {
-        guard var components = URLComponents(string: "outerloop://open-backend-logs") else { return }
-        components.queryItems = [
-            URLQueryItem(name: "server", value: "localhost"),
-            URLQueryItem(name: "identifier", value: service.serviceID),
-            URLQueryItem(name: "name", value: service.displayName),
-        ]
-        if let url = components.url {
-            NSWorkspace.shared.open(url)
-        }
+        openInOuterLoop(url)
     }
 
     private func preferredFrontend(for service: ManagedBackend) -> HostedFrontend? {
@@ -1395,8 +1383,62 @@ private final class OuterShellAgentDelegate: NSObject, NSApplicationDelegate, NS
             frontend = registered
         }
         if let url = outerLoopHostedAppURL(frontend) {
-            NSWorkspace.shared.open(url)
+            openInOuterLoop(url)
         }
+    }
+
+    private func openInOuterLoop(_ url: URL) {
+        let localhostServerID = "00000000-0000-0000-0000-000000000001"
+        launchOuterLoopOpenHelper(url: url, serverID: localhostServerID)
+    }
+
+    private func launchOuterLoopOpenHelper(url: URL, serverID: String) {
+        guard let helperURL = outerLoopOpenHelperURL() else {
+            NSLog("Unable to find outerloop-open helper")
+            return
+        }
+
+        let process = Process()
+        process.executableURL = helperURL
+        process.arguments = [
+            "--server-id",
+            serverID,
+            url.absoluteString
+        ]
+        process.terminationHandler = { process in
+            if process.terminationStatus != 0 {
+                NSLog("outerloop-open exited with status %d", process.terminationStatus)
+            }
+        }
+
+        do {
+            try process.run()
+        } catch {
+            NSLog("Failed to launch outerloop-open: %@", error.localizedDescription)
+        }
+    }
+
+    private func outerLoopOpenHelperURL() -> URL? {
+        let fileManager = FileManager.default
+        let appURLs = NSWorkspace.shared.urlsForApplications(withBundleIdentifier: "dev.outergroup.OuterLoop")
+        let applicationURLs = appURLs + [
+            URL(fileURLWithPath: "/Applications/Outer Loop.app", isDirectory: true),
+            FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent("Applications", isDirectory: true)
+                .appendingPathComponent("Outer Loop.app", isDirectory: true)
+        ]
+
+        for appURL in applicationURLs {
+            let helperURL = appURL
+                .appendingPathComponent("Contents", isDirectory: true)
+                .appendingPathComponent("MacOS", isDirectory: true)
+                .appendingPathComponent("outerloop-open")
+            if fileManager.isExecutableFile(atPath: helperURL.path) {
+                return helperURL
+            }
+        }
+
+        return nil
     }
 
     private func outerLoopHostedAppURL(_ frontend: HostedFrontend) -> URL? {

@@ -72,7 +72,7 @@ stage_home_screen_macos() {
     install -m 0644 "${REPO_ROOT}/app-icon.png" "${root}/app-icon.png"
     install -m 0644 "${RUN_ROOT}/bundles/OuterShell.bundle.macos-arm.aar" "${root}/bundles/OuterShell.bundle.macos-arm.aar"
     install -m 0644 "${RUN_ROOT}/bundles/OuterShell.bundle.macos-x86.aar" "${root}/bundles/OuterShell.bundle.macos-x86.aar"
-    clang++ -std=c++17 "${REPO_ROOT}/Resources/outerctl.cpp" \
+    clang++ -std=c++17 -arch arm64 -arch x86_64 "${REPO_ROOT}/Resources/outerctl.cpp" \
         -o "${root}/bin/outerctl"
     chmod 0755 "${root}/bin/outerctl"
     tar --format ustar --no-xattrs -C "${STAGING_ROOT}/outer-shell-macos" -czf "${OUTPUT_ROOT}/latest/outer-shell-macos.tar.gz" OuterShell
@@ -428,6 +428,22 @@ run_outerctl() {
     OUTERSHELL_HOME="$outershell_home" OUTERSHELLD_API_SOCKET="$api_socket_path" "$outerctl_path" "$@"
 }
 
+cleanup_legacy_outeragent_user_unit() {
+    [ "$root_install" = false ] || return 0
+    systemctl --user disable --now outeragent.service >/dev/null 2>&1 || true
+    rm -f "$unit_dir/outeragent.service"
+    systemctl --user daemon-reload >/dev/null 2>&1 || true
+    systemctl --user reset-failed outeragent.service >/dev/null 2>&1 || true
+}
+
+cleanup_legacy_outeragent_system_unit() {
+    [ "$root_install" = true ] || return 0
+    systemctl --system disable --now outerloop-rootd.service >/dev/null 2>&1 || true
+    rm -f /etc/systemd/system/outerloop-rootd.service
+    systemctl --system daemon-reload >/dev/null 2>&1 || true
+    systemctl --system reset-failed outerloop-rootd.service >/dev/null 2>&1 || true
+}
+
 system_binary_users_empty() {
     if [ ! -d "$system_binary_users_dir" ]; then
         return 0
@@ -612,6 +628,8 @@ EOF
 fi
 
 mkdir -p "$install_root" "$daemon_root" "$outershell_home/bin" "$unit_dir" "$app_log_dir" "$daemon_log_dir"
+cleanup_legacy_outeragent_user_unit
+cleanup_legacy_outeragent_system_unit
 archive_path="$(mktemp)"
 payload_outerctl_path="$(mktemp)"
 stage_archive "${public_base_url%/}/latest/outer-shell-${arch}.tar.gz?v=__ASSET_VERSION__" "$archive_path"

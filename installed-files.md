@@ -243,8 +243,10 @@ Legacy paths may be migrated or removed during install:
 
 - macOS legacy user root: `$HOME/Library/dev.outergroup.OuterLoop`
 - Linux legacy user root: `$HOME/.outeragent`
+- Linux legacy user systemd unit: `$HOME/.config/systemd/user/outeragent.service`
 - Linux legacy Outer Shell root: `$HOME/.outerloop/outer-shell`
 - macOS legacy system root: `/Library/dev.outergroup.OuterLoop`
 - Linux legacy system root: `/var/lib/outergroup/outeragent`
+- Linux legacy root systemd unit: `/etc/systemd/system/outerloop-rootd.service`
 
 After a legacy `registry.sqlite3` is migrated or superseded by `registry.orwa`, `outershelld` renames it to `registry.sqlite3.migrated` so it is not imported again.
