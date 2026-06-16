@@ -770,6 +770,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private var logTextFragmentCoverage: (generation: Int, textWidth: CGFloat, contentHeight: CGFloat, rect: CGRect)?
     private var logTextSelectionCoverage: (generation: Int, textWidth: CGFloat, contentHeight: CGFloat, range: NSRange, rect: CGRect)?
     private var logScrollbarController: ScrollbarController<BackendsHandler>?
+    private lazy var filePickerScrollbarDelegate = FilePickerScrollbarDelegate(owner: self)
+    private var filePickerScrollbarController: ScrollbarController<FilePickerScrollbarDelegate>?
     private let logContentStorage = NSTextContentStorage()
     private let logTextLayoutManager = NSTextLayoutManager()
     private let logTextContainer = NSTextContainer(size: CGSize(width: 320, height: 1_000_000))
@@ -826,6 +828,11 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private let installOverlayLayer = CALayer()
     private let passwordOverlayLayer = CALayer()
     private let filePickerOverlayLayer = CALayer()
+    private let filePickerListLayer = CALayer()
+    private let filePickerRowsContentLayer = CALayer()
+    private let filePickerStatusLayer = CALayer()
+    private var filePickerVisibleRowLayers: [Int: CALayer] = [:]
+    private var filePickerReusableRowLayers: [CALayer] = []
 
     private var appCardFrames: [(frame: CGRect, item: AppLauncherItem)] = []
     private var appBadgeFrames: [AppLauncherBadgeTarget] = []
@@ -869,13 +876,19 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private var installRootConfirmFrame = CGRect.zero
     private var installCancelFrame = CGRect.zero
     private var filePickerPanelFrame = CGRect.zero
-    private var filePickerEntryFrames: [(frame: CGRect, entry: FilePickerEntryRecord)] = []
+    private var filePickerEntryFrames: [(frame: CGRect, entry: FilePickerEntryRecord, index: Int)] = []
+    private var filePickerBreadcrumbFrame = CGRect.zero
+    private var filePickerBreadcrumbSegmentFrames: [(frame: CGRect, path: String)] = []
+    private var filePickerSelectedIndex: Int?
+    private var filePickerTypeaheadPrefix = ""
+    private var filePickerTypeaheadLastUpdated: Date?
     private var filePickerFilenameFrame = CGRect.zero
     private var filePickerSaveFrame = CGRect.zero
     private var filePickerCancelFrame = CGRect.zero
     private var filePickerListFrame = CGRect.zero
     private var filePickerContentHeight: CGFloat = 0
     private var filePickerScroll: CGFloat = 0
+    private let filePickerRowHeight: CGFloat = 28
 
     private let toolbarHeight: CGFloat = 48
     private let wheelScrollLineHeight: CGFloat = 44
@@ -1283,6 +1296,14 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                                              scrollOffsetOrigin: .bottom)
         scrollbar.delegate = self
         logScrollbarController = scrollbar
+        let filePickerScrollbar = ScrollbarController<FilePickerScrollbarDelegate>(appConnection: outerframeHost,
+                                                                                  viewportLayer: filePickerListLayer,
+                                                                                  appearance: appearance ?? NSAppearance.currentDrawing(),
+                                                                                  width: 10,
+                                                                                  inset: 4,
+                                                                                  scrollOffsetOrigin: .bottom)
+        filePickerScrollbar.delegate = filePickerScrollbarDelegate
+        filePickerScrollbarController = filePickerScrollbar
         createLayer.addSublayer(filePickerOverlayLayer)
 
         titleLayer.string = ""
@@ -1421,6 +1442,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 updateLogTextViewport()
                 updateLogTextSelectionLayers(force: true)
                 logScrollbarController?.updateAppearance(appearance ?? NSAppearance.currentDrawing())
+                filePickerScrollbarController?.updateAppearance(appearance ?? NSAppearance.currentDrawing())
+                updateFilePickerVisibleRows(rebuild: true)
 
                 titleLayer.font = NSFont.systemFont(ofSize: 15, weight: .semibold)
                 titleLayer.fontSize = 15
@@ -2509,16 +2532,23 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         createLayer.addSublayer(filePickerOverlayLayer)
         filePickerOverlayLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
         filePickerEntryFrames.removeAll()
+        filePickerBreadcrumbSegmentFrames.removeAll()
         guard let picker = pendingFilePicker else {
             filePickerOverlayLayer.isHidden = true
             filePickerPanelFrame = .zero
+            filePickerBreadcrumbFrame = .zero
+            filePickerSelectedIndex = nil
+            resetFilePickerTypeahead()
             filePickerFilenameFrame = .zero
             filePickerSaveFrame = .zero
             filePickerCancelFrame = .zero
             filePickerListFrame = .zero
             filePickerContentHeight = 0
+            resetFilePickerRowLayers()
+            filePickerScrollbarController?.updateLayout(metrics: filePickerScrollbarMetrics())
             return
         }
+        clampFilePickerSelection()
 
         filePickerOverlayLayer.isHidden = false
         filePickerOverlayLayer.frame = CGRect(x: 0, y: 0, width: width, height: height)
@@ -2534,7 +2564,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
         let isSaveFile = picker.mode == .saveFile
         let isChooseFile = picker.mode == .chooseFile
-        let bottomControlsHeight: CGFloat = isSaveFile ? 86 : 52
+        let bottomControlsHeight: CGFloat = isSaveFile ? 86 : 72
         let buttonTitle = isSaveFile ? "Save" : "Choose"
         let panel = CALayer()
         panel.frame = panelFrame
@@ -2549,58 +2579,69 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         title.frame = CGRect(x: 18, y: panelHeight - 38, width: panelWidth - 36, height: 20)
         panel.addSublayer(title)
 
-        let path = makeTextLayer(size: 12, weight: .regular, color: .secondaryLabelColor, monospaced: true)
-        path.string = picker.directory
-        path.frame = CGRect(x: 18, y: panelHeight - 62, width: panelWidth - 36, height: 17)
-        panel.addSublayer(path)
+        let breadcrumbFrame = CGRect(x: 18, y: panelHeight - 78, width: panelWidth - 36, height: FilePickerBreadcrumbBar.height)
+        filePickerBreadcrumbFrame = breadcrumbFrame.offsetBy(dx: panelFrame.minX, dy: panelFrame.minY)
+        let breadcrumb = CALayer()
+        breadcrumb.frame = breadcrumbFrame
+        breadcrumb.masksToBounds = true
+        FilePickerBreadcrumbBar.render(path: picker.directory,
+                                       in: breadcrumb,
+                                       segmentFrames: &filePickerBreadcrumbSegmentFrames,
+                                       appearance: appearance ?? NSAppearance.currentDrawing())
+        panel.addSublayer(breadcrumb)
 
-        let listFrame = CGRect(x: 18, y: bottomControlsHeight, width: panelWidth - 36, height: max(panelHeight - bottomControlsHeight - 84, 80))
+        let listFrame = CGRect(x: 18, y: bottomControlsHeight, width: panelWidth - 36, height: max(breadcrumbFrame.minY - bottomControlsHeight - 10, 80))
         filePickerListFrame = listFrame.offsetBy(dx: panelFrame.minX, dy: panelFrame.minY)
-        let list = CALayer()
-        list.frame = listFrame
-        list.cornerRadius = 6
-        list.borderWidth = 1
-        list.borderColor = resolvedCGColor(.separatorColor)
-        list.backgroundColor = resolvedCGColor(NSColor.controlBackgroundColor.withAlphaComponent(0.35))
-        list.masksToBounds = true
-        panel.addSublayer(list)
+        filePickerListLayer.frame = listFrame
+        filePickerListLayer.cornerRadius = 6
+        filePickerListLayer.borderWidth = 1
+        filePickerListLayer.borderColor = resolvedCGColor(.separatorColor)
+        filePickerListLayer.backgroundColor = resolvedCGColor(NSColor.controlBackgroundColor.withAlphaComponent(0.35))
+        filePickerListLayer.masksToBounds = true
+        panel.addSublayer(filePickerListLayer)
 
-        let rowHeight: CGFloat = 28
-        let parentEntry = FilePickerEntryRecord(name: "..", path: picker.parent, isDirectory: true, size: 0, modified: 0)
+        if filePickerRowsContentLayer.superlayer !== filePickerListLayer {
+            filePickerListLayer.addSublayer(filePickerRowsContentLayer)
+        }
+        if filePickerStatusLayer.superlayer !== filePickerListLayer {
+            filePickerListLayer.addSublayer(filePickerStatusLayer)
+        }
+        filePickerStatusLayer.frame = filePickerListLayer.bounds
+        filePickerStatusLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
+
         let showSaveFolderPlaceholder = isSaveFile && !picker.error.isEmpty
-        let allEntries = showSaveFolderPlaceholder ? [parentEntry] : [parentEntry] + picker.entries
-        filePickerContentHeight = CGFloat(allEntries.count) * rowHeight
+        let allEntries = showSaveFolderPlaceholder ? [] : picker.entries
+        filePickerContentHeight = CGFloat(allEntries.count) * filePickerRowHeight
         let maxPickerScroll = max(filePickerContentHeight - listFrame.height, 0)
         filePickerScroll = min(max(filePickerScroll, 0), maxPickerScroll)
 
         if picker.isLoading {
+            resetFilePickerRowLayers()
             let loading = makeTextLayer(size: 12, weight: .regular, color: .secondaryLabelColor, alignment: .center)
             loading.string = "Loading..."
             loading.frame = CGRect(x: 0, y: max((listFrame.height - 18) / 2, 0), width: listFrame.width, height: 18)
-            list.addSublayer(loading)
+            filePickerStatusLayer.addSublayer(loading)
         } else if !picker.error.isEmpty && !showSaveFolderPlaceholder {
+            resetFilePickerRowLayers()
             let message = makeTextLayer(size: 12,
                                         weight: .regular,
                                         color: .systemRed,
                                         alignment: .center)
             message.string = picker.error
             message.frame = CGRect(x: 10, y: max((listFrame.height - 18) / 2, 0), width: listFrame.width - 20, height: 18)
-            list.addSublayer(message)
+            filePickerStatusLayer.addSublayer(message)
         } else {
             if showSaveFolderPlaceholder {
+                resetFilePickerRowLayers()
                 let message = makeTextLayer(size: 12, weight: .regular, color: .secondaryLabelColor, alignment: .center)
                 message.string = "(New folder)"
                 message.frame = CGRect(x: 10, y: max((listFrame.height - 18) / 2, 0), width: listFrame.width - 20, height: 18)
-                list.addSublayer(message)
-            }
-            let visibleStart = max(Int(floor(filePickerScroll / rowHeight)), 0)
-            let visibleEnd = min(allEntries.count, visibleStart + Int(ceil(listFrame.height / rowHeight)) + 2)
-            for index in visibleStart..<visibleEnd {
-                let entry = allEntries[index]
-                let rowY = listFrame.height - CGFloat(index) * rowHeight + filePickerScroll - rowHeight
-                renderFilePickerRow(entry, in: list, localFrame: CGRect(x: 0, y: rowY, width: listFrame.width, height: rowHeight), panelFrame: panelFrame, listFrame: listFrame)
+                filePickerStatusLayer.addSublayer(message)
+            } else {
+                updateFilePickerVisibleRows(rebuild: true)
             }
         }
+        updateFilePickerScrollbarLayout()
 
         if isSaveFile {
             let filenameLabel = makeTextLayer(size: 11, weight: .medium, color: .secondaryLabelColor)
@@ -2684,29 +2725,170 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         sendCreateFieldTextInputGeometryUpdate()
     }
 
-    private func renderFilePickerRow(_ entry: FilePickerEntryRecord,
-                                     in list: CALayer,
-                                     localFrame: CGRect,
-                                     panelFrame: CGRect,
-                                     listFrame: CGRect) {
-        filePickerEntryFrames.append((localFrame.offsetBy(dx: panelFrame.minX + listFrame.minX,
-                                                          dy: panelFrame.minY + listFrame.minY),
-                                      entry))
+    private func makeFilePickerRowLayer() -> CALayer {
         let row = CALayer()
-        row.frame = localFrame
-        list.addSublayer(row)
 
         let icon = CALayer()
-        icon.frame = CGRect(x: 22, y: 6, width: 16, height: 16)
         icon.contentsGravity = .resizeAspect
         icon.contentsScale = 2
-        icon.contents = symbolCGImage(named: entry.isDirectory ? "folder" : "doc", pointSize: 15)
         row.addSublayer(icon)
 
         let name = makeTextLayer(size: 12, weight: .regular, color: .labelColor)
-        name.string = entry.name
-        name.frame = CGRect(x: 58, y: 6, width: max(localFrame.width - 70, 1), height: 16)
         row.addSublayer(name)
+        return row
+    }
+
+    private func configureFilePickerRowLayer(_ row: CALayer,
+                                             entry: FilePickerEntryRecord,
+                                             index: Int,
+                                             frame: CGRect) {
+        row.frame = frame
+        let isSelected = filePickerSelectedIndex == index
+        row.backgroundColor = isSelected ? resolvedCGColor(.selectedContentBackgroundColor) : nil
+
+        if row.sublayers?.count != 2 {
+            row.sublayers?.forEach { $0.removeFromSuperlayer() }
+            let icon = CALayer()
+            icon.contentsGravity = .resizeAspect
+            icon.contentsScale = 2
+            row.addSublayer(icon)
+            row.addSublayer(makeTextLayer(size: 12, weight: .regular, color: .labelColor))
+        }
+
+        let icon = row.sublayers?[0]
+        icon?.frame = CGRect(x: 22, y: 6, width: 16, height: 16)
+        icon?.contents = symbolCGImage(named: entry.isDirectory ? "folder" : "doc",
+                                       pointSize: 15,
+                                       color: isSelected ? .white : .secondaryLabelColor)
+
+        if let name = row.sublayers?[1] as? CATextLayer {
+            name.string = entry.name
+            name.foregroundColor = resolvedCGColor(isSelected ? .white : .labelColor)
+            name.frame = CGRect(x: 58, y: 6, width: max(frame.width - 70, 1), height: 16)
+        }
+    }
+
+    private func recycleFilePickerRowLayer(_ layer: CALayer) {
+        layer.removeFromSuperlayer()
+        filePickerReusableRowLayers.append(layer)
+    }
+
+    private func resetFilePickerRowLayers() {
+        withoutImplicitAnimations {
+            filePickerRowsContentLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
+            filePickerVisibleRowLayers.removeAll()
+            filePickerReusableRowLayers.removeAll()
+            filePickerEntryFrames.removeAll()
+            filePickerRowsContentLayer.frame = CGRect(origin: .zero,
+                                                      size: CGSize(width: filePickerListLayer.bounds.width,
+                                                                   height: 0))
+        }
+    }
+
+    private func currentFilePickerEntries() -> [FilePickerEntryRecord] {
+        guard let picker = pendingFilePicker,
+              !picker.isLoading else { return [] }
+        if !picker.error.isEmpty {
+            return []
+        }
+        return picker.entries
+    }
+
+    fileprivate func setFilePickerScroll(_ value: CGFloat) {
+        let maxPickerScroll = max(filePickerContentHeight - filePickerListFrame.height, 0)
+        let clamped = min(max(value, 0), maxPickerScroll)
+        guard abs(clamped - filePickerScroll) > 0.001 else {
+            updateFilePickerScrollbarLayout()
+            return
+        }
+        filePickerScroll = clamped
+        updateFilePickerVisibleRows(rebuild: false)
+    }
+
+    private func updateFilePickerVisibleRows(rebuild: Bool) {
+        guard pendingFilePicker != nil else {
+            resetFilePickerRowLayers()
+            return
+        }
+
+        let entries = currentFilePickerEntries()
+        let viewportHeight = max(filePickerListLayer.bounds.height, 0)
+        let viewportWidth = max(filePickerListLayer.bounds.width, 1)
+        filePickerContentHeight = CGFloat(entries.count) * filePickerRowHeight
+        let maxPickerScroll = max(filePickerContentHeight - viewportHeight, 0)
+        filePickerScroll = min(max(filePickerScroll, 0), maxPickerScroll)
+
+        withoutImplicitAnimations {
+            filePickerEntryFrames.removeAll()
+
+            let contentY = viewportHeight - filePickerContentHeight + filePickerScroll
+            filePickerRowsContentLayer.frame = CGRect(x: 0,
+                                                      y: contentY,
+                                                      width: viewportWidth,
+                                                      height: max(filePickerContentHeight, 0))
+
+            guard !entries.isEmpty, viewportHeight > 0 else {
+                filePickerRowsContentLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
+                filePickerVisibleRowLayers.removeAll()
+                filePickerReusableRowLayers.removeAll()
+                filePickerEntryFrames.removeAll()
+                filePickerRowsContentLayer.frame = CGRect(origin: .zero,
+                                                          size: CGSize(width: viewportWidth, height: 0))
+                return
+            }
+
+            let visibleStart = max(Int(floor(filePickerScroll / filePickerRowHeight)), 0)
+            let visibleEnd = min(entries.count, visibleStart + Int(ceil(viewportHeight / filePickerRowHeight)) + 2)
+            let visibleRange = visibleStart..<visibleEnd
+
+            let staleIndices = filePickerVisibleRowLayers.keys.filter { !visibleRange.contains($0) }
+            for index in staleIndices {
+                if let layer = filePickerVisibleRowLayers[index] {
+                    recycleFilePickerRowLayer(layer)
+                }
+                filePickerVisibleRowLayers.removeValue(forKey: index)
+            }
+
+            for index in visibleRange {
+                let entry = entries[index]
+                let rowFrame = CGRect(x: 0,
+                                      y: filePickerContentHeight - CGFloat(index + 1) * filePickerRowHeight,
+                                      width: viewportWidth,
+                                      height: filePickerRowHeight)
+                let row: CALayer
+                if let existing = filePickerVisibleRowLayers[index] {
+                    row = existing
+                } else if let reusable = filePickerReusableRowLayers.popLast() {
+                    row = reusable
+                    filePickerRowsContentLayer.addSublayer(row)
+                    filePickerVisibleRowLayers[index] = row
+                } else {
+                    row = makeFilePickerRowLayer()
+                    filePickerRowsContentLayer.addSublayer(row)
+                    filePickerVisibleRowLayers[index] = row
+                }
+                configureFilePickerRowLayer(row, entry: entry, index: index, frame: rowFrame)
+
+                let visibleFrame = rowFrame.offsetBy(dx: filePickerRowsContentLayer.frame.minX,
+                                                     dy: filePickerRowsContentLayer.frame.minY)
+                filePickerEntryFrames.append((visibleFrame.offsetBy(dx: filePickerListFrame.minX,
+                                                                    dy: filePickerListFrame.minY),
+                                              entry,
+                                              index))
+            }
+        }
+
+        updateFilePickerScrollbarLayout()
+    }
+
+    private func filePickerScrollbarMetrics() -> ScrollbarController<FilePickerScrollbarDelegate>.Metrics {
+        ScrollbarController.Metrics(viewportSize: filePickerListLayer.bounds.size,
+                                    contentHeight: filePickerContentHeight,
+                                    scrollOffset: filePickerScroll)
+    }
+
+    private func updateFilePickerScrollbarLayout() {
+        filePickerScrollbarController?.updateLayout(metrics: filePickerScrollbarMetrics())
     }
 
     private func renderLogHeader() {
@@ -3981,6 +4163,17 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         guard let picker = pendingFilePicker else { return [] }
         var children: [OuterframeAccessibilityNode] = []
 
+        for segment in filePickerBreadcrumbSegmentFrames {
+            let localFrame = FilePickerBreadcrumbBar.rootFrame(for: segment.frame, in: filePickerBreadcrumbFrame)
+            guard let frame = accessibilityFrame(localFrame, from: createLayer) else { continue }
+            let title = FilePickerBreadcrumbBar.segments(for: picker.directory).first(where: { $0.path == segment.path })?.title ?? segment.path
+            children.append(accessibilityNode(nextIdentifier: &nextIdentifier,
+                                              role: .button,
+                                              frame: frame,
+                                              label: title == "/" ? "Root folder" : "\(title) folder",
+                                              value: segment.path))
+        }
+
         for entry in filePickerEntryFrames {
             guard let frame = accessibilityFrame(entry.frame, from: createLayer) else { continue }
             children.append(accessibilityNode(nextIdentifier: &nextIdentifier,
@@ -4866,6 +5059,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         createValues["bashIdentifier"] = identifier
         let filename = defaultScriptFilename(for: identifier, extension: ".sh")
         filePickerScroll = 0
+        filePickerSelectedIndex = nil
+        resetFilePickerTypeahead()
         pendingFilePicker = PendingFilePicker(mode: .saveFile,
                                               recipeID: nil,
                                               targetFieldKey: "bashScriptPath",
@@ -4887,6 +5082,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         let current = createValues["bashIconPath", default: ""].trimmingCharacters(in: .whitespacesAndNewlines)
         let split = splitScriptPath(current.isEmpty ? "~" : current)
         filePickerScroll = 0
+        filePickerSelectedIndex = nil
+        resetFilePickerTypeahead()
         pendingFilePicker = PendingFilePicker(mode: .chooseFile,
                                               recipeID: nil,
                                               targetFieldKey: "bashIconPath",
@@ -4914,6 +5111,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             split.directory = preferredDirectory
         }
         filePickerScroll = 0
+        filePickerSelectedIndex = nil
+        resetFilePickerTypeahead()
         pendingFilePicker = PendingFilePicker(mode: .saveFile,
                                               recipeID: recipe.identifier,
                                               targetFieldKey: nil,
@@ -4935,6 +5134,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         let currentDirectory = createValues[key] ?? selectedRecipe()?.fields.first(where: { $0.key == key })?.defaultValue ?? "~"
         let directory = currentDirectory.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "~" : currentDirectory
         filePickerScroll = 0
+        filePickerSelectedIndex = nil
+        resetFilePickerTypeahead()
         pendingFilePicker = PendingFilePicker(mode: .chooseDirectory,
                                               recipeID: nil,
                                               targetFieldKey: key,
@@ -4957,6 +5158,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             pendingFilePicker?.isLoading = true
             pendingFilePicker?.error = ""
             filePickerScroll = 0
+            filePickerSelectedIndex = nil
+            resetFilePickerTypeahead()
             updateLayout()
         }
         var components = URLComponents(url: filePickerEndpoint, resolvingAgainstBaseURL: false)
@@ -4990,6 +5193,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                     self.pendingFilePicker?.directory = response.path
                     self.pendingFilePicker?.parent = response.parent
                     self.pendingFilePicker?.entries = response.entries
+                    self.filePickerSelectedIndex = nil
+                    self.resetFilePickerTypeahead()
                 } catch {
                     self.pendingFilePicker?.error = "Could not decode directory."
                 }
@@ -5057,8 +5262,129 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         pendingFilePicker = nil
         createValues.removeValue(forKey: Self.filePickerFilenameKey)
         filePickerScroll = 0
+        filePickerSelectedIndex = nil
+        resetFilePickerTypeahead()
         blurCreateField()
         updateLayout()
+    }
+
+    private func activateSelectedFilePickerEntry() -> Bool {
+        guard let selectedIndex = filePickerSelectedIndex,
+              let entries = pendingFilePicker?.entries,
+              entries.indices.contains(selectedIndex) else {
+            return false
+        }
+        activateFilePickerEntry(entries[selectedIndex])
+        return true
+    }
+
+    private func activateFilePickerEntry(_ entry: FilePickerEntryRecord) {
+        blurCreateField()
+        if entry.isDirectory {
+            fetchFilePickerDirectory(path: entry.path)
+        } else if pendingFilePicker?.mode == .chooseFile,
+                  let targetFieldKey = pendingFilePicker?.targetFieldKey {
+            createValues[targetFieldKey] = entry.path
+            createValues.removeValue(forKey: Self.filePickerFilenameKey)
+            pendingFilePicker = nil
+            filePickerScroll = 0
+            filePickerSelectedIndex = nil
+            resetFilePickerTypeahead()
+            focusCreateField(targetFieldKey, cursorPosition: entry.path.count)
+            createMessage = ""
+            updateLayout()
+        } else {
+            pendingFilePicker?.filename = entry.name
+            createValues[Self.filePickerFilenameKey] = entry.name
+            focusCreateField(Self.filePickerFilenameKey, cursorPosition: entry.name.count)
+            updateLayout()
+        }
+    }
+
+    private func moveFilePickerSelection(delta: Int) {
+        guard let entries = pendingFilePicker?.entries,
+              !entries.isEmpty else { return }
+        let nextIndex = min(max((filePickerSelectedIndex ?? (delta > 0 ? -1 : entries.count)) + delta, 0), entries.count - 1)
+        selectFilePickerIndex(nextIndex)
+    }
+
+    private func selectFilePickerIndex(_ index: Int) {
+        guard let entries = pendingFilePicker?.entries,
+              entries.indices.contains(index) else { return }
+        filePickerSelectedIndex = index
+        ensureFilePickerSelectionVisible()
+        updateFilePickerVisibleRows(rebuild: true)
+    }
+
+    private func ensureFilePickerSelectionVisible() {
+        guard let selectedIndex = filePickerSelectedIndex else { return }
+        let rowTop = CGFloat(selectedIndex) * filePickerRowHeight
+        let viewportHeight = max(filePickerListFrame.height, 1)
+        if rowTop < filePickerScroll {
+            filePickerScroll = rowTop
+        } else if rowTop + filePickerRowHeight > filePickerScroll + viewportHeight {
+            filePickerScroll = rowTop + filePickerRowHeight - viewportHeight
+        }
+        let maxPickerScroll = max(filePickerContentHeight - filePickerListFrame.height, 0)
+        filePickerScroll = min(max(filePickerScroll, 0), maxPickerScroll)
+    }
+
+    private func clampFilePickerSelection() {
+        guard let count = pendingFilePicker?.entries.count,
+              count > 0 else {
+            filePickerSelectedIndex = nil
+            return
+        }
+        if let selectedIndex = filePickerSelectedIndex,
+           selectedIndex >= count {
+            filePickerSelectedIndex = count - 1
+        }
+    }
+
+    private func resetFilePickerTypeahead() {
+        filePickerTypeaheadPrefix = ""
+        filePickerTypeaheadLastUpdated = nil
+    }
+
+    private func handleFilePickerTypeahead(_ text: String) {
+        guard let entries = pendingFilePicker?.entries,
+              !entries.isEmpty else { return }
+        let now = Date()
+        if let last = filePickerTypeaheadLastUpdated,
+           now.timeIntervalSince(last) > 1.0 {
+            filePickerTypeaheadPrefix = ""
+        }
+        filePickerTypeaheadLastUpdated = now
+        filePickerTypeaheadPrefix += text.lowercased()
+        if selectFilePickerEntry(matchingPrefix: filePickerTypeaheadPrefix, in: entries) {
+            return
+        }
+        filePickerTypeaheadPrefix = text.lowercased()
+        _ = selectFilePickerEntry(matchingPrefix: filePickerTypeaheadPrefix, in: entries)
+    }
+
+    private func selectFilePickerEntry(matchingPrefix prefix: String, in entries: [FilePickerEntryRecord]) -> Bool {
+        guard !prefix.isEmpty else { return false }
+        let start = (filePickerSelectedIndex ?? -1) + 1
+        for offset in 0..<entries.count {
+            let index = (start + offset) % entries.count
+            if entries[index].name.lowercased().hasPrefix(prefix) {
+                selectFilePickerIndex(index)
+                return true
+            }
+        }
+        return false
+    }
+
+    private func filePickerTypeaheadText(from characters: String) -> String? {
+        guard !characters.isEmpty,
+              characters.unicodeScalars.allSatisfy({
+                  !CharacterSet.controlCharacters.contains($0) &&
+                  !CharacterSet.newlines.contains($0)
+              }) else {
+            return nil
+        }
+        return characters
     }
 
     func textInputControllerDidChangeState() {
@@ -5156,15 +5482,19 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         }
         switch keyCode {
         case 36, 76:
-            confirmFilePickerSave()
-        case 51, 117:
-            focusCreateField(Self.filePickerFilenameKey)
-            createInputController.deleteBackward()
+            if !activateSelectedFilePickerEntry() {
+                confirmFilePickerSave()
+            }
+        case 126:
+            moveFilePickerSelection(delta: -1)
+        case 125:
+            moveFilePickerSelection(delta: 1)
         case 53:
             dismissFilePicker()
         default:
-            if let characters, !characters.isEmpty {
-                insertCreateText(characters)
+            if let characters,
+               let text = filePickerTypeaheadText(from: characters) {
+                handleFilePickerTypeahead(text)
             }
         }
     }
@@ -6176,24 +6506,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         case .filePickerCancel:
             dismissFilePicker()
         case .filePickerEntry(let entry):
-            blurCreateField()
-            if entry.isDirectory {
-                fetchFilePickerDirectory(path: entry.path)
-            } else if pendingFilePicker?.mode == .chooseFile,
-                      let targetFieldKey = pendingFilePicker?.targetFieldKey {
-                createValues[targetFieldKey] = entry.path
-                createValues.removeValue(forKey: Self.filePickerFilenameKey)
-                pendingFilePicker = nil
-                filePickerScroll = 0
-                focusCreateField(targetFieldKey, cursorPosition: entry.path.count)
-                createMessage = ""
-                updateLayout()
-            } else {
-                pendingFilePicker?.filename = entry.name
-                createValues[Self.filePickerFilenameKey] = entry.name
-                focusCreateField(Self.filePickerFilenameKey, cursorPosition: entry.name.count)
-                updateLayout()
-            }
+            activateFilePickerEntry(entry)
         case .filePickerSave:
             confirmFilePickerSave()
         case .installCancel:
@@ -6218,6 +6531,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
     private func handleMouseDragged(to point: CGPoint, modifierFlags: NSEvent.ModifierFlags) {
         _ = modifierFlags
+        if pendingFilePicker != nil,
+           filePickerScrollbarController?.handleMouseDragged(to: rootLayer.convert(point, to: filePickerListLayer)) == true {
+            return
+        }
         if logScrollbarController?.handleMouseDragged(to: rootLayer.convert(point, to: logRowsClipLayer)) == true {
             return
         }
@@ -6290,6 +6607,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         logHeaderDetailDragAnchorOffset = nil
         lastLogDragTextPoint = nil
         pendingTextSelectionDrag = nil
+        if pendingFilePicker != nil {
+            _ = filePickerScrollbarController?.handleMouseUp(at: rootLayer.convert(point, to: filePickerListLayer))
+        }
         _ = logScrollbarController?.handleMouseUp(at: rootLayer.convert(point, to: logRowsClipLayer))
         if handlePendingButtonMouseUp(at: point) {
             return
@@ -6330,7 +6650,11 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 setCursorIfNeeded(.iBeam)
             } else if filePickerSaveFrame.contains(createPoint) ||
                         filePickerCancelFrame.contains(createPoint) ||
-                        filePickerEntryFrames.contains(where: { $0.frame.contains(createPoint) }) {
+                        FilePickerBreadcrumbBar.hitPath(at: createPoint,
+                                                        breadcrumbFrame: filePickerBreadcrumbFrame,
+                                                        segmentFrames: filePickerBreadcrumbSegmentFrames) != nil ||
+                        (filePickerListFrame.contains(createPoint) &&
+                         filePickerEntryFrames.contains(where: { $0.frame.contains(createPoint) })) {
                 setCursorIfNeeded(.pointingHand)
             } else {
                 setCursorIfNeeded(.arrow)
@@ -6508,9 +6832,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 let contentPoint = contentLayer.convert(point, from: rootLayer)
                 let createPoint = createLayer.convert(contentPoint, from: contentLayer)
                 if filePickerListFrame.contains(createPoint) {
-                    filePickerScroll -= delta.y * multiplier
-                    let maxPickerScroll = max(filePickerContentHeight - filePickerListFrame.height, 0)
-                    filePickerScroll = min(max(filePickerScroll, 0), maxPickerScroll)
+                    setFilePickerScroll(filePickerScroll - delta.y * multiplier)
+                    return
                 }
             } else {
                 createScroll -= delta.y * multiplier
@@ -6748,9 +7071,26 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             updateLayout()
             return
         }
-        if let hit = filePickerEntryFrames.first(where: { $0.frame.contains(createPoint) }) {
-            armButtonClick(frame: rootFrame(hit.frame, from: createLayer),
-                           action: .filePickerEntry(hit.entry))
+        if let path = FilePickerBreadcrumbBar.hitPath(at: createPoint,
+                                                      breadcrumbFrame: filePickerBreadcrumbFrame,
+                                                      segmentFrames: filePickerBreadcrumbSegmentFrames) {
+            blurCreateField()
+            fetchFilePickerDirectory(path: path)
+            return
+        }
+        if filePickerListFrame.contains(createPoint),
+           filePickerScrollbarController?.handleMouseDown(at: createLayer.convert(createPoint, to: filePickerListLayer)) == true {
+            return
+        }
+        if filePickerListFrame.contains(createPoint),
+           let hit = filePickerEntryFrames.first(where: { $0.frame.contains(createPoint) }) {
+            blurCreateField()
+            filePickerSelectedIndex = hit.index
+            resetFilePickerTypeahead()
+            updateFilePickerVisibleRows(rebuild: true)
+            if clickCount >= 2 {
+                activateFilePickerEntry(hit.entry)
+            }
             return
         }
         if !filePickerPanelFrame.contains(createPoint), createInputController.isFocused {
@@ -8224,6 +8564,19 @@ private final class SymbolButtonLayer: CALayer {
                    fraction: 1)
 
         return bitmap.cgImage
+    }
+}
+
+@MainActor
+private final class FilePickerScrollbarDelegate: ScrollbarControllerDelegate {
+    private weak var owner: BackendsHandler?
+
+    init(owner: BackendsHandler) {
+        self.owner = owner
+    }
+
+    func scrollbarDidChangeScrollOffset(_ offset: CGFloat) {
+        owner?.setFilePickerScroll(offset)
     }
 }
 
