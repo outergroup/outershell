@@ -199,6 +199,97 @@ xml_escape() {
         -e 's/"/\&quot;/g'
 }
 
+runtime_dir_for_allowlist_scope() {
+    scope="$1"
+    if [ "$scope" = "system" ]; then
+        if [ "$os_name" = "Darwin" ]; then
+            printf '%s\n' "/var/run"
+        else
+            printf '%s\n' "/run"
+        fi
+        return
+    fi
+    if [ "$os_name" = "Darwin" ]; then
+        getconf DARWIN_USER_TEMP_DIR | sed 's:/*$::'
+    else
+        printf '%s\n' "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}" | sed 's:/*$::'
+    fi
+}
+
+allowlist_path_for_scope() {
+    scope="$1"
+    if [ "$os_name" = "Darwin" ]; then
+        if [ "$scope" = "system" ]; then
+            printf '%s\n' "/Library/Application Support/dev.outergroup.OuterLoop/http-unix.allow"
+        else
+            printf '%s\n' "$HOME/Library/Application Support/dev.outergroup.OuterLoop/http-unix.allow"
+        fi
+    else
+        if [ "$scope" = "system" ]; then
+            printf '%s\n' "/etc/outerloop/http-unix.allow"
+        else
+            printf '%s\n' "${XDG_CONFIG_HOME:-$HOME/.config}/outerloop/http-unix.allow"
+        fi
+    fi
+}
+
+allowlist_entry_for_socket_path() {
+    scope="$1"
+    socket="$2"
+    runtime_dir="$(runtime_dir_for_allowlist_scope "$scope")"
+    case "$socket" in
+        "$runtime_dir"/*)
+            suffix="${socket#"$runtime_dir"/}"
+            if [ "$scope" = "system" ]; then
+                printf '%%T/%s\n' "$suffix"
+            else
+                printf '%%t/%s\n' "$suffix"
+            fi
+            ;;
+        *)
+            printf '%s\n' "$socket"
+            ;;
+    esac
+}
+
+append_outerloop_http_unix_allowlist_entry() {
+    scope="$1"
+    socket="$2"
+    [ -n "$socket" ] || return 0
+    allowlist_path="$(allowlist_path_for_scope "$scope")"
+    allowlist_dir="$(dirname "$allowlist_path")"
+    entry="$(allowlist_entry_for_socket_path "$scope" "$socket")"
+    mkdir -p "$allowlist_dir"
+    if [ "$scope" = "system" ]; then
+        chmod 0755 "$allowlist_dir"
+    else
+        chmod 0700 "$allowlist_dir"
+    fi
+    if [ -L "$allowlist_path" ] || { [ -e "$allowlist_path" ] && [ ! -f "$allowlist_path" ]; }; then
+        echo "$allowlist_path is not a regular file" >&2
+        exit 1
+    fi
+    touch "$allowlist_path"
+    if [ "$os_name" = "Darwin" ]; then
+        owner_uid="$(stat -f %u "$allowlist_path")"
+    else
+        owner_uid="$(stat -c %u "$allowlist_path")"
+    fi
+    if [ "$scope" = "system" ]; then
+        expected_uid=0
+    else
+        expected_uid="$(id -u)"
+    fi
+    if [ "$owner_uid" != "$expected_uid" ]; then
+        echo "$allowlist_path is owned by uid $owner_uid, expected uid $expected_uid" >&2
+        exit 1
+    fi
+    chmod 0644 "$allowlist_path"
+    if ! grep -Fx -- "$entry" "$allowlist_path" >/dev/null 2>&1; then
+        printf '%s\n' "$entry" >> "$allowlist_path"
+    fi
+}
+
 systemd_quote_arg() {
     printf '"'
     printf '%s' "$1" | sed \
@@ -389,6 +480,7 @@ EOF
     OUTERSHELL_HOME="$outershell_home" "$outerctl_path" backend upsert --backend "$service_id" --name "$display_name" --launchd-plist "$plist_path" --owns-plist true
     OUTERSHELL_HOME="$outershell_home" "$outerctl_path" app clear --backend "$service_id"
     OUTERSHELL_HOME="$outershell_home" "$outerctl_path" app add --backend "$service_id" --socket-path "$socket_path" --name "$display_name" --url "/" --icon-path "$icon_path"
+    append_outerloop_http_unix_allowlist_entry user "$socket_path"
     OUTERSHELL_HOME="$outershell_home" "$outerctl_path" log clear --backend "$service_id"
     OUTERSHELL_HOME="$outershell_home" "$outerctl_path" log add --backend "$service_id" --path "$log_path"
     if [ "$command" = "update" ]; then
@@ -820,6 +912,11 @@ systemctl $systemctl_scope start org.outershell.OuterShell.socket
 run_outerctl backend upsert --backend org.outershell.OuterShell --name "Outer Shell" --systemd-unit org.outershell.OuterShell.service
 run_outerctl app clear --backend org.outershell.OuterShell
 run_outerctl app add --backend org.outershell.OuterShell --socket-path "$socket_path" --name "Outer Shell" --url "/" --icon-path "$install_root/app-icon.png"
+if [ "$root_install" = true ]; then
+    append_outerloop_http_unix_allowlist_entry system "$socket_path"
+else
+    append_outerloop_http_unix_allowlist_entry user "$socket_path"
+fi
 run_outerctl log clear --backend org.outershell.OuterShell
 run_outerctl log add --backend org.outershell.OuterShell --path "$log_path"
 

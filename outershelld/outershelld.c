@@ -252,6 +252,214 @@ static bool write_text_file(const char *path, const char *contents, char *error,
 }
 
 
+static bool path_has_directory_prefix(const char *path, const char *directory) {
+    if (!path || !directory || !path[0] || !directory[0]) return false;
+    size_t length = strlen(directory);
+    while (length > 1 && directory[length - 1] == '/') length--;
+    return strncmp(path, directory, length) == 0 &&
+           (path[length] == '/' || path[length] == '\0');
+}
+
+
+static void current_user_runtime_directory(char *out, size_t out_size) {
+    if (!out || out_size == 0) return;
+#ifdef __APPLE__
+    size_t required_length = confstr(_CS_DARWIN_USER_TEMP_DIR, NULL, 0);
+    if (required_length > 0) {
+        char temp_dir[PATH_MAX];
+        if (required_length < sizeof(temp_dir) &&
+            confstr(_CS_DARWIN_USER_TEMP_DIR, temp_dir, required_length) > 0 &&
+            temp_dir[0]) {
+            size_t length = strlen(temp_dir);
+            while (length > 1 && temp_dir[length - 1] == '/') temp_dir[--length] = '\0';
+            snprintf(out, out_size, "%s", temp_dir);
+            return;
+        }
+    }
+    snprintf(out, out_size, "/tmp");
+#else
+    const char *runtime_dir = getenv("XDG_RUNTIME_DIR");
+    if (runtime_dir && runtime_dir[0]) {
+        snprintf(out, out_size, "%s", runtime_dir);
+        return;
+    }
+    snprintf(out, out_size, "/run/user/%d", (int)getuid());
+#endif
+}
+
+
+static void system_runtime_directory(char *out, size_t out_size) {
+    if (!out || out_size == 0) return;
+#ifdef __APPLE__
+    snprintf(out, out_size, "/var/run");
+#else
+    snprintf(out, out_size, "/run");
+#endif
+}
+
+
+static void outerloop_http_unix_allowlist_path(bool system_scope, char *out, size_t out_size) {
+    if (!out || out_size == 0) return;
+#ifdef __APPLE__
+    if (system_scope) {
+        snprintf(out, out_size, "/Library/Application Support/dev.outergroup.OuterLoop/http-unix.allow");
+    } else {
+        snprintf(out, out_size, "%s/Library/Application Support/dev.outergroup.OuterLoop/http-unix.allow", home_directory());
+    }
+#else
+    if (system_scope) {
+        snprintf(out, out_size, "/etc/outerloop/http-unix.allow");
+    } else {
+        const char *config_home = getenv("XDG_CONFIG_HOME");
+        if (config_home && config_home[0]) {
+            snprintf(out, out_size, "%s/outerloop/http-unix.allow", config_home);
+        } else {
+            snprintf(out, out_size, "%s/.config/outerloop/http-unix.allow", home_directory());
+        }
+    }
+#endif
+}
+
+
+static void outerloop_http_unix_allowlist_entry(const char *socket_path,
+                                                bool system_scope,
+                                                char *out,
+                                                size_t out_size) {
+    if (!out || out_size == 0) return;
+    out[0] = '\0';
+    if (!socket_path || !socket_path[0]) return;
+
+    char runtime_dir[PATH_MAX];
+    if (system_scope) {
+        system_runtime_directory(runtime_dir, sizeof(runtime_dir));
+    } else {
+        current_user_runtime_directory(runtime_dir, sizeof(runtime_dir));
+    }
+    size_t runtime_length = strlen(runtime_dir);
+    while (runtime_length > 1 && runtime_dir[runtime_length - 1] == '/') runtime_dir[--runtime_length] = '\0';
+    if (path_has_directory_prefix(socket_path, runtime_dir)) {
+        const char *suffix = socket_path + runtime_length;
+        if (*suffix == '/') suffix++;
+        snprintf(out, out_size, "%s/%s", system_scope ? "%T" : "%t", suffix);
+        return;
+    }
+    snprintf(out, out_size, "%s", socket_path);
+}
+
+
+static bool text_contains_exact_line(const char *text, const char *line) {
+    if (!text || !line || !line[0]) return false;
+    size_t line_length = strlen(line);
+    const char *cursor = text;
+    while (*cursor) {
+        const char *line_end = strchr(cursor, '\n');
+        size_t current_length = line_end ? (size_t)(line_end - cursor) : strlen(cursor);
+        while (current_length > 0 && cursor[current_length - 1] == '\r') current_length--;
+        if (current_length == line_length && strncmp(cursor, line, line_length) == 0) return true;
+        if (!line_end) break;
+        cursor = line_end + 1;
+    }
+    return false;
+}
+
+
+static bool append_outerloop_http_unix_allowlist_entry(const char *socket_path,
+                                                       bool system_scope,
+                                                       char *error,
+                                                       size_t error_size) {
+    if (!socket_path || !socket_path[0]) return true;
+    char allowlist_path[PATH_MAX];
+    char entry[PATH_MAX + 16];
+    outerloop_http_unix_allowlist_path(system_scope, allowlist_path, sizeof(allowlist_path));
+    outerloop_http_unix_allowlist_entry(socket_path, system_scope, entry, sizeof(entry));
+    if (!entry[0]) return true;
+
+    char directory[PATH_MAX];
+    snprintf(directory, sizeof(directory), "%s", allowlist_path);
+    char *slash = strrchr(directory, '/');
+    if (slash) {
+        *slash = '\0';
+        if (!mkdir_p(directory)) {
+            snprintf(error, error_size, "failed to create %s: %s", directory, strerror(errno));
+            return false;
+        }
+        chmod(directory, system_scope ? 0755 : 0700);
+    }
+
+    struct stat st;
+    if (lstat(allowlist_path, &st) == 0 && !S_ISREG(st.st_mode)) {
+        snprintf(error, error_size, "%s is not a regular file", allowlist_path);
+        return false;
+    }
+    int fd = open(allowlist_path, O_RDWR | O_CREAT, 0644);
+    if (fd < 0) {
+        snprintf(error, error_size, "failed to open %s: %s", allowlist_path, strerror(errno));
+        return false;
+    }
+    bool ok = true;
+    (void)flock(fd, LOCK_EX);
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+        snprintf(error, error_size, "%s is not a regular file", allowlist_path);
+        ok = false;
+    } else {
+        uid_t expected_uid = system_scope ? 0 : geteuid();
+        if (st.st_uid != expected_uid) {
+            snprintf(error, error_size, "%s is owned by uid %d, expected uid %d", allowlist_path, (int)st.st_uid, (int)expected_uid);
+            ok = false;
+        }
+    }
+    if (ok) {
+        (void)fchmod(fd, 0644);
+        size_t size = st.st_size > 0 ? (size_t)st.st_size : 0;
+        char *contents = malloc(size + 1);
+        if (!contents) {
+            snprintf(error, error_size, "Out of memory.");
+            ok = false;
+        } else {
+            if (lseek(fd, 0, SEEK_SET) < 0) {
+                snprintf(error, error_size, "failed to read %s: %s", allowlist_path, strerror(errno));
+                ok = false;
+            }
+            size_t offset = 0;
+            while (ok && offset < size) {
+                ssize_t got = read(fd, contents + offset, size - offset);
+                if (got < 0) {
+                    if (errno == EINTR) continue;
+                    snprintf(error, error_size, "failed to read %s: %s", allowlist_path, strerror(errno));
+                    ok = false;
+                    break;
+                }
+                if (got == 0) break;
+                offset += (size_t)got;
+            }
+            contents[offset] = '\0';
+            if (ok && !text_contains_exact_line(contents, entry)) {
+                if (lseek(fd, 0, SEEK_END) < 0) {
+                    snprintf(error, error_size, "failed to append %s: %s", allowlist_path, strerror(errno));
+                    ok = false;
+                }
+                if (ok && offset > 0 && contents[offset - 1] != '\n') {
+                    ok = queue_all(fd, "\n", 1);
+                }
+                if (ok) ok = queue_all(fd, entry, strlen(entry)) && queue_all(fd, "\n", 1);
+                if (!ok) snprintf(error, error_size, "failed to append %s: %s", allowlist_path, strerror(errno));
+            }
+            free(contents);
+        }
+        (void)flock(fd, LOCK_UN);
+    }
+    close(fd);
+    return ok;
+}
+
+
+static bool append_outerloop_http_unix_allowlist_entry_for_current_scope(const char *socket_path,
+                                                                         char *error,
+                                                                         size_t error_size) {
+    return append_outerloop_http_unix_allowlist_entry(socket_path, geteuid() == 0, error, error_size);
+}
+
+
 static bool copy_file(const char *source, const char *destination, mode_t mode, char *error, size_t error_size) {
     int in_fd = open(source, O_RDONLY);
     if (in_fd < 0) {
@@ -8751,7 +8959,14 @@ static bool register_created_backend(const char *service_id,
                                             false);
         if (!ok) snprintf(error, error_size, "Out of memory.");
     }
-    return registry_store_close(&database, ok, error, error_size) && ok;
+    ok = registry_store_close(&database, ok, error, error_size) && ok;
+    if (ok && frontend_socket_path && frontend_socket_path[0]) {
+        ok = append_outerloop_http_unix_allowlist_entry(frontend_socket_path,
+                                                        direct_root_session_uses_system_scope(),
+                                                        error,
+                                                        error_size);
+    }
+    return ok;
 }
 
 static bool outerctl_tsv_field(StringBuilder *out, const char *text) {
@@ -9416,6 +9631,7 @@ static int outershelld_handle_outerctl(int argc, char **argv, StringBuilder *std
 
     bool ok = true;
     bool changed = false;
+    char allowlist_socket_path[PATH_MAX] = "";
 
     if (is_list) {
         (void)include_icons;
@@ -9580,6 +9796,9 @@ static int outershelld_handle_outerctl(int argc, char **argv, StringBuilder *std
                                                     true);
                 if (!ok) snprintf(error, sizeof(error), "Out of memory.");
             }
+            if (ok && has_socket) {
+                snprintf(allowlist_socket_path, sizeof(allowlist_socket_path), "%s", socket_path);
+            }
             if (ok) {
                 const char *layout_key = (has_socket && (!url || !url[0]))
                     ? stable_frontend_id
@@ -9688,6 +9907,7 @@ static int outershelld_handle_outerctl(int argc, char **argv, StringBuilder *std
                                                   (url_template && url_template[0]) ? url_template : "?file={file}",
                                                   rank);
                 if (!ok) snprintf(error, sizeof(error), "Out of memory.");
+                if (ok) snprintf(allowlist_socket_path, sizeof(allowlist_socket_path), "%s", socket_path);
                 changed = ok;
             }
         } else if (ok && strcmp(action, "remove") == 0) {
@@ -9714,6 +9934,12 @@ static int outershelld_handle_outerctl(int argc, char **argv, StringBuilder *std
     ok = ok && close_ok;
     if (!ok) {
         sb_append(stderr_buffer, error[0] ? error : "Registry operation failed.");
+        sb_append(stderr_buffer, "\n");
+        return 1;
+    }
+    if (allowlist_socket_path[0] &&
+        !append_outerloop_http_unix_allowlist_entry_for_current_scope(allowlist_socket_path, error, sizeof(error))) {
+        sb_append(stderr_buffer, error[0] ? error : "Failed to update Outer Loop Unix socket allowlist.");
         sb_append(stderr_buffer, "\n");
         return 1;
     }
@@ -9749,8 +9975,14 @@ static bool upsert_systemd_backend_registry(const char *service_id,
         ok = registry_store_upsert_log(&database, log_path, service_id);
         if (!ok) snprintf(error, error_size, "Out of memory.");
     }
-    (void)scope;
-    return registry_store_close(&database, ok, error, error_size) && ok;
+    ok = registry_store_close(&database, ok, error, error_size) && ok;
+    if (ok && socket_path && socket_path[0]) {
+        ok = append_outerloop_http_unix_allowlist_entry(socket_path,
+                                                        scope && strcmp(scope, "system") == 0,
+                                                        error,
+                                                        error_size);
+    }
+    return ok;
 }
 #endif
 
@@ -9782,7 +10014,12 @@ static bool upsert_launchd_backend_registry_at(const char *database_path,
         ok = registry_store_upsert_log(&database, log_path, service_id);
         if (!ok) snprintf(error, error_size, "Out of memory.");
     }
-    return registry_store_close(&database, ok, error, error_size) && ok;
+    ok = registry_store_close(&database, ok, error, error_size) && ok;
+    if (ok && socket_path && socket_path[0]) {
+        bool system_scope = database_path && strcmp(database_path, g_system_registry_database_path) == 0;
+        ok = append_outerloop_http_unix_allowlist_entry(socket_path, system_scope, error, error_size);
+    }
+    return ok;
 }
 #endif
 
