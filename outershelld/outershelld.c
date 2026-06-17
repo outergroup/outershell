@@ -1317,6 +1317,40 @@ static void default_user_outershell_root(char *out, size_t out_size) {
 #endif
 }
 
+static bool registry_database_path_for_passwd(const struct passwd *pw, char *out, size_t out_size) {
+    if (!pw || !pw->pw_dir || !pw->pw_dir[0] || !out || out_size == 0) return false;
+#ifdef __APPLE__
+    snprintf(out, out_size, "%s/Library/Application Support/outershell/registry.orwa", pw->pw_dir);
+#else
+    if (pw->pw_uid == 0) {
+        snprintf(out, out_size, "%s/registry.orwa", kSystemOuterShellRoot);
+    } else {
+        snprintf(out, out_size, "%s/.local/state/outershell/registry.orwa", pw->pw_dir);
+    }
+#endif
+    return out[0] != '\0' && strlen(out) < out_size;
+}
+
+static bool requester_registry_database_path(const char *requester_user,
+                                             char *out,
+                                             size_t out_size) {
+    if (!out || out_size == 0) return false;
+    out[0] = '\0';
+    if (geteuid() != 0) return false;
+
+    if (requester_user && requester_user[0]) {
+        struct passwd *pw = getpwnam(requester_user);
+        if (!pw || pw->pw_uid == 0) return false;
+        char path[PATH_MAX];
+        if (!registry_database_path_for_passwd(pw, path, sizeof(path))) return false;
+        if (strcmp(path, g_registry_database_path) == 0) return false;
+        if (!registry_storage_exists_at(path)) return false;
+        snprintf(out, out_size, "%s", path);
+        return out[0] != '\0';
+    }
+    return false;
+}
+
 static void default_user_outershell_cache_root(char *out, size_t out_size) {
     if (!out || out_size == 0) return;
 #ifdef __APPLE__
@@ -10671,6 +10705,7 @@ static bool install_bundled_app(const BundledAppDefinition *app,
                  "Environment=USER=%s\n"
                  "Environment=LOGNAME=%s\n"
                  "Environment=OUTERCTL_PATH=%s\n"
+                 "Environment=OUTERSHELLD_API_SOCKET=/run/outershelld-api\n"
                  "ExecStart=%s\n"
                  "Restart=on-failure\n"
                  "KillMode=control-group\n"
@@ -12733,7 +12768,9 @@ static void send_create_response(int fd, const char *query) {
     char outerctl_path[PATH_MAX];
     default_user_outerctl_path(outerctl_path, sizeof(outerctl_path));
     char unit_contents[12000];
-    const char *systemd_wanted_by = direct_root_session_uses_system_scope() ? "multi-user.target" : "default.target";
+    bool system_scope = direct_root_session_uses_system_scope();
+    const char *systemd_wanted_by = system_scope ? "multi-user.target" : "default.target";
+    const char *api_socket_environment = system_scope ? "Environment=OUTERSHELLD_API_SOCKET=/run/outershelld-api\n" : "";
     snprintf(unit_contents, sizeof(unit_contents),
              "[Unit]\n"
              "Description=%s\n"
@@ -12743,6 +12780,7 @@ static void send_create_response(int fd, const char *query) {
              "Type=simple\n"
              "WorkingDirectory=%s\n"
              "Environment=OUTERCTL_PATH=%s\n"
+             "%s"
              "Environment=OUTERSHELL_LOG_PATH=%s\n"
              "ExecStart=/bin/sh -lc %s\n"
              "Restart=on-failure\n"
@@ -12756,6 +12794,7 @@ static void send_create_response(int fd, const char *query) {
              description,
              working_directory,
              outerctl_path,
+             api_socket_environment,
              log_path,
              quoted_command,
              log_path,
@@ -13295,6 +13334,7 @@ static bool content_type_list_for_opener_query(const RegistryStore *database,
 
 static bool api_query_file_openers(const char *file_path,
                                    const char *content_type,
+                                   const char *requester_user,
                                    StringBuilder *rows,
                                    StringBuilder *variable,
                                    uint32_t *row_count,
@@ -13302,8 +13342,14 @@ static bool api_query_file_openers(const char *file_path,
                                    size_t error_size) {
     if (row_count) *row_count = 0;
 
+    char requester_registry_path[PATH_MAX];
+    const char *user_registry_path = g_registry_database_path;
+    if (requester_registry_database_path(requester_user, requester_registry_path, sizeof(requester_registry_path))) {
+        user_registry_path = requester_registry_path;
+    }
+
     RegistryStore database;
-    if (!registry_store_open_user_readonly(&database, error, error_size)) return false;
+    if (!registry_store_open_at(&database, user_registry_path, false, error, error_size)) return false;
     bool ok = true;
     ContentTypeList user_types = {0};
     ok = content_type_list_for_opener_query(&database, file_path, content_type, &user_types, error, error_size);
@@ -13346,6 +13392,7 @@ static bool api_query_file_openers(const char *file_path,
 static bool process_api_file_openers_request(ReactorClient *client, const unsigned char *message, size_t message_length) {
     char *file_path = NULL;
     char *content_type = NULL;
+    char *requester_user = NULL;
     char error[512] = "";
     StringBuilder rows = {0};
     StringBuilder variable = {0};
@@ -13353,11 +13400,15 @@ static bool process_api_file_openers_request(ReactorClient *client, const unsign
     bool ok = message_length >= 18 &&
               api_read_string_ref(message, message_length, 2, &file_path) &&
               api_read_string_ref(message, message_length, 10, &content_type);
-    ok = ok && api_query_file_openers(file_path, content_type, &rows, &variable, &row_count, error, sizeof(error));
+    if (ok && message_length >= 26) {
+        ok = api_read_string_ref(message, message_length, 18, &requester_user);
+    }
+    ok = ok && api_query_file_openers(file_path, content_type, requester_user, &rows, &variable, &row_count, error, sizeof(error));
     if (!ok && !error[0]) snprintf(error, sizeof(error), "Invalid file openers request.");
     api_send_file_openers_response(client->fd, ok ? 0u : 1u, error, &rows, &variable, ok ? row_count : 0);
     free(file_path);
     free(content_type);
+    free(requester_user);
     free(rows.data);
     free(variable.data);
     return false;

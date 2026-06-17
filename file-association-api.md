@@ -224,9 +224,11 @@ bytes 24..27:  UInt32 total size
 bytes 28..31:  UInt32 reserved
 ```
 
-Each Files opener row is the same five-field, 40-byte row returned by the daemon
-socket response: content type, service id, display name, socket path, and
-resolved URL.
+Each Files opener row is a six-field, 48-byte row. The first five fields match
+the daemon socket response: content type, service id, display name, socket path,
+and resolved URL. The final field is the owner username resolved from the opener
+socket path. The Files frontend uses this owner name to disambiguate openers
+when the same app is installed in both user and root scopes.
 
 ## Normalization Rules
 
