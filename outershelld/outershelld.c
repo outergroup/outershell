@@ -13366,7 +13366,10 @@ static bool api_query_file_openers(const char *file_path,
     }
     registry_store_free(&database);
 
-    if (ok && g_system_registry_database_path[0] && registry_storage_exists_at(g_system_registry_database_path)) {
+    if (ok &&
+        strcmp(user_registry_path, g_system_registry_database_path) != 0 &&
+        g_system_registry_database_path[0] &&
+        registry_storage_exists_at(g_system_registry_database_path)) {
         char system_error[512] = "";
         RegistryStore system_database;
         if (registry_store_open_system_readonly(&system_database, system_error, sizeof(system_error))) {
@@ -13376,7 +13379,7 @@ static bool api_query_file_openers(const char *file_path,
                 ok = api_append_file_openers_from_database(&system_database,
                                                           &system_types,
                                                           file_path,
-                                                          true,
+                                                          false,
                                                           rows,
                                                           variable,
                                                           row_count,
