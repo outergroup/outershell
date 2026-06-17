@@ -950,7 +950,11 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             handleScroll(at: point, delta: delta, precise: hasPreciseScrollingDeltas)
 
         case .mouseDown(let point, let modifierFlags, let clickCount):
-            handleMouseDown(at: point, modifierFlags: modifierFlags, clickCount: clickCount)
+            if modifierFlags.contains(.control) {
+                handleRightMouseDown(at: point, modifierFlags: modifierFlags, clickCount: clickCount)
+            } else {
+                handleMouseDown(at: point, modifierFlags: modifierFlags, clickCount: clickCount)
+            }
 
         case .mouseDragged(let point, let modifierFlags):
             handleMouseDragged(to: point, modifierFlags: modifierFlags)
