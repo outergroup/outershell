@@ -14,6 +14,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#ifdef __APPLE__
+#include <sys/sysctl.h>
+#endif
+#include <sys/utsname.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -81,3 +85,153 @@ void expand_tilde_path(const char *path, char *out, size_t out_size) {
     }
 }
 
+static bool append_url_encoded(StringBuilder *builder, const char *value) {
+    const unsigned char *p = (const unsigned char *)(value ? value : "");
+    while (*p) {
+        if (isalnum(*p) || *p == '-' || *p == '_' || *p == '.' || *p == '~') {
+            char one[2] = {(char)*p, '\0'};
+            if (!sb_append(builder, one)) return false;
+        } else {
+            char escaped[4];
+            snprintf(escaped, sizeof(escaped), "%%%02X", *p);
+            if (!sb_append(builder, escaped)) return false;
+        }
+        p++;
+    }
+    return true;
+}
+
+static void normalized_architecture(char *out, size_t out_size) {
+    struct utsname names;
+    if (uname(&names) != 0) {
+        snprintf(out, out_size, "unknown");
+        return;
+    }
+    if (strcmp(names.machine, "x86_64") == 0 || strcmp(names.machine, "amd64") == 0) {
+        snprintf(out, out_size, "x86_64");
+        return;
+    }
+    if (strcmp(names.machine, "aarch64") == 0 || strcmp(names.machine, "arm64") == 0) {
+        snprintf(out, out_size, "arm64");
+        return;
+    }
+    snprintf(out, out_size, "%s", names.machine);
+}
+
+static void coarsen_version(const char *input, char *out, size_t out_size) {
+    if (!out || out_size == 0) return;
+    out[0] = '\0';
+    if (!input || !input[0]) {
+        snprintf(out, out_size, "unknown");
+        return;
+    }
+
+    size_t offset = 0;
+    int dot_count = 0;
+    for (const char *p = input; *p && offset + 1 < out_size; p++) {
+        if (isdigit((unsigned char)*p)) {
+            out[offset++] = *p;
+            continue;
+        }
+        if (*p == '.' && dot_count == 0 && offset > 0 && offset + 1 < out_size) {
+            out[offset++] = '.';
+            dot_count++;
+            continue;
+        }
+        break;
+    }
+    if (offset == 0 || (offset == 1 && out[0] == '.')) {
+        snprintf(out, out_size, "unknown");
+    } else {
+        out[offset] = '\0';
+    }
+}
+
+static void operating_system_version(char *out, size_t out_size) {
+#ifdef __APPLE__
+    char version[64] = "";
+    size_t version_size = sizeof(version);
+    if (sysctlbyname("kern.osproductversion", version, &version_size, NULL, 0) == 0 && version[0]) {
+        coarsen_version(version, out, out_size);
+        return;
+    }
+#endif
+    struct utsname names;
+    if (uname(&names) == 0) {
+        coarsen_version(names.release, out, out_size);
+    } else {
+        snprintf(out, out_size, "unknown");
+    }
+}
+
+#ifndef __APPLE__
+static bool systemd_major_version(char *out, size_t out_size) {
+    if (!out || out_size == 0) return false;
+    out[0] = '\0';
+
+    FILE *pipe = popen("systemctl --version 2>/dev/null", "r");
+    if (!pipe) return false;
+
+    char line[256] = "";
+    bool found = false;
+    if (fgets(line, sizeof(line), pipe)) {
+        const char *p = line;
+        while (*p && !isdigit((unsigned char)*p)) p++;
+        if (isdigit((unsigned char)*p)) {
+            size_t offset = 0;
+            while (isdigit((unsigned char)*p) && offset + 1 < out_size) {
+                out[offset++] = *p++;
+            }
+            out[offset] = '\0';
+            found = offset > 0;
+        }
+    }
+
+    int status = pclose(pipe);
+    if (status != 0 || !found) {
+        out[0] = '\0';
+        return false;
+    }
+    return true;
+}
+#endif
+
+bool outer_shell_append_update_query(StringBuilder *builder, const char *heartbeat, const char *app_version) {
+    char arch[64];
+    char os_version[64];
+    normalized_architecture(arch, sizeof(arch));
+    operating_system_version(os_version, sizeof(os_version));
+#ifdef __APPLE__
+    const char *os = "macos";
+#else
+    const char *os = "linux";
+#endif
+
+    if (!sb_append(builder, "heartbeat=") ||
+        !append_url_encoded(builder, heartbeat && heartbeat[0] ? heartbeat : "extra") ||
+        !sb_append(builder, "&os=") ||
+        !append_url_encoded(builder, os) ||
+        !sb_append(builder, "&osVersion=") ||
+        !append_url_encoded(builder, os_version) ||
+        !sb_append(builder, "&arch=") ||
+        !append_url_encoded(builder, arch)) {
+        return false;
+    }
+
+    if (app_version && app_version[0]) {
+        if (!sb_append(builder, "&appVersion=") ||
+            !append_url_encoded(builder, app_version)) {
+            return false;
+        }
+    }
+#ifndef __APPLE__
+    char systemd_version[32];
+    if (systemd_major_version(systemd_version, sizeof(systemd_version))) {
+        if (!sb_append(builder, "&systemd=") ||
+            !append_url_encoded(builder, systemd_version)) {
+            return false;
+        }
+    }
+#endif
+    return true;
+}

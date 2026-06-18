@@ -5868,11 +5868,11 @@ static bool lookup_launchd_backend_any_for_scope(const char *service_id,
 #define FILE_PICKER_FLAG_IS_DIRECTORY 0x01u
 #define ACTION_FLAG_OK 0x01u
 #define ACTION_FLAG_NEEDS_PASSWORD 0x02u
+#define ACTION_FLAG_UPDATE_AVAILABLE 0x04u
 
 static bool root_outershell_migration_pending(void);
 static bool installed_home_screen_version(char *out, size_t out_size);
-static bool accept_home_screen_available_version(const char *provided_version, char *out, size_t out_size, char *message, size_t message_size);
-static void mark_update_check_completed(void);
+static bool fetch_home_screen_available_version(const char *heartbeat, char *out, size_t out_size, char *message, size_t message_size);
 static int compare_versions(const char *installed, const char *available);
 static bool home_screen_update_available(char *available, size_t available_size);
 static bool run_home_screen_install_script(const char *subcommand,
@@ -6039,10 +6039,12 @@ static bool build_backend_payload(const char *service_id,
                                   uint32_t flags,
                                   const char *icon_symbol_name,
                                   const char *launchd_plist_path,
+                                  const char *installed_version,
+                                  const char *available_version,
                                   StringBuilder *frontends_array,
                                   StringBuilder *log_files_array,
                                   StringBuilder *payload) {
-    if (!binary_append_zero(payload, 84)) return false;
+    if (!binary_append_zero(payload, 100)) return false;
     return binary_append_string_ref_at(payload, 0, service_id) &&
            binary_append_string_ref_at(payload, 8, display_name && display_name[0] ? display_name : service_id) &&
            binary_append_string_ref_at(payload, 16, service_unit) &&
@@ -6053,7 +6055,9 @@ static bool build_backend_payload(const char *service_id,
            binary_append_string_ref_at(payload, 56, launchd_plist_path) &&
            binary_write_u32_at(payload, 64, flags) &&
            binary_append_child_ref_at(payload, 68, frontends_array) &&
-           binary_append_child_ref_at(payload, 76, log_files_array);
+           binary_append_child_ref_at(payload, 76, log_files_array) &&
+           binary_append_string_ref_at(payload, 84, installed_version) &&
+           binary_append_string_ref_at(payload, 92, available_version);
 }
 
 static bool append_registered_backend_payloads(const RegistryStore *database,
@@ -6116,11 +6120,13 @@ static bool append_registered_backend_payloads(const RegistryStore *database,
         }
 
         uint32_t flags = BACKEND_FLAG_IS_INSTALLED;
+        char installed_version[128] = "";
+        char available_version[128] = "";
         if ((has_systemd_unit || has_launchd_unit) && !is_self) flags |= BACKEND_FLAG_CAN_CONTROL | BACKEND_FLAG_CAN_UNINSTALL;
         if (is_self) {
+            installed_home_screen_version(installed_version, sizeof(installed_version));
             flags |= BACKEND_FLAG_CAN_UNINSTALL;
             if (get_agent_menu_bar_visibility()) flags |= BACKEND_FLAG_MENU_BAR_VISIBILITY_ENABLED;
-            char available_version[128] = "";
             if (home_screen_update_available(available_version, sizeof(available_version))) {
                 snprintf(status, sizeof(status), "update available");
             }
@@ -6148,7 +6154,7 @@ static bool append_registered_backend_payloads(const RegistryStore *database,
              build_log_files_array_payload(database, service_id, &logs) &&
              build_backend_payload(service_id, display_name, service_unit, service_unit_path,
                                    effective_service_scope, status, flags, "",
-                                   plist_path, &frontends, &logs, &payload) &&
+                                   plist_path, installed_version, available_version, &frontends, &logs, &payload) &&
              binary_payload_list_append(payloads, &payload);
         free(frontends.data);
         free(logs.data);
@@ -6178,6 +6184,8 @@ static bool append_root_migration_backend_payload(BinaryPayloadList *payloads) {
                                     BACKEND_FLAG_CAN_CONTROL | BACKEND_FLAG_IS_INSTALLED | BACKEND_FLAG_IS_MIGRATION,
                                     "",
                                     "",
+                                    "",
+                                    "",
                                     &frontends,
                                     &logs,
                                     &payload) &&
@@ -6205,6 +6213,8 @@ static bool append_bundled_backend_placeholder_payload(BinaryPayloadList *payloa
                                         (app->supports_root ? BACKEND_FLAG_SUPPORTS_ROOT : 0) |
                                         (app->root_only ? BACKEND_FLAG_ROOT_ONLY : 0),
                                     app->icon_symbol_name ? app->icon_symbol_name : "",
+                                    "",
+                                    app->version ? app->version : "",
                                     "",
                                     &frontends,
                                     &logs,
@@ -6582,13 +6592,23 @@ static void send_log_response(int fd, const char *service_id, const char *path, 
     free(builder.data);
 }
 
-static void send_action_response_ex(int fd, int status, bool ok_value, const char *message, bool needs_password) {
+static void send_action_response_full(int fd,
+                                      int status,
+                                      bool ok_value,
+                                      const char *message,
+                                      bool needs_password,
+                                      bool update_available,
+                                      const char *installed_version,
+                                      const char *available_version) {
     StringBuilder builder = {0};
     uint32_t flags = (ok_value ? ACTION_FLAG_OK : 0) |
-                     (needs_password ? ACTION_FLAG_NEEDS_PASSWORD : 0);
-    bool ok = binary_append_zero(&builder, 12) &&
+                     (needs_password ? ACTION_FLAG_NEEDS_PASSWORD : 0) |
+                     (update_available ? ACTION_FLAG_UPDATE_AVAILABLE : 0);
+    bool ok = binary_append_zero(&builder, 28) &&
               binary_write_u32_at(&builder, 0, flags) &&
-              binary_append_string_ref_at(&builder, 4, message ? message : "");
+              binary_append_string_ref_at(&builder, 4, message ? message : "") &&
+              binary_append_string_ref_at(&builder, 12, installed_version ? installed_version : "") &&
+              binary_append_string_ref_at(&builder, 20, available_version ? available_version : "");
     if (!ok) {
         free(builder.data);
         send_text_response(fd, 500, "out of memory\n");
@@ -6596,6 +6616,10 @@ static void send_action_response_ex(int fd, int status, bool ok_value, const cha
     }
     send_binary_response(fd, status, &builder);
     free(builder.data);
+}
+
+static void send_action_response_ex(int fd, int status, bool ok_value, const char *message, bool needs_password) {
+    send_action_response_full(fd, status, ok_value, message, needs_password, false, "", "");
 }
 
 static void send_action_response(int fd, int status, bool ok_value, const char *message) {
@@ -6720,7 +6744,6 @@ static void send_control_response(int fd, const char *query, const char *body) {
     char requested_scope[32] = "";
     char sudo_password[PATH_MAX] = "";
     char bundled_stage_root[PATH_MAX] = "";
-    char available_version[128] = "";
     char installer_script_path[PATH_MAX] = "";
     char installer_archive_path[PATH_MAX] = "";
     if (!query_value_any(query, body, "serviceID", service_id, sizeof(service_id)) ||
@@ -6731,7 +6754,6 @@ static void send_control_response(int fd, const char *query, const char *body) {
     query_value_any(query, body, "scope", requested_scope, sizeof(requested_scope));
     query_value_any(query, body, "sudoPassword", sudo_password, sizeof(sudo_password));
     query_value_any(query, body, "bundledStageRoot", bundled_stage_root, sizeof(bundled_stage_root));
-    query_value_any(query, body, "availableVersion", available_version, sizeof(available_version));
     query_value_any(query, body, "installerScriptPath", installer_script_path, sizeof(installer_script_path));
     query_value_any(query, body, "installerArchivePath", installer_archive_path, sizeof(installer_archive_path));
     trim_whitespace_in_place(service_id);
@@ -6799,10 +6821,11 @@ static void send_control_response(int fd, const char *query, const char *body) {
             char installed[128] = "";
             char latest[128] = "";
             installed_home_screen_version(installed, sizeof(installed));
-            bool ok = accept_home_screen_available_version(available_version, latest, sizeof(latest), message, sizeof(message));
+            bool ok = fetch_home_screen_available_version("extra", latest, sizeof(latest), message, sizeof(message));
+            bool has_update = false;
             if (ok) {
-                mark_update_check_completed();
                 if (compare_versions(installed, latest) < 0) {
+                    has_update = true;
                     snprintf(message, sizeof(message),
                              "Outer Shell %s is available. Installed version: %s.",
                              latest,
@@ -6814,7 +6837,14 @@ static void send_control_response(int fd, const char *query, const char *body) {
                 }
             }
             log_event("%s Outer Shell update check: %s", ok ? "Completed" : "Failed", message);
-            send_action_response(fd, ok ? 200 : 500, ok, message);
+            send_action_response_full(fd,
+                                      ok ? 200 : 500,
+                                      ok,
+                                      message,
+                                      false,
+                                      has_update,
+                                      installed,
+                                      latest);
             return;
         }
         if (strcmp(operation, "update") == 0 || strcmp(operation, "updateOuterShell") == 0 ||
@@ -7207,10 +7237,15 @@ static void home_screen_version_path(char *out, size_t out_size) {
     snprintf(out, out_size, "%s/version", root);
 }
 
-static void home_screen_last_update_check_path(char *out, size_t out_size) {
+static void home_screen_last_update_check_path(const char *heartbeat, char *out, size_t out_size) {
     char root[PATH_MAX];
+    char sanitized[64];
+    snprintf(sanitized, sizeof(sanitized), "%s", heartbeat && heartbeat[0] ? heartbeat : "day");
+    for (char *p = sanitized; *p; p++) {
+        if (!(isalnum((unsigned char)*p) || *p == '-' || *p == '_')) *p = '-';
+    }
     home_screen_install_root(root, sizeof(root));
-    snprintf(out, out_size, "%s/last-update-check", root);
+    snprintf(out, out_size, "%s/last-update-check-%s", root, sanitized);
 }
 
 static bool installed_home_screen_version(char *out, size_t out_size) {
@@ -7219,24 +7254,51 @@ static bool installed_home_screen_version(char *out, size_t out_size) {
     return read_first_line_file(path, out, out_size);
 }
 
-static bool update_check_due(void) {
+static bool update_heartbeat_due(const char *heartbeat, long long interval_seconds) {
     char path[PATH_MAX];
     char timestamp[64] = "";
-    home_screen_last_update_check_path(path, sizeof(path));
+    home_screen_last_update_check_path(heartbeat, path, sizeof(path));
     if (!read_first_line_file(path, timestamp, sizeof(timestamp))) return true;
     char *end = NULL;
     long long last = strtoll(timestamp, &end, 10);
     if (end == timestamp || last <= 0) return true;
     time_t now = time(NULL);
-    return now <= 0 || (long long)now - last >= 24 * 60 * 60;
+    return now <= 0 || (long long)now - last >= interval_seconds;
 }
 
-static void mark_update_check_completed(void) {
+static void mark_single_update_heartbeat_completed(const char *heartbeat, time_t timestamp) {
     char path[PATH_MAX];
     char value[64];
-    home_screen_last_update_check_path(path, sizeof(path));
-    snprintf(value, sizeof(value), "%lld\n", (long long)time(NULL));
+    home_screen_last_update_check_path(heartbeat, path, sizeof(path));
+    snprintf(value, sizeof(value), "%lld\n", (long long)timestamp);
     (void)write_text_file_simple(path, value);
+}
+
+static void mark_update_heartbeat_completed(const char *heartbeat) {
+    time_t now = time(NULL);
+    if (now <= 0) now = 1;
+    if (heartbeat && strcmp(heartbeat, "month") == 0) {
+        mark_single_update_heartbeat_completed("month", now);
+        mark_single_update_heartbeat_completed("week", now);
+        mark_single_update_heartbeat_completed("day", now);
+        return;
+    }
+    if (heartbeat && strcmp(heartbeat, "week") == 0) {
+        mark_single_update_heartbeat_completed("week", now);
+        mark_single_update_heartbeat_completed("day", now);
+        return;
+    }
+    if (heartbeat && strcmp(heartbeat, "day") == 0) {
+        mark_single_update_heartbeat_completed("day", now);
+    }
+}
+
+static const char *due_update_heartbeat(void) {
+    const long long day = 24LL * 60LL * 60LL;
+    if (update_heartbeat_due("month", 30LL * day)) return "month";
+    if (update_heartbeat_due("week", 7LL * day)) return "week";
+    if (update_heartbeat_due("day", day)) return "day";
+    return NULL;
 }
 
 static int version_label_rank(const char *label) {
@@ -7296,25 +7358,124 @@ static int compare_versions(const char *installed, const char *available) {
     return 0;
 }
 
-static bool accept_home_screen_available_version(const char *provided_version, char *out, size_t out_size, char *message, size_t message_size) {
-    if (out && out_size > 0) out[0] = '\0';
-    if (!provided_version || !provided_version[0]) {
-        snprintf(message, message_size, "OuterShellBackend did not provide an available version.");
+static bool build_home_screen_update_url(const char *path, const char *heartbeat, char *out, size_t out_size) {
+    if (!out || out_size == 0) return false;
+    out[0] = '\0';
+    if (!g_home_screen_public_base_url[0]) return false;
+    const char *trimmed_path = path && path[0] == '/' ? path + 1 : (path ? path : "");
+    char base_url[2048];
+    snprintf(base_url, sizeof(base_url), "%s", g_home_screen_public_base_url);
+    size_t base_length = strlen(base_url);
+    while (base_length > 0 && base_url[base_length - 1] == '/') {
+        base_url[--base_length] = '\0';
+    }
+
+    char installed_version[128] = "";
+    installed_home_screen_version(installed_version, sizeof(installed_version));
+    StringBuilder url = {0};
+    bool ok = sb_append(&url, base_url) &&
+              sb_append(&url, "/") &&
+              sb_append(&url, trimmed_path) &&
+              sb_append(&url, "?") &&
+              outer_shell_append_update_query(&url, heartbeat, installed_version);
+    if (ok) snprintf(out, out_size, "%s", url.data ? url.data : "");
+    free(url.data);
+    return ok && out[0] != '\0';
+}
+
+static bool capture_url_contents(const char *url, char *out, size_t out_size, char *message, size_t message_size) {
+    if (out && out_size) out[0] = '\0';
+    if (!url || !url[0]) {
+        snprintf(message, message_size, "Outer Shell update URL is not configured.");
         return false;
     }
-    snprintf(out, out_size, "%s", provided_version);
+    char quoted_url[4096];
+    shell_quote(url, quoted_url, sizeof(quoted_url));
+    char command[9000];
+    snprintf(command,
+             sizeof(command),
+             "curl -fsSL --max-time 20 %s 2>/dev/null || wget -qO- %s 2>/dev/null",
+             quoted_url,
+             quoted_url);
+    FILE *pipe = popen(command, "r");
+    if (!pipe) {
+        snprintf(message, message_size, "Failed to check for Outer Shell updates: %s", strerror(errno));
+        return false;
+    }
+    size_t offset = 0;
+    while (offset + 1 < out_size) {
+        size_t got = fread(out + offset, 1, out_size - offset - 1, pipe);
+        offset += got;
+        if (got == 0) break;
+    }
+    if (out && out_size) out[offset] = '\0';
+    int status = pclose(pipe);
+    if (status != 0) {
+        snprintf(message, message_size, "Could not fetch Outer Shell update information from %s.", url);
+        return false;
+    }
     trim_whitespace_in_place(out);
-    if (!out[0]) {
+    if (!out || !out[0]) {
         snprintf(message, message_size, "Outer Shell version file was empty.");
         return false;
     }
     return true;
 }
 
+static bool download_url_to_file(const char *url, const char *path, char *message, size_t message_size) {
+    if (!url || !url[0] || !path || !path[0]) {
+        snprintf(message, message_size, "Outer Shell download path is not configured.");
+        return false;
+    }
+    char quoted_url[4096];
+    char quoted_path[PATH_MAX + 8];
+    shell_quote(url, quoted_url, sizeof(quoted_url));
+    shell_quote(path, quoted_path, sizeof(quoted_path));
+    char command[10000];
+    snprintf(command,
+             sizeof(command),
+             "curl -fsSL --max-time 60 -o %s %s 2>/dev/null || wget -q -O %s %s 2>/dev/null",
+             quoted_path,
+             quoted_url,
+             quoted_path,
+             quoted_url);
+    int status = system(command);
+    if (status != 0) {
+        snprintf(message, message_size, "Could not download Outer Shell installer from %s.", url);
+        return false;
+    }
+    chmod(path, 0755);
+    return true;
+}
+
+static bool fetch_home_screen_available_version(const char *heartbeat, char *out, size_t out_size, char *message, size_t message_size) {
+    char url[4096];
+    if (!build_home_screen_update_url("latest/version.txt", heartbeat, url, sizeof(url))) {
+        snprintf(message, message_size, "Outer Shell update URL is not configured.");
+        return false;
+    }
+    return capture_url_contents(url, out, out_size, message, message_size);
+}
+
 static bool home_screen_update_available(char *available, size_t available_size) {
-    if (!update_check_due()) return false;
-    (void)available;
-    (void)available_size;
+    const char *heartbeat = due_update_heartbeat();
+    if (!heartbeat) return false;
+    char message[512] = "";
+    char latest[128] = "";
+    if (!fetch_home_screen_available_version(heartbeat, latest, sizeof(latest), message, sizeof(message))) {
+        log_event("Outer Shell background update check failed: %s", message[0] ? message : "unknown error");
+        mark_update_heartbeat_completed(heartbeat);
+        return false;
+    }
+    mark_update_heartbeat_completed(heartbeat);
+    char installed[128] = "";
+    installed_home_screen_version(installed, sizeof(installed));
+    if (compare_versions(installed, latest) < 0) {
+        if (available && available_size > 0) {
+            snprintf(available, available_size, "%s", latest);
+        }
+        return true;
+    }
     return false;
 }
 
@@ -7324,21 +7485,34 @@ static bool run_home_screen_install_script(const char *subcommand,
                                            bool remove_user_state,
                                            char *message,
                                            size_t message_size) {
-    if (!script_path || !script_path[0]) {
-        snprintf(message, message_size, "OuterShellBackend did not provide an installer script.");
-        return false;
-    }
-    if (!archive_path || !archive_path[0]) {
-        snprintf(message, message_size, "OuterShellBackend did not provide an installer archive.");
-        return false;
+    char downloaded_script_path[PATH_MAX] = "";
+    const char *effective_script_path = script_path;
+    if (!effective_script_path || !effective_script_path[0]) {
+        char url[4096];
+        if (!build_home_screen_update_url("latest/install.sh", "extra", url, sizeof(url))) {
+            snprintf(message, message_size, "Outer Shell update URL is not configured.");
+            return false;
+        }
+        snprintf(downloaded_script_path, sizeof(downloaded_script_path), "/tmp/outershell-install-XXXXXX");
+        int fd = mkstemp(downloaded_script_path);
+        if (fd < 0) {
+            snprintf(message, message_size, "Could not create temporary installer script: %s", strerror(errno));
+            return false;
+        }
+        close(fd);
+        if (!download_url_to_file(url, downloaded_script_path, message, message_size)) {
+            unlink(downloaded_script_path);
+            return false;
+        }
+        effective_script_path = downloaded_script_path;
     }
 
     struct stat st;
-    if (stat(script_path, &st) != 0 || !S_ISREG(st.st_mode)) {
-        snprintf(message, message_size, "Installer script is missing at %s.", script_path);
+    if (stat(effective_script_path, &st) != 0 || !S_ISREG(st.st_mode)) {
+        snprintf(message, message_size, "Installer script is missing at %s.", effective_script_path);
         return false;
     }
-    if (stat(archive_path, &st) != 0 || !S_ISREG(st.st_mode)) {
+    if (archive_path && archive_path[0] && (stat(archive_path, &st) != 0 || !S_ISREG(st.st_mode))) {
         snprintf(message, message_size, "Installer archive is missing at %s.", archive_path);
         return false;
     }
@@ -7346,17 +7520,26 @@ static bool run_home_screen_install_script(const char *subcommand,
     char quoted_script_path[PATH_MAX + 8];
     char quoted_archive_path[PATH_MAX + 8];
     char quoted_subcommand[64];
-    shell_quote(script_path, quoted_script_path, sizeof(quoted_script_path));
-    shell_quote(archive_path, quoted_archive_path, sizeof(quoted_archive_path));
+    shell_quote(effective_script_path, quoted_script_path, sizeof(quoted_script_path));
+    shell_quote(archive_path && archive_path[0] ? archive_path : "", quoted_archive_path, sizeof(quoted_archive_path));
     shell_quote(subcommand && subcommand[0] ? subcommand : "install", quoted_subcommand, sizeof(quoted_subcommand));
     char command[8192];
-    snprintf(command,
-             sizeof(command),
-             "OUTERSHELL_INSTALL_ARCHIVE=%s OUTERSHELL_UNINSTALL_REMOVE_USER_STATE=%s sh %s %s",
-             quoted_archive_path,
-             remove_user_state ? "1" : "0",
-             quoted_script_path,
-             quoted_subcommand);
+    if (archive_path && archive_path[0]) {
+        snprintf(command,
+                 sizeof(command),
+                 "OUTERSHELL_INSTALL_ARCHIVE=%s OUTERSHELL_UNINSTALL_REMOVE_USER_STATE=%s sh %s %s",
+                 quoted_archive_path,
+                 remove_user_state ? "1" : "0",
+                 quoted_script_path,
+                 quoted_subcommand);
+    } else {
+        snprintf(command,
+                 sizeof(command),
+                 "OUTERSHELL_UNINSTALL_REMOVE_USER_STATE=%s sh %s %s",
+                 remove_user_state ? "1" : "0",
+                 quoted_script_path,
+                 quoted_subcommand);
+    }
 
 #ifdef __linux__
     if (strcmp(subcommand, "update") == 0 || strcmp(subcommand, "uninstall") == 0) {
@@ -7395,6 +7578,42 @@ static bool run_home_screen_install_script(const char *subcommand,
             snprintf(message, message_size, "Failed to start Outer Shell %s.", subcommand);
         }
         return false;
+    }
+#endif
+
+#ifdef __APPLE__
+    if (strcmp(subcommand, "update") == 0) {
+        pid_t pid = fork();
+        if (pid < 0) {
+            snprintf(message, message_size, "Failed to start Outer Shell update: %s", strerror(errno));
+            return false;
+        }
+        if (pid == 0) {
+            if (daemon(0, 0) != 0) {
+                _exit(127);
+            }
+            const char *home = getenv("HOME");
+            char log_path[PATH_MAX];
+            if (home && home[0]) {
+                snprintf(log_path, sizeof(log_path), "%s/Library/Logs/org.outershell.OuterShell/update.log", home);
+            } else {
+                snprintf(log_path, sizeof(log_path), "/tmp/org.outershell.OuterShell.update.log");
+            }
+            char quoted_log_path[PATH_MAX + 8];
+            shell_quote(log_path, quoted_log_path, sizeof(quoted_log_path));
+            char detached_command[24000];
+            snprintf(detached_command,
+                     sizeof(detached_command),
+                     "sleep 0.2; %s >> %s 2>&1",
+                     command,
+                     quoted_log_path);
+            execl("/bin/sh", "sh", "-c", detached_command, (char *)NULL);
+            _exit(127);
+        }
+        if (pid > 0) {
+            snprintf(message, message_size, "Outer Shell update started.");
+            return true;
+        }
     }
 #endif
 

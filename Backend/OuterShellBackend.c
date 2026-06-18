@@ -716,28 +716,37 @@ static bool stage_bundled_app(const BundledAppDefinition *app, char *out_stage_r
     return true;
 }
 
-static bool fetch_home_screen_available_version(const char *heartbeat, char *out, size_t out_size, char *message, size_t message_size) {
-    if (out && out_size > 0) out[0] = '\0';
+static bool build_home_screen_update_url(const char *path, const char *heartbeat, char *out, size_t out_size) {
+    if (!out || out_size == 0) return false;
+    out[0] = '\0';
     if (!g_home_screen_public_base_url[0]) {
-        snprintf(message, message_size, "No Outer Shell update URL is configured.");
         return false;
     }
     char base_url[2048];
     snprintf(base_url, sizeof(base_url), "%s", g_home_screen_public_base_url);
     size_t len = strlen(base_url);
     while (len > 0 && base_url[len - 1] == '/') base_url[--len] = '\0';
+    const char *trimmed_path = path && path[0] == '/' ? path + 1 : (path ? path : "");
     StringBuilder url = {0};
     bool ok = sb_append(&url, base_url) &&
-              sb_append(&url, "/latest/version.txt?heartbeat=") &&
-              (append_url_encoded(&url, heartbeat && heartbeat[0] ? heartbeat : "manual"), true);
-    if (!ok) {
-        free(url.data);
-        snprintf(message, message_size, "Failed to build update URL.");
+              sb_append(&url, "/") &&
+              sb_append(&url, trimmed_path) &&
+              sb_append(&url, "?") &&
+              outer_shell_append_update_query(&url, heartbeat, NULL);
+    if (ok) snprintf(out, out_size, "%s", url.data ? url.data : "");
+    free(url.data);
+    return ok && out[0] != '\0';
+}
+
+static bool fetch_home_screen_available_version(const char *heartbeat, char *out, size_t out_size, char *message, size_t message_size) {
+    if (out && out_size > 0) out[0] = '\0';
+    char url[4096];
+    if (!build_home_screen_update_url("latest/version.txt", heartbeat, url, sizeof(url))) {
+        snprintf(message, message_size, "No Outer Shell update URL is configured.");
         return false;
     }
     char download_error[512] = "";
-    bool fetched = outer_shell_fetch_url_text(url.data, out, out_size, download_error, sizeof(download_error));
-    free(url.data);
+    bool fetched = outer_shell_fetch_url_text(url, out, out_size, download_error, sizeof(download_error));
     if (!fetched) {
         snprintf(message, message_size, "Could not fetch Outer Shell version: %s", download_error);
         return false;
@@ -773,11 +782,6 @@ static bool stage_home_screen_installer(char *script_path, size_t script_path_si
         snprintf(message, message_size, "No Outer Shell update URL is configured.");
         return false;
     }
-    char base_url[2048];
-    snprintf(base_url, sizeof(base_url), "%s", g_home_screen_public_base_url);
-    size_t len = strlen(base_url);
-    while (len > 0 && base_url[len - 1] == '/') base_url[--len] = '\0';
-
     char cache_root[PATH_MAX];
     home_screen_install_cache_root(cache_root, sizeof(cache_root));
     if (!mkdir_p(cache_root)) {
@@ -787,7 +791,10 @@ static bool stage_home_screen_installer(char *script_path, size_t script_path_si
 
     snprintf(script_path, script_path_size, "%s/install.sh", cache_root);
     char script_url[4096];
-    snprintf(script_url, sizeof(script_url), "%s/latest/install.sh?heartbeat=manual", base_url);
+    if (!build_home_screen_update_url("latest/install.sh", "extra", script_url, sizeof(script_url))) {
+        snprintf(message, message_size, "No Outer Shell update URL is configured.");
+        return false;
+    }
     char error[512] = "";
     if (!outer_shell_download_url_to_file(script_url, script_path, error, sizeof(error))) {
         snprintf(message, message_size, "Failed to download Outer Shell install script: %s", error);
@@ -813,6 +820,10 @@ static bool stage_home_screen_installer(char *script_path, size_t script_path_si
 #endif
     snprintf(archive_path, archive_path_size, "%s/%s", cache_root, archive_name);
     char archive_url[4096];
+    char base_url[2048];
+    snprintf(base_url, sizeof(base_url), "%s", g_home_screen_public_base_url);
+    size_t len = strlen(base_url);
+    while (len > 0 && base_url[len - 1] == '/') base_url[--len] = '\0';
     snprintf(archive_url, sizeof(archive_url), "%s/latest/%s", base_url, archive_name);
     if (!outer_shell_download_url_to_file(archive_url, archive_path, error, sizeof(error))) {
         snprintf(message, message_size, "Failed to download Outer Shell archive: %s", error);
@@ -873,7 +884,7 @@ static bool augment_control_request_body(const char *query,
     if (strcmp(service_id, "org.outershell.OuterShell") == 0) {
         if (strcmp(operation, "checkUpdate") == 0 || strcmp(operation, "checkOuterShellUpdate") == 0) {
             char version[128] = "";
-            if (!fetch_home_screen_available_version("manual", version, sizeof(version), error, error_size)) {
+            if (!fetch_home_screen_available_version("extra", version, sizeof(version), error, error_size)) {
                 return false;
             }
             if (!sb_append(owned_body, body ? body : "") ||

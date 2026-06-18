@@ -484,7 +484,7 @@ EOF
     OUTERSHELL_HOME="$outershell_home" "$outerctl_path" log clear --backend "$service_id"
     OUTERSHELL_HOME="$outershell_home" "$outerctl_path" log add --backend "$service_id" --path "$log_path"
     if [ "$command" = "update" ]; then
-        printf 'Outer Shell updated to %s. The new version will run the next time Outer Shell starts.\n' "__OUTER_SHELL_VERSION__"
+        printf 'Outer Shell updated to %s and restarted.\n' "__OUTER_SHELL_VERSION__"
         exit 0
     fi
 

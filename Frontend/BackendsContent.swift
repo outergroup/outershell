@@ -36,6 +36,8 @@ private struct BackendRecord: Decodable {
     let supportsRoot: Bool?
     let rootOnly: Bool?
     let hasRootSupport: Bool?
+    let installedVersion: String?
+    let availableVersion: String?
     let iconSymbolName: String?
     let launchdPlistPath: String
     let ownsLaunchdPlist: Bool
@@ -126,6 +128,9 @@ private struct ActionResponse: Decodable {
     let ok: Bool
     let message: String
     let needsPassword: Bool?
+    let updateAvailable: Bool
+    let installedVersion: String
+    let availableVersion: String
 }
 
 private struct EventResponse {
@@ -280,6 +285,8 @@ private extension BackendRecord {
                              supportsRoot: (flags & 0x40) != 0,
                              rootOnly: (flags & 0x80) != 0,
                              hasRootSupport: (flags & 0x100) != 0,
+                             installedVersion: reader.data.count >= 92 ? emptyToNil(try reader.stringRef(at: 84)) : nil,
+                             availableVersion: reader.data.count >= 100 ? emptyToNil(try reader.stringRef(at: 92)) : nil,
                              iconSymbolName: emptyToNil(try reader.stringRef(at: 48)),
                              launchdPlistPath: try reader.stringRef(at: 56),
                              ownsLaunchdPlist: (flags & 0x20) != 0,
@@ -336,7 +343,10 @@ private extension ActionResponse {
         let flags = try reader.uint32(at: 0)
         return ActionResponse(ok: (flags & 0x01) != 0,
                               message: try reader.stringRef(at: 4),
-                              needsPassword: (flags & 0x02) != 0)
+                              needsPassword: (flags & 0x02) != 0,
+                              updateAvailable: (flags & 0x04) != 0,
+                              installedVersion: data.count >= 20 ? try reader.stringRef(at: 12) : "",
+                              availableVersion: data.count >= 28 ? try reader.stringRef(at: 20) : "")
     }
 }
 
@@ -520,6 +530,13 @@ private struct PendingPasswordAction {
     let displayName: String
 }
 
+private struct PendingOuterShellUpdate {
+    let backend: BackendRecord
+    let installedVersion: String
+    let availableVersion: String
+    let message: String
+}
+
 private struct IconMatchState {
     let frame: CGRect
     let image: NSImage?
@@ -588,6 +605,9 @@ private enum PendingButtonAction {
     case installCancel
     case installConfirm(operation: String)
     case logDismiss
+    case updateCancel
+    case updateConfirm
+    case aboutDismiss
     case passwordCancel
     case passwordSubmit
     case recipe(String)
@@ -826,6 +846,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private let createFormContentLayer = CALayer()
     private let iconTransitionLayer = CALayer()
     private let installOverlayLayer = CALayer()
+    private let updateOverlayLayer = CALayer()
+    private let aboutOverlayLayer = CALayer()
     private let passwordOverlayLayer = CALayer()
     private let filePickerOverlayLayer = CALayer()
     private let filePickerListLayer = CALayer()
@@ -843,6 +865,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private var appsContentBottom: CGFloat = 0
     private var pendingAppDrag: PendingAppDrag?
     private var pendingButtonClick: PendingButtonClick?
+    private var pendingOuterShellUpdate: PendingOuterShellUpdate?
+    private var didShowAutomaticOuterShellUpdatePrompt = false
+    private var pendingAboutBackend: BackendRecord?
     private var iconMatchStates: [String: IconMatchState] = [:]
     private var iconMatchLayers: [String: CALayer] = [:]
     private var textMatchStates: [String: TextMatchState] = [:]
@@ -869,6 +894,15 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private var passwordSubmitFrame = CGRect.zero
     private var passwordCancelFrame = CGRect.zero
     private var passwordPanelFrame = CGRect.zero
+    private var updatePanelFrame = CGRect.zero
+    private var updateCancelFrame = CGRect.zero
+    private var updateConfirmFrame = CGRect.zero
+    private var aboutPanelFrame = CGRect.zero
+    private var aboutDoneFrame = CGRect.zero
+    private var aboutTextFrame = CGRect.zero
+    private var aboutSelectionRange: NSRange?
+    private var aboutDragAnchorOffset: Int?
+    private var renderedAboutText = ""
     private var pendingInstallBackend: BackendRecord?
     private var pendingInstallOperation: String = "run"
     private var installPanelFrame = CGRect.zero
@@ -1293,6 +1327,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         rootLayer.addSublayer(iconTransitionLayer)
         rootLayer.addSublayer(createLayer)
         rootLayer.addSublayer(installOverlayLayer)
+        rootLayer.addSublayer(updateOverlayLayer)
+        rootLayer.addSublayer(aboutOverlayLayer)
         rootLayer.addSublayer(passwordOverlayLayer)
         toolbarLayer.addSublayer(titleLayer)
         toolbarLayer.addSublayer(statusLayer)
@@ -1324,6 +1360,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         titleLayer.string = ""
         outerShellActionLayer.isHidden = true
         installOverlayLayer.isHidden = true
+        updateOverlayLayer.isHidden = true
+        aboutOverlayLayer.isHidden = true
         passwordOverlayLayer.isHidden = true
         filePickerOverlayLayer.isHidden = true
         appsLayer.masksToBounds = true
@@ -1423,6 +1461,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 }
                 updateStatusText()
                 renderInstallPromptIfNeeded(width: width, height: height)
+                renderUpdatePromptIfNeeded(width: width, height: height)
+                renderAboutPromptIfNeeded(width: width, height: height)
                 renderPasswordPromptIfNeeded(width: width, height: height)
                 notifyAccessibilityLayoutChanged()
             }
@@ -2540,6 +2580,163 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         passwordCancelFrame = cancelLocal.offsetBy(dx: panelFrame.minX, dy: panelFrame.minY)
         passwordSubmitFrame = submitLocal.offsetBy(dx: panelFrame.minX, dy: panelFrame.minY)
         sendPasswordFieldTextInputGeometryUpdate()
+    }
+
+    private func renderUpdatePromptIfNeeded(width: CGFloat, height: CGFloat) {
+        updateOverlayLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
+        guard let update = pendingOuterShellUpdate else {
+            updateOverlayLayer.isHidden = true
+            updatePanelFrame = .zero
+            updateCancelFrame = .zero
+            updateConfirmFrame = .zero
+            return
+        }
+
+        updateOverlayLayer.isHidden = false
+        updateOverlayLayer.frame = CGRect(x: 0, y: 0, width: width, height: height)
+        updateOverlayLayer.backgroundColor = resolvedCGColor(NSColor.black.withAlphaComponent(0.22))
+
+        let panelWidth = min(max(width - 48, 320), 430)
+        let panelHeight: CGFloat = 166
+        let panelFrame = CGRect(x: floor((width - panelWidth) / 2),
+                                y: floor((height - panelHeight) / 2),
+                                width: panelWidth,
+                                height: panelHeight)
+        updatePanelFrame = panelFrame
+
+        let panel = CALayer()
+        panel.frame = panelFrame
+        panel.cornerRadius = 8
+        panel.borderWidth = 1
+        panel.backgroundColor = resolvedCGColor(.windowBackgroundColor)
+        panel.borderColor = resolvedCGColor(.separatorColor)
+        updateOverlayLayer.addSublayer(panel)
+
+        let title = makeTextLayer(size: 15, weight: .semibold, color: .labelColor)
+        title.string = "Outer Shell Update Available"
+        title.frame = CGRect(x: 18, y: panelHeight - 38, width: panelWidth - 36, height: 20)
+        panel.addSublayer(title)
+
+        let available = update.availableVersion.isEmpty ? "the latest version" : "Outer Shell \(update.availableVersion)"
+        let installed = update.installedVersion.isEmpty ? "unknown" : update.installedVersion
+        let message = makeTextLayer(size: 12, weight: .regular, color: .secondaryLabelColor)
+        message.string = "\(available) is available. Installed version: \(installed)."
+        message.isWrapped = true
+        message.truncationMode = .none
+        message.frame = CGRect(x: 18, y: 64, width: panelWidth - 36, height: 46)
+        panel.addSublayer(message)
+
+        let cancel = makeButtonLayer(title: "Cancel", emphasized: false)
+        let updateButton = makeButtonLayer(title: isPerformingAction ? "Updating..." : "Update", emphasized: true)
+        let buttonY: CGFloat = 20
+        let buttonWidth: CGFloat = 86
+        let updateLocal = CGRect(x: panelWidth - 18 - buttonWidth, y: buttonY, width: buttonWidth, height: 30)
+        let cancelLocal = CGRect(x: updateLocal.minX - 10 - 76, y: buttonY, width: 76, height: 30)
+        cancel.frame = cancelLocal
+        updateButton.frame = updateLocal
+        panel.addSublayer(cancel)
+        panel.addSublayer(updateButton)
+        updateCancelFrame = cancelLocal.offsetBy(dx: panelFrame.minX, dy: panelFrame.minY)
+        updateConfirmFrame = updateLocal.offsetBy(dx: panelFrame.minX, dy: panelFrame.minY)
+    }
+
+    private func renderAboutPromptIfNeeded(width: CGFloat, height: CGFloat) {
+        aboutOverlayLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
+        guard let backend = pendingAboutBackend else {
+            aboutOverlayLayer.isHidden = true
+            aboutPanelFrame = .zero
+            aboutDoneFrame = .zero
+            aboutTextFrame = .zero
+            renderedAboutText = ""
+            aboutSelectionRange = nil
+            return
+        }
+
+        aboutOverlayLayer.isHidden = false
+        aboutOverlayLayer.frame = CGRect(x: 0, y: 0, width: width, height: height)
+        aboutOverlayLayer.backgroundColor = resolvedCGColor(NSColor.black.withAlphaComponent(0.22))
+
+        let panelWidth = min(max(width - 48, 340), 500)
+        let panelHeight: CGFloat = 244
+        let panelFrame = CGRect(x: floor((width - panelWidth) / 2),
+                                y: floor((height - panelHeight) / 2),
+                                width: panelWidth,
+                                height: panelHeight)
+        aboutPanelFrame = panelFrame
+
+        let panel = CALayer()
+        panel.frame = panelFrame
+        panel.cornerRadius = 8
+        panel.borderWidth = 1
+        panel.backgroundColor = resolvedCGColor(.windowBackgroundColor)
+        panel.borderColor = resolvedCGColor(.separatorColor)
+        aboutOverlayLayer.addSublayer(panel)
+
+        let title = makeTextLayer(size: 15, weight: .semibold, color: .labelColor)
+        title.string = "About Outer Shell"
+        title.frame = CGRect(x: 18, y: panelHeight - 38, width: panelWidth - 36, height: 20)
+        panel.addSublayer(title)
+
+        renderedAboutText = aboutDialogText(for: backend)
+        let textLocalFrame = CGRect(x: 18, y: 58, width: panelWidth - 36, height: 132)
+        aboutTextFrame = textLocalFrame.offsetBy(dx: panelFrame.minX, dy: panelFrame.minY)
+
+        let textBackground = CALayer()
+        textBackground.frame = textLocalFrame
+        textBackground.cornerRadius = 6
+        textBackground.borderWidth = 1
+        textBackground.backgroundColor = resolvedCGColor(.textBackgroundColor)
+        textBackground.borderColor = resolvedCGColor(.separatorColor)
+        panel.addSublayer(textBackground)
+
+        renderAboutSelection(in: textBackground)
+        renderAboutTextLines(in: textBackground)
+
+        let done = makeButtonLayer(title: "Done", emphasized: true)
+        let doneLocal = CGRect(x: panelWidth - 18 - 76, y: 18, width: 76, height: 30)
+        done.frame = doneLocal
+        panel.addSublayer(done)
+        aboutDoneFrame = doneLocal.offsetBy(dx: panelFrame.minX, dy: panelFrame.minY)
+    }
+
+    private func renderAboutTextLines(in layer: CALayer) {
+        let font = aboutTextFont()
+        let lineHeight = aboutTextLineHeight()
+        for fragment in aboutLineFragments() {
+            let text = makeTextLayer(size: 12, weight: .regular, color: .labelColor, monospaced: true)
+            text.string = fragment.text
+            text.frame = CGRect(x: 10,
+                                y: fragment.y,
+                                width: max(layer.bounds.width - 20, 1),
+                                height: lineHeight)
+            text.font = font
+            layer.addSublayer(text)
+        }
+    }
+
+    private func renderAboutSelection(in layer: CALayer) {
+        guard let selectionRange = normalizedAboutSelectionRange(aboutSelectionRange) else { return }
+        let color = resolvedCGColor(windowIsActive ? NSColor.selectedTextBackgroundColor : NSColor.unemphasizedSelectedTextBackgroundColor)
+        for fragment in aboutLineFragments() {
+            let lower = max(selectionRange.location, fragment.range.location)
+            let upper = min(selectionRange.location + selectionRange.length, fragment.range.location + fragment.range.length)
+            guard upper > lower else { continue }
+            let line = aboutTextLine(for: fragment.text)
+            var startSecondary: CGFloat = 0
+            var endSecondary: CGFloat = 0
+            let start = CGFloat(CTLineGetOffsetForStringIndex(line, lower - fragment.range.location, &startSecondary))
+            let end = CGFloat(CTLineGetOffsetForStringIndex(line, upper - fragment.range.location, &endSecondary))
+            let x = min(start, end)
+            let width = max(abs(end - start), 1)
+            let selection = CALayer()
+            selection.frame = CGRect(x: 10 + x,
+                                     y: fragment.y + 1,
+                                     width: width,
+                                     height: aboutTextLineHeight() - 2)
+            selection.backgroundColor = color
+            selection.cornerRadius = 2
+            layer.addSublayer(selection)
+        }
     }
 
     private func renderFilePickerIfNeeded(width: CGFloat, height: CGFloat) {
@@ -4360,6 +4557,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                     if !(quiet && self.mode == .apps && previousAppsSignature == nextAppsSignature) {
                         self.updateLayout()
                     }
+                    self.showAutomaticOuterShellUpdatePromptIfNeeded()
                     if self.selectedLog != nil {
                         self.fetchSelectedLog()
                     }
@@ -4369,6 +4567,27 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 }
             }
         }.resume()
+    }
+
+    private func showAutomaticOuterShellUpdatePromptIfNeeded() {
+        guard !didShowAutomaticOuterShellUpdatePrompt,
+              pendingOuterShellUpdate == nil,
+              pendingInstallBackend == nil,
+              pendingPasswordAction == nil,
+              pendingAboutBackend == nil,
+              let backend = outerShellBackend(),
+              backend.status == "update available" else {
+            return
+        }
+        let availableVersion = backend.availableVersion?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !availableVersion.isEmpty else { return }
+        didShowAutomaticOuterShellUpdatePrompt = true
+        pendingOuterShellUpdate = PendingOuterShellUpdate(backend: backend,
+                                                          installedVersion: backend.installedVersion ?? "",
+                                                          availableVersion: availableVersion,
+                                                          message: "Outer Shell \(availableVersion) is available.")
+        backendError = ""
+        updateLayout()
     }
 
     private func fetchRecipes() {
@@ -4503,8 +4722,14 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                     if response.needsPassword == true {
                         self.showPasswordPrompt(for: backend, operation: operation, message: response.message)
                         self.backendError = ""
+                    } else if operation == "checkUpdate", response.ok, response.updateAvailable {
+                        self.pendingOuterShellUpdate = PendingOuterShellUpdate(backend: backend,
+                                                                               installedVersion: response.installedVersion,
+                                                                               availableVersion: response.availableVersion,
+                                                                               message: response.message)
+                        self.backendError = ""
                     } else {
-                        self.backendError = response.ok ? "" : response.message
+                        self.backendError = response.ok ? (operation == "checkUpdate" ? response.message : "") : response.message
                         actionCompleted = response.ok
                     }
                 } else if let data,
@@ -4525,10 +4750,34 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                         self.outerframeHost.navigate(to: url)
                         return
                     }
+                    if operation == "update" {
+                        self.reloadOuterShellAfterUpdate()
+                        return
+                    }
                 }
                 self.fetchBackends()
             }
         }.resume()
+    }
+
+    private func reloadOuterShellAfterUpdate() {
+        let url = outerShellReloadURL() ?? outerframeHost.pluginURL()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.25) { [weak self] in
+            guard let self, let url else { return }
+            self.outerframeHost.navigate(to: url)
+        }
+    }
+
+    private func outerShellReloadURL() -> URL? {
+        guard let currentURL = outerframeHost.pluginURL(),
+              var components = URLComponents(url: currentURL, resolvingAgainstBaseURL: false) else {
+            return outerframeHost.pluginURL()
+        }
+        var queryItems = components.queryItems ?? []
+        queryItems.removeAll { $0.name == "_outerShellReload" }
+        queryItems.append(URLQueryItem(name: "_outerShellReload", value: String(Int(Date().timeIntervalSince1970 * 1000))))
+        components.queryItems = queryItems
+        return components.url ?? currentURL
     }
 
     private func setFrontendList(for item: AppLauncherItem, listName: String) {
@@ -4624,6 +4873,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                  supportsRoot: backend.supportsRoot,
                                  rootOnly: backend.rootOnly,
                                  hasRootSupport: operation == "runRoot" || operation == "installRoot" || operation == "addRootSupport" ? true : (operation == "removeRootSupport" ? false : backend.hasRootSupport),
+                                 installedVersion: backend.installedVersion,
+                                 availableVersion: backend.availableVersion,
                                  iconSymbolName: backend.iconSymbolName,
                                  launchdPlistPath: backend.launchdPlistPath,
                                  ownsLaunchdPlist: backend.ownsLaunchdPlist,
@@ -4663,6 +4914,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                  supportsRoot: backend.supportsRoot,
                                  rootOnly: backend.rootOnly,
                                  hasRootSupport: backend.hasRootSupport,
+                                 installedVersion: backend.installedVersion,
+                                 availableVersion: backend.availableVersion,
                                  iconSymbolName: backend.iconSymbolName,
                                  launchdPlistPath: backend.launchdPlistPath,
                                  ownsLaunchdPlist: backend.ownsLaunchdPlist,
@@ -5808,7 +6061,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
         var enabledCommands: OuterframeEditCommandSet = []
         if requestedCommands.contains(.copy),
-           (logHeaderDetailSelectionRange?.length ?? 0) > 0 ||
+           (aboutSelectionRange?.length ?? 0) > 0 ||
+            (logHeaderDetailSelectionRange?.length ?? 0) > 0 ||
             (logTextSelectionRange?.length ?? 0) > 0 {
             enabledCommands.insert(.copy)
         }
@@ -6121,12 +6375,169 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             return pasteboardItems(for: selectedText)
         }
 
+        if let selectedText = selectedAboutAttributedText(),
+           selectedText.length > 0 {
+            return pasteboardItems(for: selectedText)
+        }
+
         guard let selectedText = selectedLogAttributedText(),
               selectedText.length > 0 else {
             return []
         }
 
         return pasteboardItems(for: selectedText)
+    }
+
+    private func aboutDialogText(for backend: BackendRecord) -> String {
+        let version = backend.installedVersion?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return [
+            "Outer Shell",
+            "Version: \((version?.isEmpty == false) ? version! : "unknown")",
+            "Service ID: \(backend.serviceID)",
+            "Scope: \(backend.serviceScope)",
+            "Status: \(backend.status)",
+            "Update source: https://outershell.org/outer-shell"
+        ].joined(separator: "\n")
+    }
+
+    private func aboutTextFont() -> NSFont {
+        NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+    }
+
+    private func aboutTextLineHeight() -> CGFloat {
+        18
+    }
+
+    private func aboutTextLine(for text: String) -> CTLine {
+        CTLineCreateWithAttributedString(NSAttributedString(string: text, attributes: [.font: aboutTextFont()]))
+    }
+
+    private func aboutLineFragments() -> [(text: String, range: NSRange, y: CGFloat)] {
+        let lines = renderedAboutText.components(separatedBy: "\n")
+        let lineHeight = aboutTextLineHeight()
+        var location = 0
+        var fragments: [(text: String, range: NSRange, y: CGFloat)] = []
+        fragments.reserveCapacity(lines.count)
+        for (index, line) in lines.enumerated() {
+            let length = (line as NSString).length
+            fragments.append((text: line,
+                              range: NSRange(location: location, length: length),
+                              y: aboutTextFrame.height - CGFloat(index + 1) * lineHeight - 4))
+            location += length
+            if index < lines.count - 1 {
+                location += 1
+            }
+        }
+        return fragments
+    }
+
+    private func normalizedAboutSelectionRange(_ range: NSRange?) -> NSRange? {
+        guard let range else { return nil }
+        let length = (renderedAboutText as NSString).length
+        let lower = max(min(range.location, length), 0)
+        let upper = max(min(range.location + range.length, length), lower)
+        guard upper > lower else { return nil }
+        return NSRange(location: lower, length: upper - lower)
+    }
+
+    private func setAboutSelectionRange(_ range: NSRange?) {
+        aboutSelectionRange = normalizedAboutSelectionRange(range)
+        updateEditingAndPasteboardState()
+        updateLayout()
+    }
+
+    private func selectedAboutAttributedText() -> NSAttributedString? {
+        guard let selectionRange = normalizedAboutSelectionRange(aboutSelectionRange) else {
+            return nil
+        }
+        let attributed = NSAttributedString(string: renderedAboutText,
+                                            attributes: [.font: aboutTextFont(),
+                                                         .foregroundColor: NSColor.labelColor])
+        return attributed.attributedSubstring(from: selectionRange)
+    }
+
+    private func aboutTextOffset(at point: CGPoint) -> Int {
+        let length = (renderedAboutText as NSString).length
+        guard length > 0 else { return 0 }
+        let x = max(point.x - aboutTextFrame.minX - 10, 0)
+        let y = point.y - aboutTextFrame.minY
+        let lineHeight = aboutTextLineHeight()
+        let fragments = aboutLineFragments()
+        guard !fragments.isEmpty else { return 0 }
+        let rawIndex = Int(floor((aboutTextFrame.height - y - 4) / lineHeight))
+        let lineIndex = min(max(rawIndex, 0), fragments.count - 1)
+        let fragment = fragments[lineIndex]
+        if x <= 0 {
+            return fragment.range.location
+        }
+        let line = aboutTextLine(for: fragment.text)
+        let index = CTLineGetStringIndexForPosition(line, CGPoint(x: x, y: 0))
+        if index == kCFNotFound {
+            return fragment.range.location + fragment.range.length
+        }
+        return min(max(fragment.range.location + index, fragment.range.location),
+                   fragment.range.location + fragment.range.length)
+    }
+
+    private func aboutWordRange(containing offset: Int) -> NSRange? {
+        let string = renderedAboutText as NSString
+        let length = string.length
+        guard length > 0 else { return nil }
+        var location = min(max(offset, 0), length - 1)
+        if location > 0, !aboutCharacterIsWordLike(string.character(at: location)) {
+            location -= 1
+        }
+        guard aboutCharacterIsWordLike(string.character(at: location)) else {
+            return NSRange(location: min(max(offset, 0), length), length: 0)
+        }
+        var start = location
+        while start > 0, aboutCharacterIsWordLike(string.character(at: start - 1)) {
+            start -= 1
+        }
+        var end = location + 1
+        while end < length, aboutCharacterIsWordLike(string.character(at: end)) {
+            end += 1
+        }
+        return NSRange(location: start, length: end - start)
+    }
+
+    private func aboutCharacterIsWordLike(_ character: unichar) -> Bool {
+        if character >= 48 && character <= 57 { return true }
+        if character >= 65 && character <= 90 { return true }
+        if character >= 97 && character <= 122 { return true }
+        return character == 45 || character == 46 || character == 47 || character == 58 || character == 95
+    }
+
+    private func handleAboutMouseDragged(to point: CGPoint) -> Bool {
+        guard let aboutDragAnchorOffset else { return false }
+        let offset = aboutTextOffset(at: point)
+        let location = min(aboutDragAnchorOffset, offset)
+        let length = abs(offset - aboutDragAnchorOffset)
+        setAboutSelectionRange(NSRange(location: location, length: length))
+        return true
+    }
+
+    private func handleAboutRightMouseDown(at point: CGPoint) {
+        guard aboutTextFrame.contains(point) else { return }
+        let offset = aboutTextOffset(at: point)
+        if let selectionRange = normalizedAboutSelectionRange(aboutSelectionRange),
+           offset >= selectionRange.location,
+           offset <= selectionRange.location + selectionRange.length,
+           let selectedText = selectedAboutAttributedText() {
+            outerframeHost.showContextMenu(for: selectedText, at: point)
+            return
+        }
+        if let wordRange = aboutWordRange(containing: offset),
+           wordRange.length > 0 {
+            aboutSelectionRange = wordRange
+        } else {
+            aboutSelectionRange = NSRange(location: 0, length: (renderedAboutText as NSString).length)
+        }
+        updateEditingAndPasteboardState()
+        updateLayout()
+        if let selectedText = selectedAboutAttributedText() {
+            outerframeHost.showContextMenu(for: selectedText, at: point)
+        }
     }
 
     private func pasteboardItems(for selectedText: NSAttributedString) -> [OuterframeContentPasteboardItem] {
@@ -6634,6 +7045,13 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             confirmPendingInstall()
         case .logDismiss:
             dismissLogViewer()
+        case .updateCancel:
+            pendingOuterShellUpdate = nil
+            updateLayout()
+        case .updateConfirm:
+            confirmOuterShellUpdate()
+        case .aboutDismiss:
+            dismissAboutPrompt()
         case .passwordCancel:
             dismissPasswordPrompt()
         case .passwordSubmit:
@@ -6654,6 +7072,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             return
         }
         if logScrollbarController?.handleMouseDragged(to: rootLayer.convert(point, to: logRowsClipLayer)) == true {
+            return
+        }
+        if handleAboutMouseDragged(to: point) {
             return
         }
         if handleLogHeaderMouseDragged(to: point) {
@@ -6721,6 +7142,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func handleMouseUp(at point: CGPoint, modifierFlags: NSEvent.ModifierFlags) {
+        aboutDragAnchorOffset = nil
         logDragAnchorOffset = nil
         logHeaderDetailDragAnchorOffset = nil
         lastLogDragTextPoint = nil
@@ -6759,6 +7181,16 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         _ = modifierFlags
         if pendingInstallBackend != nil {
             setCursorIfNeeded((installConfirmFrame.contains(point) || installRootConfirmFrame.contains(point) || installCancelFrame.contains(point)) ? .pointingHand : .arrow)
+            return
+        }
+        if pendingAboutBackend != nil {
+            if aboutDoneFrame.contains(point) {
+                setCursorIfNeeded(.pointingHand)
+            } else if aboutTextFrame.contains(point) {
+                setCursorIfNeeded(.iBeam)
+            } else {
+                setCursorIfNeeded(.arrow)
+            }
             return
         }
         if pendingFilePicker != nil, mode == .create {
@@ -6832,6 +7264,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                       clickCount: Int) {
         _ = modifierFlags
         _ = clickCount
+        if pendingAboutBackend != nil {
+            handleAboutRightMouseDown(at: point)
+            return
+        }
         if handleLogHeaderRightMouseDown(at: point) {
             return
         }
@@ -6982,6 +7418,38 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 } else {
                     dismissInstallPrompt()
                 }
+            }
+            return
+        }
+        if pendingOuterShellUpdate != nil {
+            if updateConfirmFrame.contains(point) {
+                armButtonClick(frame: updateConfirmFrame, action: .updateConfirm)
+            } else if updateCancelFrame.contains(point) || !updatePanelFrame.contains(point) {
+                if updateCancelFrame.contains(point) {
+                    armButtonClick(frame: updateCancelFrame, action: .updateCancel)
+                } else {
+                    pendingOuterShellUpdate = nil
+                    updateLayout()
+                }
+            }
+            return
+        }
+        if pendingAboutBackend != nil {
+            if aboutDoneFrame.contains(point) {
+                armButtonClick(frame: aboutDoneFrame, action: .aboutDismiss)
+            } else if aboutTextFrame.contains(point) {
+                let offset = aboutTextOffset(at: point)
+                aboutDragAnchorOffset = offset
+                switch clickCount {
+                case 3...:
+                    setAboutSelectionRange(NSRange(location: 0, length: (renderedAboutText as NSString).length))
+                case 2:
+                    setAboutSelectionRange(aboutWordRange(containing: offset))
+                default:
+                    setAboutSelectionRange(nil)
+                }
+            } else if !aboutPanelFrame.contains(point) {
+                dismissAboutPrompt()
             }
             return
         }
@@ -7228,6 +7696,14 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             handleInstallPromptKeyDown(keyCode: keyCode)
             return
         }
+        if pendingOuterShellUpdate != nil {
+            handleUpdatePromptKeyDown(keyCode: keyCode)
+            return
+        }
+        if pendingAboutBackend != nil {
+            handleAboutPromptKeyDown(keyCode: keyCode)
+            return
+        }
         if pendingPasswordAction != nil {
             handlePasswordKeyDown(keyCode: keyCode, characters: characters)
             return
@@ -7280,6 +7756,44 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         }
     }
 
+    private func handleUpdatePromptKeyDown(keyCode: UInt16) {
+        switch keyCode {
+        case 36, 76:
+            confirmOuterShellUpdate()
+        case 53:
+            pendingOuterShellUpdate = nil
+            updateLayout()
+        default:
+            break
+        }
+    }
+
+    private func handleAboutPromptKeyDown(keyCode: UInt16) {
+        switch keyCode {
+        case 36, 53, 76:
+            dismissAboutPrompt()
+        default:
+            break
+        }
+    }
+
+    private func showAboutPrompt(for backend: BackendRecord) {
+        blurCreateField()
+        blurPasswordField()
+        pendingAboutBackend = backend
+        aboutSelectionRange = nil
+        aboutDragAnchorOffset = nil
+        updateLayout()
+    }
+
+    private func dismissAboutPrompt() {
+        pendingAboutBackend = nil
+        aboutSelectionRange = nil
+        aboutDragAnchorOffset = nil
+        updateEditingAndPasteboardState()
+        updateLayout()
+    }
+
     private func showPasswordPrompt(for backend: BackendRecord, operation: String, message: String) {
         pendingPasswordAction = PendingPasswordAction(serviceID: backend.serviceID,
                                                       serviceScope: backend.serviceScope,
@@ -7310,6 +7824,12 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         }
         let password = passwordInputController.isFocused ? passwordInputController.text : sudoPasswordInput
         performControlAction(for: backend, operation: pendingPasswordAction.operation, sudoPassword: password)
+    }
+
+    private func confirmOuterShellUpdate() {
+        guard let update = pendingOuterShellUpdate else { return }
+        pendingOuterShellUpdate = nil
+        performControlAction(for: update.backend, operation: "update")
     }
 
     private func handlePasswordKeyDown(keyCode: UInt16, characters: String?) {
@@ -8092,6 +8612,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         var operationByItemID: [String: String] = [:]
         var items: [OuterframeContextMenuItem] = []
         if backend.isBackendsSelf {
+            operationByItemID["about"] = "aboutOuterShell"
+            items.append(OuterframeContextMenuItem(id: "about",
+                                                   title: "About Outer Shell",
+                                                   isEnabled: true))
             operationByItemID["showLogs"] = "showLogs:\(backend.serviceID):\(backend.serviceScope)"
             items.append(OuterframeContextMenuItem(id: "showLogs",
                                                    title: "View Logs for Outer Shell",
@@ -8104,10 +8628,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             operationByItemID["checkUpdate"] = "checkUpdate"
             items.append(OuterframeContextMenuItem(id: "checkUpdate",
                                                    title: "Check for Updates",
-                                                   isEnabled: true))
-            operationByItemID["update"] = "update"
-            items.append(OuterframeContextMenuItem(id: "update",
-                                                   title: "Update Outer Shell",
                                                    isEnabled: true))
             operationByItemID["uninstall"] = "uninstallOuterShell"
             items.append(OuterframeContextMenuItem(id: "uninstall",
@@ -8331,6 +8851,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             performControlAction(for: backend, operation: enabled ? "showMenuBarWhenRunning" : "hideMenuBarWhenRunning")
             return
         }
+        if operation == "aboutOuterShell" {
+            showAboutPrompt(for: backend)
+            return
+        }
         performControlAction(for: backend, operation: operation)
     }
 
@@ -8417,7 +8941,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         case "uninstallOuterShell":
             return "Uninstalling \(backend.displayName)..."
         case "checkUpdate":
-            return "Checking \(backend.displayName) for updates..."
+            return "Checking for \(backend.displayName) updates..."
         case "update":
             return "Updating \(backend.displayName)..."
         case "showMenuBarWhenRunning":
