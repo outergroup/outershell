@@ -941,6 +941,12 @@ static uint64_t g_backend_event_sequence = 1;
 static pthread_mutex_t g_backend_event_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 typedef struct {
+    const char *content_type;
+    const char *url_template;
+    int rank;
+} BundledAppOpenerDefinition;
+
+typedef struct {
     const char *service_id;
     const char *display_name;
     const char *unit_name;
@@ -957,6 +963,8 @@ typedef struct {
     bool root_only;
     bool supports_macos;
     const char *version;
+    const BundledAppOpenerDefinition *openers;
+    size_t opener_count;
 } BundledAppDefinition;
 
 typedef struct {
@@ -979,6 +987,14 @@ static void rewrite_files_in_directory_replacing_text(const char *directory,
                                                       bool recursive);
 #endif
 static void mark_backend_event_changed(void);
+
+static const BundledAppOpenerDefinition kPlaintextOpeners[] = {
+    {
+        .content_type = "public.text",
+        .url_template = "?file={file}",
+        .rank = 0
+    }
+};
 
 static const BundledAppDefinition kBundledApps[] = {
     {
@@ -1033,7 +1049,9 @@ static const BundledAppDefinition kBundledApps[] = {
         .supports_root = true,
         .root_only = false,
         .supports_macos = false,
-        .version = "1"
+        .version = "1",
+        .openers = kPlaintextOpeners,
+        .opener_count = sizeof(kPlaintextOpeners) / sizeof(kPlaintextOpeners[0])
     },
     {
         .service_id = "org.outershell.NetworkInspector",
@@ -1635,6 +1653,12 @@ static bool root_helper_outerctl(int argc,
                                  bool *needs_password,
                                  char *message,
                                  size_t message_size);
+static bool root_helper_registry_upsert_bundled_openers(const BundledAppDefinition *app,
+                                                        const char *socket_path,
+                                                        const char *sudo_password,
+                                                        bool *needs_password,
+                                                        char *message,
+                                                        size_t message_size);
 #ifndef __APPLE__
 static bool root_helper_registry_upsert_systemd(const char *service_id,
                                                 const char *display_name,
@@ -9981,6 +10005,38 @@ static int outershelld_handle_outerctl(int argc, char **argv, StringBuilder *std
     return 0;
 }
 
+static bool registry_store_upsert_bundled_app_openers(RegistryStore *database,
+                                                      const BundledAppDefinition *app,
+                                                      const char *socket_path,
+                                                      char *error,
+                                                      size_t error_size) {
+    if (!database || !app) return true;
+    registry_store_clear_backend_openers(database, app->service_id);
+    if (!app->openers || app->opener_count == 0) return true;
+    if (!socket_path || !socket_path[0]) {
+        snprintf(error, error_size, "Missing opener socket path.");
+        return false;
+    }
+    for (size_t i = 0; i < app->opener_count; i++) {
+        char normalized_content_type[160] = "";
+        if (!normalize_content_type_identifier(app->openers[i].content_type, normalized_content_type, sizeof(normalized_content_type))) {
+            snprintf(error, error_size, "Invalid bundled opener content type.");
+            return false;
+        }
+        if (!registry_store_upsert_opener(database,
+                                          normalized_content_type,
+                                          app->service_id,
+                                          app->display_name,
+                                          socket_path,
+                                          app->openers[i].url_template,
+                                          app->openers[i].rank)) {
+            snprintf(error, error_size, "Out of memory.");
+            return false;
+        }
+    }
+    return true;
+}
+
 #ifndef __APPLE__
 static bool upsert_systemd_backend_registry(const char *service_id,
                                             const char *display_name,
@@ -10008,6 +10064,10 @@ static bool upsert_systemd_backend_registry(const char *service_id,
     if (ok) {
         ok = registry_store_upsert_log(&database, log_path, service_id);
         if (!ok) snprintf(error, error_size, "Out of memory.");
+    }
+    const BundledAppDefinition *app = bundled_app_for_service_id(service_id);
+    if (ok && app) {
+        ok = registry_store_upsert_bundled_app_openers(&database, app, socket_path, error, error_size);
     }
     ok = registry_store_close(&database, ok, error, error_size) && ok;
     if (ok && socket_path && socket_path[0]) {
@@ -10047,6 +10107,10 @@ static bool upsert_launchd_backend_registry_at(const char *database_path,
     if (ok) {
         ok = registry_store_upsert_log(&database, log_path, service_id);
         if (!ok) snprintf(error, error_size, "Out of memory.");
+    }
+    const BundledAppDefinition *app = bundled_app_for_service_id(service_id);
+    if (ok && app) {
+        ok = registry_store_upsert_bundled_app_openers(&database, app, socket_path, error, error_size);
     }
     ok = registry_store_close(&database, ok, error, error_size) && ok;
     if (ok && socket_path && socket_path[0]) {
@@ -10877,6 +10941,14 @@ static bool install_bundled_app(const BundledAppDefinition *app,
                                                      needs_password,
                                                      message,
                                                      message_size)) {
+                return false;
+            }
+            if (!root_helper_registry_upsert_bundled_openers(app,
+                                                             actual_socket_path,
+                                                             sudo_password,
+                                                             needs_password,
+                                                             message,
+                                                             message_size)) {
                 return false;
             }
         }
@@ -11735,6 +11807,14 @@ static bool install_bundled_app_macos(const BundledAppDefinition *app,
                                                  needs_password,
                                                  message,
                                                  message_size)) {
+            return false;
+        }
+        if (!root_helper_registry_upsert_bundled_openers(app,
+                                                         socket_path,
+                                                         sudo_password,
+                                                         needs_password,
+                                                         message,
+                                                         message_size)) {
             return false;
         }
 
@@ -13126,6 +13206,46 @@ static bool root_helper_outerctl(int argc,
         snprintf(message, message_size, "Root registry operation failed.");
     }
     return ok;
+}
+
+static bool root_helper_registry_upsert_bundled_openers(const BundledAppDefinition *app,
+                                                        const char *socket_path,
+                                                        const char *sudo_password,
+                                                        bool *needs_password,
+                                                        char *message,
+                                                        size_t message_size) {
+    if (!app) return true;
+    char *clear_argv[] = {"outerctl", "opener", "clear", "--backend", (char *)app->service_id, NULL};
+    if (!root_helper_outerctl(5, clear_argv, sudo_password, needs_password, message, message_size)) return false;
+    if (!app->openers || app->opener_count == 0) return true;
+    if (!socket_path || !socket_path[0]) {
+        snprintf(message, message_size, "Missing opener socket path.");
+        return false;
+    }
+    for (size_t i = 0; i < app->opener_count; i++) {
+        char rank_string[32];
+        snprintf(rank_string, sizeof(rank_string), "%d", app->openers[i].rank);
+        char *add_argv[] = {
+            "outerctl",
+            "opener",
+            "add",
+            "--backend",
+            (char *)app->service_id,
+            "--content-type",
+            (char *)app->openers[i].content_type,
+            "--socket-path",
+            (char *)socket_path,
+            "--name",
+            (char *)app->display_name,
+            "--url-template",
+            (char *)(app->openers[i].url_template ? app->openers[i].url_template : "?file={file}"),
+            "--rank",
+            rank_string,
+            NULL
+        };
+        if (!root_helper_outerctl(15, add_argv, sudo_password, needs_password, message, message_size)) return false;
+    }
+    return true;
 }
 
 #ifndef __APPLE__
