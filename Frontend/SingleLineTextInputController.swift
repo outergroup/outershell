@@ -13,6 +13,7 @@ final class SingleLineTextInputController<DelegateClass: SingleLineTextInputCont
     weak var delegate: DelegateClass?
     var onSubmit: (() -> Void)?
     var allowsNewlines = false
+    var visualLineWidth: CGFloat?
 
     private(set) var text: String
     private(set) var cursorPosition: Int
@@ -211,28 +212,48 @@ final class SingleLineTextInputController<DelegateClass: SingleLineTextInputCont
         case "moveRight":
             moveCursorRight()
         case "moveUp":
-            moveToBeginning()
+            moveVertically(delta: -1, modifySelection: false)
         case "moveDown":
-            moveToEnd()
+            moveVertically(delta: 1, modifySelection: false)
         case "moveWordLeft":
             moveWordLeft()
         case "moveWordRight":
             moveWordRight()
-        case "moveToBeginningOfLine", "moveToBeginningOfDocument", "moveToBeginningOfParagraph", "moveToLeftEndOfLine":
+        case "moveToBeginningOfLine", "moveToLeftEndOfLine":
+            moveToVisualLineStart()
+        case "moveToEndOfLine", "moveToRightEndOfLine":
+            moveToVisualLineEnd()
+        case "moveToBeginningOfParagraph":
+            moveToParagraphStart()
+        case "moveToEndOfParagraph":
+            moveToParagraphEnd()
+        case "moveToBeginningOfDocument":
             moveToBeginning()
-        case "moveToEndOfLine", "moveToEndOfDocument", "moveToEndOfParagraph", "moveToRightEndOfLine":
+        case "moveToEndOfDocument":
             moveToEnd()
         case "moveLeftAndModifySelection":
             moveLeftAndModifySelection()
         case "moveRightAndModifySelection":
             moveRightAndModifySelection()
+        case "moveUpAndModifySelection":
+            moveVertically(delta: -1, modifySelection: true)
+        case "moveDownAndModifySelection":
+            moveVertically(delta: 1, modifySelection: true)
         case "moveWordLeftAndModifySelection":
             moveWordLeftAndModifySelection()
         case "moveWordRightAndModifySelection":
             moveWordRightAndModifySelection()
-        case "moveToBeginningOfLineAndModifySelection", "moveToBeginningOfDocumentAndModifySelection", "moveToBeginningOfParagraphAndModifySelection", "moveToLeftEndOfLineAndModifySelection":
+        case "moveToBeginningOfLineAndModifySelection", "moveToLeftEndOfLineAndModifySelection":
+            moveToVisualLineStartAndModifySelection()
+        case "moveToEndOfLineAndModifySelection", "moveToRightEndOfLineAndModifySelection":
+            moveToVisualLineEndAndModifySelection()
+        case "moveToBeginningOfParagraphAndModifySelection":
+            moveToParagraphStartAndModifySelection()
+        case "moveToEndOfParagraphAndModifySelection":
+            moveToParagraphEndAndModifySelection()
+        case "moveToBeginningOfDocumentAndModifySelection":
             moveToBeginningAndModifySelection()
-        case "moveToEndOfLineAndModifySelection", "moveToEndOfDocumentAndModifySelection", "moveToEndOfParagraphAndModifySelection", "moveToRightEndOfLineAndModifySelection":
+        case "moveToEndOfDocumentAndModifySelection":
             moveToEndAndModifySelection()
         case "selectAll":
             selectAll()
@@ -244,10 +265,14 @@ final class SingleLineTextInputController<DelegateClass: SingleLineTextInputCont
             deleteWordBackward()
         case "deleteWordForward":
             deleteWordForward()
-        case "deleteToBeginningOfLine", "deleteToBeginningOfParagraph":
-            deleteToBeginning()
-        case "deleteToEndOfLine", "deleteToEndOfParagraph":
-            deleteToEnd()
+        case "deleteToBeginningOfLine":
+            deleteToVisualLineStart()
+        case "deleteToEndOfLine":
+            deleteToVisualLineEnd()
+        case "deleteToBeginningOfParagraph":
+            deleteToParagraphStart()
+        case "deleteToEndOfParagraph":
+            deleteToParagraphEnd()
         case "deleteToMark":
             deleteToBeginning()
         case "insertNewline":
@@ -351,6 +376,50 @@ final class SingleLineTextInputController<DelegateClass: SingleLineTextInputCont
         notifyStateChanged()
     }
 
+    private func moveToVisualLineStart() {
+        clearMarkedTextState()
+        cursorPosition = visualLineRange(for: cursorPosition).lowerBound
+        selectionAnchor = nil
+        notifyStateChanged()
+    }
+
+    private func moveToVisualLineEnd() {
+        clearMarkedTextState()
+        cursorPosition = visualLineRange(for: cursorPosition).upperBound
+        selectionAnchor = nil
+        notifyStateChanged()
+    }
+
+    private func moveToParagraphStart() {
+        clearMarkedTextState()
+        cursorPosition = paragraphStart(for: cursorPosition)
+        selectionAnchor = nil
+        notifyStateChanged()
+    }
+
+    private func moveToParagraphEnd() {
+        clearMarkedTextState()
+        cursorPosition = paragraphEnd(for: cursorPosition)
+        selectionAnchor = nil
+        notifyStateChanged()
+    }
+
+    private func moveVertically(delta: Int, modifySelection: Bool) {
+        guard delta != 0 else { return }
+        guard allowsNewlines,
+              let target = visualLineOffset(from: cursorPosition, delta: delta) else {
+            return
+        }
+        clearMarkedTextState()
+        if modifySelection {
+            extendSelection(to: target)
+        } else {
+            cursorPosition = target
+            selectionAnchor = nil
+            notifyStateChanged()
+        }
+    }
+
     private func moveWordLeft() {
         clearMarkedTextState()
         if hasSelection {
@@ -411,6 +480,26 @@ final class SingleLineTextInputController<DelegateClass: SingleLineTextInputCont
         extendSelection(to: text.count)
     }
 
+    private func moveToVisualLineStartAndModifySelection() {
+        clearMarkedTextState()
+        extendSelection(to: visualLineRange(for: cursorPosition).lowerBound)
+    }
+
+    private func moveToVisualLineEndAndModifySelection() {
+        clearMarkedTextState()
+        extendSelection(to: visualLineRange(for: cursorPosition).upperBound)
+    }
+
+    private func moveToParagraphStartAndModifySelection() {
+        clearMarkedTextState()
+        extendSelection(to: paragraphStart(for: cursorPosition))
+    }
+
+    private func moveToParagraphEndAndModifySelection() {
+        clearMarkedTextState()
+        extendSelection(to: paragraphEnd(for: cursorPosition))
+    }
+
     private func deleteSelection() {
         guard let range = selectionRange else { return }
         clearMarkedTextState()
@@ -453,29 +542,57 @@ final class SingleLineTextInputController<DelegateClass: SingleLineTextInputCont
         notifyStateChanged()
     }
 
+    private func deleteToVisualLineStart() {
+        deleteBackward(to: visualLineRange(for: cursorPosition).lowerBound)
+    }
+
+    private func deleteToVisualLineEnd() {
+        deleteForward(to: visualLineRange(for: cursorPosition).upperBound)
+    }
+
+    private func deleteToParagraphStart() {
+        deleteBackward(to: paragraphStart(for: cursorPosition))
+    }
+
+    private func deleteToParagraphEnd() {
+        deleteForward(to: paragraphEnd(for: cursorPosition))
+    }
+
     private func deleteToBeginning() {
+        deleteBackward(to: 0)
+    }
+
+    private func deleteBackward(to target: Int) {
         if hasSelection {
             deleteSelection()
             return
         }
-        guard cursorPosition > 0 else { return }
+        let clampedTarget = clamp(target)
+        guard clampedTarget < cursorPosition else { return }
         clearMarkedTextState()
+        let startIndex = stringIndex(forCharacterIndex: clampedTarget)
         let endIndex = stringIndex(forCharacterIndex: cursorPosition)
-        text.removeSubrange(text.startIndex..<endIndex)
-        cursorPosition = 0
+        text.removeSubrange(startIndex..<endIndex)
+        cursorPosition = clampedTarget
         selectionAnchor = nil
         notifyStateChanged()
     }
 
     private func deleteToEnd() {
+        deleteForward(to: text.count)
+    }
+
+    private func deleteForward(to target: Int) {
         if hasSelection {
             deleteSelection()
             return
         }
-        guard cursorPosition < text.count else { return }
+        let clampedTarget = clamp(target)
+        guard clampedTarget > cursorPosition else { return }
         clearMarkedTextState()
         let startIndex = stringIndex(forCharacterIndex: cursorPosition)
-        text.removeSubrange(startIndex..<text.endIndex)
+        let endIndex = stringIndex(forCharacterIndex: clampedTarget)
+        text.removeSubrange(startIndex..<endIndex)
         selectionAnchor = nil
         notifyStateChanged()
     }
@@ -564,6 +681,129 @@ final class SingleLineTextInputController<DelegateClass: SingleLineTextInputCont
         let offset = max(0, min(utf16Index, text.utf16.count))
         let stringIndex = String.Index(utf16Offset: offset, in: text)
         return text.distance(from: text.startIndex, to: stringIndex)
+    }
+
+    private func paragraphStart(for position: Int) -> Int {
+        let clamped = clamp(position)
+        let index = stringIndex(forCharacterIndex: clamped)
+        guard let newline = text[..<index].lastIndex(of: "\n") else { return 0 }
+        return text.distance(from: text.startIndex, to: text.index(after: newline))
+    }
+
+    private func paragraphEnd(for position: Int) -> Int {
+        let clamped = clamp(position)
+        let index = stringIndex(forCharacterIndex: clamped)
+        guard let newline = text[index...].firstIndex(of: "\n") else { return text.count }
+        return text.distance(from: text.startIndex, to: newline)
+    }
+
+    private func visualLineRange(for position: Int) -> Range<Int> {
+        let clamped = clamp(position)
+        guard allowsNewlines,
+              let visualLineWidth,
+              visualLineWidth > 1 else {
+            return paragraphStart(for: clamped)..<paragraphEnd(for: clamped)
+        }
+
+        let fragments = visualLineFragments(maxWidth: visualLineWidth)
+        return fragments.first { fragment in
+            if fragment.lowerBound == fragment.upperBound {
+                return clamped == fragment.lowerBound
+            }
+            return clamped >= fragment.lowerBound && clamped < fragment.upperBound
+        }
+            ?? fragments.last
+            ?? 0..<0
+    }
+
+    private func visualLineOffset(from position: Int, delta: Int) -> Int? {
+        guard let visualLineWidth, visualLineWidth > 1 else { return nil }
+        let fragments = visualLineFragments(maxWidth: visualLineWidth)
+        guard !fragments.isEmpty else { return nil }
+        let clamped = clamp(position)
+        let currentIndex = visualLineIndex(for: clamped, in: fragments)
+        let targetIndex = min(max(currentIndex + delta, 0), fragments.count - 1)
+        guard targetIndex != currentIndex else { return nil }
+
+        let current = fragments[currentIndex]
+        let target = fragments[targetIndex]
+        let column = max(clamped - current.lowerBound, 0)
+        return min(target.lowerBound + column, target.upperBound)
+    }
+
+    private func visualLineIndex(for position: Int, in fragments: [Range<Int>]) -> Int {
+        let clamped = clamp(position)
+        if let exact = fragments.firstIndex(where: { fragment in
+            if fragment.lowerBound == fragment.upperBound {
+                return clamped == fragment.lowerBound
+            }
+            return clamped >= fragment.lowerBound && clamped < fragment.upperBound
+        }) {
+            return exact
+        }
+        if clamped >= fragments.last?.upperBound ?? 0 {
+            return max(fragments.count - 1, 0)
+        }
+        return 0
+    }
+
+    private func visualLineFragments(maxWidth: CGFloat) -> [Range<Int>] {
+        guard !text.isEmpty else { return [0..<0] }
+
+        var fragments: [Range<Int>] = []
+        var paragraphStart = 0
+        let parts = text.split(separator: "\n", omittingEmptySubsequences: false)
+        if parts.isEmpty {
+            return [0..<0]
+        }
+
+        for part in parts {
+            let paragraph = String(part)
+            let paragraphLength = paragraph.count
+            if paragraphLength == 0 {
+                fragments.append(paragraphStart..<paragraphStart)
+            } else {
+                for relativeRange in wrappedRanges(for: paragraph, maxWidth: maxWidth) {
+                    fragments.append((paragraphStart + relativeRange.lowerBound)..<(paragraphStart + relativeRange.upperBound))
+                }
+            }
+            paragraphStart += paragraphLength + 1
+        }
+
+        return fragments
+    }
+
+    private func wrappedRanges(for value: String, maxWidth: CGFloat) -> [Range<Int>] {
+        let count = value.count
+        guard count > 0 else { return [0..<0] }
+        var ranges: [Range<Int>] = []
+        var start = 0
+        while start < count {
+            var low = start + 1
+            var high = count
+            var best = start + 1
+            while low <= high {
+                let mid = (low + high) / 2
+                if measuredWidth(of: value, range: start..<mid) <= maxWidth {
+                    best = mid
+                    low = mid + 1
+                } else {
+                    high = mid - 1
+                }
+            }
+            ranges.append(start..<max(best, start + 1))
+            start = max(best, start + 1)
+        }
+        return ranges
+    }
+
+    private func measuredWidth(of value: String, range: Range<Int>) -> CGFloat {
+        let lower = value.index(value.startIndex, offsetBy: range.lowerBound)
+        let upper = value.index(value.startIndex, offsetBy: range.upperBound)
+        let attributed = NSAttributedString(string: String(value[lower..<upper]),
+                                            attributes: [.font: NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)])
+        let line = CTLineCreateWithAttributedString(attributed)
+        return CGFloat(CTLineGetTypographicBounds(line, nil, nil, nil))
     }
 
     private func notifyStateChanged() {

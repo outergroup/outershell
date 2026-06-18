@@ -5681,6 +5681,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         let value = createValues[key] ?? (key == Self.filePickerFilenameKey ? pendingFilePicker?.filename : nil) ?? selectedRecipe()?.fields.first(where: { $0.key == key })?.defaultValue ?? ""
         isSynchronizingCreateInput = true
         createInputController.allowsNewlines = key == "bashCommands"
+        createInputController.visualLineWidth = createFieldLayouts[key]?.multiline == true ? createFieldLayouts[key]?.textFrame.width : nil
         createInputController.setText(value)
         createInputController.focus(selectAll: selectAll)
         if let cursorPosition {
@@ -5694,6 +5695,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
     private func blurCreateField() {
         createInputController.allowsNewlines = false
+        createInputController.visualLineWidth = nil
         createInputController.blur()
         updateInputMode()
         updateEditingAndPasteboardState()
@@ -5730,6 +5732,13 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 dismissCreateOverlay()
             }
             return
+        }
+        if let key = activeCreateFieldKey,
+           let layout = createFieldLayouts[key],
+           layout.multiline {
+            createInputController.visualLineWidth = layout.textFrame.width
+        } else {
+            createInputController.visualLineWidth = nil
         }
         createInputController.performCommand(command)
     }
@@ -5817,25 +5826,71 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
     private func createTextAreaLineFragments(text: String, layout: CreateFieldLayout) -> [CreateTextLineFragment] {
         let lineHeight: CGFloat = 16
-        let lineCount = max(text.components(separatedBy: "\n").count, 1)
         var fragments: [CreateTextLineFragment] = []
-        fragments.reserveCapacity(lineCount)
 
         var start = 0
+        var visualLineIndex = 0
         let parts = text.split(separator: "\n", omittingEmptySubsequences: false)
         if parts.isEmpty {
             return [CreateTextLineFragment(text: "", start: 0, end: 0, y: layout.textFrame.maxY - lineHeight)]
         }
-        for (index, part) in parts.enumerated() {
+        for part in parts {
             let lineText = String(part)
             let end = start + lineText.count
-            fragments.append(CreateTextLineFragment(text: lineText,
-                                                    start: start,
-                                                    end: end,
-                                                    y: layout.textFrame.maxY - CGFloat(index + 1) * lineHeight))
+            let wrappedRanges = wrappedCreateTextRanges(for: lineText,
+                                                        maxWidth: layout.textFrame.width,
+                                                        monospaced: layout.monospaced)
+            for range in wrappedRanges {
+                let fragmentStart = start + range.lowerBound
+                let fragmentEnd = start + range.upperBound
+                let lower = lineText.index(lineText.startIndex, offsetBy: range.lowerBound)
+                let upper = lineText.index(lineText.startIndex, offsetBy: range.upperBound)
+                fragments.append(CreateTextLineFragment(text: String(lineText[lower..<upper]),
+                                                        start: fragmentStart,
+                                                        end: fragmentEnd,
+                                                        y: layout.textFrame.maxY - CGFloat(visualLineIndex + 1) * lineHeight))
+                visualLineIndex += 1
+            }
             start = end + 1
         }
         return fragments
+    }
+
+    private func wrappedCreateTextRanges(for text: String,
+                                         maxWidth: CGFloat,
+                                         monospaced: Bool) -> [Range<Int>] {
+        let count = text.count
+        guard count > 0 else { return [0..<0] }
+        guard maxWidth > 1 else { return (0..<count).map { $0..<($0 + 1) } }
+
+        var ranges: [Range<Int>] = []
+        var start = 0
+        while start < count {
+            var low = start + 1
+            var high = count
+            var best = start + 1
+            while low <= high {
+                let mid = (low + high) / 2
+                if measuredCreateTextWidth(text, range: start..<mid, monospaced: monospaced) <= maxWidth {
+                    best = mid
+                    low = mid + 1
+                } else {
+                    high = mid - 1
+                }
+            }
+            ranges.append(start..<max(best, start + 1))
+            start = max(best, start + 1)
+        }
+        return ranges
+    }
+
+    private func measuredCreateTextWidth(_ text: String,
+                                         range: Range<Int>,
+                                         monospaced: Bool) -> CGFloat {
+        let lower = text.index(text.startIndex, offsetBy: range.lowerBound)
+        let upper = text.index(text.startIndex, offsetBy: range.upperBound)
+        let line = makeCreateFieldLine(for: String(text[lower..<upper]), monospaced: monospaced)
+        return CGFloat(CTLineGetTypographicBounds(line, nil, nil, nil))
     }
 
     private func makePasswordFieldLine(for text: String) -> CTLine {
