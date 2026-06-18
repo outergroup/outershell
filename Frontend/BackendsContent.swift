@@ -991,6 +991,17 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                  replacementLength: replacementLength)
             }
 
+        case .setMarkedText(let text, let selectedLocation, let selectedLength, let hasReplacementRange, let replacementLocation, let replacementLength):
+            handleSetMarkedText(text,
+                                selectedLocation: Int(selectedLocation),
+                                selectedLength: Int(selectedLength),
+                                hasReplacementRange: hasReplacementRange,
+                                replacementLocation: Int(replacementLocation),
+                                replacementLength: Int(replacementLength))
+
+        case .unmarkText:
+            handleUnmarkText()
+
         case .textCommand(let command):
             handleTextCommand(command)
 
@@ -5554,6 +5565,65 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         let cleaned = activeCreateFieldKey == "bashCommands" ? cleanBashCommandText(text) : cleanSingleLineText(text)
         guard !cleaned.isEmpty else { return }
         createInputController.insertText(cleaned)
+    }
+
+    private func activeCreateReplacementRange(hasReplacementRange: Bool,
+                                              replacementLocation: Int,
+                                              replacementLength: Int) -> Range<Int>? {
+        guard hasReplacementRange else { return nil }
+        let start = min(max(replacementLocation, 0), createInputController.text.count)
+        let end = min(max(start + replacementLength, start), createInputController.text.count)
+        return start..<end
+    }
+
+    private func passwordReplacementRange(hasReplacementRange: Bool,
+                                          replacementLocation: Int,
+                                          replacementLength: Int) -> Range<Int>? {
+        guard hasReplacementRange else { return nil }
+        let start = min(max(replacementLocation, 0), passwordInputController.text.count)
+        let end = min(max(start + replacementLength, start), passwordInputController.text.count)
+        return start..<end
+    }
+
+    private func handleSetMarkedText(_ text: String,
+                                     selectedLocation: Int,
+                                     selectedLength: Int,
+                                     hasReplacementRange: Bool,
+                                     replacementLocation: Int,
+                                     replacementLength: Int) {
+        if pendingPasswordAction != nil {
+            if !passwordInputController.isFocused {
+                focusPasswordField()
+            }
+            passwordInputController.setMarkedText(cleanSingleLineText(text),
+                                                  selectedLocation: selectedLocation,
+                                                  selectedLength: selectedLength,
+                                                  replacementRange: passwordReplacementRange(hasReplacementRange: hasReplacementRange,
+                                                                                            replacementLocation: replacementLocation,
+                                                                                            replacementLength: replacementLength))
+            return
+        }
+
+        guard mode == .create else { return }
+        if !createInputController.isFocused {
+            focusActiveCreateField()
+        }
+        let cleaned = cleanTextForActiveCreateField(text)
+        createInputController.setMarkedText(cleaned,
+                                            selectedLocation: min(selectedLocation, cleaned.count),
+                                            selectedLength: selectedLength,
+                                            replacementRange: activeCreateReplacementRange(hasReplacementRange: hasReplacementRange,
+                                                                                          replacementLocation: replacementLocation,
+                                                                                          replacementLength: replacementLength))
+    }
+
+    private func handleUnmarkText() {
+        if pendingPasswordAction != nil, passwordInputController.isFocused {
+            passwordInputController.unmarkText()
+            return
+        }
+        guard mode == .create, createInputController.isFocused else { return }
+        createInputController.unmarkText()
     }
 
     private func cleanSingleLineText(_ text: String) -> String {
