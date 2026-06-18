@@ -3243,55 +3243,24 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         let selectionColor = resolvedCGColor(windowIsActive ? NSColor.selectedTextBackgroundColor.withAlphaComponent(0.78) : NSColor.unemphasizedSelectedTextBackgroundColor.withAlphaComponent(0.78))
         let selectionRect = expandedLogTextContentRect(containing: visibleTextRect,
                                                        contentHeight: contentHeight)
-        let metrics = logVisualLineMetrics(textWidth: textWidth)
-        guard !metrics.lines.isEmpty else {
-            return
-        }
-
-        let firstLine = max(Int(floor(max(selectionRect.minY, 0) / metrics.lineHeight)), 0)
-        let lastLine = min(Int(floor(max(selectionRect.maxY - 0.001, 0) / metrics.lineHeight)), metrics.lines.count - 1)
-        if firstLine <= lastLine {
-            for lineIndex in firstLine...lastLine {
-                let line = metrics.lines[lineIndex]
-                let intersection = NSIntersectionRange(selectionRange, line.range)
-                let selectsEmptyLine = line.range.length == 0 &&
-                                       selectionRange.location <= line.range.location &&
-                                       selectionRange.location + selectionRange.length > line.range.location
-                guard intersection.length > 0 || selectsEmptyLine else {
-                    continue
-                }
-
-                let startColumn: Int
-                let selectedColumnCount: Int
-                if selectsEmptyLine {
-                    startColumn = 0
-                    selectedColumnCount = 1
-                } else {
-                    startColumn = max(intersection.location - line.range.location, 0)
-                    selectedColumnCount = max(intersection.length, 1)
-                }
-
-                let x = min(CGFloat(startColumn) * metrics.charWidth, textWidth)
-                let width = max(min(CGFloat(selectedColumnCount) * metrics.charWidth, textWidth - x), 1)
-                let topDownY = CGFloat(lineIndex) * metrics.lineHeight
-                let rect = CGRect(x: x,
-                                  y: topDownY,
-                                  width: width,
-                                  height: metrics.lineHeight)
-                guard rect.intersects(selectionRect) else {
-                    continue
-                }
-
-                let highlight = CALayer()
-                highlight.frame = CGRect(x: rect.minX,
-                                         y: logTextSelectionLayer.bounds.height - rect.maxY,
-                                         width: rect.width,
-                                         height: rect.height)
-                highlight.backgroundColor = selectionColor
-                highlight.cornerRadius = 2
-                self.logTextSelectionLayer.addSublayer(highlight)
-                self.logTextSelectionLayers.append(highlight)
+        for rect in logTextSegmentRects(for: selectionRange, type: .selection) {
+            guard rect.intersects(selectionRect) else {
+                continue
             }
+
+            let normalizedRect = CGRect(x: rect.minX,
+                                        y: rect.minY,
+                                        width: max(rect.width, 1),
+                                        height: max(rect.height, 1))
+            let highlight = CALayer()
+            highlight.frame = CGRect(x: normalizedRect.minX,
+                                     y: logTextSelectionLayer.bounds.height - normalizedRect.maxY,
+                                     width: normalizedRect.width,
+                                     height: normalizedRect.height)
+            highlight.backgroundColor = selectionColor
+            highlight.cornerRadius = 2
+            self.logTextSelectionLayer.addSublayer(highlight)
+            self.logTextSelectionLayers.append(highlight)
         }
         logTextSelectionCoverage = (generation: logTextContentGeneration,
                                     textWidth: textWidth,
@@ -3390,6 +3359,26 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             return nil
         }
         return NSTextRange(location: start, end: end)
+    }
+
+    private func logTextLocation(for offset: Int) -> (any NSTextLocation)? {
+        logContentStorage.location(logTextLayoutManager.documentRange.location,
+                                   offsetBy: min(max(offset, 0), logAttributedText.length))
+    }
+
+    private func logTextOffset(for location: any NSTextLocation) -> Int {
+        min(max(logContentStorage.offset(from: logTextLayoutManager.documentRange.location, to: location), 0), logAttributedText.length)
+    }
+
+    private func logTextSegmentRects(for range: NSRange, type: NSTextLayoutManager.SegmentType) -> [CGRect] {
+        guard let textRange = logTextRange(for: range) else { return [] }
+        logTextLayoutManager.ensureLayout(for: textRange)
+        var rects: [CGRect] = []
+        logTextLayoutManager.enumerateTextSegments(in: textRange, type: type, options: []) { _, rect, _, _ in
+            rects.append(rect)
+            return true
+        }
+        return rects
     }
 
     private func renderCreateForm() {
@@ -7885,13 +7874,25 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func logTextOffset(atTextPoint textPoint: CGPoint) -> Int {
-        let metrics = logVisualLineMetrics()
-        guard !metrics.lines.isEmpty else { return 0 }
+        let point = CGPoint(x: max(textPoint.x, 0), y: max(textPoint.y, 0))
+        logTextLayoutManager.ensureLayout(for: logTextLayoutManager.documentRange)
+        guard let fragment = logTextLayoutManager.textLayoutFragment(for: point) else {
+            return point.y <= 0 ? 0 : logAttributedText.length
+        }
+        let fragmentFrame = fragment.layoutFragmentFrame
+        let localY = point.y - fragmentFrame.minY
+        guard let line = fragment.textLineFragment(forVerticalOffset: localY, requiresExactMatch: false) else {
+            return logTextOffset(for: fragment.rangeInElement.location)
+        }
 
-        let lineIndex = min(max(Int(floor(max(textPoint.y, 0) / metrics.lineHeight)), 0), metrics.lines.count - 1)
-        let line = metrics.lines[lineIndex]
-        let column = min(max(Int(floor(max(textPoint.x, 0) / metrics.charWidth)), 0), line.range.length)
-        return min(line.range.location + column, logAttributedText.length)
+        let fragmentStart = logTextOffset(for: fragment.rangeInElement.location)
+        let linePoint = CGPoint(x: point.x - fragmentFrame.minX - line.typographicBounds.minX,
+                                y: localY - line.typographicBounds.minY)
+        let localIndex = line.characterIndex(for: linePoint)
+        let lineLower = line.characterRange.location
+        let lineUpper = line.characterRange.location + line.characterRange.length
+        let clampedLocalIndex = min(max(localIndex, lineLower), lineUpper)
+        return min(max(fragmentStart + clampedLocalIndex, 0), logAttributedText.length)
     }
 
     private func clampAppsScrollUsingRenderedContent() -> Bool {
