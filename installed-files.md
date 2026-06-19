@@ -159,7 +159,7 @@ macOS root install:
 - `/Library/Logs/<service-id>.log`
 - `/var/run/<service-id>` for socket-activated apps
 
-The LaunchDaemon sets `OUTERCTL_PATH` to `<system-state>/bin/outerctl`.
+The LaunchDaemon sets `OUTERCTL_PATH` to `<system-state>/bin/outerctl` and `OUTERSHELL_SERVICE_STATE_DIR` to `<system-state>/apps/<service-id>`.
 
 When root support is installed from a non-root macOS session for an app that also supports user mode, Outer Shell also writes `$HOME/Library/LaunchAgents/<service-id>.plist`, `$HOME/Library/Logs/<service-id>/output.log`, and `<user-runtime>/<service-id>`. That LaunchAgent points at the root-owned payload under `<system-state>/apps/<service-id>`; it does not install another copy under `<user-state>/apps/<service-id>`.
 
@@ -185,6 +185,7 @@ Linux root install:
 - `/etc/systemd/system/<service-id>.service`
 - `/etc/systemd/system/<service-id>.socket` for socket-activated apps
 - `/var/log/outershell/<service-id>.log`
+- `<system-state>/apps/<service-id>` for root service state, exposed to the app as `OUTERSHELL_SERVICE_STATE_DIR`
 - `/run/<service-id>` for socket-activated apps
 - `<system-state>/system-binary-users/root-apps`
 

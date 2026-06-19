@@ -11036,10 +11036,6 @@ static bool install_bundled_app(const BundledAppDefinition *app,
             return false;
         }
 
-        char user_name[128] = "";
-        struct passwd *pw = getpwuid(getuid());
-        snprintf(user_name, sizeof(user_name), "%s", pw && pw->pw_name ? pw->pw_name : "");
-
         char install_root[PATH_MAX];
         snprintf(install_root, sizeof(install_root), "/opt/outershell/%s", app->install_directory_name);
         char bundles_dir[PATH_MAX];
@@ -11066,6 +11062,8 @@ static bool install_bundled_app(const BundledAppDefinition *app,
         system_binary_root_apps_marker_path(root_apps_marker, sizeof(root_apps_marker));
         char log_path[PATH_MAX];
         snprintf(log_path, sizeof(log_path), "/var/log/outershell/%s.log", app->service_id);
+        char service_state_root[PATH_MAX];
+        snprintf(service_state_root, sizeof(service_state_root), "%s/apps/%s", kSystemOuterShellRoot, app->install_directory_name);
         char unit_path[PATH_MAX];
         snprintf(unit_path, sizeof(unit_path), "/etc/systemd/system/%s", app->unit_name);
         char socket_unit_name[256] = "";
@@ -11097,6 +11095,7 @@ static bool install_bundled_app(const BundledAppDefinition *app,
         char quoted_system_users_dir[PATH_MAX + 8];
         char quoted_root_apps_marker[PATH_MAX + 8];
         char quoted_log_path[PATH_MAX + 8];
+        char quoted_service_state_root[PATH_MAX + 8];
         char quoted_unit_path[PATH_MAX + 8];
         char quoted_socket_unit[320] = "";
         char quoted_socket_unit_path[PATH_MAX + 8] = "";
@@ -11115,6 +11114,7 @@ static bool install_bundled_app(const BundledAppDefinition *app,
         shell_quote(system_users_dir, quoted_system_users_dir, sizeof(quoted_system_users_dir));
         shell_quote(root_apps_marker, quoted_root_apps_marker, sizeof(quoted_root_apps_marker));
         shell_quote(log_path, quoted_log_path, sizeof(quoted_log_path));
+        shell_quote(service_state_root, quoted_service_state_root, sizeof(quoted_service_state_root));
         shell_quote(unit_path, quoted_unit_path, sizeof(quoted_unit_path));
         if (socket_unit_name[0]) shell_quote(socket_unit_name, quoted_socket_unit, sizeof(quoted_socket_unit)); else quoted_socket_unit[0] = '\0';
         if (socket_unit_path[0]) shell_quote(socket_unit_path, quoted_socket_unit_path, sizeof(quoted_socket_unit_path)); else quoted_socket_unit_path[0] = '\0';
@@ -11159,6 +11159,7 @@ static bool install_bundled_app(const BundledAppDefinition *app,
                  "Environment=HOME=%s\n"
                  "Environment=USER=%s\n"
                  "Environment=LOGNAME=%s\n"
+                 "Environment=OUTERSHELL_SERVICE_STATE_DIR=%s\n"
                  "Environment=OUTERCTL_PATH=%s\n"
                  "Environment=OUTERSHELLD_API_SOCKET=/run/outershelld-api\n"
                  "ExecStart=%s\n"
@@ -11171,9 +11172,10 @@ static bool install_bundled_app(const BundledAppDefinition *app,
                  "WantedBy=multi-user.target\n",
                  description,
                  install_root,
-                 home_directory(),
-                 user_name,
-                 user_name,
+                 "/root",
+                 "root",
+                 "root",
+                 service_state_root,
                  wrapper_path,
                  exec_start,
                  log_path,
@@ -11229,8 +11231,9 @@ static bool install_bundled_app(const BundledAppDefinition *app,
                 "timeout 12s systemctl --system stop %s >/dev/null 2>&1 || true\n"
                 "timeout 5s systemctl --system reset-failed %s >/dev/null 2>&1 || true\n"
                 "rm -rf -- %s\n"
-                "mkdir -p %s %s /var/log/outershell %s\n"
+                "mkdir -p %s %s /var/log/outershell %s %s\n"
                 "chmod 0755 %s\n"
+                "chmod 0700 %s\n"
                 "install -m 0755 %s %s\n"
                 "install -m 0644 %s %s\n"
                 "install -m 0644 %s %s\n",
@@ -11240,7 +11243,9 @@ static bool install_bundled_app(const BundledAppDefinition *app,
                 quoted_install_root,
                 quoted_bundles_dir,
                 quoted_system_outershell_root,
+                quoted_service_state_root,
                 quoted_system_outershell_root,
+                quoted_service_state_root,
                 quoted_binary_source,
                 quoted_target_binary,
                 quoted_source_bundle_arm,
@@ -11737,6 +11742,7 @@ static bool make_bundled_launchd_plist(const char *label,
                                        const char *working_directory,
                                        const char *outerctl_path,
                                        const char *log_path,
+                                       const char *service_state_dir,
                                        StringBuilder *builder) {
     bool ok = sb_append(builder,
                         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
@@ -11779,6 +11785,13 @@ static bool make_bundled_launchd_plist(const char *label,
                          "        <key>OUTERSHELL_LOG_PATH</key>\n"
                          "        <string>");
     ok = ok && sb_append_xml_escaped(builder, log_path);
+    if (service_state_dir && service_state_dir[0]) {
+        ok = ok && sb_append(builder,
+                             "</string>\n"
+                             "        <key>OUTERSHELL_SERVICE_STATE_DIR</key>\n"
+                             "        <string>");
+        ok = ok && sb_append_xml_escaped(builder, service_state_dir);
+    }
     ok = ok && sb_append(builder,
                          "</string>\n"
                          "    </dict>\n"
@@ -11925,6 +11938,7 @@ static bool install_bundled_app_user_launchagent_for_system_payload(const Bundle
                                     uses_app_bundle ? system_app_bundle : system_install_root,
                                     outerctl_path,
                                     log_path,
+                                    "",
                                     &plist)) {
         free(plist.data);
         snprintf(message, message_size, "Failed to generate LaunchAgent plist.");
@@ -12078,6 +12092,8 @@ static bool install_bundled_app_macos(const BundledAppDefinition *app,
         snprintf(log_path, sizeof(log_path), "/Library/Logs/%s.log", app->service_id);
         char plist_path[PATH_MAX];
         snprintf(plist_path, sizeof(plist_path), "/Library/LaunchDaemons/%s.plist", app->service_id);
+        char service_state_root[PATH_MAX];
+        snprintf(service_state_root, sizeof(service_state_root), "%s", install_root);
 
         StringBuilder plist = {0};
         if (!make_bundled_launchd_plist(app->service_id,
@@ -12089,6 +12105,7 @@ static bool install_bundled_app_macos(const BundledAppDefinition *app,
                                         source_is_app_bundle ? target_app_bundle : install_root,
                                         outerctl_path,
                                         log_path,
+                                        service_state_root,
                                         &plist)) {
             free(plist.data);
             snprintf(message, message_size, "Failed to generate LaunchDaemon plist.");
@@ -12330,6 +12347,7 @@ static bool install_bundled_app_macos(const BundledAppDefinition *app,
                                     source_is_app_bundle ? target_app_bundle : install_root,
                                     outerctl_path,
                                     log_path,
+                                    "",
                                     &plist)) {
         free(plist.data);
         snprintf(message, message_size, "Failed to generate LaunchAgent plist.");
