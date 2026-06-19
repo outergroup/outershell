@@ -1616,21 +1616,6 @@ static void legacy_outer_shell_outerctl_path(char *out, size_t out_size) {
 #endif
 }
 
-static bool resolve_user_script_path(const char *raw_path,
-                                     const char *working_directory,
-                                     char *out,
-                                     size_t out_size) {
-    char expanded[PATH_MAX];
-    expand_tilde_path(raw_path, expanded, sizeof(expanded));
-    if (!expanded[0]) return false;
-    if (expanded[0] == '/') {
-        snprintf(out, out_size, "%s", expanded);
-    } else {
-        append_path_component(out, out_size, working_directory && working_directory[0] ? working_directory : home_directory(), expanded);
-    }
-    return out[0] != '\0';
-}
-
 static bool sudo_failure_needs_password(const char *output, int exit_status);
 static bool read_exact_with_timeout(int fd, void *buffer, size_t length, int timeout_ms);
 static bool run_sudo_shell(const char *command, const char *password, char *output, size_t output_size, int *exit_status);
@@ -6191,10 +6176,11 @@ static bool build_backend_payload(const char *service_id,
                                   const char *launchd_plist_path,
                                   const char *installed_version,
                                   const char *available_version,
+                                  const char *script_path,
                                   StringBuilder *frontends_array,
                                   StringBuilder *log_files_array,
                                   StringBuilder *payload) {
-    if (!binary_append_zero(payload, 100)) return false;
+    if (!binary_append_zero(payload, 108)) return false;
     return binary_append_string_ref_at(payload, 0, service_id) &&
            binary_append_string_ref_at(payload, 8, display_name && display_name[0] ? display_name : service_id) &&
            binary_append_string_ref_at(payload, 16, service_unit) &&
@@ -6207,7 +6193,38 @@ static bool build_backend_payload(const char *service_id,
            binary_append_child_ref_at(payload, 68, frontends_array) &&
            binary_append_child_ref_at(payload, 76, log_files_array) &&
            binary_append_string_ref_at(payload, 84, installed_version) &&
-           binary_append_string_ref_at(payload, 92, available_version);
+           binary_append_string_ref_at(payload, 92, available_version) &&
+           binary_append_string_ref_at(payload, 100, script_path);
+}
+
+static void managed_backend_script_path(const char *service_id,
+                                        const char *service_scope,
+                                        char *out,
+                                        size_t out_size) {
+    if (!out || out_size == 0) return;
+    out[0] = '\0';
+    if (!safe_service_directory_name(service_id)) return;
+
+    char install_root[PATH_MAX] = "";
+#ifndef __APPLE__
+    if (service_scope && strcmp(service_scope, "system") == 0) {
+        snprintf(install_root, sizeof(install_root), "%s/apps/%s", kSystemOuterShellRoot, service_id);
+    } else
+#endif
+    {
+        default_user_outershell_app_root(service_id, install_root, sizeof(install_root));
+    }
+
+    const char *filenames[] = {"run.sh", "run.py"};
+    for (size_t i = 0; i < sizeof(filenames) / sizeof(filenames[0]); i++) {
+        char candidate[PATH_MAX];
+        snprintf(candidate, sizeof(candidate), "%s/%s", install_root, filenames[i]);
+        struct stat st;
+        if (stat(candidate, &st) == 0 && S_ISREG(st.st_mode)) {
+            snprintf(out, out_size, "%s", candidate);
+            return;
+        }
+    }
 }
 
 static bool append_registered_backend_payloads(const RegistryStore *database,
@@ -6299,12 +6316,14 @@ static bool append_registered_backend_payloads(const RegistryStore *database,
         StringBuilder frontends = {0};
         StringBuilder logs = {0};
         StringBuilder payload = {0};
+        char script_path[PATH_MAX] = "";
+        managed_backend_script_path(service_id, effective_service_scope, script_path, sizeof(script_path));
         bool service_is_running = strcmp(status, "running") == 0;
         ok = build_frontends_array_payload(database, layout_database ? layout_database : database, service_id, service_is_running, &frontends) &&
              build_log_files_array_payload(database, service_id, &logs) &&
              build_backend_payload(service_id, display_name, service_unit, service_unit_path,
                                    effective_service_scope, status, flags, "",
-                                   plist_path, installed_version, available_version, &frontends, &logs, &payload) &&
+                                   plist_path, installed_version, available_version, script_path, &frontends, &logs, &payload) &&
              binary_payload_list_append(payloads, &payload);
         free(frontends.data);
         free(logs.data);
@@ -6332,6 +6351,7 @@ static bool append_root_migration_backend_payload(BinaryPayloadList *payloads) {
                                     "system",
                                     "pending",
                                     BACKEND_FLAG_CAN_CONTROL | BACKEND_FLAG_IS_INSTALLED | BACKEND_FLAG_IS_MIGRATION,
+                                    "",
                                     "",
                                     "",
                                     "",
@@ -6365,6 +6385,7 @@ static bool append_bundled_backend_placeholder_payload(BinaryPayloadList *payloa
                                     app->icon_symbol_name ? app->icon_symbol_name : "",
                                     "",
                                     app->version ? app->version : "",
+                                    "",
                                     "",
                                     &frontends,
                                     &logs,
@@ -8820,9 +8841,11 @@ static int compare_file_picker_entries(const void *lhs, const void *rhs) {
 
 static bool build_file_picker_entry_payload(const FilePickerEntry *entry, StringBuilder *payload) {
     if (!binary_append_zero(payload, 40)) return false;
+    uint32_t flags = 0;
+    if (entry->is_directory) flags |= FILE_PICKER_FLAG_IS_DIRECTORY;
     return binary_append_string_ref_at(payload, 0, entry->name) &&
            binary_append_string_ref_at(payload, 8, entry->path) &&
-           binary_write_u32_at(payload, 16, entry->is_directory ? FILE_PICKER_FLAG_IS_DIRECTORY : 0) &&
+           binary_write_u32_at(payload, 16, flags) &&
            binary_write_u64_at(payload, 20, entry->size) &&
            binary_write_f64_at(payload, 28, entry->modified);
 }
@@ -8913,6 +8936,7 @@ static void send_file_picker_response(int fd, const char *query) {
         file->modified = (double)st.st_mtime;
         file->mode = st.st_mode;
     }
+
     closedir(dir);
 
     qsort(entries, count, sizeof(FilePickerEntry), compare_file_picker_entries);
@@ -9093,27 +9117,25 @@ static bool make_fixed_port_script(const char *service_id,
         sb_append(builder, quoted_id) &&
         sb_append(builder, "\nDISPLAY_NAME=") &&
         sb_append(builder, quoted_name) &&
-        sb_append(builder, "\nPORT=") &&
-        sb_append(builder, quoted_port) &&
-        sb_append(builder, "\nSOCKET_PATH=") &&
-        sb_append(builder, quoted_socket_path) &&
-        sb_append(builder, "\nENDPOINT_KIND=") &&
-        sb_append(builder, use_unix_socket ? "unixSocket" : "port") &&
-        sb_append(builder,
-        "\nexport BACKEND_ID DISPLAY_NAME PORT SOCKET_PATH ENDPOINT_KIND\n"
-        ) &&
+        (use_unix_socket
+            ? (sb_append(builder, "\nSOCKET_PATH=") &&
+               sb_append(builder, quoted_socket_path) &&
+               sb_append(builder, "\nexport BACKEND_ID DISPLAY_NAME SOCKET_PATH\n"))
+            : (sb_append(builder, "\nPORT=") &&
+               sb_append(builder, quoted_port) &&
+               sb_append(builder, "\nexport BACKEND_ID DISPLAY_NAME PORT\n"))) &&
         append_generated_script_log_redirect(builder) &&
         append_inline_shell_startup_snapshot(builder) &&
-        sb_append(builder,
-        "\n"
-        "if [ \"$ENDPOINT_KIND\" = unixSocket ]; then\n"
-        "    socket_dir=${SOCKET_PATH%/*}\n"
-        "    if [ -n \"$socket_dir\" ] && [ \"$socket_dir\" != \"$SOCKET_PATH\" ]; then\n"
-        "        mkdir -p \"$socket_dir\"\n"
-        "    fi\n"
-        "    rm -f \"$SOCKET_PATH\"\n"
-        "fi\n"
-        "\n") &&
+        (use_unix_socket
+            ? sb_append(builder,
+                "\n"
+                "socket_dir=${SOCKET_PATH%/*}\n"
+                "if [ -n \"$socket_dir\" ] && [ \"$socket_dir\" != \"$SOCKET_PATH\" ]; then\n"
+                "    mkdir -p \"$socket_dir\"\n"
+                "fi\n"
+                "rm -f \"$SOCKET_PATH\"\n"
+                "\n")
+            : sb_append(builder, "\n")) &&
         sb_append(builder, command) &&
         sb_append(builder, "\n");
 }
@@ -9122,6 +9144,7 @@ static bool make_jupyter_script(const char *service_id,
                                 const char *display_name,
                                 const char *python,
                                 const char *port,
+                                const char *socket_path,
                                 bool use_unix_socket,
                                 bool project_venv,
                                 StringBuilder *builder) {
@@ -9167,7 +9190,6 @@ static bool make_jupyter_script(const char *service_id,
         "import signal\n"
         "import subprocess\n"
         "import sys\n"
-        "import tempfile\n"
         "import time\n"
         "from urllib.parse import urlencode, urlsplit\n"
         "\n"
@@ -9180,24 +9202,11 @@ static bool make_jupyter_script(const char *service_id,
     ok = ok && sb_append_python_list(builder, module_command, command_count);
     ok = ok && sb_append(builder, "\nPROBE_COMMAND = ");
     ok = ok && sb_append_python_list(builder, probe_command, probe_count);
-    ok = ok && sb_append(builder, "\nUSE_UNIX_SOCKET = ");
-    ok = ok && sb_append(builder, use_unix_socket ? "True" : "False");
+    if (use_unix_socket) {
+        ok = ok && sb_append(builder, "\nSOCKET_PATH = ");
+        ok = ok && sb_append_python_string(builder, socket_path ? socket_path : "");
+    }
     ok = ok && sb_append(builder,
-        "\n"
-        "def runtime_socket_directory():\n"
-        "    if sys.platform == \"darwin\":\n"
-        "        return tempfile.gettempdir()\n"
-        "    if sys.platform.startswith(\"linux\") and os.geteuid() == 0:\n"
-        "        return \"/run\"\n"
-        "    runtime_dir = os.environ.get(\"XDG_RUNTIME_DIR\", \"\").strip()\n"
-        "    if runtime_dir:\n"
-        "        return runtime_dir\n"
-        "    if sys.platform.startswith(\"linux\"):\n"
-        "        return f\"/run/user/{os.getuid()}\"\n"
-        "    return tempfile.gettempdir()\n"
-        "\n"
-        "SOCKET_DIRECTORY = runtime_socket_directory()\n"
-        "SOCKET_PATH = os.path.join(SOCKET_DIRECTORY, BACKEND_ID)\n"
         "\n"
         "child = None\n"
         "\n"
@@ -9215,14 +9224,17 @@ static bool make_jupyter_script(const char *service_id,
         "        log(f\"outerctl failed ({result.returncode})\" + (f\": {detail}\" if detail else \"\"))\n"
         "\n"
         "def build_command() -> list[str]:\n"
-        "    command = list(BASE_COMMAND)\n"
-        "    if USE_UNIX_SOCKET:\n"
-        "        command.extend([\n"
-        "            f\"--ServerApp.sock={SOCKET_PATH}\",\n"
-        "            \"--ServerApp.sock_mode=0600\",\n"
-        "            \"--IdentityProvider.token=\",\n"
-        "            \"--ServerApp.password=\",\n"
-        "        ])\n"
+        "    command = list(BASE_COMMAND)\n");
+    if (use_unix_socket) {
+        ok = ok && sb_append(builder,
+            "    command.extend([\n"
+            "        f\"--ServerApp.sock={SOCKET_PATH}\",\n"
+            "        \"--ServerApp.sock_mode=0600\",\n"
+            "        \"--IdentityProvider.token=\",\n"
+            "        \"--ServerApp.password=\",\n"
+            "    ])\n");
+    }
+    ok = ok && sb_append(builder,
         "    return command\n"
         "\n"
         "def resource_python_path():\n"
@@ -9270,40 +9282,74 @@ static bool make_jupyter_script(const char *service_id,
         "        log(f\"using Jupyter package favicon at {path}\")\n"
         "        return path\n"
         "    return None\n"
-        "\n"
-        "def probe_frontend():\n"
-        "    probe_result = subprocess.run(PROBE_COMMAND, capture_output=True, text=True)\n"
-        "    for line in probe_result.stdout.splitlines():\n"
-        "        line = line.strip()\n"
-        "        if not line:\n"
-        "            continue\n"
-        "        try:\n"
-        "            entry = json.loads(line)\n"
-        "        except json.JSONDecodeError:\n"
-        "            continue\n"
-        "        server_url = entry.get(\"url\")\n"
-        "        token = entry.get(\"token\")\n"
-        "        if not isinstance(server_url, str) or not server_url:\n"
-        "            continue\n"
-        "        frontend_url = (server_url if server_url.endswith(\"/\") else server_url + \"/\") + \"lab\"\n"
-        "        if not USE_UNIX_SOCKET and isinstance(token, str) and token:\n"
-        "            separator = \"&\" if \"?\" in frontend_url else \"?\"\n"
-        "            frontend_url = frontend_url + separator + urlencode({\"token\": token})\n"
-        "        parsed_frontend = urlsplit(frontend_url)\n"
-        "        app_url = parsed_frontend.path or \"/\"\n"
-        "        if parsed_frontend.query:\n"
-        "            app_url += \"?\" + parsed_frontend.query\n"
-        "        icon_path = jupyter_icon_path()\n"
-        "        if USE_UNIX_SOCKET:\n"
-        "            return app_url, icon_path\n"
-        "        port = entry.get(\"port\")\n"
-        "        try:\n"
-        "            port = int(port)\n"
-        "        except (TypeError, ValueError):\n"
-        "            continue\n"
-        "        return str(port), app_url, icon_path\n"
-        "    return None\n"
-        "\n"
+        "\n");
+    if (use_unix_socket) {
+        ok = ok && sb_append(builder,
+            "def probe_frontend():\n"
+            "    probe_result = subprocess.run(PROBE_COMMAND, capture_output=True, text=True)\n"
+            "    for line in probe_result.stdout.splitlines():\n"
+            "        line = line.strip()\n"
+            "        if not line:\n"
+            "            continue\n"
+            "        try:\n"
+            "            entry = json.loads(line)\n"
+            "        except json.JSONDecodeError:\n"
+            "            continue\n"
+            "        server_url = entry.get(\"url\")\n"
+            "        if not isinstance(server_url, str) or not server_url:\n"
+            "            continue\n"
+            "        frontend_url = (server_url if server_url.endswith(\"/\") else server_url + \"/\") + \"lab\"\n"
+            "        parsed_frontend = urlsplit(frontend_url)\n"
+            "        app_url = parsed_frontend.path or \"/\"\n"
+            "        if parsed_frontend.query:\n"
+            "            app_url += \"?\" + parsed_frontend.query\n"
+            "        return app_url, jupyter_icon_path()\n"
+            "    return None\n"
+            "\n"
+            "def frontend_add_args(discovered):\n"
+            "    app_url, icon_path = discovered\n"
+            "    args = [\"app\", \"add\", \"--backend\", BACKEND_ID, \"--frontend-id\", f\"{BACKEND_ID}:main\", \"--socket-path\", SOCKET_PATH, \"--name\", DISPLAY_NAME, \"--url\", app_url]\n"
+            "    return args, icon_path\n"
+            "\n");
+    } else {
+        ok = ok && sb_append(builder,
+            "def probe_frontend():\n"
+            "    probe_result = subprocess.run(PROBE_COMMAND, capture_output=True, text=True)\n"
+            "    for line in probe_result.stdout.splitlines():\n"
+            "        line = line.strip()\n"
+            "        if not line:\n"
+            "            continue\n"
+            "        try:\n"
+            "            entry = json.loads(line)\n"
+            "        except json.JSONDecodeError:\n"
+            "            continue\n"
+            "        server_url = entry.get(\"url\")\n"
+            "        token = entry.get(\"token\")\n"
+            "        if not isinstance(server_url, str) or not server_url:\n"
+            "            continue\n"
+            "        frontend_url = (server_url if server_url.endswith(\"/\") else server_url + \"/\") + \"lab\"\n"
+            "        if isinstance(token, str) and token:\n"
+            "            separator = \"&\" if \"?\" in frontend_url else \"?\"\n"
+            "            frontend_url = frontend_url + separator + urlencode({\"token\": token})\n"
+            "        parsed_frontend = urlsplit(frontend_url)\n"
+            "        app_url = parsed_frontend.path or \"/\"\n"
+            "        if parsed_frontend.query:\n"
+            "            app_url += \"?\" + parsed_frontend.query\n"
+            "        port = entry.get(\"port\")\n"
+            "        try:\n"
+            "            port = int(port)\n"
+            "        except (TypeError, ValueError):\n"
+            "            continue\n"
+            "        return str(port), app_url, jupyter_icon_path()\n"
+            "    return None\n"
+            "\n"
+            "def frontend_add_args(discovered):\n"
+            "    port, app_url, icon_path = discovered\n"
+            "    args = [\"app\", \"add\", \"--backend\", BACKEND_ID, \"--frontend-id\", f\"{BACKEND_ID}:main\", \"--port\", port, \"--name\", DISPLAY_NAME, \"--url\", app_url]\n"
+            "    return args, icon_path\n"
+            "\n");
+    }
+    ok = ok && sb_append(builder,
         "def handle_signal(signum, _frame):\n"
         "    raise SystemExit(128 + signum)\n"
         "\n"
@@ -9312,13 +9358,18 @@ static bool make_jupyter_script(const char *service_id,
         "probe_attempts = 0\n"
         "announced = False\n"
         "\n"
-        "try:\n"
-        "    if USE_UNIX_SOCKET:\n"
-        "        os.makedirs(SOCKET_DIRECTORY, exist_ok=True)\n"
-        "        try:\n"
-        "            os.unlink(SOCKET_PATH)\n"
-        "        except FileNotFoundError:\n"
-        "            pass\n"
+        "try:\n");
+    if (use_unix_socket) {
+        ok = ok && sb_append(builder,
+            "    socket_dir = os.path.dirname(SOCKET_PATH)\n"
+            "    if socket_dir:\n"
+            "        os.makedirs(socket_dir, exist_ok=True)\n"
+            "    try:\n"
+            "        os.unlink(SOCKET_PATH)\n"
+            "    except FileNotFoundError:\n"
+            "        pass\n");
+    }
+    ok = ok && sb_append(builder,
         "    child = subprocess.Popen(build_command())\n"
         "    while True:\n"
         "        status = child.poll()\n"
@@ -9327,12 +9378,7 @@ static bool make_jupyter_script(const char *service_id,
         "        if not announced:\n"
         "            discovered = probe_frontend()\n"
         "            if discovered is not None:\n"
-        "                if USE_UNIX_SOCKET:\n"
-        "                    app_url, icon_path = discovered\n"
-        "                    add_args = [\"app\", \"add\", \"--backend\", BACKEND_ID, \"--frontend-id\", f\"{BACKEND_ID}:main\", \"--socket-path\", SOCKET_PATH, \"--name\", DISPLAY_NAME, \"--url\", app_url]\n"
-        "                else:\n"
-        "                    port, app_url, icon_path = discovered\n"
-        "                    add_args = [\"app\", \"add\", \"--backend\", BACKEND_ID, \"--frontend-id\", f\"{BACKEND_ID}:main\", \"--port\", port, \"--name\", DISPLAY_NAME, \"--url\", app_url]\n"
+        "                add_args, icon_path = frontend_add_args(discovered)\n"
         "                add_args.extend([\"--list\", \"Jupyter\"])\n"
         "                if icon_path:\n"
         "                    add_args.extend([\"--icon-path\", icon_path])\n"
@@ -9348,11 +9394,15 @@ static bool make_jupyter_script(const char *service_id,
         "        except subprocess.TimeoutExpired:\n"
         "            child.kill()\n"
         "            child.wait()\n"
-        "    if USE_UNIX_SOCKET:\n"
-        "        try:\n"
-        "            os.unlink(SOCKET_PATH)\n"
-        "        except FileNotFoundError:\n"
-        "            pass\n"
+        );
+    if (use_unix_socket) {
+        ok = ok && sb_append(builder,
+        "    try:\n"
+        "        os.unlink(SOCKET_PATH)\n"
+        "    except FileNotFoundError:\n"
+        "        pass\n");
+    }
+    ok = ok && sb_append(builder,
         "    pass\n");
     return ok;
 }
@@ -12496,7 +12546,7 @@ static bool uninstall_backend(const char *service_id, const char *sudo_password,
             snprintf(install_name, sizeof(install_name), "%s", app ? app->install_directory_name : service_id);
             char install_root[PATH_MAX] = "";
             if (safe_service_directory_name(install_name)) {
-                snprintf(install_root, sizeof(install_root), "/opt/outershell/%s", install_name);
+                snprintf(install_root, sizeof(install_root), "%s/apps/%s", kSystemOuterShellRoot, install_name);
             }
             char log_path[PATH_MAX];
             snprintf(log_path, sizeof(log_path), "/var/log/outershell/%s.log", service_id);
@@ -12850,7 +12900,6 @@ static void send_recipes_response(int fd) {
     ok = ok &&
          append_field_payload(&fields, "command", "Command", "", "text", "bundle exec jekyll serve --host 0.0.0.0", NULL, NULL, 0) &&
          append_field_payload(&fields, "workdir", "Working Dir", "~", "directory", "~", NULL, NULL, 0) &&
-         append_field_payload(&fields, "scriptPath", "Script Path", "", "file", "~/dev/run-service.sh", NULL, NULL, 0) &&
          append_field_payload(&fields, "frontendTransport", "Connection", "port", "choice", "", NULL, connection_choices, 2) &&
          append_field_payload(&fields, "port", "Port", "", "text", "4000", NULL, NULL, 0) &&
          append_field_payload(&fields, "socketPath", "Socket Path", "", "text", command_socket_placeholder, NULL, NULL, 0) &&
@@ -12863,7 +12912,6 @@ static void send_recipes_response(int fd) {
     fields = (BinaryPayloadList){0};
     ok = ok &&
          append_field_payload(&fields, "workdir", "Working Dir", "~", "directory", "~", NULL, NULL, 0) &&
-         append_field_payload(&fields, "scriptPath", "Script Path", "", "file", "~/dev/run-service.sh", NULL, NULL, 0) &&
          append_field_payload(&fields, "name", "Display Name", "", "text", "My Service", NULL, NULL, 0) &&
          append_field_payload(&fields, "identifier", "Identifier", "", "text", "my-service", NULL, NULL, 0) &&
          append_recipe_payload(&recipes, "custom", "Blank Script",
@@ -12874,7 +12922,6 @@ static void send_recipes_response(int fd) {
     ok = ok &&
          append_field_payload(&fields, "python", "Python", "/usr/bin/python3", "file", "/usr/bin/python3", &seen, NULL, 0) &&
          append_field_payload(&fields, "workdir", "Working Dir", "~/dev", "directory", "~/dev", NULL, NULL, 0) &&
-         append_field_payload(&fields, "scriptPath", "Script Path", "", "file", "~/dev/run-jupyter.py", NULL, NULL, 0) &&
          append_field_payload(&fields, "frontendTransport", "Connection", "port", "choice", "", NULL, connection_choices, 2) &&
          append_field_payload(&fields, "port", "Port", "", "text", "Auto", NULL, NULL, 0) &&
          append_field_payload(&fields, "name", "Display Name", "Jupyter Lab", "text", "Jupyter Lab", NULL, NULL, 0) &&
@@ -12886,7 +12933,6 @@ static void send_recipes_response(int fd) {
     fields = (BinaryPayloadList){0};
     ok = ok &&
          append_field_payload(&fields, "projectDir", "Project Dir", "~", "directory", "~/dev/my-project", NULL, NULL, 0) &&
-         append_field_payload(&fields, "scriptPath", "Script Path", "", "file", "~/dev/my-project/run-jupyter.py", NULL, NULL, 0) &&
          append_field_payload(&fields, "frontendTransport", "Connection", "port", "choice", "", NULL, connection_choices, 2) &&
          append_field_payload(&fields, "port", "Port", "", "text", "Auto", NULL, NULL, 0) &&
          append_field_payload(&fields, "name", "Display Name", "Jupyter Lab", "text", "Jupyter Lab", NULL, NULL, 0) &&
@@ -13089,12 +13135,11 @@ static void send_create_response(int fd, const char *query) {
                                        strcmp(recipe, "jupyter") == 0 ||
                                        strcmp(recipe, "jupyter-uv") == 0;
         if (generated_script_recipe) {
-            char script_path_raw[PATH_MAX] = "";
-            query_value(query, "scriptPath", script_path_raw, sizeof(script_path_raw));
-            if (!resolve_user_script_path(script_path_raw, working_directory, script_path, sizeof(script_path))) {
-                send_action_response(fd, 400, false, "Script Path is required.");
-                return;
-            }
+            snprintf(script_path,
+                     sizeof(script_path),
+                     "%s/%s",
+                     backend_dir,
+                     (strcmp(recipe, "jupyter") == 0 || strcmp(recipe, "jupyter-uv") == 0) ? "run.py" : "run.sh");
         }
 
         if (strcmp(recipe, "command-port") == 0) {
@@ -13195,6 +13240,7 @@ static void send_create_response(int fd, const char *query) {
             }
             StringBuilder script = {0};
             if (!make_jupyter_script(service_id, display_name, python, use_unix_socket ? "" : port,
+                                     use_unix_socket ? initial_frontend_socket_path : "",
                                      use_unix_socket,
                                      strcmp(recipe, "jupyter-uv") == 0,
                                      &script)) {
