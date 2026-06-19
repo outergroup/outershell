@@ -90,8 +90,8 @@ Linux public install when connected directly as root:
 - `/etc/systemd/system/org.outershell.OuterShell.socket`
 - `/etc/systemd/system/outershelld.service`
 - `/etc/systemd/system/outershelld.socket`
-- `/var/log/outergroup/org.outershell.OuterShell.log`
-- `/var/log/outergroup/outershelld.log`
+- `/var/log/outershell/org.outershell.OuterShell.log`
+- `/var/log/outershell/outershelld.log`
 - `/run/org.outershell.OuterShell`
 - `/run/outershelld-api`
 - `<system-state>/system-binary-users/uid-0`
@@ -111,7 +111,7 @@ A non-root Linux Outer Shell can promote `outershelld` and `outerctl` into syste
 - `<system-state>/bin/outerctl`
 - `/etc/systemd/system/outershelld.service`
 - `/etc/systemd/system/outershelld.socket`
-- `/var/log/outergroup/outershelld.log`
+- `/var/log/outershell/outershelld.log`
 - `/run/outershelld-api`
 - `<user-state>/outershelld/outershelld -> <system-state>/outershelld/outershelld`
 - `<user-state>/bin/outerctl -> <system-state>/bin/outerctl`
@@ -177,14 +177,14 @@ Linux user install:
 
 Linux root install:
 
-- `/opt/outergroup/<service-id>/<binary-name>`
-- `/opt/outergroup/<service-id>/bundles/<bundle-prefix>.bundle.macos-arm.aar`
-- `/opt/outergroup/<service-id>/bundles/<bundle-prefix>.bundle.macos-x86.aar`
-- `/opt/outergroup/<service-id>/app-icon.png` when the app has a raster icon
-- `/opt/outergroup/<service-id>/version`
+- `/opt/outershell/<service-id>/<binary-name>`
+- `/opt/outershell/<service-id>/bundles/<bundle-prefix>.bundle.macos-arm.aar`
+- `/opt/outershell/<service-id>/bundles/<bundle-prefix>.bundle.macos-x86.aar`
+- `/opt/outershell/<service-id>/app-icon.png` when the app has a raster icon
+- `/opt/outershell/<service-id>/version`
 - `/etc/systemd/system/<service-id>.service`
 - `/etc/systemd/system/<service-id>.socket` for socket-activated apps
-- `/var/log/outergroup/<service-id>.log`
+- `/var/log/outershell/<service-id>.log`
 - `/run/<service-id>` for socket-activated apps
 - `<system-state>/system-binary-users/root-apps`
 
@@ -230,7 +230,7 @@ Custom backends that use Unix sockets or fixed ports register those frontends in
 Linux direct-root:
 
 - `<system-state>/apps/<service-id>/`
-- `/var/log/outergroup/<service-id>.log`
+- `/var/log/outershell/<service-id>.log`
 - `/etc/systemd/system/<service-id>.service`
 - Generated recipe scripts live at the user-selected script path.
 
@@ -249,7 +249,7 @@ Legacy paths may be migrated or removed during install:
 - Linux legacy user systemd unit: `$HOME/.config/systemd/user/outeragent.service`
 - Linux legacy Outer Shell root: `$HOME/.outerloop/outer-shell`
 - macOS legacy system root: `/Library/dev.outergroup.OuterLoop`
-- Linux legacy system root: `/var/lib/outergroup/outeragent`
+- Linux legacy system root: `/var/lib/outershell/outeragent`
 - Linux legacy root systemd unit: `/etc/systemd/system/outerloop-rootd.service`
 
 After a legacy `registry.sqlite3` is migrated or superseded by `registry.orwa`, `outershelld` renames it to `registry.sqlite3.migrated` so it is not imported again.

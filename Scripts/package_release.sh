@@ -357,6 +357,29 @@ if [ "$os_name" = "Darwin" ]; then
         return 1
     }
 
+    cleanup_legacy_macos_user_launch_agents() {
+        for legacy_plist in "$launch_agent_dir"/*.plist; do
+            [ -e "$legacy_plist" ] || continue
+            legacy_name="$(basename "$legacy_plist" .plist)"
+            remove_legacy=false
+            case "$legacy_name" in
+                dev.outergroup.Top|dev.outergroup.OuterLoopServiceList)
+                remove_legacy=true
+                    ;;
+            esac
+            if [ "$remove_legacy" = false ] && grep -q -e "dev.outergroup.Top" -e "BuiltinBackends/Top" "$legacy_plist" 2>/dev/null; then
+                remove_legacy=true
+            fi
+            [ "$remove_legacy" = true ] || continue
+            launchctl bootout "gui/$(id -u)/$legacy_name" >/dev/null 2>&1 || launchctl remove "$legacy_name" >/dev/null 2>&1 || true
+            rm -f "$legacy_plist"
+        done
+        pkill -f "$HOME/Library/dev.outergroup.OuterLoop/.*TopBackend" >/dev/null 2>&1 || true
+        pkill -f "$HOME/Library/Application Support/outershell/apps/dev\\.outergroup\\.Top/.*TopBackend" >/dev/null 2>&1 || true
+        pkill -f "/Library/Application Support/outershell/apps/dev\\.outergroup\\.Top/.*TopBackend" >/dev/null 2>&1 || true
+        pkill -f "/Applications/Outer Loop.app/Contents/Resources/Outer Loop Services.app/.*BuiltinBackends/Top/.*TopBackend" >/dev/null 2>&1 || true
+    }
+
     if [ "$command" = "uninstall" ]; then
         unload_outer_shell
         rm -f "$plist_path" "$socket_path" "$api_socket_path"
@@ -399,6 +422,7 @@ EOF
     fi
 
     mkdir -p "$app_install_root" "$tools_install_root" "$outershell_home/bin" "$launch_agent_dir" "$log_dir"
+    cleanup_legacy_macos_user_launch_agents
     archive_path="$(mktemp)"
     payload_root="$(mktemp -d)"
     stage_archive "${public_base_url%/}/latest/outer-shell-${package_arch}.zip?v=__ASSET_VERSION__" "$archive_path"
@@ -417,6 +441,7 @@ EOF
     printf '%s\n' "__OUTER_SHELL_VERSION__" > "$app_install_root/version"
     printf '%s\n' "__OUTER_SHELL_VERSION__" > "$tools_install_root/version"
     touch "$log_path"
+    OUTERSHELL_HOME="$outershell_home" "$outershelld_path" --migrate-user-state-only >> "$log_path" 2>&1 || true
 
     unload_outer_shell
     rm -f "$socket_path" "$api_socket_path"
@@ -544,8 +569,8 @@ if [ "$root_install" = true ]; then
     unit_dir="/etc/systemd/system"
     socket_path="/run/org.outershell.OuterShell"
     api_socket_path="/run/outershelld-api"
-    app_log_dir="/var/log/outergroup"
-    daemon_log_dir="/var/log/outergroup"
+    app_log_dir="/var/log/outershell"
+    daemon_log_dir="/var/log/outershell"
     log_path="$app_log_dir/org.outershell.OuterShell.log"
     broker_log_path="$daemon_log_dir/outershelld.log"
     systemctl_scope="--system"
@@ -592,20 +617,53 @@ run_outerctl() {
     OUTERSHELL_HOME="$outershell_home" OUTERSHELLD_API_SOCKET="$api_socket_path" "$outerctl_path" "$@"
 }
 
-cleanup_legacy_outeragent_user_unit() {
+cleanup_legacy_outeragent_user_units() {
     [ "$root_install" = false ] || return 0
-    systemctl --user disable --now outeragent.service >/dev/null 2>&1 || true
-    rm -f "$unit_dir/outeragent.service"
+    mkdir -p "$unit_dir"
+    for unit_path in "$unit_dir"/*.service; do
+        [ -e "$unit_path" ] || continue
+        unit_name="$(basename "$unit_path")"
+        remove_unit=false
+        case "$unit_name" in
+            outeragent.service|dev.outergroup.Top.service)
+                remove_unit=true
+                ;;
+            *)
+                if grep -q -e 'dev\.outergroup\.Top' "$unit_path" 2>/dev/null; then
+                    remove_unit=true
+                fi
+                ;;
+        esac
+        [ "$remove_unit" = true ] || continue
+        systemctl --user disable --now "$unit_name" >/dev/null 2>&1 || true
+        rm -f "$unit_path"
+        systemctl --user reset-failed "$unit_name" >/dev/null 2>&1 || true
+    done
     systemctl --user daemon-reload >/dev/null 2>&1 || true
-    systemctl --user reset-failed outeragent.service >/dev/null 2>&1 || true
 }
 
-cleanup_legacy_outeragent_system_unit() {
+cleanup_legacy_outeragent_system_units() {
     [ "$root_install" = true ] || return 0
-    systemctl --system disable --now outerloop-rootd.service >/dev/null 2>&1 || true
-    rm -f /etc/systemd/system/outerloop-rootd.service
+    for unit_path in /etc/systemd/system/*.service; do
+        [ -e "$unit_path" ] || continue
+        unit_name="$(basename "$unit_path")"
+        remove_unit=false
+        case "$unit_name" in
+            outerloop-rootd.service|dev.outergroup.Top.service)
+                remove_unit=true
+                ;;
+            *)
+                if grep -q -e 'dev\.outergroup\.Top' "$unit_path" 2>/dev/null; then
+                    remove_unit=true
+                fi
+                ;;
+        esac
+        [ "$remove_unit" = true ] || continue
+        systemctl --system disable --now "$unit_name" >/dev/null 2>&1 || true
+        rm -f "$unit_path"
+        systemctl --system reset-failed "$unit_name" >/dev/null 2>&1 || true
+    done
     systemctl --system daemon-reload >/dev/null 2>&1 || true
-    systemctl --system reset-failed outerloop-rootd.service >/dev/null 2>&1 || true
 }
 
 system_binary_users_empty() {
@@ -638,13 +696,13 @@ remove_system_binaries_if_unused() {
     rm -f /etc/systemd/system/outershelld.service /etc/systemd/system/outershelld.socket /run/outershelld-api
     systemctl --system daemon-reload >/dev/null 2>&1 || true
     rm -f "$system_outershelld_path" "$system_outerctl_path" "$system_version_path"
-    rm -f /var/log/outergroup/outershelld.log /var/log/outergroup/org.outershell.OuterShell.log
+    rm -f /var/log/outershell/outershelld.log /var/log/outershell/org.outershell.OuterShell.log
     if ! find "$system_outershell_home/apps" -mindepth 1 -print -quit 2>/dev/null | grep -q . &&
-       ! find /opt/outergroup -mindepth 1 -print -quit 2>/dev/null | grep -q .; then
+       ! find /opt/outershell -mindepth 1 -print -quit 2>/dev/null | grep -q .; then
         rm -f "$system_outershell_home/registry.orwa" "$system_outershell_home/registry.orwa.lock"
-        rmdir "$system_outershell_home/apps" /opt/outergroup >/dev/null 2>&1 || true
+        rmdir "$system_outershell_home/apps" /opt/outershell >/dev/null 2>&1 || true
     fi
-    rmdir "$system_daemon_root" "$system_outershell_home/bin" "$system_binary_users_dir" "$system_outershell_home" /var/log/outergroup >/dev/null 2>&1 || true
+    rmdir "$system_daemon_root" "$system_outershell_home/bin" "$system_binary_users_dir" "$system_outershell_home" /var/log/outershell >/dev/null 2>&1 || true
 }
 
 system_binary_cleanup_shell_functions() {
@@ -679,13 +737,13 @@ remove_system_binaries_if_unused() {
     rm -f /etc/systemd/system/outershelld.service /etc/systemd/system/outershelld.socket /run/outershelld-api
     systemctl --system daemon-reload >/dev/null 2>&1 || true
     rm -f "$system_outershelld_path" "$system_outerctl_path" "$system_version_path"
-    rm -f /var/log/outergroup/outershelld.log /var/log/outergroup/org.outershell.OuterShell.log
+    rm -f /var/log/outershell/outershelld.log /var/log/outershell/org.outershell.OuterShell.log
     if ! find "$system_outershell_home/apps" -mindepth 1 -print -quit 2>/dev/null | grep -q . &&
-       ! find /opt/outergroup -mindepth 1 -print -quit 2>/dev/null | grep -q .; then
+       ! find /opt/outershell -mindepth 1 -print -quit 2>/dev/null | grep -q .; then
         rm -f "$system_outershell_home/registry.orwa" "$system_outershell_home/registry.orwa.lock"
-        rmdir "$system_outershell_home/apps" /opt/outergroup >/dev/null 2>&1 || true
+        rmdir "$system_outershell_home/apps" /opt/outershell >/dev/null 2>&1 || true
     fi
-    rmdir "$system_daemon_root" "$system_outershell_home/bin" "$system_binary_users_dir" "$system_outershell_home" /var/log/outergroup >/dev/null 2>&1 || true
+    rmdir "$system_daemon_root" "$system_outershell_home/bin" "$system_binary_users_dir" "$system_outershell_home" /var/log/outershell >/dev/null 2>&1 || true
 }
 OUTERSHELL_SYSTEM_BINARY_CLEANUP_SH
 }
@@ -792,8 +850,8 @@ EOF
 fi
 
 mkdir -p "$install_root" "$daemon_root" "$outershell_home/bin" "$unit_dir" "$app_log_dir" "$daemon_log_dir"
-cleanup_legacy_outeragent_user_unit
-cleanup_legacy_outeragent_system_unit
+cleanup_legacy_outeragent_user_units
+cleanup_legacy_outeragent_system_units
 archive_path="$(mktemp)"
 payload_outerctl_path="$(mktemp)"
 payload_root="$(mktemp -d)"
@@ -836,7 +894,7 @@ outer_shell_exec="$(systemd_quote_arg "$install_root/OuterShellBackend") --socke
 
 cat > "$unit_dir/org.outershell.OuterShell.service" <<EOF
 [Unit]
-Description=Outer Group Outer Shell
+Description=Outer Shell
 After=outershelld.socket
 Wants=outershelld.socket
 
@@ -853,7 +911,7 @@ EOF
 
 cat > "$unit_dir/org.outershell.OuterShell.socket" <<EOF
 [Unit]
-Description=Outer Group Outer Shell Socket
+Description=Outer Shell Socket
 
 [Socket]
 ListenStream=$socket_path

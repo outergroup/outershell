@@ -72,7 +72,7 @@ Custom content types are registered through `outerctl`:
 
 ```bash
 outerctl content-type add \
-  --content-type dev.outergroup.example-source \
+  --content-type org.outershell.example-source \
   --name 'Example Source' \
   --conforms-to public.text \
   --extensions example,exs \
@@ -83,7 +83,7 @@ outerctl content-type add \
 Remove a custom content type:
 
 ```bash
-outerctl content-type remove --content-type dev.outergroup.example-source
+outerctl content-type remove --content-type org.outershell.example-source
 ```
 
 Remove all custom content type definitions from the user registry:
@@ -103,9 +103,9 @@ Add or update an opener:
 
 ```bash
 outerctl opener add \
-  --backend dev.outergroup.Plaintext \
+  --backend org.outershell.Plaintext \
   --content-type public.text \
-  --socket-path "$XDG_RUNTIME_DIR/dev.outergroup.Plaintext" \
+  --socket-path "$XDG_RUNTIME_DIR/org.outershell.Plaintext" \
   --name Plaintext \
   --url-template '?file={file}' \
   --rank 0
@@ -115,14 +115,14 @@ Remove one opener for a backend and content type:
 
 ```bash
 outerctl opener remove \
-  --backend dev.outergroup.Plaintext \
+  --backend org.outershell.Plaintext \
   --content-type public.text
 ```
 
 Remove all opener records for a backend:
 
 ```bash
-outerctl opener clear --backend dev.outergroup.Plaintext
+outerctl opener clear --backend org.outershell.Plaintext
 ```
 
 The backend must already be registered before `opener add` or `opener remove`.
@@ -135,7 +135,7 @@ clean stale rows.
 
 ```bash
 outerctl opener list
-outerctl opener list --backend dev.outergroup.Plaintext
+outerctl opener list --backend org.outershell.Plaintext
 outerctl opener list --content-type public.text --file /path/to/README
 ```
 

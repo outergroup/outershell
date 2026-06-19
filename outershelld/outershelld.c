@@ -2760,11 +2760,14 @@ static bool merge_registry_database(const char *old_path,
     }
     bool old_frontends_have_display_name = frontends_has_column(old_database, "display_name", error, error_size);
     bool old_frontends_have_name = frontends_has_column(old_database, "name", error, error_size);
+    bool old_frontends_have_list = frontends_has_column(old_database, "list", error, error_size);
     const char *old_frontend_display_name_expression = old_frontends_have_display_name
         ? (old_frontends_have_name ? "COALESCE(NULLIF(display_name, ''), name, '')" : "COALESCE(display_name, '')")
         : (old_frontends_have_name ? "COALESCE(name, '')" : "''");
-    char *old_frontends_sql = sqlite3_mprintf("SELECT COALESCE(NULLIF(service_id, ''), 'app') || ':' || rowid, url, service_id, %s, COALESCE(port, 0), COALESCE(socket_path, ''), icon, CASE WHEN icon IS NOT NULL AND substr(icon, 1, 5) != 'data:' THEN icon ELSE NULL END, list FROM frontends;",
-                                             old_frontend_display_name_expression);
+    const char *old_frontend_list_expression = old_frontends_have_list ? "COALESCE(list, '')" : "''";
+    char *old_frontends_sql = sqlite3_mprintf("SELECT COALESCE(NULLIF(service_id, ''), 'app') || ':' || rowid, url, service_id, %s, COALESCE(port, 0), COALESCE(socket_path, ''), icon, CASE WHEN icon IS NOT NULL AND substr(icon, 1, 5) != 'data:' THEN icon ELSE NULL END, %s FROM frontends WHERE COALESCE(service_id, '') != 'dev.outergroup.Top';",
+                                             old_frontend_display_name_expression,
+                                             old_frontend_list_expression);
     if (!old_frontends_sql) {
         snprintf(error, error_size, "Out of memory.");
         sqlite3_close(old_database);
@@ -2774,7 +2777,7 @@ static bool merge_registry_database(const char *old_path,
     bool ok = ensure_registry_schema(database, error, error_size);
     if (ok) ok = sqlite_exec_ok(database, "BEGIN IMMEDIATE TRANSACTION;", error, error_size);
     if (ok) ok = copy_registry_rows(old_database, database,
-                                    "SELECT service_id, COALESCE(display_name, ''), service_unit FROM backends;",
+                                    "SELECT service_id, COALESCE(display_name, ''), service_unit FROM backends WHERE service_id != 'dev.outergroup.Top';",
                                     "INSERT OR REPLACE INTO backends(service_id, display_name, service_unit) VALUES (?, ?, ?);",
                                     error, error_size);
     if (ok) ok = copy_registry_rows(old_database, database,
@@ -2787,16 +2790,20 @@ static bool merge_registry_database(const char *old_path,
                                 error,
                                 error_size);
     if (ok) ok = copy_registry_rows(old_database, database,
-                                    "SELECT path, service_id FROM log_files;",
+                                    "SELECT path, service_id FROM log_files WHERE service_id != 'dev.outergroup.Top';",
                                     "INSERT OR REPLACE INTO log_files(path, service_id) VALUES (?, ?);",
                                     error, error_size);
     if (ok) ok = copy_registry_rows(old_database, database,
-                                    "SELECT service_id, unit_name, COALESCE(scope, 'user') FROM systemd_backends;",
+                                    "SELECT service_id, unit_name, COALESCE(scope, 'user') FROM systemd_backends WHERE service_id != 'dev.outergroup.Top';",
                                     "INSERT OR REPLACE INTO systemd_backends(service_id, unit_name, scope) VALUES (?, ?, ?);",
                                     error, error_size);
     if (ok) ok = copy_registry_rows(old_database, database,
-                                    "SELECT service_id, plist_path, COALESCE(owns_plist, 0) FROM launchd_backends;",
+                                    "SELECT service_id, plist_path, COALESCE(owns_plist, 0) FROM launchd_backends WHERE service_id != 'dev.outergroup.Top';",
                                     "INSERT OR REPLACE INTO launchd_backends(service_id, plist_path, owns_plist) VALUES (?, ?, ?);",
+                                    error, error_size);
+    if (ok) ok = copy_registry_rows(old_database, database,
+                                    "SELECT extension, service_id, COALESCE(display_name, ''), COALESCE(socket_path, ''), COALESCE(url_template, '?file={file}'), COALESCE(rank, 0) FROM file_openers WHERE service_id != 'dev.outergroup.Top';",
+                                    "INSERT OR REPLACE INTO file_openers(extension, service_id, display_name, socket_path, url_template, rank) VALUES (?, ?, ?, ?, ?, ?);",
                                     error, error_size);
     for (size_t i = 0; ok && i < replacement_count; i++) {
         const char *old_text = replacements[i].old_text;
@@ -2805,7 +2812,10 @@ static bool merge_registry_database(const char *old_path,
         ok = sqlite_exec_formatted(database, error, error_size,
                                    "UPDATE log_files SET path = replace(path, %Q, %Q);"
                                    "UPDATE frontends SET url = replace(url, %Q, %Q), socket_path = replace(socket_path, %Q, %Q);"
-                                   "UPDATE launchd_backends SET plist_path = replace(plist_path, %Q, %Q);",
+                                   "UPDATE launchd_backends SET plist_path = replace(plist_path, %Q, %Q);"
+                                   "UPDATE file_openers SET socket_path = replace(socket_path, %Q, %Q), url_template = replace(url_template, %Q, %Q);",
+                                   old_text, new_text,
+                                   old_text, new_text,
                                    old_text, new_text,
                                    old_text, new_text,
                                    old_text, new_text,
@@ -2847,7 +2857,8 @@ static void migrate_user_app_directories(const char *old_apps_root, const char *
         if (strcmp(entry->d_name, "registry.sqlite3") == 0 ||
             strcmp(entry->d_name, "registry.lock") == 0 ||
             strcmp(entry->d_name, "registry.bin") == 0 ||
-            strcmp(entry->d_name, "outerctl") == 0) {
+            strcmp(entry->d_name, "outerctl") == 0 ||
+            strcmp(entry->d_name, "dev.outergroup.Top") == 0) {
             continue;
         }
         char old_path[PATH_MAX];
@@ -2865,6 +2876,147 @@ static void migrate_user_app_directories(const char *old_apps_root, const char *
     }
     closedir(dir);
 }
+
+static bool string_has_suffix(const char *value, const char *suffix) {
+    if (!value || !suffix) return false;
+    size_t value_length = strlen(value);
+    size_t suffix_length = strlen(suffix);
+    return value_length >= suffix_length &&
+           strcmp(value + value_length - suffix_length, suffix) == 0;
+}
+
+#ifdef __APPLE__
+static bool legacy_macos_launch_agent_should_be_removed(const char *plist_name, const char *plist_path) {
+    if (!plist_name || !plist_path || !string_has_suffix(plist_name, ".plist")) return false;
+    if (strcmp(plist_name, "dev.outergroup.Top.plist") == 0 ||
+        strcmp(plist_name, "dev.outergroup.OuterLoopServiceList.plist") == 0) {
+        return true;
+    }
+    size_t size = 0;
+    char *contents = read_text_file_alloc(plist_path, &size);
+    (void)size;
+    if (!contents) return false;
+    bool remove = strstr(contents, "dev.outergroup.Top") ||
+                  strstr(contents, "BuiltinBackends/Top");
+    free(contents);
+    return remove;
+}
+
+static void cleanup_legacy_macos_launch_agents(void) {
+    char launch_agents_dir[PATH_MAX];
+    snprintf(launch_agents_dir, sizeof(launch_agents_dir), "%s/Library/LaunchAgents", home_directory());
+    DIR *dir = opendir(launch_agents_dir);
+    if (dir) {
+        struct dirent *entry;
+        while ((entry = readdir(dir)) != NULL) {
+            if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
+            char plist_path[PATH_MAX];
+            snprintf(plist_path, sizeof(plist_path), "%s/%s", launch_agents_dir, entry->d_name);
+            struct stat st;
+            if (lstat(plist_path, &st) != 0 || (!S_ISREG(st.st_mode) && !S_ISLNK(st.st_mode))) continue;
+            if (!legacy_macos_launch_agent_should_be_removed(entry->d_name, plist_path)) continue;
+
+            char label[PATH_MAX];
+            snprintf(label, sizeof(label), "%s", entry->d_name);
+            char *suffix = strstr(label, ".plist");
+            if (suffix && suffix[6] == '\0') *suffix = '\0';
+
+            char launchd_target[PATH_MAX + 32];
+            snprintf(launchd_target, sizeof(launchd_target), "gui/%ld/%s", (long)getuid(), label);
+            char quoted_target[PATH_MAX * 2];
+            char quoted_label[PATH_MAX * 2];
+            char quoted_path[PATH_MAX * 2];
+            char command[PATH_MAX * 6];
+            shell_quote(launchd_target, quoted_target, sizeof(quoted_target));
+            shell_quote(label, quoted_label, sizeof(quoted_label));
+            shell_quote(plist_path, quoted_path, sizeof(quoted_path));
+            snprintf(command, sizeof(command),
+                     "launchctl bootout %s >/dev/null 2>&1 || launchctl remove %s >/dev/null 2>&1 || true; rm -f %s",
+                     quoted_target, quoted_label, quoted_path);
+            run_shell_ignored(command);
+            log_event("Removed legacy macOS launch agent %s.", entry->d_name);
+        }
+        closedir(dir);
+    }
+
+    char user_outerloop_pattern[PATH_MAX * 2];
+    char user_outershell_pattern[PATH_MAX * 2];
+    char system_outershell_pattern[PATH_MAX * 2];
+    char outer_loop_services_pattern[PATH_MAX * 2];
+    char command[PATH_MAX * 10];
+    char pattern[PATH_MAX];
+    snprintf(pattern, sizeof(pattern), "%s/Library/dev.outergroup.OuterLoop/.*TopBackend", home_directory());
+    shell_quote(pattern, user_outerloop_pattern, sizeof(user_outerloop_pattern));
+    snprintf(pattern, sizeof(pattern), "%s/Library/Application Support/outershell/apps/dev\\.outergroup\\.Top/.*TopBackend", home_directory());
+    shell_quote(pattern, user_outershell_pattern, sizeof(user_outershell_pattern));
+    shell_quote("/Library/Application Support/outershell/apps/dev\\.outergroup\\.Top/.*TopBackend",
+                system_outershell_pattern,
+                sizeof(system_outershell_pattern));
+    shell_quote("/Applications/Outer Loop.app/Contents/Resources/Outer Loop Services.app/.*BuiltinBackends/Top/.*TopBackend",
+                outer_loop_services_pattern,
+                sizeof(outer_loop_services_pattern));
+    snprintf(command, sizeof(command),
+             "pkill -f %s >/dev/null 2>&1 || true; "
+             "pkill -f %s >/dev/null 2>&1 || true; "
+             "pkill -f %s >/dev/null 2>&1 || true; "
+             "pkill -f %s >/dev/null 2>&1 || true",
+             user_outerloop_pattern,
+             user_outershell_pattern,
+             system_outershell_pattern,
+             outer_loop_services_pattern);
+    run_shell_ignored(command);
+}
+#else
+static bool legacy_outeragent_user_unit_should_be_removed(const char *unit_name, const char *unit_path) {
+    if (!unit_name || !unit_path || !string_has_suffix(unit_name, ".service")) return false;
+    if (strcmp(unit_name, "outeragent.service") == 0 ||
+        strcmp(unit_name, "dev.outergroup.Top.service") == 0) {
+        return true;
+    }
+    size_t size = 0;
+    char *contents = read_text_file_alloc(unit_path, &size);
+    (void)size;
+    if (!contents) return false;
+    bool remove = strstr(contents, "dev.outergroup.Top");
+    free(contents);
+    return remove;
+}
+
+static void cleanup_legacy_outeragent_user_units(void) {
+    char user_units_dir[PATH_MAX];
+    snprintf(user_units_dir, sizeof(user_units_dir), "%s/.config/systemd/user", home_directory());
+    DIR *dir = opendir(user_units_dir);
+    if (!dir) return;
+    struct dirent *entry;
+    bool removed_any = false;
+    while ((entry = readdir(dir)) != NULL) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
+        char unit_path[PATH_MAX];
+        snprintf(unit_path, sizeof(unit_path), "%s/%s", user_units_dir, entry->d_name);
+        struct stat st;
+        if (lstat(unit_path, &st) != 0 || (!S_ISREG(st.st_mode) && !S_ISLNK(st.st_mode))) continue;
+        if (!legacy_outeragent_user_unit_should_be_removed(entry->d_name, unit_path)) continue;
+
+        char quoted_unit[PATH_MAX * 2];
+        char quoted_path[PATH_MAX * 2];
+        char command[PATH_MAX * 5];
+        shell_quote(entry->d_name, quoted_unit, sizeof(quoted_unit));
+        shell_quote(unit_path, quoted_path, sizeof(quoted_path));
+        snprintf(command, sizeof(command),
+                 "systemctl --user disable --now %s >/dev/null 2>&1 || true; "
+                 "rm -f %s; "
+                 "systemctl --user reset-failed %s >/dev/null 2>&1 || true",
+                 quoted_unit, quoted_path, quoted_unit);
+        run_shell_ignored(command);
+        removed_any = true;
+        log_event("Removed legacy outeragent user unit %s.", entry->d_name);
+    }
+    closedir(dir);
+    if (removed_any) {
+        run_shell_ignored("systemctl --user daemon-reload >/dev/null 2>&1 || true");
+    }
+}
+#endif
 
 static void migrate_user_outershell_state(void) {
     char old_registry[PATH_MAX];
@@ -2884,35 +3036,33 @@ static void migrate_user_outershell_state(void) {
     (void)mkdir_p(new_root);
     (void)mkdir_p(new_apps_root);
 
+#ifndef __APPLE__
+    cleanup_legacy_outeragent_user_units();
+#else
+    cleanup_legacy_macos_launch_agents();
+#endif
+
     TextReplacement replacements[] = {
         {old_outer_shell_outerctl, new_outerctl},
         {old_outerctl, new_outerctl},
         {old_apps_root, new_apps_root},
         {"outeragent.log", "backend.log"},
         {"OUTERAGENT_ROOT", "OUTERSHELL_HOME"},
-        {"/var/lib/outergroup/outeragent", kSystemOuterShellRoot}
+        {"/var/lib/outergroup/outeragent", kSystemOuterShellRoot},
+        {"/var/lib/outershell/outeragent", kSystemOuterShellRoot}
     };
 
     char error[1024] = "";
-    char binary_registry[PATH_MAX] = "";
-    bool new_binary_registry_exists = registry_binary_output_path(g_registry_database_path,
-                                                                  binary_registry,
-                                                                  sizeof(binary_registry)) &&
-                                      access(binary_registry, F_OK) == 0;
     if (access(old_registry, R_OK) == 0) {
-        if (!new_binary_registry_exists) {
-            if (merge_registry_database(old_registry,
-                                        g_registry_database_path,
-                                        replacements,
-                                        sizeof(replacements) / sizeof(replacements[0]),
-                                        error,
-                                        sizeof(error))) {
-                log_event("Migrated user outershell registry from %s to %s.", old_registry, g_registry_database_path);
-            } else {
-                log_event("Failed to migrate user registry from %s: %s", old_registry, error);
-            }
+        if (merge_registry_database(old_registry,
+                                    g_registry_database_path,
+                                    replacements,
+                                    sizeof(replacements) / sizeof(replacements[0]),
+                                    error,
+                                    sizeof(error))) {
+            log_event("Migrated legacy registry from %s to %s, excluding dev.outergroup.Top.", old_registry, g_registry_database_path);
         } else {
-            archive_migrated_sqlite_registry(old_registry);
+            log_event("Failed to migrate legacy registry from %s: %s", old_registry, error);
         }
     }
 
@@ -6171,7 +6321,7 @@ static bool append_root_migration_backend_payload(BinaryPayloadList *payloads) {
 #ifdef __APPLE__
     const char *path = "/Library/dev.outergroup.OuterLoop";
 #else
-    const char *path = "/var/lib/outergroup/outeragent";
+    const char *path = "/var/lib/outershell/outeragent";
 #endif
     bool ok = build_empty_array_payload(&frontends) &&
               build_empty_array_payload(&logs) &&
@@ -6235,6 +6385,7 @@ static bool file_contains_any_legacy_outershell_text(const char *path) {
                  strstr(contents, ".outeragent/outerctl") ||
                  strstr(contents, ".outerloop/outer-shell/bin/outerctl") ||
                  strstr(contents, "/var/lib/outergroup/outeragent") ||
+                 strstr(contents, "/var/lib/outershell/outeragent") ||
                  strstr(contents, "outeragent.log");
     free(contents);
     return found;
@@ -6269,9 +6420,9 @@ static bool root_outershell_migration_pending(void) {
            directory_contains_legacy_outershell_text("/Library/LaunchDaemons", false);
 #else
     struct stat st;
-    return stat("/var/lib/outergroup/outeragent/registry.sqlite3", &st) == 0 ||
-           stat("/var/lib/outergroup/outeragent", &st) == 0 ||
-           directory_contains_legacy_outershell_text("/opt/outergroup", true) ||
+    return stat("/var/lib/outershell/outeragent/registry.sqlite3", &st) == 0 ||
+           stat("/var/lib/outershell/outeragent", &st) == 0 ||
+           directory_contains_legacy_outershell_text("/opt/outershell", true) ||
            directory_contains_legacy_outershell_text("/etc/systemd/system", false);
 #endif
 }
@@ -8068,16 +8219,24 @@ static bool ensure_root_helper_installed(const char *sudo_password, bool *needs_
 
     fprintf(script,
             "set -eu\n"
-            "systemctl --system disable --now outerloop-rootd.service >/dev/null 2>&1 || true\n"
-            "rm -f /etc/systemd/system/outerloop-rootd.service\n"
+            "for unit_path in /etc/systemd/system/*.service; do\n"
+            "  [ -e \"$unit_path\" ] || continue\n"
+            "  unit_name=$(basename \"$unit_path\")\n"
+            "  remove_unit=false\n"
+            "  case \"$unit_name\" in outerloop-rootd.service|dev.outergroup.Top.service) remove_unit=true ;; esac\n"
+            "  if [ \"$remove_unit\" = false ] && grep -q -e 'dev\\.outergroup\\.Top' \"$unit_path\" 2>/dev/null; then remove_unit=true; fi\n"
+            "  [ \"$remove_unit\" = true ] || continue\n"
+            "  systemctl --system disable --now \"$unit_name\" >/dev/null 2>&1 || true\n"
+            "  rm -f \"$unit_path\"\n"
+            "  systemctl --system reset-failed \"$unit_name\" >/dev/null 2>&1 || true\n"
+            "done\n"
             "systemctl --system daemon-reload >/dev/null 2>&1 || true\n"
-            "systemctl --system reset-failed outerloop-rootd.service >/dev/null 2>&1 || true\n"
             "systemctl --system disable --now %s >/dev/null 2>&1 || true\n"
             "systemctl --system disable --now %s >/dev/null 2>&1 || true\n"
             "rm -f /etc/systemd/system/%s /etc/systemd/system/%s\n"
             "systemctl --system daemon-reload >/dev/null 2>&1 || true\n"
             "systemctl --system stop outershelld.service >/dev/null 2>&1 || true\n"
-            "mkdir -p %s %s %s %s /etc/systemd/system /var/log/outergroup\n"
+            "mkdir -p %s %s %s %s /etc/systemd/system /var/log/outershell\n"
             "chmod 1777 %s\n"
             "touch %s\n"
             "chown %ld:%ld %s 2>/dev/null || true\n"
@@ -8106,16 +8265,16 @@ static bool ensure_root_helper_installed(const char *sudo_password, bool *needs_
             "Environment=OUTER_SHELL_PUBLIC_BASE_URL=%s\n"
             "ExecStart=/var/lib/outershell/outershelld/outershelld\n"
             "Restart=no\n"
-            "StandardOutput=append:/var/log/outergroup/outershelld.log\n"
-            "StandardError=append:/var/log/outergroup/outershelld.log\n"
+            "StandardOutput=append:/var/log/outershell/outershelld.log\n"
+            "StandardError=append:/var/log/outershell/outershelld.log\n"
             "\n"
             "[Install]\n"
             "WantedBy=multi-user.target\n"
             "__OUTERSHELLD_SERVICE__\n"
             "if [ -f %s ]; then cp %s %s; else printf '%%s\\n' 'root-support' > %s; fi\n"
             "chmod 0644 %s\n"
-            "touch /var/log/outergroup/outershelld.log\n"
-            "chmod 0644 /var/log/outergroup/outershelld.log\n"
+            "touch /var/log/outershell/outershelld.log\n"
+            "chmod 0644 /var/log/outershell/outershelld.log\n"
             "rm -f %s %s\n"
             "ln -s %s %s\n"
             "ln -s %s %s\n"
@@ -8325,13 +8484,13 @@ static void write_system_binary_cleanup_shell(FILE *script) {
             "  rm -f /etc/systemd/system/outershelld.service /etc/systemd/system/outershelld.socket /run/outershelld-api\n"
             "  systemctl --system daemon-reload >/dev/null 2>&1 || true\n"
             "  rm -f \"$system_outershelld_path\" \"$system_outerctl_path\" \"$system_version_path\"\n"
-            "  rm -f /var/log/outergroup/outershelld.log /var/log/outergroup/org.outershell.OuterShell.log\n"
+            "  rm -f /var/log/outershell/outershelld.log /var/log/outershell/org.outershell.OuterShell.log\n"
             "  if ! find \"$system_outershell_home/apps\" -mindepth 1 -print -quit 2>/dev/null | grep -q . &&\n"
-            "     ! find /opt/outergroup -mindepth 1 -print -quit 2>/dev/null | grep -q .; then\n"
+            "     ! find /opt/outershell -mindepth 1 -print -quit 2>/dev/null | grep -q .; then\n"
             "    rm -f \"$system_outershell_home/registry.orwa\" \"$system_outershell_home/registry.orwa.lock\"\n"
-            "    rmdir \"$system_outershell_home/apps\" /opt/outergroup >/dev/null 2>&1 || true\n"
+            "    rmdir \"$system_outershell_home/apps\" /opt/outershell >/dev/null 2>&1 || true\n"
             "  fi\n"
-            "  rmdir \"$system_daemon_root\" \"$system_outershell_home/bin\" \"$system_binary_users_dir\" \"$system_outershell_home\" /var/log/outergroup >/dev/null 2>&1 || true\n"
+            "  rmdir \"$system_daemon_root\" \"$system_outershell_home/bin\" \"$system_binary_users_dir\" \"$system_outershell_home\" /var/log/outershell >/dev/null 2>&1 || true\n"
             "}\n",
             quoted_system_users_dir,
             quoted_system_root,
@@ -8347,7 +8506,7 @@ static void write_root_apps_marker_cleanup_shell(FILE *script) {
     char quoted_root_apps_marker[PATH_MAX + 8];
     shell_quote(root_apps_marker, quoted_root_apps_marker, sizeof(quoted_root_apps_marker));
     fprintf(script,
-            "if ! find /opt/outergroup -mindepth 1 -maxdepth 1 -type d -print -quit 2>/dev/null | grep -q .; then\n"
+            "if ! find /opt/outershell -mindepth 1 -maxdepth 1 -type d -print -quit 2>/dev/null | grep -q .; then\n"
             "  rm -f %s\n"
             "fi\n",
             quoted_root_apps_marker);
@@ -8373,7 +8532,7 @@ static bool run_root_outershell_migration(const char *sudo_password, bool *needs
 #ifdef __APPLE__
         "/Library/dev.outergroup.OuterLoop";
 #else
-        "/var/lib/outergroup/outeragent";
+        "/var/lib/outershell/outeragent";
 #endif
 
     char legacy_system_apps_root[PATH_MAX];
@@ -8436,6 +8595,7 @@ static bool run_root_outershell_migration(const char *sudo_password, bool *needs
             "  for child in \"$OLD_SYSTEM_APPS\"/*; do\n"
             "    [ -e \"$child\" ] || continue\n"
             "    name=$(basename \"$child\")\n"
+            "    [ \"$name\" != \"dev.outergroup.Top\" ] || continue\n"
             "    if [ ! -e \"$NEW_SYSTEM_APPS/$name\" ]; then mv \"$child\" \"$NEW_SYSTEM_APPS/$name\"; fi\n"
             "  done\n"
             "fi\n"
@@ -8488,9 +8648,13 @@ static bool run_root_outershell_migration(const char *sudo_password, bool *needs
             "    old = open_old_registry(old_db)\n"
             "    try:\n"
             "        for row in old_rows(old, 'backends'):\n"
+            "            if row['service_id'] == 'dev.outergroup.Top':\n"
+            "                continue\n"
             "            db.execute('INSERT OR REPLACE INTO backends(service_id, display_name, service_unit) VALUES (?, ?, ?)',\n"
             "                       (row['service_id'], row['display_name'] if 'display_name' in row.keys() and row['display_name'] is not None else '', row['service_unit'] if 'service_unit' in row.keys() else None))\n"
             "        for row in old_rows(old, 'frontends'):\n"
+            "            if 'service_id' in row.keys() and row['service_id'] == 'dev.outergroup.Top':\n"
+            "                continue\n"
             "            icon = row['icon'] if 'icon' in row.keys() and row['icon'] is not None else None\n"
             "            icon_path = icon if icon and not str(icon).startswith('data:') else None\n"
             "            display_name = row['display_name'] if 'display_name' in row.keys() and row['display_name'] is not None else (row['name'] if 'name' in row.keys() and row['name'] is not None else '')\n"
@@ -8499,14 +8663,22 @@ static bool run_root_outershell_migration(const char *sudo_password, bool *needs
             "            db.execute('INSERT OR REPLACE INTO frontend_layouts(url, list) VALUES (?, ?)',\n"
             "                       (row['url'], row['list'] if 'list' in row.keys() and row['list'] is not None else ''))\n"
             "        for row in old_rows(old, 'log_files'):\n"
+            "            if row['service_id'] == 'dev.outergroup.Top':\n"
+            "                continue\n"
             "            db.execute('INSERT OR REPLACE INTO log_files(path, service_id) VALUES (?, ?)', (row['path'], row['service_id']))\n"
             "        for row in old_rows(old, 'systemd_backends'):\n"
+            "            if row['service_id'] == 'dev.outergroup.Top':\n"
+            "                continue\n"
             "            db.execute('INSERT OR REPLACE INTO systemd_backends(service_id, unit_name, scope) VALUES (?, ?, ?)',\n"
             "                       (row['service_id'], row['unit_name'], row['scope'] if 'scope' in row.keys() and row['scope'] is not None else 'system'))\n"
             "        for row in old_rows(old, 'launchd_backends'):\n"
+            "            if row['service_id'] == 'dev.outergroup.Top':\n"
+            "                continue\n"
             "            db.execute('INSERT OR REPLACE INTO launchd_backends(service_id, plist_path, owns_plist) VALUES (?, ?, ?)',\n"
             "                       (row['service_id'], row['plist_path'], row['owns_plist'] if 'owns_plist' in row.keys() and row['owns_plist'] is not None else 1))\n"
             "        for row in old_rows(old, 'file_openers'):\n"
+            "            if row['service_id'] == 'dev.outergroup.Top':\n"
+            "                continue\n"
             "            db.execute('INSERT OR REPLACE INTO file_openers(extension, service_id, display_name, socket_path, url_template, rank) VALUES (?, ?, ?, ?, ?, ?)',\n"
             "                       (row['extension'], row['service_id'], row['display_name'] if 'display_name' in row.keys() and row['display_name'] is not None else '', row['socket_path'] if 'socket_path' in row.keys() and row['socket_path'] is not None else '', row['url_template'] if 'url_template' in row.keys() and row['url_template'] is not None else '?file={file}', row['rank'] if 'rank' in row.keys() and row['rank'] is not None else 0))\n"
             "    finally:\n"
@@ -8529,7 +8701,7 @@ static bool run_root_outershell_migration(const char *sudo_password, bool *needs
             "            pass\n"
             "db.commit()\n"
             "db.close()\n"
-            "for root in (os.environ['NEW_SYSTEM_APPS'], '/opt/outergroup', '/etc/systemd/system', '/Library/LaunchDaemons'):\n"
+            "for root in (os.environ['NEW_SYSTEM_APPS'], '/opt/outershell', '/etc/systemd/system', '/Library/LaunchDaemons'):\n"
             "    if not os.path.isdir(root):\n"
             "        continue\n"
             "    for dirpath, _, filenames in os.walk(root):\n"
@@ -8554,7 +8726,7 @@ static bool run_root_outershell_migration(const char *sudo_password, bool *needs
             "if command -v launchctl >/dev/null 2>&1; then\n"
             "  for plist in /Library/LaunchDaemons/*.plist; do\n"
             "    [ -f \"$plist\" ] || continue\n"
-            "    if grep -E -q 'outershell|dev[.]outergroup|outergroup' \"$plist\" 2>/dev/null; then\n"
+            "    if grep -E -q 'outershell' \"$plist\" 2>/dev/null; then\n"
             "      label=$(/usr/libexec/PlistBuddy -c 'Print :Label' \"$plist\" 2>/dev/null || true)\n"
             "      [ -n \"$label\" ] || continue\n"
             "      launchctl bootout \"system/$label\" >/dev/null 2>&1 || true\n"
@@ -10869,7 +11041,7 @@ static bool install_bundled_app(const BundledAppDefinition *app,
         snprintf(user_name, sizeof(user_name), "%s", pw && pw->pw_name ? pw->pw_name : "");
 
         char install_root[PATH_MAX];
-        snprintf(install_root, sizeof(install_root), "/opt/outergroup/%s", app->install_directory_name);
+        snprintf(install_root, sizeof(install_root), "/opt/outershell/%s", app->install_directory_name);
         char bundles_dir[PATH_MAX];
         snprintf(bundles_dir, sizeof(bundles_dir), "%s/bundles", install_root);
         char target_binary[PATH_MAX];
@@ -10893,7 +11065,7 @@ static bool install_bundled_app(const BundledAppDefinition *app,
         system_binary_users_dir(system_users_dir, sizeof(system_users_dir));
         system_binary_root_apps_marker_path(root_apps_marker, sizeof(root_apps_marker));
         char log_path[PATH_MAX];
-        snprintf(log_path, sizeof(log_path), "/var/log/outergroup/%s.log", app->service_id);
+        snprintf(log_path, sizeof(log_path), "/var/log/outershell/%s.log", app->service_id);
         char unit_path[PATH_MAX];
         snprintf(unit_path, sizeof(unit_path), "/etc/systemd/system/%s", app->unit_name);
         char socket_unit_name[256] = "";
@@ -11042,14 +11214,22 @@ static bool install_bundled_app(const BundledAppDefinition *app,
         }
         fprintf(script,
                 "set -eu\n"
-                "timeout 12s systemctl --system disable --now outerloop-rootd.service >/dev/null 2>&1 || true\n"
-                "rm -f /etc/systemd/system/outerloop-rootd.service\n"
+                "for unit_path in /etc/systemd/system/*.service; do\n"
+                "  [ -e \"$unit_path\" ] || continue\n"
+                "  unit_name=$(basename \"$unit_path\")\n"
+                "  remove_unit=false\n"
+                "  case \"$unit_name\" in outerloop-rootd.service|dev.outergroup.Top.service) remove_unit=true ;; esac\n"
+                "  if [ \"$remove_unit\" = false ] && grep -q -e 'dev\\.outergroup\\.Top' \"$unit_path\" 2>/dev/null; then remove_unit=true; fi\n"
+                "  [ \"$remove_unit\" = true ] || continue\n"
+                "  timeout 12s systemctl --system disable --now \"$unit_name\" >/dev/null 2>&1 || true\n"
+                "  rm -f \"$unit_path\"\n"
+                "  timeout 5s systemctl --system reset-failed \"$unit_name\" >/dev/null 2>&1 || true\n"
+                "done\n"
                 "systemctl --system daemon-reload >/dev/null 2>&1 || true\n"
-                "timeout 5s systemctl --system reset-failed outerloop-rootd.service >/dev/null 2>&1 || true\n"
                 "timeout 12s systemctl --system stop %s >/dev/null 2>&1 || true\n"
                 "timeout 5s systemctl --system reset-failed %s >/dev/null 2>&1 || true\n"
                 "rm -rf -- %s\n"
-                "mkdir -p %s %s /var/log/outergroup %s\n"
+                "mkdir -p %s %s /var/log/outershell %s\n"
                 "chmod 0755 %s\n"
                 "install -m 0755 %s %s\n"
                 "install -m 0644 %s %s\n"
@@ -11391,9 +11571,9 @@ static bool remove_bundled_root_support(const BundledAppDefinition *app,
     }
 
     char install_root[PATH_MAX];
-    snprintf(install_root, sizeof(install_root), "/opt/outergroup/%s", app->install_directory_name);
+    snprintf(install_root, sizeof(install_root), "/opt/outershell/%s", app->install_directory_name);
     char log_path[PATH_MAX];
-    snprintf(log_path, sizeof(log_path), "/var/log/outergroup/%s.log", app->service_id);
+    snprintf(log_path, sizeof(log_path), "/var/log/outershell/%s.log", app->service_id);
     char unit_path[PATH_MAX];
     snprintf(unit_path, sizeof(unit_path), "/etc/systemd/system/%s", app->unit_name);
     char socket_unit_name[256] = "";
@@ -12298,10 +12478,10 @@ static bool uninstall_backend(const char *service_id, const char *sudo_password,
             snprintf(install_name, sizeof(install_name), "%s", app ? app->install_directory_name : service_id);
             char install_root[PATH_MAX] = "";
             if (safe_service_directory_name(install_name)) {
-                snprintf(install_root, sizeof(install_root), "/opt/outergroup/%s", install_name);
+                snprintf(install_root, sizeof(install_root), "/opt/outershell/%s", install_name);
             }
             char log_path[PATH_MAX];
-            snprintf(log_path, sizeof(log_path), "/var/log/outergroup/%s.log", service_id);
+            snprintf(log_path, sizeof(log_path), "/var/log/outershell/%s.log", service_id);
             char unit_path[PATH_MAX];
             snprintf(unit_path, sizeof(unit_path), "/etc/systemd/system/%s", unit_name);
             char socket_unit_name[256] = "";
@@ -12866,7 +13046,7 @@ static void send_create_response(int fd, const char *query) {
     snprintf(unit_path, sizeof(unit_path), "%s/Library/LaunchAgents/%s.plist", home_directory(), unit_name);
 #else
     if (direct_root_session_uses_system_scope()) {
-        snprintf(log_path, sizeof(log_path), "/var/log/outergroup/%s.log", service_id);
+        snprintf(log_path, sizeof(log_path), "/var/log/outershell/%s.log", service_id);
         snprintf(unit_path, sizeof(unit_path), "/etc/systemd/system/%s", unit_name);
     } else {
         snprintf(log_path, sizeof(log_path), "%s/output.log", backend_dir);
@@ -13139,8 +13319,8 @@ static void send_create_response(int fd, const char *query) {
     free(plist.data);
 #else
     if (direct_root_session_uses_system_scope()) {
-        if (!mkdir_p("/var/log/outergroup")) {
-            snprintf(error, sizeof(error), "Failed to create /var/log/outergroup: %s", strerror(errno));
+        if (!mkdir_p("/var/log/outershell")) {
+            snprintf(error, sizeof(error), "Failed to create /var/log/outershell: %s", strerror(errno));
             send_action_response(fd, 500, false, error);
             return;
         }
@@ -14265,7 +14445,7 @@ static void run_root_helper_api_loop(int api_listener) {
 #endif
 
 static void outershelld_usage(const char *program) {
-    fprintf(stderr, "Usage: %s [--api-socket-path PATH] [--database PATH] [--system-database PATH] [--bundled-apps-dir DIR] [--public-base-url URL] [--stay-alive] [--root-helper --root-helper-owner-uid UID]\n", program);
+    fprintf(stderr, "Usage: %s [--api-socket-path PATH] [--database PATH] [--system-database PATH] [--bundled-apps-dir DIR] [--public-base-url URL] [--stay-alive] [--migrate-user-state-only] [--root-helper --root-helper-owner-uid UID]\n", program);
 }
 
 static void initialize_runtime_paths(char *api_socket_path, size_t api_socket_path_size) {
@@ -14285,6 +14465,7 @@ static void initialize_runtime_paths(char *api_socket_path, size_t api_socket_pa
 int OuterShelldMain(int argc, char **argv) {
     char api_socket_path[PATH_MAX] = "";
     initialize_runtime_paths(api_socket_path, sizeof(api_socket_path));
+    bool migrate_user_state_only = false;
 #ifndef __APPLE__
     bool root_helper_mode = false;
 #endif
@@ -14324,6 +14505,8 @@ int OuterShelldMain(int argc, char **argv) {
             expand_tilde_path(argv[++i], g_system_registry_database_path, sizeof(g_system_registry_database_path));
         } else if (strcmp(argv[i], "--stay-alive") == 0) {
             g_stay_alive_when_socket_idle = true;
+        } else if (strcmp(argv[i], "--migrate-user-state-only") == 0) {
+            migrate_user_state_only = true;
         } else if (strcmp(argv[i], "--root-helper") == 0) {
 #ifdef __APPLE__
             outershelld_usage(argv[0]);
@@ -14378,6 +14561,11 @@ int OuterShelldMain(int argc, char **argv) {
         return 0;
     }
 #endif
+
+    if (migrate_user_state_only) {
+        migrate_user_outershell_state();
+        return 0;
+    }
 
     migrate_user_outershell_state();
 

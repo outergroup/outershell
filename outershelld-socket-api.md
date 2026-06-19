@@ -76,16 +76,16 @@ types and `opener` commands for apps that can open files by content type:
 
 ```bash
 outerctl content-type add \
-  --content-type dev.outergroup.example-source \
+  --content-type org.outershell.example-source \
   --name 'Example Source' \
   --conforms-to public.text \
   --extensions example,exs \
   --filenames Examplefile \
   --mime-types text/x-example
 
-outerctl opener add --backend dev.outergroup.Plaintext \
+outerctl opener add --backend org.outershell.Plaintext \
   --content-type public.text \
-  --socket-path "$XDG_RUNTIME_DIR/dev.outergroup.Plaintext" \
+  --socket-path "$XDG_RUNTIME_DIR/org.outershell.Plaintext" \
   --name Plaintext \
   --url-template '?file={file}'
 
