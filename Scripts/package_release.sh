@@ -603,15 +603,26 @@ else
 fi
 
 root_binaries_match=false
-if [ "$root_install" = false ] &&
-   [ -x "$system_outershelld_path" ] &&
-   [ -x "$system_outerctl_path" ] &&
-   [ -f "$system_version_path" ] &&
-   [ -f "$system_binary_user_marker" ] &&
-   [ "$(stat -c %u "$system_binary_user_marker" 2>/dev/null || echo invalid)" = "$(id -u)" ] &&
-   [ "$(cat "$system_version_path" 2>/dev/null || true)" = "__OUTER_SHELL_VERSION__" ]; then
-    root_binaries_match=true
-fi
+
+current_user_uses_system_binaries() {
+    [ "$root_install" = false ] || return 1
+    [ -f "$system_binary_user_marker" ] || return 1
+    [ "$(stat -c %u "$system_binary_user_marker" 2>/dev/null || echo invalid)" = "$(id -u)" ] || return 1
+    return 0
+}
+
+refresh_root_binaries_match() {
+    root_binaries_match=false
+    if current_user_uses_system_binaries &&
+       [ -x "$system_outershelld_path" ] &&
+       [ -x "$system_outerctl_path" ] &&
+       [ -f "$system_version_path" ] &&
+       [ "$(cat "$system_version_path" 2>/dev/null || true)" = "__OUTER_SHELL_VERSION__" ]; then
+        root_binaries_match=true
+    fi
+}
+
+refresh_root_binaries_match
 
 run_outerctl() {
     OUTERSHELL_HOME="$outershell_home" OUTERSHELLD_API_SOCKET="$api_socket_path" "$outerctl_path" "$@"
@@ -783,6 +794,34 @@ EOF
     rm -f "$cleanup_root_script"
 }
 
+refresh_system_binaries_with_sudo() {
+    [ "$root_install" = false ] || return 0
+    current_user_uses_system_binaries || return 0
+    payload_outershelld="$1"
+    payload_outerctl="$2"
+    [ -f "$payload_outershelld" ] || return 0
+    [ -f "$payload_outerctl" ] || return 0
+
+    refresh_root_script="$(mktemp)"
+    cat > "$refresh_root_script" <<EOF
+#!/bin/sh
+set -eu
+mkdir -p "$system_daemon_root" "$system_outershell_home/bin"
+install -m 0755 "$payload_outershelld" "$system_outershelld_path"
+install -m 0755 "$payload_outerctl" "$system_outerctl_path"
+printf '%s\n' "__OUTER_SHELL_VERSION__" > "$system_version_path"
+systemctl --system try-restart outershelld.service >/dev/null 2>&1 || true
+EOF
+    chmod 0700 "$refresh_root_script"
+    if sudo -n sh "$refresh_root_script" >/dev/null 2>&1; then
+        rm -f "$refresh_root_script"
+        return 0
+    fi
+    printf 'Administrator password required to update shared Outer Shell root support.\n' >&2
+    sudo sh "$refresh_root_script"
+    rm -f "$refresh_root_script"
+}
+
 if [ "$command" = "uninstall" ]; then
     if [ "$root_install" = true ]; then
         systemctl --system disable org.outershell.OuterShell.socket >/dev/null 2>&1 || true
@@ -868,10 +907,12 @@ install -m 0755 "$app_payload/OuterShellBackend" "$install_root/OuterShellBacken
 install -m 0644 "$app_payload/app-icon.png" "$install_root/app-icon.png"
 install -m 0644 "$app_payload/bundles/OuterShell.bundle.macos-arm.aar" "$install_root/bundles/OuterShell.bundle.macos-arm.aar"
 install -m 0644 "$app_payload/bundles/OuterShell.bundle.macos-x86.aar" "$install_root/bundles/OuterShell.bundle.macos-x86.aar"
+refresh_system_binaries_with_sudo "$payload/tools/outershelld" "$payload_outerctl_path"
 rm -rf "$payload_root"
 chmod 0755 "$outershelld_path"
 chmod 0755 "$install_root/OuterShellBackend"
 chmod 0755 "$payload_outerctl_path"
+refresh_root_binaries_match
 if [ "$root_install" = true ]; then
     mkdir -p "$system_binary_users_dir"
     chmod 1777 "$system_binary_users_dir"

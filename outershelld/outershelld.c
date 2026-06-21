@@ -931,6 +931,8 @@ typedef struct {
     SystemdStatusEntry entries[MAX_SYSTEMD_STATUS_ENTRIES];
     size_t count;
     int64_t refreshed_at_ms;
+    int64_t user_refreshed_at_ms;
+    int64_t system_refreshed_at_ms;
 } SystemdStatusCache;
 
 #define FRONTEND_FLAG_RUNNING 0x01u
@@ -5034,13 +5036,18 @@ static void replace_systemd_status_cache(const SystemdStatusEntry *entries, size
         memcpy(g_systemd_status_cache.entries, entries, count * sizeof(SystemdStatusEntry));
     }
     g_systemd_status_cache.count = count;
-    g_systemd_status_cache.refreshed_at_ms = monotonic_milliseconds();
+    int64_t now = monotonic_milliseconds();
+    g_systemd_status_cache.refreshed_at_ms = now;
+    g_systemd_status_cache.user_refreshed_at_ms = now;
+    g_systemd_status_cache.system_refreshed_at_ms = now;
     pthread_mutex_unlock(&g_systemd_status_cache_mutex);
 }
 
 static void invalidate_systemd_status_cache(void) {
     pthread_mutex_lock(&g_systemd_status_cache_mutex);
     g_systemd_status_cache.refreshed_at_ms = 0;
+    g_systemd_status_cache.user_refreshed_at_ms = 0;
+    g_systemd_status_cache.system_refreshed_at_ms = 0;
     pthread_mutex_unlock(&g_systemd_status_cache_mutex);
 }
 
@@ -5064,7 +5071,13 @@ static void replace_systemd_status_scope_cache(const char *scope, const SystemdS
         memcpy(g_systemd_status_cache.entries + write_index, entries, count * sizeof(SystemdStatusEntry));
     }
     g_systemd_status_cache.count = write_index + count;
-    g_systemd_status_cache.refreshed_at_ms = monotonic_milliseconds();
+    int64_t now = monotonic_milliseconds();
+    g_systemd_status_cache.refreshed_at_ms = now;
+    if (strcmp(normalized_scope, "system") == 0) {
+        g_systemd_status_cache.system_refreshed_at_ms = now;
+    } else {
+        g_systemd_status_cache.user_refreshed_at_ms = now;
+    }
     pthread_mutex_unlock(&g_systemd_status_cache_mutex);
 }
 
@@ -5119,6 +5132,8 @@ static SystemdBusApi g_systemd_bus_api = {0};
 static pthread_mutex_t g_systemd_status_watcher_mutex = PTHREAD_MUTEX_INITIALIZER;
 static bool g_systemd_status_watcher_started = false;
 static bool g_systemd_status_event_cache_failed = false;
+static bool g_systemd_status_user_watch_active = false;
+static bool g_systemd_status_system_watch_active = false;
 
 static bool load_systemd_bus_api(SystemdBusApi *api) {
     if (api->handle) return true;
@@ -5155,12 +5170,22 @@ static void set_systemd_status_event_cache_failed(bool failed) {
     pthread_mutex_unlock(&g_systemd_status_watcher_mutex);
 }
 
-static bool should_skip_systemd_status_polling(void) {
-    bool skip = false;
+static void set_systemd_status_watch_scopes(bool user_active, bool system_active) {
     pthread_mutex_lock(&g_systemd_status_watcher_mutex);
-    skip = g_systemd_status_watcher_started && !g_systemd_status_event_cache_failed;
+    g_systemd_status_user_watch_active = user_active;
+    g_systemd_status_system_watch_active = system_active;
     pthread_mutex_unlock(&g_systemd_status_watcher_mutex);
-    return skip;
+}
+
+static bool systemd_status_scope_is_watched(const char *scope) {
+    bool watched = false;
+    bool is_system_scope = scope && strcmp(scope, "system") == 0;
+    pthread_mutex_lock(&g_systemd_status_watcher_mutex);
+    if (g_systemd_status_watcher_started && !g_systemd_status_event_cache_failed) {
+        watched = is_system_scope ? g_systemd_status_system_watch_active : g_systemd_status_user_watch_active;
+    }
+    pthread_mutex_unlock(&g_systemd_status_watcher_mutex);
+    return watched;
 }
 
 static int systemd_bus_signal_handler(OuterSdBusMessage *message, void *userdata, OuterSdBusError *ret_error) {
@@ -5340,6 +5365,7 @@ static void *systemd_status_watcher_main(void *context) {
     bool user_active = open_systemd_bus_watch(&user_watch, "user");
     bool system_active = open_systemd_bus_watch(&system_watch, "system");
     bool any_active = user_active || system_active;
+    set_systemd_status_watch_scopes(user_active, system_active);
     set_systemd_status_event_cache_failed(!any_active);
     if (!any_active) return NULL;
     mark_backend_event_changed();
@@ -5347,6 +5373,7 @@ static void *systemd_status_watcher_main(void *context) {
     while (!g_shutdown_requested && (user_watch.active || system_watch.active)) {
         process_systemd_bus_watch(&user_watch);
         process_systemd_bus_watch(&system_watch);
+        set_systemd_status_watch_scopes(user_watch.active, system_watch.active);
         if (user_watch.active && user_watch.bus) {
             g_systemd_bus_api.wait(user_watch.bus, 500000);
         } else if (system_watch.active && system_watch.bus) {
@@ -5358,6 +5385,7 @@ static void *systemd_status_watcher_main(void *context) {
 
     if (user_watch.bus) g_systemd_bus_api.unref(user_watch.bus);
     if (system_watch.bus) g_systemd_bus_api.unref(system_watch.bus);
+    set_systemd_status_watch_scopes(false, false);
     set_systemd_status_event_cache_failed(true);
     return NULL;
 }
@@ -5384,27 +5412,40 @@ static void start_systemd_status_watcher(void) {
 
 static void refresh_systemd_status_cache_if_needed(void) {
 #ifndef __APPLE__
-    if (should_skip_systemd_status_polling()) return;
+    bool poll_user = !direct_root_session_uses_system_scope() && !systemd_status_scope_is_watched("user");
+    bool poll_system = !systemd_status_scope_is_watched("system");
+    if (!poll_user && !poll_system) return;
+#else
+    bool poll_user = true;
+    bool poll_system = false;
 #endif
     int64_t now = monotonic_milliseconds();
     pthread_mutex_lock(&g_systemd_status_cache_mutex);
-    if (g_systemd_status_cache.refreshed_at_ms > 0 &&
-        now - g_systemd_status_cache.refreshed_at_ms < SYSTEMD_STATUS_CACHE_TTL_MS) {
-        pthread_mutex_unlock(&g_systemd_status_cache_mutex);
-        return;
-    }
+    bool user_recent = g_systemd_status_cache.user_refreshed_at_ms > 0 &&
+                       now - g_systemd_status_cache.user_refreshed_at_ms < SYSTEMD_STATUS_CACHE_TTL_MS;
+    bool system_recent = g_systemd_status_cache.system_refreshed_at_ms > 0 &&
+                         now - g_systemd_status_cache.system_refreshed_at_ms < SYSTEMD_STATUS_CACHE_TTL_MS;
     pthread_mutex_unlock(&g_systemd_status_cache_mutex);
 
-    SystemdStatusEntry entries[MAX_SYSTEMD_STATUS_ENTRIES];
-    size_t count = direct_root_session_uses_system_scope()
-        ? 0
-        : collect_systemd_status_scope_via_systemctl("user", entries, MAX_SYSTEMD_STATUS_ENTRIES);
 #ifndef __APPLE__
-    count += collect_systemd_status_scope_via_systemctl("system",
-                                                        entries + count,
-                                                        MAX_SYSTEMD_STATUS_ENTRIES - count);
-#endif
+    if (poll_user && !user_recent) {
+        SystemdStatusEntry entries[MAX_SYSTEMD_STATUS_ENTRIES];
+        size_t count = collect_systemd_status_scope_via_systemctl("user", entries, MAX_SYSTEMD_STATUS_ENTRIES);
+        replace_systemd_status_scope_cache("user", entries, count);
+    }
+    if (poll_system && !system_recent) {
+        SystemdStatusEntry entries[MAX_SYSTEMD_STATUS_ENTRIES];
+        size_t count = collect_systemd_status_scope_via_systemctl("system", entries, MAX_SYSTEMD_STATUS_ENTRIES);
+        replace_systemd_status_scope_cache("system", entries, count);
+    }
+#else
+    (void)poll_user;
+    (void)poll_system;
+    if (user_recent) return;
+    SystemdStatusEntry entries[MAX_SYSTEMD_STATUS_ENTRIES];
+    size_t count = collect_systemd_status_scope_via_systemctl("user", entries, MAX_SYSTEMD_STATUS_ENTRIES);
     replace_systemd_status_cache(entries, count);
+#endif
 }
 
 static bool cached_systemd_active_state(const char *unit_name, const char *scope, char *out, size_t out_size) {
