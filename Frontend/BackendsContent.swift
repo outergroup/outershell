@@ -8022,7 +8022,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func endpointIsRunning(_ endpoint: AppLauncherEndpoint) -> Bool {
-        endpoint.frontend.isRunning || endpoint.backend.status == "running"
+        if endpoint.frontend.hasEndpoint {
+            return endpoint.frontend.isRunning
+        }
+        return endpoint.frontend.isRunning || endpoint.backend.status == "running"
     }
 
     private func endpointIsReadyToOpen(_ endpoint: AppLauncherEndpoint) -> Bool {

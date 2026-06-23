@@ -752,7 +752,6 @@ static uint64_t mix_u64(uint64_t hash, uint64_t value) {
 }
 
 
-#ifndef __APPLE__
 static uint64_t string_state_token(const char *text) {
     uint64_t hash = UINT64_C(1469598103934665603);
     if (!text) return hash;
@@ -762,7 +761,6 @@ static uint64_t string_state_token(const char *text) {
     }
     return hash ? hash : 1;
 }
-#endif
 
 
 static uint64_t file_state_token(const char *path) {
@@ -6062,6 +6060,9 @@ static bool uninstall_local_home_screen(const char *sudo_password,
                                         bool remove_user_state,
                                         char *message,
                                         size_t message_size);
+static bool frontend_endpoint_is_ready(int port, const char *socket_path, bool system_scope);
+static bool frontend_endpoint_is_passively_ready(int port, const char *socket_path);
+static uint64_t frontend_endpoint_readiness_state_token(void);
 
 static bool build_frontend_payload(const char *name,
                                    const char *frontend_id,
@@ -6167,6 +6168,11 @@ static bool build_frontends_array_payload(const RegistryStore *database,
             free(payload.data);
             break;
         }
+        bool frontend_running = is_running;
+        if (is_running && record->port > 0) {
+            frontend_running = frontend_endpoint_is_passively_ready(record->port,
+                                                                    record->socket_path ? record->socket_path : "");
+        }
         ok = build_frontend_payload(record->display_name,
                                     frontend_id,
                                     url,
@@ -6174,7 +6180,7 @@ static bool build_frontends_array_payload(const RegistryStore *database,
                                     record->socket_path,
                                     record->icon_path,
                                     has_layout ? layout_list : suggested_list,
-                                    is_running,
+                                    frontend_running,
                                     &payload) &&
              binary_payload_list_append(&list, &payload);
         if (!ok) free(payload.data);
@@ -6360,7 +6366,11 @@ static bool append_registered_backend_payloads(const RegistryStore *database,
         char script_path[PATH_MAX] = "";
         managed_backend_script_path(service_id, effective_service_scope, script_path, sizeof(script_path));
         bool service_is_running = strcmp(status, "running") == 0;
-        ok = build_frontends_array_payload(database, layout_database ? layout_database : database, service_id, service_is_running, &frontends) &&
+        ok = build_frontends_array_payload(database,
+                                           layout_database ? layout_database : database,
+                                           service_id,
+                                           service_is_running,
+                                           &frontends) &&
              build_log_files_array_payload(database, service_id, &logs) &&
              build_backend_payload(service_id, display_name, service_unit, service_unit_path,
                                    effective_service_scope, status, flags, "",
@@ -6594,6 +6604,7 @@ static uint64_t current_backends_event_version(void) {
     version = mix_u64(version, registry_file_state_token(g_registry_database_path));
     version = mix_u64(version, registry_file_state_token(g_system_registry_database_path));
     version = mix_u64(version, systemd_status_state_token());
+    version = mix_u64(version, frontend_endpoint_readiness_state_token());
     return version ? version : 1;
 }
 
@@ -6704,6 +6715,14 @@ static bool frontend_endpoint_is_ready(int port, const char *socket_path, bool s
     return false;
 }
 
+static bool frontend_endpoint_is_passively_ready(int port, const char *socket_path) {
+    if (port > 0) {
+        return try_connect_tcp_port(port);
+    }
+    (void)socket_path;
+    return false;
+}
+
 static bool any_frontend_endpoint_ready(const RegistryStore *database, const char *service_id, bool system_scope, bool *has_endpoint) {
     *has_endpoint = false;
     bool ready = false;
@@ -6722,6 +6741,37 @@ static bool any_frontend_endpoint_ready(const RegistryStore *database, const cha
         }
     }
     return ready;
+}
+
+static uint64_t frontend_endpoint_readiness_store_token(const RegistryStore *database) {
+    uint64_t token = 0x9e3779b97f4a7c15ULL;
+    for (size_t i = 0; database && i < database->frontend_count; i++) {
+        const RegistryFrontendRecord *record = &database->frontends[i];
+        int port = record->port;
+        const char *socket_path = record->socket_path ? record->socket_path : "";
+        if (port <= 0) continue;
+
+        token = mix_u64(token, string_state_token(record->service_id ? record->service_id : ""));
+        token = mix_u64(token, string_state_token(record->frontend_id ? record->frontend_id : ""));
+        token = mix_u64(token, (uint64_t)port);
+        token = mix_u64(token, frontend_endpoint_is_passively_ready(port, socket_path) ? 1 : 0);
+    }
+    return token;
+}
+
+static uint64_t frontend_endpoint_readiness_state_token(void) {
+    uint64_t token = 0xcbf29ce484222325ULL;
+    char error[512] = "";
+    RegistryStore database;
+    if (registry_store_open_user_readonly(&database, error, sizeof(error))) {
+        token = mix_u64(token, frontend_endpoint_readiness_store_token(&database));
+        registry_store_free(&database);
+    }
+    if (registry_store_open_system_readonly(&database, error, sizeof(error))) {
+        token = mix_u64(token, frontend_endpoint_readiness_store_token(&database));
+        registry_store_free(&database);
+    }
+    return token;
 }
 
 static bool wait_for_frontend_endpoint_ready(const char *service_id,
