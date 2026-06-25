@@ -35,8 +35,8 @@ Every message begins with:
 bytes 0..1: UInt16 messageType
 ```
 
-Request message types are allocated contiguously from `10` through `32`.
-Dedicated responses are allocated contiguously from `100` through `108`.
+Request message types are allocated contiguously from `10` through `26`.
+Dedicated responses are allocated contiguously from `100` through `107`.
 
 Strings are encoded as offset-based references into the same message:
 
@@ -111,7 +111,8 @@ outerctl backend upsert \
 ```
 
 Creates or updates a backend service record. This is the root record that app,
-log, service-manager, and opener rows refer to by service id.
+log, opener, and content-type rows refer to by service id. Platform
+service-manager metadata is stored on this backend row.
 
 Socket message: `backendUpsertRequest` (`messageType = 10`)
 
@@ -151,8 +152,9 @@ bytes 2..9: StringRef32 backend service id
 
 Response: `commandResponse` (`messageType = 100`).
 
-The backend must not still have app, log, service-manager, or opener records.
-Clear dependent rows first.
+Removing a backend also removes the app, log, opener, and content-type rows
+owned by that backend, plus the platform service-manager metadata stored on the
+backend row.
 
 ### `outerctl backend list`
 
@@ -197,7 +199,8 @@ Flags:
 ## App Commands
 
 App rows are user-facing entry points for a backend. Each app has either a TCP
-port or a Unix socket endpoint. App icons live on app rows, not backend rows.
+endpoint, a Unix socket endpoint, or no endpoint yet. The endpoint scheme and
+URL path are stored separately from the endpoint-specific payload.
 
 ### `outerctl app add`
 
@@ -205,33 +208,44 @@ port or a Unix socket endpoint. App icons live on app rows, not backend rows.
 outerctl app add \
   --backend <service-id> \
   --name <display-name> \
-  --url <url-or-path> \
   [--frontend-id <id>] \
+  [--scheme http|https] \
+  [--host <host>] \
+  [--path <url-path>] \
+  [--url <legacy-url-or-path>] \
   [--icon-path <path>] \
   [--list <suggested-list>] \
   [--port <port> | --socket-path <socket-path>]
 ```
 
 Creates or updates a user-facing app entry point for a backend. The entry can
-target a TCP port, a Unix socket, or an already-formed URL.
+target a TCP host and port or a Unix socket. `--path` is the URL path opened
+inside the endpoint; `--url` is accepted as command-line convenience and is
+parsed into scheme, host, port, and path before the socket request is sent.
 
 Socket message: `appAddRequest` (`messageType = 13`)
 
 ```text
-bytes 2..5:    UInt32 port
-bytes 6..13:   StringRef32 backend service id
-bytes 14..21:  StringRef32 display name
-bytes 22..29:  StringRef32 URL
-bytes 30..37:  StringRef32 frontend id
-bytes 38..45:  StringRef32 icon path
-bytes 46..53:  StringRef32 frontend list
-bytes 54..61:  StringRef32 socket path
+bytes 2..3:    UInt16 endpoint kind
+bytes 4..5:    UInt16 scheme
+bytes 6..7:    UInt16 endpoint flags, currently 0
+bytes 8..9:    UInt16 TCP port, 0 when not a TCP endpoint
+bytes 10..17:  StringRef32 backend service id
+bytes 18..25:  StringRef32 frontend id
+bytes 26..33:  StringRef32 display name
+bytes 34..41:  StringRef32 URL path
+bytes 42..49:  StringRef32 TCP host
+bytes 50..57:  StringRef32 Unix socket path
+bytes 58..65:  StringRef32 icon path
+bytes 66..73:  StringRef32 frontend list
 ```
 
 Response: `commandResponse` (`messageType = 100`).
 
-Set either `port` or `socket path`, not both. If `frontend id` is empty,
-`outershelld` derives the main app id from the backend id.
+Endpoint kinds are `0` none, `1` TCP, and `2` Unix socket. Schemes are `0`
+default, `1` HTTP, and `2` HTTPS. Set either TCP fields or Unix socket path,
+not both. If `frontend id` is empty, `outershelld` derives the main app id from
+the backend id.
 
 ### `outerctl app remove`
 
@@ -256,22 +270,6 @@ bytes 22..29:  StringRef32 socket path
 
 Response: `commandResponse` (`messageType = 100`).
 
-### `outerctl app clear`
-
-```bash
-outerctl app clear --backend <service-id>
-```
-
-Removes all app entry points for the backend.
-
-Socket message: `appClearRequest` (`messageType = 15`)
-
-```text
-bytes 2..9: StringRef32 backend service id
-```
-
-Response: `commandResponse` (`messageType = 100`).
-
 ### `outerctl app list`
 
 ```bash
@@ -281,7 +279,7 @@ outerctl app list [--backend <service-id>]
 Lists app entry points. If `--backend` is present, the response contains only
 apps whose backend service id exactly matches that value.
 
-Socket message: `appListRequest` (`messageType = 16`)
+Socket message: `appListRequest` (`messageType = 15`)
 
 ```text
 bytes 2..9: StringRef32 backend service id, empty for all app rows
@@ -291,22 +289,29 @@ Response message: `appListResponse` (`messageType = 102`)
 
 This response uses the common list response header above. Its `row count`
 field tells you how many app rows follow at byte 22. Use the header's
-`row size` field as the stride between rows; the current row size is 60 bytes.
+`row size` field as the stride between rows; the current row size is 80 bytes.
 
 ```text
-App row, 60 bytes:
-bytes 0..3:    UInt32 port
-bytes 4..11:   StringRef32 frontend id
-bytes 12..19:  StringRef32 URL
-bytes 20..27:  StringRef32 backend service id
-bytes 28..35:  StringRef32 display name
-bytes 36..43:  StringRef32 socket path
-bytes 44..51:  StringRef32 icon path
-bytes 52..59:  StringRef32 frontend list
+App row, 80 bytes:
+bytes 0..1:    UInt16 endpoint kind
+bytes 2..3:    UInt16 scheme
+bytes 4..5:    UInt16 endpoint flags, currently 0
+bytes 6..7:    UInt16 TCP port, 0 when not a TCP endpoint
+bytes 8..15:   StringRef32 frontend id
+bytes 16..23:  StringRef32 backend service id
+bytes 24..31:  StringRef32 display name
+bytes 32..39:  StringRef32 TCP host
+bytes 40..47:  StringRef32 Unix socket path
+bytes 48..55:  StringRef32 URL path
+bytes 56..63:  StringRef32 derived URL
+bytes 64..71:  StringRef32 icon path
+bytes 72..79:  StringRef32 frontend list
 ```
 
-`outerctl` prints these rows as TSV columns `frontend_id`, `url`,
-`service_id`, `display_name`, `port`, `socket_path`, `icon_path`, and `list`.
+`outerctl` prints these rows as TSV columns `frontend_id`, `service_id`,
+`display_name`, `endpoint_kind`, `scheme`, `host`, `port`, `socket_path`,
+`path`, `url`, `icon_path`, and `list`. The `url` column is derived from the
+structured endpoint fields for compatibility and display.
 
 ## Log Commands
 
@@ -320,7 +325,7 @@ outerctl log add --backend <service-id> --path <log-path>
 
 Registers a log file path as belonging to a backend.
 
-Socket message: `logAddRequest` (`messageType = 17`)
+Socket message: `logAddRequest` (`messageType = 16`)
 
 ```text
 bytes 2..9:    StringRef32 backend service id
@@ -337,27 +342,11 @@ outerctl log remove --backend <service-id> --path <log-path>
 
 Removes one registered log path for a backend.
 
-Socket message: `logRemoveRequest` (`messageType = 18`)
+Socket message: `logRemoveRequest` (`messageType = 17`)
 
 ```text
 bytes 2..9:    StringRef32 backend service id
 bytes 10..17:  StringRef32 log path
-```
-
-Response: `commandResponse` (`messageType = 100`).
-
-### `outerctl log clear`
-
-```bash
-outerctl log clear --backend <service-id>
-```
-
-Removes all registered log paths for the backend.
-
-Socket message: `logClearRequest` (`messageType = 19`)
-
-```text
-bytes 2..9: StringRef32 backend service id
 ```
 
 Response: `commandResponse` (`messageType = 100`).
@@ -371,7 +360,7 @@ outerctl log list [--backend <service-id>]
 Lists registered log paths. If `--backend` is present, the response contains
 only log rows whose backend service id exactly matches that value.
 
-Socket message: `logListRequest` (`messageType = 20`)
+Socket message: `logListRequest` (`messageType = 18`)
 
 ```text
 bytes 2..9: StringRef32 backend service id, empty for all log rows
@@ -391,99 +380,13 @@ bytes 8..15:  StringRef32 backend service id
 
 `outerctl` prints these rows as TSV columns `path` and `service_id`.
 
-## Service Manager Commands
+## Service Manager Metadata
 
 Service-manager metadata is now stored on the backend row. Prefer
-`backend upsert --systemd-unit` or `backend upsert --launchd-plist` for writes.
-
-### `outerctl systemd clear`
-
-```bash
-outerctl systemd clear --backend <service-id>
-```
-
-Clears the Linux systemd service-manager metadata stored on the backend row.
-
-Socket message: `serviceManagerClearRequest` (`messageType = 21`)
-
-```text
-bytes 2..9: StringRef32 backend service id
-```
-
-Response: `commandResponse` (`messageType = 100`).
-
-### `outerctl systemd list`
-
-```bash
-outerctl systemd list [--backend <service-id>]
-```
-
-Lists backend systemd registrations. If `--backend` is present, the response
-contains only the systemd row for that backend service id.
-
-Socket message: `serviceManagerListRequest` (`messageType = 22`)
-
-```text
-bytes 2..9: StringRef32 backend service id, empty for all service-manager rows
-```
-
-Response message: `serviceManagerListResponse` (`messageType = 104`)
-
-This response uses the common list response header above. Its `row count`
-field tells you how many service-manager rows follow at byte 22. Use the
-header's `row size` field as the stride between rows; the current row size is
-20 bytes.
-
-```text
-Service-manager row, 20 bytes:
-bytes 0..3:    UInt32 flags
-bytes 4..11:   StringRef32 backend service id
-bytes 12..19:  StringRef32 platform service-manager entry
-```
-
-Flags:
-
-```text
-0x01 owns platform service-manager entry
-```
-
-On Linux, `outerctl systemd list` prints `service_id` and `unit_name`. On
-macOS, `outerctl launchd list` prints `service_id`, `plist_path`, and
-`owns_plist`.
-
-### `outerctl launchd clear`
-
-```bash
-outerctl launchd clear --backend <service-id>
-```
-
-Clears the macOS launchd service-manager metadata stored on the backend row.
-
-Socket message: `serviceManagerClearRequest` (`messageType = 21`)
-
-```text
-bytes 2..9: StringRef32 backend service id
-```
-
-Response: `commandResponse` (`messageType = 100`).
-
-### `outerctl launchd list`
-
-```bash
-outerctl launchd list [--backend <service-id>]
-```
-
-Lists backend launchd registrations. If `--backend` is present, the response
-contains only the launchd row for that backend service id.
-
-Socket message: `serviceManagerListRequest` (`messageType = 22`)
-
-```text
-bytes 2..9: StringRef32 backend service id, empty for all service-manager rows
-```
-
-The response is the same `serviceManagerListResponse` (`messageType = 104`)
-described above.
+`backend upsert --systemd-unit` or `backend upsert --launchd-plist` to set it.
+`backend remove` removes the backend row, app rows, log rows, opener rows,
+content-type rows, and service-manager metadata for that backend. Use
+`backend list` to inspect the `unit_name`, `unit_path`, and `owns_unit` fields.
 
 ## Content Type Commands
 
@@ -508,7 +411,7 @@ Creates or updates one backend-owned custom content type definition. These
 definitions augment the built-in content types used for file matching.
 `backend remove` clears the custom definitions owned by that backend.
 
-Socket message: `contentTypeAddRequest` (`messageType = 23`)
+Socket message: `contentTypeAddRequest` (`messageType = 19`)
 
 ```text
 bytes 2..9:    StringRef32 backend service id
@@ -531,7 +434,7 @@ outerctl content-type remove --backend <service-id> --content-type <identifier>
 Removes one backend-owned custom content type definition. Built-in content
 types are not stored in the registry and cannot be removed.
 
-Socket message: `contentTypeRemoveRequest` (`messageType = 24`)
+Socket message: `contentTypeRemoveRequest` (`messageType = 20`)
 
 ```text
 bytes 2..9:    StringRef32 backend service id
@@ -539,26 +442,6 @@ bytes 10..17:  StringRef32 content type
 ```
 
 Response: `commandResponse` (`messageType = 100`).
-
-### `outerctl content-type clear`
-
-```bash
-outerctl content-type clear --backend <service-id>
-```
-
-Removes all custom content type definitions owned by one backend. `backend
-remove` does this automatically before removing the backend row.
-
-Socket message: `contentTypeClearRequest` (`messageType = 25`)
-
-```text
-bytes 2..9: StringRef32 backend service id
-```
-
-Response: `commandResponse` (`messageType = 100`).
-
-Built-in content types are not stored in the registry and are not removed by
-this command.
 
 ### `outerctl content-type list`
 
@@ -572,14 +455,14 @@ matches the normalized value. If `--backend` is present, the response contains
 only custom definitions owned by that backend; built-ins have no backend owner
 and are omitted.
 
-Socket message: `contentTypeListRequest` (`messageType = 26`)
+Socket message: `contentTypeListRequest` (`messageType = 21`)
 
 ```text
 bytes 2..9:    StringRef32 backend service id, empty for all backends and built-ins
 bytes 10..17:  StringRef32 content type identifier, empty for all content types
 ```
 
-Response message: `contentTypeListResponse` (`messageType = 105`)
+Response message: `contentTypeListResponse` (`messageType = 104`)
 
 This response uses the common list response header above. Its `row count`
 field tells you how many content-type rows follow at byte 22. Use the header's
@@ -623,7 +506,7 @@ Creates or updates an opener record for a backend and content type. The opener
 record tells Outer Shell that the backend can view, edit, or otherwise open
 files that match that content type.
 
-Socket message: `openerAddRequest` (`messageType = 27`)
+Socket message: `openerAddRequest` (`messageType = 22`)
 
 ```text
 bytes 2..5:    UInt32 rank
@@ -659,27 +542,11 @@ outerctl opener remove \
 
 Removes one opener record for the backend and registered content type.
 
-Socket message: `openerRemoveRequest` (`messageType = 28`)
+Socket message: `openerRemoveRequest` (`messageType = 23`)
 
 ```text
 bytes 2..9:    StringRef32 backend service id
 bytes 10..17:  StringRef32 content type
-```
-
-Response: `commandResponse` (`messageType = 100`).
-
-### `outerctl opener clear`
-
-```bash
-outerctl opener clear --backend <service-id>
-```
-
-Removes all opener records for the backend.
-
-Socket message: `openerClearRequest` (`messageType = 29`)
-
-```text
-bytes 2..9: StringRef32 backend service id
 ```
 
 Response: `commandResponse` (`messageType = 100`).
@@ -702,14 +569,14 @@ Use `fileOpenersQuery` when you want “which apps can open this file?” behavi
 with content-type inference, optional explicit content type, conformance
 expansion, and resolved URLs.
 
-Socket message: `openerListRequest` (`messageType = 30`)
+Socket message: `openerListRequest` (`messageType = 24`)
 
 ```text
 bytes 2..9:    StringRef32 backend service id, empty for all openers
 bytes 10..17:  StringRef32 registered content type, empty for all openers
 ```
 
-Response message: `openerListResponse` (`messageType = 106`)
+Response message: `openerListResponse` (`messageType = 105`)
 
 This response uses the common list response header above. Its `row count`
 field tells you how many opener rows follow at byte 22. Use the header's
@@ -737,7 +604,7 @@ service id; it asks the daemon to infer or use a content type, expand conformanc
 types, and return all matching openers.
 
 ```text
-fileOpenersQuery, messageType = 31
+fileOpenersQuery, messageType = 25
 bytes 2..9:    StringRef32 file path
 bytes 10..17:  StringRef32 content type, optional
 bytes 18..25:  StringRef32 requester user, optional
@@ -746,7 +613,7 @@ bytes 18..25:  StringRef32 requester user, optional
 The response is:
 
 ```text
-fileOpenersResponse, messageType = 107
+fileOpenersResponse, messageType = 106
 bytes 2..5:    UInt32 status, 0 for success
 bytes 6..13:   StringRef32 error message
 bytes 14..17:  UInt32 opener row count

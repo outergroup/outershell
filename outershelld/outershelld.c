@@ -3167,6 +3167,7 @@ enum {
     ORWA_LEGACY_FRONTENDS_ROW_SIZE = 97,
     ORWA_FRONTENDS_ROW_SIZE = 113,
     ORWA_FRONTENDS_ROW_SIZE_WITH_FLAGS = 117,
+    ORWA_STRUCTURED_FRONTENDS_ROW_SIZE = 80,
     ORWA_FRONTEND_LAYOUTS_ROW_SIZE = 32,
     ORWA_LOG_FILES_ROW_SIZE = 32,
     ORWA_CONTENT_TYPES_ROW_SIZE = 112,
@@ -3205,6 +3206,12 @@ typedef struct {
 static bool binary_append_u32(StringBuilder *builder, uint32_t value) {
     unsigned char bytes[4];
     write_uint32_le(bytes, value);
+    return sb_append_n(builder, (const char *)bytes, sizeof(bytes));
+}
+
+static bool binary_append_u16(StringBuilder *builder, uint16_t value) {
+    unsigned char bytes[2];
+    write_uint16_le(bytes, value);
     return sb_append_n(builder, (const char *)bytes, sizeof(bytes));
 }
 
@@ -3283,6 +3290,18 @@ static bool registry_binary_append_string_ref(RegistryBinaryStringPool *pool,
     uint64_t length = 0;
     return registry_binary_string_ref(pool, variable_region, text, &offset, &length) &&
            binary_append_string_ref(rows, offset, length);
+}
+
+static bool registry_binary_append_string_ref32(RegistryBinaryStringPool *pool,
+                                                StringBuilder *variable_region,
+                                                StringBuilder *rows,
+                                                const char *text) {
+    uint64_t offset = 0;
+    uint64_t length = 0;
+    if (!registry_binary_string_ref(pool, variable_region, text, &offset, &length)) return false;
+    if (offset > UINT32_MAX || length > UINT32_MAX) return false;
+    return binary_append_u32(rows, (uint32_t)offset) &&
+           binary_append_u32(rows, (uint32_t)length);
 }
 
 static bool registry_binary_append_string_list_ref(RegistryBinaryStringPool *pool,
@@ -3456,32 +3475,69 @@ static bool registry_binary_append_backend_row(sqlite3_stmt *statement,
            binary_append_u32(rows, flags);
 }
 
+static void registry_frontend_parse_legacy_endpoint(const char *raw_url,
+                                                    uint32_t raw_port,
+                                                    const char *raw_socket_path,
+                                                    uint16_t *endpoint_kind,
+                                                    uint16_t *endpoint_scheme,
+                                                    char *host,
+                                                    size_t host_size,
+                                                    uint16_t *port,
+                                                    char *path,
+                                                    size_t path_size);
+static bool registry_frontend_build_url(uint16_t endpoint_kind,
+                                        uint16_t endpoint_scheme,
+                                        const char *host,
+                                        uint16_t port,
+                                        const char *path,
+                                        char *out,
+                                        size_t out_size);
+
 static bool registry_binary_append_frontend_row(sqlite3_stmt *statement,
                                                 RegistryBinaryStringPool *pool,
                                                 StringBuilder *variable_region,
                                                 StringBuilder *rows) {
+    const char *url = sqlite_column_text_or_empty(statement, 0);
     const char *socket_path = sqlite_column_text_or_empty(statement, 4);
     uint32_t port = (uint32_t)sqlite3_column_int(statement, 3);
-    unsigned char endpoint_kind = socket_path[0] ? 2u : (port ? 1u : 0u);
-    unsigned char zero_padding[12] = {0};
-    unsigned char empty_payload[16] = {0};
-    bool ok = registry_binary_append_string_ref(pool, variable_region, rows, sqlite_column_text_or_empty(statement, 0)) &&
-              registry_binary_append_string_ref(pool, variable_region, rows, sqlite_column_text_or_empty(statement, 1)) &&
-              registry_binary_append_string_ref(pool, variable_region, rows, sqlite_column_text_or_empty(statement, 2)) &&
-              registry_binary_append_string_ref(pool, variable_region, rows, sqlite_column_text_or_empty(statement, 5)) &&
-              registry_binary_append_string_ref(pool, variable_region, rows, sqlite_column_text_or_empty(statement, 6)) &&
-              sb_append_n(rows, (const char *)&endpoint_kind, sizeof(endpoint_kind));
+    uint16_t endpoint_kind = OUTERSHELLD_API_FRONTEND_ENDPOINT_NONE;
+    uint16_t endpoint_scheme = OUTERSHELLD_API_FRONTEND_SCHEME_HTTP;
+    uint16_t endpoint_port = 0;
+    char host[PATH_MAX];
+    char path[PATH_MAX * 2];
+    registry_frontend_parse_legacy_endpoint(url,
+                                            port,
+                                            socket_path,
+                                            &endpoint_kind,
+                                            &endpoint_scheme,
+                                            host,
+                                            sizeof(host),
+                                            &endpoint_port,
+                                            path,
+                                            sizeof(path));
+    bool ok = registry_binary_append_string_ref32(pool, variable_region, rows, sqlite_column_text_or_empty(statement, 7)) &&
+              registry_binary_append_string_ref32(pool, variable_region, rows, sqlite_column_text_or_empty(statement, 1)) &&
+              registry_binary_append_string_ref32(pool, variable_region, rows, sqlite_column_text_or_empty(statement, 2)) &&
+              registry_binary_append_string_ref32(pool, variable_region, rows, sqlite_column_text_or_empty(statement, 5)) &&
+              registry_binary_append_string_ref32(pool, variable_region, rows, sqlite_column_text_or_empty(statement, 6)) &&
+              binary_append_u16(rows, endpoint_kind) &&
+              binary_append_u16(rows, 0) &&
+              binary_append_u16(rows, endpoint_scheme) &&
+              binary_append_u16(rows, 0) &&
+              registry_binary_append_string_ref32(pool, variable_region, rows, path);
     if (!ok) return false;
-    if (endpoint_kind == 2u) {
-        ok = registry_binary_append_string_ref(pool, variable_region, rows, socket_path);
-    } else if (endpoint_kind == 1u) {
-        ok = binary_append_u32(rows, port) &&
-             sb_append_n(rows, (const char *)zero_padding, sizeof(zero_padding));
+    if (endpoint_kind == OUTERSHELLD_API_FRONTEND_ENDPOINT_UNIX) {
+        ok = registry_binary_append_string_ref32(pool, variable_region, rows, socket_path) &&
+             binary_append_zero(rows, 16);
+    } else if (endpoint_kind == OUTERSHELLD_API_FRONTEND_ENDPOINT_TCP) {
+        ok = registry_binary_append_string_ref32(pool, variable_region, rows, host) &&
+             binary_append_u16(rows, endpoint_port) &&
+             binary_append_zero(rows, 14);
     } else {
-        ok = sb_append_n(rows, (const char *)empty_payload, sizeof(empty_payload));
+        ok = registry_binary_append_string_ref32(pool, variable_region, rows, "") &&
+             binary_append_zero(rows, 16);
     }
-    if (!ok) return false;
-    return registry_binary_append_string_ref(pool, variable_region, rows, sqlite_column_text_or_empty(statement, 7));
+    return ok;
 }
 
 static bool registry_binary_append_frontend_layout_row(sqlite3_stmt *statement,
@@ -3629,6 +3685,24 @@ static bool registry_binary_read_string(const unsigned char *file,
     value[length] = '\0';
     *out = value;
     return true;
+}
+
+static bool registry_binary_read_string_ref32(const unsigned char *file,
+                                              size_t file_size,
+                                              uint64_t variable_offset,
+                                              const unsigned char *row_bytes,
+                                              size_t offset,
+                                              char **out,
+                                              char *error,
+                                              size_t error_size) {
+    return registry_binary_read_string(file,
+                                       file_size,
+                                       variable_offset,
+                                       read_uint32_le(row_bytes + offset),
+                                       read_uint32_le(row_bytes + offset + 4),
+                                       out,
+                                       error,
+                                       error_size);
 }
 
 #ifndef OUTER_SHELL_BACKEND_LIBRARY
@@ -3884,7 +3958,8 @@ static bool import_registry_binary_into_sqlite(sqlite3 *database, const char *sq
         if ((i == ORWA_TABLE_BACKENDS
                 ? (descriptors[i].row_size != ORWA_BACKENDS_ROW_SIZE && descriptors[i].row_size != ORWA_LEGACY_BACKENDS_ROW_SIZE)
                 : i == ORWA_TABLE_FRONTENDS
-                ? (descriptors[i].row_size != ORWA_FRONTENDS_ROW_SIZE &&
+                ? (descriptors[i].row_size != ORWA_STRUCTURED_FRONTENDS_ROW_SIZE &&
+                   descriptors[i].row_size != ORWA_FRONTENDS_ROW_SIZE &&
                    descriptors[i].row_size != ORWA_FRONTENDS_ROW_SIZE_WITH_FLAGS &&
                    descriptors[i].row_size != ORWA_LEGACY_FRONTENDS_ROW_SIZE)
                 : i == ORWA_TABLE_CONTENT_TYPES
@@ -3926,45 +4001,85 @@ static bool import_registry_binary_into_sqlite(sqlite3 *database, const char *sq
 
     for (uint64_t row = 0; ok && row < descriptors[ORWA_TABLE_FRONTENDS].row_count; row++) {
         const unsigned char *row_bytes = bytes + descriptors[ORWA_TABLE_FRONTENDS].offset + row * descriptors[ORWA_TABLE_FRONTENDS].row_size;
-        char *url = NULL, *service_id = NULL, *display_name = NULL, *icon_path = NULL, *list = NULL, *socket_path = NULL, *frontend_id = NULL;
+        char *url = NULL, *service_id = NULL, *display_name = NULL, *icon_path = NULL, *list = NULL, *socket_path = NULL, *frontend_id = NULL, *host = NULL, *path_value = NULL;
         uint32_t port = 0;
-        ok = registry_binary_read_string(bytes, file_size, variable_offset, read_uint64_le(row_bytes), read_uint64_le(row_bytes + 8), &url, error, error_size) &&
-             registry_binary_read_string(bytes, file_size, variable_offset, read_uint64_le(row_bytes + 16), read_uint64_le(row_bytes + 24), &service_id, error, error_size) &&
-             registry_binary_read_string(bytes, file_size, variable_offset, read_uint64_le(row_bytes + 32), read_uint64_le(row_bytes + 40), &display_name, error, error_size) &&
-             registry_binary_read_string(bytes, file_size, variable_offset, read_uint64_le(row_bytes + 48), read_uint64_le(row_bytes + 56), &icon_path, error, error_size) &&
-             registry_binary_read_string(bytes, file_size, variable_offset, read_uint64_le(row_bytes + 64), read_uint64_le(row_bytes + 72), &list, error, error_size);
-        if (ok) {
-            uint8_t endpoint_kind = row_bytes[80];
-            if (endpoint_kind == 1u) {
-                port = read_uint32_le(row_bytes + 81);
+        if (descriptors[ORWA_TABLE_FRONTENDS].row_size == ORWA_STRUCTURED_FRONTENDS_ROW_SIZE) {
+            uint16_t endpoint_kind = read_uint16_le(row_bytes + 40);
+            uint16_t endpoint_scheme = read_uint16_le(row_bytes + 44);
+            ok = registry_binary_read_string_ref32(bytes, file_size, variable_offset, row_bytes, 0, &frontend_id, error, error_size) &&
+                 registry_binary_read_string_ref32(bytes, file_size, variable_offset, row_bytes, 8, &service_id, error, error_size) &&
+                 registry_binary_read_string_ref32(bytes, file_size, variable_offset, row_bytes, 16, &display_name, error, error_size) &&
+                 registry_binary_read_string_ref32(bytes, file_size, variable_offset, row_bytes, 24, &icon_path, error, error_size) &&
+                 registry_binary_read_string_ref32(bytes, file_size, variable_offset, row_bytes, 32, &list, error, error_size) &&
+                 registry_binary_read_string_ref32(bytes, file_size, variable_offset, row_bytes, 48, &path_value, error, error_size);
+            if (ok && endpoint_kind == OUTERSHELLD_API_FRONTEND_ENDPOINT_TCP) {
+                port = read_uint16_le(row_bytes + 64);
+                ok = registry_binary_read_string_ref32(bytes, file_size, variable_offset, row_bytes, 56, &host, error, error_size);
+                if (ok) socket_path = strdup("");
+            } else if (ok && endpoint_kind == OUTERSHELLD_API_FRONTEND_ENDPOINT_UNIX) {
+                ok = registry_binary_read_string_ref32(bytes, file_size, variable_offset, row_bytes, 56, &socket_path, error, error_size);
+                if (ok) host = strdup("");
+            } else if (ok && endpoint_kind == OUTERSHELLD_API_FRONTEND_ENDPOINT_NONE) {
+                host = strdup("");
                 socket_path = strdup("");
-                if (!socket_path) {
-                    snprintf(error, error_size, "Out of memory.");
-                    ok = false;
-                }
-            } else if (endpoint_kind == 2u) {
-                ok = registry_binary_read_string(bytes, file_size, variable_offset, read_uint64_le(row_bytes + 81), read_uint64_le(row_bytes + 89), &socket_path, error, error_size);
-            } else if (endpoint_kind == 0u) {
-                socket_path = strdup("");
-                if (!socket_path) {
-                    snprintf(error, error_size, "Out of memory.");
-                    ok = false;
-                }
-            } else {
+            } else if (ok) {
                 snprintf(error, error_size, "Registry binary frontend endpoint kind is unsupported.");
                 ok = false;
             }
-        }
-        if (ok && descriptors[ORWA_TABLE_FRONTENDS].row_size >= ORWA_FRONTENDS_ROW_SIZE) {
-            ok = registry_binary_read_string(bytes, file_size, variable_offset, read_uint64_le(row_bytes + 97), read_uint64_le(row_bytes + 105), &frontend_id, error, error_size);
-        } else if (ok) {
-            size_t needed = strlen(service_id ? service_id : "") + strlen(url ? url : "") + 2;
-            frontend_id = (char *)malloc(needed);
-            if (frontend_id) {
-                snprintf(frontend_id, needed, "%s:%s", service_id ? service_id : "app", url && url[0] ? url : "main");
-            } else {
+            if (ok && (!host || !socket_path)) {
                 snprintf(error, error_size, "Out of memory.");
                 ok = false;
+            }
+            if (ok) {
+                char url_buffer[PATH_MAX * 3];
+                ok = registry_frontend_build_url(endpoint_kind, endpoint_scheme, host, (uint16_t)port, path_value, url_buffer, sizeof(url_buffer));
+                if (ok) {
+                    url = strdup(url_buffer);
+                    if (!url) {
+                        snprintf(error, error_size, "Out of memory.");
+                        ok = false;
+                    }
+                }
+            }
+        } else {
+            ok = registry_binary_read_string(bytes, file_size, variable_offset, read_uint64_le(row_bytes), read_uint64_le(row_bytes + 8), &url, error, error_size) &&
+                 registry_binary_read_string(bytes, file_size, variable_offset, read_uint64_le(row_bytes + 16), read_uint64_le(row_bytes + 24), &service_id, error, error_size) &&
+                 registry_binary_read_string(bytes, file_size, variable_offset, read_uint64_le(row_bytes + 32), read_uint64_le(row_bytes + 40), &display_name, error, error_size) &&
+                 registry_binary_read_string(bytes, file_size, variable_offset, read_uint64_le(row_bytes + 48), read_uint64_le(row_bytes + 56), &icon_path, error, error_size) &&
+                 registry_binary_read_string(bytes, file_size, variable_offset, read_uint64_le(row_bytes + 64), read_uint64_le(row_bytes + 72), &list, error, error_size);
+            if (ok) {
+                uint8_t endpoint_kind = row_bytes[80];
+                if (endpoint_kind == 1u) {
+                    port = read_uint32_le(row_bytes + 81);
+                    socket_path = strdup("");
+                    if (!socket_path) {
+                        snprintf(error, error_size, "Out of memory.");
+                        ok = false;
+                    }
+                } else if (endpoint_kind == 2u) {
+                    ok = registry_binary_read_string(bytes, file_size, variable_offset, read_uint64_le(row_bytes + 81), read_uint64_le(row_bytes + 89), &socket_path, error, error_size);
+                } else if (endpoint_kind == 0u) {
+                    socket_path = strdup("");
+                    if (!socket_path) {
+                        snprintf(error, error_size, "Out of memory.");
+                        ok = false;
+                    }
+                } else {
+                    snprintf(error, error_size, "Registry binary frontend endpoint kind is unsupported.");
+                    ok = false;
+                }
+            }
+            if (ok && descriptors[ORWA_TABLE_FRONTENDS].row_size >= ORWA_FRONTENDS_ROW_SIZE) {
+                ok = registry_binary_read_string(bytes, file_size, variable_offset, read_uint64_le(row_bytes + 97), read_uint64_le(row_bytes + 105), &frontend_id, error, error_size);
+            } else if (ok) {
+                size_t needed = strlen(service_id ? service_id : "") + strlen(url ? url : "") + 2;
+                frontend_id = (char *)malloc(needed);
+                if (frontend_id) {
+                    snprintf(frontend_id, needed, "%s:%s", service_id ? service_id : "app", url && url[0] ? url : "main");
+                } else {
+                    snprintf(error, error_size, "Out of memory.");
+                    ok = false;
+                }
             }
         }
         if (ok) {
@@ -3980,6 +4095,8 @@ static bool import_registry_binary_into_sqlite(sqlite3 *database, const char *sq
         free(list);
         free(socket_path);
         free(frontend_id);
+        free(host);
+        free(path_value);
     }
 
     if (table_count != ORWA_LEGACY_THREE_TABLE_COUNT) {
@@ -4052,7 +4169,7 @@ static bool export_registry_binary_from_sqlite(sqlite3 *database, const char *sq
 
     RegistryBinaryTableDescriptor descriptors[ORWA_TABLE_COUNT] = {
         {.row_count = registry_binary_count_rows(database, "backends"), .row_size = ORWA_BACKENDS_ROW_SIZE},
-        {.row_count = registry_binary_count_rows(database, "frontends"), .row_size = ORWA_FRONTENDS_ROW_SIZE},
+        {.row_count = registry_binary_count_rows(database, "frontends"), .row_size = ORWA_STRUCTURED_FRONTENDS_ROW_SIZE},
         {.row_count = registry_binary_count_rows(database, "frontend_layouts"), .row_size = ORWA_FRONTEND_LAYOUTS_ROW_SIZE},
         {.row_count = registry_binary_count_rows(database, "log_files"), .row_size = ORWA_LOG_FILES_ROW_SIZE},
         {.row_count = 0, .row_size = ORWA_CONTENT_TYPES_ROW_SIZE},
@@ -4214,7 +4331,12 @@ typedef struct {
     char *url;
     char *service_id;
     char *display_name;
+    uint16_t endpoint_kind;
+    uint16_t endpoint_scheme;
+    uint16_t endpoint_flags;
     int port;
+    char *host;
+    char *path;
     char *socket_path;
     char *icon_path;
     char *list;
@@ -4284,6 +4406,195 @@ static bool registry_assign_string(char **slot, const char *value) {
     if (!copy) return false;
     free(*slot);
     *slot = copy;
+    return true;
+}
+
+static uint16_t registry_frontend_normalize_endpoint_kind(uint16_t kind) {
+    switch (kind) {
+    case OUTERSHELLD_API_FRONTEND_ENDPOINT_TCP:
+    case OUTERSHELLD_API_FRONTEND_ENDPOINT_UNIX:
+        return kind;
+    default:
+        return OUTERSHELLD_API_FRONTEND_ENDPOINT_NONE;
+    }
+}
+
+static uint16_t registry_frontend_normalize_scheme(uint16_t scheme) {
+    switch (scheme) {
+    case OUTERSHELLD_API_FRONTEND_SCHEME_HTTPS:
+        return scheme;
+    case OUTERSHELLD_API_FRONTEND_SCHEME_HTTP:
+    case OUTERSHELLD_API_FRONTEND_SCHEME_DEFAULT:
+    default:
+        return OUTERSHELLD_API_FRONTEND_SCHEME_HTTP;
+    }
+}
+
+static const char *registry_frontend_scheme_text(uint16_t scheme) {
+    return registry_frontend_normalize_scheme(scheme) == OUTERSHELLD_API_FRONTEND_SCHEME_HTTPS ? "https" : "http";
+}
+
+static void registry_frontend_normalize_path(const char *raw, char *out, size_t out_size) {
+    if (!out || out_size == 0) return;
+    const char *path = raw && raw[0] ? raw : "/";
+    if (path[0] == '/' || path[0] == '?' || path[0] == '#') {
+        if (path[0] == '/' || out_size < 2) {
+            snprintf(out, out_size, "%s", path);
+        } else {
+            snprintf(out, out_size, "/%s", path);
+        }
+    } else {
+        snprintf(out, out_size, "/%s", path);
+    }
+}
+
+static const char *first_url_suffix(const char *authority) {
+    const char *slash = strchr(authority, '/');
+    const char *query = strchr(authority, '?');
+    const char *fragment = strchr(authority, '#');
+    const char *suffix = slash;
+    if (!suffix || (query && query < suffix)) suffix = query;
+    if (!suffix || (fragment && fragment < suffix)) suffix = fragment;
+    return suffix;
+}
+
+static void parse_host_port(const char *start,
+                            size_t length,
+                            char *host,
+                            size_t host_size,
+                            uint16_t *port) {
+    if (host && host_size) host[0] = '\0';
+    if (!start || length == 0) return;
+    const char *host_end = start + length;
+    const char *port_start = NULL;
+    if (start[0] == '[') {
+        const char *closing = memchr(start, ']', length);
+        if (closing) {
+            host_end = closing + 1;
+            if ((size_t)(host_end - start) < length && *host_end == ':') {
+                port_start = host_end + 1;
+            }
+        }
+    } else {
+        const char *colon = NULL;
+        for (const char *cursor = start; cursor < start + length; cursor++) {
+            if (*cursor == ':') colon = cursor;
+        }
+        if (colon) {
+            host_end = colon;
+            port_start = colon + 1;
+        }
+    }
+    size_t host_length = (size_t)(host_end - start);
+    if (host_length >= host_size) host_length = host_size ? host_size - 1 : 0;
+    if (host && host_size) {
+        memcpy(host, start, host_length);
+        host[host_length] = '\0';
+    }
+    if (port_start && port_start < start + length && port) {
+        char buffer[16];
+        size_t port_length = (size_t)((start + length) - port_start);
+        if (port_length >= sizeof(buffer)) port_length = sizeof(buffer) - 1;
+        memcpy(buffer, port_start, port_length);
+        buffer[port_length] = '\0';
+        char *end = NULL;
+        long value = strtol(buffer, &end, 10);
+        if (end && *end == '\0' && value > 0 && value <= 65535) {
+            *port = (uint16_t)value;
+        }
+    }
+}
+
+static void registry_frontend_parse_legacy_endpoint(const char *raw_url,
+                                                    uint32_t raw_port,
+                                                    const char *raw_socket_path,
+                                                    uint16_t *endpoint_kind,
+                                                    uint16_t *endpoint_scheme,
+                                                    char *host,
+                                                    size_t host_size,
+                                                    uint16_t *port,
+                                                    char *path,
+                                                    size_t path_size) {
+    bool has_socket = raw_socket_path && raw_socket_path[0];
+    const char *url = raw_url ? raw_url : "";
+    if (endpoint_kind) {
+        *endpoint_kind = has_socket
+            ? OUTERSHELLD_API_FRONTEND_ENDPOINT_UNIX
+            : (raw_port > 0 || url[0] ? OUTERSHELLD_API_FRONTEND_ENDPOINT_TCP : OUTERSHELLD_API_FRONTEND_ENDPOINT_NONE);
+    }
+    if (endpoint_scheme) *endpoint_scheme = OUTERSHELLD_API_FRONTEND_SCHEME_HTTP;
+    if (host && host_size) snprintf(host, host_size, "127.0.0.1");
+    if (port) *port = raw_port > 65535 ? 0 : (uint16_t)raw_port;
+    registry_frontend_normalize_path("/", path, path_size);
+
+    const char *authority = url;
+    const char *scheme = strstr(url, "://");
+    if (scheme) {
+        size_t scheme_length = (size_t)(scheme - url);
+        if (endpoint_scheme && scheme_length == 5 && strncmp(url, "https", 5) == 0) {
+            *endpoint_scheme = OUTERSHELLD_API_FRONTEND_SCHEME_HTTPS;
+        } else if (endpoint_scheme && scheme_length == 4 && strncmp(url, "http", 4) == 0) {
+            *endpoint_scheme = OUTERSHELLD_API_FRONTEND_SCHEME_HTTP;
+        }
+        authority = scheme + 3;
+    }
+
+    if (url[0] == '/' || url[0] == '?' || url[0] == '#') {
+        registry_frontend_normalize_path(url, path, path_size);
+        return;
+    }
+
+    const char *suffix = first_url_suffix(authority);
+    bool looks_like_authority = scheme != NULL;
+    if (!looks_like_authority) {
+        const char *slash = suffix ? suffix : authority + strlen(authority);
+        looks_like_authority = memchr(authority, ':', (size_t)(slash - authority)) != NULL;
+    }
+    if (looks_like_authority) {
+        const char *authority_end = suffix ? suffix : authority + strlen(authority);
+        if (!has_socket) {
+            parse_host_port(authority,
+                            (size_t)(authority_end - authority),
+                            host,
+                            host_size,
+                            port);
+        }
+        registry_frontend_normalize_path(suffix ? suffix : "/", path, path_size);
+        return;
+    }
+
+    if (url[0]) {
+        registry_frontend_normalize_path(url, path, path_size);
+    }
+}
+
+static bool registry_frontend_build_url(uint16_t endpoint_kind,
+                                        uint16_t endpoint_scheme,
+                                        const char *host,
+                                        uint16_t port,
+                                        const char *path,
+                                        char *out,
+                                        size_t out_size) {
+    if (!out || out_size == 0) return false;
+    out[0] = '\0';
+    char normalized_path[PATH_MAX * 2];
+    registry_frontend_normalize_path(path, normalized_path, sizeof(normalized_path));
+    endpoint_kind = registry_frontend_normalize_endpoint_kind(endpoint_kind);
+    if (endpoint_kind == OUTERSHELLD_API_FRONTEND_ENDPOINT_UNIX) {
+        snprintf(out, out_size, "%s", normalized_path);
+        return true;
+    }
+    if (endpoint_kind == OUTERSHELLD_API_FRONTEND_ENDPOINT_TCP) {
+        const char *safe_host = host && host[0] ? host : "127.0.0.1";
+        const char *scheme = registry_frontend_scheme_text(endpoint_scheme);
+        if (port > 0) {
+            snprintf(out, out_size, "%s://%s:%u%s", scheme, safe_host, (unsigned)port, normalized_path);
+        } else {
+            snprintf(out, out_size, "%s://%s%s", scheme, safe_host, normalized_path);
+        }
+        return true;
+    }
+    snprintf(out, out_size, "%s", path && path[0] ? normalized_path : "");
     return true;
 }
 
@@ -4392,6 +4703,8 @@ static void registry_store_free(RegistryStore *store) {
         free(store->frontends[i].url);
         free(store->frontends[i].service_id);
         free(store->frontends[i].display_name);
+        free(store->frontends[i].host);
+        free(store->frontends[i].path);
         free(store->frontends[i].socket_path);
         free(store->frontends[i].icon_path);
         free(store->frontends[i].list);
@@ -4528,16 +4841,20 @@ static bool registry_store_upsert_backend(RegistryStore *store,
     return true;
 }
 
-static bool registry_store_upsert_frontend(RegistryStore *store,
-                                           const char *frontend_id,
-                                           const char *url,
-                                           const char *service_id,
-                                           const char *display_name,
-                                           int port,
-                                           const char *socket_path,
-                                           const char *icon_path,
-                                           const char *list,
-                                           bool preserve_empty_icon_and_list) {
+static bool registry_store_upsert_frontend_endpoint(RegistryStore *store,
+                                                    const char *frontend_id,
+                                                    const char *service_id,
+                                                    const char *display_name,
+                                                    uint16_t endpoint_kind,
+                                                    uint16_t endpoint_scheme,
+                                                    uint16_t endpoint_flags,
+                                                    const char *host,
+                                                    uint16_t port,
+                                                    const char *path,
+                                                    const char *socket_path,
+                                                    const char *icon_path,
+                                                    const char *list,
+                                                    bool preserve_empty_icon_and_list) {
     RegistryFrontendRecord *record = registry_store_find_frontend(store, frontend_id);
     if (!record) {
         REGISTRY_ENSURE_CAPACITY(store, frontend, RegistryFrontendRecord);
@@ -4545,13 +4862,32 @@ static bool registry_store_upsert_frontend(RegistryStore *store,
         memset(record, 0, sizeof(*record));
         if (!registry_assign_string(&record->frontend_id, frontend_id)) return false;
     }
-    if (!registry_assign_string(&record->url, url) ||
+    char normalized_path[PATH_MAX * 2];
+    char derived_url[PATH_MAX * 2];
+    endpoint_kind = registry_frontend_normalize_endpoint_kind(endpoint_kind);
+    endpoint_scheme = registry_frontend_normalize_scheme(endpoint_scheme);
+    registry_frontend_normalize_path(path, normalized_path, sizeof(normalized_path));
+    if (!registry_frontend_build_url(endpoint_kind,
+                                     endpoint_scheme,
+                                     host,
+                                     port,
+                                     normalized_path,
+                                     derived_url,
+                                     sizeof(derived_url))) {
+        return false;
+    }
+    if (!registry_assign_string(&record->url, derived_url) ||
         !registry_assign_string(&record->service_id, service_id) ||
         !registry_assign_string(&record->display_name, display_name) ||
+        !registry_assign_string(&record->host, endpoint_kind == OUTERSHELLD_API_FRONTEND_ENDPOINT_TCP ? (host && host[0] ? host : "127.0.0.1") : "") ||
+        !registry_assign_string(&record->path, normalized_path) ||
         !registry_assign_string(&record->socket_path, socket_path)) {
         return false;
     }
-    record->port = port > 0 ? port : 0;
+    record->endpoint_kind = endpoint_kind;
+    record->endpoint_scheme = endpoint_scheme;
+    record->endpoint_flags = endpoint_flags;
+    record->port = endpoint_kind == OUTERSHELLD_API_FRONTEND_ENDPOINT_TCP ? (int)port : 0;
     if (!preserve_empty_icon_and_list || (icon_path && icon_path[0])) {
         if (!registry_assign_string(&record->icon_path, icon_path)) return false;
     } else if (!record->icon_path && !registry_assign_string(&record->icon_path, "")) {
@@ -4563,6 +4899,47 @@ static bool registry_store_upsert_frontend(RegistryStore *store,
         return false;
     }
     return true;
+}
+
+static bool registry_store_upsert_frontend(RegistryStore *store,
+                                           const char *frontend_id,
+                                           const char *url,
+                                           const char *service_id,
+                                           const char *display_name,
+                                           int port,
+                                           const char *socket_path,
+                                           const char *icon_path,
+                                           const char *list,
+                                           bool preserve_empty_icon_and_list) {
+    uint16_t endpoint_kind = OUTERSHELLD_API_FRONTEND_ENDPOINT_NONE;
+    uint16_t endpoint_scheme = OUTERSHELLD_API_FRONTEND_SCHEME_HTTP;
+    uint16_t endpoint_port = 0;
+    char host[PATH_MAX] = "";
+    char path[PATH_MAX * 2] = "";
+    registry_frontend_parse_legacy_endpoint(url,
+                                            port > 0 ? (uint32_t)port : 0,
+                                            socket_path,
+                                            &endpoint_kind,
+                                            &endpoint_scheme,
+                                            host,
+                                            sizeof(host),
+                                            &endpoint_port,
+                                            path,
+                                            sizeof(path));
+    return registry_store_upsert_frontend_endpoint(store,
+                                                   frontend_id,
+                                                   service_id,
+                                                   display_name,
+                                                   endpoint_kind,
+                                                   endpoint_scheme,
+                                                   0,
+                                                   host,
+                                                   endpoint_port,
+                                                   path,
+                                                   socket_path,
+                                                   icon_path,
+                                                   list,
+                                                   preserve_empty_icon_and_list);
 }
 
 static bool registry_store_upsert_layout(RegistryStore *store, const char *url, const char *list) {
@@ -4693,6 +5070,8 @@ static void registry_store_remove_frontend_at(RegistryStore *store, size_t index
     free(record->url);
     free(record->service_id);
     free(record->display_name);
+    free(record->host);
+    free(record->path);
     free(record->socket_path);
     free(record->icon_path);
     free(record->list);
@@ -4786,6 +5165,14 @@ static void registry_store_clear_backend_openers(RegistryStore *store, const cha
             registry_store_remove_opener_at(store, i - 1);
         }
     }
+}
+
+static bool registry_store_remove_backend_and_owned_records(RegistryStore *store, const char *service_id) {
+    registry_store_clear_backend_content_types(store, service_id);
+    registry_store_clear_backend_openers(store, service_id);
+    registry_store_clear_backend_frontends(store, service_id);
+    registry_store_clear_backend_logs(store, service_id);
+    return registry_store_remove_backend(store, service_id);
 }
 
 static bool registry_store_read_string(const unsigned char *bytes,
@@ -4917,7 +5304,8 @@ static bool registry_store_load_orwa_file(RegistryStore *store, const char *path
         if ((i == ORWA_TABLE_BACKENDS
                 ? (descriptors[i].row_size != ORWA_BACKENDS_ROW_SIZE && descriptors[i].row_size != ORWA_LEGACY_BACKENDS_ROW_SIZE)
                 : i == ORWA_TABLE_FRONTENDS
-                ? (descriptors[i].row_size != ORWA_FRONTENDS_ROW_SIZE &&
+                ? (descriptors[i].row_size != ORWA_STRUCTURED_FRONTENDS_ROW_SIZE &&
+                   descriptors[i].row_size != ORWA_FRONTENDS_ROW_SIZE &&
                    descriptors[i].row_size != ORWA_FRONTENDS_ROW_SIZE_WITH_FLAGS &&
                    descriptors[i].row_size != ORWA_LEGACY_FRONTENDS_ROW_SIZE)
                 : i == ORWA_TABLE_CONTENT_TYPES
@@ -4966,48 +5354,102 @@ static bool registry_store_load_orwa_file(RegistryStore *store, const char *path
     for (uint64_t row = 0; ok && row < descriptors[ORWA_TABLE_FRONTENDS].row_count; row++) {
         const unsigned char *row_bytes = bytes + descriptors[ORWA_TABLE_FRONTENDS].offset + row * descriptors[ORWA_TABLE_FRONTENDS].row_size;
         char *url = NULL, *service_id = NULL, *display_name = NULL, *icon_path = NULL, *list = NULL, *socket_path = NULL, *frontend_id = NULL;
-        uint32_t port = 0;
-        ok = registry_store_read_string(bytes, file_size, variable_offset, row_bytes, 0, &url, error, error_size) &&
-             registry_store_read_string(bytes, file_size, variable_offset, row_bytes, 16, &service_id, error, error_size) &&
-             registry_store_read_string(bytes, file_size, variable_offset, row_bytes, 32, &display_name, error, error_size) &&
-             registry_store_read_string(bytes, file_size, variable_offset, row_bytes, 48, &icon_path, error, error_size) &&
-             registry_store_read_string(bytes, file_size, variable_offset, row_bytes, 64, &list, error, error_size);
-        if (ok) {
-            uint8_t endpoint_kind = row_bytes[80];
-            if (endpoint_kind == 1u) {
-                port = read_uint32_le(row_bytes + 81);
-                socket_path = registry_strdup("");
-            } else if (endpoint_kind == 2u) {
-                ok = registry_store_read_string(bytes, file_size, variable_offset, row_bytes, 81, &socket_path, error, error_size);
-            } else if (endpoint_kind == 0u) {
-                socket_path = registry_strdup("");
-            } else {
-                snprintf(error, error_size, "Registry binary frontend endpoint kind is unsupported.");
-                ok = false;
+        char *host = NULL, *path = NULL;
+        uint16_t endpoint_kind = OUTERSHELLD_API_FRONTEND_ENDPOINT_NONE;
+        uint16_t endpoint_scheme = OUTERSHELLD_API_FRONTEND_SCHEME_HTTP;
+        uint16_t endpoint_flags = 0;
+        uint16_t port = 0;
+        if (descriptors[ORWA_TABLE_FRONTENDS].row_size == ORWA_STRUCTURED_FRONTENDS_ROW_SIZE) {
+            ok = registry_binary_read_string_ref32(bytes, file_size, variable_offset, row_bytes, 0, &frontend_id, error, error_size) &&
+                 registry_binary_read_string_ref32(bytes, file_size, variable_offset, row_bytes, 8, &service_id, error, error_size) &&
+                 registry_binary_read_string_ref32(bytes, file_size, variable_offset, row_bytes, 16, &display_name, error, error_size) &&
+                 registry_binary_read_string_ref32(bytes, file_size, variable_offset, row_bytes, 24, &icon_path, error, error_size) &&
+                 registry_binary_read_string_ref32(bytes, file_size, variable_offset, row_bytes, 32, &list, error, error_size) &&
+                 registry_binary_read_string_ref32(bytes, file_size, variable_offset, row_bytes, 48, &path, error, error_size);
+            if (ok) {
+                endpoint_kind = read_uint16_le(row_bytes + 40);
+                endpoint_flags = read_uint16_le(row_bytes + 42);
+                endpoint_scheme = read_uint16_le(row_bytes + 44);
+                if (endpoint_kind == OUTERSHELLD_API_FRONTEND_ENDPOINT_TCP) {
+                    ok = registry_binary_read_string_ref32(bytes, file_size, variable_offset, row_bytes, 56, &host, error, error_size);
+                    port = read_uint16_le(row_bytes + 64);
+                    socket_path = registry_strdup("");
+                } else if (endpoint_kind == OUTERSHELLD_API_FRONTEND_ENDPOINT_UNIX) {
+                    ok = registry_binary_read_string_ref32(bytes, file_size, variable_offset, row_bytes, 56, &socket_path, error, error_size);
+                    host = registry_strdup("");
+                } else if (endpoint_kind == OUTERSHELLD_API_FRONTEND_ENDPOINT_NONE) {
+                    host = registry_strdup("");
+                    socket_path = registry_strdup("");
+                } else {
+                    snprintf(error, error_size, "Registry binary frontend endpoint kind is unsupported.");
+                    ok = false;
+                }
+                if (ok && (!host || !socket_path)) {
+                    snprintf(error, error_size, "Out of memory.");
+                    ok = false;
+                }
             }
-            if (ok && !socket_path) {
-                snprintf(error, error_size, "Out of memory.");
-                ok = false;
+            if (ok) {
+                ok = registry_store_upsert_frontend_endpoint(store,
+                                                             frontend_id,
+                                                             service_id,
+                                                             display_name,
+                                                             endpoint_kind,
+                                                             endpoint_scheme,
+                                                             endpoint_flags,
+                                                             host,
+                                                             port,
+                                                             path,
+                                                             socket_path,
+                                                             icon_path,
+                                                             list,
+                                                             false);
+                if (!ok) snprintf(error, error_size, "Out of memory.");
             }
-        }
-        if (ok && descriptors[ORWA_TABLE_FRONTENDS].row_size >= ORWA_FRONTENDS_ROW_SIZE) {
-            ok = registry_store_read_string(bytes, file_size, variable_offset, row_bytes, 97, &frontend_id, error, error_size);
-        } else if (ok) {
-            size_t needed = strlen(service_id ? service_id : "") + strlen(url ? url : "") + 2;
-            frontend_id = malloc(needed);
-            if (frontend_id) snprintf(frontend_id, needed, "%s:%s", service_id ? service_id : "app", url && url[0] ? url : "main");
-            else {
-                snprintf(error, error_size, "Out of memory.");
-                ok = false;
+        } else {
+            uint32_t legacy_port = 0;
+            ok = registry_store_read_string(bytes, file_size, variable_offset, row_bytes, 0, &url, error, error_size) &&
+                 registry_store_read_string(bytes, file_size, variable_offset, row_bytes, 16, &service_id, error, error_size) &&
+                 registry_store_read_string(bytes, file_size, variable_offset, row_bytes, 32, &display_name, error, error_size) &&
+                 registry_store_read_string(bytes, file_size, variable_offset, row_bytes, 48, &icon_path, error, error_size) &&
+                 registry_store_read_string(bytes, file_size, variable_offset, row_bytes, 64, &list, error, error_size);
+            if (ok) {
+                uint8_t legacy_endpoint_kind = row_bytes[80];
+                if (legacy_endpoint_kind == 1u) {
+                    legacy_port = read_uint32_le(row_bytes + 81);
+                    socket_path = registry_strdup("");
+                } else if (legacy_endpoint_kind == 2u) {
+                    ok = registry_store_read_string(bytes, file_size, variable_offset, row_bytes, 81, &socket_path, error, error_size);
+                } else if (legacy_endpoint_kind == 0u) {
+                    socket_path = registry_strdup("");
+                } else {
+                    snprintf(error, error_size, "Registry binary frontend endpoint kind is unsupported.");
+                    ok = false;
+                }
+                if (ok && !socket_path) {
+                    snprintf(error, error_size, "Out of memory.");
+                    ok = false;
+                }
             }
-        }
-        if (ok) {
-            ok = registry_store_upsert_frontend(store, frontend_id, url, service_id, display_name, (int)port, socket_path, icon_path, list, false);
-            if (!ok) snprintf(error, error_size, "Out of memory.");
-        }
-        if (ok && table_count == ORWA_LEGACY_THREE_TABLE_COUNT) {
-            ok = registry_store_upsert_layout(store, url, list);
-            if (!ok) snprintf(error, error_size, "Out of memory.");
+            if (ok && descriptors[ORWA_TABLE_FRONTENDS].row_size >= ORWA_FRONTENDS_ROW_SIZE) {
+                ok = registry_store_read_string(bytes, file_size, variable_offset, row_bytes, 97, &frontend_id, error, error_size);
+            } else if (ok) {
+                size_t needed = strlen(service_id ? service_id : "") + strlen(url ? url : "") + 2;
+                frontend_id = malloc(needed);
+                if (frontend_id) snprintf(frontend_id, needed, "%s:%s", service_id ? service_id : "app", url && url[0] ? url : "main");
+                else {
+                    snprintf(error, error_size, "Out of memory.");
+                    ok = false;
+                }
+            }
+            if (ok) {
+                ok = registry_store_upsert_frontend(store, frontend_id, url, service_id, display_name, (int)legacy_port, socket_path, icon_path, list, false);
+                if (!ok) snprintf(error, error_size, "Out of memory.");
+            }
+            if (ok && table_count == ORWA_LEGACY_THREE_TABLE_COUNT) {
+                ok = registry_store_upsert_layout(store, url, list);
+                if (!ok) snprintf(error, error_size, "Out of memory.");
+            }
         }
         free(url);
         free(service_id);
@@ -5016,6 +5458,8 @@ static bool registry_store_load_orwa_file(RegistryStore *store, const char *path
         free(list);
         free(socket_path);
         free(frontend_id);
+        free(host);
+        free(path);
     }
 
     if (ok && table_count != ORWA_LEGACY_THREE_TABLE_COUNT) {
@@ -5124,7 +5568,7 @@ static bool registry_store_load_orwa_file(RegistryStore *store, const char *path
 static bool registry_store_write_orwa_file(RegistryStore *store, const char *path, char *error, size_t error_size) {
     RegistryBinaryTableDescriptor descriptors[ORWA_TABLE_COUNT] = {
         {.row_count = store->backend_count, .row_size = ORWA_BACKENDS_ROW_SIZE},
-        {.row_count = store->frontend_count, .row_size = ORWA_FRONTENDS_ROW_SIZE},
+        {.row_count = store->frontend_count, .row_size = ORWA_STRUCTURED_FRONTENDS_ROW_SIZE},
         {.row_count = store->layout_count, .row_size = ORWA_FRONTEND_LAYOUTS_ROW_SIZE},
         {.row_count = store->log_count, .row_size = ORWA_LOG_FILES_ROW_SIZE},
         {.row_count = store->content_type_count, .row_size = ORWA_CONTENT_TYPES_ROW_SIZE},
@@ -5152,24 +5596,30 @@ static bool registry_store_write_orwa_file(RegistryStore *store, const char *pat
     }
     for (size_t i = 0; ok && i < store->frontend_count; i++) {
         RegistryFrontendRecord *record = &store->frontends[i];
-        unsigned char endpoint_kind = record->socket_path && record->socket_path[0] ? 2u : (record->port > 0 ? 1u : 0u);
-        unsigned char zero_padding[12] = {0};
-        unsigned char empty_payload[16] = {0};
-        ok = registry_binary_append_string_ref(&pool, &variable_region, &rows, record->url) &&
-             registry_binary_append_string_ref(&pool, &variable_region, &rows, record->service_id) &&
-             registry_binary_append_string_ref(&pool, &variable_region, &rows, record->display_name) &&
-             registry_binary_append_string_ref(&pool, &variable_region, &rows, record->icon_path) &&
-             registry_binary_append_string_ref(&pool, &variable_region, &rows, record->list) &&
-             sb_append_n(&rows, (const char *)&endpoint_kind, sizeof(endpoint_kind));
-        if (ok && endpoint_kind == 2u) {
-            ok = registry_binary_append_string_ref(&pool, &variable_region, &rows, record->socket_path);
-        } else if (ok && endpoint_kind == 1u) {
-            ok = binary_append_u32(&rows, (uint32_t)record->port) &&
-                 sb_append_n(&rows, (const char *)zero_padding, sizeof(zero_padding));
+        unsigned char reserved2[2] = {0};
+        unsigned char reserved14[14] = {0};
+        unsigned char reserved16[16] = {0};
+        ok = registry_binary_append_string_ref32(&pool, &variable_region, &rows, record->frontend_id) &&
+             registry_binary_append_string_ref32(&pool, &variable_region, &rows, record->service_id) &&
+             registry_binary_append_string_ref32(&pool, &variable_region, &rows, record->display_name) &&
+             registry_binary_append_string_ref32(&pool, &variable_region, &rows, record->icon_path) &&
+             registry_binary_append_string_ref32(&pool, &variable_region, &rows, record->list) &&
+             binary_append_u16(&rows, record->endpoint_kind) &&
+             binary_append_u16(&rows, record->endpoint_flags) &&
+             binary_append_u16(&rows, record->endpoint_scheme) &&
+             sb_append_n(&rows, (const char *)reserved2, sizeof(reserved2)) &&
+             registry_binary_append_string_ref32(&pool, &variable_region, &rows, record->path);
+        if (ok && record->endpoint_kind == OUTERSHELLD_API_FRONTEND_ENDPOINT_UNIX) {
+            ok = registry_binary_append_string_ref32(&pool, &variable_region, &rows, record->socket_path);
+            if (ok) ok = sb_append_n(&rows, (const char *)reserved16, sizeof(reserved16));
+        } else if (ok && record->endpoint_kind == OUTERSHELLD_API_FRONTEND_ENDPOINT_TCP) {
+            ok = registry_binary_append_string_ref32(&pool, &variable_region, &rows, record->host) &&
+                 binary_append_u16(&rows, record->port > 0 ? (uint16_t)record->port : 0) &&
+                 sb_append_n(&rows, (const char *)reserved14, sizeof(reserved14));
         } else if (ok) {
-            ok = sb_append_n(&rows, (const char *)empty_payload, sizeof(empty_payload));
+            ok = registry_binary_append_string_ref32(&pool, &variable_region, &rows, "") &&
+                 sb_append_n(&rows, (const char *)reserved16, sizeof(reserved16));
         }
-        if (ok) ok = registry_binary_append_string_ref(&pool, &variable_region, &rows, record->frontend_id);
     }
     for (size_t i = 0; ok && i < store->layout_count; i++) {
         ok = registry_binary_append_string_ref(&pool, &variable_region, &rows, store->layouts[i].url) &&
@@ -5763,8 +6213,10 @@ static void refresh_systemd_status_cache_if_needed(void) {
     pthread_mutex_lock(&g_systemd_status_cache_mutex);
     bool user_recent = g_systemd_status_cache.user_refreshed_at_ms > 0 &&
                        now - g_systemd_status_cache.user_refreshed_at_ms < SYSTEMD_STATUS_CACHE_TTL_MS;
+#ifndef __APPLE__
     bool system_recent = g_systemd_status_cache.system_refreshed_at_ms > 0 &&
                          now - g_systemd_status_cache.system_refreshed_at_ms < SYSTEMD_STATUS_CACHE_TTL_MS;
+#endif
     pthread_mutex_unlock(&g_systemd_status_cache_mutex);
 
 #ifndef __APPLE__
@@ -6239,27 +6691,6 @@ static bool lookup_systemd_backend(const RegistryStore *store,
     return true;
 }
 
-static bool lookup_systemd_backend_any(const char *service_id,
-                                       char *unit_name,
-                                       size_t unit_name_size,
-                                       char *scope,
-                                       size_t scope_size) {
-    char error[512] = "";
-    RegistryStore store;
-    if (registry_store_open_user_readonly(&store, error, sizeof(error))) {
-        bool found = lookup_systemd_backend(&store, service_id, unit_name, unit_name_size, scope, scope_size, "user");
-        registry_store_free(&store);
-        if (found) return true;
-    }
-
-    if (registry_store_open_system_readonly(&store, error, sizeof(error))) {
-        bool found = lookup_systemd_backend(&store, service_id, unit_name, unit_name_size, scope, scope_size, "system");
-        registry_store_free(&store);
-        if (found) return true;
-    }
-    return false;
-}
-
 static bool lookup_systemd_backend_any_for_scope(const char *service_id,
                                                  const char *requested_scope,
                                                  char *unit_name,
@@ -6318,25 +6749,6 @@ static bool lookup_launchd_backend(const RegistryStore *store,
     snprintf(plist_path, plist_path_size, "%s", record->unit_path);
     if (owns_plist) *owns_plist = record->owns_unit ? 1 : 0;
     return true;
-}
-
-static bool lookup_launchd_backend_any(const char *service_id,
-                                       char *plist_path,
-                                       size_t plist_path_size,
-                                       int *owns_plist) {
-    char error[512] = "";
-    RegistryStore store;
-    if (registry_store_open_user_readonly(&store, error, sizeof(error))) {
-        bool found = lookup_launchd_backend(&store, service_id, plist_path, plist_path_size, owns_plist);
-        registry_store_free(&store);
-        if (found) return true;
-    }
-    if (registry_store_open_system_readonly(&store, error, sizeof(error))) {
-        bool found = lookup_launchd_backend(&store, service_id, plist_path, plist_path_size, owns_plist);
-        registry_store_free(&store);
-        if (found) return true;
-    }
-    return false;
 }
 
 static bool lookup_launchd_backend_any_for_scope(const char *service_id,
@@ -9878,48 +10290,6 @@ static bool outerctl_tsv_registry_string_list_field(StringBuilder *out, const Re
     return list ? outerctl_tsv_string_list_field(out, (const char *const *)list->items, list->count) : true;
 }
 
-static bool outerctl_make_frontend_url(const char *raw_url,
-                                       int port,
-                                       const char *socket_path,
-                                       char *out,
-                                       size_t out_size) {
-    const char *safe_socket_path = socket_path ? socket_path : "";
-    const char *safe_url = raw_url ? raw_url : "";
-    if (safe_url[0]) {
-        snprintf(out, out_size, "%s", safe_url);
-    } else if (safe_socket_path[0]) {
-        snprintf(out, out_size, "/");
-    } else if (port > 0) {
-        snprintf(out, out_size, "http://127.0.0.1:%d", port);
-    } else {
-        return false;
-    }
-
-    const char *scheme = strstr(out, "://");
-    const char *authority = scheme ? scheme + 3 : out;
-    const char *slash = strchr(authority, '/');
-    const char *query = strchr(authority, '?');
-    const char *fragment = strchr(authority, '#');
-    const char *suffix = query;
-    if (!suffix || (fragment && fragment < suffix)) suffix = fragment;
-    if (slash && (!suffix || slash < suffix)) return true;
-    if (!suffix) {
-        size_t len = strlen(out);
-        if (len + 1 >= out_size) return false;
-        out[len] = '/';
-        out[len + 1] = '\0';
-        return true;
-    }
-
-    char copy[PATH_MAX * 2];
-    snprintf(copy, sizeof(copy), "%s", out);
-    size_t prefix_len = (size_t)(suffix - out);
-    if (prefix_len + strlen(copy + prefix_len) + 2 > out_size) return false;
-    memmove(out + prefix_len + 1, copy + prefix_len, strlen(copy + prefix_len) + 1);
-    out[prefix_len] = '/';
-    return true;
-}
-
 typedef struct {
     const char *identifier;
     const char *display_name;
@@ -10312,23 +10682,31 @@ static bool outerctl_print_registry_list(const RegistryStore *database,
             if (ok && !sb_append(out, "\n")) ok = false;
         }
     } else if (strcmp(resource, "app") == 0) {
-        const char *headers[] = {"frontend_id", "url", "service_id", "display_name", "port", "socket_path", "icon_path", "list"};
+        const char *headers[] = {"frontend_id", "service_id", "display_name", "endpoint_kind", "scheme", "host", "port", "socket_path", "path", "url", "icon_path", "list"};
         ok = outerctl_print_headers(out, headers, sizeof(headers) / sizeof(headers[0]));
         for (size_t i = 0; ok && i < database->frontend_count; i++) {
             const RegistryFrontendRecord *record = &database->frontends[i];
             if (backend_filter && backend_filter[0] && strcmp(record->service_id, backend_filter) != 0) continue;
             char port_buffer[32];
+            char kind_buffer[16];
+            char scheme_buffer[16];
+            snprintf(kind_buffer, sizeof(kind_buffer), "%u", (unsigned)record->endpoint_kind);
+            snprintf(scheme_buffer, sizeof(scheme_buffer), "%u", (unsigned)record->endpoint_scheme);
             snprintf(port_buffer, sizeof(port_buffer), "%d", record->port);
             const RegistryFrontendLayoutRecord *layout =
                 registry_store_find_layout_const(database, record->frontend_id && record->frontend_id[0] ? record->frontend_id : record->url);
             if (!layout) layout = registry_store_find_layout_const(database, record->url);
             const char *fields[] = {
                 record->frontend_id,
-                record->url,
                 record->service_id,
                 record->display_name,
+                kind_buffer,
+                scheme_buffer,
+                record->host,
                 port_buffer,
                 record->socket_path,
+                record->path,
+                record->url,
                 record->icon_path,
                 layout ? layout->list : record->list
             };
@@ -10439,16 +10817,6 @@ static bool outerctl_print_registry_list(const RegistryStore *database,
     return ok;
 }
 
-static bool registry_backend_has_dependencies(RegistryStore *database, const char *backend) {
-    const RegistryBackendRecord *record = registry_store_find_backend_const(database, backend);
-    if (record && record->unit_name && record->unit_name[0]) return true;
-    if (record && record->unit_path && record->unit_path[0]) return true;
-    for (size_t i = 0; i < database->log_count; i++) if (strcmp(database->logs[i].service_id, backend) == 0) return true;
-    for (size_t i = 0; i < database->frontend_count; i++) if (strcmp(database->frontends[i].service_id, backend) == 0) return true;
-    for (size_t i = 0; i < database->opener_count; i++) if (strcmp(database->openers[i].service_id, backend) == 0) return true;
-    return false;
-}
-
 static bool parse_opener_capabilities_option(const char *raw, uint32_t *out) {
     if (!raw || !raw[0] || !out) return false;
     uint32_t flags = 0;
@@ -10489,6 +10857,9 @@ static int outershelld_handle_outerctl(int argc, char **argv, StringBuilder *std
     const char *systemd_unit = NULL;
     const char *log_path = NULL;
     const char *url = NULL;
+    const char *frontend_host = NULL;
+    const char *frontend_path = NULL;
+    const char *frontend_scheme = NULL;
     const char *frontend_id = NULL;
     const char *icon_path = NULL;
     const char *frontend_list = NULL;
@@ -10524,9 +10895,17 @@ static int outershelld_handle_outerctl(int argc, char **argv, StringBuilder *std
         } else if (strcmp(arg, "--unit") == 0 || strcmp(arg, "--systemd-unit") == 0) {
             REQUIRE_VALUE("--unit", systemd_unit);
         } else if (strcmp(arg, "--path") == 0) {
-            REQUIRE_VALUE("--path", log_path);
+            if (strcmp(resource, "app") == 0) {
+                REQUIRE_VALUE("--path", frontend_path);
+            } else {
+                REQUIRE_VALUE("--path", log_path);
+            }
         } else if (strcmp(arg, "--url") == 0) {
             REQUIRE_VALUE("--url", url);
+        } else if (strcmp(arg, "--host") == 0) {
+            REQUIRE_VALUE("--host", frontend_host);
+        } else if (strcmp(arg, "--scheme") == 0) {
+            REQUIRE_VALUE("--scheme", frontend_scheme);
         } else if (strcmp(arg, "--frontend-id") == 0 || strcmp(arg, "--id") == 0) {
             REQUIRE_VALUE("--frontend-id", frontend_id);
         } else if (strcmp(arg, "--icon-path") == 0 || strcmp(arg, "--icon-file") == 0) {
@@ -10653,13 +11032,8 @@ static int outershelld_handle_outerctl(int argc, char **argv, StringBuilder *std
                 snprintf(error, sizeof(error), "Backend not registered.");
                 ok = false;
             }
-            if (ok && registry_backend_has_dependencies(&database, backend)) {
-                snprintf(error, sizeof(error), "Backend still has service-manager, log, app, or opener records. Clear those first.");
-                ok = false;
-            }
             if (ok) {
-                registry_store_clear_backend_content_types(&database, backend);
-                ok = registry_store_remove_backend(&database, backend);
+                ok = registry_store_remove_backend_and_owned_records(&database, backend);
                 changed = ok;
             }
         } else {
@@ -10668,14 +11042,7 @@ static int outershelld_handle_outerctl(int argc, char **argv, StringBuilder *std
         }
     } else if (ok && !is_content_type_resource) {
         bool backend_exists = registry_store_find_backend(&database, backend) != NULL;
-        bool can_clear_orphaned_records =
-            strcmp(action, "clear") == 0 &&
-            (strcmp(resource, "systemd") == 0 ||
-             strcmp(resource, "launchd") == 0 ||
-             strcmp(resource, "log") == 0 ||
-             strcmp(resource, "app") == 0 ||
-             strcmp(resource, "opener") == 0);
-        if (!backend_exists && !can_clear_orphaned_records) {
+        if (!backend_exists) {
             snprintf(error, sizeof(error), "Backend not registered. Run outerctl backend upsert first.");
             ok = false;
         }
@@ -10683,36 +11050,11 @@ static int outershelld_handle_outerctl(int argc, char **argv, StringBuilder *std
         snprintf(error, sizeof(error), "Missing backend identifier.");
         ok = false;
     } else if (ok && is_content_type_resource && backend && backend[0] && !registry_store_find_backend(&database, backend)) {
-        bool can_clear_orphaned_records = strcmp(action, "clear") == 0;
-        if (!can_clear_orphaned_records) {
-            snprintf(error, sizeof(error), "Backend not registered. Run outerctl backend upsert first.");
-            ok = false;
-        }
+        snprintf(error, sizeof(error), "Backend not registered. Run outerctl backend upsert first.");
+        ok = false;
     }
 
-    if (ok && strcmp(resource, "systemd") == 0) {
-        if (strcmp(action, "clear") == 0) {
-            RegistryBackendRecord *record = registry_store_find_backend(&database, backend);
-            ok = !record || registry_assign_string(&record->unit_name, "");
-            if (!ok) snprintf(error, sizeof(error), "Out of memory.");
-            changed = ok;
-        } else {
-            snprintf(error, sizeof(error), "Unknown systemd action.");
-            ok = false;
-        }
-    } else if (ok && strcmp(resource, "launchd") == 0) {
-        if (strcmp(action, "clear") == 0) {
-            RegistryBackendRecord *record = registry_store_find_backend(&database, backend);
-            ok = !record ||
-                 (registry_assign_string(&record->unit_name, "") &&
-                  registry_assign_string(&record->unit_path, ""));
-            if (!ok) snprintf(error, sizeof(error), "Out of memory.");
-            changed = ok;
-        } else {
-            snprintf(error, sizeof(error), "Unknown launchd action.");
-            ok = false;
-        }
-    } else if (ok && strcmp(resource, "log") == 0) {
+    if (ok && strcmp(resource, "log") == 0) {
         if (strcmp(action, "add") == 0) {
             if (!log_path || !log_path[0]) {
                 snprintf(error, sizeof(error), "Missing log path.");
@@ -10735,9 +11077,6 @@ static int outershelld_handle_outerctl(int argc, char **argv, StringBuilder *std
                 }
                 changed = ok;
             }
-        } else if (strcmp(action, "clear") == 0) {
-            registry_store_clear_backend_logs(&database, backend);
-            changed = ok;
         } else {
             snprintf(error, sizeof(error), "Unknown log action.");
             ok = false;
@@ -10753,37 +11092,76 @@ static int outershelld_handle_outerctl(int argc, char **argv, StringBuilder *std
         if ((has_port ? 1 : 0) + (has_socket ? 1 : 0) > 1) {
             snprintf(error, sizeof(error), "Specify either --port or --socket-path, not both.");
             ok = false;
+        } else if (has_socket && frontend_host && frontend_host[0]) {
+            snprintf(error, sizeof(error), "Specify --host only with TCP endpoints.");
+            ok = false;
         } else if (strcmp(action, "add") == 0) {
             if (!display_name || !display_name[0]) {
                 snprintf(error, sizeof(error), "Missing app display name.");
                 ok = false;
             }
-            char frontend_url[PATH_MAX * 2] = "";
-            if (ok && (has_port || has_socket || (url && url[0])) &&
-                !outerctl_make_frontend_url(url, port, socket_path, frontend_url, sizeof(frontend_url))) {
-                snprintf(error, sizeof(error), "Could not build app URL.");
-                ok = false;
+            uint16_t endpoint_kind = OUTERSHELLD_API_FRONTEND_ENDPOINT_NONE;
+            uint16_t endpoint_scheme = OUTERSHELLD_API_FRONTEND_SCHEME_HTTP;
+            uint16_t endpoint_port = 0;
+            char endpoint_host[PATH_MAX] = "";
+            char endpoint_path[PATH_MAX * 2] = "";
+            registry_frontend_parse_legacy_endpoint(url,
+                                                    has_port ? (uint32_t)port : 0,
+                                                    socket_path,
+                                                    &endpoint_kind,
+                                                    &endpoint_scheme,
+                                                    endpoint_host,
+                                                    sizeof(endpoint_host),
+                                                    &endpoint_port,
+                                                    endpoint_path,
+                                                    sizeof(endpoint_path));
+            if (ok && frontend_scheme && frontend_scheme[0]) {
+                if (strcmp(frontend_scheme, "https") == 0) {
+                    endpoint_scheme = OUTERSHELLD_API_FRONTEND_SCHEME_HTTPS;
+                } else if (strcmp(frontend_scheme, "http") == 0) {
+                    endpoint_scheme = OUTERSHELLD_API_FRONTEND_SCHEME_HTTP;
+                } else {
+                    snprintf(error, sizeof(error), "Invalid app endpoint scheme.");
+                    ok = false;
+                }
+            }
+            if (ok && frontend_host && frontend_host[0]) {
+                snprintf(endpoint_host, sizeof(endpoint_host), "%s", frontend_host);
+                if (endpoint_kind == OUTERSHELLD_API_FRONTEND_ENDPOINT_NONE) {
+                    endpoint_kind = OUTERSHELLD_API_FRONTEND_ENDPOINT_TCP;
+                }
+            }
+            if (ok && frontend_path && frontend_path[0]) {
+                registry_frontend_normalize_path(frontend_path, endpoint_path, sizeof(endpoint_path));
+            }
+            if (ok && has_port) {
+                endpoint_kind = OUTERSHELLD_API_FRONTEND_ENDPOINT_TCP;
+                endpoint_port = (uint16_t)port;
+            } else if (ok && has_socket) {
+                endpoint_kind = OUTERSHELLD_API_FRONTEND_ENDPOINT_UNIX;
             }
             if (ok) {
-                ok = registry_store_upsert_frontend(&database,
-                                                    stable_frontend_id,
-                                                    frontend_url,
-                                                    backend,
-                                                    display_name,
-                                                    port,
-                                                    has_socket ? socket_path : "",
-                                                    icon_path ? icon_path : "",
-                                                    frontend_list ? frontend_list : "",
-                                                    true);
+                ok = registry_store_upsert_frontend_endpoint(&database,
+                                                             stable_frontend_id,
+                                                             backend,
+                                                             display_name,
+                                                             endpoint_kind,
+                                                             endpoint_scheme,
+                                                             0,
+                                                             endpoint_host,
+                                                             endpoint_port,
+                                                             endpoint_path,
+                                                             has_socket ? socket_path : "",
+                                                             icon_path ? icon_path : "",
+                                                             frontend_list ? frontend_list : "",
+                                                             true);
                 if (!ok) snprintf(error, sizeof(error), "Out of memory.");
             }
             if (ok && has_socket) {
                 snprintf(allowlist_socket_path, sizeof(allowlist_socket_path), "%s", socket_path);
             }
             if (ok) {
-                const char *layout_key = (has_socket && (!url || !url[0]))
-                    ? stable_frontend_id
-                    : (frontend_url[0] ? frontend_url : stable_frontend_id);
+                const char *layout_key = stable_frontend_id;
                 ok = registry_store_upsert_layout(&database,
                                                   layout_key,
                                                   frontend_list ? frontend_list : "");
@@ -10812,30 +11190,28 @@ static int outershelld_handle_outerctl(int argc, char **argv, StringBuilder *std
                 changed = ok;
             } else {
                 for (size_t i = database.frontend_count; i > 0; i--) {
+                    bool host_matches = !frontend_host || !frontend_host[0] ||
+                        strcmp(database.frontends[i - 1].host ? database.frontends[i - 1].host : "", frontend_host) == 0;
                     if (strcmp(database.frontends[i - 1].service_id, backend) == 0 &&
-                        database.frontends[i - 1].port == port) {
+                        database.frontends[i - 1].port == port &&
+                        host_matches) {
                         registry_store_remove_frontend_at(&database, i - 1);
                     }
                 }
                 changed = ok;
             }
-        } else if (strcmp(action, "clear") == 0) {
-            registry_store_clear_backend_frontends(&database, backend);
-            changed = ok;
         } else {
             snprintf(error, sizeof(error), "Unknown app action.");
             ok = false;
         }
     } else if (ok && is_content_type_resource) {
         char normalized_content_type[160] = "";
-        if (strcmp(action, "clear") != 0) {
-            if (!content_type || !content_type[0]) {
-                snprintf(error, sizeof(error), "Missing content type.");
-                ok = false;
-            } else if (!normalize_content_type_identifier(content_type, normalized_content_type, sizeof(normalized_content_type))) {
-                snprintf(error, sizeof(error), "Invalid content type.");
-                ok = false;
-            }
+        if (!content_type || !content_type[0]) {
+            snprintf(error, sizeof(error), "Missing content type.");
+            ok = false;
+        } else if (!normalize_content_type_identifier(content_type, normalized_content_type, sizeof(normalized_content_type))) {
+            snprintf(error, sizeof(error), "Invalid content type.");
+            ok = false;
         }
         if (ok && strcmp(action, "add") == 0) {
             ok = registry_store_upsert_content_type(&database,
@@ -10856,23 +11232,18 @@ static int outershelld_handle_outerctl(int argc, char **argv, StringBuilder *std
                 }
             }
             changed = ok;
-        } else if (ok && strcmp(action, "clear") == 0) {
-            registry_store_clear_backend_content_types(&database, backend);
-            changed = ok;
         } else if (ok) {
             snprintf(error, sizeof(error), "Unknown content-type action.");
             ok = false;
         }
     } else if (ok && strcmp(resource, "opener") == 0) {
         char opener_key[160] = "";
-        if (strcmp(action, "clear") != 0) {
-            if (!content_type || !content_type[0]) {
-                snprintf(error, sizeof(error), "Missing opener content type.");
-                ok = false;
-            } else if (!normalize_content_type_identifier(content_type, opener_key, sizeof(opener_key))) {
-                snprintf(error, sizeof(error), "Invalid content type.");
-                ok = false;
-            }
+        if (!content_type || !content_type[0]) {
+            snprintf(error, sizeof(error), "Missing opener content type.");
+            ok = false;
+        } else if (!normalize_content_type_identifier(content_type, opener_key, sizeof(opener_key))) {
+            snprintf(error, sizeof(error), "Invalid content type.");
+            ok = false;
         }
         if (ok && strcmp(action, "add") == 0) {
             if (!display_name || !display_name[0]) {
@@ -10901,9 +11272,6 @@ static int outershelld_handle_outerctl(int argc, char **argv, StringBuilder *std
                     registry_store_remove_opener_at(&database, i - 1);
                 }
             }
-            changed = ok;
-        } else if (ok && strcmp(action, "clear") == 0) {
-            registry_store_clear_backend_openers(&database, backend);
             changed = ok;
         } else if (ok) {
             snprintf(error, sizeof(error), "Unknown opener action.");
@@ -11051,11 +11419,7 @@ static bool upsert_launchd_backend_registry_at(const char *database_path,
 static bool unregister_backend_records(const char *service_id, char *error, size_t error_size) {
     RegistryStore database;
     if (!registry_store_open_user_readwrite(&database, error, error_size)) return false;
-    registry_store_clear_backend_content_types(&database, service_id);
-    registry_store_clear_backend_openers(&database, service_id);
-    registry_store_clear_backend_frontends(&database, service_id);
-    registry_store_clear_backend_logs(&database, service_id);
-    (void)registry_store_remove_backend(&database, service_id);
+    (void)registry_store_remove_backend_and_owned_records(&database, service_id);
     return registry_store_close(&database, true, error, error_size);
 }
 
@@ -14226,16 +14590,18 @@ static bool root_helper_registry_upsert_systemd(const char *service_id,
     char *backend_argv[] = {"outerctl", "backend", "upsert", "--backend", (char *)service_id, "--name", (char *)display_name, "--systemd-unit", (char *)unit_name, NULL};
     if (!root_helper_outerctl(9, backend_argv, sudo_password, needs_password, message, message_size)) return false;
 
-    char *app_clear_argv[] = {"outerctl", "app", "clear", "--backend", (char *)service_id, NULL};
-    if (!root_helper_outerctl(5, app_clear_argv, sudo_password, needs_password, message, message_size)) return false;
+    char frontend_id[PATH_MAX * 2];
+    snprintf(frontend_id, sizeof(frontend_id), "%s:main", service_id);
+    char *app_remove_argv[] = {"outerctl", "app", "remove", "--backend", (char *)service_id, "--frontend-id", frontend_id, NULL};
+    if (!root_helper_outerctl(7, app_remove_argv, sudo_password, needs_password, message, message_size)) return false;
 
     if (socket_path && socket_path[0]) {
         char *app_add_argv[] = {"outerctl", "app", "add", "--backend", (char *)service_id, "--socket-path", (char *)socket_path, "--name", (char *)display_name, "--icon-path", (char *)(icon_path ? icon_path : ""), NULL};
         if (!root_helper_outerctl(11, app_add_argv, sudo_password, needs_password, message, message_size)) return false;
     }
 
-    char *log_clear_argv[] = {"outerctl", "log", "clear", "--backend", (char *)service_id, NULL};
-    if (!root_helper_outerctl(5, log_clear_argv, sudo_password, needs_password, message, message_size)) return false;
+    char *log_remove_argv[] = {"outerctl", "log", "remove", "--backend", (char *)service_id, "--path", (char *)log_path, NULL};
+    if (!root_helper_outerctl(7, log_remove_argv, sudo_password, needs_password, message, message_size)) return false;
 
     char *log_add_argv[] = {"outerctl", "log", "add", "--backend", (char *)service_id, "--path", (char *)log_path, NULL};
     return root_helper_outerctl(7, log_add_argv, sudo_password, needs_password, message, message_size);
@@ -14246,16 +14612,6 @@ static bool root_helper_registry_remove_backend(const char *service_id,
                                                 bool *needs_password,
                                                 char *message,
                                                 size_t message_size) {
-    char *app_clear_argv[] = {"outerctl", "app", "clear", "--backend", (char *)service_id, NULL};
-    (void)root_helper_outerctl(5, app_clear_argv, sudo_password, needs_password, message, message_size);
-    char *log_clear_argv[] = {"outerctl", "log", "clear", "--backend", (char *)service_id, NULL};
-    (void)root_helper_outerctl(5, log_clear_argv, sudo_password, needs_password, message, message_size);
-    char *opener_clear_argv[] = {"outerctl", "opener", "clear", "--backend", (char *)service_id, NULL};
-    (void)root_helper_outerctl(5, opener_clear_argv, sudo_password, needs_password, message, message_size);
-    char *content_clear_argv[] = {"outerctl", "content-type", "clear", "--backend", (char *)service_id, NULL};
-    (void)root_helper_outerctl(5, content_clear_argv, sudo_password, needs_password, message, message_size);
-    char *systemd_clear_argv[] = {"outerctl", "systemd", "clear", "--backend", (char *)service_id, NULL};
-    (void)root_helper_outerctl(5, systemd_clear_argv, sudo_password, needs_password, message, message_size);
     char *backend_remove_argv[] = {"outerctl", "backend", "remove", "--backend", (char *)service_id, NULL};
     if (root_helper_outerctl(5, backend_remove_argv, sudo_password, needs_password, message, message_size)) return true;
     return contains_case_insensitive(message, "Backend not registered");
@@ -14274,16 +14630,18 @@ static bool root_helper_registry_upsert_launchd(const char *service_id,
     char *backend_argv[] = {"outerctl", "backend", "upsert", "--backend", (char *)service_id, "--name", (char *)display_name, "--launchd-plist", (char *)plist_path, "--outershell-owns", "true", NULL};
     if (!root_helper_outerctl(11, backend_argv, sudo_password, needs_password, message, message_size)) return false;
 
-    char *app_clear_argv[] = {"outerctl", "app", "clear", "--backend", (char *)service_id, NULL};
-    if (!root_helper_outerctl(5, app_clear_argv, sudo_password, needs_password, message, message_size)) return false;
+    char frontend_id[PATH_MAX * 2];
+    snprintf(frontend_id, sizeof(frontend_id), "%s:main", service_id);
+    char *app_remove_argv[] = {"outerctl", "app", "remove", "--backend", (char *)service_id, "--frontend-id", frontend_id, NULL};
+    if (!root_helper_outerctl(7, app_remove_argv, sudo_password, needs_password, message, message_size)) return false;
 
     if (socket_path && socket_path[0]) {
         char *app_add_argv[] = {"outerctl", "app", "add", "--backend", (char *)service_id, "--socket-path", (char *)socket_path, "--name", (char *)display_name, "--icon-path", (char *)(icon_path ? icon_path : ""), NULL};
         if (!root_helper_outerctl(11, app_add_argv, sudo_password, needs_password, message, message_size)) return false;
     }
 
-    char *log_clear_argv[] = {"outerctl", "log", "clear", "--backend", (char *)service_id, NULL};
-    if (!root_helper_outerctl(5, log_clear_argv, sudo_password, needs_password, message, message_size)) return false;
+    char *log_remove_argv[] = {"outerctl", "log", "remove", "--backend", (char *)service_id, "--path", (char *)log_path, NULL};
+    if (!root_helper_outerctl(7, log_remove_argv, sudo_password, needs_password, message, message_size)) return false;
 
     char *log_add_argv[] = {"outerctl", "log", "add", "--backend", (char *)service_id, "--path", (char *)log_path, NULL};
     return root_helper_outerctl(7, log_add_argv, sudo_password, needs_password, message, message_size);
@@ -14294,18 +14652,6 @@ static bool root_helper_registry_remove_backend(const char *service_id,
                                                 bool *needs_password,
                                                 char *message,
                                                 size_t message_size) {
-    char *app_clear_argv[] = {"outerctl", "app", "clear", "--backend", (char *)service_id, NULL};
-    (void)root_helper_outerctl(5, app_clear_argv, sudo_password, needs_password, message, message_size);
-    char *log_clear_argv[] = {"outerctl", "log", "clear", "--backend", (char *)service_id, NULL};
-    (void)root_helper_outerctl(5, log_clear_argv, sudo_password, needs_password, message, message_size);
-    char *opener_clear_argv[] = {"outerctl", "opener", "clear", "--backend", (char *)service_id, NULL};
-    (void)root_helper_outerctl(5, opener_clear_argv, sudo_password, needs_password, message, message_size);
-    char *content_clear_argv[] = {"outerctl", "content-type", "clear", "--backend", (char *)service_id, NULL};
-    (void)root_helper_outerctl(5, content_clear_argv, sudo_password, needs_password, message, message_size);
-    char *launchd_clear_argv[] = {"outerctl", "launchd", "clear", "--backend", (char *)service_id, NULL};
-    (void)root_helper_outerctl(5, launchd_clear_argv, sudo_password, needs_password, message, message_size);
-    char *systemd_clear_argv[] = {"outerctl", "systemd", "clear", "--backend", (char *)service_id, NULL};
-    (void)root_helper_outerctl(5, systemd_clear_argv, sudo_password, needs_password, message, message_size);
     char *backend_remove_argv[] = {"outerctl", "backend", "remove", "--backend", (char *)service_id, NULL};
     if (root_helper_outerctl(5, backend_remove_argv, sudo_password, needs_password, message, message_size)) return true;
     return contains_case_insensitive(message, "Backend not registered");
@@ -14392,13 +14738,10 @@ static bool api_registry_list_row_size(uint16_t response_type, uint32_t *row_siz
         *row_size = 36;
         return true;
     case OUTERSHELLD_API_APP_LIST_RESPONSE:
-        *row_size = 60;
+        *row_size = 80;
         return true;
     case OUTERSHELLD_API_LOG_LIST_RESPONSE:
         *row_size = 16;
-        return true;
-    case OUTERSHELLD_API_SERVICE_MANAGER_LIST_RESPONSE:
-        *row_size = 20;
         return true;
     case OUTERSHELLD_API_CONTENT_TYPE_LIST_RESPONSE:
         *row_size = 56;
@@ -14455,15 +14798,20 @@ static bool api_app_list_response_append_row(StringBuilder *message,
         registry_store_find_layout_const(database, record && record->frontend_id && record->frontend_id[0] ? record->frontend_id : (record ? record->url : ""));
     if (!layout && record) layout = registry_store_find_layout_const(database, record->url);
     size_t row_offset = 0;
-    return api_list_response_append_row(message, 60, &row_offset) &&
-           binary_write_u32_at(message, row_offset, record && record->port > 0 ? (uint32_t)record->port : 0u) &&
-           binary_append_string_ref_at(message, row_offset + 4, record ? record->frontend_id : "") &&
-           binary_append_string_ref_at(message, row_offset + 12, record ? record->url : "") &&
-           binary_append_string_ref_at(message, row_offset + 20, record ? record->service_id : "") &&
-           binary_append_string_ref_at(message, row_offset + 28, record ? record->display_name : "") &&
-           binary_append_string_ref_at(message, row_offset + 36, record ? record->socket_path : "") &&
-           binary_append_string_ref_at(message, row_offset + 44, record ? record->icon_path : "") &&
-           binary_append_string_ref_at(message, row_offset + 52, layout ? layout->list : (record ? record->list : "")) &&
+    return api_list_response_append_row(message, 80, &row_offset) &&
+           binary_write_u16_at(message, row_offset, record ? record->endpoint_kind : 0) &&
+           binary_write_u16_at(message, row_offset + 2, record ? record->endpoint_scheme : 0) &&
+           binary_write_u16_at(message, row_offset + 4, record ? record->endpoint_flags : 0) &&
+           binary_write_u16_at(message, row_offset + 6, record && record->port > 0 ? (uint16_t)record->port : 0u) &&
+           binary_append_string_ref_at(message, row_offset + 8, record ? record->frontend_id : "") &&
+           binary_append_string_ref_at(message, row_offset + 16, record ? record->service_id : "") &&
+           binary_append_string_ref_at(message, row_offset + 24, record ? record->display_name : "") &&
+           binary_append_string_ref_at(message, row_offset + 32, record ? record->host : "") &&
+           binary_append_string_ref_at(message, row_offset + 40, record ? record->socket_path : "") &&
+           binary_append_string_ref_at(message, row_offset + 48, record ? record->path : "") &&
+           binary_append_string_ref_at(message, row_offset + 56, record ? record->url : "") &&
+           binary_append_string_ref_at(message, row_offset + 64, record ? record->icon_path : "") &&
+           binary_append_string_ref_at(message, row_offset + 72, layout ? layout->list : (record ? record->list : "")) &&
            api_list_response_finish_row(message, row_count);
 }
 
@@ -14474,18 +14822,6 @@ static bool api_log_list_response_append_row(StringBuilder *message,
     return api_list_response_append_row(message, 16, &row_offset) &&
            binary_append_string_ref_at(message, row_offset, record ? record->path : "") &&
            binary_append_string_ref_at(message, row_offset + 8, record ? record->service_id : "") &&
-           api_list_response_finish_row(message, row_count);
-}
-
-static bool api_service_manager_list_response_append_row(StringBuilder *message,
-                                                         const RegistryBackendRecord *record,
-                                                         const char *service_manager_entry,
-                                                         uint32_t *row_count) {
-    size_t row_offset = 0;
-    return api_list_response_append_row(message, 20, &row_offset) &&
-           binary_write_u32_at(message, row_offset, record && record->owns_unit ? 1u : 0u) &&
-           binary_append_string_ref_at(message, row_offset + 4, record ? record->service_id : "") &&
-           binary_append_string_ref_at(message, row_offset + 12, service_manager_entry ? service_manager_entry : "") &&
            api_list_response_finish_row(message, row_count);
 }
 
@@ -14755,8 +15091,6 @@ static uint16_t api_registry_list_response_type(uint16_t request_type) {
         return OUTERSHELLD_API_APP_LIST_RESPONSE;
     case OUTERSHELLD_API_LOG_LIST_REQUEST:
         return OUTERSHELLD_API_LOG_LIST_RESPONSE;
-    case OUTERSHELLD_API_SERVICE_MANAGER_LIST_REQUEST:
-        return OUTERSHELLD_API_SERVICE_MANAGER_LIST_RESPONSE;
     case OUTERSHELLD_API_CONTENT_TYPE_LIST_REQUEST:
         return OUTERSHELLD_API_CONTENT_TYPE_LIST_RESPONSE;
     case OUTERSHELLD_API_OPENER_LIST_REQUEST:
@@ -14835,19 +15169,6 @@ static bool process_api_registry_list_request(ReactorClient *client, const unsig
                 ok = api_log_list_response_append_row(&response, record, &row_count);
             }
             break;
-        case OUTERSHELLD_API_SERVICE_MANAGER_LIST_REQUEST:
-            for (size_t i = 0; ok && i < database.backend_count; i++) {
-                const RegistryBackendRecord *record = &database.backends[i];
-                if (backend && backend[0] && strcmp(record->service_id, backend) != 0) continue;
-#if defined(__APPLE__)
-                if (!record->unit_path || !record->unit_path[0]) continue;
-                ok = api_service_manager_list_response_append_row(&response, record, record->unit_path, &row_count);
-#else
-                if (!record->unit_name || !record->unit_name[0] || (record->unit_path && record->unit_path[0])) continue;
-                ok = api_service_manager_list_response_append_row(&response, record, record->unit_name, &row_count);
-#endif
-            }
-            break;
         case OUTERSHELLD_API_CONTENT_TYPE_LIST_REQUEST:
             if (!backend || !backend[0]) {
                 for (size_t i = 0; ok && i < sizeof(kBuiltInContentTypes) / sizeof(kBuiltInContentTypes[0]); i++) {
@@ -14919,6 +15240,8 @@ static bool process_api_command_request(ReactorClient *client, const unsigned ch
     char *log_path = NULL;
     char *url = NULL;
     char *frontend_id = NULL;
+    char *frontend_host = NULL;
+    char *frontend_path = NULL;
     char *icon_path = NULL;
     char *frontend_list = NULL;
     char *socket_path = NULL;
@@ -14934,6 +15257,9 @@ static bool process_api_command_request(ReactorClient *client, const unsigned ch
     char rank_buffer[32];
     char capabilities_buffer[16];
     uint16_t flags = 0;
+    uint16_t endpoint_kind = OUTERSHELLD_API_FRONTEND_ENDPOINT_NONE;
+    uint16_t endpoint_scheme = OUTERSHELLD_API_FRONTEND_SCHEME_HTTP;
+    uint16_t endpoint_flags = 0;
     uint32_t port = 0;
     uint32_t rank = 0;
     uint32_t capabilities = OUTERSHELLD_API_OPENER_CAPABILITY_DEFAULT;
@@ -14972,25 +15298,42 @@ static bool process_api_command_request(ReactorClient *client, const unsigned ch
              api_command_append_option(argv, &argc, 64, "--backend", backend);
         break;
     case OUTERSHELLD_API_APP_ADD_REQUEST:
-        ok = ok && message_length >= 62 &&
+        ok = ok && message_length >= 74 &&
              INIT_COMMAND("app", "add") &&
-             READ_REF(6, backend) &&
-             READ_REF(14, display_name) &&
-             READ_REF(22, url) &&
-             READ_REF(30, frontend_id) &&
-             READ_REF(38, icon_path) &&
-             READ_REF(46, frontend_list) &&
-             READ_REF(54, socket_path);
-        port = ok ? read_uint32_le(message + 2) : 0;
+             READ_REF(10, backend) &&
+             READ_REF(18, frontend_id) &&
+             READ_REF(26, display_name) &&
+             READ_REF(34, frontend_path) &&
+             READ_REF(42, frontend_host) &&
+             READ_REF(50, socket_path) &&
+             READ_REF(58, icon_path) &&
+             READ_REF(66, frontend_list);
+        endpoint_kind = ok ? read_uint16_le(message + 2) : OUTERSHELLD_API_FRONTEND_ENDPOINT_NONE;
+        endpoint_scheme = ok ? read_uint16_le(message + 4) : OUTERSHELLD_API_FRONTEND_SCHEME_HTTP;
+        endpoint_flags = ok ? read_uint16_le(message + 6) : 0;
+        port = ok ? read_uint16_le(message + 8) : 0;
         ok = ok &&
              api_command_append_option(argv, &argc, 64, "--backend", backend) &&
              api_command_append_option(argv, &argc, 64, "--name", display_name) &&
-             api_command_append_option(argv, &argc, 64, "--url", url) &&
              api_command_append_option(argv, &argc, 64, "--frontend-id", frontend_id) &&
+             api_command_append_option(argv, &argc, 64, "--path", frontend_path) &&
              api_command_append_option(argv, &argc, 64, "--icon-path", icon_path) &&
-             api_command_append_option(argv, &argc, 64, "--list", frontend_list) &&
-             api_command_append_option(argv, &argc, 64, "--socket-path", socket_path) &&
-             api_command_append_port(argv, &argc, 64, port, port_buffer, sizeof(port_buffer));
+             api_command_append_option(argv, &argc, 64, "--list", frontend_list);
+        if (ok && endpoint_scheme == OUTERSHELLD_API_FRONTEND_SCHEME_HTTPS) {
+            ok = api_command_append_option(argv, &argc, 64, "--scheme", "https");
+        } else if (ok && endpoint_scheme != OUTERSHELLD_API_FRONTEND_SCHEME_DEFAULT &&
+                   endpoint_scheme != OUTERSHELLD_API_FRONTEND_SCHEME_HTTP) {
+            ok = false;
+        }
+        if (ok && endpoint_flags != 0) ok = false;
+        if (ok && endpoint_kind == OUTERSHELLD_API_FRONTEND_ENDPOINT_TCP) {
+            ok = api_command_append_option(argv, &argc, 64, "--host", frontend_host) &&
+                 api_command_append_port(argv, &argc, 64, port, port_buffer, sizeof(port_buffer));
+        } else if (ok && endpoint_kind == OUTERSHELLD_API_FRONTEND_ENDPOINT_UNIX) {
+            ok = api_command_append_option(argv, &argc, 64, "--socket-path", socket_path);
+        } else if (ok && endpoint_kind != OUTERSHELLD_API_FRONTEND_ENDPOINT_NONE) {
+            ok = false;
+        }
         break;
     case OUTERSHELLD_API_APP_REMOVE_REQUEST:
         ok = ok && message_length >= 30 &&
@@ -15005,10 +15348,9 @@ static bool process_api_command_request(ReactorClient *client, const unsigned ch
              api_command_append_option(argv, &argc, 64, "--socket-path", socket_path) &&
              api_command_append_port(argv, &argc, 64, port, port_buffer, sizeof(port_buffer));
         break;
-    case OUTERSHELLD_API_APP_CLEAR_REQUEST:
     case OUTERSHELLD_API_APP_LIST_REQUEST:
         ok = ok && message_length >= 10 &&
-             INIT_COMMAND("app", message_type == OUTERSHELLD_API_APP_CLEAR_REQUEST ? "clear" : "list") &&
+             INIT_COMMAND("app", "list") &&
              READ_REF(2, backend) &&
              api_command_append_option(argv, &argc, 64, "--backend", backend);
         break;
@@ -15021,26 +15363,12 @@ static bool process_api_command_request(ReactorClient *client, const unsigned ch
              api_command_append_option(argv, &argc, 64, "--backend", backend) &&
              api_command_append_option(argv, &argc, 64, "--path", log_path);
         break;
-    case OUTERSHELLD_API_LOG_CLEAR_REQUEST:
     case OUTERSHELLD_API_LOG_LIST_REQUEST:
         ok = ok && message_length >= 10 &&
-             INIT_COMMAND("log", message_type == OUTERSHELLD_API_LOG_CLEAR_REQUEST ? "clear" : "list") &&
+             INIT_COMMAND("log", "list") &&
              READ_REF(2, backend) &&
              api_command_append_option(argv, &argc, 64, "--backend", backend);
         break;
-    case OUTERSHELLD_API_SERVICE_MANAGER_CLEAR_REQUEST:
-    case OUTERSHELLD_API_SERVICE_MANAGER_LIST_REQUEST: {
-        bool is_clear = message_type == OUTERSHELLD_API_SERVICE_MANAGER_CLEAR_REQUEST;
-        ok = ok && message_length >= 10 &&
-#if defined(__APPLE__)
-             INIT_COMMAND("launchd", is_clear ? "clear" : "list") &&
-#else
-             INIT_COMMAND("systemd", is_clear ? "clear" : "list") &&
-#endif
-             READ_REF(2, backend) &&
-             api_command_append_option(argv, &argc, 64, "--backend", backend);
-        break;
-    }
     case OUTERSHELLD_API_CONTENT_TYPE_ADD_REQUEST:
         ok = ok && message_length >= 58 &&
              INIT_COMMAND("content-type", "add") &&
@@ -15067,12 +15395,6 @@ static bool process_api_command_request(ReactorClient *client, const unsigned ch
              READ_REF(10, content_type) &&
              api_command_append_option(argv, &argc, 64, "--backend", backend) &&
              api_command_append_option(argv, &argc, 64, "--content-type", content_type);
-        break;
-    case OUTERSHELLD_API_CONTENT_TYPE_CLEAR_REQUEST:
-        ok = ok && message_length >= 10 &&
-             INIT_COMMAND("content-type", "clear") &&
-             READ_REF(2, backend) &&
-             api_command_append_option(argv, &argc, 64, "--backend", backend);
         break;
     case OUTERSHELLD_API_OPENER_ADD_REQUEST:
         ok = ok && message_length >= 50 &&
@@ -15108,12 +15430,6 @@ static bool process_api_command_request(ReactorClient *client, const unsigned ch
              api_command_append_option(argv, &argc, 64, "--backend", backend) &&
              api_command_append_option(argv, &argc, 64, "--content-type", content_type);
         break;
-    case OUTERSHELLD_API_OPENER_CLEAR_REQUEST:
-        ok = ok && message_length >= 10 &&
-             INIT_COMMAND("opener", "clear") &&
-             READ_REF(2, backend) &&
-             api_command_append_option(argv, &argc, 64, "--backend", backend);
-        break;
     case OUTERSHELLD_API_OPENER_LIST_REQUEST:
         ok = ok && message_length >= 18 &&
              INIT_COMMAND("opener", "list") &&
@@ -15143,6 +15459,8 @@ static bool process_api_command_request(ReactorClient *client, const unsigned ch
     free(log_path);
     free(url);
     free(frontend_id);
+    free(frontend_host);
+    free(frontend_path);
     free(icon_path);
     free(frontend_list);
     free(socket_path);
@@ -15163,17 +15481,12 @@ static bool api_message_is_command_request(uint16_t message_type) {
     case OUTERSHELLD_API_BACKEND_REMOVE_REQUEST:
     case OUTERSHELLD_API_APP_ADD_REQUEST:
     case OUTERSHELLD_API_APP_REMOVE_REQUEST:
-    case OUTERSHELLD_API_APP_CLEAR_REQUEST:
     case OUTERSHELLD_API_LOG_ADD_REQUEST:
     case OUTERSHELLD_API_LOG_REMOVE_REQUEST:
-    case OUTERSHELLD_API_LOG_CLEAR_REQUEST:
-    case OUTERSHELLD_API_SERVICE_MANAGER_CLEAR_REQUEST:
     case OUTERSHELLD_API_CONTENT_TYPE_ADD_REQUEST:
     case OUTERSHELLD_API_CONTENT_TYPE_REMOVE_REQUEST:
-    case OUTERSHELLD_API_CONTENT_TYPE_CLEAR_REQUEST:
     case OUTERSHELLD_API_OPENER_ADD_REQUEST:
     case OUTERSHELLD_API_OPENER_REMOVE_REQUEST:
-    case OUTERSHELLD_API_OPENER_CLEAR_REQUEST:
         return true;
     default:
         return false;

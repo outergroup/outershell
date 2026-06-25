@@ -388,9 +388,6 @@ if [ "$os_name" = "Darwin" ]; then
             unload_outer_shell
             rm -f "$plist_path" "$socket_path" "$api_socket_path"
             if [ -x "$outerctl_path" ]; then
-                OUTERSHELL_HOME="$outershell_home" "$outerctl_path" app clear --backend "$service_id" >/dev/null 2>&1 || true
-                OUTERSHELL_HOME="$outershell_home" "$outerctl_path" log clear --backend "$service_id" >/dev/null 2>&1 || true
-                OUTERSHELL_HOME="$outershell_home" "$outerctl_path" launchd clear --backend "$service_id" >/dev/null 2>&1 || true
                 OUTERSHELL_HOME="$outershell_home" "$outerctl_path" backend remove --backend "$service_id" >/dev/null 2>&1 || true
             fi
             rm -rf "$app_install_root" "$legacy_install_root" "$tools_install_root"
@@ -407,9 +404,6 @@ if [ "$os_name" = "Darwin" ]; then
         unload_outer_shell
         rm -f "$plist_path" "$socket_path" "$api_socket_path"
         if [ -x "$outerctl_path" ]; then
-            OUTERSHELL_HOME="$outershell_home" "$outerctl_path" app clear --backend "$service_id" >/dev/null 2>&1 || true
-            OUTERSHELL_HOME="$outershell_home" "$outerctl_path" log clear --backend "$service_id" >/dev/null 2>&1 || true
-            OUTERSHELL_HOME="$outershell_home" "$outerctl_path" launchd clear --backend "$service_id" >/dev/null 2>&1 || true
             OUTERSHELL_HOME="$outershell_home" "$outerctl_path" backend remove --backend "$service_id" >/dev/null 2>&1 || true
         fi
         rm -rf "$app_install_root" "$legacy_install_root"
@@ -526,10 +520,10 @@ EOF
         attempts=$((attempts - 1))
     done
     OUTERSHELL_HOME="$outershell_home" "$outerctl_path" backend upsert --backend "$service_id" --name "$display_name" --launchd-plist "$plist_path" --outershell-owns true
-    OUTERSHELL_HOME="$outershell_home" "$outerctl_path" app clear --backend "$service_id"
+    OUTERSHELL_HOME="$outershell_home" "$outerctl_path" app remove --backend "$service_id" --frontend-id "$service_id:main"
     OUTERSHELL_HOME="$outershell_home" "$outerctl_path" app add --backend "$service_id" --socket-path "$socket_path" --name "$display_name" --url "/" --icon-path "$icon_path"
     append_outerloop_http_unix_allowlist_entry user "$socket_path"
-    OUTERSHELL_HOME="$outershell_home" "$outerctl_path" log clear --backend "$service_id"
+    OUTERSHELL_HOME="$outershell_home" "$outerctl_path" log remove --backend "$service_id" --path "$log_path"
     OUTERSHELL_HOME="$outershell_home" "$outerctl_path" log add --backend "$service_id" --path "$log_path"
     if [ "$command" = "update" ]; then
         printf 'Outer Shell updated to %s and restarted.\n' "__OUTER_SHELL_VERSION__"
@@ -658,9 +652,6 @@ rollback_failed_linux_install() {
     if [ "$command" = "install" ] && [ "$install_completed" != true ]; then
         printf 'Outer Shell install failed; rolling back partial install.\n' >&2
         if [ -x "$outerctl_path" ]; then
-            run_outerctl app clear --backend org.outershell.OuterShell >/dev/null 2>&1 || true
-            run_outerctl log clear --backend org.outershell.OuterShell >/dev/null 2>&1 || true
-            run_outerctl systemd clear --backend org.outershell.OuterShell >/dev/null 2>&1 || true
             run_outerctl backend remove --backend org.outershell.OuterShell >/dev/null 2>&1 || true
         fi
         if [ "$root_install" = true ]; then
@@ -887,9 +878,6 @@ if [ "$command" = "uninstall" ]; then
         systemctl --user disable org.outershell.OuterShell.socket outershelld.socket outershelld.service >/dev/null 2>&1 || true
     fi
     if [ -x "$outerctl_path" ]; then
-        run_outerctl app clear --backend org.outershell.OuterShell >/dev/null 2>&1 || true
-        run_outerctl log clear --backend org.outershell.OuterShell >/dev/null 2>&1 || true
-        run_outerctl systemd clear --backend org.outershell.OuterShell >/dev/null 2>&1 || true
         run_outerctl backend remove --backend org.outershell.OuterShell >/dev/null 2>&1 || true
     fi
     remove_system_binary_user_marker_with_sudo
@@ -1068,14 +1056,14 @@ systemctl $systemctl_scope start outershelld.socket
 systemctl $systemctl_scope start org.outershell.OuterShell.socket
 
 run_outerctl backend upsert --backend org.outershell.OuterShell --name "Outer Shell" --systemd-unit org.outershell.OuterShell.service
-run_outerctl app clear --backend org.outershell.OuterShell
+run_outerctl app remove --backend org.outershell.OuterShell --frontend-id org.outershell.OuterShell:main
 run_outerctl app add --backend org.outershell.OuterShell --socket-path "$socket_path" --name "Outer Shell" --url "/" --icon-path "$install_root/app-icon.png"
 if [ "$root_install" = true ]; then
     append_outerloop_http_unix_allowlist_entry system "$socket_path"
 else
     append_outerloop_http_unix_allowlist_entry user "$socket_path"
 fi
-run_outerctl log clear --backend org.outershell.OuterShell
+run_outerctl log remove --backend org.outershell.OuterShell --path "$log_path"
 run_outerctl log add --backend org.outershell.OuterShell --path "$log_path"
 
 if [ "$command" = "update" ]; then

@@ -98,12 +98,6 @@ Remove a custom content type:
 outerctl content-type remove --backend org.outershell.Plaintext --content-type org.outershell.example-source
 ```
 
-Remove all custom content type definitions owned by a backend:
-
-```bash
-outerctl content-type clear --backend org.outershell.Plaintext
-```
-
 Built-in content types are not stored in the registry and cannot be removed.
 Removing a backend clears custom content type definitions owned by that backend.
 
@@ -111,8 +105,7 @@ Removing a backend clears custom content type definitions owned by that backend.
 
 Mutating opener operations use `outerctl` commands. The `outerctl` binary parses
 the command line and sends dedicated structured messages such as
-`openerAddRequest`, `openerRemoveRequest`, and `openerClearRequest` to
-`outershelld`.
+`openerAddRequest` and `openerRemoveRequest` to `outershelld`.
 
 Add or update an opener:
 
@@ -135,15 +128,8 @@ outerctl opener remove \
   --content-type public.text
 ```
 
-Remove all opener records for a backend:
-
-```bash
-outerctl opener clear --backend org.outershell.Plaintext
-```
-
 The backend must already be registered before `opener add` or `opener remove`.
-`opener clear` can run for orphaned backend identifiers so uninstall paths can
-clean stale rows.
+Removing a backend clears opener records owned by that backend.
 
 ## Listing Openers
 

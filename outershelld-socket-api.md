@@ -61,24 +61,18 @@ Request message types are allocated in one contiguous block:
 12 backendListRequest
 13 appAddRequest
 14 appRemoveRequest
-15 appClearRequest
-16 appListRequest
-17 logAddRequest
-18 logRemoveRequest
-19 logClearRequest
-20 logListRequest
-21 serviceManagerClearRequest
-22 serviceManagerListRequest
-23 contentTypeAddRequest
-24 contentTypeRemoveRequest
-25 contentTypeClearRequest
-26 contentTypeListRequest
-27 openerAddRequest
-28 openerRemoveRequest
-29 openerClearRequest
-30 openerListRequest
-31 fileOpenersQuery
-32 uiRequest
+15 appListRequest
+16 logAddRequest
+17 logRemoveRequest
+18 logListRequest
+19 contentTypeAddRequest
+20 contentTypeRemoveRequest
+21 contentTypeListRequest
+22 openerAddRequest
+23 openerRemoveRequest
+24 openerListRequest
+25 fileOpenersQuery
+26 uiRequest
 ```
 
 Response message types are allocated in one contiguous block:
@@ -88,11 +82,10 @@ Response message types are allocated in one contiguous block:
 101 backendListResponse
 102 appListResponse
 103 logListResponse
-104 serviceManagerListResponse
-105 contentTypeListResponse
-106 openerListResponse
-107 fileOpenersResponse
-108 uiResponse
+104 contentTypeListResponse
+105 openerListResponse
+106 fileOpenersResponse
+107 uiResponse
 ```
 
 Flags:
@@ -126,6 +119,9 @@ bytes 2..9: StringRef32 backend service id
 
 Returns `commandResponse` (`messageType = 100`).
 
+Removing a backend also removes its app, log, opener, and content-type rows,
+plus its platform service-manager metadata.
+
 `backendListRequest` (`12`):
 
 ```text
@@ -136,22 +132,26 @@ Returns `backendListResponse` (`messageType = 101`).
 
 ### Apps
 
-`appAddRequest` (`20`):
+`appAddRequest` (`13`):
 
 ```text
-bytes 2..5:    UInt32 port
-bytes 6..13:   StringRef32 backend service id
-bytes 14..21:  StringRef32 display name
-bytes 22..29:  StringRef32 URL
-bytes 30..37:  StringRef32 frontend id
-bytes 38..45:  StringRef32 icon path
-bytes 46..53:  StringRef32 frontend list
-bytes 54..61:  StringRef32 socket path
+bytes 2..3:    UInt16 endpoint kind
+bytes 4..5:    UInt16 scheme
+bytes 6..7:    UInt16 endpoint flags, currently 0
+bytes 8..9:    UInt16 TCP port, 0 when not a TCP endpoint
+bytes 10..17:  StringRef32 backend service id
+bytes 18..25:  StringRef32 frontend id
+bytes 26..33:  StringRef32 display name
+bytes 34..41:  StringRef32 URL path
+bytes 42..49:  StringRef32 TCP host
+bytes 50..57:  StringRef32 Unix socket path
+bytes 58..65:  StringRef32 icon path
+bytes 66..73:  StringRef32 frontend list
 ```
 
 Returns `commandResponse` (`messageType = 100`).
 
-`appRemoveRequest` (`21`):
+`appRemoveRequest` (`14`):
 
 ```text
 bytes 2..5:    UInt32 port
@@ -162,15 +162,7 @@ bytes 22..29:  StringRef32 socket path
 
 Returns `commandResponse` (`messageType = 100`).
 
-`appClearRequest` (`22`):
-
-```text
-bytes 2..9: StringRef32 backend service id
-```
-
-Returns `commandResponse` (`messageType = 100`).
-
-`appListRequest` (`23`):
+`appListRequest` (`15`):
 
 ```text
 bytes 2..9: StringRef32 backend service id
@@ -178,18 +170,9 @@ bytes 2..9: StringRef32 backend service id
 
 Returns `appListResponse` (`messageType = 102`).
 
-### Logs And Service Managers
+### Logs
 
-`logAddRequest` (`30`):
-
-```text
-bytes 2..9:    StringRef32 backend service id
-bytes 10..17:  StringRef32 log path
-```
-
-Returns `commandResponse` (`messageType = 100`).
-
-`logRemoveRequest` (`31`):
+`logAddRequest` (`16`):
 
 ```text
 bytes 2..9:    StringRef32 backend service id
@@ -198,15 +181,16 @@ bytes 10..17:  StringRef32 log path
 
 Returns `commandResponse` (`messageType = 100`).
 
-`logClearRequest` (`32`):
+`logRemoveRequest` (`17`):
 
 ```text
-bytes 2..9: StringRef32 backend service id
+bytes 2..9:    StringRef32 backend service id
+bytes 10..17:  StringRef32 log path
 ```
 
 Returns `commandResponse` (`messageType = 100`).
 
-`logListRequest` (`33`):
+`logListRequest` (`18`):
 
 ```text
 bytes 2..9: StringRef32 backend service id
@@ -214,25 +198,9 @@ bytes 2..9: StringRef32 backend service id
 
 Returns `logListResponse` (`messageType = 103`).
 
-`serviceManagerClearRequest` (`40`):
-
-```text
-bytes 2..9: StringRef32 backend service id
-```
-
-Returns `commandResponse` (`messageType = 100`).
-
-`serviceManagerListRequest` (`41`):
-
-```text
-bytes 2..9: StringRef32 backend service id
-```
-
-Returns `serviceManagerListResponse` (`messageType = 104`).
-
 ### Content Types
 
-`contentTypeAddRequest` (`messageType = 23`):
+`contentTypeAddRequest` (`messageType = 19`):
 
 ```text
 bytes 2..9:    StringRef32 backend service id
@@ -246,7 +214,7 @@ bytes 50..57:  StringListRef32 MIME types
 
 Returns `commandResponse` (`messageType = 100`).
 
-`contentTypeRemoveRequest` (`messageType = 24`):
+`contentTypeRemoveRequest` (`messageType = 20`):
 
 ```text
 bytes 2..9:    StringRef32 backend service id
@@ -255,26 +223,18 @@ bytes 10..17:  StringRef32 content type
 
 Returns `commandResponse` (`messageType = 100`).
 
-`contentTypeClearRequest` (`messageType = 25`):
-
-```text
-bytes 2..9: StringRef32 backend service id
-```
-
-Returns `commandResponse` (`messageType = 100`).
-
-`contentTypeListRequest` (`messageType = 26`):
+`contentTypeListRequest` (`messageType = 21`):
 
 ```text
 bytes 2..9:    StringRef32 backend service id
 bytes 10..17:  StringRef32 content type
 ```
 
-Returns `contentTypeListResponse` (`messageType = 105`).
+Returns `contentTypeListResponse` (`messageType = 104`).
 
 ### Openers
 
-`openerAddRequest` (`messageType = 27`):
+`openerAddRequest` (`messageType = 22`):
 
 ```text
 bytes 2..5:    UInt32 rank
@@ -295,7 +255,7 @@ Capability flags:
 0x02 edit
 ```
 
-`openerRemoveRequest` (`messageType = 28`):
+`openerRemoveRequest` (`messageType = 23`):
 
 ```text
 bytes 2..9:    StringRef32 backend service id
@@ -304,22 +264,14 @@ bytes 10..17:  StringRef32 content type
 
 Returns `commandResponse` (`messageType = 100`).
 
-`openerClearRequest` (`messageType = 29`):
-
-```text
-bytes 2..9: StringRef32 backend service id
-```
-
-Returns `commandResponse` (`messageType = 100`).
-
-`openerListRequest` (`messageType = 30`):
+`openerListRequest` (`messageType = 24`):
 
 ```text
 bytes 2..9:    StringRef32 backend service id
 bytes 10..17:  StringRef32 content type
 ```
 
-Returns `openerListResponse` (`messageType = 106`).
+Returns `openerListResponse` (`messageType = 105`).
 
 ## Command Responses
 
@@ -357,17 +309,22 @@ bytes 28..35:  StringRef32 launchd plist path
 
 `appListResponse` (`102`) uses the common list response header. Its `row count`
 field tells you how many app rows follow at byte 22. Use the header's `row
-size` field as the stride between rows; the current row size is 60 bytes:
+size` field as the stride between rows; the current row size is 80 bytes:
 
 ```text
-bytes 0..3:    UInt32 port
-bytes 4..11:   StringRef32 frontend id
-bytes 12..19:  StringRef32 URL
-bytes 20..27:  StringRef32 backend service id
-bytes 28..35:  StringRef32 display name
-bytes 36..43:  StringRef32 socket path
-bytes 44..51:  StringRef32 icon path
-bytes 52..59:  StringRef32 frontend list
+bytes 0..1:    UInt16 endpoint kind
+bytes 2..3:    UInt16 scheme
+bytes 4..5:    UInt16 endpoint flags, currently 0
+bytes 6..7:    UInt16 TCP port, 0 when not a TCP endpoint
+bytes 8..15:   StringRef32 frontend id
+bytes 16..23:  StringRef32 backend service id
+bytes 24..31:  StringRef32 display name
+bytes 32..39:  StringRef32 TCP host
+bytes 40..47:  StringRef32 Unix socket path
+bytes 48..55:  StringRef32 URL path
+bytes 56..63:  StringRef32 derived URL
+bytes 64..71:  StringRef32 icon path
+bytes 72..79:  StringRef32 frontend list
 ```
 
 `logListResponse` (`103`) uses the common list response header. Its `row count`
@@ -379,18 +336,7 @@ bytes 0..7:   StringRef32 log path
 bytes 8..15:  StringRef32 backend service id
 ```
 
-`serviceManagerListResponse` (`104`) uses the common list response header. Its
-`row count` field tells you how many service-manager rows follow at byte 22.
-Use the header's `row size` field as the stride between rows; the current row
-size is 20 bytes:
-
-```text
-bytes 0..3:    UInt32 flags
-bytes 4..11:   StringRef32 backend service id
-bytes 12..19:  StringRef32 platform service-manager entry
-```
-
-`contentTypeListResponse` (`105`) uses the common list response header. Its
+`contentTypeListResponse` (`104`) uses the common list response header. Its
 `row count` field tells you how many content-type rows follow at byte 22. Use
 the header's `row size` field as the stride between rows; the current row size
 is 56 bytes:
@@ -405,7 +351,7 @@ bytes 40..47:  StringListRef32 exact filenames
 bytes 48..55:  StringListRef32 MIME types
 ```
 
-`openerListResponse` (`106`) uses the common list response header. Its `row
+`openerListResponse` (`105`) uses the common list response header. Its `row
 count` field tells you how many opener rows follow at byte 22. Use the
 header's `row size` field as the stride between rows; the current row size is
 48 bytes:
@@ -420,7 +366,7 @@ bytes 36..43:  StringRef32 URL template
 bytes 44..47:  UInt32 capability flags
 ```
 
-## `fileOpenersQuery` (`messageType = 31`)
+## `fileOpenersQuery` (`messageType = 25`)
 
 Returns applications that can open a file path or an explicit content type.
 This is the file-to-openers query; it does not take a backend service id.
@@ -437,7 +383,7 @@ is provided, `outershelld` expands it through its `conforms_to` graph.
 If `requester user` is present, the daemon queries that user's registry before
 adding accessible system-registry openers.
 
-## `fileOpenersResponse` (`messageType = 107`)
+## `fileOpenersResponse` (`messageType = 106`)
 
 ```text
 bytes 2..5:    UInt32 status, 0 for success

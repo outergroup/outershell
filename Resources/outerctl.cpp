@@ -342,29 +342,22 @@ enum : uint16_t {
     kMessageBackendListRequest = 12,
     kMessageAppAddRequest = 13,
     kMessageAppRemoveRequest = 14,
-    kMessageAppClearRequest = 15,
-    kMessageAppListRequest = 16,
-    kMessageLogAddRequest = 17,
-    kMessageLogRemoveRequest = 18,
-    kMessageLogClearRequest = 19,
-    kMessageLogListRequest = 20,
-    kMessageServiceManagerClearRequest = 21,
-    kMessageServiceManagerListRequest = 22,
-    kMessageContentTypeAddRequest = 23,
-    kMessageContentTypeRemoveRequest = 24,
-    kMessageContentTypeClearRequest = 25,
-    kMessageContentTypeListRequest = 26,
-    kMessageOpenerAddRequest = 27,
-    kMessageOpenerRemoveRequest = 28,
-    kMessageOpenerClearRequest = 29,
-    kMessageOpenerListRequest = 30,
+    kMessageAppListRequest = 15,
+    kMessageLogAddRequest = 16,
+    kMessageLogRemoveRequest = 17,
+    kMessageLogListRequest = 18,
+    kMessageContentTypeAddRequest = 19,
+    kMessageContentTypeRemoveRequest = 20,
+    kMessageContentTypeListRequest = 21,
+    kMessageOpenerAddRequest = 22,
+    kMessageOpenerRemoveRequest = 23,
+    kMessageOpenerListRequest = 24,
     kMessageCommandResponse = 100,
     kMessageBackendListResponse = 101,
     kMessageAppListResponse = 102,
     kMessageLogListResponse = 103,
-    kMessageServiceManagerListResponse = 104,
-    kMessageContentTypeListResponse = 105,
-    kMessageOpenerListResponse = 106
+    kMessageContentTypeListResponse = 104,
+    kMessageOpenerListResponse = 105
 };
 
 enum : uint16_t {
@@ -372,9 +365,24 @@ enum : uint16_t {
     kFlagIncludeIcons = 0x02
 };
 
+enum : uint16_t {
+    kFrontendEndpointNone = 0,
+    kFrontendEndpointTcp = 1,
+    kFrontendEndpointUnix = 2
+};
+
+enum : uint16_t {
+    kFrontendSchemeDefault = 0,
+    kFrontendSchemeHttp = 1,
+    kFrontendSchemeHttps = 2
+};
+
 struct CommandRequest {
     uint16_t messageType = 0;
     uint16_t flags = 0;
+    uint16_t endpointKind = kFrontendEndpointNone;
+    uint16_t endpointScheme = kFrontendSchemeHttp;
+    uint16_t endpointFlags = 0;
     uint32_t port = 0;
     uint32_t rank = 0;
     uint32_t openerCapabilities = kOpenerCapabilityDefault;
@@ -384,6 +392,8 @@ struct CommandRequest {
     const char *serviceManagerPath = "";
     const char *logPath = "";
     const char *url = "";
+    const char *host = "";
+    const char *path = "";
     const char *frontendId = "";
     const char *iconPath = "";
     const char *frontendList = "";
@@ -407,6 +417,123 @@ bool parseUInt32(const char *raw, uint32_t maxValue, uint32_t &out) {
 
 bool truthy(const char *raw) {
     return raw && (strcmp(raw, "true") == 0 || strcmp(raw, "1") == 0 || strcmp(raw, "yes") == 0);
+}
+
+void normalizePath(const char *raw, Buffer &out) {
+    out.size = 0;
+    if (out.data) out.data[0] = '\0';
+    const char *path = raw && raw[0] ? raw : "/";
+    if (path[0] == '/') {
+        appendCString(out, path);
+    } else {
+        appendCString(out, "/");
+        appendCString(out, path);
+    }
+}
+
+const char *firstUrlSuffix(const char *authority) {
+    const char *slash = strchr(authority, '/');
+    const char *query = strchr(authority, '?');
+    const char *fragment = strchr(authority, '#');
+    const char *suffix = slash;
+    if (!suffix || (query && query < suffix)) suffix = query;
+    if (!suffix || (fragment && fragment < suffix)) suffix = fragment;
+    return suffix;
+}
+
+bool parseHostPort(const char *start, size_t length, Buffer &host, uint32_t &port) {
+    const char *hostEnd = start + length;
+    const char *portStart = nullptr;
+    if (length > 0 && start[0] == '[') {
+        const char *closing = static_cast<const char *>(memchr(start, ']', length));
+        if (closing) {
+            hostEnd = closing + 1;
+            if (static_cast<size_t>(hostEnd - start) < length && *hostEnd == ':') {
+                portStart = hostEnd + 1;
+            }
+        }
+    } else {
+        const char *colon = nullptr;
+        for (const char *cursor = start; cursor < start + length; cursor += 1) {
+            if (*cursor == ':') colon = cursor;
+        }
+        if (colon) {
+            hostEnd = colon;
+            portStart = colon + 1;
+        }
+    }
+    host.size = 0;
+    if (host.data) host.data[0] = '\0';
+    if (hostEnd > start) {
+        if (!appendBuffer(host, start, static_cast<size_t>(hostEnd - start))) return false;
+    }
+    if (portStart && portStart < start + length) {
+        char buffer[16];
+        size_t portLength = static_cast<size_t>((start + length) - portStart);
+        if (portLength >= sizeof(buffer)) portLength = sizeof(buffer) - 1;
+        memcpy(buffer, portStart, portLength);
+        buffer[portLength] = '\0';
+        uint32_t parsed = 0;
+        if (parseUInt32(buffer, 65535, parsed) && parsed > 0) port = parsed;
+    }
+    return true;
+}
+
+bool parseAppEndpoint(CommandRequest &request, Buffer &hostBuffer, Buffer &pathBuffer, Buffer &errorMessage) {
+    bool hasSocket = request.socketPath && request.socketPath[0];
+    bool hasPort = request.port > 0;
+    request.endpointKind = hasSocket ? kFrontendEndpointUnix : (hasPort ? kFrontendEndpointTcp : kFrontendEndpointNone);
+    if (request.endpointScheme == kFrontendSchemeDefault) request.endpointScheme = kFrontendSchemeHttp;
+    assignCString(hostBuffer, "127.0.0.1");
+    normalizePath("/", pathBuffer);
+
+    const char *url = request.url ? request.url : "";
+    if (url[0]) {
+        const char *authority = url;
+        const char *scheme = strstr(url, "://");
+        if (scheme) {
+            size_t schemeLength = static_cast<size_t>(scheme - url);
+            if (schemeLength == 5 && strncmp(url, "https", 5) == 0) request.endpointScheme = kFrontendSchemeHttps;
+            else if (schemeLength == 4 && strncmp(url, "http", 4) == 0) request.endpointScheme = kFrontendSchemeHttp;
+            else {
+                assignCString(errorMessage, "Invalid app endpoint URL scheme.");
+                return false;
+            }
+            authority = scheme + 3;
+        }
+        if (url[0] == '/' || url[0] == '?' || url[0] == '#') {
+            normalizePath(url, pathBuffer);
+        } else {
+            const char *suffix = firstUrlSuffix(authority);
+            const char *authorityEnd = suffix ? suffix : authority + strlen(authority);
+            bool looksLikeAuthority = scheme != nullptr ||
+                memchr(authority, ':', static_cast<size_t>(authorityEnd - authority)) != nullptr;
+            if (looksLikeAuthority) {
+                if (!hasSocket && !parseHostPort(authority, static_cast<size_t>(authorityEnd - authority), hostBuffer, request.port)) {
+                    assignCString(errorMessage, "Invalid app endpoint host.");
+                    return false;
+                }
+                normalizePath(suffix ? suffix : "/", pathBuffer);
+                if (!hasSocket) request.endpointKind = kFrontendEndpointTcp;
+            } else {
+                normalizePath(url, pathBuffer);
+            }
+        }
+    }
+    if (request.host && request.host[0]) {
+        if (hasSocket) {
+            assignCString(errorMessage, "Specify --host only with TCP endpoints.");
+            return false;
+        }
+        assignCString(hostBuffer, request.host);
+        request.endpointKind = kFrontendEndpointTcp;
+    }
+    if (request.path && request.path[0]) normalizePath(request.path, pathBuffer);
+    if (hasPort) request.endpointKind = kFrontendEndpointTcp;
+    if (hasSocket) request.endpointKind = kFrontendEndpointUnix;
+    request.host = hostBuffer.data ? hostBuffer.data : "";
+    request.path = pathBuffer.data ? pathBuffer.data : "/";
+    return true;
 }
 
 bool parseOpenerCapabilities(const char *raw, uint32_t &out) {
@@ -445,33 +572,21 @@ bool mapCommand(const char *resource, const char *action, uint16_t &messageType)
     } else if (strcmp(resource, "app") == 0) {
         if (strcmp(action, "add") == 0) messageType = kMessageAppAddRequest;
         else if (strcmp(action, "remove") == 0) messageType = kMessageAppRemoveRequest;
-        else if (strcmp(action, "clear") == 0) messageType = kMessageAppClearRequest;
         else if (strcmp(action, "list") == 0) messageType = kMessageAppListRequest;
         else return false;
     } else if (strcmp(resource, "log") == 0) {
         if (strcmp(action, "add") == 0) messageType = kMessageLogAddRequest;
         else if (strcmp(action, "remove") == 0) messageType = kMessageLogRemoveRequest;
-        else if (strcmp(action, "clear") == 0) messageType = kMessageLogClearRequest;
         else if (strcmp(action, "list") == 0) messageType = kMessageLogListRequest;
-        else return false;
-    } else if (strcmp(resource, "systemd") == 0) {
-        if (strcmp(action, "clear") == 0) messageType = kMessageServiceManagerClearRequest;
-        else if (strcmp(action, "list") == 0) messageType = kMessageServiceManagerListRequest;
-        else return false;
-    } else if (strcmp(resource, "launchd") == 0) {
-        if (strcmp(action, "clear") == 0) messageType = kMessageServiceManagerClearRequest;
-        else if (strcmp(action, "list") == 0) messageType = kMessageServiceManagerListRequest;
         else return false;
     } else if (strcmp(resource, "content-type") == 0 || strcmp(resource, "type") == 0) {
         if (strcmp(action, "add") == 0) messageType = kMessageContentTypeAddRequest;
         else if (strcmp(action, "remove") == 0) messageType = kMessageContentTypeRemoveRequest;
-        else if (strcmp(action, "clear") == 0) messageType = kMessageContentTypeClearRequest;
         else if (strcmp(action, "list") == 0) messageType = kMessageContentTypeListRequest;
         else return false;
     } else if (strcmp(resource, "opener") == 0) {
         if (strcmp(action, "add") == 0) messageType = kMessageOpenerAddRequest;
         else if (strcmp(action, "remove") == 0) messageType = kMessageOpenerRemoveRequest;
-        else if (strcmp(action, "clear") == 0) messageType = kMessageOpenerClearRequest;
         else if (strcmp(action, "list") == 0) messageType = kMessageOpenerListRequest;
         else return false;
     } else {
@@ -518,9 +633,24 @@ bool parseCommandRequest(int argc, char *argv[], CommandRequest &request, Buffer
             REQUIRE_VALUE("--unit", request.serviceManagerPath);
             request.hasServiceManagerPath = true;
         } else if (strcmp(arg, "--path") == 0) {
-            REQUIRE_VALUE("--path", request.logPath);
+            if (strcmp(argv[1], "app") == 0) {
+                REQUIRE_VALUE("--path", request.path);
+            } else {
+                REQUIRE_VALUE("--path", request.logPath);
+            }
         } else if (strcmp(arg, "--url") == 0) {
             REQUIRE_VALUE("--url", request.url);
+        } else if (strcmp(arg, "--host") == 0) {
+            REQUIRE_VALUE("--host", request.host);
+        } else if (strcmp(arg, "--scheme") == 0) {
+            const char *rawScheme = nullptr;
+            REQUIRE_VALUE("--scheme", rawScheme);
+            if (strcmp(rawScheme, "https") == 0) request.endpointScheme = kFrontendSchemeHttps;
+            else if (strcmp(rawScheme, "http") == 0) request.endpointScheme = kFrontendSchemeHttp;
+            else {
+                assignCString(errorMessage, "Invalid app endpoint scheme.");
+                return false;
+            }
         } else if (strcmp(arg, "--frontend-id") == 0 || strcmp(arg, "--id") == 0) {
             REQUIRE_VALUE("--frontend-id", request.frontendId);
         } else if (strcmp(arg, "--icon-path") == 0 || strcmp(arg, "--icon-file") == 0) {
@@ -603,19 +733,20 @@ bool appendCommandRequestMessage(Buffer &message, const CommandRequest &request)
     }
     case kMessageBackendRemoveRequest:
     case kMessageBackendListRequest:
-    case kMessageAppClearRequest:
     case kMessageAppListRequest:
-    case kMessageLogClearRequest:
-    case kMessageLogListRequest:
-    case kMessageServiceManagerClearRequest:
-    case kMessageServiceManagerListRequest: {
+    case kMessageLogListRequest: {
         const char *values[] = {request.backend};
         ok = ok && appendStringRefs(message, values, 1);
         break;
     }
     case kMessageAppAddRequest: {
-        const char *values[] = {request.backend, request.displayName, request.url, request.frontendId, request.iconPath, request.frontendList, request.socketPath};
-        ok = ok && appendLittleEndianUInt32(message, request.port) && appendStringRefs(message, values, 7);
+        const char *values[] = {request.backend, request.frontendId, request.displayName, request.path, request.host, request.socketPath, request.iconPath, request.frontendList};
+        ok = ok &&
+            appendLittleEndianUInt16(message, request.endpointKind) &&
+            appendLittleEndianUInt16(message, request.endpointScheme) &&
+            appendLittleEndianUInt16(message, request.endpointFlags) &&
+            appendLittleEndianUInt16(message, static_cast<uint16_t>(request.port)) &&
+            appendStringRefs(message, values, 8);
         break;
     }
     case kMessageAppRemoveRequest: {
@@ -648,11 +779,6 @@ bool appendCommandRequestMessage(Buffer &message, const CommandRequest &request)
         ok = ok && appendStringRefs(message, values, 2);
         break;
     }
-    case kMessageContentTypeClearRequest: {
-        const char *values[] = {request.backend};
-        ok = ok && appendStringRefs(message, values, 1);
-        break;
-    }
     case kMessageOpenerAddRequest: {
         const char *values[] = {request.backend, request.contentType, request.displayName, request.socketPath, request.urlTemplate};
         ok = ok &&
@@ -664,11 +790,6 @@ bool appendCommandRequestMessage(Buffer &message, const CommandRequest &request)
     case kMessageOpenerRemoveRequest: {
         const char *values[] = {request.backend, request.contentType};
         ok = ok && appendStringRefs(message, values, 2);
-        break;
-    }
-    case kMessageOpenerClearRequest: {
-        const char *values[] = {request.backend};
-        ok = ok && appendStringRefs(message, values, 1);
         break;
     }
     case kMessageOpenerListRequest: {
@@ -691,8 +812,6 @@ uint16_t listResponseTypeForRequest(uint16_t messageType) {
         return kMessageAppListResponse;
     case kMessageLogListRequest:
         return kMessageLogListResponse;
-    case kMessageServiceManagerListRequest:
-        return kMessageServiceManagerListResponse;
     case kMessageContentTypeListRequest:
         return kMessageContentTypeListResponse;
     case kMessageOpenerListRequest:
@@ -734,13 +853,8 @@ bool writeRegistryListResponse(const CommandRequest &request, const Buffer &resp
     freeBuffer(errorBuffer);
 
     const char *backendHeaders[] = {"service_id", "display_name", "unit_name", "unit_path", "owns_unit"};
-    const char *appHeaders[] = {"frontend_id", "url", "service_id", "display_name", "port", "socket_path", "icon_path", "list"};
+    const char *appHeaders[] = {"frontend_id", "service_id", "display_name", "endpoint_kind", "scheme", "host", "port", "socket_path", "path", "url", "icon_path", "list"};
     const char *logHeaders[] = {"path", "service_id"};
-#if defined(__APPLE__)
-    const char *serviceManagerHeaders[] = {"service_id", "plist_path", "owns_plist"};
-#else
-    const char *serviceManagerHeaders[] = {"service_id", "unit_name"};
-#endif
     const char *contentTypeHeaders[] = {"service_id", "identifier", "display_name", "conforms_to", "extensions", "filenames", "mime_types"};
     const char *openerHeaders[] = {"content_type", "service_id", "display_name", "socket_path", "url_template", "rank", "capabilities"};
 
@@ -768,7 +882,7 @@ bool writeRegistryListResponse(const CommandRequest &request, const Buffer &resp
         }
         break;
     case kMessageAppListResponse:
-        minimumRowSize = 60;
+        minimumRowSize = 80;
         if (responseRowSize < minimumRowSize) {
             ok = false;
             break;
@@ -780,11 +894,21 @@ bool writeRegistryListResponse(const CommandRequest &request, const Buffer &resp
                 ok = false;
                 break;
             }
+            char kindBuffer[16];
+            char schemeBuffer[16];
             char portBuffer[32];
-            snprintf(portBuffer, sizeof(portBuffer), "%u", readLittleEndianUInt32(bytes + offset));
-            const size_t firstRefs[] = {4, 12, 20, 28};
-            const size_t lastRefs[] = {36, 44, 52};
+            snprintf(kindBuffer, sizeof(kindBuffer), "%u", readLittleEndianUInt16(bytes + offset));
+            snprintf(schemeBuffer, sizeof(schemeBuffer), "%u", readLittleEndianUInt16(bytes + offset + 2));
+            snprintf(portBuffer, sizeof(portBuffer), "%u", readLittleEndianUInt16(bytes + offset + 6));
+            const size_t firstRefs[] = {8, 16, 24};
+            const size_t lastRefs[] = {40, 48, 56, 64, 72};
             ok = writeTsvRefs(response, offset, firstRefs, sizeof(firstRefs) / sizeof(firstRefs[0])) &&
+                fputc('\t', stdout) != EOF &&
+                writeTsvString(kindBuffer) &&
+                fputc('\t', stdout) != EOF &&
+                writeTsvString(schemeBuffer) &&
+                fputc('\t', stdout) != EOF &&
+                writeTsvRef(response, offset + 32) &&
                 fputc('\t', stdout) != EOF &&
                 writeTsvString(portBuffer);
             for (size_t i = 0; ok && i < sizeof(lastRefs) / sizeof(lastRefs[0]); i += 1) {
@@ -808,32 +932,6 @@ bool writeRegistryListResponse(const CommandRequest &request, const Buffer &resp
             }
             const size_t refs[] = {0, 8};
             ok = writeTsvRefRow(response, offset, refs, sizeof(refs) / sizeof(refs[0]));
-        }
-        break;
-    case kMessageServiceManagerListResponse:
-        minimumRowSize = 20;
-        if (responseRowSize < minimumRowSize) {
-            ok = false;
-            break;
-        }
-        ok = writeTsvHeaders(serviceManagerHeaders, sizeof(serviceManagerHeaders) / sizeof(serviceManagerHeaders[0]));
-        for (uint32_t row = 0; ok && row < rowCount; row += 1) {
-            const size_t offset = rowBase + static_cast<size_t>(row) * responseRowSize;
-            if (offset + minimumRowSize > response.size) {
-                ok = false;
-                break;
-            }
-            const size_t refs[] = {4, 12};
-            ok = writeTsvRefs(response, offset, refs, sizeof(refs) / sizeof(refs[0]));
-#if defined(__APPLE__)
-            if (ok) {
-                ok = fputc('\t', stdout) != EOF &&
-                    writeTsvString(readLittleEndianUInt32(bytes + offset) ? "1" : "0") &&
-                    fputc('\n', stdout) != EOF;
-            }
-#else
-            if (ok) ok = fputc('\n', stdout) != EOF;
-#endif
         }
         break;
     case kMessageContentTypeListResponse:
@@ -1000,11 +1098,25 @@ int main(int argc, char *argv[]) {
         freeBuffer(apiError);
         return 1;
     }
+    Buffer endpointHost;
+    Buffer endpointPath;
+    if (request.messageType == kMessageAppAddRequest &&
+        !parseAppEndpoint(request, endpointHost, endpointPath, apiError)) {
+        fprintf(stderr, "%s\n", apiError.data ? apiError.data : "Invalid app endpoint.");
+        freeBuffer(endpointHost);
+        freeBuffer(endpointPath);
+        freeBuffer(apiError);
+        return 1;
+    }
     if (tryOuterctlApi(request, apiExitStatus, apiError)) {
+        freeBuffer(endpointHost);
+        freeBuffer(endpointPath);
         freeBuffer(apiError);
         return apiExitStatus;
     }
     fprintf(stderr, "%s\n", apiError.data ? apiError.data : "Failed to call outershelld API.");
+    freeBuffer(endpointHost);
+    freeBuffer(endpointPath);
     freeBuffer(apiError);
     return 1;
 }
