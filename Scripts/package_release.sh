@@ -380,6 +380,29 @@ if [ "$os_name" = "Darwin" ]; then
         pkill -f "/Applications/Outer Loop.app/Contents/Resources/Outer Loop Services.app/.*BuiltinBackends/Top/.*TopBackend" >/dev/null 2>&1 || true
     }
 
+    install_completed=false
+    rollback_failed_macos_install() {
+        status=$?
+        if [ "$command" = "install" ] && [ "$install_completed" != true ]; then
+            printf 'Outer Shell install failed; rolling back partial install.\n' >&2
+            unload_outer_shell
+            rm -f "$plist_path" "$socket_path" "$api_socket_path"
+            if [ -x "$outerctl_path" ]; then
+                OUTERSHELL_HOME="$outershell_home" "$outerctl_path" app clear --backend "$service_id" >/dev/null 2>&1 || true
+                OUTERSHELL_HOME="$outershell_home" "$outerctl_path" log clear --backend "$service_id" >/dev/null 2>&1 || true
+                OUTERSHELL_HOME="$outershell_home" "$outerctl_path" launchd clear --backend "$service_id" >/dev/null 2>&1 || true
+                OUTERSHELL_HOME="$outershell_home" "$outerctl_path" backend remove --backend "$service_id" >/dev/null 2>&1 || true
+            fi
+            rm -rf "$app_install_root" "$legacy_install_root" "$tools_install_root"
+            rm -f "$outerctl_path"
+            rmdir "$outershell_home/apps" "$outershell_home/bin" "$outershell_home" >/dev/null 2>&1 || true
+            rm -rf "$outer_shell_cache_root/install"
+            rmdir "$outer_shell_cache_root" "$outershell_cache_root" >/dev/null 2>&1 || true
+        fi
+        exit "$status"
+    }
+    trap rollback_failed_macos_install EXIT
+
     if [ "$command" = "uninstall" ]; then
         unload_outer_shell
         rm -f "$plist_path" "$socket_path" "$api_socket_path"
@@ -441,7 +464,7 @@ EOF
     printf '%s\n' "__OUTER_SHELL_VERSION__" > "$app_install_root/version"
     printf '%s\n' "__OUTER_SHELL_VERSION__" > "$tools_install_root/version"
     touch "$log_path"
-    OUTERSHELL_HOME="$outershell_home" "$outershelld_path" --migrate-user-state-only >> "$log_path" 2>&1 || true
+    OUTERSHELL_HOME="$outershell_home" "$outershelld_path" --migrate-user-state-only >> "$log_path" 2>&1
 
     unload_outer_shell
     rm -f "$socket_path" "$api_socket_path"
@@ -502,7 +525,7 @@ EOF
         sleep 0.1
         attempts=$((attempts - 1))
     done
-    OUTERSHELL_HOME="$outershell_home" "$outerctl_path" backend upsert --backend "$service_id" --name "$display_name" --launchd-plist "$plist_path" --owns-plist true
+    OUTERSHELL_HOME="$outershell_home" "$outerctl_path" backend upsert --backend "$service_id" --name "$display_name" --launchd-plist "$plist_path" --outershell-owns true
     OUTERSHELL_HOME="$outershell_home" "$outerctl_path" app clear --backend "$service_id"
     OUTERSHELL_HOME="$outershell_home" "$outerctl_path" app add --backend "$service_id" --socket-path "$socket_path" --name "$display_name" --url "/" --icon-path "$icon_path"
     append_outerloop_http_unix_allowlist_entry user "$socket_path"
@@ -517,6 +540,7 @@ EOF
     while [ "$attempts" -gt 0 ]; do
         if [ -S "$socket_path" ]; then
             printf '%s\n' "$socket_path"
+            install_completed=true
             exit 0
         fi
         sleep 0.1
@@ -627,6 +651,40 @@ refresh_root_binaries_match
 run_outerctl() {
     OUTERSHELL_HOME="$outershell_home" OUTERSHELLD_API_SOCKET="$api_socket_path" "$outerctl_path" "$@"
 }
+
+install_completed=false
+rollback_failed_linux_install() {
+    status=$?
+    if [ "$command" = "install" ] && [ "$install_completed" != true ]; then
+        printf 'Outer Shell install failed; rolling back partial install.\n' >&2
+        if [ -x "$outerctl_path" ]; then
+            run_outerctl app clear --backend org.outershell.OuterShell >/dev/null 2>&1 || true
+            run_outerctl log clear --backend org.outershell.OuterShell >/dev/null 2>&1 || true
+            run_outerctl systemd clear --backend org.outershell.OuterShell >/dev/null 2>&1 || true
+            run_outerctl backend remove --backend org.outershell.OuterShell >/dev/null 2>&1 || true
+        fi
+        if [ "$root_install" = true ]; then
+            systemctl --system disable org.outershell.OuterShell.socket >/dev/null 2>&1 || true
+            systemctl --system stop org.outershell.OuterShell.socket org.outershell.OuterShell.service >/dev/null 2>&1 || true
+            rm -f "$unit_dir/org.outershell.OuterShell.service" "$unit_dir/org.outershell.OuterShell.socket" "$socket_path"
+        else
+            systemctl --user disable org.outershell.OuterShell.socket outershelld.socket outershelld.service >/dev/null 2>&1 || true
+            systemctl --user stop org.outershell.OuterShell.socket outershelld.socket org.outershell.OuterShell.service outershelld.service >/dev/null 2>&1 || true
+            rm -f "$unit_dir/org.outershell.OuterShell.service" "$unit_dir/outershelld.service" "$unit_dir/outershelld.socket" "$unit_dir/org.outershell.OuterShell.socket" "$socket_path" "$api_socket_path"
+            rm -rf "$daemon_root"
+            rm -f "$outerctl_path"
+        fi
+        systemctl $systemctl_scope daemon-reload >/dev/null 2>&1 || true
+        rm -rf "$install_root"
+        rm -rf "$outer_shell_install_cache"
+        rmdir "$outer_shell_cache_root" "$outershell_cache_home" >/dev/null 2>&1 || true
+        if [ "$root_install" = false ]; then
+            rmdir "$outershell_home/bin" "$daemon_root" "$install_root" "$outershell_home" >/dev/null 2>&1 || true
+        fi
+    fi
+    exit "$status"
+}
+trap rollback_failed_linux_install EXIT
 
 cleanup_legacy_outeragent_user_units() {
     [ "$root_install" = false ] || return 0
@@ -930,6 +988,7 @@ rm -f "$payload_outerctl_path"
 printf '%s\n' "__OUTER_SHELL_VERSION__" > "$app_version_path"
 printf '%s\n' "__OUTER_SHELL_VERSION__" > "$daemon_version_path"
 touch "$log_path" "$broker_log_path"
+OUTERSHELL_HOME="$outershell_home" "$outershelld_path" --migrate-user-state-only >> "$broker_log_path" 2>&1
 
 outer_shell_exec="$(systemd_quote_arg "$install_root/OuterShellBackend") --socket-path $(systemd_quote_arg "$socket_path") --api-socket-path $(systemd_quote_arg "$api_socket_path") --bundles-dir $(systemd_quote_arg "$install_root/bundles") --bundled-apps-dir $(systemd_quote_arg "$install_root/bundled-apps") --app-base-url $(systemd_quote_arg "$app_base_url") --public-base-url $(systemd_quote_arg "$public_base_url")"
 
@@ -1028,6 +1087,7 @@ attempts=50
 while [ "$attempts" -gt 0 ]; do
     if [ -S "$socket_path" ]; then
         printf '%s\n' "$socket_path"
+        install_completed=true
         exit 0
     fi
     sleep 0.1

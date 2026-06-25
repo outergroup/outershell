@@ -12,12 +12,13 @@ calls them content types rather than UTIs.
 
 A content type record contains:
 
+- `service_id`: backend that owns the custom declaration; built-ins have no owner
 - `identifier`: normalized type identifier, for example `public.text`
 - `display_name`: label shown to people
-- `conforms_to`: comma-separated parent content type identifiers
-- `extensions`: comma-separated filename extensions without leading dots
-- `filenames`: comma-separated exact filenames, for example `Makefile`
-- `mime_types`: comma-separated MIME type hints
+- `conforms_to`: content type identifiers this type conforms to
+- `extensions`: filename extensions without leading dots
+- `filenames`: exact filenames, for example `Makefile`
+- `mime_types`: MIME type hints
 
 An opener says that a backend can open files whose inferred content type is the
 opener content type or conforms to it. For example, an opener registered for
@@ -31,11 +32,21 @@ An opener record contains:
 - `socket_path`: Unix socket endpoint for the backend/app
 - `url_template`: app URL template, defaulting to `?file={file}`
 - `rank`: non-negative integer used for ordering within a content type
+- `capabilities`: `view`, `edit`, or both
 
 `url_template` supports the `{file}` placeholder. When resolving an opener,
 `outershelld` percent-encodes the file path and substitutes it into the
 template. If a `socket_path` exists, the resolved URL is prefixed with that
 socket path and a separating `/` when needed.
+
+Capability flags are stored as a UInt32 bitmask:
+
+```text
+0x01 view
+0x02 edit
+```
+
+If capabilities are omitted, the opener is treated as both `view` and `edit`.
 
 ## Built-In Content Types
 
@@ -72,6 +83,7 @@ Custom content types are registered through `outerctl`:
 
 ```bash
 outerctl content-type add \
+  --backend org.outershell.Plaintext \
   --content-type org.outershell.example-source \
   --name 'Example Source' \
   --conforms-to public.text \
@@ -83,21 +95,24 @@ outerctl content-type add \
 Remove a custom content type:
 
 ```bash
-outerctl content-type remove --content-type org.outershell.example-source
+outerctl content-type remove --backend org.outershell.Plaintext --content-type org.outershell.example-source
 ```
 
-Remove all custom content type definitions from the user registry:
+Remove all custom content type definitions owned by a backend:
 
 ```bash
-outerctl content-type clear
+outerctl content-type clear --backend org.outershell.Plaintext
 ```
 
 Built-in content types are not stored in the registry and cannot be removed.
+Removing a backend clears custom content type definitions owned by that backend.
 
 ## Registering Openers
 
-Mutating opener operations use `outerctl` commands. The `outerctl` binary sends
-these commands to `outershelld` through the `outerctlInvoke` socket message.
+Mutating opener operations use `outerctl` commands. The `outerctl` binary parses
+the command line and sends dedicated structured messages such as
+`openerAddRequest`, `openerRemoveRequest`, and `openerClearRequest` to
+`outershelld`.
 
 Add or update an opener:
 
@@ -108,7 +123,8 @@ outerctl opener add \
   --socket-path "$XDG_RUNTIME_DIR/org.outershell.Plaintext" \
   --name Plaintext \
   --url-template '?file={file}' \
-  --rank 0
+  --rank 0 \
+  --capabilities view,edit
 ```
 
 Remove one opener for a backend and content type:
@@ -136,47 +152,52 @@ clean stale rows.
 ```bash
 outerctl opener list
 outerctl opener list --backend org.outershell.Plaintext
-outerctl opener list --content-type public.text --file /path/to/README
+outerctl opener list --content-type public.text
 ```
 
 Columns:
 
 ```text
-content_type  service_id  display_name  socket_path  url_template  rank  url
+content_type  service_id  display_name  socket_path  url_template  rank  capabilities
 ```
 
-The `url` column is only populated when `--file` is provided.
+This is a registry listing command. `--content-type` matches the opener's
+registered content type exactly after normalization. It does not infer a file's
+type and does not expand conformed-to content types.
 
 ## Typed Socket Query
 
-Read-only opener lookup uses the typed `fileOpenersQuery` message on the
-`outershelld` API socket.
+Read-only file-to-opener lookup uses the typed `fileOpenersQuery` message on
+the `outershelld` API socket. Use this message when the caller has a file path
+and needs all apps that can open it.
 
 Default API socket:
 
 - macOS: `$OUTERSHELLD_API_SOCKET`, otherwise `$DARWIN_USER_TEMP_DIR/outershelld-api`, `$TMPDIR/outershelld-api`, or `/tmp/outershelld-api-<uid>`
 - Linux: `$OUTERSHELLD_API_SOCKET`, otherwise `$XDG_RUNTIME_DIR/outershelld-api` or `/run/user/<uid>/outershelld-api`
 
-Request message type: `3` (`OUTERSHELLD_API_FILE_OPENERS_QUERY`)
+Request message type: `31` (`OUTERSHELLD_API_FILE_OPENERS_QUERY`)
 
 ```text
-bytes 0..1:    UInt16 message type = 3
+bytes 0..1:    UInt16 message type = 31
 bytes 2..9:    StringRef32 file path
 bytes 10..17:  StringRef32 content type, optional
+bytes 18..25:  StringRef32 requester user, optional
 ```
 
 If `content type` is empty, `outershelld` infers content types from the file
 path. If a content type is provided, `outershelld` expands it through its
-`conforms_to` parents.
+`conforms_to` graph. If `requester user` is present, `outershelld` queries
+that user's registry before adding accessible system-registry openers.
 
-Response message type: `4` (`OUTERSHELLD_API_FILE_OPENERS_RESPONSE`)
+Response message type: `107` (`OUTERSHELLD_API_FILE_OPENERS_RESPONSE`)
 
 ```text
-bytes 0..1:    UInt16 message type = 4
+bytes 0..1:    UInt16 message type = 107
 bytes 2..5:    UInt32 status, 0 for success
 bytes 6..13:   StringRef32 error message
 bytes 14..17:  UInt32 opener row count
-bytes 18..:    opener rows, 40 bytes each
+bytes 18..:    opener rows, 44 bytes each
 
 Opener row:
 bytes 0..7:    StringRef32 content type
@@ -184,6 +205,7 @@ bytes 8..15:   StringRef32 service id
 bytes 16..23:  StringRef32 display name
 bytes 24..31:  StringRef32 socket path
 bytes 32..39:  StringRef32 resolved URL
+bytes 40..43:  UInt32 capability flags
 ```
 
 Lookup behavior:
@@ -191,7 +213,7 @@ Lookup behavior:
 - A path query infers matching content types from exact filename, extension,
   file magic, shebang, and text sniffing.
 - The inferred or explicit content types are expanded through `conforms_to`
-  parents.
+  conformance.
 - User-registry rows do not require a socket accessibility check.
 - System-registry rows are included only if the current user can read and write
   the registered Unix socket path and the path is a socket.
@@ -217,18 +239,25 @@ Files response header:
 bytes 0..3:    UInt32 magic
 bytes 4..7:    UInt32 version
 bytes 8..11:   UInt32 row count
-bytes 12..15:  UInt32 row size, currently 40
+bytes 12..15:  UInt32 row size, currently 52
 bytes 16..19:  UInt32 rows offset
 bytes 20..23:  UInt32 variable data offset
 bytes 24..27:  UInt32 total size
 bytes 28..31:  UInt32 reserved
 ```
 
-Each Files opener row is a six-field, 48-byte row. The first five fields match
+Each Files opener row is a seven-field, 52-byte row. The first six fields match
 the daemon socket response: content type, service id, display name, socket path,
-and resolved URL. The final field is the owner username resolved from the opener
-socket path. The Files frontend uses this owner name to disambiguate openers
-when the same app is installed in both user and root scopes.
+resolved URL, and capability flags. The final field is the owner username
+resolved from the opener socket path. The Files frontend uses this owner name
+to disambiguate openers when the same app is installed in both user and root
+scopes.
+
+For root-owned files, Files should apply root-instance routing only to openers
+with the `edit` capability. A viewer-only opener can remain connected to the
+user instance and should not be labeled with `(root)`. An editor-capable opener
+that resolves to a root/system instance can be labeled as `Edit in <app>
+(root)`.
 
 ## Normalization Rules
 
@@ -243,6 +272,11 @@ without leading dots. Matching is case-insensitive.
 
 Filename lists in content type definitions use comma-separated exact filenames.
 Matching is case-sensitive.
+
+On the socket API, these list-like content type fields are encoded as
+`StringListRef32` payloads, not comma-separated strings. The `outerctl`
+command-line interface accepts and prints comma-separated text as a human
+convenience.
 
 ## Storage
 
@@ -274,16 +308,21 @@ The binary `ORWA` file has six table descriptors:
 5: file openers
 ```
 
-Content type rows are 96 bytes:
+Content type rows are 112 bytes:
 
 ```text
-bytes 0..15:   StringRef64 identifier
-bytes 16..31:  StringRef64 display name
-bytes 32..47:  StringRef64 conforms_to
-bytes 48..63:  StringRef64 extensions
-bytes 64..79:  StringRef64 filenames
-bytes 80..95:  StringRef64 mime_types
+bytes 0..15:    StringRef64 service_id
+bytes 16..31:   StringRef64 identifier
+bytes 32..47:   StringRef64 display name
+bytes 48..63:   StringListRef64 conforms_to
+bytes 64..79:   StringListRef64 extensions
+bytes 80..95:   StringListRef64 filenames
+bytes 96..111:  StringListRef64 mime_types
 ```
+
+`StringListRef64` uses the same shape as `StringRef64`, but the second field is
+an item count instead of a byte length. The referenced payload is that many
+consecutive `StringRef64` entries.
 
 File opener rows are 88 bytes:
 
@@ -294,7 +333,7 @@ bytes 32..47:  StringRef64 display name
 bytes 48..63:  StringRef64 socket path
 bytes 64..79:  StringRef64 url template
 bytes 80..83:  UInt32 rank
-bytes 84..87:  padding
+bytes 84..87:  UInt32 capability flags
 ```
 
 The binary writer keeps strings in a shared variable region and stores string
@@ -303,7 +342,6 @@ updates the in-memory `RegistryStore`, then rewrites the `ORWA` file on commit.
 
 ## Current Gaps
 
-- There is no typed mutating socket API for content type or opener changes;
-  mutations still go through the `outerctlInvoke` argv wrapper.
-- The public typed query returns resolved URLs but not `rank` or `url_template`.
+- The public typed opener query returns resolved URLs and capabilities but not
+  `rank` or `url_template`.
 - Ordering is whatever the current registry file order produces.

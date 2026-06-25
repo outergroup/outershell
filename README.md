@@ -41,9 +41,9 @@ API_SOCKET="$(getconf DARWIN_USER_TEMP_DIR)outershelld-api"
 ```
 
 By default `outershelld` opens an `outerctl` API socket at
-`${OUTERSHELLD_API_SOCKET}`, `$XDG_RUNTIME_DIR/outershelld-api`, or a
-platform-specific per-user temporary path. Use `--api-socket-path` to override
-it.
+`${OUTERSHELLD_API_SOCKET}`, `$XDG_RUNTIME_DIR/outershelld-api`, a
+platform-specific per-user temporary path, or `/var/run/outershelld-api` for
+the macOS root daemon. Use `--api-socket-path` to override it.
 
 Open this URL in Outer Loop or Outerframe:
 

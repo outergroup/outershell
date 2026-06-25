@@ -34,7 +34,8 @@ Registry overrides:
 API socket:
 
 - `OUTERSHELLD_API_SOCKET` overrides the API socket path.
-- macOS default: `<user-runtime>/outershelld-api`
+- macOS user default: `<user-runtime>/outershelld-api`
+- macOS root default: `/var/run/outershelld-api`
 - Linux user default: `<user-runtime>/outershelld-api`
 - Linux direct-root default: `/run/outershelld-api`
 
@@ -129,6 +130,8 @@ macOS root app installs promote the same `outershelld` and `outerctl` tools into
 
 - `<system-state>/outershelld/outershelld`
 - `<system-state>/bin/outerctl`
+- `/Library/LaunchDaemons/org.outershell.outershelld.plist`
+- `/var/run/outershelld-api`
 - `<user-state>/outershelld/outershelld -> <system-state>/outershelld/outershelld`
 - `<user-state>/bin/outerctl -> <system-state>/bin/outerctl`
 - `/usr/local/libexec/outershelld-root-tool -> <system-state>/outershelld/outershelld`

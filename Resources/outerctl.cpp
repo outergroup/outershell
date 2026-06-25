@@ -12,7 +12,10 @@
 
 namespace {
 
-constexpr uint32_t kOuterctlApiMaxFrameLength = 65536;
+constexpr uint32_t kOuterctlApiMaxFrameLength = 16u * 1024u * 1024u;
+constexpr uint32_t kOpenerCapabilityView = 0x01;
+constexpr uint32_t kOpenerCapabilityEdit = 0x02;
+constexpr uint32_t kOpenerCapabilityDefault = kOpenerCapabilityView | kOpenerCapabilityEdit;
 
 struct Buffer {
     char *data = nullptr;
@@ -70,14 +73,6 @@ bool assignCString(Buffer &buffer, const char *value) {
     buffer.size = 0;
     if (buffer.data) buffer.data[0] = '\0';
     return appendCString(buffer, value);
-}
-
-bool appendPathComponent(Buffer &path, const char *component) {
-    if (!component || !component[0]) return true;
-    if (path.size > 0 && path.data[path.size - 1] != '/') {
-        if (!appendCString(path, "/")) return false;
-    }
-    return appendCString(path, component);
 }
 
 bool setErrnoError(Buffer &errorMessage, const char *prefix) {
@@ -138,6 +133,72 @@ bool appendOuterctlApiStringRef(Buffer &message, size_t refOffset, const char *v
         writeBufferLittleEndianUInt32At(message, refOffset + 4, static_cast<uint32_t>(length));
 }
 
+bool appendOuterctlApiStringRefBytes(Buffer &message, size_t refOffset, const char *value, size_t length) {
+    if (message.size > UINT32_MAX || length > UINT32_MAX) return false;
+    const uint32_t offset = static_cast<uint32_t>(message.size);
+    return appendBuffer(message, value ? value : "", length) &&
+        writeBufferLittleEndianUInt32At(message, refOffset, offset) &&
+        writeBufferLittleEndianUInt32At(message, refOffset + 4, static_cast<uint32_t>(length));
+}
+
+bool isAsciiSpace(char c) {
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v';
+}
+
+bool nextCsvToken(const char *&cursor, const char *&data, size_t &size) {
+    if (!cursor) return false;
+    while (*cursor) {
+        while (*cursor == ',' || isAsciiSpace(*cursor)) cursor += 1;
+        if (!*cursor) return false;
+        const char *start = cursor;
+        const char *end = cursor;
+        while (*end && *end != ',') end += 1;
+        const char *trimEnd = end;
+        while (trimEnd > start && isAsciiSpace(trimEnd[-1])) trimEnd -= 1;
+        cursor = end;
+        if (*cursor == ',') cursor += 1;
+        if (trimEnd > start) {
+            data = start;
+            size = static_cast<size_t>(trimEnd - start);
+            return true;
+        }
+    }
+    return false;
+}
+
+size_t countCsvTokens(const char *csv) {
+    const char *cursor = csv ? csv : "";
+    const char *data = "";
+    size_t size = 0;
+    size_t count = 0;
+    while (nextCsvToken(cursor, data, size)) count += 1;
+    return count;
+}
+
+bool appendOuterctlApiStringListRef(Buffer &message, size_t refOffset, const char *csv) {
+    const size_t count = countCsvTokens(csv);
+    if (count == 0) {
+        return writeBufferLittleEndianUInt32At(message, refOffset, 0) &&
+            writeBufferLittleEndianUInt32At(message, refOffset + 4, 0);
+    }
+    if (count > UINT32_MAX || count > SIZE_MAX / 8 || message.size > UINT32_MAX) return false;
+    const size_t listOffset = message.size;
+    if (!writeBufferLittleEndianUInt32At(message, refOffset, static_cast<uint32_t>(listOffset)) ||
+        !writeBufferLittleEndianUInt32At(message, refOffset + 4, static_cast<uint32_t>(count)) ||
+        !appendZeroBytes(message, count * 8)) {
+        return false;
+    }
+    const char *cursor = csv ? csv : "";
+    const char *data = "";
+    size_t size = 0;
+    size_t index = 0;
+    while (nextCsvToken(cursor, data, size)) {
+        if (!appendOuterctlApiStringRefBytes(message, listOffset + index * 8, data, size)) return false;
+        index += 1;
+    }
+    return index == count;
+}
+
 bool readExact(int fd, void *data, size_t size) {
     char *bytes = static_cast<char *>(data);
     while (size > 0) {
@@ -178,6 +239,97 @@ bool readOuterctlApiStringRef(const Buffer &message, size_t refOffset, Buffer &o
     return appendBuffer(out, message.data + offset, length);
 }
 
+bool readOuterctlApiStringRefView(const Buffer &message, size_t refOffset, const char *&data, size_t &size) {
+    if (refOffset + 8 > message.size) return false;
+    const uint8_t *bytes = reinterpret_cast<const uint8_t *>(message.data);
+    const uint32_t offset = readLittleEndianUInt32(bytes + refOffset);
+    const uint32_t length = readLittleEndianUInt32(bytes + refOffset + 4);
+    if (offset > message.size || length > message.size - offset) return false;
+    data = message.data + offset;
+    size = length;
+    return true;
+}
+
+bool writeTsvField(const char *data, size_t size) {
+    for (size_t i = 0; i < size; i += 1) {
+        const unsigned char c = static_cast<unsigned char>(data[i]);
+        if (c == '\t') {
+            if (fputs("\\t", stdout) < 0) return false;
+        } else if (c == '\n') {
+            if (fputs("\\n", stdout) < 0) return false;
+        } else if (c == '\r') {
+            if (fputs("\\r", stdout) < 0) return false;
+        } else if (c == '\\') {
+            if (fputs("\\\\", stdout) < 0) return false;
+        } else if (fputc(c, stdout) == EOF) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool writeTsvString(const char *value) {
+    const char *safeValue = value ? value : "";
+    return writeTsvField(safeValue, strlen(safeValue));
+}
+
+bool writeOpenerCapabilities(uint32_t capabilities) {
+    bool wrote = false;
+    if (capabilities & kOpenerCapabilityView) {
+        if (!writeTsvString("view")) return false;
+        wrote = true;
+    }
+    if (capabilities & kOpenerCapabilityEdit) {
+        if (wrote && fputc(',', stdout) == EOF) return false;
+        if (!writeTsvString("edit")) return false;
+        wrote = true;
+    }
+    return wrote || writeTsvString("");
+}
+
+bool writeTsvHeaders(const char *const *headers, size_t count) {
+    for (size_t i = 0; i < count; i += 1) {
+        if (i > 0 && fputc('\t', stdout) == EOF) return false;
+        if (!writeTsvString(headers[i])) return false;
+    }
+    return fputc('\n', stdout) != EOF;
+}
+
+bool writeTsvRef(const Buffer &message, size_t refOffset) {
+    const char *data = "";
+    size_t size = 0;
+    return readOuterctlApiStringRefView(message, refOffset, data, size) &&
+        writeTsvField(data, size);
+}
+
+bool writeTsvStringListRef(const Buffer &message, size_t refOffset) {
+    if (refOffset + 8 > message.size) return false;
+    const uint8_t *bytes = reinterpret_cast<const uint8_t *>(message.data);
+    const uint32_t listOffset = readLittleEndianUInt32(bytes + refOffset);
+    const uint32_t count = readLittleEndianUInt32(bytes + refOffset + 4);
+    if (count == 0) return true;
+    if (listOffset == 0 || listOffset > message.size) return false;
+    if (count > (message.size - listOffset) / 8) return false;
+    for (uint32_t i = 0; i < count; i += 1) {
+        if (i > 0 && fputc(',', stdout) == EOF) return false;
+        if (!writeTsvRef(message, listOffset + static_cast<size_t>(i) * 8)) return false;
+    }
+    return true;
+}
+
+bool writeTsvRefs(const Buffer &message, size_t rowOffset, const size_t *refs, size_t count) {
+    for (size_t i = 0; i < count; i += 1) {
+        if (i > 0 && fputc('\t', stdout) == EOF) return false;
+        if (!writeTsvRef(message, rowOffset + refs[i])) return false;
+    }
+    return true;
+}
+
+bool writeTsvRefRow(const Buffer &message, size_t rowOffset, const size_t *refs, size_t count) {
+    return writeTsvRefs(message, rowOffset, refs, count) &&
+        fputc('\n', stdout) != EOF;
+}
+
 void defaultOuterctlApiSocketPath(char *out, size_t outSize) {
     const char *envPath = getenv("OUTERSHELLD_API_SOCKET");
     if (envPath && envPath[0]) {
@@ -185,6 +337,10 @@ void defaultOuterctlApiSocketPath(char *out, size_t outSize) {
         return;
     }
 #if defined(__APPLE__)
+    if (geteuid() == 0) {
+        snprintf(out, outSize, "/var/run/outershelld-api");
+        return;
+    }
     const char *tmp = getenv("DARWIN_USER_TEMP_DIR");
     if (!tmp || !tmp[0]) tmp = getenv("TMPDIR");
     if (tmp && tmp[0]) {
@@ -206,40 +362,561 @@ void defaultOuterctlApiSocketPath(char *out, size_t outSize) {
 #endif
 }
 
-bool outerShellHome(Buffer &path) {
-    const char *override = getenv("OUTERSHELL_HOME");
-    if (override && override[0]) return appendCString(path, override);
+enum : uint16_t {
+    kMessageBackendUpsertRequest = 10,
+    kMessageBackendRemoveRequest = 11,
+    kMessageBackendListRequest = 12,
+    kMessageAppAddRequest = 13,
+    kMessageAppRemoveRequest = 14,
+    kMessageAppClearRequest = 15,
+    kMessageAppListRequest = 16,
+    kMessageLogAddRequest = 17,
+    kMessageLogRemoveRequest = 18,
+    kMessageLogClearRequest = 19,
+    kMessageLogListRequest = 20,
+    kMessageServiceManagerClearRequest = 21,
+    kMessageServiceManagerListRequest = 22,
+    kMessageContentTypeAddRequest = 23,
+    kMessageContentTypeRemoveRequest = 24,
+    kMessageContentTypeClearRequest = 25,
+    kMessageContentTypeListRequest = 26,
+    kMessageOpenerAddRequest = 27,
+    kMessageOpenerRemoveRequest = 28,
+    kMessageOpenerClearRequest = 29,
+    kMessageOpenerListRequest = 30,
+    kMessageCommandResponse = 100,
+    kMessageBackendListResponse = 101,
+    kMessageAppListResponse = 102,
+    kMessageLogListResponse = 103,
+    kMessageServiceManagerListResponse = 104,
+    kMessageContentTypeListResponse = 105,
+    kMessageOpenerListResponse = 106
+};
+
+enum : uint16_t {
+    kFlagOwnsServiceManagerEntry = 0x01,
+    kFlagIncludeIcons = 0x02
+};
+
+struct CommandRequest {
+    uint16_t messageType = 0;
+    uint16_t flags = 0;
+    uint32_t port = 0;
+    uint32_t rank = 0;
+    uint32_t openerCapabilities = kOpenerCapabilityDefault;
+    bool hasServiceManagerPath = false;
+    const char *backend = "";
+    const char *displayName = "";
+    const char *serviceManagerPath = "";
+    const char *logPath = "";
+    const char *url = "";
+    const char *frontendId = "";
+    const char *iconPath = "";
+    const char *frontendList = "";
+    const char *socketPath = "";
+    const char *contentType = "";
+    const char *conformsTo = "";
+    const char *extensions = "";
+    const char *filenames = "";
+    const char *mimeTypes = "";
+    const char *urlTemplate = "";
+};
+
+bool parseUInt32(const char *raw, uint32_t maxValue, uint32_t &out) {
+    if (!raw || !raw[0]) return false;
+    char *end = nullptr;
+    unsigned long value = strtoul(raw, &end, 10);
+    if (!end || *end != '\0' || value > maxValue) return false;
+    out = static_cast<uint32_t>(value);
+    return true;
+}
+
+bool truthy(const char *raw) {
+    return raw && (strcmp(raw, "true") == 0 || strcmp(raw, "1") == 0 || strcmp(raw, "yes") == 0);
+}
+
+bool parseOpenerCapabilities(const char *raw, uint32_t &out) {
+    if (!raw || !raw[0]) return false;
+    uint32_t flags = 0;
+    const char *cursor = raw;
+    while (*cursor) {
+        const char *comma = strchr(cursor, ',');
+        size_t length = comma ? static_cast<size_t>(comma - cursor) : strlen(cursor);
+        if (length == 4 && strncmp(cursor, "view", length) == 0) {
+            flags |= kOpenerCapabilityView;
+        } else if (length == 6 && strncmp(cursor, "viewer", length) == 0) {
+            flags |= kOpenerCapabilityView;
+        } else if (length == 4 && strncmp(cursor, "edit", length) == 0) {
+            flags |= kOpenerCapabilityEdit;
+        } else if (length == 6 && strncmp(cursor, "editor", length) == 0) {
+            flags |= kOpenerCapabilityEdit;
+        } else {
+            return false;
+        }
+        if (!comma) break;
+        cursor = comma + 1;
+        if (!*cursor) return false;
+    }
+    if ((flags & kOpenerCapabilityDefault) == 0) return false;
+    out = flags;
+    return true;
+}
+
+bool mapCommand(const char *resource, const char *action, uint16_t &messageType) {
+    if (strcmp(resource, "backend") == 0) {
+        if (strcmp(action, "upsert") == 0) messageType = kMessageBackendUpsertRequest;
+        else if (strcmp(action, "remove") == 0) messageType = kMessageBackendRemoveRequest;
+        else if (strcmp(action, "list") == 0) messageType = kMessageBackendListRequest;
+        else return false;
+    } else if (strcmp(resource, "app") == 0) {
+        if (strcmp(action, "add") == 0) messageType = kMessageAppAddRequest;
+        else if (strcmp(action, "remove") == 0) messageType = kMessageAppRemoveRequest;
+        else if (strcmp(action, "clear") == 0) messageType = kMessageAppClearRequest;
+        else if (strcmp(action, "list") == 0) messageType = kMessageAppListRequest;
+        else return false;
+    } else if (strcmp(resource, "log") == 0) {
+        if (strcmp(action, "add") == 0) messageType = kMessageLogAddRequest;
+        else if (strcmp(action, "remove") == 0) messageType = kMessageLogRemoveRequest;
+        else if (strcmp(action, "clear") == 0) messageType = kMessageLogClearRequest;
+        else if (strcmp(action, "list") == 0) messageType = kMessageLogListRequest;
+        else return false;
+    } else if (strcmp(resource, "systemd") == 0) {
+        if (strcmp(action, "clear") == 0) messageType = kMessageServiceManagerClearRequest;
+        else if (strcmp(action, "list") == 0) messageType = kMessageServiceManagerListRequest;
+        else return false;
+    } else if (strcmp(resource, "launchd") == 0) {
+        if (strcmp(action, "clear") == 0) messageType = kMessageServiceManagerClearRequest;
+        else if (strcmp(action, "list") == 0) messageType = kMessageServiceManagerListRequest;
+        else return false;
+    } else if (strcmp(resource, "content-type") == 0 || strcmp(resource, "type") == 0) {
+        if (strcmp(action, "add") == 0) messageType = kMessageContentTypeAddRequest;
+        else if (strcmp(action, "remove") == 0) messageType = kMessageContentTypeRemoveRequest;
+        else if (strcmp(action, "clear") == 0) messageType = kMessageContentTypeClearRequest;
+        else if (strcmp(action, "list") == 0) messageType = kMessageContentTypeListRequest;
+        else return false;
+    } else if (strcmp(resource, "opener") == 0) {
+        if (strcmp(action, "add") == 0) messageType = kMessageOpenerAddRequest;
+        else if (strcmp(action, "remove") == 0) messageType = kMessageOpenerRemoveRequest;
+        else if (strcmp(action, "clear") == 0) messageType = kMessageOpenerClearRequest;
+        else if (strcmp(action, "list") == 0) messageType = kMessageOpenerListRequest;
+        else return false;
+    } else {
+        return false;
+    }
+    return true;
+}
+
+bool parseCommandRequest(int argc, char *argv[], CommandRequest &request, Buffer &errorMessage) {
+    if (argc < 3) {
+        assignCString(errorMessage, "Usage: outerctl <resource> <action> [options]");
+        return false;
+    }
+    if (!mapCommand(argv[1], argv[2], request.messageType)) {
+        assignCString(errorMessage, "Unknown outerctl command.");
+        return false;
+    }
+
+    for (int i = 3; i < argc; i += 1) {
+        const char *arg = argv[i];
+#define REQUIRE_VALUE(name, target) do { \
+            if (i + 1 >= argc) { \
+                assignCString(errorMessage, "Missing value for " name); \
+                return false; \
+            } \
+            target = argv[++i]; \
+        } while (0)
+        if (strcmp(arg, "--backend") == 0) {
+            REQUIRE_VALUE("--backend", request.backend);
+        } else if (strcmp(arg, "--name") == 0) {
+            REQUIRE_VALUE("--name", request.displayName);
+        } else if (strcmp(arg, "--plist") == 0 || strcmp(arg, "--launchd-plist") == 0) {
+            if (request.hasServiceManagerPath) {
+                assignCString(errorMessage, "Specify only one service-manager value.");
+                return false;
+            }
+            REQUIRE_VALUE("--plist", request.serviceManagerPath);
+            request.hasServiceManagerPath = true;
+        } else if (strcmp(arg, "--unit") == 0 || strcmp(arg, "--systemd-unit") == 0) {
+            if (request.hasServiceManagerPath) {
+                assignCString(errorMessage, "Specify only one service-manager value.");
+                return false;
+            }
+            REQUIRE_VALUE("--unit", request.serviceManagerPath);
+            request.hasServiceManagerPath = true;
+        } else if (strcmp(arg, "--path") == 0) {
+            REQUIRE_VALUE("--path", request.logPath);
+        } else if (strcmp(arg, "--url") == 0) {
+            REQUIRE_VALUE("--url", request.url);
+        } else if (strcmp(arg, "--frontend-id") == 0 || strcmp(arg, "--id") == 0) {
+            REQUIRE_VALUE("--frontend-id", request.frontendId);
+        } else if (strcmp(arg, "--icon-path") == 0 || strcmp(arg, "--icon-file") == 0) {
+            REQUIRE_VALUE("--icon-path", request.iconPath);
+        } else if (strcmp(arg, "--list") == 0) {
+            REQUIRE_VALUE("--list", request.frontendList);
+        } else if (strcmp(arg, "--socket-path") == 0) {
+            REQUIRE_VALUE("--socket-path", request.socketPath);
+        } else if (strcmp(arg, "--content-type") == 0 || strcmp(arg, "--type") == 0) {
+            REQUIRE_VALUE("--content-type", request.contentType);
+        } else if (strcmp(arg, "--conforms-to") == 0) {
+            REQUIRE_VALUE("--conforms-to", request.conformsTo);
+        } else if (strcmp(arg, "--extensions") == 0) {
+            REQUIRE_VALUE("--extensions", request.extensions);
+        } else if (strcmp(arg, "--filenames") == 0) {
+            REQUIRE_VALUE("--filenames", request.filenames);
+        } else if (strcmp(arg, "--mime-types") == 0) {
+            REQUIRE_VALUE("--mime-types", request.mimeTypes);
+        } else if (strcmp(arg, "--url-template") == 0) {
+            REQUIRE_VALUE("--url-template", request.urlTemplate);
+        } else if (strcmp(arg, "--capabilities") == 0) {
+            const char *rawCapabilities = nullptr;
+            REQUIRE_VALUE("--capabilities", rawCapabilities);
+            if (!parseOpenerCapabilities(rawCapabilities, request.openerCapabilities)) {
+                assignCString(errorMessage, "Invalid opener capabilities.");
+                return false;
+            }
+        } else if (strcmp(arg, "--port") == 0) {
+            const char *rawPort = nullptr;
+            REQUIRE_VALUE("--port", rawPort);
+            uint32_t port = 0;
+            if (!parseUInt32(rawPort, 65535, port) || port == 0) {
+                assignCString(errorMessage, "Invalid port.");
+                return false;
+            }
+            request.port = port;
+        } else if (strcmp(arg, "--rank") == 0) {
+            const char *rawRank = nullptr;
+            REQUIRE_VALUE("--rank", rawRank);
+            uint32_t rank = 0;
+            if (!parseUInt32(rawRank, INT32_MAX, rank)) {
+                assignCString(errorMessage, "Invalid rank.");
+                return false;
+            }
+            request.rank = rank;
+        } else if (strcmp(arg, "--outershell-owns") == 0) {
+            const char *raw = nullptr;
+            REQUIRE_VALUE("--outershell-owns", raw);
+            if (truthy(raw)) request.flags |= kFlagOwnsServiceManagerEntry;
+        } else if (strcmp(arg, "--icons") == 0) {
+            request.flags |= kFlagIncludeIcons;
+        } else {
+            errorMessage.size = 0;
+            if (errorMessage.data) errorMessage.data[0] = '\0';
+            appendCString(errorMessage, "Unknown argument: ");
+            appendCString(errorMessage, arg);
+            return false;
+        }
+#undef REQUIRE_VALUE
+    }
+    return true;
+}
+
+bool appendStringRefs(Buffer &message, const char *const *values, size_t count) {
+    const size_t refsOffset = message.size;
+    if (!appendZeroBytes(message, count * 8)) return false;
+    for (size_t i = 0; i < count; i += 1) {
+        if (!appendOuterctlApiStringRef(message, refsOffset + i * 8, values[i])) return false;
+    }
+    return true;
+}
+
+bool appendCommandRequestMessage(Buffer &message, const CommandRequest &request) {
+    bool ok = appendLittleEndianUInt16(message, request.messageType);
+    switch (request.messageType) {
+    case kMessageBackendUpsertRequest: {
+        const char *values[] = {request.backend, request.displayName, request.serviceManagerPath};
+        ok = ok && appendLittleEndianUInt16(message, request.flags) && appendStringRefs(message, values, 3);
+        break;
+    }
+    case kMessageBackendRemoveRequest:
+    case kMessageBackendListRequest:
+    case kMessageAppClearRequest:
+    case kMessageAppListRequest:
+    case kMessageLogClearRequest:
+    case kMessageLogListRequest:
+    case kMessageServiceManagerClearRequest:
+    case kMessageServiceManagerListRequest: {
+        const char *values[] = {request.backend};
+        ok = ok && appendStringRefs(message, values, 1);
+        break;
+    }
+    case kMessageAppAddRequest: {
+        const char *values[] = {request.backend, request.displayName, request.url, request.frontendId, request.iconPath, request.frontendList, request.socketPath};
+        ok = ok && appendLittleEndianUInt32(message, request.port) && appendStringRefs(message, values, 7);
+        break;
+    }
+    case kMessageAppRemoveRequest: {
+        const char *values[] = {request.backend, request.frontendId, request.socketPath};
+        ok = ok && appendLittleEndianUInt32(message, request.port) && appendStringRefs(message, values, 3);
+        break;
+    }
+    case kMessageLogAddRequest:
+    case kMessageLogRemoveRequest: {
+        const char *values[] = {request.backend, request.logPath};
+        ok = ok && appendStringRefs(message, values, 2);
+        break;
+    }
+    case kMessageContentTypeAddRequest: {
+        const size_t fieldsOffset = message.size;
+        ok = ok &&
+            appendZeroBytes(message, 56) &&
+            appendOuterctlApiStringRef(message, fieldsOffset, request.backend) &&
+            appendOuterctlApiStringRef(message, fieldsOffset + 8, request.contentType) &&
+            appendOuterctlApiStringRef(message, fieldsOffset + 16, request.displayName) &&
+            appendOuterctlApiStringListRef(message, fieldsOffset + 24, request.conformsTo) &&
+            appendOuterctlApiStringListRef(message, fieldsOffset + 32, request.extensions) &&
+            appendOuterctlApiStringListRef(message, fieldsOffset + 40, request.filenames) &&
+            appendOuterctlApiStringListRef(message, fieldsOffset + 48, request.mimeTypes);
+        break;
+    }
+    case kMessageContentTypeRemoveRequest:
+    case kMessageContentTypeListRequest: {
+        const char *values[] = {request.backend, request.contentType};
+        ok = ok && appendStringRefs(message, values, 2);
+        break;
+    }
+    case kMessageContentTypeClearRequest: {
+        const char *values[] = {request.backend};
+        ok = ok && appendStringRefs(message, values, 1);
+        break;
+    }
+    case kMessageOpenerAddRequest: {
+        const char *values[] = {request.backend, request.contentType, request.displayName, request.socketPath, request.urlTemplate};
+        ok = ok &&
+            appendLittleEndianUInt32(message, request.rank) &&
+            appendLittleEndianUInt32(message, request.openerCapabilities) &&
+            appendStringRefs(message, values, 5);
+        break;
+    }
+    case kMessageOpenerRemoveRequest: {
+        const char *values[] = {request.backend, request.contentType};
+        ok = ok && appendStringRefs(message, values, 2);
+        break;
+    }
+    case kMessageOpenerClearRequest: {
+        const char *values[] = {request.backend};
+        ok = ok && appendStringRefs(message, values, 1);
+        break;
+    }
+    case kMessageOpenerListRequest: {
+        const char *values[] = {request.backend, request.contentType};
+        ok = ok && appendStringRefs(message, values, 2);
+        break;
+    }
+    default:
+        ok = false;
+        break;
+    }
+    return ok;
+}
+
+uint16_t listResponseTypeForRequest(uint16_t messageType) {
+    switch (messageType) {
+    case kMessageBackendListRequest:
+        return kMessageBackendListResponse;
+    case kMessageAppListRequest:
+        return kMessageAppListResponse;
+    case kMessageLogListRequest:
+        return kMessageLogListResponse;
+    case kMessageServiceManagerListRequest:
+        return kMessageServiceManagerListResponse;
+    case kMessageContentTypeListRequest:
+        return kMessageContentTypeListResponse;
+    case kMessageOpenerListRequest:
+        return kMessageOpenerListResponse;
+    default:
+        return 0;
+    }
+}
+
+bool writeRegistryListResponse(const CommandRequest &request, const Buffer &response, int &exitStatus, Buffer &errorMessage) {
+    if (response.size < 22) {
+        assignCString(errorMessage, "outershelld API list response frame is invalid.");
+        return false;
+    }
+    const uint8_t *bytes = reinterpret_cast<const uint8_t *>(response.data);
+    const uint16_t responseType = readLittleEndianUInt16(bytes);
+    const uint16_t expectedResponseType = listResponseTypeForRequest(request.messageType);
+    if (responseType != expectedResponseType) {
+        assignCString(errorMessage, "outershelld API list response type is invalid.");
+        return false;
+    }
+
+    exitStatus = static_cast<int>(readLittleEndianUInt32(bytes + 2));
+    Buffer errorBuffer;
+    bool ok = readOuterctlApiStringRef(response, 6, errorBuffer);
+    const uint32_t rowCount = readLittleEndianUInt32(bytes + 14);
+    const uint32_t responseRowSize = readLittleEndianUInt32(bytes + 18);
+    if (!ok) {
+        freeBuffer(errorBuffer);
+        assignCString(errorMessage, "outershelld API list response payload is invalid.");
+        return false;
+    }
+    if (exitStatus != 0) {
+        if (errorBuffer.size > 0) fwrite(errorBuffer.data, 1, errorBuffer.size, stderr);
+        if (errorBuffer.size == 0 || errorBuffer.data[errorBuffer.size - 1] != '\n') fputc('\n', stderr);
+        freeBuffer(errorBuffer);
+        return true;
+    }
+    freeBuffer(errorBuffer);
+
+    const char *backendHeaders[] = {"service_id", "display_name", "unit_name", "unit_path", "owns_unit"};
+    const char *appHeaders[] = {"frontend_id", "url", "service_id", "display_name", "port", "socket_path", "icon_path", "list"};
+    const char *logHeaders[] = {"path", "service_id"};
 #if defined(__APPLE__)
-    if (geteuid() == 0) {
-        return appendCString(path, "/Library/Application Support/outershell");
-    }
-    const char *home = getenv("HOME");
-    return home && home[0] &&
-        appendCString(path, home) &&
-        appendPathComponent(path, "Library/Application Support/outershell");
+    const char *serviceManagerHeaders[] = {"service_id", "plist_path", "owns_plist"};
 #else
-    if (geteuid() == 0) {
-        return appendCString(path, "/var/lib/outershell");
-    }
-    const char *stateHome = getenv("XDG_STATE_HOME");
-    if (stateHome && stateHome[0]) {
-        return appendCString(path, stateHome) && appendPathComponent(path, "outershell");
-    }
-    const char *home = getenv("HOME");
-    return home && home[0] &&
-        appendCString(path, home) &&
-        appendPathComponent(path, ".local/state/outershell");
+    const char *serviceManagerHeaders[] = {"service_id", "unit_name"};
 #endif
+    const char *contentTypeHeaders[] = {"service_id", "identifier", "display_name", "conforms_to", "extensions", "filenames", "mime_types"};
+    const char *openerHeaders[] = {"content_type", "service_id", "display_name", "socket_path", "url_template", "rank", "capabilities"};
+
+    size_t minimumRowSize = 0;
+    size_t rowBase = 22;
+    switch (responseType) {
+    case kMessageBackendListResponse:
+        minimumRowSize = 36;
+        if (responseRowSize < minimumRowSize) {
+            ok = false;
+            break;
+        }
+        ok = writeTsvHeaders(backendHeaders, sizeof(backendHeaders) / sizeof(backendHeaders[0]));
+        for (uint32_t row = 0; ok && row < rowCount; row += 1) {
+            const size_t offset = rowBase + static_cast<size_t>(row) * responseRowSize;
+            if (offset + minimumRowSize > response.size) {
+                ok = false;
+                break;
+            }
+            const size_t refs[] = {4, 12, 20, 28};
+            ok = writeTsvRefs(response, offset, refs, sizeof(refs) / sizeof(refs[0])) &&
+                fputc('\t', stdout) != EOF &&
+                writeTsvString(readLittleEndianUInt32(bytes + offset) ? "1" : "0") &&
+                fputc('\n', stdout) != EOF;
+        }
+        break;
+    case kMessageAppListResponse:
+        minimumRowSize = 60;
+        if (responseRowSize < minimumRowSize) {
+            ok = false;
+            break;
+        }
+        ok = writeTsvHeaders(appHeaders, sizeof(appHeaders) / sizeof(appHeaders[0]));
+        for (uint32_t row = 0; ok && row < rowCount; row += 1) {
+            const size_t offset = rowBase + static_cast<size_t>(row) * responseRowSize;
+            if (offset + minimumRowSize > response.size) {
+                ok = false;
+                break;
+            }
+            char portBuffer[32];
+            snprintf(portBuffer, sizeof(portBuffer), "%u", readLittleEndianUInt32(bytes + offset));
+            const size_t firstRefs[] = {4, 12, 20, 28};
+            const size_t lastRefs[] = {36, 44, 52};
+            ok = writeTsvRefs(response, offset, firstRefs, sizeof(firstRefs) / sizeof(firstRefs[0])) &&
+                fputc('\t', stdout) != EOF &&
+                writeTsvString(portBuffer);
+            for (size_t i = 0; ok && i < sizeof(lastRefs) / sizeof(lastRefs[0]); i += 1) {
+                ok = fputc('\t', stdout) != EOF && writeTsvRef(response, offset + lastRefs[i]);
+            }
+            if (ok) ok = fputc('\n', stdout) != EOF;
+        }
+        break;
+    case kMessageLogListResponse:
+        minimumRowSize = 16;
+        if (responseRowSize < minimumRowSize) {
+            ok = false;
+            break;
+        }
+        ok = writeTsvHeaders(logHeaders, sizeof(logHeaders) / sizeof(logHeaders[0]));
+        for (uint32_t row = 0; ok && row < rowCount; row += 1) {
+            const size_t offset = rowBase + static_cast<size_t>(row) * responseRowSize;
+            if (offset + minimumRowSize > response.size) {
+                ok = false;
+                break;
+            }
+            const size_t refs[] = {0, 8};
+            ok = writeTsvRefRow(response, offset, refs, sizeof(refs) / sizeof(refs[0]));
+        }
+        break;
+    case kMessageServiceManagerListResponse:
+        minimumRowSize = 20;
+        if (responseRowSize < minimumRowSize) {
+            ok = false;
+            break;
+        }
+        ok = writeTsvHeaders(serviceManagerHeaders, sizeof(serviceManagerHeaders) / sizeof(serviceManagerHeaders[0]));
+        for (uint32_t row = 0; ok && row < rowCount; row += 1) {
+            const size_t offset = rowBase + static_cast<size_t>(row) * responseRowSize;
+            if (offset + minimumRowSize > response.size) {
+                ok = false;
+                break;
+            }
+            const size_t refs[] = {4, 12};
+            ok = writeTsvRefs(response, offset, refs, sizeof(refs) / sizeof(refs[0]));
+#if defined(__APPLE__)
+            if (ok) {
+                ok = fputc('\t', stdout) != EOF &&
+                    writeTsvString(readLittleEndianUInt32(bytes + offset) ? "1" : "0") &&
+                    fputc('\n', stdout) != EOF;
+            }
+#else
+            if (ok) ok = fputc('\n', stdout) != EOF;
+#endif
+        }
+        break;
+    case kMessageContentTypeListResponse:
+        minimumRowSize = 56;
+        if (responseRowSize < minimumRowSize) {
+            ok = false;
+            break;
+        }
+        ok = writeTsvHeaders(contentTypeHeaders, sizeof(contentTypeHeaders) / sizeof(contentTypeHeaders[0]));
+        for (uint32_t row = 0; ok && row < rowCount; row += 1) {
+            const size_t offset = rowBase + static_cast<size_t>(row) * responseRowSize;
+            if (offset + minimumRowSize > response.size) {
+                ok = false;
+                break;
+            }
+            const size_t refs[] = {0, 8, 16};
+            const size_t lists[] = {24, 32, 40, 48};
+            ok = writeTsvRefs(response, offset, refs, sizeof(refs) / sizeof(refs[0]));
+            for (size_t i = 0; ok && i < sizeof(lists) / sizeof(lists[0]); i += 1) {
+                ok = fputc('\t', stdout) != EOF && writeTsvStringListRef(response, offset + lists[i]);
+            }
+            if (ok) ok = fputc('\n', stdout) != EOF;
+        }
+        break;
+    case kMessageOpenerListResponse:
+        minimumRowSize = 48;
+        if (responseRowSize < minimumRowSize) {
+            ok = false;
+            break;
+        }
+        ok = writeTsvHeaders(openerHeaders, sizeof(openerHeaders) / sizeof(openerHeaders[0]));
+        for (uint32_t row = 0; ok && row < rowCount; row += 1) {
+            const size_t offset = rowBase + static_cast<size_t>(row) * responseRowSize;
+            if (offset + minimumRowSize > response.size) {
+                ok = false;
+                break;
+            }
+            char rankBuffer[32];
+            snprintf(rankBuffer, sizeof(rankBuffer), "%u", readLittleEndianUInt32(bytes + offset));
+            const size_t refs[] = {4, 12, 20, 28, 36};
+            ok = writeTsvRefs(response, offset, refs, sizeof(refs) / sizeof(refs[0])) &&
+                fputc('\t', stdout) != EOF &&
+                writeTsvString(rankBuffer) &&
+                fputc('\t', stdout) != EOF &&
+                writeOpenerCapabilities(readLittleEndianUInt32(bytes + offset + 44)) &&
+                fputc('\n', stdout) != EOF;
+        }
+        break;
+    default:
+        ok = false;
+        break;
+    }
+    if (!ok) assignCString(errorMessage, "outershelld API list response payload is invalid.");
+    return ok;
 }
 
-bool outerctlApiRegistryPath(Buffer &path) {
-    const char *registry = getenv("OUTERSHELL_REGISTRY");
-    if (!registry || !registry[0]) registry = getenv("BACKENDS_REGISTRY_DB");
-    if (registry && registry[0]) return appendCString(path, registry);
-    return outerShellHome(path) && appendPathComponent(path, "registry.orwa");
-}
-
-bool tryOuterctlApi(int argc, char *argv[], int &exitStatus, Buffer &errorMessage) {
+bool tryOuterctlApi(const CommandRequest &request, int &exitStatus, Buffer &errorMessage) {
     char socketPath[PATH_MAX];
     defaultOuterctlApiSocketPath(socketPath, sizeof(socketPath));
 
@@ -268,18 +945,7 @@ bool tryOuterctlApi(int argc, char *argv[], int &exitStatus, Buffer &errorMessag
     }
 
     Buffer message;
-    Buffer registryPath;
-    bool ok = appendLittleEndianUInt16(message, 1) &&
-        appendLittleEndianUInt32(message, static_cast<uint32_t>(argc)) &&
-        outerctlApiRegistryPath(registryPath);
-    const size_t registryRefOffset = message.size;
-    const size_t refsOffset = registryRefOffset + 8;
-    ok = ok && appendZeroBytes(message, 8 + static_cast<size_t>(argc) * 8);
-    ok = ok && appendOuterctlApiStringRef(message, registryRefOffset, registryPath.data ? registryPath.data : "");
-    for (int i = 0; ok && i < argc; i += 1) {
-        ok = appendOuterctlApiStringRef(message, refsOffset + static_cast<size_t>(i) * 8, argv[i]);
-    }
-    freeBuffer(registryPath);
+    bool ok = appendCommandRequestMessage(message, request);
     if (!ok || message.size > UINT32_MAX) {
         freeBuffer(message);
         close(fd);
@@ -305,7 +971,7 @@ bool tryOuterctlApi(int argc, char *argv[], int &exitStatus, Buffer &errorMessag
         return false;
     }
     const uint32_t responseLength = readLittleEndianUInt32(responseLengthBytes);
-    if (responseLength < 22 || responseLength > kOuterctlApiMaxFrameLength) {
+    if (responseLength < 18 || responseLength > kOuterctlApiMaxFrameLength) {
         close(fd);
         assignCString(errorMessage, "outershelld API response frame is invalid.");
         return false;
@@ -323,7 +989,14 @@ bool tryOuterctlApi(int argc, char *argv[], int &exitStatus, Buffer &errorMessag
     response.data[response.size] = '\0';
 
     const uint8_t *responseBytes = reinterpret_cast<const uint8_t *>(response.data);
-    if (readLittleEndianUInt16(responseBytes) != 2) {
+    const uint16_t responseType = readLittleEndianUInt16(responseBytes);
+    const uint16_t expectedListResponseType = listResponseTypeForRequest(request.messageType);
+    if (expectedListResponseType != 0) {
+        ok = writeRegistryListResponse(request, response, exitStatus, errorMessage);
+        freeBuffer(response);
+        return ok;
+    }
+    if (responseType != kMessageCommandResponse) {
         freeBuffer(response);
         assignCString(errorMessage, "outershelld API response type is invalid.");
         return false;
@@ -342,57 +1015,21 @@ bool tryOuterctlApi(int argc, char *argv[], int &exitStatus, Buffer &errorMessag
     return ok;
 }
 
-#if defined(__APPLE__)
-bool tryMacRootHelperFallback(int argc, char *argv[], Buffer &errorMessage) {
-    if (geteuid() != 0 || argc < 2) return false;
-
-    const char *helper = "/Library/Application Support/outershell/outershelld/outershelld";
-    if (access(helper, X_OK) != 0) {
-        return false;
-    }
-
-    const size_t helperArgc = static_cast<size_t>(argc) + 1;
-    char **helperArgv = static_cast<char **>(calloc(helperArgc + 1, sizeof(char *)));
-    if (!helperArgv) {
-        assignCString(errorMessage, "Out of memory while building root outerctl helper argv.");
-        return true;
-    }
-
-    helperArgv[0] = const_cast<char *>(helper);
-    helperArgv[1] = const_cast<char *>("--root-helper-outerctl");
-    for (int i = 1; i < argc; i += 1) {
-        helperArgv[i + 1] = argv[i];
-    }
-    helperArgv[helperArgc] = nullptr;
-
-    execv(helper, helperArgv);
-    free(helperArgv);
-    errorMessage.size = 0;
-    if (errorMessage.data) errorMessage.data[0] = '\0';
-    appendCString(errorMessage, "Failed to execute ");
-    appendCString(errorMessage, helper);
-    appendCString(errorMessage, ": ");
-    appendCString(errorMessage, strerror(errno));
-    return true;
-}
-#endif
-
 } // namespace
 
 int main(int argc, char *argv[]) {
     int apiExitStatus = 1;
     Buffer apiError;
-    if (tryOuterctlApi(argc, argv, apiExitStatus, apiError)) {
-        freeBuffer(apiError);
-        return apiExitStatus;
-    }
-#if defined(__APPLE__)
-    if (tryMacRootHelperFallback(argc, argv, apiError)) {
-        fprintf(stderr, "%s\n", apiError.data ? apiError.data : "Failed to call root outerctl helper.");
+    CommandRequest request;
+    if (!parseCommandRequest(argc, argv, request, apiError)) {
+        fprintf(stderr, "%s\n", apiError.data ? apiError.data : "Invalid outerctl command.");
         freeBuffer(apiError);
         return 1;
     }
-#endif
+    if (tryOuterctlApi(request, apiExitStatus, apiError)) {
+        freeBuffer(apiError);
+        return apiExitStatus;
+    }
     fprintf(stderr, "%s\n", apiError.data ? apiError.data : "Failed to call outershelld API.");
     freeBuffer(apiError);
     return 1;

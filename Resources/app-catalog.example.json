@@ -17,7 +17,9 @@
       "supportsRoot": true,
       "archives": {
         "linux-aarch64": "https://example.com/outer-shell/apps/Files/linux-aarch64.tar.gz",
-        "linux-x86_64": "https://example.com/outer-shell/apps/Files/linux-x86_64.tar.gz"
+        "linux-x86_64": "https://example.com/outer-shell/apps/Files/linux-x86_64.tar.gz",
+        "macos-arm64": "https://example.com/outer-shell/apps/Files/macos-arm64.tar.gz",
+        "macos-x86_64": "https://example.com/outer-shell/apps/Files/macos-x86_64.tar.gz"
       }
     },
     {
@@ -26,7 +28,9 @@
       "supportsRoot": true,
       "archives": {
         "linux-aarch64": "https://example.com/outer-shell/apps/Plaintext/linux-aarch64.tar.gz",
-        "linux-x86_64": "https://example.com/outer-shell/apps/Plaintext/linux-x86_64.tar.gz"
+        "linux-x86_64": "https://example.com/outer-shell/apps/Plaintext/linux-x86_64.tar.gz",
+        "macos-arm64": "https://example.com/outer-shell/apps/Plaintext/macos-arm64.tar.gz",
+        "macos-x86_64": "https://example.com/outer-shell/apps/Plaintext/macos-x86_64.tar.gz"
       }
     },
     {

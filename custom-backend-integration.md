@@ -271,7 +271,7 @@ On macOS:
   --backend "$SERVICE_ID" \
   --name "$DISPLAY_NAME" \
   --launchd-plist "$HOME/Library/LaunchAgents/$SERVICE_ID.plist" \
-  --owns-plist true
+  --outershell-owns true
 ```
 
 Then register the app and log path. These commands are the same shape on both
@@ -378,7 +378,7 @@ sudo OUTERSHELL_HOME=/Library/Application\ Support/outershell "$OUTERCTL" backen
   --backend "$SERVICE_ID" \
   --name "$DISPLAY_NAME" \
   --launchd-plist "/Library/LaunchDaemons/$SERVICE_ID.plist" \
-  --owns-plist true
+  --outershell-owns true
 ```
 
 Then run the same root-scoped `app add` and `log add` commands:

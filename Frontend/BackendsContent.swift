@@ -1400,6 +1400,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         NSColor(cgColor: resolvedCGColor(color)) ?? color
     }
 
+    private func pageBackgroundColor() -> NSColor {
+        .controlBackgroundColor
+    }
+
     private func updateLayout() {
         withEffectiveAppearance {
             withoutImplicitAnimations {
@@ -1412,7 +1416,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 createLayer.frame = rootLayer.bounds
 
                 titleLayer.frame = .zero
-                outerShellActionFrame = (mode == .apps || mode == .create) && outerShellBackend() != nil
+                outerShellActionFrame = (mode == .apps || mode == .create) && outerShellActionsBackend() != nil
                     ? CGRect(x: max(width - horizontalInset - 28, horizontalInset),
                              y: 10,
                              width: 28,
@@ -1480,9 +1484,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private func updateColors() {
         withEffectiveAppearance {
             withoutImplicitAnimations {
-                rootLayer.backgroundColor = resolvedCGColor(.windowBackgroundColor)
+                let pageBackground = pageBackgroundColor()
+                rootLayer.backgroundColor = resolvedCGColor(pageBackground)
                 toolbarLayer.backgroundColor = resolvedCGColor(.controlBackgroundColor)
-                contentLayer.backgroundColor = resolvedCGColor(.windowBackgroundColor)
+                contentLayer.backgroundColor = resolvedCGColor(pageBackground)
                 logHeaderLayer.backgroundColor = resolvedCGColor(NSColor.controlBackgroundColor.withAlphaComponent(0.9))
                 dividerLayer.backgroundColor = resolvedCGColor(.separatorColor)
 
@@ -7124,7 +7129,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         if mode == .apps {
             let toolbarPoint = toolbarLayer.convert(point, from: rootLayer)
             if outerShellActionFrame.contains(toolbarPoint),
-               let backend = outerShellBackend() {
+               let backend = outerShellActionsBackend() {
                 showBackendActionsMenu(for: backend, at: point)
                 return
             }
@@ -7320,7 +7325,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         let toolbarPoint = toolbarLayer.convert(point, from: rootLayer)
         if mode == .apps,
            outerShellActionFrame.contains(toolbarPoint),
-           let backend = outerShellBackend() {
+           let backend = outerShellActionsBackend() {
             showBackendActionsMenu(for: backend, at: point)
             return
         }
@@ -7876,6 +7881,36 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
     private func outerShellBackend() -> BackendRecord? {
         backends.first { $0.isBackendsSelf }
+    }
+
+    private func outerShellActionsBackend() -> BackendRecord? {
+        if let backend = outerShellBackend() {
+            return backend
+        }
+        guard controlEndpoint != nil else { return nil }
+        return BackendRecord(serviceID: "org.outershell.OuterShell",
+                             displayName: "Outer Shell",
+                             serviceUnit: "",
+                             serviceUnitPath: nil,
+                             serviceScope: "user",
+                             status: backendError.isEmpty ? "" : "error",
+                             canControl: true,
+                             canUninstall: true,
+                             isBundled: false,
+                             isInstalled: true,
+                             isMigration: false,
+                             supportsRoot: false,
+                             rootOnly: false,
+                             hasRootSupport: false,
+                             installedVersion: nil,
+                             availableVersion: nil,
+                             scriptPath: nil,
+                             iconSymbolName: nil,
+                             launchdPlistPath: "",
+                             ownsLaunchdPlist: true,
+                             menuBarVisibilityEnabled: nil,
+                             frontends: [],
+                             logFiles: [])
     }
 
     private func currentLogFile(for backend: BackendRecord) -> LogFileRecord? {

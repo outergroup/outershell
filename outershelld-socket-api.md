@@ -7,6 +7,9 @@ scalars and offset-based references.
 as `OuterShellBackend` and talks to the broker socket instead of owning that
 socket itself.
 
+For a command-oriented view of the same request messages, see
+[`outerctl-socket-messages.md`](outerctl-socket-messages.md).
+
 ```text
 Socket frame:
 bytes 0..3:    UInt32 little-endian message length, L
@@ -20,19 +23,307 @@ bytes 4..7: UInt32 little-endian UTF-8 byte length
 Offsets are relative to the beginning of the message, where byte 0 is the first
 byte of `messageType`.
 
-## `outerctlInvoke` request (`messageType = 1`)
-
-This transitional request moves existing `outerctl` registry operations behind
-outershelld. Future APIs should add typed messages instead of extending this
-argv wrapper.
+String lists use a 4-byte offset to a variable-region list payload:
 
 ```text
-bytes 2..5:           UInt32 argc
-bytes 6..13:          StringRef32 registry database path
-bytes 14..<14+8*argc: argv StringRef32 entries
+StringListRef32:
+bytes 0..3: UInt32 little-endian offset to first StringRef32 entry, or 0 when item count is 0
+bytes 4..7: UInt32 little-endian item count
+
+List payload:
+bytes 0..: item count consecutive StringRef32 entries
 ```
 
-## `outerctlInvokeResponse` (`messageType = 2`)
+Nested `StringRef32` entries still use offsets relative to byte 0 of the full
+message.
+
+Every request begins with:
+
+```text
+bytes 0..1: UInt16 messageType
+```
+
+## Request Messages
+
+`outerctl` is a command-line client for these messages. It parses command-line
+arguments locally and sends one dedicated binary message for each command
+action.
+
+Registry command requests do not carry a registry path. The `outershelld`
+instance that receives the request chooses its configured registry, such as the
+user registry for a user daemon or the system registry for a root daemon.
+
+Request message types are allocated in one contiguous block:
+
+```text
+10 backendUpsertRequest
+11 backendRemoveRequest
+12 backendListRequest
+13 appAddRequest
+14 appRemoveRequest
+15 appClearRequest
+16 appListRequest
+17 logAddRequest
+18 logRemoveRequest
+19 logClearRequest
+20 logListRequest
+21 serviceManagerClearRequest
+22 serviceManagerListRequest
+23 contentTypeAddRequest
+24 contentTypeRemoveRequest
+25 contentTypeClearRequest
+26 contentTypeListRequest
+27 openerAddRequest
+28 openerRemoveRequest
+29 openerClearRequest
+30 openerListRequest
+31 fileOpenersQuery
+32 uiRequest
+```
+
+Response message types are allocated in one contiguous block:
+
+```text
+100 commandResponse
+101 backendListResponse
+102 appListResponse
+103 logListResponse
+104 serviceManagerListResponse
+105 contentTypeListResponse
+106 openerListResponse
+107 fileOpenersResponse
+108 uiResponse
+```
+
+Flags:
+
+```text
+0x01 owns platform service-manager entry
+0x02 include icons
+```
+
+### Backend
+
+`backendUpsertRequest` (`messageType = 10`):
+
+```text
+bytes 2..3:    UInt16 flags
+bytes 4..11:   StringRef32 backend service id
+bytes 12..19:  StringRef32 display name
+bytes 20..27:  StringRef32 platform service-manager entry
+```
+
+Returns `commandResponse` (`messageType = 100`).
+
+The platform service-manager entry is a systemd unit name on Linux and a
+launchd plist path on macOS.
+
+`backendRemoveRequest` (`11`):
+
+```text
+bytes 2..9: StringRef32 backend service id
+```
+
+Returns `commandResponse` (`messageType = 100`).
+
+`backendListRequest` (`12`):
+
+```text
+bytes 2..9: StringRef32 backend service id
+```
+
+Returns `backendListResponse` (`messageType = 101`).
+
+### Apps
+
+`appAddRequest` (`20`):
+
+```text
+bytes 2..5:    UInt32 port
+bytes 6..13:   StringRef32 backend service id
+bytes 14..21:  StringRef32 display name
+bytes 22..29:  StringRef32 URL
+bytes 30..37:  StringRef32 frontend id
+bytes 38..45:  StringRef32 icon path
+bytes 46..53:  StringRef32 frontend list
+bytes 54..61:  StringRef32 socket path
+```
+
+Returns `commandResponse` (`messageType = 100`).
+
+`appRemoveRequest` (`21`):
+
+```text
+bytes 2..5:    UInt32 port
+bytes 6..13:   StringRef32 backend service id
+bytes 14..21:  StringRef32 frontend id
+bytes 22..29:  StringRef32 socket path
+```
+
+Returns `commandResponse` (`messageType = 100`).
+
+`appClearRequest` (`22`):
+
+```text
+bytes 2..9: StringRef32 backend service id
+```
+
+Returns `commandResponse` (`messageType = 100`).
+
+`appListRequest` (`23`):
+
+```text
+bytes 2..9: StringRef32 backend service id
+```
+
+Returns `appListResponse` (`messageType = 102`).
+
+### Logs And Service Managers
+
+`logAddRequest` (`30`):
+
+```text
+bytes 2..9:    StringRef32 backend service id
+bytes 10..17:  StringRef32 log path
+```
+
+Returns `commandResponse` (`messageType = 100`).
+
+`logRemoveRequest` (`31`):
+
+```text
+bytes 2..9:    StringRef32 backend service id
+bytes 10..17:  StringRef32 log path
+```
+
+Returns `commandResponse` (`messageType = 100`).
+
+`logClearRequest` (`32`):
+
+```text
+bytes 2..9: StringRef32 backend service id
+```
+
+Returns `commandResponse` (`messageType = 100`).
+
+`logListRequest` (`33`):
+
+```text
+bytes 2..9: StringRef32 backend service id
+```
+
+Returns `logListResponse` (`messageType = 103`).
+
+`serviceManagerClearRequest` (`40`):
+
+```text
+bytes 2..9: StringRef32 backend service id
+```
+
+Returns `commandResponse` (`messageType = 100`).
+
+`serviceManagerListRequest` (`41`):
+
+```text
+bytes 2..9: StringRef32 backend service id
+```
+
+Returns `serviceManagerListResponse` (`messageType = 104`).
+
+### Content Types
+
+`contentTypeAddRequest` (`messageType = 23`):
+
+```text
+bytes 2..9:    StringRef32 backend service id
+bytes 10..17:  StringRef32 content type
+bytes 18..25:  StringRef32 display name
+bytes 26..33:  StringListRef32 conforms-to content types
+bytes 34..41:  StringListRef32 filename extensions
+bytes 42..49:  StringListRef32 exact filenames
+bytes 50..57:  StringListRef32 MIME types
+```
+
+Returns `commandResponse` (`messageType = 100`).
+
+`contentTypeRemoveRequest` (`messageType = 24`):
+
+```text
+bytes 2..9:    StringRef32 backend service id
+bytes 10..17:  StringRef32 content type
+```
+
+Returns `commandResponse` (`messageType = 100`).
+
+`contentTypeClearRequest` (`messageType = 25`):
+
+```text
+bytes 2..9: StringRef32 backend service id
+```
+
+Returns `commandResponse` (`messageType = 100`).
+
+`contentTypeListRequest` (`messageType = 26`):
+
+```text
+bytes 2..9:    StringRef32 backend service id
+bytes 10..17:  StringRef32 content type
+```
+
+Returns `contentTypeListResponse` (`messageType = 105`).
+
+### Openers
+
+`openerAddRequest` (`messageType = 27`):
+
+```text
+bytes 2..5:    UInt32 rank
+bytes 6..9:    UInt32 capability flags
+bytes 10..17:  StringRef32 backend service id
+bytes 18..25:  StringRef32 content type
+bytes 26..33:  StringRef32 display name
+bytes 34..41:  StringRef32 socket path
+bytes 42..49:  StringRef32 URL template
+```
+
+Returns `commandResponse` (`messageType = 100`).
+
+Capability flags:
+
+```text
+0x01 view
+0x02 edit
+```
+
+`openerRemoveRequest` (`messageType = 28`):
+
+```text
+bytes 2..9:    StringRef32 backend service id
+bytes 10..17:  StringRef32 content type
+```
+
+Returns `commandResponse` (`messageType = 100`).
+
+`openerClearRequest` (`messageType = 29`):
+
+```text
+bytes 2..9: StringRef32 backend service id
+```
+
+Returns `commandResponse` (`messageType = 100`).
+
+`openerListRequest` (`messageType = 30`):
+
+```text
+bytes 2..9:    StringRef32 backend service id
+bytes 10..17:  StringRef32 content type
+```
+
+Returns `openerListResponse` (`messageType = 106`).
+
+## Command Responses
+
+Mutating command requests return `commandResponse` (`messageType = 100`):
 
 ```text
 bytes 2..5:    UInt32 process-style exit status
@@ -40,26 +331,119 @@ bytes 6..13:   StringRef32 stdout bytes
 bytes 14..21:  StringRef32 stderr bytes
 ```
 
-## `fileOpenersQuery` (`messageType = 3`)
+List requests return dedicated binary responses instead of TSV. The common
+response header is:
+
+```text
+bytes 2..5:    UInt32 status, 0 for success
+bytes 6..13:   StringRef32 error message
+bytes 14..17:  UInt32 row count
+bytes 18..21:  UInt32 row size in bytes
+bytes 22..:    row count consecutive rows of row size bytes, followed by referenced string data
+```
+
+`backendListResponse` (`101`) uses the common list response header. Its `row
+count` field tells you how many backend rows follow at byte 22. Use the
+header's `row size` field as the stride between rows; the current row size is
+36 bytes:
+
+```text
+bytes 0..3:    UInt32 flags
+bytes 4..11:   StringRef32 service id
+bytes 12..19:  StringRef32 display name
+bytes 20..27:  StringRef32 systemd unit name
+bytes 28..35:  StringRef32 launchd plist path
+```
+
+`appListResponse` (`102`) uses the common list response header. Its `row count`
+field tells you how many app rows follow at byte 22. Use the header's `row
+size` field as the stride between rows; the current row size is 60 bytes:
+
+```text
+bytes 0..3:    UInt32 port
+bytes 4..11:   StringRef32 frontend id
+bytes 12..19:  StringRef32 URL
+bytes 20..27:  StringRef32 backend service id
+bytes 28..35:  StringRef32 display name
+bytes 36..43:  StringRef32 socket path
+bytes 44..51:  StringRef32 icon path
+bytes 52..59:  StringRef32 frontend list
+```
+
+`logListResponse` (`103`) uses the common list response header. Its `row count`
+field tells you how many log rows follow at byte 22. Use the header's `row
+size` field as the stride between rows; the current row size is 16 bytes:
+
+```text
+bytes 0..7:   StringRef32 log path
+bytes 8..15:  StringRef32 backend service id
+```
+
+`serviceManagerListResponse` (`104`) uses the common list response header. Its
+`row count` field tells you how many service-manager rows follow at byte 22.
+Use the header's `row size` field as the stride between rows; the current row
+size is 20 bytes:
+
+```text
+bytes 0..3:    UInt32 flags
+bytes 4..11:   StringRef32 backend service id
+bytes 12..19:  StringRef32 platform service-manager entry
+```
+
+`contentTypeListResponse` (`105`) uses the common list response header. Its
+`row count` field tells you how many content-type rows follow at byte 22. Use
+the header's `row size` field as the stride between rows; the current row size
+is 56 bytes:
+
+```text
+bytes 0..7:    StringRef32 backend service id, empty for built-ins
+bytes 8..15:   StringRef32 identifier
+bytes 16..23:  StringRef32 display name
+bytes 24..31:  StringListRef32 conforms-to content types
+bytes 32..39:  StringListRef32 filename extensions
+bytes 40..47:  StringListRef32 exact filenames
+bytes 48..55:  StringListRef32 MIME types
+```
+
+`openerListResponse` (`106`) uses the common list response header. Its `row
+count` field tells you how many opener rows follow at byte 22. Use the
+header's `row size` field as the stride between rows; the current row size is
+48 bytes:
+
+```text
+bytes 0..3:    UInt32 rank
+bytes 4..11:   StringRef32 content type
+bytes 12..19:  StringRef32 backend service id
+bytes 20..27:  StringRef32 display name
+bytes 28..35:  StringRef32 socket path
+bytes 36..43:  StringRef32 URL template
+bytes 44..47:  UInt32 capability flags
+```
+
+## `fileOpenersQuery` (`messageType = 31`)
 
 Returns applications that can open a file path or an explicit content type.
+This is the file-to-openers query; it does not take a backend service id.
 
 ```text
 bytes 2..9:    StringRef32 file path
 bytes 10..17:  StringRef32 content type, optional
+bytes 18..25:  StringRef32 requester user, optional
 ```
 
 If `content type` is empty, `outershelld` infers content types from exact
 filename, extension, file magic, shebang, and text sniffing. If a content type
-is provided, `outershelld` expands it through its `conforms_to` parents.
+is provided, `outershelld` expands it through its `conforms_to` graph.
+If `requester user` is present, the daemon queries that user's registry before
+adding accessible system-registry openers.
 
-## `fileOpenersResponse` (`messageType = 4`)
+## `fileOpenersResponse` (`messageType = 107`)
 
 ```text
 bytes 2..5:    UInt32 status, 0 for success
 bytes 6..13:   StringRef32 error message
 bytes 14..17:  UInt32 opener row count
-bytes 18..:    opener rows, 40 bytes each
+bytes 18..:    opener rows, 44 bytes each
 
 Opener row:
 bytes 0..7:    StringRef32 content type
@@ -67,6 +451,7 @@ bytes 8..15:   StringRef32 service id
 bytes 16..23:  StringRef32 display name
 bytes 24..31:  StringRef32 socket path
 bytes 32..39:  StringRef32 resolved URL
+bytes 40..43:  UInt32 capability flags
 ```
 
 ## File Opener Registry
@@ -76,6 +461,7 @@ types and `opener` commands for apps that can open files by content type:
 
 ```bash
 outerctl content-type add \
+  --backend org.outershell.Plaintext \
   --content-type org.outershell.example-source \
   --name 'Example Source' \
   --conforms-to public.text \
@@ -87,9 +473,10 @@ outerctl opener add --backend org.outershell.Plaintext \
   --content-type public.text \
   --socket-path "$XDG_RUNTIME_DIR/org.outershell.Plaintext" \
   --name Plaintext \
-  --url-template '?file={file}'
+  --url-template '?file={file}' \
+  --capabilities view,edit
 
-outerctl opener list --content-type public.text --file /path/to/README
+outerctl opener list --content-type public.text
 outerctl content-type list
 ```
 
@@ -100,8 +487,10 @@ app URL.
 
 Lookup is user-contextual. A backend that receives an HTTP request over a Unix
 socket should inspect the peer UID for that request and query that user's
-`outershelld` socket, normally `/run/user/<uid>/outershelld-api`. The user
-broker returns user registry openers plus system registry openers whose socket
-path is accessible to that user. TCP HTTP listeners cannot provide peer
+`outershelld` socket, normally `DARWIN_USER_TEMP_DIR/outershelld-api` on macOS
+or `/run/user/<uid>/outershelld-api` on Linux. Root callers use
+`/var/run/outershelld-api` on macOS and `/run/outershelld-api` on Linux. The
+user broker returns user registry openers plus system registry openers whose
+socket path is accessible to that user. TCP HTTP listeners cannot provide peer
 credentials, so they should be treated as a local/development fallback and use
 the backend process UID.

@@ -217,7 +217,7 @@ static const BundledAppDefinition kBundledApps[] = {
         .bundle_prefix = "FilesContent",
         .icon_name = "app-icon.png",
         .source_name = "FilesBackend.c",
-        .supports_macos = false
+        .supports_macos = true
     },
     {
         .service_id = "org.outershell.Plaintext",
@@ -225,9 +225,9 @@ static const BundledAppDefinition kBundledApps[] = {
         .stage_directory_name = "Plaintext",
         .binary_name = "PlaintextBackend",
         .bundle_prefix = "PlaintextContent",
-        .icon_name = NULL,
+        .icon_name = "app-icon.png",
         .source_name = "PlaintextBackend.c",
-        .supports_macos = false
+        .supports_macos = true
     },
     {
         .service_id = "org.outershell.NetworkInspector",
@@ -1625,6 +1625,10 @@ static void default_api_socket_path(char *out, size_t out_size) {
         return;
     }
 #ifdef __APPLE__
+    if (geteuid() == 0) {
+        snprintf(out, out_size, "/var/run/outershelld-api");
+        return;
+    }
     const char *tmp = getenv("DARWIN_USER_TEMP_DIR");
     if (!tmp || !tmp[0]) tmp = getenv("TMPDIR");
     if (tmp && tmp[0]) {
