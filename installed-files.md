@@ -28,8 +28,8 @@ System registry files:
 
 Registry overrides:
 
-- `OUTERSHELL_REGISTRY` or `BACKENDS_REGISTRY_DB` overrides the user registry path.
-- `OUTERSHELL_SYSTEM_REGISTRY` or `BACKENDS_SYSTEM_REGISTRY_DB` overrides the system registry path.
+- `OUTERSHELL_REGISTRY` overrides the user registry path.
+- `OUTERSHELL_SYSTEM_REGISTRY` overrides the system registry path.
 
 API socket:
 
@@ -126,7 +126,7 @@ Linux removes old helper files and units when installing current root support:
 - `/etc/systemd/system/outershelld-root-helper-<uid>.service`
 - `/etc/systemd/system/outershelld-root-helper-<uid>.socket`
 
-macOS root app installs promote the same `outershelld` and `outerctl` tools into system scope. Outer Shell itself remains a user LaunchAgent and is never installed as a root app. After promotion, user tool paths and the legacy root-tool path are symlinks to root-owned tools:
+macOS root app installs promote the same `outershelld` and `outerctl` tools into system scope. Outer Shell itself remains a user LaunchAgent and is never installed as a root app. After promotion, user tool paths are symlinks to root-owned tools:
 
 - `<system-state>/outershelld/outershelld`
 - `<system-state>/bin/outerctl`
@@ -134,7 +134,6 @@ macOS root app installs promote the same `outershelld` and `outerctl` tools into
 - `/var/run/outershelld-api`
 - `<user-state>/outershelld/outershelld -> <system-state>/outershelld/outershelld`
 - `<user-state>/bin/outerctl -> <system-state>/bin/outerctl`
-- `/usr/local/libexec/outershelld-root-tool -> <system-state>/outershelld/outershelld`
 
 ## Bundled Apps
 

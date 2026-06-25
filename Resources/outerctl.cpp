@@ -10,6 +10,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "OuterShellPaths.h"
+
 namespace {
 
 constexpr uint32_t kOuterctlApiMaxFrameLength = 16u * 1024u * 1024u;
@@ -331,35 +333,7 @@ bool writeTsvRefRow(const Buffer &message, size_t rowOffset, const size_t *refs,
 }
 
 void defaultOuterctlApiSocketPath(char *out, size_t outSize) {
-    const char *envPath = getenv("OUTERSHELLD_API_SOCKET");
-    if (envPath && envPath[0]) {
-        snprintf(out, outSize, "%s", envPath);
-        return;
-    }
-#if defined(__APPLE__)
-    if (geteuid() == 0) {
-        snprintf(out, outSize, "/var/run/outershelld-api");
-        return;
-    }
-    const char *tmp = getenv("DARWIN_USER_TEMP_DIR");
-    if (!tmp || !tmp[0]) tmp = getenv("TMPDIR");
-    if (tmp && tmp[0]) {
-        snprintf(out, outSize, "%s%soutershelld-api", tmp, tmp[strlen(tmp) - 1] == '/' ? "" : "/");
-        return;
-    }
-    snprintf(out, outSize, "/tmp/outershelld-api-%d", static_cast<int>(getuid()));
-#else
-    if (geteuid() == 0) {
-        snprintf(out, outSize, "/run/outershelld-api");
-        return;
-    }
-    const char *runtime = getenv("XDG_RUNTIME_DIR");
-    if (runtime && runtime[0]) {
-        snprintf(out, outSize, "%s/outershelld-api", runtime);
-        return;
-    }
-    snprintf(out, outSize, "/run/user/%d/outershelld-api", static_cast<int>(getuid()));
-#endif
+    outer_shell_default_api_socket_path(out, outSize);
 }
 
 enum : uint16_t {

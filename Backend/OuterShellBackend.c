@@ -34,6 +34,7 @@
 #include "OuterShellBuffer.h"
 #include "OuterShellDownloader.h"
 #include "OuterShellPlatform.h"
+#include "../Resources/OuterShellPaths.h"
 
 #ifdef __APPLE__
 #include <mach-o/dyld.h>
@@ -555,7 +556,7 @@ static void bundled_apps_root(char *out, size_t out_size) {
         snprintf(out, out_size, "%s", g_bundled_apps_directory);
         return;
     }
-    const char *env_root = getenv("BACKENDS_BUNDLED_APPS_DIR");
+    const char *env_root = getenv("OUTERSHELL_BUNDLED_APPS_DIR");
     if (env_root && env_root[0]) {
         expand_tilde_path(env_root, out, out_size);
         return;
@@ -1618,44 +1619,8 @@ static void outer_shell_backend_usage(const char *program) {
     fprintf(stderr, "Usage: %s [--port PORT | --socket-path PATH] [--api-socket-path PATH] [--launchd-socket-name NAME] [--bundles-dir DIR] [--stay-alive]\n", program);
 }
 
-static void default_api_socket_path(char *out, size_t out_size) {
-    const char *env_path = getenv("OUTERSHELLD_API_SOCKET");
-    if (env_path && env_path[0]) {
-        expand_tilde_path(env_path, out, out_size);
-        return;
-    }
-#ifdef __APPLE__
-    if (geteuid() == 0) {
-        snprintf(out, out_size, "/var/run/outershelld-api");
-        return;
-    }
-    const char *tmp = getenv("DARWIN_USER_TEMP_DIR");
-    if (!tmp || !tmp[0]) tmp = getenv("TMPDIR");
-    if (tmp && tmp[0]) {
-        snprintf(out, out_size, "%s%soutershelld-api", tmp, tmp[strlen(tmp) - 1] == '/' ? "" : "/");
-        return;
-    }
-    snprintf(out, out_size, "/tmp/outershelld-api-%d", (int)getuid());
-#else
-    if (geteuid() == 0) {
-        snprintf(out, out_size, "/run/outershelld-api");
-        return;
-    }
-    const char *runtime = getenv("XDG_RUNTIME_DIR");
-    if (runtime && runtime[0]) {
-        snprintf(out, out_size, "%s/outershelld-api", runtime);
-        return;
-    }
-    snprintf(out, out_size, "/run/user/%d/outershelld-api", (int)getuid());
-#endif
-}
-
 static void initialize_runtime_paths(char *api_socket_path, size_t api_socket_path_size) {
-    default_api_socket_path(api_socket_path, api_socket_path_size);
-    const char *api_socket_env = getenv("OUTERSHELLD_API_SOCKET");
-    if (api_socket_env && api_socket_env[0]) {
-        expand_tilde_path(api_socket_env, api_socket_path, api_socket_path_size);
-    }
+    outer_shell_default_api_socket_path(api_socket_path, api_socket_path_size);
 }
 
 int OuterShellBackendMain(int argc, char **argv) {

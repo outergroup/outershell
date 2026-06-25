@@ -285,7 +285,6 @@ The current registry is stored as an `ORWA` binary file.
 Default user registry path:
 
 - `$OUTERSHELL_REGISTRY`, if set
-- `$BACKENDS_REGISTRY_DB`, if set
 - otherwise `$OUTERSHELL_HOME/registry.orwa`
 - on macOS, default `$OUTERSHELL_HOME` is `~/Library/Application Support/outershell`
 - on Linux, default `$OUTERSHELL_HOME` is `$XDG_STATE_HOME/outershell` or `~/.local/state/outershell`
@@ -293,7 +292,6 @@ Default user registry path:
 Default system registry path:
 
 - `$OUTERSHELL_SYSTEM_REGISTRY`, if set
-- `$BACKENDS_SYSTEM_REGISTRY_DB`, if set
 - otherwise `/Library/Application Support/outershell/registry.orwa` on macOS
 - otherwise `/var/lib/outershell/registry.orwa` on Linux
 

@@ -143,6 +143,224 @@ private enum MenuBarVisibilityPreference {
     }
 }
 
+private enum BinaryPayloadError: Error {
+    case outOfBounds
+    case invalidString
+}
+
+private struct BinaryPayloadReader {
+    let data: Data
+
+    func uint32(at offset: Int) throws -> UInt32 {
+        guard offset >= 0, offset + 4 <= data.count else { throw BinaryPayloadError.outOfBounds }
+        return UInt32(data[offset]) |
+               (UInt32(data[offset + 1]) << 8) |
+               (UInt32(data[offset + 2]) << 16) |
+               (UInt32(data[offset + 3]) << 24)
+    }
+
+    func dataRef(at offset: Int) throws -> Data {
+        let start = Int(try uint32(at: offset))
+        let length = Int(try uint32(at: offset + 4))
+        guard start >= 0, length >= 0, start <= data.count, length <= data.count - start else {
+            throw BinaryPayloadError.outOfBounds
+        }
+        return Data(data[start..<(start + length)])
+    }
+
+    func stringRef(at offset: Int) throws -> String {
+        let bytes = try dataRef(at: offset)
+        guard !bytes.isEmpty else { return "" }
+        guard let string = String(data: bytes, encoding: .utf8) else {
+            throw BinaryPayloadError.invalidString
+        }
+        return string
+    }
+
+    func child(at offset: Int) throws -> BinaryPayloadReader {
+        BinaryPayloadReader(data: try dataRef(at: offset))
+    }
+
+    func payloadArray() throws -> [BinaryPayloadReader] {
+        let count = Int(try uint32(at: 0))
+        var children: [BinaryPayloadReader] = []
+        children.reserveCapacity(count)
+        for index in 0..<count {
+            children.append(try child(at: 4 + index * 8))
+        }
+        return children
+    }
+}
+
+private enum OuterShellBackendAPI {
+    private struct BackendRecord {
+        let serviceID: String
+        let displayName: String
+        let serviceScope: String
+        let status: String
+        let launchdPlistPath: String
+        let frontends: [HostedFrontend]
+        let logFiles: [String]
+    }
+
+    static func loadBackends() throws -> [ManagedBackend] {
+        let body = try httpGet(path: "/api/backends", socketPath: defaultSocketPath())
+        let reader = BinaryPayloadReader(data: body)
+        let error = try reader.stringRef(at: 0)
+        if !error.isEmpty {
+            throw NSError(domain: "org.outershell.OuterShellAgent",
+                          code: 1,
+                          userInfo: [NSLocalizedDescriptionKey: error])
+        }
+        let count = Int(try reader.uint32(at: 8))
+        var records: [BackendRecord] = []
+        records.reserveCapacity(count)
+        for index in 0..<count {
+            records.append(try decodeBackend(try reader.child(at: 12 + index * 8)))
+        }
+        return records
+            .filter { $0.serviceID != "org.outershell.OuterShell" }
+            .map { record in
+                ManagedBackend(serviceID: record.serviceID,
+                               displayName: record.displayName.isEmpty ? record.serviceID : record.displayName,
+                               registryScope: record.serviceScope,
+                               plistPath: record.launchdPlistPath,
+                               logFiles: record.logFiles.sorted(),
+                               frontends: record.frontends.sorted { lhs, rhs in
+                                   lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
+                               },
+                               state: state(from: record.status))
+            }
+            .sorted { lhs, rhs in
+                let order = lhs.displayName.localizedCaseInsensitiveCompare(rhs.displayName)
+                if order == .orderedSame {
+                    let serviceIDOrder = lhs.serviceID.localizedCaseInsensitiveCompare(rhs.serviceID)
+                    if serviceIDOrder == .orderedSame {
+                        return lhs.registryScope.localizedCaseInsensitiveCompare(rhs.registryScope) == .orderedDescending
+                    }
+                    return serviceIDOrder == .orderedAscending
+                }
+                return order == .orderedAscending
+            }
+    }
+
+    private static func state(from status: String) -> ManagedBackend.State {
+        switch status {
+        case "running":
+            return .running(pid: nil)
+        case "stopped":
+            return .stopped
+        case "available", "registered":
+            return .registered
+        case "missing":
+            return .missing
+        default:
+            return .unknown
+        }
+    }
+
+    private static func decodeBackend(_ reader: BinaryPayloadReader) throws -> BackendRecord {
+        let serviceID = try reader.stringRef(at: 0)
+        return BackendRecord(serviceID: serviceID,
+                             displayName: try reader.stringRef(at: 8),
+                             serviceScope: try reader.stringRef(at: 32),
+                             status: try reader.stringRef(at: 40),
+                             launchdPlistPath: try reader.stringRef(at: 56),
+                             frontends: try reader.child(at: 68).payloadArray().map { try decodeFrontend($0, serviceID: serviceID) },
+                             logFiles: try reader.child(at: 76).payloadArray().compactMap { logReader in
+                                 let path = try logReader.stringRef(at: 16)
+                                 return path.isEmpty ? nil : path
+                             })
+    }
+
+    private static func decodeFrontend(_ reader: BinaryPayloadReader, serviceID: String) throws -> HostedFrontend {
+        HostedFrontend(serviceID: serviceID,
+                       name: try reader.stringRef(at: 0),
+                       port: Int(try reader.uint32(at: 48)),
+                       socketPath: try reader.stringRef(at: 16),
+                       url: try reader.stringRef(at: 8))
+    }
+
+    private static func httpGet(path: String, socketPath: String) throws -> Data {
+        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+        guard fd >= 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        defer { close(fd) }
+
+        let sunPathSize = MemoryLayout.size(ofValue: sockaddr_un().sun_path)
+        guard socketPath.utf8.count < sunPathSize else {
+            throw NSError(domain: "org.outershell.OuterShellAgent",
+                          code: 2,
+                          userInfo: [NSLocalizedDescriptionKey: "Socket path is too long: \(socketPath)"])
+        }
+
+        var address = sockaddr_un()
+        address.sun_family = sa_family_t(AF_UNIX)
+        _ = socketPath.withCString { source in
+            withUnsafeMutablePointer(to: &address.sun_path) { pointer in
+                pointer.withMemoryRebound(to: CChar.self,
+                                          capacity: sunPathSize) { destination in
+                    strncpy(destination, source, sunPathSize - 1)
+                }
+            }
+        }
+
+        let connected = withUnsafePointer(to: &address) { pointer in
+            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPointer in
+                Darwin.connect(fd, sockaddrPointer, socklen_t(MemoryLayout<sockaddr_un>.size))
+            }
+        }
+        guard connected == 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+
+        let request = "GET \(path) HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+        try request.withCString { cString in
+            var remaining = strlen(cString)
+            var offset = 0
+            while remaining > 0 {
+                let wrote = write(fd, cString.advanced(by: offset), remaining)
+                if wrote < 0 {
+                    if errno == EINTR { continue }
+                    throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+                }
+                if wrote == 0 { throw POSIXError(.EPIPE) }
+                offset += wrote
+                remaining -= wrote
+            }
+        }
+
+        var response = Data()
+        var buffer = [UInt8](repeating: 0, count: 16384)
+        while true {
+            let got = buffer.withUnsafeMutableBytes { read(fd, $0.baseAddress, $0.count) }
+            if got > 0 {
+                response.append(contentsOf: buffer.prefix(got))
+            } else if got == 0 {
+                break
+            } else if errno != EINTR {
+                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+            }
+        }
+
+        guard let headerEnd = response.range(of: Data([13, 10, 13, 10])) else {
+            throw NSError(domain: "org.outershell.OuterShellAgent",
+                          code: 3,
+                          userInfo: [NSLocalizedDescriptionKey: "Invalid HTTP response from Outer Shell backend."])
+        }
+        let headerData = response[..<headerEnd.lowerBound]
+        let header = String(data: Data(headerData), encoding: .utf8) ?? ""
+        guard header.hasPrefix("HTTP/1.1 200 ") || header.hasPrefix("HTTP/1.0 200 ") else {
+            let statusLine = header.split(separator: "\r\n", maxSplits: 1).first.map(String.init) ?? "HTTP error"
+            throw NSError(domain: "org.outershell.OuterShellAgent",
+                          code: 4,
+                          userInfo: [NSLocalizedDescriptionKey: statusLine])
+        }
+        return Data(response[headerEnd.upperBound...])
+    }
+}
+
 @MainActor
 private weak var activeOuterShellAgentDelegate: OuterShellAgentDelegate?
 
@@ -165,286 +383,7 @@ private let backendEventChangedCallback: BackendEventChangedCallback = {
 
 private enum OuterShellRegistry {
     static func loadBackends() throws -> [ManagedBackend] {
-        var merged: [String: PartialBackend] = [:]
-        for path in registryPaths() where FileManager.default.isReadableFile(atPath: path) {
-            try loadRegistry(at: path, registryScope: registryScope(for: path), into: &merged)
-        }
-        return merged.values
-            .filter { $0.serviceID != "org.outershell.OuterShell" }
-            .map { partial in
-                let state = launchdState(serviceID: partial.serviceID, plistPath: partial.plistPath)
-                return ManagedBackend(serviceID: partial.serviceID,
-                                      displayName: partial.displayName.isEmpty ? partial.serviceID : partial.displayName,
-                                      registryScope: partial.registryScope,
-                                      plistPath: partial.plistPath,
-                                      logFiles: partial.logFiles.sorted(),
-                                      frontends: partial.frontends.sorted { lhs, rhs in
-                                          lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
-                                      },
-                                      state: state)
-            }
-            .sorted { lhs, rhs in
-                let order = lhs.displayName.localizedCaseInsensitiveCompare(rhs.displayName)
-                if order == .orderedSame {
-                    let serviceIDOrder = lhs.serviceID.localizedCaseInsensitiveCompare(rhs.serviceID)
-                    if serviceIDOrder == .orderedSame {
-                        return lhs.registryScope.localizedCaseInsensitiveCompare(rhs.registryScope) == .orderedDescending
-                    }
-                    return serviceIDOrder == .orderedAscending
-                }
-                return order == .orderedAscending
-            }
-    }
-
-    private struct PartialBackend {
-        let serviceID: String
-        let registryScope: String
-        var displayName: String = ""
-        var plistPath: String = ""
-        var logFiles: Set<String> = []
-        var frontends: [HostedFrontend] = []
-    }
-
-    private struct OrwaDescriptor {
-        let offset: Int
-        let rowCount: Int
-        let rowSize: Int
-    }
-
-    private static let orwaDescriptorSize = 20
-    private static let orwaTableCount = 6
-    private static let orwaLegacyFiveTableCount = 5
-    private static let orwaLegacyFourTableCount = 4
-    private static let orwaLegacyThreeTableCount = 3
-    private static let orwaHeaderSize = 8 + orwaTableCount * orwaDescriptorSize
-    private static let orwaLegacyFiveTableHeaderSize = 8 + orwaLegacyFiveTableCount * orwaDescriptorSize
-    private static let orwaLegacyFourTableHeaderSize = 8 + orwaLegacyFourTableCount * orwaDescriptorSize
-    private static let orwaLegacyThreeTableHeaderSize = 8 + orwaLegacyThreeTableCount * orwaDescriptorSize
-    private static let orwaBackendsRowSize = 68
-    private static let orwaLegacyBackendsRowSize = 84
-    private static let orwaLegacyFrontendsRowSize = 97
-    private static let orwaFrontendsRowSize = 113
-    private static let orwaFrontendsRowSizeWithFlags = 117
-    private static let orwaFrontendLayoutsRowSize = 32
-    private static let orwaLogFilesRowSize = 32
-    private static let orwaContentTypesRowSize = 96
-    private static let orwaFileOpenersRowSize = 88
-
-    private static func registryPaths() -> [String] {
-        let home = FileManager.default.homeDirectoryForCurrentUser.path
-        var paths: [String] = []
-        if let override = ProcessInfo.processInfo.environment["OUTERSHELL_REGISTRY"], !override.isEmpty {
-            paths.append(orwaPath(for: (override as NSString).expandingTildeInPath))
-        } else {
-            paths.append((home as NSString).appendingPathComponent("Library/Application Support/outershell/registry.orwa"))
-        }
-        if let override = ProcessInfo.processInfo.environment["OUTERSHELL_SYSTEM_REGISTRY"], !override.isEmpty {
-            paths.append(orwaPath(for: (override as NSString).expandingTildeInPath))
-        } else {
-            paths.append("/Library/Application Support/outershell/registry.orwa")
-        }
-        return Array(Set(paths))
-    }
-
-    private static func registryScope(for path: String) -> String {
-        let normalized = (path as NSString).standardizingPath
-        return normalized.hasPrefix("/Library/Application Support/outershell/") ? "system" : "user"
-    }
-
-    private static func registryKey(serviceID: String, registryScope: String) -> String {
-        "\(registryScope):\(serviceID)"
-    }
-
-    private static func orwaPath(for registryPath: String) -> String {
-        let path = registryPath as NSString
-        if path.lastPathComponent == "registry.orwa" {
-            return registryPath
-        }
-        return (path.deletingLastPathComponent as NSString).appendingPathComponent("registry.orwa")
-    }
-
-    private static func loadRegistry(at path: String,
-                                     registryScope: String,
-                                     into merged: inout [String: PartialBackend]) throws {
-        let data = try Data(contentsOf: URL(fileURLWithPath: path), options: [.mappedIfSafe])
-        guard data.count >= orwaLegacyThreeTableHeaderSize,
-              data.starts(with: [0x4f, 0x52, 0x57, 0x41]),
-              readUInt32(data, 4) == 1 else {
-            return
-        }
-
-        let firstTableOffset = readUInt64(data, 8)
-        let tableCount: Int
-        if firstTableOffset == UInt64(orwaHeaderSize) {
-            tableCount = orwaTableCount
-        } else if firstTableOffset == UInt64(orwaLegacyFiveTableHeaderSize) {
-            tableCount = orwaLegacyFiveTableCount
-        } else if firstTableOffset == UInt64(orwaLegacyFourTableHeaderSize) {
-            tableCount = orwaLegacyFourTableCount
-        } else if firstTableOffset == UInt64(orwaLegacyThreeTableHeaderSize) {
-            tableCount = orwaLegacyThreeTableCount
-        } else {
-            return
-        }
-        guard data.count >= 8 + tableCount * orwaDescriptorSize else { return }
-
-        var descriptors: [OrwaDescriptor] = []
-        var variableOffset = 0
-        for tableIndex in 0..<tableCount {
-            let descriptorOffset = 8 + tableIndex * orwaDescriptorSize
-            let offset = Int(readUInt64(data, descriptorOffset))
-            let rowCount = Int(readUInt64(data, descriptorOffset + 8))
-            let rowSize = Int(readUInt32(data, descriptorOffset + 16))
-            guard rowSize > 0,
-                  offset >= 0,
-                  rowCount >= 0,
-                  rowCount <= (Int.max / rowSize),
-                  offset <= data.count,
-                  rowCount * rowSize <= data.count - offset,
-                  rowSizeIsValid(rowSize, tableIndex: tableIndex, tableCount: tableCount) else {
-                return
-            }
-            descriptors.append(OrwaDescriptor(offset: offset, rowCount: rowCount, rowSize: rowSize))
-            variableOffset = max(variableOffset, offset + rowCount * rowSize)
-        }
-
-        let backends = descriptors[0]
-        for row in 0..<backends.rowCount {
-            let rowOffset = backends.offset + row * backends.rowSize
-            let serviceID = readString(data, variableOffset, rowOffset)
-            guard !serviceID.isEmpty else { continue }
-            let key = registryKey(serviceID: serviceID, registryScope: registryScope)
-            var partial = merged[key] ?? PartialBackend(serviceID: serviceID, registryScope: registryScope)
-            let displayName = readString(data, variableOffset, rowOffset + 16)
-            let plistPath: String
-            if backends.rowSize >= orwaLegacyBackendsRowSize {
-                plistPath = readString(data, variableOffset, rowOffset + 64)
-            } else {
-                plistPath = readString(data, variableOffset, rowOffset + 48)
-            }
-            if !displayName.isEmpty { partial.displayName = displayName }
-            if !plistPath.isEmpty { partial.plistPath = plistPath }
-            merged[key] = partial
-        }
-
-        let frontends = descriptors[1]
-        for row in 0..<frontends.rowCount {
-            let rowOffset = frontends.offset + row * frontends.rowSize
-            let url = readString(data, variableOffset, rowOffset)
-            let serviceID = readString(data, variableOffset, rowOffset + 16)
-            guard !serviceID.isEmpty else { continue }
-            let key = registryKey(serviceID: serviceID, registryScope: registryScope)
-            let displayName = readString(data, variableOffset, rowOffset + 32)
-            var port = 0
-            var socketPath = ""
-            if rowOffset + 81 < data.count {
-                let endpointKind = data[rowOffset + 80]
-                if endpointKind == 1 {
-                    port = Int(readUInt32(data, rowOffset + 81))
-                } else if endpointKind == 2 {
-                    socketPath = readString(data, variableOffset, rowOffset + 81)
-                }
-            }
-            var partial = merged[key] ?? PartialBackend(serviceID: serviceID, registryScope: registryScope)
-            let frontend = HostedFrontend(serviceID: serviceID,
-                                          name: displayName,
-                                          port: port,
-                                          socketPath: socketPath,
-                                          url: url)
-            if !partial.frontends.contains(frontend) {
-                partial.frontends.append(frontend)
-            }
-            merged[key] = partial
-        }
-
-        let logTableIndex = tableCount == orwaLegacyThreeTableCount ? 2 : 3
-        guard logTableIndex < descriptors.count else { return }
-        let logs = descriptors[logTableIndex]
-        for row in 0..<logs.rowCount {
-            let rowOffset = logs.offset + row * logs.rowSize
-            let path = readString(data, variableOffset, rowOffset)
-            let serviceID = readString(data, variableOffset, rowOffset + 16)
-            guard !serviceID.isEmpty, !path.isEmpty else { continue }
-            let key = registryKey(serviceID: serviceID, registryScope: registryScope)
-            var partial = merged[key] ?? PartialBackend(serviceID: serviceID, registryScope: registryScope)
-            partial.logFiles.insert(path)
-            merged[key] = partial
-        }
-    }
-
-    private static func rowSizeIsValid(_ rowSize: Int, tableIndex: Int, tableCount: Int) -> Bool {
-        switch tableIndex {
-        case 0:
-            return rowSize == orwaBackendsRowSize || rowSize == orwaLegacyBackendsRowSize
-        case 1:
-            return rowSize == orwaFrontendsRowSize || rowSize == orwaFrontendsRowSizeWithFlags || rowSize == orwaLegacyFrontendsRowSize
-        case 2 where tableCount != orwaLegacyThreeTableCount:
-            return rowSize == orwaFrontendLayoutsRowSize
-        case 4 where tableCount == orwaTableCount:
-            return rowSize == orwaContentTypesRowSize
-        case 4, 5:
-            return rowSize == orwaFileOpenersRowSize
-        default:
-            return rowSize == orwaLogFilesRowSize
-        }
-    }
-
-    private static func readString(_ data: Data, _ variableOffset: Int, _ refOffset: Int) -> String {
-        guard refOffset >= 0, refOffset + 16 <= data.count else { return "" }
-        let offset = Int(readUInt64(data, refOffset))
-        let length = Int(readUInt64(data, refOffset + 8))
-        guard length > 0,
-              offset >= variableOffset,
-              offset <= data.count,
-              length <= data.count - offset else {
-            return ""
-        }
-        return String(data: data.subdata(in: offset..<(offset + length)), encoding: .utf8) ?? ""
-    }
-
-    private static func readUInt32(_ data: Data, _ offset: Int) -> UInt32 {
-        guard offset + 4 <= data.count else { return 0 }
-        return UInt32(data[offset]) |
-            (UInt32(data[offset + 1]) << 8) |
-            (UInt32(data[offset + 2]) << 16) |
-            (UInt32(data[offset + 3]) << 24)
-    }
-
-    private static func readUInt64(_ data: Data, _ offset: Int) -> UInt64 {
-        guard offset + 8 <= data.count else { return 0 }
-        var value: UInt64 = 0
-        for i in 0..<8 {
-            value |= UInt64(data[offset + i]) << UInt64(i * 8)
-        }
-        return value
-    }
-
-    private static func launchdState(serviceID: String, plistPath: String) -> ManagedBackend.State {
-        if plistPath.isEmpty {
-            return .registered
-        }
-        guard FileManager.default.fileExists(atPath: plistPath) else {
-            return .missing
-        }
-        let domain = plistPath.hasPrefix("/Library/LaunchDaemons/") ? "system" : "gui/\(getuid())"
-        guard let result = runProcess("/bin/launchctl", ["print", "\(domain)/\(serviceID)"]),
-              result.status == 0 else {
-            return .stopped
-        }
-        var pid: Int32?
-        var running = false
-        for rawLine in (result.stdout + "\n" + result.stderr).split(whereSeparator: \.isNewline) {
-            let line = rawLine.trimmingCharacters(in: .whitespaces)
-            if line == "state = running" {
-                running = true
-            } else if line.hasPrefix("pid = "),
-                      let parsed = Int32(line.dropFirst("pid = ".count)),
-                      parsed > 0 {
-                running = true
-                pid = parsed
-            }
-        }
-        return running ? .running(pid: pid) : .stopped
+        return try OuterShellBackendAPI.loadBackends()
     }
 
     static func runProcess(_ executable: String, _ arguments: [String]) -> (status: Int32, stdout: String, stderr: String)? {

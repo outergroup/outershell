@@ -139,7 +139,7 @@ On Linux it also reads the system/root registry:
 /var/lib/outershell/registry.orwa
 ```
 
-Override the user registry path with either `--database`, `OUTERSHELL_REGISTRY`, or `BACKENDS_REGISTRY_DB`. Override the system registry path with `--system-database`, `OUTERSHELL_SYSTEM_REGISTRY`, or `BACKENDS_SYSTEM_REGISTRY_DB`. If an override still points at a legacy `registry.sqlite3` path, Outer Shell uses the sibling `registry.orwa` file and `outershelld` migrates the SQLite file when needed.
+Override the user registry path with either `--database` or `OUTERSHELL_REGISTRY`. Override the system registry path with `--system-database` or `OUTERSHELL_SYSTEM_REGISTRY`. If an override still points at a legacy `registry.sqlite3` path, Outer Shell uses the sibling `registry.orwa` file and `outershelld` migrates the SQLite file when needed.
 
 ```bash
 ./build/macos/Release/outershelld \
@@ -156,7 +156,7 @@ its own repo.
 
 At runtime, Outer Shell looks for app payloads in `build/run/bundled-apps` next
 to a local build, then in the directory passed with `--bundled-apps-dir` or
-`BACKENDS_BUNDLED_APPS_DIR`. If a starter app payload is not present locally,
+`OUTERSHELL_BUNDLED_APPS_DIR`. If a starter app payload is not present locally,
 Outer Shell downloads it from the catalog URL into
 `$HOME/Library/Caches/outershell/outer-shell/bundled-apps` on macOS,
 `$XDG_CACHE_HOME/outershell/outer-shell/bundled-apps` or

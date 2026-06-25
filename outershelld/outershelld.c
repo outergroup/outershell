@@ -40,6 +40,7 @@
 #include "../Backend/OuterShellAPI.h"
 #include "../Backend/OuterShellBuffer.h"
 #include "../Backend/OuterShellPlatform.h"
+#include "../Resources/OuterShellPaths.h"
 
 #ifdef __APPLE__
 #include <mach-o/dyld.h>
@@ -888,9 +889,6 @@ static bool g_systemd_socket_activation = false;
 static bool g_api_systemd_socket_activation = false;
 static bool g_launchd_socket_activation = false;
 static bool g_stay_alive_when_socket_idle = false;
-#ifndef __APPLE__
-static uid_t g_root_helper_owner_uid = (uid_t)-1;
-#endif
 static volatile sig_atomic_t g_shutdown_requested = 0;
 static volatile sig_atomic_t g_listener_fd = -1;
 static volatile sig_atomic_t g_api_listener_fd = -1;
@@ -1527,15 +1525,6 @@ static void default_outershell_install_root(char *out, size_t out_size) {
     snprintf(out, out_size, "%s/outer-shell", root);
 }
 
-static void default_system_api_socket_path(char *out, size_t out_size) {
-    if (!out || out_size == 0) return;
-#ifdef __APPLE__
-    snprintf(out, out_size, "/var/run/outershelld-api");
-#else
-    snprintf(out, out_size, "/run/outershelld-api");
-#endif
-}
-
 #ifdef __APPLE__
 static void default_user_outershelld_path(char *out, size_t out_size) {
     if (!out || out_size == 0) return;
@@ -1938,7 +1927,7 @@ static void bundled_apps_root(char *out, size_t out_size) {
         snprintf(out, out_size, "%s", g_bundled_apps_directory);
         return;
     }
-    const char *env_root = getenv("BACKENDS_BUNDLED_APPS_DIR");
+    const char *env_root = getenv("OUTERSHELL_BUNDLED_APPS_DIR");
     if (env_root && env_root[0]) {
         expand_tilde_path(env_root, out, out_size);
         return;
@@ -2140,9 +2129,6 @@ static bool resolve_bundled_app_stage_root(const BundledAppDefinition *app,
 
 static void default_registry_database_path(char *out, size_t out_size) {
     const char *env_path = getenv("OUTERSHELL_REGISTRY");
-    if (!env_path || !env_path[0]) {
-        env_path = getenv("BACKENDS_REGISTRY_DB");
-    }
     if (env_path && env_path[0]) {
         expand_tilde_path(env_path, out, out_size);
         return;
@@ -2154,9 +2140,6 @@ static void default_registry_database_path(char *out, size_t out_size) {
 
 static void default_system_registry_database_path(char *out, size_t out_size) {
     const char *env_path = getenv("OUTERSHELL_SYSTEM_REGISTRY");
-    if (!env_path || !env_path[0]) {
-        env_path = getenv("BACKENDS_SYSTEM_REGISTRY_DB");
-    }
     if (env_path && env_path[0]) {
         expand_tilde_path(env_path, out, out_size);
         return;
@@ -2164,43 +2147,7 @@ static void default_system_registry_database_path(char *out, size_t out_size) {
     snprintf(out, out_size, "%s/registry.orwa", kSystemOuterShellRoot);
 }
 
-static void default_api_socket_path(char *out, size_t out_size) {
-    const char *env_path = getenv("OUTERSHELLD_API_SOCKET");
-    if (env_path && env_path[0]) {
-        expand_tilde_path(env_path, out, out_size);
-        return;
-    }
-#ifdef __APPLE__
-    if (direct_root_session_uses_system_scope()) {
-        default_system_api_socket_path(out, out_size);
-        return;
-    }
-    const char *tmp = getenv("DARWIN_USER_TEMP_DIR");
-    if (!tmp || !tmp[0]) tmp = getenv("TMPDIR");
-    if (tmp && tmp[0]) {
-        snprintf(out, out_size, "%s%soutershelld-api", tmp, tmp[strlen(tmp) - 1] == '/' ? "" : "/");
-        return;
-    }
-    snprintf(out, out_size, "/tmp/outershelld-api-%d", (int)getuid());
-#else
-    if (direct_root_session_uses_system_scope()) {
-        snprintf(out, out_size, "/run/outershelld-api");
-        return;
-    }
-    const char *runtime = getenv("XDG_RUNTIME_DIR");
-    if (runtime && runtime[0]) {
-        snprintf(out, out_size, "%s/outershelld-api", runtime);
-        return;
-    }
-    snprintf(out, out_size, "/run/user/%d/outershelld-api", (int)getuid());
-#endif
-}
-
 #ifndef __APPLE__
-static void root_helper_socket_path_for_uid(uid_t uid, char *out, size_t out_size) {
-    snprintf(out, out_size, "/run/outershelld-root-helper-%ld.sock", (long)uid);
-}
-
 static void root_helper_unit_name_for_uid(uid_t uid, const char *suffix, char *out, size_t out_size) {
     snprintf(out, out_size, "outershelld-root-helper-%ld.%s", (long)uid, suffix && suffix[0] ? suffix : "service");
 }
@@ -8864,7 +8811,7 @@ static bool ensure_root_helper_installed(const char *sudo_password, bool *needs_
     default_system_outershelld_install_root(system_install_root, sizeof(system_install_root));
     default_system_outershelld_path(system_outershelld, sizeof(system_outershelld));
     default_system_outerctl_path(system_outerctl, sizeof(system_outerctl));
-    default_system_api_socket_path(system_api_socket, sizeof(system_api_socket));
+    outer_shell_default_system_api_socket_path(system_api_socket, sizeof(system_api_socket));
     snprintf(system_daemon_plist, sizeof(system_daemon_plist), "/Library/LaunchDaemons/org.outershell.outershelld.plist");
     snprintf(system_daemon_log, sizeof(system_daemon_log), "/Library/Logs/outershelld.log");
     if (!parent_directory(system_outerctl, system_outerctl_parent, sizeof(system_outerctl_parent))) {
@@ -8906,8 +8853,6 @@ static bool ensure_root_helper_installed(const char *sudo_password, bool *needs_
             "chmod 0755 %s\n"
             "if [ ! -e %s ] || ! cmp -s %s %s; then install -m 0755 %s %s; fi\n"
             "chmod 0755 %s\n"
-            "rm -f /usr/local/libexec/outershelld-root-tool\n"
-            "ln -s %s /usr/local/libexec/outershelld-root-tool\n"
             "rm -f %s %s\n"
             "ln -s %s %s\n"
             "ln -s %s %s\n"
@@ -8970,7 +8915,6 @@ static bool ensure_root_helper_installed(const char *sudo_password, bool *needs_
             quoted_user_outerctl_source,
             quoted_system_outerctl,
             quoted_system_outerctl,
-            quoted_system_outershelld,
             quoted_executable,
             quoted_user_outerctl,
             quoted_system_outershelld,
@@ -12081,7 +12025,7 @@ static bool install_bundled_app(const BundledAppDefinition *app,
             char user_log_path[PATH_MAX];
             snprintf(user_log_path, sizeof(user_log_path), "%s/backend.log", user_state_root);
             char user_api_socket_path[PATH_MAX];
-            default_api_socket_path(user_api_socket_path, sizeof(user_api_socket_path));
+            outer_shell_default_api_socket_path(user_api_socket_path, sizeof(user_api_socket_path));
             if (!install_bundled_user_systemd_unit_from_paths(app,
                                                               install_root,
                                                               target_binary,
@@ -12182,7 +12126,7 @@ static bool install_bundled_app(const BundledAppDefinition *app,
     char description[256];
     unit_description_text(app->display_name, description, sizeof(description));
     char api_socket_path[PATH_MAX];
-    default_api_socket_path(api_socket_path, sizeof(api_socket_path));
+    outer_shell_default_api_socket_path(api_socket_path, sizeof(api_socket_path));
     char unit_contents[12000];
     snprintf(unit_contents, sizeof(unit_contents),
              "[Unit]\n"
@@ -12607,7 +12551,7 @@ static bool install_bundled_app_user_launchagent_for_system_payload(const Bundle
     char plist_path[PATH_MAX];
     snprintf(plist_path, sizeof(plist_path), "%s/Library/LaunchAgents/%s.plist", home_directory(), app->service_id);
     char api_socket_path[PATH_MAX];
-    default_api_socket_path(api_socket_path, sizeof(api_socket_path));
+    outer_shell_default_api_socket_path(api_socket_path, sizeof(api_socket_path));
 
     char log_dir[PATH_MAX];
     snprintf(log_dir, sizeof(log_dir), "%s", log_path);
@@ -12801,7 +12745,7 @@ static bool install_bundled_app_macos(const BundledAppDefinition *app,
             }
         }
         char api_socket_path[PATH_MAX];
-        default_system_api_socket_path(api_socket_path, sizeof(api_socket_path));
+        outer_shell_default_system_api_socket_path(api_socket_path, sizeof(api_socket_path));
         char log_path[PATH_MAX];
         snprintf(log_path, sizeof(log_path), "/Library/Logs/%s.log", app->service_id);
         char plist_path[PATH_MAX];
@@ -12985,7 +12929,7 @@ static bool install_bundled_app_macos(const BundledAppDefinition *app,
     char plist_path[PATH_MAX];
     snprintf(plist_path, sizeof(plist_path), "%s/Library/LaunchAgents/%s.plist", home_directory(), app->service_id);
     char api_socket_path[PATH_MAX];
-    default_api_socket_path(api_socket_path, sizeof(api_socket_path));
+    outer_shell_default_api_socket_path(api_socket_path, sizeof(api_socket_path));
 
     char error[1024] = "";
     if (!mkdir_p(source_is_app_bundle ? install_root : bundles_dir)) {
@@ -15789,69 +15733,8 @@ static void run_api_reactor(int api_listener) {
     free(clients);
 }
 
-#ifndef __APPLE__
-static bool root_helper_peer_allowed(int client_fd) {
-    if (g_root_helper_owner_uid == (uid_t)-1) return false;
-    struct ucred credentials;
-    socklen_t length = sizeof(credentials);
-    if (getsockopt(client_fd, SOL_SOCKET, SO_PEERCRED, &credentials, &length) != 0) {
-        return false;
-    }
-    return credentials.uid == 0;
-}
-
-static void run_root_helper_api_loop(int api_listener) {
-    if (api_listener < 0) return;
-    set_fd_nonblocking(api_listener, true);
-    while (!g_shutdown_requested) {
-        struct pollfd pfd = {.fd = api_listener, .events = POLLIN, .revents = 0};
-        int poll_result = poll(&pfd, 1, socket_activation_enabled() ? 60000 : 1000);
-        if (poll_result == 0) {
-            if (socket_activation_enabled()) break;
-            continue;
-        }
-        if (poll_result < 0) {
-            if (errno == EINTR) continue;
-            break;
-        }
-        if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) break;
-        if (!(pfd.revents & POLLIN)) continue;
-
-        struct sockaddr_storage peer;
-        socklen_t peer_len = sizeof(peer);
-        int client_fd = accept(api_listener, (struct sockaddr *)&peer, &peer_len);
-        if (client_fd < 0) {
-            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
-            break;
-        }
-        if (!root_helper_peer_allowed(client_fd)) {
-            close(client_fd);
-            continue;
-        }
-
-        char request[READ_BUFFER_SIZE];
-        unsigned char length_bytes[4];
-        bool ok = read_exact_with_timeout(client_fd, length_bytes, sizeof(length_bytes), 5000);
-        uint32_t message_length = ok ? read_uint32_le(length_bytes) : 0;
-        if (ok && message_length <= READ_BUFFER_SIZE - 4) {
-            memcpy(request, length_bytes, sizeof(length_bytes));
-            ok = read_exact_with_timeout(client_fd, request + 4, message_length, 5000);
-        } else {
-            ok = false;
-        }
-        if (ok) {
-            ReactorClient client = {0};
-            client.fd = client_fd;
-            client.is_api = true;
-            (void)process_api_client_request(&client, request, (size_t)message_length + 4);
-        }
-        close(client_fd);
-    }
-}
-#endif
-
 static void outershelld_usage(const char *program) {
-    fprintf(stderr, "Usage: %s [--api-socket-path PATH] [--database PATH] [--system-database PATH] [--bundled-apps-dir DIR] [--public-base-url URL] [--stay-alive] [--migrate-user-state-only] [--root-helper --root-helper-owner-uid UID]\n", program);
+    fprintf(stderr, "Usage: %s [--api-socket-path PATH] [--database PATH] [--system-database PATH] [--bundled-apps-dir DIR] [--public-base-url URL] [--stay-alive] [--migrate-user-state-only]\n", program);
 }
 
 static void initialize_runtime_paths(char *api_socket_path, size_t api_socket_path_size) {
@@ -15861,7 +15744,7 @@ static void initialize_runtime_paths(char *api_socket_path, size_t api_socket_pa
     }
     default_registry_database_path(g_registry_database_path, sizeof(g_registry_database_path));
     default_system_registry_database_path(g_system_registry_database_path, sizeof(g_system_registry_database_path));
-    default_api_socket_path(api_socket_path, api_socket_path_size);
+    outer_shell_default_api_socket_path(api_socket_path, api_socket_path_size);
     const char *api_socket_env = getenv("OUTERSHELLD_API_SOCKET");
     if (api_socket_env && api_socket_env[0]) {
         expand_tilde_path(api_socket_env, api_socket_path, api_socket_path_size);
@@ -15872,9 +15755,6 @@ int OuterShelldMain(int argc, char **argv) {
     char api_socket_path[PATH_MAX] = "";
     initialize_runtime_paths(api_socket_path, sizeof(api_socket_path));
     bool migrate_user_state_only = false;
-#ifndef __APPLE__
-    bool root_helper_mode = false;
-#endif
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--api-socket-path") == 0 && i + 1 < argc) {
@@ -15893,60 +15773,11 @@ int OuterShelldMain(int argc, char **argv) {
             g_stay_alive_when_socket_idle = true;
         } else if (strcmp(argv[i], "--migrate-user-state-only") == 0) {
             migrate_user_state_only = true;
-        } else if (strcmp(argv[i], "--root-helper") == 0) {
-#ifdef __APPLE__
-            outershelld_usage(argv[0]);
-            return 2;
-#else
-            root_helper_mode = true;
-#endif
-        } else if (strcmp(argv[i], "--root-helper-owner-uid") == 0 && i + 1 < argc) {
-#ifdef __APPLE__
-            outershelld_usage(argv[0]);
-            return 2;
-#else
-            char *end = NULL;
-            unsigned long value = strtoul(argv[++i], &end, 10);
-            if (!end || *end != '\0') {
-                outershelld_usage(argv[0]);
-                return 2;
-            }
-            g_root_helper_owner_uid = (uid_t)value;
-#endif
         } else {
             outershelld_usage(argv[0]);
             return 2;
         }
     }
-
-#ifndef __APPLE__
-    if (root_helper_mode) {
-        if (g_root_helper_owner_uid == (uid_t)-1 || geteuid() != 0) {
-            fprintf(stderr, "root helper mode requires root and --root-helper-owner-uid.\n");
-            return 2;
-        }
-        snprintf(g_registry_database_path, sizeof(g_registry_database_path), "%s", g_system_registry_database_path);
-        int api_listener = systemd_activated_listener_named("api", &g_api_systemd_socket_activation);
-        clear_systemd_activation_environment();
-        if (api_listener < 0) {
-            api_listener = create_unix_listener(api_socket_path);
-        }
-        if (api_socket_path[0]) {
-            snprintf(g_api_socket_path, sizeof(g_api_socket_path), "%s", api_socket_path);
-        }
-        if (api_listener < 0) return 1;
-        g_api_listener_fd = api_listener;
-        fprintf(stderr, "outershelld root helper API listening on %s\n", api_socket_path[0] ? api_socket_path : "(socket activated)");
-        fprintf(stderr, "System registry database: %s\n", g_registry_database_path);
-        run_root_helper_api_loop(api_listener);
-        close(api_listener);
-        g_api_listener_fd = -1;
-        if (g_api_socket_path[0] && !g_api_systemd_socket_activation) {
-            unlink(g_api_socket_path);
-        }
-        return 0;
-    }
-#endif
 
     if (migrate_user_state_only) {
         migrate_user_outershell_state();

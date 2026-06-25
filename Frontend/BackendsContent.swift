@@ -4428,14 +4428,14 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 }
                 if let http = response as? HTTPURLResponse, http.statusCode >= 400 {
                     if !quiet || self.backends.isEmpty {
-                        self.backendError = "Backends API returned HTTP \(http.statusCode)."
+                        self.backendError = "Outer Shell API returned HTTP \(http.statusCode)."
                         self.updateLayout()
                     }
                     return
                 }
                 guard let data else {
                     if !quiet || self.backends.isEmpty {
-                        self.backendError = "Backends API returned no data."
+                        self.backendError = "Outer Shell API returned no data."
                         self.updateLayout()
                     }
                     return
@@ -4467,7 +4467,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                         self.fetchSelectedLog()
                     }
                 } catch {
-                    self.backendError = "Could not decode Backends API response."
+                    self.backendError = "Could not decode Outer Shell API response."
                     self.updateLayout()
                 }
             }
