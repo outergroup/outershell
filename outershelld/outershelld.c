@@ -6402,7 +6402,6 @@ static bool uninstall_local_home_screen(const char *sudo_password,
                                         bool remove_user_state,
                                         char *message,
                                         size_t message_size);
-static bool frontend_endpoint_is_ready(int port, const char *socket_path, bool system_scope);
 static bool frontend_endpoint_is_passively_ready(int port, const char *socket_path);
 static uint64_t frontend_endpoint_readiness_state_token(void);
 
@@ -7009,80 +7008,12 @@ static bool try_connect_tcp_port(int port) {
     return ok;
 }
 
-static bool try_connect_unix_socket(const char *socket_path) {
-    if (!socket_path || !socket_path[0] ||
-        strlen(socket_path) >= sizeof(((struct sockaddr_un *)0)->sun_path)) {
-        return false;
-    }
-
-    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (fd < 0) return false;
-
-    struct sockaddr_un addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sun_family = AF_UNIX;
-    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", socket_path);
-
-    bool ok = false;
-    if (set_fd_nonblocking(fd, true)) {
-        int result = connect(fd, (struct sockaddr *)&addr, sizeof(addr));
-        if (result == 0) {
-            ok = true;
-        } else if (errno == EINPROGRESS) {
-            struct pollfd pfd = {.fd = fd, .events = POLLOUT, .revents = 0};
-            if (poll(&pfd, 1, 250) > 0 && (pfd.revents & POLLOUT)) {
-                int socket_error = 0;
-                socklen_t socket_error_size = sizeof(socket_error);
-                if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &socket_error, &socket_error_size) == 0 &&
-                    socket_error == 0) {
-                    ok = true;
-                }
-            }
-        }
-    }
-    close(fd);
-    return ok;
-}
-
-static bool frontend_endpoint_is_ready(int port, const char *socket_path, bool system_scope) {
-    if (socket_path && socket_path[0]) {
-        if (system_scope) {
-            return true;
-        }
-        return try_connect_unix_socket(socket_path);
-    }
-    if (port > 0) {
-        return try_connect_tcp_port(port);
-    }
-    return false;
-}
-
 static bool frontend_endpoint_is_passively_ready(int port, const char *socket_path) {
     if (port > 0) {
         return try_connect_tcp_port(port);
     }
     (void)socket_path;
     return false;
-}
-
-static bool any_frontend_endpoint_ready(const RegistryStore *database, const char *service_id, bool system_scope, bool *has_endpoint) {
-    *has_endpoint = false;
-    bool ready = false;
-    for (size_t i = 0; database && i < database->frontend_count; i++) {
-        const RegistryFrontendRecord *record = &database->frontends[i];
-        if (strcmp(record->service_id ? record->service_id : "", service_id ? service_id : "") != 0) continue;
-        int port = record->port;
-        const char *socket_path = record->socket_path ? record->socket_path : "";
-        if (port <= 0 && (!socket_path || !socket_path[0])) {
-            continue;
-        }
-        *has_endpoint = true;
-        if (frontend_endpoint_is_ready(port, socket_path, system_scope)) {
-            ready = true;
-            break;
-        }
-    }
-    return ready;
 }
 
 static uint64_t frontend_endpoint_readiness_store_token(const RegistryStore *database) {
@@ -7114,44 +7045,6 @@ static uint64_t frontend_endpoint_readiness_state_token(void) {
         registry_store_free(&database);
     }
     return token;
-}
-
-static bool wait_for_frontend_endpoint_ready(const char *service_id,
-                                             const char *scope,
-                                             char *message,
-                                             size_t message_size) {
-    const bool system_scope = scope && strcmp(scope, "system") == 0;
-    const int64_t deadline = monotonic_milliseconds() + 15000;
-    int sleep_us = 100000;
-    bool saw_endpoint = false;
-
-    while (monotonic_milliseconds() < deadline) {
-        char error[512] = "";
-        RegistryStore database;
-        bool have_database = system_scope
-            ? registry_store_open_system_readonly(&database, error, sizeof(error))
-            : registry_store_open_user_readonly(&database, error, sizeof(error));
-        if (have_database) {
-            bool has_endpoint = false;
-            bool ready = any_frontend_endpoint_ready(&database, service_id, system_scope, &has_endpoint);
-            registry_store_free(&database);
-            if (has_endpoint) saw_endpoint = true;
-            if (ready) {
-                snprintf(message, message_size, "Started and frontend endpoint is ready.");
-                return true;
-            }
-        }
-
-        usleep((useconds_t)sleep_us);
-        if (sleep_us < 500000) sleep_us += 100000;
-    }
-
-    snprintf(message,
-             message_size,
-             saw_endpoint
-                 ? "Started, but timed out waiting for the frontend endpoint."
-                 : "Started, but no frontend endpoint is registered yet.");
-    return false;
 }
 
 static void send_events_response(int fd,
@@ -7650,18 +7543,8 @@ static void send_control_response(int fd, const char *query, const char *body) {
                                                    &needs_password,
                                                    message,
                                                    sizeof(message));
-        if (ok && strcmp(operation, "start") == 0) {
-            char wait_message[1024] = "";
-            bool system_scope = strncmp(plist_path, "/Library/LaunchDaemons/", 23) == 0;
-            if (wait_for_frontend_endpoint_ready(service_id,
-                                                 system_scope ? "system" : "user",
-                                                 wait_message,
-                                                 sizeof(wait_message))) {
-                snprintf(message, sizeof(message), "%s", wait_message);
-            } else {
-                ok = false;
-                snprintf(message, sizeof(message), "%s", wait_message);
-            }
+        if (ok && strcmp(operation, "start") == 0 && strcmp(message, "ok") == 0) {
+            snprintf(message, sizeof(message), "Start requested.");
         }
         log_event("%s launchd operation %s for %s: %s",
                   ok ? "Completed" : "Failed",
@@ -7747,14 +7630,8 @@ static void send_control_response(int fd, const char *query, const char *body) {
     if (ok) {
         invalidate_systemd_status_cache();
     }
-    if (ok && strcmp(operation, "start") == 0) {
-        char wait_message[1024] = "";
-        if (wait_for_frontend_endpoint_ready(service_id, scope, wait_message, sizeof(wait_message))) {
-            snprintf(message, sizeof(message), "%s", wait_message);
-        } else {
-            ok = false;
-            snprintf(message, sizeof(message), "%s", wait_message);
-        }
+    if (ok && strcmp(operation, "start") == 0 && strcmp(message, "ok") == 0) {
+        snprintf(message, sizeof(message), "Start requested.");
     }
     log_event("%s systemd operation %s for %s (%s): %s",
               ok ? "Completed" : "Failed",
