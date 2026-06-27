@@ -1,5 +1,7 @@
 # Outer Shell Uninstall Considerations
 
+_(This is a quick analysis written by a coding agent, so it can use it as a reference in the future.)_
+
 Outer Shell uninstall is more delicate than normal install because the code doing the uninstall may be part of the service being removed. This is most visible on Linux, where the UI request arrives in `OuterShellBackend`, which asks `outershelld` to run the public installer in `uninstall` mode. During that operation, the uninstall may stop and remove both `OuterShellBackend` and `outershelld`.
 
 ## Why It Is Delicate
