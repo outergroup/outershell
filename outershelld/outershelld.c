@@ -14683,8 +14683,6 @@ static bool root_helper_registry_upsert_bundled_openers(const BundledAppDefiniti
                                                         char *message,
                                                         size_t message_size) {
     if (!app) return true;
-    char *clear_argv[] = {"outerctl", "opener", "clear", "--backend", (char *)app->service_id, NULL};
-    if (!root_helper_outerctl(5, clear_argv, sudo_password, needs_password, message, message_size)) return false;
     if (!app->openers || app->opener_count == 0) return true;
     if (!socket_path || !socket_path[0]) {
         snprintf(message, message_size, "Missing opener socket path.");
@@ -14702,6 +14700,17 @@ static bool root_helper_registry_upsert_bundled_openers(const BundledAppDefiniti
         } else {
             snprintf(capabilities_string, sizeof(capabilities_string), "view,edit");
         }
+        char *remove_argv[] = {
+            "outerctl",
+            "opener",
+            "remove",
+            "--backend",
+            (char *)app->service_id,
+            "--content-type",
+            (char *)app->openers[i].content_type,
+            NULL
+        };
+        if (!root_helper_outerctl(7, remove_argv, sudo_password, needs_password, message, message_size)) return false;
         char *add_argv[] = {
             "outerctl",
             "opener",
@@ -14895,7 +14904,7 @@ static bool api_registry_list_row_size(uint16_t response_type, uint32_t *row_siz
         *row_size = 16;
         return true;
     case OUTERSHELLD_API_CONTENT_TYPE_LIST_RESPONSE:
-        *row_size = 56;
+        *row_size = 48;
         return true;
     case OUTERSHELLD_API_OPENER_LIST_RESPONSE:
         *row_size = 48;
