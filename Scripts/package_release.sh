@@ -39,6 +39,7 @@ require_file "${RUN_ROOT}/bundles/OuterShell.bundle.macos-x86.aar"
 require_file "${MACOS_BUILD_ROOT}/Outer Shell.app/Contents/MacOS/Outer Shell"
 require_file "${MACOS_BUILD_ROOT}/outershelld"
 require_file "${REPO_ROOT}/app-icon.png"
+require_file "${REPO_ROOT}/OuterShell.icns"
 if [[ -n "${APP_CATALOG_PATH}" ]]; then
     require_file "${APP_CATALOG_PATH}"
 fi
@@ -126,6 +127,7 @@ stage_home_screen_macos() {
     rm -rf "${app_bundle}/Contents/Resources/bundles"
     mkdir -p "${app_bundle}/Contents/Resources/bundles"
     install -m 0644 "${REPO_ROOT}/app-icon.png" "${app_bundle}/Contents/Resources/app-icon.png"
+    install -m 0644 "${REPO_ROOT}/OuterShell.icns" "${app_bundle}/Contents/Resources/OuterShell.icns"
     install -m 0644 "${RUN_ROOT}/bundles/OuterShell.bundle.macos-arm.aar" "${app_bundle}/Contents/Resources/bundles/OuterShell.bundle.macos-arm.aar"
     install -m 0644 "${RUN_ROOT}/bundles/OuterShell.bundle.macos-x86.aar" "${app_bundle}/Contents/Resources/bundles/OuterShell.bundle.macos-x86.aar"
     thin_macho "${MACOS_BUILD_ROOT}/Outer Shell.app/Contents/MacOS/Outer Shell" "${macho_arch}" "${app_bundle}/Contents/MacOS/Outer Shell"
@@ -477,6 +479,10 @@ EOF
 <dict>
   <key>Label</key>
   <string>org.outershell.OuterShell</string>
+  <key>AssociatedBundleIdentifiers</key>
+  <array>
+    <string>org.outershell.OuterShell.Agent</string>
+  </array>
   <key>ProgramArguments</key>
   <array>
     <string>$app_executable_xml</string>

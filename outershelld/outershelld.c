@@ -7007,7 +7007,14 @@ static void managed_backend_script_path(const char *service_id,
         default_user_outershell_app_root(service_id, install_root, sizeof(install_root));
     }
 
-    const char *filenames[] = {"run.sh", "run.py"};
+    char shell_script_name[320];
+    char python_script_name[320];
+    char sanitized_service_id[256];
+    sanitize_identifier_component(service_id, sanitized_service_id, sizeof(sanitized_service_id));
+    snprintf(shell_script_name, sizeof(shell_script_name), "%s.sh", sanitized_service_id);
+    snprintf(python_script_name, sizeof(python_script_name), "%s.py", sanitized_service_id);
+
+    const char *filenames[] = {shell_script_name, python_script_name, "run.sh", "run.py"};
     for (size_t i = 0; i < sizeof(filenames) / sizeof(filenames[0]); i++) {
         char candidate[PATH_MAX];
         snprintf(candidate, sizeof(candidate), "%s/%s", install_root, filenames[i]);
@@ -9149,6 +9156,10 @@ static bool ensure_root_helper_installed(const char *sudo_password, bool *needs_
             "<dict>\n"
             "    <key>Label</key>\n"
             "    <string>org.outershell.outershelld</string>\n"
+            "    <key>AssociatedBundleIdentifiers</key>\n"
+            "    <array>\n"
+            "        <string>org.outershell.OuterShell.Agent</string>\n"
+            "    </array>\n"
             "    <key>ProgramArguments</key>\n"
             "    <array>\n"
             "        <string>%s</string>\n"
@@ -10193,6 +10204,16 @@ static bool make_jupyter_script(const char *service_id,
     ok = ok && sb_append(builder,
         "    pass\n");
     return ok;
+}
+
+static void managed_backend_script_filename(const char *service_id,
+                                            const char *extension,
+                                            char *out,
+                                            size_t out_size) {
+    if (!out || out_size == 0) return;
+    char sanitized_service_id[256];
+    sanitize_identifier_component(service_id, sanitized_service_id, sizeof(sanitized_service_id));
+    snprintf(out, out_size, "%s.%s", sanitized_service_id, extension && extension[0] ? extension : "sh");
 }
 
 static bool register_created_backend(const char *service_id,
@@ -12768,6 +12789,10 @@ static bool make_bundled_launchd_plist(const char *label,
     ok = ok && sb_append_xml_escaped(builder, label);
     ok = ok && sb_append(builder,
                          "</string>\n"
+                         "    <key>AssociatedBundleIdentifiers</key>\n"
+                         "    <array>\n"
+                         "        <string>org.outershell.OuterShell.Agent</string>\n"
+                         "    </array>\n"
                          "    <key>ProgramArguments</key>\n"
                          "    <array>\n");
     ok = ok && append_xml_string_element(builder, binary_path);
@@ -13953,6 +13978,10 @@ static bool make_launchd_plist(const char *label,
     ok = ok && sb_append_xml_escaped(builder, label);
     ok = ok && sb_append(builder,
                          "</string>\n"
+                         "    <key>AssociatedBundleIdentifiers</key>\n"
+                         "    <array>\n"
+                         "        <string>org.outershell.OuterShell.Agent</string>\n"
+                         "    </array>\n"
                          "    <key>ProgramArguments</key>\n"
                          "    <array>\n"
                          "        <string>");
@@ -14099,11 +14128,16 @@ static void send_create_response(int fd, const char *query) {
                                        strcmp(recipe, "jupyter") == 0 ||
                                        strcmp(recipe, "jupyter-uv") == 0;
         if (generated_script_recipe) {
+            char script_filename[320];
+            managed_backend_script_filename(service_id,
+                                            (strcmp(recipe, "jupyter") == 0 || strcmp(recipe, "jupyter-uv") == 0) ? "py" : "sh",
+                                            script_filename,
+                                            sizeof(script_filename));
             snprintf(script_path,
                      sizeof(script_path),
                      "%s/%s",
                      backend_dir,
-                     (strcmp(recipe, "jupyter") == 0 || strcmp(recipe, "jupyter-uv") == 0) ? "run.py" : "run.sh");
+                     script_filename);
         }
 
         if (strcmp(recipe, "command-port") == 0) {
@@ -14247,7 +14281,9 @@ static void send_create_response(int fd, const char *query) {
 #ifdef __APPLE__
     if (!recipe[0]) {
         char script_path[PATH_MAX];
-        snprintf(script_path, sizeof(script_path), "%s/run.sh", backend_dir);
+        char script_filename[320];
+        managed_backend_script_filename(service_id, "sh", script_filename, sizeof(script_filename));
+        snprintf(script_path, sizeof(script_path), "%s/%s", backend_dir, script_filename);
         StringBuilder script = {0};
         bool script_ok = sb_append(&script, "#!/bin/sh\nset -eu\nexec /bin/sh -lc ");
         char quoted_raw_command[9000];

@@ -8,6 +8,7 @@
 
 /* Begin PBXBuildFile section */
 		37AA00012FEA000000000009 /* app-icon.png in Resources */ = {isa = PBXBuildFile; fileRef = 37AA00022FEA000000000009 /* app-icon.png */; };
+		37AA00032FEA000000000009 /* OuterShell.icns in Resources */ = {isa = PBXBuildFile; fileRef = 37AA00042FEA000000000009 /* OuterShell.icns */; };
 		37B4F9D12FA1B00100873894 /* outershelld.c in Sources */ = {isa = PBXBuildFile; fileRef = 37B4F9D02FA1B00100873894 /* outershelld.c */; };
 		37B4F9DE2FA1B00100873894 /* OuterShellBuffer.c in Sources */ = {isa = PBXBuildFile; fileRef = 37B4F9DC2FA1B00100873894 /* OuterShellBuffer.c */; };
 		37B4F9DF2FA1B00100873894 /* OuterShellAPI.c in Sources */ = {isa = PBXBuildFile; fileRef = 37B4F9E02FA1B00100873894 /* OuterShellAPI.c */; };
@@ -42,6 +43,7 @@
 		0F0000000000000000000009 /* build_site.sh */ = {isa = PBXFileReference; lastKnownFileType = text.script.sh; path = build_site.sh; sourceTree = "<group>"; };
 		0F000000000000000000000A /* .gitignore */ = {isa = PBXFileReference; lastKnownFileType = text; path = .gitignore; sourceTree = "<group>"; };
 		37AA00022FEA000000000009 /* app-icon.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = "app-icon.png"; sourceTree = "<group>"; };
+		37AA00042FEA000000000009 /* OuterShell.icns */ = {isa = PBXFileReference; lastKnownFileType = image.icns; path = OuterShell.icns; sourceTree = "<group>"; };
 		37B4F9C12FA189AB00873894 /* AGENTS.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = AGENTS.md; sourceTree = "<group>"; };
 		37B4F9C22FA18C1E00873894 /* LICENSE */ = {isa = PBXFileReference; lastKnownFileType = text; path = LICENSE; sourceTree = "<group>"; };
 		37B4F9CF2FA1B00100873894 /* outershelld */ = {isa = PBXFileReference; explicitFileType = "compiled.mach-o.executable"; includeInIndex = 0; path = outershelld; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -58,6 +60,7 @@
 		37B4F9F22FA1B00100873894 /* OuterShellDownloaderApple.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = OuterShellDownloaderApple.m; sourceTree = "<group>"; };
 		AG0000000000000000000001 /* Outer Shell.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "Outer Shell.app"; sourceTree = BUILT_PRODUCTS_DIR; };
 		AG0000000000000000000003 /* OuterShellAgent.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OuterShellAgent.swift; sourceTree = "<group>"; };
+		AG0000000000000000000023 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -113,6 +116,7 @@
 				0F0000000000000000000005 /* Vendor */,
 				0F0000000000000000000006 /* Scripts */,
 				37AA00022FEA000000000009 /* app-icon.png */,
+				37AA00042FEA000000000009 /* OuterShell.icns */,
 				0F0000000000000000000007 /* Info.plist */,
 				0F0000000000000000000008 /* README.md */,
 				37B4F9C12FA189AB00873894 /* AGENTS.md */,
@@ -162,6 +166,7 @@
 			isa = PBXGroup;
 			children = (
 				AG0000000000000000000003 /* OuterShellAgent.swift */,
+				AG0000000000000000000023 /* Info.plist */,
 			);
 			path = Agent;
 			sourceTree = "<group>";
@@ -288,6 +293,7 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				37AA00032FEA000000000009 /* OuterShell.icns in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -584,10 +590,8 @@
 					"OUTER_SHELL_BACKEND_LIBRARY=1",
 					"$(inherited)",
 				);
-				GENERATE_INFOPLIST_FILE = YES;
-				INFOPLIST_KEY_CFBundleDisplayName = "Outer Shell";
-				INFOPLIST_KEY_LSUIElement = YES;
-				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = Agent/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",
@@ -621,10 +625,8 @@
 					"OUTER_SHELL_BACKEND_LIBRARY=1",
 					"$(inherited)",
 				);
-				GENERATE_INFOPLIST_FILE = YES;
-				INFOPLIST_KEY_CFBundleDisplayName = "Outer Shell";
-				INFOPLIST_KEY_LSUIElement = YES;
-				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = Agent/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",

@@ -105,6 +105,8 @@ cp "${RUN_ROOT}/bundles"/OuterShell.bundle.*.aar \
     "${BUILD_ROOT}/${CONFIGURATION}/Outer Shell.app/Contents/Resources/bundles/"
 cp "${SCRIPT_DIR}/app-icon.png" \
     "${BUILD_ROOT}/${CONFIGURATION}/Outer Shell.app/Contents/Resources/app-icon.png"
+cp "${SCRIPT_DIR}/OuterShell.icns" \
+    "${BUILD_ROOT}/${CONFIGURATION}/Outer Shell.app/Contents/Resources/OuterShell.icns"
 rm -rf "${BUILD_ROOT}/${CONFIGURATION}/Outer Shell.app/Contents/Resources/bundled-apps"
 
 echo "==> Staging bundled Top"
