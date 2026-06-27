@@ -23,7 +23,7 @@ repositories and publish their own payload archives.
   content-type/openers metadata, app install records, and log metadata.
 - `outerctl`: the small command-line client used by installers and apps to update
   the registry through `outershelld`.
-- `Backends` Xcode target: the Outerframe frontend bundle for the Outer Shell UI.
+- `Outer Shell` Xcode target: the Outerframe frontend bundle for the Outer Shell UI.
 - `Resources/app-catalog.example.json`: the app catalog schema used to discover
   installable starter apps.
 

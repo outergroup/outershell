@@ -16,9 +16,9 @@
             <BuildableReference
                BuildableIdentifier = "primary"
                BlueprintIdentifier = "0F000000000000000000000B"
-               BuildableName = "Backends.bundle"
-               BlueprintName = "Backends"
-               ReferencedContainer = "container:Backends.xcodeproj">
+               BuildableName = "Outer Shell.bundle"
+               BlueprintName = "Outer Shell"
+               ReferencedContainer = "container:outershell.xcodeproj">
             </BuildableReference>
          </BuildActionEntry>
       </BuildActionEntries>
@@ -51,9 +51,9 @@
          <BuildableReference
             BuildableIdentifier = "primary"
             BlueprintIdentifier = "0F000000000000000000000B"
-            BuildableName = "Backends.bundle"
-            BlueprintName = "Backends"
-            ReferencedContainer = "container:Backends.xcodeproj">
+            BuildableName = "Outer Shell.bundle"
+            BlueprintName = "Outer Shell"
+            ReferencedContainer = "container:outershell.xcodeproj">
          </BuildableReference>
       </MacroExpansion>
    </ProfileAction>

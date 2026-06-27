@@ -41,10 +41,10 @@ mkdir -p \
     "${TOP_APP_ROOT}/Contents/MacOS" \
     "${TOP_APP_ROOT}/Contents/Resources/bundles"
 
-echo "==> Building Backends.bundle"
+echo "==> Building Outer Shell.bundle"
 /usr/bin/xcodebuild \
-    -project "${SCRIPT_DIR}/Backends.xcodeproj" \
-    -scheme Backends \
+    -project "${SCRIPT_DIR}/outershell.xcodeproj" \
+    -scheme "Outer Shell" \
     -configuration "${CONFIGURATION}" \
     SYMROOT="${BUILD_ROOT}" \
     ARCHS="arm64 x86_64" \
@@ -55,7 +55,7 @@ echo "==> Building Backends.bundle"
 
 echo "==> Building outershelld"
 /usr/bin/xcodebuild \
-    -project "${SCRIPT_DIR}/Backends.xcodeproj" \
+    -project "${SCRIPT_DIR}/outershell.xcodeproj" \
     -target outershelld \
     -configuration "${CONFIGURATION}" \
     SYMROOT="${BUILD_ROOT}" \
@@ -64,7 +64,7 @@ echo "==> Building outershelld"
 
 echo "==> Building Outer Shell agent"
 /usr/bin/xcodebuild \
-    -project "${SCRIPT_DIR}/Backends.xcodeproj" \
+    -project "${SCRIPT_DIR}/outershell.xcodeproj" \
     -target OuterShellAgent \
     -configuration "${CONFIGURATION}" \
     SYMROOT="${BUILD_ROOT}" \
@@ -95,8 +95,8 @@ echo "==> Building bundled Top content"
     build
 
 echo "==> Archiving OuterShell bundles"
-"${SCRIPT_DIR}/Scripts/archive_backends_bundle.sh" \
-    "${BUILD_ROOT}/${CONFIGURATION}/Backends.bundle" \
+"${SCRIPT_DIR}/Scripts/archive_outershell_bundle.sh" \
+    "${BUILD_ROOT}/${CONFIGURATION}/Outer Shell.bundle" \
     "${RUN_ROOT}/bundles" \
     OuterShell.bundle
 rm -rf "${BUILD_ROOT}/${CONFIGURATION}/Outer Shell.app/Contents/Resources/bundles"
@@ -151,9 +151,6 @@ cp "${TOP_APP_ROOT}/Contents/Resources/app-icon.png" \
 if command -v /usr/bin/codesign >/dev/null 2>&1; then
     /usr/bin/codesign --force --sign - --timestamp=none "${TOP_APP_ROOT}" >/dev/null
 fi
-
-ln -sf "Outer Shell.app/Contents/MacOS/Outer Shell" "${BUILD_ROOT}/${CONFIGURATION}/BackendsBackend"
-ln -sf "Outer Shell.app/Contents/MacOS/Outer Shell" "${BUILD_ROOT}/${CONFIGURATION}/NavigatorBackend"
 
 echo "Built:"
 echo "  ${BUILD_ROOT}/${CONFIGURATION}/outershelld"
