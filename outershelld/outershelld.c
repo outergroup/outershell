@@ -16018,6 +16018,7 @@ static void run_api_reactor(int api_listener) {
         int64_t now = monotonic_milliseconds();
         for (size_t i = client_count; i > 0; i--) {
             size_t index = i - 1;
+            if (clients[index].waiting_for_events) continue;
             if (now - clients[index].last_activity_ms > CLIENT_IDLE_TIMEOUT_MS) {
                 close_reactor_client(clients, &client_count, index);
             }
