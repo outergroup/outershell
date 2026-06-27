@@ -17,7 +17,6 @@ A content type record contains:
 - `display_name`: label shown to people
 - `conforms_to`: content type identifiers this type conforms to
 - `extensions`: filename extensions without leading dots
-- `filenames`: exact filenames, for example `Makefile`
 - `mime_types`: MIME type hints
 
 An opener says that a backend can open files whose inferred content type is the
@@ -88,7 +87,6 @@ outerctl content-type add \
   --name 'Example Source' \
   --conforms-to public.text \
   --extensions example,exs \
-  --filenames Examplefile \
   --mime-types text/x-example
 ```
 
@@ -162,10 +160,10 @@ Default API socket:
 - macOS: `$OUTERSHELLD_API_SOCKET`, otherwise `$DARWIN_USER_TEMP_DIR/outershelld-api`, `$TMPDIR/outershelld-api`, or `/tmp/outershelld-api-<uid>`
 - Linux: `$OUTERSHELLD_API_SOCKET`, otherwise `$XDG_RUNTIME_DIR/outershelld-api` or `/run/user/<uid>/outershelld-api`
 
-Request message type: `31` (`OUTERSHELLD_API_FILE_OPENERS_QUERY`)
+Request message type: `25` (`OUTERSHELLD_API_FILE_OPENERS_QUERY`)
 
 ```text
-bytes 0..1:    UInt16 message type = 31
+bytes 0..1:    UInt16 message type = 25
 bytes 2..9:    StringRef32 file path
 bytes 10..17:  StringRef32 content type, optional
 bytes 18..25:  StringRef32 requester user, optional
@@ -176,10 +174,10 @@ path. If a content type is provided, `outershelld` expands it through its
 `conforms_to` graph. If `requester user` is present, `outershelld` queries
 that user's registry before adding accessible system-registry openers.
 
-Response message type: `107` (`OUTERSHELLD_API_FILE_OPENERS_RESPONSE`)
+Response message type: `106` (`OUTERSHELLD_API_FILE_OPENERS_RESPONSE`)
 
 ```text
-bytes 0..1:    UInt16 message type = 107
+bytes 0..1:    UInt16 message type = 106
 bytes 2..5:    UInt32 status, 0 for success
 bytes 6..13:   StringRef32 error message
 bytes 14..17:  UInt32 opener row count
@@ -196,8 +194,8 @@ bytes 40..43:  UInt32 capability flags
 
 Lookup behavior:
 
-- A path query infers matching content types from exact filename, extension,
-  file magic, shebang, and text sniffing.
+- A path query infers matching content types from extension, built-in basename
+  rules, file magic, shebang, and text sniffing.
 - The inferred or explicit content types are expanded through `conforms_to`
   conformance.
 - User-registry rows do not require a socket accessibility check.
@@ -254,10 +252,9 @@ Content type normalization:
 - only ASCII alphanumeric characters, `.`, `-`, and `_` are accepted
 
 Extension lists in content type definitions use comma-separated extensions
-without leading dots. Matching is case-insensitive.
-
-Filename lists in content type definitions use comma-separated exact filenames.
-Matching is case-sensitive.
+without leading dots. Matching is case-insensitive. Special extensionless
+filenames such as `Makefile` are handled by built-in basename rules, not by
+custom content type definitions.
 
 On the socket API, these list-like content type fields are encoded as
 `StringListRef32` payloads, not comma-separated strings. The `outerctl`
@@ -292,7 +289,7 @@ The binary `ORWA` file has six table descriptors:
 5: file openers
 ```
 
-Content type rows are 112 bytes:
+Content type rows are 96 bytes:
 
 ```text
 bytes 0..15:    StringRef64 service_id
@@ -300,8 +297,7 @@ bytes 16..31:   StringRef64 identifier
 bytes 32..47:   StringRef64 display name
 bytes 48..63:   StringListRef64 conforms_to
 bytes 64..79:   StringListRef64 extensions
-bytes 80..95:   StringListRef64 filenames
-bytes 96..111:  StringListRef64 mime_types
+bytes 80..95:   StringListRef64 mime_types
 ```
 
 `StringListRef64` uses the same shape as `StringRef64`, but the second field is

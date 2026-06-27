@@ -208,8 +208,7 @@ bytes 10..17:  StringRef32 content type
 bytes 18..25:  StringRef32 display name
 bytes 26..33:  StringListRef32 conforms-to content types
 bytes 34..41:  StringListRef32 filename extensions
-bytes 42..49:  StringListRef32 exact filenames
-bytes 50..57:  StringListRef32 MIME types
+bytes 42..49:  StringListRef32 MIME types
 ```
 
 Returns `commandResponse` (`messageType = 100`).
@@ -339,7 +338,7 @@ bytes 8..15:  StringRef32 backend service id
 `contentTypeListResponse` (`104`) uses the common list response header. Its
 `row count` field tells you how many content-type rows follow at byte 22. Use
 the header's `row size` field as the stride between rows; the current row size
-is 56 bytes:
+is 48 bytes:
 
 ```text
 bytes 0..7:    StringRef32 backend service id, empty for built-ins
@@ -347,8 +346,7 @@ bytes 8..15:   StringRef32 identifier
 bytes 16..23:  StringRef32 display name
 bytes 24..31:  StringListRef32 conforms-to content types
 bytes 32..39:  StringListRef32 filename extensions
-bytes 40..47:  StringListRef32 exact filenames
-bytes 48..55:  StringListRef32 MIME types
+bytes 40..47:  StringListRef32 MIME types
 ```
 
 `openerListResponse` (`105`) uses the common list response header. Its `row
@@ -412,7 +410,6 @@ outerctl content-type add \
   --name 'Example Source' \
   --conforms-to public.text \
   --extensions example,exs \
-  --filenames Examplefile \
   --mime-types text/x-example
 
 outerctl opener add --backend org.outershell.Plaintext \

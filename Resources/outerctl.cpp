@@ -401,7 +401,6 @@ struct CommandRequest {
     const char *contentType = "";
     const char *conformsTo = "";
     const char *extensions = "";
-    const char *filenames = "";
     const char *mimeTypes = "";
     const char *urlTemplate = "";
 };
@@ -665,8 +664,6 @@ bool parseCommandRequest(int argc, char *argv[], CommandRequest &request, Buffer
             REQUIRE_VALUE("--conforms-to", request.conformsTo);
         } else if (strcmp(arg, "--extensions") == 0) {
             REQUIRE_VALUE("--extensions", request.extensions);
-        } else if (strcmp(arg, "--filenames") == 0) {
-            REQUIRE_VALUE("--filenames", request.filenames);
         } else if (strcmp(arg, "--mime-types") == 0) {
             REQUIRE_VALUE("--mime-types", request.mimeTypes);
         } else if (strcmp(arg, "--url-template") == 0) {
@@ -763,14 +760,13 @@ bool appendCommandRequestMessage(Buffer &message, const CommandRequest &request)
     case kMessageContentTypeAddRequest: {
         const size_t fieldsOffset = message.size;
         ok = ok &&
-            appendZeroBytes(message, 56) &&
+            appendZeroBytes(message, 48) &&
             appendOuterctlApiStringRef(message, fieldsOffset, request.backend) &&
             appendOuterctlApiStringRef(message, fieldsOffset + 8, request.contentType) &&
             appendOuterctlApiStringRef(message, fieldsOffset + 16, request.displayName) &&
             appendOuterctlApiStringListRef(message, fieldsOffset + 24, request.conformsTo) &&
             appendOuterctlApiStringListRef(message, fieldsOffset + 32, request.extensions) &&
-            appendOuterctlApiStringListRef(message, fieldsOffset + 40, request.filenames) &&
-            appendOuterctlApiStringListRef(message, fieldsOffset + 48, request.mimeTypes);
+            appendOuterctlApiStringListRef(message, fieldsOffset + 40, request.mimeTypes);
         break;
     }
     case kMessageContentTypeRemoveRequest:
@@ -855,7 +851,7 @@ bool writeRegistryListResponse(const CommandRequest &request, const Buffer &resp
     const char *backendHeaders[] = {"service_id", "display_name", "unit_name", "unit_path", "owns_unit"};
     const char *appHeaders[] = {"frontend_id", "service_id", "display_name", "endpoint_kind", "scheme", "host", "port", "socket_path", "path", "url", "icon_path", "list"};
     const char *logHeaders[] = {"path", "service_id"};
-    const char *contentTypeHeaders[] = {"service_id", "identifier", "display_name", "conforms_to", "extensions", "filenames", "mime_types"};
+    const char *contentTypeHeaders[] = {"service_id", "identifier", "display_name", "conforms_to", "extensions", "mime_types"};
     const char *openerHeaders[] = {"content_type", "service_id", "display_name", "socket_path", "url_template", "rank", "capabilities"};
 
     size_t minimumRowSize = 0;
@@ -935,7 +931,7 @@ bool writeRegistryListResponse(const CommandRequest &request, const Buffer &resp
         }
         break;
     case kMessageContentTypeListResponse:
-        minimumRowSize = 56;
+        minimumRowSize = 48;
         if (responseRowSize < minimumRowSize) {
             ok = false;
             break;
@@ -948,7 +944,7 @@ bool writeRegistryListResponse(const CommandRequest &request, const Buffer &resp
                 break;
             }
             const size_t refs[] = {0, 8, 16};
-            const size_t lists[] = {24, 32, 40, 48};
+            const size_t lists[] = {24, 32, 40};
             ok = writeTsvRefs(response, offset, refs, sizeof(refs) / sizeof(refs[0]));
             for (size_t i = 0; ok && i < sizeof(lists) / sizeof(lists[0]); i += 1) {
                 ok = fputc('\t', stdout) != EOF && writeTsvStringListRef(response, offset + lists[i]);

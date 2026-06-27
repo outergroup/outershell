@@ -1706,6 +1706,7 @@ static bool remove_bundled_root_support(const BundledAppDefinition *app,
                                         bool *needs_password,
                                         char *message,
                                         size_t message_size);
+static void repair_user_bundled_app_registry_records(void);
 #endif
 
 static const BundledAppDefinition *bundled_app_for_service_id(const char *service_id) {
@@ -3170,7 +3171,8 @@ enum {
     ORWA_STRUCTURED_FRONTENDS_ROW_SIZE = 80,
     ORWA_FRONTEND_LAYOUTS_ROW_SIZE = 32,
     ORWA_LOG_FILES_ROW_SIZE = 32,
-    ORWA_CONTENT_TYPES_ROW_SIZE = 112,
+    ORWA_LEGACY_CONTENT_TYPES_ROW_SIZE = 112,
+    ORWA_CONTENT_TYPES_ROW_SIZE = 96,
     ORWA_FILE_OPENERS_ROW_SIZE = 88
 };
 
@@ -4358,7 +4360,6 @@ typedef struct {
     char *display_name;
     RegistryStringList conforms_to;
     RegistryStringList extensions;
-    RegistryStringList filenames;
     RegistryStringList mime_types;
 } RegistryContentTypeRecord;
 
@@ -4726,7 +4727,6 @@ static void registry_store_free(RegistryStore *store) {
         free(store->content_types[i].display_name);
         registry_string_list_free(&store->content_types[i].conforms_to);
         registry_string_list_free(&store->content_types[i].extensions);
-        registry_string_list_free(&store->content_types[i].filenames);
         registry_string_list_free(&store->content_types[i].mime_types);
     }
     free(store->content_types);
@@ -4970,7 +4970,6 @@ static bool registry_store_upsert_content_type_lists(RegistryStore *store,
                                                      const char *display_name,
                                                      const RegistryStringList *conforms_to,
                                                      const RegistryStringList *extensions,
-                                                     const RegistryStringList *filenames,
                                                      const RegistryStringList *mime_types) {
     RegistryContentTypeRecord *record = registry_store_find_content_type(store, service_id, identifier);
     if (!record) {
@@ -4985,7 +4984,6 @@ static bool registry_store_upsert_content_type_lists(RegistryStore *store,
     return registry_assign_string(&record->display_name, display_name) &&
            registry_string_list_assign_copy(&record->conforms_to, conforms_to) &&
            registry_string_list_assign_copy(&record->extensions, extensions) &&
-           registry_string_list_assign_copy(&record->filenames, filenames) &&
            registry_string_list_assign_copy(&record->mime_types, mime_types);
 }
 
@@ -4995,15 +4993,12 @@ static bool registry_store_upsert_content_type(RegistryStore *store,
                                                const char *display_name,
                                                const char *conforms_to,
                                                const char *extensions,
-                                               const char *filenames,
                                                const char *mime_types) {
     RegistryStringList conforms_to_list = {0};
     RegistryStringList extensions_list = {0};
-    RegistryStringList filenames_list = {0};
     RegistryStringList mime_types_list = {0};
     bool ok = registry_string_list_assign_from_csv(&conforms_to_list, conforms_to) &&
               registry_string_list_assign_from_csv(&extensions_list, extensions) &&
-              registry_string_list_assign_from_csv(&filenames_list, filenames) &&
               registry_string_list_assign_from_csv(&mime_types_list, mime_types);
     if (ok) {
         ok = registry_store_upsert_content_type_lists(store,
@@ -5012,12 +5007,10 @@ static bool registry_store_upsert_content_type(RegistryStore *store,
                                                       display_name,
                                                       &conforms_to_list,
                                                       &extensions_list,
-                                                      &filenames_list,
                                                       &mime_types_list);
     }
     registry_string_list_free(&conforms_to_list);
     registry_string_list_free(&extensions_list);
-    registry_string_list_free(&filenames_list);
     registry_string_list_free(&mime_types_list);
     return ok;
 }
@@ -5096,7 +5089,6 @@ static void registry_store_remove_content_type_at(RegistryStore *store, size_t i
     free(record->display_name);
     registry_string_list_free(&record->conforms_to);
     registry_string_list_free(&record->extensions);
-    registry_string_list_free(&record->filenames);
     registry_string_list_free(&record->mime_types);
     memmove(record, record + 1, (store->content_type_count - index - 1) * sizeof(*record));
     store->content_type_count--;
@@ -5288,7 +5280,7 @@ static bool registry_store_load_orwa_file(RegistryStore *store, const char *path
         uint32_t expected_row_size = i == ORWA_TABLE_BACKENDS ? ORWA_BACKENDS_ROW_SIZE :
                                      i == ORWA_TABLE_FRONTENDS ? descriptors[i].row_size :
                                      i == ORWA_TABLE_FRONTEND_LAYOUTS && table_count != ORWA_LEGACY_THREE_TABLE_COUNT ? ORWA_FRONTEND_LAYOUTS_ROW_SIZE :
-                                     i == ORWA_TABLE_CONTENT_TYPES ? ORWA_CONTENT_TYPES_ROW_SIZE :
+                                     i == ORWA_TABLE_CONTENT_TYPES ? descriptors[i].row_size :
                                      i == ORWA_TABLE_FILE_OPENERS ? ORWA_FILE_OPENERS_ROW_SIZE :
                                      ORWA_LOG_FILES_ROW_SIZE;
         bool row_size_supported = descriptors[i].row_size == expected_row_size;
@@ -5309,16 +5301,20 @@ static bool registry_store_load_orwa_file(RegistryStore *store, const char *path
                    descriptors[i].row_size != ORWA_FRONTENDS_ROW_SIZE_WITH_FLAGS &&
                    descriptors[i].row_size != ORWA_LEGACY_FRONTENDS_ROW_SIZE)
                 : i == ORWA_TABLE_CONTENT_TYPES
-                ? false
+                ? (descriptors[i].row_size != ORWA_CONTENT_TYPES_ROW_SIZE &&
+                   descriptors[i].row_size != ORWA_LEGACY_CONTENT_TYPES_ROW_SIZE)
                 : !row_size_supported) ||
             (i != ORWA_TABLE_CONTENT_TYPES && !bounds_valid)) {
             snprintf(error, error_size, "Registry binary table descriptor is invalid.");
             ok = false;
             break;
         }
-        if (i == ORWA_TABLE_CONTENT_TYPES && (!row_size_supported || !bounds_valid)) {
-            content_types_table_supported = false;
-            store->needs_rewrite = true;
+        if (i == ORWA_TABLE_CONTENT_TYPES) {
+            if (descriptors[i].row_size == ORWA_LEGACY_CONTENT_TYPES_ROW_SIZE) store->needs_rewrite = true;
+            if (!bounds_valid) {
+                content_types_table_supported = false;
+                store->needs_rewrite = true;
+            }
         }
         if (bounds_valid && table_end > variable_offset) variable_offset = table_end;
     }
@@ -5497,15 +5493,14 @@ static bool registry_store_load_orwa_file(RegistryStore *store, const char *path
             char *service_id = NULL, *identifier = NULL, *display_name = NULL;
             RegistryStringList conforms_to = {0};
             RegistryStringList extensions = {0};
-            RegistryStringList filenames = {0};
             RegistryStringList mime_types = {0};
+            const size_t mime_types_offset = descriptors[ORWA_TABLE_CONTENT_TYPES].row_size == ORWA_LEGACY_CONTENT_TYPES_ROW_SIZE ? 96 : 80;
             ok = registry_store_read_string(bytes, file_size, variable_offset, row_bytes, 0, &service_id, error, error_size) &&
                  registry_store_read_string(bytes, file_size, variable_offset, row_bytes, 16, &identifier, error, error_size) &&
                  registry_store_read_string(bytes, file_size, variable_offset, row_bytes, 32, &display_name, error, error_size) &&
                  registry_store_read_string_list(bytes, file_size, variable_offset, row_bytes, 48, &conforms_to, error, error_size) &&
                  registry_store_read_string_list(bytes, file_size, variable_offset, row_bytes, 64, &extensions, error, error_size) &&
-                 registry_store_read_string_list(bytes, file_size, variable_offset, row_bytes, 80, &filenames, error, error_size) &&
-                 registry_store_read_string_list(bytes, file_size, variable_offset, row_bytes, 96, &mime_types, error, error_size);
+                 registry_store_read_string_list(bytes, file_size, variable_offset, row_bytes, mime_types_offset, &mime_types, error, error_size);
             if (ok) {
                 ok = registry_store_upsert_content_type_lists(store,
                                                               service_id,
@@ -5513,7 +5508,6 @@ static bool registry_store_load_orwa_file(RegistryStore *store, const char *path
                                                               display_name,
                                                               &conforms_to,
                                                               &extensions,
-                                                              &filenames,
                                                               &mime_types);
                 if (!ok) snprintf(error, error_size, "Out of memory.");
             }
@@ -5522,7 +5516,6 @@ static bool registry_store_load_orwa_file(RegistryStore *store, const char *path
             free(display_name);
             registry_string_list_free(&conforms_to);
             registry_string_list_free(&extensions);
-            registry_string_list_free(&filenames);
             registry_string_list_free(&mime_types);
         }
         if (!ok) {
@@ -5635,7 +5628,6 @@ static bool registry_store_write_orwa_file(RegistryStore *store, const char *pat
              registry_binary_append_string_ref(&pool, &variable_region, &rows, store->content_types[i].display_name) &&
              registry_binary_append_string_list_ref(&pool, &variable_region, &rows, &store->content_types[i].conforms_to) &&
              registry_binary_append_string_list_ref(&pool, &variable_region, &rows, &store->content_types[i].extensions) &&
-             registry_binary_append_string_list_ref(&pool, &variable_region, &rows, &store->content_types[i].filenames) &&
              registry_binary_append_string_list_ref(&pool, &variable_region, &rows, &store->content_types[i].mime_types);
     }
     for (size_t i = 0; ok && i < store->opener_count; i++) {
@@ -7253,6 +7245,10 @@ static bool root_outershell_migration_pending(void) {
 }
 
 static void send_backends_response(int fd) {
+#ifdef __APPLE__
+    repair_user_bundled_app_registry_records();
+#endif
+
     BinaryPayloadList payloads = {0};
     char user_error[512] = "";
     char system_error[512] = "";
@@ -10295,7 +10291,6 @@ typedef struct {
     const char *display_name;
     StaticStringList conforms_to;
     StaticStringList extensions;
-    StaticStringList filenames;
     StaticStringList mime_types;
 } BuiltInContentType;
 
@@ -10305,15 +10300,12 @@ typedef struct {
 static const char *const kContentTypePublicDataMimeTypes[] = {"application/octet-stream"};
 static const char *const kContentTypePublicTextConformsTo[] = {"public.data"};
 static const char *const kContentTypePublicTextExtensions[] = {"txt", "text", "log", "conf", "ini", "cfg"};
-static const char *const kContentTypePublicTextFilenames[] = {"README", "LICENSE", "Makefile", "Dockerfile", ".gitignore", ".env", "CMakeLists.txt"};
 static const char *const kContentTypePublicTextMimeTypes[] = {"text/plain"};
 static const char *const kContentTypePlainTextConformsTo[] = {"public.text"};
 static const char *const kContentTypePlainTextExtensions[] = {"txt", "text", "log", "conf", "ini", "cfg"};
-static const char *const kContentTypePlainTextFilenames[] = {"README", "LICENSE", ".gitignore", ".env"};
 static const char *const kContentTypePlainTextMimeTypes[] = {"text/plain"};
 static const char *const kContentTypeMarkdownConformsTo[] = {"public.text"};
 static const char *const kContentTypeMarkdownExtensions[] = {"md", "markdown", "mdown", "mkdn"};
-static const char *const kContentTypeMarkdownFilenames[] = {"README.md"};
 static const char *const kContentTypeMarkdownMimeTypes[] = {"text/markdown"};
 static const char *const kContentTypeJsonConformsTo[] = {"public.text"};
 static const char *const kContentTypeJsonExtensions[] = {"json"};
@@ -10355,23 +10347,23 @@ static const char *const kContentTypeZipExtensions[] = {"zip"};
 static const char *const kContentTypeZipMimeTypes[] = {"application/zip"};
 
 static const BuiltInContentType kBuiltInContentTypes[] = {
-    {"public.data", "Data", STATIC_EMPTY_LIST, STATIC_EMPTY_LIST, STATIC_EMPTY_LIST, STATIC_LIST(kContentTypePublicDataMimeTypes)},
-    {"public.text", "Text", STATIC_LIST(kContentTypePublicTextConformsTo), STATIC_LIST(kContentTypePublicTextExtensions), STATIC_LIST(kContentTypePublicTextFilenames), STATIC_LIST(kContentTypePublicTextMimeTypes)},
-    {"public.plain-text", "Plain Text", STATIC_LIST(kContentTypePlainTextConformsTo), STATIC_LIST(kContentTypePlainTextExtensions), STATIC_LIST(kContentTypePlainTextFilenames), STATIC_LIST(kContentTypePlainTextMimeTypes)},
-    {"public.markdown", "Markdown", STATIC_LIST(kContentTypeMarkdownConformsTo), STATIC_LIST(kContentTypeMarkdownExtensions), STATIC_LIST(kContentTypeMarkdownFilenames), STATIC_LIST(kContentTypeMarkdownMimeTypes)},
-    {"public.json", "JSON", STATIC_LIST(kContentTypeJsonConformsTo), STATIC_LIST(kContentTypeJsonExtensions), STATIC_EMPTY_LIST, STATIC_LIST(kContentTypeJsonMimeTypes)},
-    {"public.xml", "XML", STATIC_LIST(kContentTypeXmlConformsTo), STATIC_LIST(kContentTypeXmlExtensions), STATIC_EMPTY_LIST, STATIC_LIST(kContentTypeXmlMimeTypes)},
-    {"public.shell-script", "Shell Script", STATIC_LIST(kContentTypeShellScriptConformsTo), STATIC_LIST(kContentTypeShellScriptExtensions), STATIC_EMPTY_LIST, STATIC_LIST(kContentTypeShellScriptMimeTypes)},
-    {"public.python-script", "Python Script", STATIC_LIST(kContentTypePythonScriptConformsTo), STATIC_LIST(kContentTypePythonScriptExtensions), STATIC_EMPTY_LIST, STATIC_LIST(kContentTypePythonScriptMimeTypes)},
-    {"public.javascript", "JavaScript", STATIC_LIST(kContentTypeJavascriptConformsTo), STATIC_LIST(kContentTypeJavascriptExtensions), STATIC_EMPTY_LIST, STATIC_LIST(kContentTypeJavascriptMimeTypes)},
-    {"public.html", "HTML", STATIC_LIST(kContentTypeHtmlConformsTo), STATIC_LIST(kContentTypeHtmlExtensions), STATIC_EMPTY_LIST, STATIC_LIST(kContentTypeHtmlMimeTypes)},
-    {"public.css", "CSS", STATIC_LIST(kContentTypeCssConformsTo), STATIC_LIST(kContentTypeCssExtensions), STATIC_EMPTY_LIST, STATIC_LIST(kContentTypeCssMimeTypes)},
-    {"public.image", "Image", STATIC_LIST(kContentTypeImageConformsTo), STATIC_EMPTY_LIST, STATIC_EMPTY_LIST, STATIC_LIST(kContentTypeImageMimeTypes)},
-    {"public.png", "PNG", STATIC_LIST(kContentTypePngConformsTo), STATIC_LIST(kContentTypePngExtensions), STATIC_EMPTY_LIST, STATIC_LIST(kContentTypePngMimeTypes)},
-    {"public.jpeg", "JPEG", STATIC_LIST(kContentTypeJpegConformsTo), STATIC_LIST(kContentTypeJpegExtensions), STATIC_EMPTY_LIST, STATIC_LIST(kContentTypeJpegMimeTypes)},
-    {"public.gif", "GIF", STATIC_LIST(kContentTypeGifConformsTo), STATIC_LIST(kContentTypeGifExtensions), STATIC_EMPTY_LIST, STATIC_LIST(kContentTypeGifMimeTypes)},
-    {"public.pdf", "PDF", STATIC_LIST(kContentTypePdfConformsTo), STATIC_LIST(kContentTypePdfExtensions), STATIC_EMPTY_LIST, STATIC_LIST(kContentTypePdfMimeTypes)},
-    {"public.zip-archive", "ZIP Archive", STATIC_LIST(kContentTypeZipConformsTo), STATIC_LIST(kContentTypeZipExtensions), STATIC_EMPTY_LIST, STATIC_LIST(kContentTypeZipMimeTypes)}
+    {"public.data", "Data", STATIC_EMPTY_LIST, STATIC_EMPTY_LIST, STATIC_LIST(kContentTypePublicDataMimeTypes)},
+    {"public.text", "Text", STATIC_LIST(kContentTypePublicTextConformsTo), STATIC_LIST(kContentTypePublicTextExtensions), STATIC_LIST(kContentTypePublicTextMimeTypes)},
+    {"public.plain-text", "Plain Text", STATIC_LIST(kContentTypePlainTextConformsTo), STATIC_LIST(kContentTypePlainTextExtensions), STATIC_LIST(kContentTypePlainTextMimeTypes)},
+    {"public.markdown", "Markdown", STATIC_LIST(kContentTypeMarkdownConformsTo), STATIC_LIST(kContentTypeMarkdownExtensions), STATIC_LIST(kContentTypeMarkdownMimeTypes)},
+    {"public.json", "JSON", STATIC_LIST(kContentTypeJsonConformsTo), STATIC_LIST(kContentTypeJsonExtensions), STATIC_LIST(kContentTypeJsonMimeTypes)},
+    {"public.xml", "XML", STATIC_LIST(kContentTypeXmlConformsTo), STATIC_LIST(kContentTypeXmlExtensions), STATIC_LIST(kContentTypeXmlMimeTypes)},
+    {"public.shell-script", "Shell Script", STATIC_LIST(kContentTypeShellScriptConformsTo), STATIC_LIST(kContentTypeShellScriptExtensions), STATIC_LIST(kContentTypeShellScriptMimeTypes)},
+    {"public.python-script", "Python Script", STATIC_LIST(kContentTypePythonScriptConformsTo), STATIC_LIST(kContentTypePythonScriptExtensions), STATIC_LIST(kContentTypePythonScriptMimeTypes)},
+    {"public.javascript", "JavaScript", STATIC_LIST(kContentTypeJavascriptConformsTo), STATIC_LIST(kContentTypeJavascriptExtensions), STATIC_LIST(kContentTypeJavascriptMimeTypes)},
+    {"public.html", "HTML", STATIC_LIST(kContentTypeHtmlConformsTo), STATIC_LIST(kContentTypeHtmlExtensions), STATIC_LIST(kContentTypeHtmlMimeTypes)},
+    {"public.css", "CSS", STATIC_LIST(kContentTypeCssConformsTo), STATIC_LIST(kContentTypeCssExtensions), STATIC_LIST(kContentTypeCssMimeTypes)},
+    {"public.image", "Image", STATIC_LIST(kContentTypeImageConformsTo), STATIC_EMPTY_LIST, STATIC_LIST(kContentTypeImageMimeTypes)},
+    {"public.png", "PNG", STATIC_LIST(kContentTypePngConformsTo), STATIC_LIST(kContentTypePngExtensions), STATIC_LIST(kContentTypePngMimeTypes)},
+    {"public.jpeg", "JPEG", STATIC_LIST(kContentTypeJpegConformsTo), STATIC_LIST(kContentTypeJpegExtensions), STATIC_LIST(kContentTypeJpegMimeTypes)},
+    {"public.gif", "GIF", STATIC_LIST(kContentTypeGifConformsTo), STATIC_LIST(kContentTypeGifExtensions), STATIC_LIST(kContentTypeGifMimeTypes)},
+    {"public.pdf", "PDF", STATIC_LIST(kContentTypePdfConformsTo), STATIC_LIST(kContentTypePdfExtensions), STATIC_LIST(kContentTypePdfMimeTypes)},
+    {"public.zip-archive", "ZIP Archive", STATIC_LIST(kContentTypeZipConformsTo), STATIC_LIST(kContentTypeZipExtensions), STATIC_LIST(kContentTypeZipMimeTypes)}
 };
 
 #undef STATIC_LIST
@@ -10484,21 +10476,6 @@ static bool content_type_matches_extension(const RegistryStore *store, const cha
     return builtin && string_list_contains(builtin->extensions.items, builtin->extensions.count, extension, false);
 }
 
-static bool content_type_matches_filename(const RegistryStore *store, const char *identifier, const char *filename) {
-    if (!identifier || !filename || !filename[0]) return false;
-    if (store) {
-        for (size_t i = 0; i < store->content_type_count; i++) {
-            const RegistryContentTypeRecord *custom = &store->content_types[i];
-            if (strcmp(custom->identifier ? custom->identifier : "", identifier) == 0 &&
-                registry_string_list_contains(&custom->filenames, filename, true)) {
-                return true;
-            }
-        }
-    }
-    const BuiltInContentType *builtin = builtin_content_type_for_identifier(identifier);
-    return builtin && string_list_contains(builtin->filenames.items, builtin->filenames.count, filename, true);
-}
-
 static bool path_file_extension(const char *path, char *out, size_t out_size) {
     if (!out || out_size == 0) return false;
     out[0] = '\0';
@@ -10512,6 +10489,33 @@ static bool path_file_extension(const char *path, char *out, size_t out_size) {
 static const char *path_file_name(const char *path) {
     const char *name = strrchr(path ? path : "", '/');
     return name ? name + 1 : (path ? path : "");
+}
+
+typedef struct {
+    const char *filename;
+    const char *content_type;
+} BuiltInFilenameContentTypeRule;
+
+static const BuiltInFilenameContentTypeRule kBuiltInFilenameContentTypeRules[] = {
+    {"README", "public.plain-text"},
+    {"LICENSE", "public.plain-text"},
+    {".gitignore", "public.plain-text"},
+    {".env", "public.plain-text"},
+    {"Makefile", "public.text"},
+    {"Dockerfile", "public.text"},
+    {"CMakeLists.txt", "public.text"},
+};
+
+static bool append_content_types_for_builtin_filename(const RegistryStore *store, const char *filename, ContentTypeList *list) {
+    if (!filename || !filename[0]) return true;
+    for (size_t i = 0; i < sizeof(kBuiltInFilenameContentTypeRules) / sizeof(kBuiltInFilenameContentTypeRules[0]); i++) {
+        const BuiltInFilenameContentTypeRule *rule = &kBuiltInFilenameContentTypeRules[i];
+        if (strcasecmp(filename, rule->filename) == 0 &&
+            !append_content_type_and_conformance_closure(store, list, rule->content_type)) {
+            return false;
+        }
+    }
+    return true;
 }
 
 static bool file_sample(const char *path, unsigned char *buffer, size_t capacity, size_t *out_count) {
@@ -10564,20 +10568,19 @@ static bool infer_content_types_for_path(const RegistryStore *store, const char 
 
     for (size_t i = 0; i < sizeof(kBuiltInContentTypes) / sizeof(kBuiltInContentTypes[0]); i++) {
         const char *identifier = kBuiltInContentTypes[i].identifier;
-        if ((extension[0] && content_type_matches_extension(store, identifier, extension)) ||
-            (filename[0] && content_type_matches_filename(store, identifier, filename))) {
+        if (extension[0] && content_type_matches_extension(store, identifier, extension)) {
             if (!append_content_type_and_conformance_closure(store, list, identifier)) return false;
         }
     }
     if (store) {
         for (size_t i = 0; i < store->content_type_count; i++) {
             const char *identifier = store->content_types[i].identifier;
-            if ((extension[0] && content_type_matches_extension(store, identifier, extension)) ||
-                (filename[0] && content_type_matches_filename(store, identifier, filename))) {
+            if (extension[0] && content_type_matches_extension(store, identifier, extension)) {
                 if (!append_content_type_and_conformance_closure(store, list, identifier)) return false;
             }
         }
     }
+    if (!append_content_types_for_builtin_filename(store, filename, list)) return false;
 
     unsigned char sample[4096];
     size_t count = 0;
@@ -10758,7 +10761,7 @@ static bool outerctl_print_registry_list(const RegistryStore *database,
             if (ok && !sb_append(out, "\n")) ok = false;
         }
     } else if (strcmp(resource, "content-type") == 0 || strcmp(resource, "type") == 0) {
-        const char *headers[] = {"service_id", "identifier", "display_name", "conforms_to", "extensions", "filenames", "mime_types"};
+        const char *headers[] = {"service_id", "identifier", "display_name", "conforms_to", "extensions", "mime_types"};
         ok = outerctl_print_headers(out, headers, sizeof(headers) / sizeof(headers[0]));
         if (!backend_filter || !backend_filter[0]) {
             for (size_t i = 0; ok && i < sizeof(kBuiltInContentTypes) / sizeof(kBuiltInContentTypes[0]); i++) {
@@ -10771,7 +10774,6 @@ static bool outerctl_print_registry_list(const RegistryStore *database,
                 }
                 if (ok) ok = sb_append(out, "\t") && outerctl_tsv_string_list_field(out, record->conforms_to.items, record->conforms_to.count);
                 if (ok) ok = sb_append(out, "\t") && outerctl_tsv_string_list_field(out, record->extensions.items, record->extensions.count);
-                if (ok) ok = sb_append(out, "\t") && outerctl_tsv_string_list_field(out, record->filenames.items, record->filenames.count);
                 if (ok) ok = sb_append(out, "\t") && outerctl_tsv_string_list_field(out, record->mime_types.items, record->mime_types.count);
                 if (ok && !sb_append(out, "\n")) ok = false;
             }
@@ -10787,7 +10789,6 @@ static bool outerctl_print_registry_list(const RegistryStore *database,
             }
             if (ok) ok = sb_append(out, "\t") && outerctl_tsv_registry_string_list_field(out, &record->conforms_to);
             if (ok) ok = sb_append(out, "\t") && outerctl_tsv_registry_string_list_field(out, &record->extensions);
-            if (ok) ok = sb_append(out, "\t") && outerctl_tsv_registry_string_list_field(out, &record->filenames);
             if (ok) ok = sb_append(out, "\t") && outerctl_tsv_registry_string_list_field(out, &record->mime_types);
             if (ok && !sb_append(out, "\n")) ok = false;
         }
@@ -10867,7 +10868,6 @@ static int outershelld_handle_outerctl(int argc, char **argv, StringBuilder *std
     const char *content_type = NULL;
     const char *conforms_to = NULL;
     const char *extensions = NULL;
-    const char *filenames = NULL;
     const char *mime_types = NULL;
     const char *url_template = NULL;
     int port = 0;
@@ -10920,8 +10920,6 @@ static int outershelld_handle_outerctl(int argc, char **argv, StringBuilder *std
             REQUIRE_VALUE("--conforms-to", conforms_to);
         } else if (strcmp(arg, "--extensions") == 0) {
             REQUIRE_VALUE("--extensions", extensions);
-        } else if (strcmp(arg, "--filenames") == 0) {
-            REQUIRE_VALUE("--filenames", filenames);
         } else if (strcmp(arg, "--mime-types") == 0) {
             REQUIRE_VALUE("--mime-types", mime_types);
         } else if (strcmp(arg, "--url-template") == 0) {
@@ -11220,7 +11218,6 @@ static int outershelld_handle_outerctl(int argc, char **argv, StringBuilder *std
                                                     (display_name && display_name[0]) ? display_name : normalized_content_type,
                                                     conforms_to ? conforms_to : "",
                                                     extensions ? extensions : "",
-                                                    filenames ? filenames : "",
                                                     mime_types ? mime_types : "");
             if (!ok) snprintf(error, sizeof(error), "Out of memory.");
             changed = ok;
@@ -11413,6 +11410,124 @@ static bool upsert_launchd_backend_registry_at(const char *database_path,
         ok = append_outerloop_http_unix_allowlist_entry(socket_path, system_scope, error, error_size);
     }
     return ok;
+}
+#endif
+
+#ifdef __APPLE__
+static void repair_user_bundled_app_registry_records(void) {
+    char registry_error[1024] = "";
+    RegistryStore database;
+    if (!registry_store_open_user_readwrite(&database, registry_error, sizeof(registry_error))) {
+        log_event("Failed to inspect bundled app registry records: %s",
+                  registry_error[0] ? registry_error : "unknown error");
+        return;
+    }
+
+    bool ok = true;
+    bool changed = false;
+    for (size_t i = 0; i < sizeof(kBundledApps) / sizeof(kBundledApps[0]); i++) {
+        const BundledAppDefinition *app = &kBundledApps[i];
+        if (!bundled_app_is_available_on_platform(app)) continue;
+
+        char install_root[PATH_MAX];
+        default_user_outershell_app_root(app->install_directory_name, install_root, sizeof(install_root));
+        char app_bundle[PATH_MAX];
+        bundled_app_macos_app_bundle_path(app, install_root, app_bundle, sizeof(app_bundle));
+        if (!bundled_app_macos_app_has_expected_files(app, app_bundle)) continue;
+
+        char plist_path[PATH_MAX];
+        snprintf(plist_path, sizeof(plist_path), "%s/Library/LaunchAgents/%s.plist", home_directory(), app->service_id);
+        struct stat st;
+        if (stat(plist_path, &st) != 0 || !S_ISREG(st.st_mode)) continue;
+
+        char socket_path[PATH_MAX];
+        bundled_socket_path_for_scope(app, "user", socket_path, sizeof(socket_path));
+        char log_path[PATH_MAX];
+        snprintf(log_path, sizeof(log_path), "%s/Library/Logs/%s/output.log", home_directory(), app->service_id);
+        char icon_path[PATH_MAX] = "";
+        bundled_app_macos_app_icon_path(app, app_bundle, icon_path, sizeof(icon_path));
+
+        char frontend_id[PATH_MAX * 2];
+        snprintf(frontend_id, sizeof(frontend_id), "%s:main", app->service_id);
+        bool repair_needed = false;
+        const RegistryBackendRecord *existing_backend = registry_store_find_backend_const(&database, app->service_id);
+        if (!existing_backend ||
+            strcmp(existing_backend->display_name ? existing_backend->display_name : "", app->display_name) != 0 ||
+            strcmp(existing_backend->unit_name ? existing_backend->unit_name : "", app->service_id) != 0 ||
+            strcmp(existing_backend->unit_path ? existing_backend->unit_path : "", plist_path) != 0 ||
+            !existing_backend->owns_unit) {
+            repair_needed = true;
+        }
+        const RegistryFrontendRecord *existing_frontend = registry_store_find_frontend(&database, frontend_id);
+        if (socket_path[0] &&
+            (!existing_frontend ||
+             existing_frontend->endpoint_kind != OUTERSHELLD_API_FRONTEND_ENDPOINT_UNIX ||
+             strcmp(existing_frontend->socket_path ? existing_frontend->socket_path : "", socket_path) != 0)) {
+            repair_needed = true;
+        }
+        if (!registry_store_find_log_by_path(&database, log_path)) {
+            repair_needed = true;
+        }
+        for (size_t opener_index = 0; opener_index < app->opener_count && !repair_needed; opener_index++) {
+            char normalized_content_type[160] = "";
+            if (!normalize_content_type_identifier(app->openers[opener_index].content_type,
+                                                   normalized_content_type,
+                                                   sizeof(normalized_content_type)) ||
+                !registry_store_find_opener(&database, normalized_content_type, app->service_id)) {
+                repair_needed = true;
+            }
+        }
+        if (!repair_needed) continue;
+
+        ok = registry_store_upsert_backend(&database, app->service_id, app->display_name, app->service_id, plist_path, true);
+        if (!ok) {
+            snprintf(registry_error, sizeof(registry_error), "Out of memory.");
+            break;
+        }
+        registry_store_clear_backend_frontends(&database, app->service_id);
+        if (socket_path[0]) {
+            char *icon_value = registry_icon_path_value(icon_path);
+            ok = registry_store_upsert_frontend(&database,
+                                                frontend_id,
+                                                "",
+                                                app->service_id,
+                                                app->display_name,
+                                                0,
+                                                socket_path,
+                                                icon_value ? icon_value : "",
+                                                "",
+                                                false);
+            free(icon_value);
+            if (!ok) {
+                snprintf(registry_error, sizeof(registry_error), "Out of memory.");
+                break;
+            }
+        }
+        registry_store_clear_backend_logs(&database, app->service_id);
+        ok = registry_store_upsert_log(&database, log_path, app->service_id);
+        if (!ok) {
+            snprintf(registry_error, sizeof(registry_error), "Out of memory.");
+            break;
+        }
+        ok = registry_store_upsert_bundled_app_openers(&database, app, socket_path, registry_error, sizeof(registry_error));
+        if (!ok) break;
+
+        char allowlist_error[512] = "";
+        if (socket_path[0] &&
+            !append_outerloop_http_unix_allowlist_entry(socket_path, false, allowlist_error, sizeof(allowlist_error))) {
+            log_event("Failed to update allowlist while repairing bundled app %s: %s",
+                      app->service_id,
+                      allowlist_error[0] ? allowlist_error : "unknown error");
+        }
+        changed = true;
+        log_event("Repaired registry entry for installed bundled app %s.", app->service_id);
+    }
+
+    bool close_ok = registry_store_close(&database, ok && changed, registry_error, sizeof(registry_error));
+    if (!ok || !close_ok) {
+        log_event("Failed to repair bundled app registry records: %s",
+                  registry_error[0] ? registry_error : "unknown error");
+    }
 }
 #endif
 
@@ -14833,20 +14948,17 @@ static bool api_content_type_list_response_append_row(StringBuilder *message,
                                                       size_t conforms_to_count,
                                                       const char *const *extensions,
                                                       size_t extension_count,
-                                                      const char *const *filenames,
-                                                      size_t filename_count,
                                                       const char *const *mime_types,
                                                       size_t mime_type_count,
                                                       uint32_t *row_count) {
     size_t row_offset = 0;
-    return api_list_response_append_row(message, 56, &row_offset) &&
+    return api_list_response_append_row(message, 48, &row_offset) &&
            binary_append_string_ref_at(message, row_offset, service_id) &&
            binary_append_string_ref_at(message, row_offset + 8, identifier) &&
            binary_append_string_ref_at(message, row_offset + 16, display_name) &&
            api_append_string_list_ref32_items_at(message, row_offset + 24, conforms_to, conforms_to_count) &&
            api_append_string_list_ref32_items_at(message, row_offset + 32, extensions, extension_count) &&
-           api_append_string_list_ref32_items_at(message, row_offset + 40, filenames, filename_count) &&
-           api_append_string_list_ref32_items_at(message, row_offset + 48, mime_types, mime_type_count) &&
+           api_append_string_list_ref32_items_at(message, row_offset + 40, mime_types, mime_type_count) &&
            api_list_response_finish_row(message, row_count);
 }
 
@@ -15182,8 +15294,6 @@ static bool process_api_registry_list_request(ReactorClient *client, const unsig
                                                                    record->conforms_to.count,
                                                                    record->extensions.items,
                                                                    record->extensions.count,
-                                                                   record->filenames.items,
-                                                                   record->filenames.count,
                                                                    record->mime_types.items,
                                                                    record->mime_types.count,
                                                                    &row_count);
@@ -15201,8 +15311,6 @@ static bool process_api_registry_list_request(ReactorClient *client, const unsig
                                                                record->conforms_to.count,
                                                                (const char *const *)record->extensions.items,
                                                                record->extensions.count,
-                                                               (const char *const *)record->filenames.items,
-                                                               record->filenames.count,
                                                                (const char *const *)record->mime_types.items,
                                                                record->mime_types.count,
                                                                &row_count);
@@ -15248,7 +15356,6 @@ static bool process_api_command_request(ReactorClient *client, const unsigned ch
     char *content_type = NULL;
     char *conforms_to = NULL;
     char *extensions = NULL;
-    char *filenames = NULL;
     char *mime_types = NULL;
     char *url_template = NULL;
     char *argv[64];
@@ -15370,21 +15477,19 @@ static bool process_api_command_request(ReactorClient *client, const unsigned ch
              api_command_append_option(argv, &argc, 64, "--backend", backend);
         break;
     case OUTERSHELLD_API_CONTENT_TYPE_ADD_REQUEST:
-        ok = ok && message_length >= 58 &&
+        ok = ok && message_length >= 50 &&
              INIT_COMMAND("content-type", "add") &&
              READ_REF(2, backend) &&
              READ_REF(10, content_type) &&
              READ_REF(18, display_name) &&
              READ_LIST_REF(26, conforms_to) &&
              READ_LIST_REF(34, extensions) &&
-             READ_LIST_REF(42, filenames) &&
-             READ_LIST_REF(50, mime_types) &&
+             READ_LIST_REF(42, mime_types) &&
              api_command_append_option(argv, &argc, 64, "--backend", backend) &&
              api_command_append_option(argv, &argc, 64, "--content-type", content_type) &&
              api_command_append_option(argv, &argc, 64, "--name", display_name) &&
              api_command_append_option(argv, &argc, 64, "--conforms-to", conforms_to) &&
              api_command_append_option(argv, &argc, 64, "--extensions", extensions) &&
-             api_command_append_option(argv, &argc, 64, "--filenames", filenames) &&
              api_command_append_option(argv, &argc, 64, "--mime-types", mime_types);
         break;
     case OUTERSHELLD_API_CONTENT_TYPE_REMOVE_REQUEST:
@@ -15467,7 +15572,6 @@ static bool process_api_command_request(ReactorClient *client, const unsigned ch
     free(content_type);
     free(conforms_to);
     free(extensions);
-    free(filenames);
     free(mime_types);
     free(url_template);
     free(stdout_buffer.data);

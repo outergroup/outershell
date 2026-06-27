@@ -392,7 +392,7 @@ content-type rows, and service-manager metadata for that backend. Use
 
 Content types are normalized, lowercase dotted identifiers such as
 `public.text` or `org.example.source`. A type can conform to one or more other
-types, and it can match extensions, exact filenames, or MIME type hints.
+types, and it can match extensions or MIME type hints.
 
 ### `outerctl content-type add`
 
@@ -403,7 +403,6 @@ outerctl content-type add \
   --name <display-name> \
   [--conforms-to <comma-separated-types>] \
   [--extensions <comma-separated-extensions>] \
-  [--filenames <comma-separated-filenames>] \
   [--mime-types <comma-separated-mime-types>]
 ```
 
@@ -419,8 +418,7 @@ bytes 10..17:  StringRef32 content type
 bytes 18..25:  StringRef32 display name
 bytes 26..33:  StringListRef32 conforms-to content types
 bytes 34..41:  StringListRef32 filename extensions
-bytes 42..49:  StringListRef32 exact filenames
-bytes 50..57:  StringListRef32 MIME types
+bytes 42..49:  StringListRef32 MIME types
 ```
 
 Response: `commandResponse` (`messageType = 100`).
@@ -466,21 +464,20 @@ Response message: `contentTypeListResponse` (`messageType = 104`)
 
 This response uses the common list response header above. Its `row count`
 field tells you how many content-type rows follow at byte 22. Use the header's
-`row size` field as the stride between rows; the current row size is 56 bytes.
+`row size` field as the stride between rows; the current row size is 48 bytes.
 
 ```text
-Content-type row, 56 bytes:
+Content-type row, 48 bytes:
 bytes 0..7:    StringRef32 backend service id, empty for built-ins
 bytes 8..15:   StringRef32 identifier
 bytes 16..23:  StringRef32 display name
 bytes 24..31:  StringListRef32 conforms-to content types
 bytes 32..39:  StringListRef32 filename extensions
-bytes 40..47:  StringListRef32 exact filenames
-bytes 48..55:  StringListRef32 MIME types
+bytes 40..47:  StringListRef32 MIME types
 ```
 
 `outerctl` prints these rows as TSV columns `service_id`, `identifier`,
-`display_name`, `conforms_to`, `extensions`, `filenames`, and `mime_types`,
+`display_name`, `conforms_to`, `extensions`, and `mime_types`,
 joining each list column with commas for display.
 
 ## Opener Commands
