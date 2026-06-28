@@ -206,7 +206,6 @@ Bundled app table:
 | Top | `org.outershell.Top` | `TopBackend` | `TopContent` | optional |
 | Files | `org.outershell.Files` | `FilesBackend` | `FilesContent` | optional |
 | Plaintext | `org.outershell.Plaintext` | `PlaintextBackend` | `PlaintextContent` | optional |
-| Network Inspector | `org.outershell.NetworkInspector` | `NetworkInspectorBackend` | `NetworkInspectorContent` | optional |
 | Firehose | `org.outershell.Firehose` | `FirehoseBackend` | `FirehoseContent` | required |
 | Profile | `org.outershell.Profile` | `ProfileBackend` | `ProfileContent` | optional |
 

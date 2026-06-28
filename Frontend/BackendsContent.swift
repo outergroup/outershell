@@ -8006,8 +8006,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             return "folder"
         case "org.outershell.Firehose":
             return "text.line.last.and.arrowtriangle.forward"
-        case "org.outershell.NetworkInspector":
-            return "network"
         case "org.outershell.Plaintext":
             return "doc.plaintext"
         case "org.outershell.Top":

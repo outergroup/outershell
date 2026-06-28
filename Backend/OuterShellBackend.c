@@ -231,16 +231,6 @@ static const BundledAppDefinition kBundledApps[] = {
         .supports_macos = true
     },
     {
-        .service_id = "org.outershell.NetworkInspector",
-        .display_name = "Network Inspector",
-        .stage_directory_name = "NetworkInspector",
-        .binary_name = "NetworkInspectorBackend",
-        .bundle_prefix = "NetworkInspectorContent",
-        .icon_name = "app-icon.png",
-        .source_name = "NetworkInspectorBackend.c",
-        .supports_macos = false
-    },
-    {
         .service_id = "org.outershell.Firehose",
         .display_name = "Firehose",
         .stage_directory_name = "Firehose",

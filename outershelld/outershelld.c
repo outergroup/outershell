@@ -1066,24 +1066,6 @@ static const BundledAppDefinition kBundledApps[] = {
         .opener_count = sizeof(kPlaintextOpeners) / sizeof(kPlaintextOpeners[0])
     },
     {
-        .service_id = "org.outershell.NetworkInspector",
-        .display_name = "Network Inspector",
-        .unit_name = "org.outershell.NetworkInspector.service",
-        .stage_directory_name = "NetworkInspector",
-        .install_directory_name = "org.outershell.NetworkInspector",
-        .binary_name = "NetworkInspectorBackend",
-        .bundle_prefix = "NetworkInspectorContent",
-        .icon_symbol_name = "network",
-        .icon_name = "app-icon.png",
-        .source_name = "NetworkInspectorBackend.c",
-        .socket_name = "org.outershell.NetworkInspector",
-        .socket_activated = true,
-        .supports_root = true,
-        .root_only = false,
-        .supports_macos = false,
-        .version = "1"
-    },
-    {
         .service_id = "org.outershell.Firehose",
         .display_name = "Firehose",
         .unit_name = "org.outershell.Firehose.service",

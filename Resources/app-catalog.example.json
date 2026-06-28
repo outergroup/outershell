@@ -34,15 +34,6 @@
       }
     },
     {
-      "serviceID": "org.outershell.NetworkInspector",
-      "name": "Network Inspector",
-      "supportsRoot": true,
-      "archives": {
-        "linux-aarch64": "https://example.com/outer-shell/apps/NetworkInspector/linux-aarch64.tar.gz",
-        "linux-x86_64": "https://example.com/outer-shell/apps/NetworkInspector/linux-x86_64.tar.gz"
-      }
-    },
-    {
       "serviceID": "org.outershell.Firehose",
       "name": "Firehose",
       "supportsRoot": true,
