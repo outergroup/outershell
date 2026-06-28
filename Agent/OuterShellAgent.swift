@@ -961,7 +961,7 @@ private final class OuterShellAgentDelegate: NSObject, NSApplicationDelegate, NS
         quit.target = self
         menu.addItem(quit)
         quit.image = menuImage(systemSymbolName: "eye.slash")
-        let manage = NSMenuItem(title: "View in Outer Shell",
+        let manage = NSMenuItem(title: "Manage in Outer Shell",
                                 action: #selector(openOuterShell(_:)),
                                 keyEquivalent: "")
         manage.target = self
