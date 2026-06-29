@@ -11040,7 +11040,7 @@ static int outershelld_handle_outerctl(int argc, char **argv, StringBuilder *std
                                                    (display_name && display_name[0]) ? display_name : backend,
                                                    (systemd_unit && systemd_unit[0]) ? systemd_unit : (plist_path && plist_path[0] ? backend : ""),
                                                    (plist_path && plist_path[0]) ? plist_path : "",
-                                                   (systemd_unit && systemd_unit[0]) || owns_plist);
+                                                   owns_plist);
                 if (!ok) snprintf(error, sizeof(error), "Out of memory.");
             }
             changed = ok;
