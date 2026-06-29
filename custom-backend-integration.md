@@ -278,7 +278,7 @@ Then register the app and log path. These commands are the same shape on both
 platforms:
 
 ```bash
-"$OUTERCTL" app add \
+"$OUTERCTL" app upsert \
   --backend "$SERVICE_ID" \
   --frontend-id "$FRONTEND_ID" \
   --port "$PORT" \
@@ -296,7 +296,7 @@ What each row does:
 
 - `backend upsert` creates the managed service identity and records the
   systemd unit or launchd plist so Outer Shell can start and stop it.
-- `app add` creates the Apps-page entry point. Reuse the same `--frontend-id`
+- `app upsert` creates the Apps-page entry point. Reuse the same `--frontend-id`
   for runtime endpoint updates.
 - `log add` lets Outer Shell show the service log viewer.
 
@@ -318,11 +318,11 @@ example:
 - The backend chooses a free port dynamically.
 - The backend creates different app entries based on local state.
 
-In that case, call `app add` again with the same `--frontend-id` after the
+In that case, call `app upsert` again with the same `--frontend-id` after the
 backend knows the final endpoint:
 
 ```bash
-"$OUTERCTL" app add \
+"$OUTERCTL" app upsert \
   --backend "$SERVICE_ID" \
   --frontend-id "$FRONTEND_ID" \
   --port "$PORT" \
@@ -340,7 +340,7 @@ If your backend listens on a Unix socket instead of a TCP port, register the app
 with `--socket-path`:
 
 ```bash
-"$OUTERCTL" app add \
+"$OUTERCTL" app upsert \
   --backend "$SERVICE_ID" \
   --frontend-id "$FRONTEND_ID" \
   --socket-path "$XDG_RUNTIME_DIR/com.example.TensorBoard.sock" \
@@ -381,10 +381,10 @@ sudo OUTERSHELL_HOME=/Library/Application\ Support/outershell "$OUTERCTL" backen
   --outershell-owns true
 ```
 
-Then run the same root-scoped `app add` and `log add` commands:
+Then run the same root-scoped `app upsert` and `log add` commands:
 
 ```bash
-sudo OUTERSHELL_HOME=/var/lib/outershell "$OUTERCTL" app add \
+sudo OUTERSHELL_HOME=/var/lib/outershell "$OUTERCTL" app upsert \
   --backend "$SERVICE_ID" \
   --frontend-id "$FRONTEND_ID" \
   --port "$PORT" \

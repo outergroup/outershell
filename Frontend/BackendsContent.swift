@@ -1124,6 +1124,29 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         urlSession = URLSession(configuration: configuration)
     }
 
+    private func recoverNetworkingIfNeeded(after error: Error) -> Bool {
+        let nsError = error as NSError
+        guard nsError.domain == NSURLErrorDomain else { return false }
+        switch nsError.code {
+        case NSURLErrorCannotConnectToHost,
+             NSURLErrorNetworkConnectionLost,
+             NSURLErrorNotConnectedToInternet,
+             NSURLErrorCannotFindHost,
+             NSURLErrorDNSLookupFailed,
+             NSURLErrorTimedOut:
+            eventWatchGeneration += 1
+            eventWatchTask?.cancel()
+            eventWatchTask = nil
+            eventWatchRetryDelay = 1
+            urlSession?.invalidateAndCancel()
+            configureNetworking()
+            startEventWatch()
+            return true
+        default:
+            return false
+        }
+    }
+
     private func modeFromURL(_ urlString: String?) -> BackendsViewMode {
         guard let urlString,
               let components = URLComponents(string: urlString) else {
@@ -4398,7 +4421,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         }
     }
 
-    private func fetchBackends(quiet: Bool = false) {
+    private func fetchBackends(quiet: Bool = false, didRecoverNetworking: Bool = false) {
         guard !isLoadingBackends, let backendsEndpoint, let urlSession else { return }
         isLoadingBackends = true
         if !quiet {
@@ -4410,6 +4433,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 guard let self else { return }
                 self.isLoadingBackends = false
                 if let error {
+                    if !didRecoverNetworking, self.recoverNetworkingIfNeeded(after: error) {
+                        self.fetchBackends(quiet: quiet, didRecoverNetworking: true)
+                        return
+                    }
                     let nsError = error as NSError
                     if nsError.domain == NSURLErrorDomain,
                        nsError.code == NSURLErrorTimedOut,
@@ -4495,14 +4522,18 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         updateLayout()
     }
 
-    private func fetchRecipes() {
+    private func fetchRecipes(didRecoverNetworking: Bool = false) {
         guard !isLoadingRecipes, let recipesEndpoint, let urlSession else { return }
         isLoadingRecipes = true
         urlSession.dataTask(with: recipesEndpoint) { [weak self] data, _, error in
             Task { @MainActor in
                 guard let self else { return }
                 self.isLoadingRecipes = false
-                if error != nil {
+                if let error {
+                    if !didRecoverNetworking, self.recoverNetworkingIfNeeded(after: error) {
+                        self.fetchRecipes(didRecoverNetworking: true)
+                        return
+                    }
                     self.updateLayout()
                     return
                 }
@@ -4525,7 +4556,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         }.resume()
     }
 
-    private func fetchSelectedLog(quiet: Bool = false, scrollToBottom: Bool = false) {
+    private func fetchSelectedLog(quiet: Bool = false, scrollToBottom: Bool = false, didRecoverNetworking: Bool = false) {
         guard let selection = selectedLog, let logsEndpoint, let urlSession else { return }
         if isLoadingLog { return }
         let shouldFollowLogTail = quiet && isLogScrolledNearBottom()
@@ -4559,6 +4590,12 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 guard self.selectedLog == selection else { return }
                 self.isLoadingLog = false
                 if let error {
+                    if !didRecoverNetworking, self.recoverNetworkingIfNeeded(after: error) {
+                        self.fetchSelectedLog(quiet: quiet,
+                                              scrollToBottom: scrollToBottom,
+                                              didRecoverNetworking: true)
+                        return
+                    }
                     self.logError = error.localizedDescription
                     self.updateLayout()
                     return
@@ -4585,7 +4622,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         }.resume()
     }
 
-    private func performControlAction(for backend: BackendRecord, operation: String, sudoPassword: String? = nil) {
+    private func performControlAction(for backend: BackendRecord,
+                                      operation: String,
+                                      sudoPassword: String? = nil,
+                                      didRecoverNetworking: Bool = false) {
         guard !isPerformingAction, let controlEndpoint, let urlSession else { return }
         isPerformingAction = true
         backendError = actionProgressText(operation: operation, backend: backend)
@@ -4621,6 +4661,13 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 self.isPerformingAction = false
                 var actionCompleted = false
                 if let error {
+                    if !didRecoverNetworking, self.recoverNetworkingIfNeeded(after: error) {
+                        self.performControlAction(for: backend,
+                                                  operation: operation,
+                                                  sudoPassword: sudoPassword,
+                                                  didRecoverNetworking: true)
+                        return
+                    }
                     self.backendError = error.localizedDescription
                 } else if let data,
                           let response = try? ActionResponse.decodeBinary(data) {
@@ -4685,7 +4732,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         return components.url ?? currentURL
     }
 
-    private func setFrontendList(for item: AppLauncherItem, listName: String) {
+    private func setFrontendList(for item: AppLauncherItem, listName: String, didRecoverNetworking: Bool = false) {
         guard !isPerformingAction, let controlEndpoint, let urlSession else { return }
         isPerformingAction = true
         backendsRefreshGeneration += 1
@@ -4717,6 +4764,12 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 guard let self else { return }
                 self.isPerformingAction = false
                 if let error {
+                    if !didRecoverNetworking, self.recoverNetworkingIfNeeded(after: error) {
+                        self.setFrontendList(for: item,
+                                             listName: listName,
+                                             didRecoverNetworking: true)
+                        return
+                    }
                     self.backendError = error.localizedDescription
                 } else if let data,
                           let response = try? ActionResponse.decodeBinary(data) {
@@ -4868,7 +4921,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private func startAndOpenLauncherEndpoint(_ endpoint: AppLauncherEndpoint,
                                               displayName: String,
                                               opensInNewTab: Bool,
-                                              opensInNewWindow: Bool) {
+                                              opensInNewWindow: Bool,
+                                              didRecoverNetworking: Bool = false) {
         guard !isPerformingAction, let controlEndpoint, let urlSession else { return }
         isPerformingAction = true
         backendError = "Starting \(displayName)..."
@@ -4893,6 +4947,14 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 guard let self else { return }
                 self.isPerformingAction = false
                 if let error {
+                    if !didRecoverNetworking, self.recoverNetworkingIfNeeded(after: error) {
+                        self.startAndOpenLauncherEndpoint(endpoint,
+                                                          displayName: displayName,
+                                                          opensInNewTab: opensInNewTab,
+                                                          opensInNewWindow: opensInNewWindow,
+                                                          didRecoverNetworking: true)
+                        return
+                    }
                     self.backendError = error.localizedDescription
                     self.updateLayout()
                     return
@@ -4917,13 +4979,23 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                          displayName: String,
                                          opensInNewTab: Bool,
                                          opensInNewWindow: Bool,
-                                         attempt: Int) {
+                                         attempt: Int,
+                                         didRecoverNetworking: Bool = false) {
         guard let backendsEndpoint, let urlSession else { return }
         backendError = "Waiting for \(displayName)..."
         updateLayout()
-        urlSession.dataTask(with: backendsEndpoint) { [weak self] data, _, _ in
+        urlSession.dataTask(with: backendsEndpoint) { [weak self] data, _, error in
             Task { @MainActor in
                 guard let self else { return }
+                if let error, !didRecoverNetworking, self.recoverNetworkingIfNeeded(after: error) {
+                    self.waitForLauncherEndpoint(endpoint,
+                                                 displayName: displayName,
+                                                 opensInNewTab: opensInNewTab,
+                                                 opensInNewWindow: opensInNewWindow,
+                                                 attempt: attempt,
+                                                 didRecoverNetworking: true)
+                    return
+                }
                 if let data,
                    let response = try? BackendsResponse.decodeBinary(data) {
                     self.backends = response.backends
@@ -5162,7 +5234,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         performBashCreateRequest()
     }
 
-    private func performCreateRequest(recipe: RecipeRecord, createEndpoint: URL, urlSession: URLSession) {
+    private func performCreateRequest(recipe: RecipeRecord,
+                                      createEndpoint: URL,
+                                      urlSession: URLSession,
+                                      didRecoverNetworking: Bool = false) {
         isPerformingAction = true
         createMessage = "Creating..."
         updateLayout()
@@ -5188,6 +5263,14 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 guard let self else { return }
                 self.isPerformingAction = false
                 if let error {
+                    if !didRecoverNetworking, self.recoverNetworkingIfNeeded(after: error),
+                       let urlSession = self.urlSession {
+                        self.performCreateRequest(recipe: recipe,
+                                                  createEndpoint: createEndpoint,
+                                                  urlSession: urlSession,
+                                                  didRecoverNetworking: true)
+                        return
+                    }
                     self.createMessage = error.localizedDescription
                 } else if let data,
                           let response = try? ActionResponse.decodeBinary(data) {
@@ -5207,7 +5290,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         }.resume()
     }
 
-    private func performBashCreateRequest() {
+    private func performBashCreateRequest(didRecoverNetworking: Bool = false) {
         guard !isPerformingAction, let createEndpoint, let urlSession else { return }
         ensureBashDefaults()
         isPerformingAction = true
@@ -5249,6 +5332,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 guard let self else { return }
                 self.isPerformingAction = false
                 if let error {
+                    if !didRecoverNetworking, self.recoverNetworkingIfNeeded(after: error) {
+                        self.performBashCreateRequest(didRecoverNetworking: true)
+                        return
+                    }
                     self.createMessage = error.localizedDescription
                 } else if let data,
                           let response = try? ActionResponse.decodeBinary(data) {
@@ -5304,7 +5391,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         updateLayout()
     }
 
-    private func fetchFilePickerDirectory(path: String) {
+    private func fetchFilePickerDirectory(path: String, didRecoverNetworking: Bool = false) {
         guard let filePickerEndpoint, let urlSession else { return }
         if pendingFilePicker != nil {
             pendingFilePicker?.directory = path
@@ -5333,6 +5420,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 guard let self, self.pendingFilePicker != nil else { return }
                 self.pendingFilePicker?.isLoading = false
                 if let error {
+                    if !didRecoverNetworking, self.recoverNetworkingIfNeeded(after: error) {
+                        self.fetchFilePickerDirectory(path: path, didRecoverNetworking: true)
+                        return
+                    }
                     self.pendingFilePicker?.error = error.localizedDescription
                     self.updateLayout()
                     return
@@ -5370,7 +5461,13 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             }
             createValues[targetFieldKey] = picker.entries[selectedIndex].path
         } else {
-            createValues[targetFieldKey] = picker.directory
+            if let selectedIndex = filePickerSelectedIndex,
+               picker.entries.indices.contains(selectedIndex),
+               picker.entries[selectedIndex].isDirectory {
+                createValues[targetFieldKey] = picker.entries[selectedIndex].path
+            } else {
+                createValues[targetFieldKey] = picker.directory
+            }
         }
         pendingFilePicker = nil
         filePickerScroll = 0

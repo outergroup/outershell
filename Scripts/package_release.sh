@@ -527,7 +527,7 @@ EOF
     done
     OUTERSHELL_HOME="$outershell_home" "$outerctl_path" backend upsert --backend "$service_id" --name "$display_name" --launchd-plist "$plist_path" --outershell-owns true
     OUTERSHELL_HOME="$outershell_home" "$outerctl_path" app remove --backend "$service_id" --frontend-id "$service_id:main"
-    OUTERSHELL_HOME="$outershell_home" "$outerctl_path" app add --backend "$service_id" --socket-path "$socket_path" --name "$display_name" --url "/" --icon-path "$icon_path"
+    OUTERSHELL_HOME="$outershell_home" "$outerctl_path" app upsert --backend "$service_id" --socket-path "$socket_path" --name "$display_name" --url "/" --icon-path "$icon_path"
     append_outerloop_http_unix_allowlist_entry user "$socket_path"
     OUTERSHELL_HOME="$outershell_home" "$outerctl_path" log remove --backend "$service_id" --path "$log_path"
     OUTERSHELL_HOME="$outershell_home" "$outerctl_path" log add --backend "$service_id" --path "$log_path"
@@ -1063,7 +1063,7 @@ systemctl $systemctl_scope start org.outershell.OuterShell.socket
 
 run_outerctl backend upsert --backend org.outershell.OuterShell --name "Outer Shell" --systemd-unit org.outershell.OuterShell.service
 run_outerctl app remove --backend org.outershell.OuterShell --frontend-id org.outershell.OuterShell:main
-run_outerctl app add --backend org.outershell.OuterShell --socket-path "$socket_path" --name "Outer Shell" --url "/" --icon-path "$install_root/app-icon.png"
+run_outerctl app upsert --backend org.outershell.OuterShell --socket-path "$socket_path" --name "Outer Shell" --url "/" --icon-path "$install_root/app-icon.png"
 if [ "$root_install" = true ]; then
     append_outerloop_http_unix_allowlist_entry system "$socket_path"
 else

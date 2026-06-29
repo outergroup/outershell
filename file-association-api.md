@@ -103,22 +103,20 @@ Removing a backend clears custom content type definitions owned by that backend.
 
 Mutating opener operations use `outerctl` commands. The `outerctl` binary parses
 the command line and sends dedicated structured messages such as
-`openerAddRequest` and `openerRemoveRequest` to `outershelld`.
+`openerUpsertRequest` and `openerRemoveRequest` to `outershelld`.
 
 Add or update an opener:
 
 ```bash
-outerctl opener add \
+outerctl opener upsert \
   --backend org.outershell.Plaintext \
   --content-type public.text \
-  --socket-path "$XDG_RUNTIME_DIR/org.outershell.Plaintext" \
-  --name Plaintext \
   --url-template '?file={file}' \
   --rank 0 \
   --capabilities view,edit
 ```
 
-Remove one opener for a backend and content type:
+Remove one opener for a frontend and content type:
 
 ```bash
 outerctl opener remove \
@@ -126,8 +124,9 @@ outerctl opener remove \
   --content-type public.text
 ```
 
-The backend must already be registered before `opener add` or `opener remove`.
-Removing a backend clears opener records owned by that backend.
+The frontend must already be registered before `opener upsert` or
+`opener remove`. If `--frontend-id` is omitted, `--backend` is used as shorthand
+for `<backend>:main`. Removing a backend clears opener records for its frontends.
 
 ## Listing Openers
 
@@ -142,7 +141,7 @@ outerctl opener list --content-type public.text
 Columns:
 
 ```text
-content_type  service_id  display_name  socket_path  url_template  rank  capabilities
+content_type  frontend_id  url_template  rank  capabilities
 ```
 
 This is a registry listing command. `--content-type` matches the opener's

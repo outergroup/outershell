@@ -202,10 +202,10 @@ App rows are user-facing entry points for a backend. Each app has either a TCP
 endpoint, a Unix socket endpoint, or no endpoint yet. The endpoint scheme and
 URL path are stored separately from the endpoint-specific payload.
 
-### `outerctl app add`
+### `outerctl app upsert`
 
 ```bash
-outerctl app add \
+outerctl app upsert \
   --backend <service-id> \
   --name <display-name> \
   [--frontend-id <id>] \
@@ -223,7 +223,7 @@ target a TCP host and port or a Unix socket. `--path` is the URL path opened
 inside the endpoint; `--url` is accepted as command-line convenience and is
 parsed into scheme, host, port, and path before the socket request is sent.
 
-Socket message: `appAddRequest` (`messageType = 13`)
+Socket message: `appUpsertRequest` (`messageType = 13`)
 
 ```text
 bytes 2..3:    UInt16 endpoint kind
@@ -486,33 +486,32 @@ Openers connect a backend to a content type. When a file matches the content
 type or any child type, Outer Shell can present the backend as an app that can
 open the file.
 
-### `outerctl opener add`
+### `outerctl opener upsert`
 
 ```bash
-outerctl opener add \
-  --backend <service-id> \
+outerctl opener upsert \
+  [--backend <service-id>] \
+  [--frontend-id <frontend-id>] \
   --content-type <identifier> \
-  --socket-path <socket-path> \
-  --name <display-name> \
   [--url-template <template>] \
   [--rank <non-negative-integer>] \
   [--capabilities view,edit]
 ```
 
-Creates or updates an opener record for a backend and content type. The opener
-record tells Outer Shell that the backend can view, edit, or otherwise open
-files that match that content type.
+Creates or updates an opener record for a frontend and content type. The opener
+record tells Outer Shell that the frontend can view, edit, or otherwise open
+files that match that content type. If `--frontend-id` is omitted, `outershelld`
+derives `<backend>:main` from `--backend`.
 
-Socket message: `openerAddRequest` (`messageType = 22`)
+Socket message: `openerUpsertRequest` (`messageType = 22`)
 
 ```text
 bytes 2..5:    UInt32 rank
 bytes 6..9:    UInt32 capability flags
-bytes 10..17:  StringRef32 backend service id
-bytes 18..25:  StringRef32 content type
-bytes 26..33:  StringRef32 display name
-bytes 34..41:  StringRef32 socket path
-bytes 42..49:  StringRef32 URL template
+bytes 10..17:  StringRef32 backend service id, optional shorthand
+bytes 18..25:  StringRef32 frontend id, optional if backend is present
+bytes 26..33:  StringRef32 content type
+bytes 34..41:  StringRef32 URL template
 ```
 
 Response: `commandResponse` (`messageType = 100`).
@@ -533,17 +532,19 @@ path and substitutes it into the template when resolving opener URLs.
 
 ```bash
 outerctl opener remove \
-  --backend <service-id> \
+  [--backend <service-id>] \
+  [--frontend-id <frontend-id>] \
   --content-type <identifier>
 ```
 
-Removes one opener record for the backend and registered content type.
+Removes one opener record for the frontend and registered content type.
 
 Socket message: `openerRemoveRequest` (`messageType = 23`)
 
 ```text
-bytes 2..9:    StringRef32 backend service id
-bytes 10..17:  StringRef32 content type
+bytes 2..9:    StringRef32 backend service id, optional shorthand
+bytes 10..17:  StringRef32 frontend id, optional if backend is present
+bytes 18..25:  StringRef32 content type
 ```
 
 Response: `commandResponse` (`messageType = 100`).
@@ -553,14 +554,17 @@ Response: `commandResponse` (`messageType = 100`).
 ```bash
 outerctl opener list \
   [--backend <service-id>] \
+  [--frontend-id <frontend-id>] \
   [--content-type <identifier>]
 ```
 
 Lists registered opener records. If `--backend` is present, only opener rows
-for that backend service id are returned. If `--content-type` is present, only
-opener rows whose registered content type exactly matches the normalized value
-are returned. This is a registry listing filter; it does not expand content
-type conformance and does not infer a file's type.
+whose frontend belongs to that backend are returned. If `--frontend-id` is
+present, only opener rows for that exact frontend are returned. If
+`--content-type` is present, only opener rows whose registered content type
+exactly matches the normalized value are returned. This is a registry listing
+filter; it does not expand content type conformance and does not infer a file's
+type.
 
 Use `fileOpenersQuery` when you want “which apps can open this file?” behavior
 with content-type inference, optional explicit content type, conformance
@@ -570,28 +574,27 @@ Socket message: `openerListRequest` (`messageType = 24`)
 
 ```text
 bytes 2..9:    StringRef32 backend service id, empty for all openers
-bytes 10..17:  StringRef32 registered content type, empty for all openers
+bytes 10..17:  StringRef32 frontend id, empty for all openers
+bytes 18..25:  StringRef32 registered content type, empty for all openers
 ```
 
 Response message: `openerListResponse` (`messageType = 105`)
 
 This response uses the common list response header above. Its `row count`
 field tells you how many opener rows follow at byte 22. Use the header's
-`row size` field as the stride between rows; the current row size is 48 bytes.
+`row size` field as the stride between rows; the current row size is 32 bytes.
 
 ```text
-Opener row, 48 bytes:
+Opener row, 32 bytes:
 bytes 0..3:    UInt32 rank
 bytes 4..11:   StringRef32 content type
-bytes 12..19:  StringRef32 backend service id
-bytes 20..27:  StringRef32 display name
-bytes 28..35:  StringRef32 socket path
-bytes 36..43:  StringRef32 URL template
-bytes 44..47:  UInt32 capability flags
+bytes 12..19:  StringRef32 frontend id
+bytes 20..27:  StringRef32 URL template
+bytes 28..31:  UInt32 capability flags
 ```
 
-`outerctl` prints these rows as TSV columns `content_type`, `service_id`,
-`display_name`, `socket_path`, `url_template`, `rank`, and `capabilities`.
+`outerctl` prints these rows as TSV columns `content_type`, `frontend_id`,
+`url_template`, `rank`, and `capabilities`.
 
 ## Querying File Openers Directly
 

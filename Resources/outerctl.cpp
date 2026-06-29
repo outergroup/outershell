@@ -340,7 +340,7 @@ enum : uint16_t {
     kMessageBackendUpsertRequest = 10,
     kMessageBackendRemoveRequest = 11,
     kMessageBackendListRequest = 12,
-    kMessageAppAddRequest = 13,
+    kMessageAppUpsertRequest = 13,
     kMessageAppRemoveRequest = 14,
     kMessageAppListRequest = 15,
     kMessageLogAddRequest = 16,
@@ -349,7 +349,7 @@ enum : uint16_t {
     kMessageContentTypeAddRequest = 19,
     kMessageContentTypeRemoveRequest = 20,
     kMessageContentTypeListRequest = 21,
-    kMessageOpenerAddRequest = 22,
+    kMessageOpenerUpsertRequest = 22,
     kMessageOpenerRemoveRequest = 23,
     kMessageOpenerListRequest = 24,
     kMessageCommandResponse = 100,
@@ -569,7 +569,7 @@ bool mapCommand(const char *resource, const char *action, uint16_t &messageType)
         else if (strcmp(action, "list") == 0) messageType = kMessageBackendListRequest;
         else return false;
     } else if (strcmp(resource, "app") == 0) {
-        if (strcmp(action, "add") == 0) messageType = kMessageAppAddRequest;
+        if (strcmp(action, "upsert") == 0) messageType = kMessageAppUpsertRequest;
         else if (strcmp(action, "remove") == 0) messageType = kMessageAppRemoveRequest;
         else if (strcmp(action, "list") == 0) messageType = kMessageAppListRequest;
         else return false;
@@ -584,7 +584,7 @@ bool mapCommand(const char *resource, const char *action, uint16_t &messageType)
         else if (strcmp(action, "list") == 0) messageType = kMessageContentTypeListRequest;
         else return false;
     } else if (strcmp(resource, "opener") == 0) {
-        if (strcmp(action, "add") == 0) messageType = kMessageOpenerAddRequest;
+        if (strcmp(action, "upsert") == 0) messageType = kMessageOpenerUpsertRequest;
         else if (strcmp(action, "remove") == 0) messageType = kMessageOpenerRemoveRequest;
         else if (strcmp(action, "list") == 0) messageType = kMessageOpenerListRequest;
         else return false;
@@ -736,7 +736,7 @@ bool appendCommandRequestMessage(Buffer &message, const CommandRequest &request)
         ok = ok && appendStringRefs(message, values, 1);
         break;
     }
-    case kMessageAppAddRequest: {
+    case kMessageAppUpsertRequest: {
         const char *values[] = {request.backend, request.frontendId, request.displayName, request.path, request.host, request.socketPath, request.iconPath, request.frontendList};
         ok = ok &&
             appendLittleEndianUInt16(message, request.endpointKind) &&
@@ -775,22 +775,18 @@ bool appendCommandRequestMessage(Buffer &message, const CommandRequest &request)
         ok = ok && appendStringRefs(message, values, 2);
         break;
     }
-    case kMessageOpenerAddRequest: {
-        const char *values[] = {request.backend, request.contentType, request.displayName, request.socketPath, request.urlTemplate};
+    case kMessageOpenerUpsertRequest: {
+        const char *values[] = {request.backend, request.frontendId, request.contentType, request.urlTemplate};
         ok = ok &&
             appendLittleEndianUInt32(message, request.rank) &&
             appendLittleEndianUInt32(message, request.openerCapabilities) &&
-            appendStringRefs(message, values, 5);
+            appendStringRefs(message, values, 4);
         break;
     }
-    case kMessageOpenerRemoveRequest: {
-        const char *values[] = {request.backend, request.contentType};
-        ok = ok && appendStringRefs(message, values, 2);
-        break;
-    }
+    case kMessageOpenerRemoveRequest:
     case kMessageOpenerListRequest: {
-        const char *values[] = {request.backend, request.contentType};
-        ok = ok && appendStringRefs(message, values, 2);
+        const char *values[] = {request.backend, request.frontendId, request.contentType};
+        ok = ok && appendStringRefs(message, values, 3);
         break;
     }
     default:
@@ -852,7 +848,7 @@ bool writeRegistryListResponse(const CommandRequest &request, const Buffer &resp
     const char *appHeaders[] = {"frontend_id", "service_id", "display_name", "endpoint_kind", "scheme", "host", "port", "socket_path", "path", "url", "icon_path", "list"};
     const char *logHeaders[] = {"path", "service_id"};
     const char *contentTypeHeaders[] = {"service_id", "identifier", "display_name", "conforms_to", "extensions", "mime_types"};
-    const char *openerHeaders[] = {"content_type", "service_id", "display_name", "socket_path", "url_template", "rank", "capabilities"};
+    const char *openerHeaders[] = {"content_type", "frontend_id", "url_template", "rank", "capabilities"};
 
     size_t minimumRowSize = 0;
     size_t rowBase = 22;
@@ -953,7 +949,7 @@ bool writeRegistryListResponse(const CommandRequest &request, const Buffer &resp
         }
         break;
     case kMessageOpenerListResponse:
-        minimumRowSize = 48;
+        minimumRowSize = 32;
         if (responseRowSize < minimumRowSize) {
             ok = false;
             break;
@@ -967,12 +963,12 @@ bool writeRegistryListResponse(const CommandRequest &request, const Buffer &resp
             }
             char rankBuffer[32];
             snprintf(rankBuffer, sizeof(rankBuffer), "%u", readLittleEndianUInt32(bytes + offset));
-            const size_t refs[] = {4, 12, 20, 28, 36};
+            const size_t refs[] = {4, 12, 20};
             ok = writeTsvRefs(response, offset, refs, sizeof(refs) / sizeof(refs[0])) &&
                 fputc('\t', stdout) != EOF &&
                 writeTsvString(rankBuffer) &&
                 fputc('\t', stdout) != EOF &&
-                writeOpenerCapabilities(readLittleEndianUInt32(bytes + offset + 44)) &&
+                writeOpenerCapabilities(readLittleEndianUInt32(bytes + offset + 28)) &&
                 fputc('\n', stdout) != EOF;
         }
         break;
@@ -1096,7 +1092,7 @@ int main(int argc, char *argv[]) {
     }
     Buffer endpointHost;
     Buffer endpointPath;
-    if (request.messageType == kMessageAppAddRequest &&
+    if (request.messageType == kMessageAppUpsertRequest &&
         !parseAppEndpoint(request, endpointHost, endpointPath, apiError)) {
         fprintf(stderr, "%s\n", apiError.data ? apiError.data : "Invalid app endpoint.");
         freeBuffer(endpointHost);

@@ -59,7 +59,7 @@ Request message types are allocated in one contiguous block:
 10 backendUpsertRequest
 11 backendRemoveRequest
 12 backendListRequest
-13 appAddRequest
+13 appUpsertRequest
 14 appRemoveRequest
 15 appListRequest
 16 logAddRequest
@@ -68,7 +68,7 @@ Request message types are allocated in one contiguous block:
 19 contentTypeAddRequest
 20 contentTypeRemoveRequest
 21 contentTypeListRequest
-22 openerAddRequest
+22 openerUpsertRequest
 23 openerRemoveRequest
 24 openerListRequest
 25 fileOpenersQuery
@@ -132,7 +132,7 @@ Returns `backendListResponse` (`messageType = 101`).
 
 ### Apps
 
-`appAddRequest` (`13`):
+`appUpsertRequest` (`13`):
 
 ```text
 bytes 2..3:    UInt16 endpoint kind
@@ -233,16 +233,15 @@ Returns `contentTypeListResponse` (`messageType = 104`).
 
 ### Openers
 
-`openerAddRequest` (`messageType = 22`):
+`openerUpsertRequest` (`messageType = 22`):
 
 ```text
 bytes 2..5:    UInt32 rank
 bytes 6..9:    UInt32 capability flags
-bytes 10..17:  StringRef32 backend service id
-bytes 18..25:  StringRef32 content type
-bytes 26..33:  StringRef32 display name
-bytes 34..41:  StringRef32 socket path
-bytes 42..49:  StringRef32 URL template
+bytes 10..17:  StringRef32 backend service id, optional shorthand
+bytes 18..25:  StringRef32 frontend id, optional if backend is present
+bytes 26..33:  StringRef32 content type
+bytes 34..41:  StringRef32 URL template
 ```
 
 Returns `commandResponse` (`messageType = 100`).
@@ -412,10 +411,8 @@ outerctl content-type add \
   --extensions example,exs \
   --mime-types text/x-example
 
-outerctl opener add --backend org.outershell.Plaintext \
+outerctl opener upsert --backend org.outershell.Plaintext \
   --content-type public.text \
-  --socket-path "$XDG_RUNTIME_DIR/org.outershell.Plaintext" \
-  --name Plaintext \
   --url-template '?file={file}' \
   --capabilities view,edit
 
