@@ -8252,7 +8252,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             let rootEndpoint = sorted.first { $0.backend.serviceScope == "system" }
             let runningUserEndpoint = userEndpoint.flatMap { endpointIsRunning($0) ? $0 : nil }
             let runningEndpoint = sorted.first { endpointIsRunning($0) }
-            let primaryEndpoint = runningUserEndpoint ?? runningEndpoint ?? userEndpoint ?? rootEndpoint ?? sorted[0]
+            let readyUserEndpoint = userEndpoint.flatMap { endpointIsReadyToOpen($0) ? $0 : nil }
+            let readyEndpoint = sorted.first { endpointIsReadyToOpen($0) }
+            let primaryEndpoint = runningUserEndpoint ?? runningEndpoint ?? readyUserEndpoint ?? readyEndpoint ?? userEndpoint ?? rootEndpoint ?? sorted[0]
             return AppLauncherItem(identityKey: key,
                                    primaryEndpoint: primaryEndpoint,
                                    userEndpoint: userEndpoint,
@@ -8651,7 +8653,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                                    isEnabled: true,
                                                    systemImageName: "macwindow.badge.plus"))
 
-            if endpoint.backend.canControl {
+            if endpoint.backend.canControl && (endpointIsRunning(endpoint) || !endpointIsReadyToOpen(endpoint)) {
                 let isRunning = endpointIsRunning(endpoint)
                 let controlOperation = isRunning ? "stop" : "start"
                 let controlItemID = "\(idPrefix)-\(controlOperation)"

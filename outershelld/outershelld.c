@@ -6264,19 +6264,14 @@ static void systemd_status(const char *unit_name, const char *scope, char *out, 
     } else if (!has_active_state ||
                strcmp(active_state, "inactive") == 0 ||
                strcmp(active_state, "failed") == 0) {
-        for (size_t i = 0; i < sizeof(kBundledApps) / sizeof(kBundledApps[0]); i++) {
-            if (!kBundledApps[i].socket_activated || strcmp(kBundledApps[i].unit_name, unit_name) != 0) {
-                continue;
-            }
-            char socket_unit[256];
-            systemd_socket_unit_name(unit_name, socket_unit, sizeof(socket_unit));
-            if (safe_unit_name(socket_unit)) {
-                char socket_active_state[32] = "";
-                if (cached_systemd_active_state(socket_unit, scope, socket_active_state, sizeof(socket_active_state)) &&
-                    strcmp(socket_active_state, "active") == 0) {
-                    snprintf(out, out_size, "available");
-                    return;
-                }
+        char socket_unit[256];
+        systemd_socket_unit_name(unit_name, socket_unit, sizeof(socket_unit));
+        if (safe_unit_name(socket_unit) && strcmp(socket_unit, unit_name) != 0) {
+            char socket_active_state[32] = "";
+            if (cached_systemd_active_state(socket_unit, scope, socket_active_state, sizeof(socket_active_state)) &&
+                strcmp(socket_active_state, "active") == 0) {
+                snprintf(out, out_size, "available");
+                return;
             }
         }
         snprintf(out, out_size, "stopped");
