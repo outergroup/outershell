@@ -6964,10 +6964,11 @@ static bool build_backend_payload(const char *service_id,
                                   const char *installed_version,
                                   const char *available_version,
                                   const char *script_path,
+                                  const char *public_base_url,
                                   StringBuilder *frontends_array,
                                   StringBuilder *log_files_array,
                                   StringBuilder *payload) {
-    if (!binary_append_zero(payload, 108)) return false;
+    if (!binary_append_zero(payload, 116)) return false;
     return binary_append_string_ref_at(payload, 0, service_id) &&
            binary_append_string_ref_at(payload, 8, display_name && display_name[0] ? display_name : service_id) &&
            binary_append_string_ref_at(payload, 16, service_unit) &&
@@ -6981,7 +6982,8 @@ static bool build_backend_payload(const char *service_id,
            binary_append_child_ref_at(payload, 76, log_files_array) &&
            binary_append_string_ref_at(payload, 84, installed_version) &&
            binary_append_string_ref_at(payload, 92, available_version) &&
-           binary_append_string_ref_at(payload, 100, script_path);
+           binary_append_string_ref_at(payload, 100, script_path) &&
+           binary_append_string_ref_at(payload, 108, public_base_url);
 }
 
 static void managed_backend_script_path(const char *service_id,
@@ -7112,6 +7114,7 @@ static bool append_registered_backend_payloads(const RegistryStore *database,
         StringBuilder payload = {0};
         char script_path[PATH_MAX] = "";
         managed_backend_script_path(service_id, effective_service_scope, script_path, sizeof(script_path));
+        const char *public_base_url = is_self ? g_home_screen_public_base_url : "";
         bool service_is_running = strcmp(status, "running") == 0;
         ok = build_frontends_array_payload(database,
                                            layout_database ? layout_database : database,
@@ -7121,7 +7124,7 @@ static bool append_registered_backend_payloads(const RegistryStore *database,
              build_log_files_array_payload(database, service_id, &logs) &&
              build_backend_payload(service_id, display_name, service_unit, service_unit_path,
                                    effective_service_scope, status, flags, "",
-                                   plist_path, installed_version, available_version, script_path, &frontends, &logs, &payload) &&
+                                   plist_path, installed_version, available_version, script_path, public_base_url, &frontends, &logs, &payload) &&
              binary_payload_list_append(payloads, &payload);
         free(frontends.data);
         free(logs.data);
@@ -7149,6 +7152,7 @@ static bool append_root_migration_backend_payload(BinaryPayloadList *payloads) {
                                     "system",
                                     "pending",
                                     BACKEND_FLAG_CAN_CONTROL | BACKEND_FLAG_IS_INSTALLED | BACKEND_FLAG_IS_MIGRATION,
+                                    "",
                                     "",
                                     "",
                                     "",
@@ -7183,6 +7187,7 @@ static bool append_bundled_backend_placeholder_payload(BinaryPayloadList *payloa
                                     app->icon_symbol_name ? app->icon_symbol_name : "",
                                     "",
                                     app->version ? app->version : "",
+                                    "",
                                     "",
                                     "",
                                     &frontends,
@@ -7710,6 +7715,11 @@ static void send_control_response(int fd, const char *query, const char *body) {
 
     if (is_home_screen_service_id(service_id)) {
         char message[4096] = "";
+        if (strcmp(operation, "invalidateBackendState") == 0) {
+            mark_backend_event_changed();
+            send_action_response(fd, 200, true, "Backend state invalidated.");
+            return;
+        }
         if (strcmp(operation, "showMenuBarWhenRunning") == 0 ||
             strcmp(operation, "hideMenuBarWhenRunning") == 0) {
             bool enabled = strcmp(operation, "showMenuBarWhenRunning") == 0;

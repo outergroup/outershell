@@ -39,6 +39,7 @@ private struct BackendRecord: Decodable {
     let installedVersion: String?
     let availableVersion: String?
     let scriptPath: String?
+    let publicBaseURL: String?
     let iconSymbolName: String?
     let launchdPlistPath: String
     let ownsLaunchdPlist: Bool
@@ -289,6 +290,7 @@ private extension BackendRecord {
                              installedVersion: reader.data.count >= 92 ? emptyToNil(try reader.stringRef(at: 84)) : nil,
                              availableVersion: reader.data.count >= 100 ? emptyToNil(try reader.stringRef(at: 92)) : nil,
                              scriptPath: reader.data.count >= 108 ? emptyToNil(try reader.stringRef(at: 100)) : nil,
+                             publicBaseURL: reader.data.count >= 116 ? emptyToNil(try reader.stringRef(at: 108)) : nil,
                              iconSymbolName: emptyToNil(try reader.stringRef(at: 48)),
                              launchdPlistPath: try reader.stringRef(at: 56),
                              ownsLaunchdPlist: (flags & 0x20) != 0,
@@ -4834,6 +4836,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                  installedVersion: backend.installedVersion,
                                  availableVersion: backend.availableVersion,
                                  scriptPath: backend.scriptPath,
+                                 publicBaseURL: backend.publicBaseURL,
                                  iconSymbolName: backend.iconSymbolName,
                                  launchdPlistPath: backend.launchdPlistPath,
                                  ownsLaunchdPlist: backend.ownsLaunchdPlist,
@@ -4876,6 +4879,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                  installedVersion: backend.installedVersion,
                                  availableVersion: backend.availableVersion,
                                  scriptPath: backend.scriptPath,
+                                 publicBaseURL: backend.publicBaseURL,
                                  iconSymbolName: backend.iconSymbolName,
                                  launchdPlistPath: backend.launchdPlistPath,
                                  ownsLaunchdPlist: backend.ownsLaunchdPlist,
@@ -4916,6 +4920,35 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         } else {
             outerframeHost.navigate(to: url)
         }
+        scheduleEndpointActivationStateInvalidationIfNeeded(for: endpoint)
+    }
+
+    private func scheduleEndpointActivationStateInvalidationIfNeeded(for endpoint: AppLauncherEndpoint) {
+        let socketPath = endpoint.frontend.socketPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !socketPath.isEmpty || endpoint.frontend.port > 0 else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+            self?.invalidateBackendStateAfterEndpointActivation()
+        }
+    }
+
+    private func invalidateBackendStateAfterEndpointActivation(didRecoverNetworking: Bool = false) {
+        guard let controlEndpoint, let urlSession else { return }
+        var components = URLComponents(url: controlEndpoint, resolvingAgainstBaseURL: false)
+        components?.queryItems = [
+            URLQueryItem(name: "serviceID", value: "org.outershell.OuterShell"),
+            URLQueryItem(name: "operation", value: "invalidateBackendState")
+        ]
+        guard let url = components?.url else { return }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        urlSession.dataTask(with: request) { [weak self] _, _, error in
+            guard let self, let error, !didRecoverNetworking else { return }
+            Task { @MainActor in
+                if self.recoverNetworkingIfNeeded(after: error) {
+                    self.invalidateBackendStateAfterEndpointActivation(didRecoverNetworking: true)
+                }
+            }
+        }.resume()
     }
 
     private func startAndOpenLauncherEndpoint(_ endpoint: AppLauncherEndpoint,
@@ -6332,13 +6365,15 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
     private func aboutDialogText(for backend: BackendRecord) -> String {
         let version = backend.installedVersion?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let publicBaseURL = backend.publicBaseURL?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let updateSource = (publicBaseURL?.isEmpty == false) ? publicBaseURL! : "unknown"
         return [
             "Outer Shell",
             "Version: \((version?.isEmpty == false) ? version! : "unknown")",
             "Service ID: \(backend.serviceID)",
             "Scope: \(backend.serviceScope)",
             "Status: \(backend.status)",
-            "Update source: https://outershell.org/outer-shell"
+            "Update source: \(updateSource)"
         ].joined(separator: "\n")
     }
 
@@ -8002,6 +8037,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                              installedVersion: nil,
                              availableVersion: nil,
                              scriptPath: nil,
+                             publicBaseURL: nil,
                              iconSymbolName: nil,
                              launchdPlistPath: "",
                              ownsLaunchdPlist: true,

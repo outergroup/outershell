@@ -93,6 +93,8 @@ See:
 - `Resources/app-catalog.example.json` for the catalog shape.
 - `Resources/README.md` for Outer Shell release assets and starter app archive
   layout.
+- `deployment-testing.md` for public release deployment and direct server deploy
+  commands.
 
 Installed app payloads are copied into user or root locations appropriate for the
 platform, registered with `outershelld`, and launched through launchd on macOS or
