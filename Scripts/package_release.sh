@@ -11,7 +11,18 @@ PACKAGE_ROOT="${PACKAGE_ROOT:-${REPO_ROOT}/build/linux-package}"
 MACOS_BUILD_ROOT="${MACOS_BUILD_ROOT:-${REPO_ROOT}/build/macos/Release}"
 PUBLIC_BASE_URL="${PUBLIC_BASE_URL:-}"
 APP_CATALOG_PATH="${APP_CATALOG_PATH:-}"
-OUTER_SHELL_VERSION="${OUTER_SHELL_VERSION:-0.0.0.DEV}"
+VERSION_FILE="${VERSION_FILE:-${REPO_ROOT}/VERSION}"
+if [[ -z "${OUTER_SHELL_VERSION:-}" ]]; then
+    if [[ -f "${VERSION_FILE}" ]]; then
+        OUTER_SHELL_VERSION="$(tr -d '[:space:]' < "${VERSION_FILE}")"
+    else
+        OUTER_SHELL_VERSION="0.0.0.DEV"
+    fi
+fi
+if [[ -z "${OUTER_SHELL_VERSION}" ]]; then
+    echo "error: Outer Shell version is empty" >&2
+    exit 1
+fi
 OUTER_SHELL_CODESIGN_IDENTITY="${OUTER_SHELL_CODESIGN_IDENTITY:-${CODE_SIGN_IDENTITY:--}}"
 OUTER_SHELL_NOTARY_PROFILE="${OUTER_SHELL_NOTARY_PROFILE:-}"
 
