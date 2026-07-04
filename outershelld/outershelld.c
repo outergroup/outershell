@@ -11502,7 +11502,7 @@ static void repair_user_bundled_app_registry_records(void) {
             if (!normalize_content_type_identifier(app->openers[opener_index].content_type,
                                                    normalized_content_type,
                                                    sizeof(normalized_content_type)) ||
-                !registry_store_find_opener(&database, normalized_content_type, app->service_id)) {
+                !registry_store_find_opener(&database, normalized_content_type, frontend_id)) {
                 repair_needed = true;
             }
         }

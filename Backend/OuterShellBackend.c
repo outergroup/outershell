@@ -138,6 +138,7 @@ static const char *kBundleFilePathMacosX86 = "bundles/OuterShell.bundle.macos-x8
 static char g_bundle_file_path_macos_arm[PATH_MAX] = "";
 static char g_bundle_file_path_macos_x86[PATH_MAX] = "";
 static char g_bundled_apps_directory[PATH_MAX] = "";
+static char g_native_app_template_directory[PATH_MAX] = "";
 static char g_bundled_apps_base_url[2048] = "";
 static char g_home_screen_public_base_url[2048] = "";
 static char g_listen_socket_path[PATH_MAX] = "";
@@ -956,6 +957,169 @@ static void send_bundle_file(int fd, const char *path) {
     free(data);
 }
 
+static bool archive_append_u16(StringBuilder *archive, uint16_t value) {
+    unsigned char bytes[2];
+    write_uint16_le(bytes, value);
+    return sb_append_n(archive, (const char *)bytes, sizeof(bytes));
+}
+
+static bool archive_append_u32(StringBuilder *archive, uint32_t value) {
+    unsigned char bytes[4];
+    write_uint32_le(bytes, value);
+    return sb_append_n(archive, (const char *)bytes, sizeof(bytes));
+}
+
+static bool archive_append_u64(StringBuilder *archive, uint64_t value) {
+    unsigned char bytes[8];
+    write_uint64_le(bytes, value);
+    return sb_append_n(archive, (const char *)bytes, sizeof(bytes));
+}
+
+static bool archive_append_template_file(StringBuilder *archive,
+                                         const char *root,
+                                         const char *relative_path,
+                                         const struct stat *st) {
+    size_t relative_length = strlen(relative_path);
+    if (relative_length == 0 || relative_length > UINT16_MAX) {
+        return false;
+    }
+    if (st->st_size < 0) {
+        return false;
+    }
+
+    char full_path[PATH_MAX];
+    int full_length = snprintf(full_path, sizeof(full_path), "%s/%s", root, relative_path);
+    if (full_length < 0 || (size_t)full_length >= sizeof(full_path)) {
+        return false;
+    }
+
+    int file_fd = open(full_path, O_RDONLY);
+    if (file_fd < 0) {
+        return false;
+    }
+
+    bool ok = archive_append_u16(archive, (uint16_t)relative_length) &&
+              archive_append_u32(archive, (uint32_t)(st->st_mode & 0777)) &&
+              archive_append_u64(archive, (uint64_t)st->st_size) &&
+              sb_append_n(archive, relative_path, relative_length);
+
+    char buffer[32768];
+    off_t remaining = st->st_size;
+    while (ok && remaining > 0) {
+        ssize_t got = read(file_fd, buffer, sizeof(buffer));
+        if (got < 0) {
+            if (errno == EINTR) continue;
+            ok = false;
+            break;
+        }
+        if (got == 0) {
+            ok = false;
+            break;
+        }
+        ok = sb_append_n(archive, buffer, (size_t)got);
+        remaining -= got;
+    }
+
+    close(file_fd);
+    return ok;
+}
+
+static bool archive_append_template_directory(StringBuilder *archive,
+                                              const char *root,
+                                              const char *relative_directory) {
+    char full_directory[PATH_MAX];
+    if (relative_directory[0]) {
+        int full_length = snprintf(full_directory, sizeof(full_directory), "%s/%s", root, relative_directory);
+        if (full_length < 0 || (size_t)full_length >= sizeof(full_directory)) {
+            return false;
+        }
+    } else {
+        snprintf(full_directory, sizeof(full_directory), "%s", root);
+    }
+
+    DIR *dir = opendir(full_directory);
+    if (!dir) {
+        return false;
+    }
+
+    bool ok = true;
+    struct dirent *entry;
+    while (ok && (entry = readdir(dir)) != NULL) {
+        const char *name = entry->d_name;
+        if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0 ||
+            strcmp(name, ".DS_Store") == 0 || strncmp(name, "._", 2) == 0) {
+            continue;
+        }
+
+        char child_relative[PATH_MAX];
+        int child_length;
+        if (relative_directory[0]) {
+            child_length = snprintf(child_relative, sizeof(child_relative), "%s/%s", relative_directory, name);
+        } else {
+            child_length = snprintf(child_relative, sizeof(child_relative), "%s", name);
+        }
+        if (child_length < 0 || (size_t)child_length >= sizeof(child_relative)) {
+            ok = false;
+            break;
+        }
+
+        char child_full[PATH_MAX];
+        int full_length = snprintf(child_full, sizeof(child_full), "%s/%s", root, child_relative);
+        if (full_length < 0 || (size_t)full_length >= sizeof(child_full)) {
+            ok = false;
+            break;
+        }
+
+        struct stat st;
+        if (lstat(child_full, &st) != 0) {
+            ok = false;
+            break;
+        }
+        if (S_ISDIR(st.st_mode)) {
+            ok = archive_append_template_directory(archive, root, child_relative);
+        } else if (S_ISREG(st.st_mode)) {
+            ok = archive_append_template_file(archive, root, child_relative, &st);
+        }
+    }
+
+    closedir(dir);
+    return ok;
+}
+
+static void send_native_app_template_archive(int fd) {
+    if (!g_native_app_template_directory[0]) {
+        send_text_response(fd, 404, "native app template directory is not configured\n");
+        return;
+    }
+
+    struct stat st;
+    if (stat(g_native_app_template_directory, &st) != 0 || !S_ISDIR(st.st_mode)) {
+        char message[PATH_MAX + 96];
+        snprintf(message, sizeof(message), "native app template directory not found at %s\n", g_native_app_template_directory);
+        send_text_response(fd, 404, message);
+        return;
+    }
+
+    StringBuilder archive = {0};
+    bool ok = sb_append_n(&archive, "OSNTPL1", 7) &&
+              sb_append_n(&archive, "\0", 1) &&
+              archive_append_template_directory(&archive, g_native_app_template_directory, "") &&
+              archive_append_u16(&archive, 0);
+    if (!ok) {
+        free(archive.data);
+        send_text_response(fd, 500, "failed to build native app template archive\n");
+        return;
+    }
+
+    send_response(fd,
+                  200,
+                  "OK",
+                  "application/vnd.outershell.native-app-template",
+                  archive.data,
+                  archive.length);
+    free(archive.data);
+}
+
 static bool is_navigator_route(const char *target) {
     return strcmp(target, "/") == 0 ||
            strcmp(target, "/apps") == 0 ||
@@ -1203,6 +1367,8 @@ static bool process_http_client_request(ReactorClient *client, char *request, si
 
     if (strcasecmp(method, "POST") == 0) {
         send_text_response(fd, 404, "not found\n");
+    } else if (strcmp(target, "/api/native-app-template") == 0) {
+        send_native_app_template_archive(fd);
     } else if (is_navigator_route(target)) {
         send_outer_descriptor(fd);
     } else {
@@ -1607,7 +1773,7 @@ static void run_http_reactor(int listener) {
 }
 
 static void outer_shell_backend_usage(const char *program) {
-    fprintf(stderr, "Usage: %s [--port PORT | --socket-path PATH] [--api-socket-path PATH] [--launchd-socket-name NAME] [--bundles-dir DIR] [--stay-alive]\n", program);
+    fprintf(stderr, "Usage: %s [--port PORT | --socket-path PATH] [--api-socket-path PATH] [--launchd-socket-name NAME] [--bundles-dir DIR] [--native-app-template-dir DIR] [--stay-alive]\n", program);
 }
 
 static void initialize_runtime_paths(char *api_socket_path, size_t api_socket_path_size) {
@@ -1646,6 +1812,8 @@ int OuterShellBackendMain(int argc, char **argv) {
             snprintf(launchd_socket_name, sizeof(launchd_socket_name), "%s", argv[++i]);
         } else if (strcmp(argv[i], "--bundles-dir") == 0 && i + 1 < argc) {
             bundles_dir = argv[++i];
+        } else if (strcmp(argv[i], "--native-app-template-dir") == 0 && i + 1 < argc) {
+            expand_tilde_path(argv[++i], g_native_app_template_directory, sizeof(g_native_app_template_directory));
         } else if (strcmp(argv[i], "--bundled-apps-dir") == 0 && i + 1 < argc) {
             expand_tilde_path(argv[++i], g_bundled_apps_directory, sizeof(g_bundled_apps_directory));
         } else if (strcmp(argv[i], "--app-base-url") == 0 && i + 1 < argc) {

@@ -1,0 +1,19 @@
+# systemd user unit for @APP_NAME@. Rendered from deploy/app.service.in by
+# `./app build` (@APP_ID@/@APP_NAME@ come from app.env) and installed to
+# ~/.config/systemd/user/@APP_ID@.service by deploy/remote-install.sh.
+#
+# %h = the user's home directory, %t = $XDG_RUNTIME_DIR. Using specifiers
+# keeps this file identical for every user of the machine.
+
+[Unit]
+Description=@APP_NAME@ (outerframe app backend)
+
+[Service]
+Type=simple
+ExecStart=%h/.local/share/outershell-apps/@APP_ID@/@BACKEND_EXECUTABLE_NAME@ --socket %t/@SOCKET_FILENAME@ --root %h/.local/share/outershell-apps/@APP_ID@
+StandardOutput=append:%h/.local/state/outershell/apps/@APP_ID@/backend.log
+StandardError=append:%h/.local/state/outershell/apps/@APP_ID@/backend.log
+Restart=on-failure
+
+[Install]
+WantedBy=default.target

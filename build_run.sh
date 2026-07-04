@@ -163,5 +163,5 @@ echo
 echo "Run:"
 echo "  API_SOCKET=\"$(getconf DARWIN_USER_TEMP_DIR)outershelld-api\""
 echo "  \"${BUILD_ROOT}/${CONFIGURATION}/outershelld\" --api-socket-path \"\$API_SOCKET\" &"
-echo "  cc -std=gnu17 -DOUTER_SHELL_BACKEND_STANDALONE=1 Backend/OuterShellBuffer.c Backend/OuterShellAPI.c Backend/OuterShellPlatform.c Backend/OuterShellBackend.c -o /tmp/OuterShellBackend && /tmp/OuterShellBackend --port 7354 --api-socket-path \"\$API_SOCKET\" --bundles-dir \"${RUN_ROOT}/bundles\""
+echo "  clang -std=gnu17 -DOUTER_SHELL_BACKEND_STANDALONE=1 Backend/OuterShellBuffer.c Backend/OuterShellAPI.c Backend/OuterShellPlatform.c Backend/OuterShellDownloaderApple.m Backend/OuterShellBackend.c -framework Foundation -o /tmp/OuterShellBackend && /tmp/OuterShellBackend --port 7354 --api-socket-path \"\$API_SOCKET\" --bundles-dir \"${RUN_ROOT}/bundles\" --native-app-template-dir \"${SCRIPT_DIR}/Resources/NativeAppTemplate\""
 echo "  \"${BUILD_ROOT}/${CONFIGURATION}/Outer Shell.app/Contents/MacOS/Outer Shell\" --socket-path \"$(getconf DARWIN_USER_TEMP_DIR)org.outershell.OuterShell\" --app-base-url \"https://outershell.org/outer-shell/apps\""

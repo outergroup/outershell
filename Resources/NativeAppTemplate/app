@@ -1,0 +1,724 @@
+#!/bin/bash
+#
+# Task runner for this outerframe app. Everything the project can do is a
+# subcommand here; run ./app help for the list. This file is meant to be read:
+# each function is one step of the pipeline, and there is no machinery hiding
+# anywhere else.
+
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "${ROOT}"
+
+# shellcheck source=app.env
+source "${ROOT}/app.env"
+BACKEND_EXECUTABLE_NAME="${BACKEND_EXECUTABLE_NAME:-${XCODE_SCHEME}Backend}"
+
+BUILD_DIR="${ROOT}/build"
+PAYLOAD_DIR="${BUILD_DIR}/payload"
+DERIVED_DATA_DIR="${BUILD_DIR}/DerivedData"
+LOCAL_PORT="${LOCAL_PORT:-8787}"
+
+# Server-side locations. Must agree with deploy/app.service.in and the
+# deploy/remote-*.sh scripts.
+REMOTE_APP_DIR=".local/share/outershell-apps/${APP_ID}"   # relative to \$HOME
+
+# ---------------------------------------------------------------------------
+# SSH target
+# ---------------------------------------------------------------------------
+
+# target.env holds OUTER_TARGET_KIND and OUTER_TARGET_SSH. For SSH targets,
+# OUTER_TARGET_SSH is an argv array used to reach the deploy target, e.g.
+# ("ssh" "-p" "2222" "me@devbox"). For localhost targets, OUTER_TARGET_KIND is
+# "local" and OUTER_TARGET_SSH is intentionally empty. It is gitignored so the
+# project stays shareable. Outer Loop knows these arguments and prefills the
+# file in generated projects.
+#
+# If the first argument is ssh, connection-multiplexing options are inserted so
+# a whole deploy authenticates once, not once per connection.
+
+TARGET_KIND="ssh"
+SSH_BASE=()
+
+load_target() {
+    if [[ ! -f "${ROOT}/target.env" ]]; then
+        echo "error: no deploy target configured." >&2
+        echo "  ./app target \"ssh -p 22 you@your-server\"" >&2
+        exit 1
+    fi
+    # shellcheck source=/dev/null
+    source "${ROOT}/target.env"
+    TARGET_KIND="${OUTER_TARGET_KIND:-ssh}"
+    if [[ "${TARGET_KIND}" != "ssh" && "${TARGET_KIND}" != "local" ]]; then
+        echo "error: target.env has unsupported OUTER_TARGET_KIND '${TARGET_KIND}'" >&2
+        exit 1
+    fi
+    if [[ "$(declare -p OUTER_TARGET_SSH 2>/dev/null)" != declare\ -a* ]]; then
+        echo "error: target.env does not set OUTER_TARGET_SSH as an array" >&2
+        exit 1
+    fi
+    if [[ "${TARGET_KIND}" == "local" ]]; then
+        SSH_BASE=()
+        return
+    fi
+    if [[ "${#OUTER_TARGET_SSH[@]}" -eq 0 ]]; then
+        echo "error: OUTER_TARGET_KIND is ssh, but OUTER_TARGET_SSH is empty" >&2
+        exit 1
+    fi
+
+    if [[ "$(basename "${OUTER_TARGET_SSH[0]}")" == "ssh" ]]; then
+        mkdir -p "${HOME}/.ssh"
+        SSH_BASE=(
+            "${OUTER_TARGET_SSH[0]}"
+            -o ControlMaster=auto
+            -o "ControlPath=${HOME}/.ssh/app-%C"
+            -o ControlPersist=2m
+            "${OUTER_TARGET_SSH[@]:1}"
+        )
+    else
+        SSH_BASE=("${OUTER_TARGET_SSH[@]}")
+    fi
+}
+
+run_ssh() {
+    if [[ "${TARGET_KIND}" == "local" ]]; then
+        if [[ $# -gt 0 && "$1" == "-t" ]]; then
+            shift
+        fi
+        if [[ $# -eq 0 ]]; then
+            "${SHELL:-/bin/sh}"
+        elif [[ $# -eq 1 ]]; then
+            bash -lc "$1"
+        else
+            "$@"
+        fi
+        return
+    fi
+    "${SSH_BASE[@]}" "$@"
+}
+
+shell_quote() {
+    local value="$1"
+    printf "'%s'" "${value//\'/\'\\\'\'}"
+}
+
+# Ask the server for its architecture so the backend build targets the right
+# one. Cached per build; ControlMaster makes repeat probes free anyway.
+probe_goarch() {
+    local machine
+    machine="$(run_ssh uname -m </dev/null)"
+    case "${machine}" in
+        x86_64)          echo amd64 ;;
+        aarch64|arm64)   echo arm64 ;;
+        *)
+            echo "error: unsupported server architecture '${machine}'" >&2
+            exit 1
+            ;;
+    esac
+}
+
+host_goarch() {
+    case "$(uname -m)" in
+        arm64)  echo arm64 ;;
+        x86_64) echo amd64 ;;
+        *)
+            echo "error: unsupported host architecture" >&2
+            exit 1
+            ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
+# Frontend build (macOS bundle -> platform archives + .outer descriptor)
+# ---------------------------------------------------------------------------
+
+require_tool() {
+    if ! command -v "$1" >/dev/null 2>&1; then
+        echo "error: required tool '$1' was not found on PATH" >&2
+        exit 1
+    fi
+}
+
+bundle_executable_name() {
+    local bundle_path="$1"
+    local info_plist="${bundle_path}/Contents/Info.plist"
+    local executable_name=""
+    if [[ -f "${info_plist}" && -x /usr/libexec/PlistBuddy ]]; then
+        executable_name="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "${info_plist}" 2>/dev/null || true)"
+    fi
+    if [[ -z "${executable_name}" ]]; then
+        executable_name="$(basename "${bundle_path}" .bundle)"
+    fi
+    printf '%s\n' "${executable_name}"
+}
+
+# Thin the universal bundle to one slice and pack it as an Apple Archive,
+# which is the wire format Outer Loop downloads for a platform.
+archive_platform_bundle() {
+    local source_bundle="$1"
+    local platform="$2"
+    local slice_arch="$3"
+    local archive_path="${PAYLOAD_DIR}/frontends/${platform}"
+
+    local temp_root temp_bundle executable_name executable_path executable_archs
+    temp_root="$(mktemp -d)"
+    temp_bundle="${temp_root}/$(basename "${source_bundle}")"
+    cp -R "${source_bundle}" "${temp_bundle}"
+
+    executable_name="$(bundle_executable_name "${temp_bundle}")"
+    executable_path="${temp_bundle}/Contents/MacOS/${executable_name}"
+    executable_archs="$(lipo -archs "${executable_path}")"
+    case " ${executable_archs} " in
+        *" ${slice_arch} "*) ;;
+        *)
+            echo "error: ${executable_path} does not contain ${slice_arch} (found: ${executable_archs})" >&2
+            rm -rf "${temp_root}"
+            exit 1
+            ;;
+    esac
+    if [[ "${executable_archs}" != "${slice_arch}" ]]; then
+        lipo "${executable_path}" -thin "${slice_arch}" -output "${temp_root}/thin"
+        mv "${temp_root}/thin" "${executable_path}"
+        chmod +x "${executable_path}"
+    fi
+
+    aa archive \
+        -d "${temp_root}" \
+        -subdir "$(basename "${temp_bundle}")" \
+        -o "${archive_path}" \
+        -a lzfse
+
+    rm -rf "${temp_root}"
+}
+
+cmd_build_frontend() {
+    if [[ "$(uname -s)" != "Darwin" ]]; then
+        echo "error: the frontend is a macOS bundle; build it on a Mac with Xcode" >&2
+        exit 1
+    fi
+    require_tool /usr/bin/xcodebuild
+    require_tool aa
+    require_tool lipo
+    require_tool /usr/bin/python3
+
+    mkdir -p "${PAYLOAD_DIR}/frontends"
+
+    echo "==> Building ${XCODE_SCHEME}.bundle"
+    /usr/bin/xcodebuild \
+        -project "${ROOT}/frontend/${XCODE_SCHEME}.xcodeproj" \
+        -scheme "${XCODE_SCHEME}" \
+        -configuration Release \
+        -derivedDataPath "${DERIVED_DATA_DIR}" \
+        ARCHS="arm64 x86_64" \
+        ONLY_ACTIVE_ARCH=NO \
+        CODE_SIGNING_ALLOWED=NO \
+        CODE_SIGNING_REQUIRED=NO \
+        build
+
+    local built_bundle="${DERIVED_DATA_DIR}/Build/Products/Release/${XCODE_SCHEME}.bundle"
+    if [[ ! -d "${built_bundle}" ]]; then
+        echo "error: expected bundle at ${built_bundle}" >&2
+        exit 1
+    fi
+
+    echo "==> Archiving platform bundles"
+    archive_platform_bundle "${built_bundle}" macos-arm arm64
+    archive_platform_bundle "${built_bundle}" macos-x86 x86_64
+
+    echo "==> Writing app.outer"
+    /usr/bin/python3 "${ROOT}/frontend/Scripts/generate_outer.py" \
+        --bundle-url "${FRONTEND_PATH}" \
+        --output "${PAYLOAD_DIR}/app.outer"
+}
+
+# ---------------------------------------------------------------------------
+# Backend build (Linux static binary, via Docker Desktop)
+# ---------------------------------------------------------------------------
+
+DOCKER_IMAGE_TAG="app-backend-toolchain-$(printf '%s' "${APP_ID}" \
+    | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9._-]/-/g')"
+
+backend_build_go_in_docker() {
+    local goos="$1"
+    local goarch="$2"
+    local output="$3"
+
+    require_tool docker
+    mkdir -p "$(dirname "${output}")"
+
+    docker build -q -t "${DOCKER_IMAGE_TAG}" "${ROOT}/backend" >/dev/null
+
+    # The named volume keeps Go's build cache warm between runs.
+    docker run --rm \
+        -v "${ROOT}/backend":/src \
+        -v "$(dirname "${output}")":/out \
+        -v app-go-cache:/gocache \
+        -w /src \
+        -e CGO_ENABLED=0 \
+        -e GOOS="${goos}" \
+        -e GOARCH="${goarch}" \
+        -e GOCACHE=/gocache \
+        "${DOCKER_IMAGE_TAG}" \
+        go build -trimpath -ldflags="-s -w" -o "/out/$(basename "${output}")" .
+}
+
+backend_build_c_in_docker() {
+    local target_arch="$1"
+    local output="$2"
+    local cc
+
+    case "${target_arch}" in
+        amd64) cc=x86_64-linux-gnu-gcc ;;
+        arm64) cc=aarch64-linux-gnu-gcc ;;
+        *)
+            echo "error: unsupported C backend architecture '${target_arch}'" >&2
+            exit 1
+            ;;
+    esac
+
+    require_tool docker
+    mkdir -p "$(dirname "${output}")"
+
+    docker build -q -t "${DOCKER_IMAGE_TAG}" "${ROOT}/backend" >/dev/null
+
+    docker run --rm \
+        -v "${ROOT}/backend":/src \
+        -v "$(dirname "${output}")":/out \
+        -w /src \
+        -e CC="${cc}" \
+        -e OUTPUT="/out/$(basename "${output}")" \
+        "${DOCKER_IMAGE_TAG}" \
+        make
+}
+
+cmd_build_backend() {
+    load_target
+    if [[ "${TARGET_KIND}" == "local" ]]; then
+        if [[ "$(uname -s)" != "Darwin" ]]; then
+            echo "error: local deploy is currently supported on macOS only" >&2
+            exit 1
+        fi
+        local host_arch
+        host_arch="$(host_goarch)"
+        echo "==> Building ${BACKEND_LANGUAGE} backend for this Mac"
+        case "${BACKEND_LANGUAGE}" in
+            go)
+                if command -v go >/dev/null 2>&1; then
+                    (cd "${ROOT}/backend" && CGO_ENABLED=0 go build -o "${PAYLOAD_DIR}/${BACKEND_EXECUTABLE_NAME}" .)
+                else
+                    backend_build_go_in_docker darwin "${host_arch}" "${PAYLOAD_DIR}/${BACKEND_EXECUTABLE_NAME}"
+                fi
+                ;;
+            c)
+                require_tool cc
+                require_tool make
+                mkdir -p "${PAYLOAD_DIR}"
+                (cd "${ROOT}/backend" && make OUTPUT="${PAYLOAD_DIR}/${BACKEND_EXECUTABLE_NAME}" LDFLAGS=)
+                ;;
+            *)
+                echo "error: unsupported BACKEND_LANGUAGE '${BACKEND_LANGUAGE}'" >&2
+                exit 1
+                ;;
+        esac
+        return
+    fi
+
+    local goarch
+    goarch="$(probe_goarch)"
+    echo "==> Building ${BACKEND_LANGUAGE} backend for linux/${goarch} (via Docker)"
+    case "${BACKEND_LANGUAGE}" in
+        go)
+            backend_build_go_in_docker linux "${goarch}" "${PAYLOAD_DIR}/${BACKEND_EXECUTABLE_NAME}"
+            ;;
+        c)
+            backend_build_c_in_docker "${goarch}" "${PAYLOAD_DIR}/${BACKEND_EXECUTABLE_NAME}"
+            ;;
+        *)
+            echo "error: unsupported BACKEND_LANGUAGE '${BACKEND_LANGUAGE}'" >&2
+            exit 1
+            ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
+# Assemble + deploy
+# ---------------------------------------------------------------------------
+
+render_unit() {
+    mkdir -p "${PAYLOAD_DIR}/deploy"
+    sed -e "s/@APP_ID@/${APP_ID}/g" \
+        -e "s/@APP_NAME@/${APP_NAME}/g" \
+        -e "s/@SOCKET_FILENAME@/${SOCKET_FILENAME}/g" \
+        -e "s/@BACKEND_EXECUTABLE_NAME@/${BACKEND_EXECUTABLE_NAME}/g" \
+        "${ROOT}/deploy/app.service.in" \
+        > "${PAYLOAD_DIR}/deploy/${APP_ID}.service"
+}
+
+stage_app_icon() {
+    if [[ -f "${ROOT}/app-icon.png" ]]; then
+        mkdir -p "${PAYLOAD_DIR}"
+        cp "${ROOT}/app-icon.png" "${PAYLOAD_DIR}/app-icon.png"
+    fi
+}
+
+local_outerctl_path() {
+    printf '%s\n' "${HOME}/Library/Application Support/outershell/bin/outerctl"
+}
+
+local_app_root() {
+    printf '%s\n' "${HOME}/Library/Application Support/outershell/apps/${APP_ID}"
+}
+
+local_log_path() {
+    printf '%s\n' "${HOME}/Library/Logs/${APP_ID}/output.log"
+}
+
+local_socket_path() {
+    local runtime_dir="${TMPDIR:-/tmp}"
+    printf '%s/%s\n' "${runtime_dir%/}" "${APP_ID}"
+}
+
+local_launch_agent_path() {
+    printf '%s\n' "${HOME}/Library/LaunchAgents/${APP_ID}.plist"
+}
+
+write_local_launch_agent() {
+    local plist_path="$1"
+    local backend_path="$2"
+    local socket_path="$3"
+    local app_root="$4"
+    local log_path="$5"
+    /usr/bin/python3 - "$plist_path" "$APP_ID" "$backend_path" "$socket_path" "$app_root" "$log_path" <<'PY'
+import plistlib
+import sys
+
+plist_path, app_id, backend_path, socket_path, app_root, log_path = sys.argv[1:]
+plist = {
+    "Label": app_id,
+    "AssociatedBundleIdentifiers": ["org.outershell.OuterShell.Agent"],
+    "ProgramArguments": [
+        backend_path,
+        "--socket", socket_path,
+        "--root", app_root,
+    ],
+    "WorkingDirectory": app_root,
+    "StandardOutPath": log_path,
+    "StandardErrorPath": log_path,
+    "RunAtLoad": False,
+}
+with open(plist_path, "wb") as f:
+    plistlib.dump(plist, f)
+PY
+}
+
+cmd_deploy_local_macos() {
+    cmd_build
+
+    local outerctl_path app_root staging_root old_root log_path socket_path plist_path
+    outerctl_path="$(local_outerctl_path)"
+    app_root="$(local_app_root)"
+    staging_root="${app_root}.staging"
+    old_root="${app_root}.old"
+    log_path="$(local_log_path)"
+    socket_path="$(local_socket_path)"
+    plist_path="$(local_launch_agent_path)"
+
+    if [[ ! -x "${outerctl_path}" ]]; then
+        echo "error: outerctl not found at ${outerctl_path}. Install Outer Shell locally first." >&2
+        exit 1
+    fi
+
+    echo "==> Installing payload at ${app_root}"
+    rm -rf "${staging_root}" "${old_root}"
+    mkdir -p "$(dirname "${app_root}")" "$(dirname "${log_path}")" "$(dirname "${plist_path}")"
+    cp -R "${PAYLOAD_DIR}" "${staging_root}"
+    if [[ -d "${app_root}" ]]; then
+        mv "${app_root}" "${old_root}"
+    fi
+    mv "${staging_root}" "${app_root}"
+    rm -rf "${old_root}"
+    touch "${log_path}"
+
+    echo "==> Installing LaunchAgent ${APP_ID}"
+    write_local_launch_agent "${plist_path}" "${app_root}/${BACKEND_EXECUTABLE_NAME}" "${socket_path}" "${app_root}" "${log_path}"
+    launchctl bootout "gui/$(id -u)/${APP_ID}" >/dev/null 2>&1 || true
+    for _ in {1..20}; do
+        if ! launchctl print "gui/$(id -u)/${APP_ID}" >/dev/null 2>&1; then
+            break
+        fi
+        sleep 0.1
+    done
+    if ! launchctl bootstrap "gui/$(id -u)" "${plist_path}"; then
+        sleep 0.2
+        launchctl bootstrap "gui/$(id -u)" "${plist_path}"
+    fi
+    launchctl enable "gui/$(id -u)/${APP_ID}" >/dev/null 2>&1 || true
+    launchctl kickstart -k "gui/$(id -u)/${APP_ID}" >/dev/null 2>&1 || true
+
+    echo "==> Registering with local Outer Shell"
+    OUTERSHELL_HOME="${HOME}/Library/Application Support/outershell" "${outerctl_path}" backend upsert \
+        --backend "${APP_ID}" \
+        --name "${APP_NAME}" \
+        --launchd-plist "${plist_path}" \
+        --outershell-owns true
+
+    OUTERSHELL_HOME="${HOME}/Library/Application Support/outershell" "${outerctl_path}" app remove \
+        --backend "${APP_ID}" \
+        --frontend-id "${APP_ID}:main" || true
+
+    OUTERSHELL_HOME="${HOME}/Library/Application Support/outershell" "${outerctl_path}" app upsert \
+        --backend "${APP_ID}" \
+        --frontend-id "${APP_ID}:main" \
+        --name "${APP_NAME}" \
+        --socket-path "${socket_path}" \
+        --url / \
+        --icon-path "${app_root}/app-icon.png"
+
+    OUTERSHELL_HOME="${HOME}/Library/Application Support/outershell" "${outerctl_path}" log remove \
+        --backend "${APP_ID}" \
+        --path "${log_path}" || true
+    OUTERSHELL_HOME="${HOME}/Library/Application Support/outershell" "${outerctl_path}" log add \
+        --backend "${APP_ID}" \
+        --path "${log_path}"
+
+    echo
+    echo "Deployed locally. Open localhost in Outer Loop; '${APP_NAME}' is in its app list."
+}
+
+cmd_build() {
+    cmd_build_frontend
+    cmd_build_backend
+    render_unit
+    stage_app_icon
+    echo "==> Payload ready at ${PAYLOAD_DIR}"
+}
+
+cmd_deploy() {
+    load_target
+    if [[ "${TARGET_KIND}" == "local" ]]; then
+        cmd_deploy_local_macos
+        return
+    fi
+
+    cmd_build
+
+    echo "==> Uploading payload"
+    COPYFILE_DISABLE=1 tar czf - -C "${PAYLOAD_DIR}" . | run_ssh "
+        set -e
+        rm -rf \"\$HOME/${REMOTE_APP_DIR}.staging\"
+        mkdir -p \"\$HOME/${REMOTE_APP_DIR}.staging\"
+        COPYFILE_DISABLE=1 tar xzf - -C \"\$HOME/${REMOTE_APP_DIR}.staging\"
+    "
+
+    echo "==> Installing on server"
+    run_ssh "APP_ID='${APP_ID}' APP_NAME='${APP_NAME}' SOCKET_FILENAME='${SOCKET_FILENAME}' bash -s" \
+        < "${ROOT}/deploy/remote-install.sh"
+
+    echo
+    echo "Deployed. Open this server in Outer Loop; '${APP_NAME}' is in its app list."
+}
+
+# Frontend-only update: re-archive the bundle and drop it into the live app
+# directory. The backend serves these files from disk per request, so no
+# restart is needed -- just reload in Outer Loop.
+cmd_push_frontend() {
+    load_target
+    if [[ "${TARGET_KIND}" == "local" ]]; then
+        cmd_build_frontend
+        stage_app_icon
+        local app_root
+        app_root="$(local_app_root)"
+        test -d "${app_root}" || { echo "error: app not deployed yet; run ./app deploy first" >&2; exit 1; }
+        cp -R "${PAYLOAD_DIR}/app.outer" "${PAYLOAD_DIR}/frontends" "${app_root}/"
+        if [[ -f "${PAYLOAD_DIR}/app-icon.png" ]]; then
+            cp "${PAYLOAD_DIR}/app-icon.png" "${app_root}/app-icon.png"
+        fi
+        echo "Pushed locally. Reload the app in Outer Loop."
+        return
+    fi
+
+    cmd_build_frontend
+    stage_app_icon
+
+    echo "==> Pushing frontend"
+    COPYFILE_DISABLE=1 tar czf - -C "${PAYLOAD_DIR}" app.outer frontends app-icon.png | run_ssh "
+        set -e
+        test -d \"\$HOME/${REMOTE_APP_DIR}\" || { echo 'error: app not deployed yet; run ./app deploy first' >&2; exit 1; }
+        COPYFILE_DISABLE=1 tar xzf - -C \"\$HOME/${REMOTE_APP_DIR}\"
+    "
+    echo "Pushed. Reload the app in Outer Loop."
+}
+
+# ---------------------------------------------------------------------------
+# Local development (no server involved)
+# ---------------------------------------------------------------------------
+
+cmd_run_local() {
+    cmd_build_frontend
+
+    local host_goarch
+    host_goarch="$(host_goarch)"
+
+    local backend_bin="${BUILD_DIR}/${BACKEND_EXECUTABLE_NAME}-local"
+    case "${BACKEND_LANGUAGE}" in
+        go)
+            if command -v go >/dev/null 2>&1; then
+                echo "==> Building backend for this Mac (local Go toolchain)"
+                (cd "${ROOT}/backend" && CGO_ENABLED=0 go build -o "${backend_bin}" .)
+            else
+                echo "==> Building backend for this Mac (via Docker)"
+                backend_build_go_in_docker darwin "${host_goarch}" "${backend_bin}"
+            fi
+            ;;
+        c)
+            require_tool cc
+            require_tool make
+            echo "==> Building backend for this Mac (local C toolchain)"
+            (cd "${ROOT}/backend" && make OUTPUT="${backend_bin}" LDFLAGS=)
+            ;;
+        *)
+            echo "error: unsupported BACKEND_LANGUAGE '${BACKEND_LANGUAGE}'" >&2
+            exit 1
+            ;;
+    esac
+
+    echo
+    echo "Open in Outer Loop:  http://127.0.0.1:${LOCAL_PORT}/"
+    echo
+    exec "${backend_bin}" --port "${LOCAL_PORT}" --root "${PAYLOAD_DIR}"
+}
+
+# ---------------------------------------------------------------------------
+# Operations
+# ---------------------------------------------------------------------------
+
+cmd_target() {
+    if [[ $# -ne 1 ]]; then
+        echo "usage: ./app target local" >&2
+        echo "       ./app target \"ssh -p 22 you@your-server\"" >&2
+        exit 1
+    fi
+    if [[ "$1" == "local" || "$1" == "localhost" ]]; then
+        {
+            printf 'OUTER_TARGET_KIND=local\n'
+            printf 'OUTER_TARGET_SSH=()\n'
+        } > "${ROOT}/target.env"
+        echo "Wrote target.env"
+        return
+    fi
+    read -r -a words <<< "$1"
+    {
+        printf 'OUTER_TARGET_KIND=ssh\n'
+        printf 'OUTER_TARGET_SSH=(\n'
+        local word
+        for word in "${words[@]}"; do
+            printf '    '
+            shell_quote "${word}"
+            printf '\n'
+        done
+        printf ')\n'
+    } > "${ROOT}/target.env"
+    echo "Wrote target.env"
+}
+
+cmd_logs() {
+    load_target
+    if [[ "${TARGET_KIND}" == "local" ]]; then
+        tail -f "$(local_log_path)"
+        return
+    fi
+    run_ssh -t "journalctl --user -u '${APP_ID}.service' -f"
+}
+
+cmd_status() {
+    load_target
+    if [[ "${TARGET_KIND}" == "local" ]]; then
+        launchctl print "gui/$(id -u)/${APP_ID}" || true
+        return
+    fi
+    run_ssh "systemctl --user status '${APP_ID}.service' --no-pager" || true
+}
+
+cmd_ssh() {
+    load_target
+    run_ssh "$@"
+}
+
+cmd_uninstall() {
+    load_target
+    if [[ "${TARGET_KIND}" == "local" ]]; then
+        local outerctl_path app_root plist_path log_path
+        outerctl_path="$(local_outerctl_path)"
+        app_root="$(local_app_root)"
+        plist_path="$(local_launch_agent_path)"
+        log_path="$(local_log_path)"
+        if [[ -x "${outerctl_path}" ]]; then
+            OUTERSHELL_HOME="${HOME}/Library/Application Support/outershell" "${outerctl_path}" app remove \
+                --backend "${APP_ID}" \
+                --frontend-id "${APP_ID}:main" || true
+            OUTERSHELL_HOME="${HOME}/Library/Application Support/outershell" "${outerctl_path}" log remove \
+                --backend "${APP_ID}" \
+                --path "${log_path}" || true
+            OUTERSHELL_HOME="${HOME}/Library/Application Support/outershell" "${outerctl_path}" backend remove \
+                --backend "${APP_ID}" || true
+        fi
+        launchctl bootout "gui/$(id -u)/${APP_ID}" >/dev/null 2>&1 || true
+        rm -f "${plist_path}" "${log_path}"
+        rm -rf "${app_root}" "${app_root}.staging" "${app_root}.old"
+        rmdir "$(dirname "${log_path}")" 2>/dev/null || true
+        echo "Uninstalled local ${APP_ID}."
+        return
+    fi
+    run_ssh "APP_ID='${APP_ID}' SOCKET_FILENAME='${SOCKET_FILENAME}' bash -s" < "${ROOT}/deploy/remote-uninstall.sh"
+}
+
+cmd_clean() {
+    rm -rf "${BUILD_DIR}"
+    echo "Removed ${BUILD_DIR}"
+}
+
+cmd_help() {
+    cat <<EOF
+${APP_NAME} -- outerframe app tasks
+
+  ./app target local       set localhost as the deploy target
+  ./app target "ssh ..."   set an SSH deploy target (writes target.env)
+  ./app build              build frontend + backend + payload
+  ./app deploy             build, upload, install, and register on the server
+  ./app push-frontend      update only the frontend on the server (fast)
+  ./app run-local          run the app locally; open the printed URL in Outer Loop
+  ./app logs               follow the backend's journal on the server
+  ./app status             show the backend service status
+  ./app ssh [cmd]          open a shell (or run a command) on the target
+  ./app uninstall          deregister and remove the app from the server
+  ./app clean              delete the local build directory
+
+Identity lives in app.env. The deploy target lives in target.env (gitignored).
+EOF
+}
+
+# ---------------------------------------------------------------------------
+
+command="${1:-help}"
+shift $(( $# > 0 ? 1 : 0 ))
+
+case "${command}" in
+    target)          cmd_target "$@" ;;
+    build)           cmd_build ;;
+    build-frontend)  cmd_build_frontend ;;
+    build-backend)   cmd_build_backend ;;
+    deploy)          cmd_deploy ;;
+    push-frontend)   cmd_push_frontend ;;
+    run-local)       cmd_run_local ;;
+    logs)            cmd_logs ;;
+    status)          cmd_status ;;
+    ssh)             cmd_ssh "$@" ;;
+    uninstall)       cmd_uninstall ;;
+    clean)           cmd_clean ;;
+    help|--help|-h)  cmd_help ;;
+    *)
+        echo "error: unknown command '${command}'" >&2
+        cmd_help >&2
+        exit 1
+        ;;
+esac

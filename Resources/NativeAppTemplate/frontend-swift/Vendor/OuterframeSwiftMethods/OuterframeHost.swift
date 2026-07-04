@@ -683,14 +683,6 @@ final class OuterframeHost: SocketToBrowserDelegate {
             return
         }
         Task {
-            try? await Task.sleep(nanoseconds: 1_000_000_000)
-            await MainActor.run {
-                if let pending = self.pendingOuterLoopSSHCommandArgumentsRequests.removeValue(forKey: requestID) {
-                    pending(nil)
-                }
-            }
-        }
-        Task {
             do {
                 try await socket.send(ContentToBrowserMessage.hostSpecificMessage(
                     name: "sh.outerloop.sshCommandArgumentsRequest",

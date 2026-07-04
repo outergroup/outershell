@@ -111,6 +111,7 @@ stage_home_screen() {
     install -m 0644 "${REPO_ROOT}/app-icon.png" "${app_root}/app-icon.png"
     install -m 0644 "${RUN_ROOT}/bundles/OuterShell.bundle.macos-arm.aar" "${app_root}/bundles/OuterShell.bundle.macos-arm.aar"
     install -m 0644 "${RUN_ROOT}/bundles/OuterShell.bundle.macos-x86.aar" "${app_root}/bundles/OuterShell.bundle.macos-x86.aar"
+    ditto "${REPO_ROOT}/Resources/NativeAppTemplate" "${app_root}/native-app-template"
     tar --format ustar --no-xattrs -C "${STAGING_ROOT}/${package_name}" -czf "${OUTPUT_ROOT}/latest/${package_name}.tar.gz" OuterShell
 }
 
@@ -126,6 +127,7 @@ stage_home_screen_macos() {
     rm -rf "${app_bundle}/Contents/Resources/bundled-apps"
     rm -rf "${app_bundle}/Contents/Resources/bundles"
     mkdir -p "${app_bundle}/Contents/Resources/bundles"
+    ditto "${REPO_ROOT}/Resources/NativeAppTemplate" "${app_root}/native-app-template"
     install -m 0644 "${REPO_ROOT}/app-icon.png" "${app_bundle}/Contents/Resources/app-icon.png"
     install -m 0644 "${REPO_ROOT}/OuterShell.icns" "${app_bundle}/Contents/Resources/OuterShell.icns"
     install -m 0644 "${RUN_ROOT}/bundles/OuterShell.bundle.macos-arm.aar" "${app_bundle}/Contents/Resources/bundles/OuterShell.bundle.macos-arm.aar"
@@ -451,6 +453,7 @@ EOF
     rm -rf "$app_install_root" "$legacy_install_root"
     mkdir -p "$app_install_root" "$tools_install_root" "$outershell_home/bin" "$log_dir"
     ditto "$payload/apps/$service_id/Outer Shell.app" "$app_install_root/Outer Shell.app"
+    ditto "$payload/apps/$service_id/native-app-template" "$app_install_root/native-app-template"
     install -m 0755 "$payload/tools/outershelld" "$outershelld_path"
     install -m 0755 "$payload/tools/outerctl" "$outerctl_path"
     rm -rf "$payload_root"
@@ -467,10 +470,12 @@ EOF
 
     app_executable="$app_install_root/Outer Shell.app/Contents/MacOS/Outer Shell"
     icon_path="$app_install_root/Outer Shell.app/Contents/Resources/app-icon.png"
+    native_template_path="$app_install_root/native-app-template"
     app_executable_xml="$(xml_escape "$app_executable")"
     socket_path_xml="$(xml_escape "$socket_path")"
     app_base_url_xml="$(xml_escape "$app_base_url")"
     public_base_url_xml="$(xml_escape "$public_base_url")"
+    native_template_path_xml="$(xml_escape "$native_template_path")"
     log_path_xml="$(xml_escape "$log_path")"
     cat > "$plist_path" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -494,6 +499,8 @@ EOF
     <string>$app_base_url_xml</string>
     <string>--public-base-url</string>
     <string>$public_base_url_xml</string>
+    <string>--native-app-template-dir</string>
+    <string>$native_template_path_xml</string>
   </array>
   <key>Sockets</key>
   <dict>
@@ -959,6 +966,8 @@ install -m 0755 "$app_payload/OuterShellBackend" "$install_root/OuterShellBacken
 install -m 0644 "$app_payload/app-icon.png" "$install_root/app-icon.png"
 install -m 0644 "$app_payload/bundles/OuterShell.bundle.macos-arm.aar" "$install_root/bundles/OuterShell.bundle.macos-arm.aar"
 install -m 0644 "$app_payload/bundles/OuterShell.bundle.macos-x86.aar" "$install_root/bundles/OuterShell.bundle.macos-x86.aar"
+rm -rf "$install_root/native-app-template"
+cp -R "$app_payload/native-app-template" "$install_root/native-app-template"
 refresh_system_binaries_with_sudo "$payload/tools/outershelld" "$payload_outerctl_path"
 rm -rf "$payload_root"
 chmod 0755 "$outershelld_path"
@@ -984,7 +993,7 @@ printf '%s\n' "__OUTER_SHELL_VERSION__" > "$daemon_version_path"
 touch "$log_path" "$broker_log_path"
 OUTERSHELL_HOME="$outershell_home" "$outershelld_path" --migrate-user-state-only >> "$broker_log_path" 2>&1
 
-outer_shell_exec="$(systemd_quote_arg "$install_root/OuterShellBackend") --socket-path $(systemd_quote_arg "$socket_path") --api-socket-path $(systemd_quote_arg "$api_socket_path") --bundles-dir $(systemd_quote_arg "$install_root/bundles") --bundled-apps-dir $(systemd_quote_arg "$install_root/bundled-apps") --app-base-url $(systemd_quote_arg "$app_base_url") --public-base-url $(systemd_quote_arg "$public_base_url")"
+outer_shell_exec="$(systemd_quote_arg "$install_root/OuterShellBackend") --socket-path $(systemd_quote_arg "$socket_path") --api-socket-path $(systemd_quote_arg "$api_socket_path") --bundles-dir $(systemd_quote_arg "$install_root/bundles") --bundled-apps-dir $(systemd_quote_arg "$install_root/bundled-apps") --app-base-url $(systemd_quote_arg "$app_base_url") --public-base-url $(systemd_quote_arg "$public_base_url") --native-app-template-dir $(systemd_quote_arg "$install_root/native-app-template")"
 
 cat > "$unit_dir/org.outershell.OuterShell.service" <<EOF
 [Unit]
