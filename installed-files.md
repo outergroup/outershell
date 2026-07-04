@@ -244,7 +244,7 @@ Uninstalling Outer Shell removes its service unit, socket unit, launch agent, ru
 
 Uninstalling a bundled app removes its unit/plist, socket unit when present, app payload directory, cached archive/extracted installer payload, registry backend/app/log/opener records, and registered log path for the selected scope. On Linux, uninstalling the last root-installed app removes the `root-apps` marker; if that was the last root-support marker, shared root support is also removed.
 
-Legacy paths may be migrated or removed during install:
+Some old pre-release paths may still be removed during install:
 
 - macOS legacy user root: `$HOME/Library/dev.outergroup.OuterLoop`
 - Linux legacy user root: `$HOME/.outeragent`
@@ -253,5 +253,3 @@ Legacy paths may be migrated or removed during install:
 - macOS legacy system root: `/Library/dev.outergroup.OuterLoop`
 - Linux legacy system root: `/var/lib/outershell/outeragent`
 - Linux legacy root systemd unit: `/etc/systemd/system/outerloop-rootd.service`
-
-After a legacy `registry.sqlite3` is migrated or superseded by `registry.orwa`, `outershelld` renames it to `registry.sqlite3.migrated` so it is not imported again.

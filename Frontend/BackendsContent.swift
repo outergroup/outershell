@@ -9788,8 +9788,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             return "Showing \(backend.displayName) in the menu bar..."
         case "hideMenuBarWhenRunning":
             return "Hiding \(backend.displayName) from the menu bar..."
-        case "migrateRoot":
-            return "Migrating \(backend.displayName)..."
         case "start":
             return "Starting \(backend.displayName)..."
         case "stop":

@@ -463,7 +463,6 @@ EOF
     printf '%s\n' "__OUTER_SHELL_VERSION__" > "$app_install_root/version"
     printf '%s\n' "__OUTER_SHELL_VERSION__" > "$tools_install_root/version"
     touch "$log_path"
-    OUTERSHELL_HOME="$outershell_home" "$outershelld_path" --migrate-user-state-only >> "$log_path" 2>&1
 
     unload_outer_shell
     rm -f "$socket_path" "$api_socket_path"
@@ -991,7 +990,6 @@ rm -f "$payload_outerctl_path"
 printf '%s\n' "__OUTER_SHELL_VERSION__" > "$app_version_path"
 printf '%s\n' "__OUTER_SHELL_VERSION__" > "$daemon_version_path"
 touch "$log_path" "$broker_log_path"
-OUTERSHELL_HOME="$outershell_home" "$outershelld_path" --migrate-user-state-only >> "$broker_log_path" 2>&1
 
 outer_shell_exec="$(systemd_quote_arg "$install_root/OuterShellBackend") --socket-path $(systemd_quote_arg "$socket_path") --api-socket-path $(systemd_quote_arg "$api_socket_path") --bundles-dir $(systemd_quote_arg "$install_root/bundles") --bundled-apps-dir $(systemd_quote_arg "$install_root/bundled-apps") --app-base-url $(systemd_quote_arg "$app_base_url") --public-base-url $(systemd_quote_arg "$public_base_url") --native-app-template-dir $(systemd_quote_arg "$install_root/native-app-template")"
 

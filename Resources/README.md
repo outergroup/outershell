@@ -72,13 +72,10 @@ build/linux-package/RemoteLinuxBinaries/<arch>/outershelld
 build/linux-package/RemoteLinuxBinaries/<arch>/outerctl
 ```
 
-`outerctl` and the SQLite amalgamation used to build it live in this repository
-under:
+`outerctl` lives in this repository under:
 
 ```text
 Resources/outerctl.cpp
-Resources/ThirdParty/sqlite/sqlite3.c
-Resources/ThirdParty/sqlite/sqlite3.h
 ```
 
 Those files are Outer Shell resources because `outerctl` is part of the

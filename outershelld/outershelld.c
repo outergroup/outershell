@@ -20,9 +20,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
-#ifndef OUTER_SHELL_BACKEND_LIBRARY
-#include <sqlite3.h>
-#endif
 #include <sys/file.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -872,7 +869,6 @@ static void append_url_encoded(StringBuilder *builder, const char *value) {
 #define MAX_SYSTEMD_STATUS_ENTRIES 512
 
 static const char *kOuterShellServiceID = "org.outershell.OuterShell";
-static const char *kMigrationServiceID = "org.outershell.OuterShellMigration";
 #ifdef __APPLE__
 static const char *kSystemOuterShellRoot = "/Library/Application Support/outershell";
 #else
@@ -979,25 +975,9 @@ typedef struct {
     size_t opener_count;
 } BundledAppDefinition;
 
-typedef struct {
-    const char *old_text;
-    const char *new_text;
-} TextReplacement;
-
-#ifndef OUTER_SHELL_BACKEND_LIBRARY
-static bool ensure_registry_schema(sqlite3 *database, char *error, size_t error_size);
-static bool export_registry_binary_from_sqlite(sqlite3 *database, const char *sqlite_path, char *error, size_t error_size);
-static bool import_registry_binary_into_sqlite(sqlite3 *database, const char *sqlite_path, char *error, size_t error_size);
-#endif
-static bool registry_binary_output_path(const char *sqlite_path, char *out, size_t out_size);
+static bool registry_binary_output_path(const char *registry_path, char *out, size_t out_size);
 static int registry_binary_lock(const char *registry_path, int operation, char *error, size_t error_size);
 static bool registry_storage_exists_at(const char *database_path);
-#ifndef OUTER_SHELL_BACKEND_LIBRARY
-static void rewrite_files_in_directory_replacing_text(const char *directory,
-                                                      const TextReplacement *replacements,
-                                                      size_t replacement_count,
-                                                      bool recursive);
-#endif
 static void mark_backend_event_changed(void);
 
 static const BundledAppOpenerDefinition kPlaintextOpeners[] = {
@@ -1584,43 +1564,10 @@ static void default_user_outershell_apps_root(char *out, size_t out_size) {
     snprintf(out, out_size, "%s/apps", root);
 }
 
-#ifndef OUTER_SHELL_BACKEND_LIBRARY
-static void legacy_user_registry_database_path(char *out, size_t out_size) {
-#ifdef __APPLE__
-    snprintf(out, out_size, "%s/Library/dev.outergroup.OuterLoop/registry.sqlite3", home_directory());
-#else
-    snprintf(out, out_size, "%s/.outeragent/registry.sqlite3", home_directory());
-#endif
-}
-#endif
-
-static void legacy_user_apps_root(char *out, size_t out_size) {
-#ifdef __APPLE__
-    snprintf(out, out_size, "%s/Library/dev.outergroup.OuterLoop/backends", home_directory());
-#else
-    snprintf(out, out_size, "%s/.outeragent", home_directory());
-#endif
-}
-
-static void legacy_user_outerctl_path(char *out, size_t out_size) {
-#ifdef __APPLE__
-    snprintf(out, out_size, "%s/Library/dev.outergroup.OuterLoop/outerctl", home_directory());
-#else
-    snprintf(out, out_size, "%s/.outeragent/outerctl", home_directory());
-#endif
-}
-
-static void legacy_outer_shell_outerctl_path(char *out, size_t out_size) {
-#ifdef __APPLE__
-    snprintf(out, out_size, "%s/Library/dev.outergroup.OuterLoop/outerctl", home_directory());
-#else
-    snprintf(out, out_size, "%s/.outerloop/outer-shell/bin/outerctl", home_directory());
-#endif
-}
-
 static bool sudo_failure_needs_password(const char *output, int exit_status);
 static bool read_exact_with_timeout(int fd, void *buffer, size_t length, int timeout_ms);
 static bool run_sudo_shell(const char *command, const char *password, char *output, size_t output_size, int *exit_status);
+static bool run_root_script(const char *script_path, const char *sudo_password, bool *needs_password, char *message, size_t message_size);
 static bool process_api_client_request(ReactorClient *client, char *request, size_t n);
 static bool prepare_events_response_or_wait(ReactorClient *client, const char *query);
 static bool event_client_ready(ReactorClient *client, bool *timed_out, uint64_t *backends_version, uint64_t *log_version);
@@ -2167,961 +2114,6 @@ static bool quarantine_invalid_registry_binary(const char *registry_path, const 
     return true;
 }
 
-#ifndef OUTER_SHELL_BACKEND_LIBRARY
-static sqlite3 *open_legacy_sqlite_registry_at(const char *path, char *error, size_t error_size) {
-    if (!path || !path[0]) {
-        snprintf(error, error_size, "registry database path is empty");
-        return NULL;
-    }
-    sqlite3 *database = NULL;
-    int result = sqlite3_open_v2(path, &database,
-                                 SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX | SQLITE_OPEN_URI, NULL);
-    if (result != SQLITE_OK) {
-        snprintf(error, error_size, "%s", database ? sqlite3_errmsg(database) : "failed to open registry database");
-        if (database) sqlite3_close(database);
-        return NULL;
-    }
-    sqlite3_busy_timeout(database, 5000);
-    return database;
-}
-
-static void archive_migrated_sqlite_registry(const char *sqlite_path) {
-    if (!sqlite_path || !sqlite_path[0]) return;
-    char migrated_path[PATH_MAX];
-    int written = snprintf(migrated_path, sizeof(migrated_path), "%s.migrated", sqlite_path);
-    if (written < 0 || (size_t)written >= sizeof(migrated_path)) {
-        log_event("Could not archive migrated registry %s: path is too long.", sqlite_path);
-        return;
-    }
-    (void)unlink(migrated_path);
-    if (rename(sqlite_path, migrated_path) != 0 && errno != ENOENT) {
-        log_event("Could not archive migrated registry %s: %s", sqlite_path, strerror(errno));
-    }
-}
-
-static bool migrate_sqlite_registry_to_binary_if_needed(const char *sqlite_path, const char *binary_path, char *error, size_t error_size) {
-    struct stat binary_stat;
-    if (stat(binary_path, &binary_stat) == 0 && S_ISREG(binary_stat.st_mode)) {
-        struct stat sqlite_stat;
-        if (stat(sqlite_path, &sqlite_stat) == 0 && S_ISREG(sqlite_stat.st_mode)) {
-            archive_migrated_sqlite_registry(sqlite_path);
-        }
-        return true;
-    }
-    if (errno != ENOENT) {
-        snprintf(error, error_size, "failed to inspect %s: %s", binary_path, strerror(errno));
-        return false;
-    }
-    struct stat sqlite_stat;
-    if (stat(sqlite_path, &sqlite_stat) != 0) {
-        if (errno == ENOENT) return true;
-        snprintf(error, error_size, "failed to inspect %s: %s", sqlite_path, strerror(errno));
-        return false;
-    }
-    if (!S_ISREG(sqlite_stat.st_mode)) return true;
-
-    sqlite3 *database = open_legacy_sqlite_registry_at(sqlite_path, error, error_size);
-    if (!database) return false;
-    bool ok = ensure_registry_schema(database, error, error_size) &&
-              export_registry_binary_from_sqlite(database, sqlite_path, error, error_size);
-    sqlite3_close(database);
-    if (ok) {
-        archive_migrated_sqlite_registry(sqlite_path);
-        log_event("Migrated registry.sqlite3 to registry.orwa at %s.", binary_path);
-    }
-    return ok;
-}
-
-static sqlite3 *open_registry_memory_at(const char *path, bool writable, char *error, size_t error_size) {
-    if (!path || !path[0]) {
-        snprintf(error, error_size, "registry database path is empty");
-        return NULL;
-    }
-    char binary_path[PATH_MAX];
-    if (!registry_binary_output_path(path, binary_path, sizeof(binary_path))) {
-        snprintf(error, error_size, "registry path is too long");
-        return NULL;
-    }
-    struct stat binary_stat;
-    struct stat sqlite_stat;
-    bool have_binary = stat(binary_path, &binary_stat) == 0 && S_ISREG(binary_stat.st_mode);
-    bool have_sqlite = stat(path, &sqlite_stat) == 0 && S_ISREG(sqlite_stat.st_mode);
-    if (!writable && !have_binary && !have_sqlite) {
-        sqlite3 *database = NULL;
-        int result = sqlite3_open_v2(":memory:", &database,
-                                     SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX, NULL);
-        if (result != SQLITE_OK) {
-            snprintf(error, error_size, "%s", database ? sqlite3_errmsg(database) : "failed to open in-memory registry database");
-            if (database) sqlite3_close(database);
-            return NULL;
-        }
-        if (!ensure_registry_schema(database, error, error_size)) {
-            sqlite3_close(database);
-            return NULL;
-        }
-        return database;
-    }
-    if ((writable || have_sqlite) && !ensure_parent_directory(binary_path, error, error_size)) {
-        return NULL;
-    }
-    if (!migrate_sqlite_registry_to_binary_if_needed(path, binary_path, error, error_size)) {
-        return NULL;
-    }
-
-    int lock_fd = -1;
-    if (writable) {
-        lock_fd = registry_binary_lock(binary_path, LOCK_EX, error, error_size);
-        if (lock_fd < 0) return NULL;
-    }
-
-    sqlite3 *database = NULL;
-    int result = sqlite3_open_v2(":memory:", &database,
-                                 SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX, NULL);
-    if (result != SQLITE_OK) {
-        snprintf(error, error_size, "%s", database ? sqlite3_errmsg(database) : "failed to open in-memory registry database");
-        if (database) sqlite3_close(database);
-        if (lock_fd >= 0) {
-            flock(lock_fd, LOCK_UN);
-            close(lock_fd);
-        }
-        return NULL;
-    }
-    sqlite3_busy_timeout(database, 5000);
-    bool ok = ensure_registry_schema(database, error, error_size) &&
-              import_registry_binary_into_sqlite(database, path, error, error_size);
-    if (!ok && writable) {
-        char load_error[512];
-        snprintf(load_error, sizeof(load_error), "%s", error && error[0] ? error : "unknown error");
-        sqlite3_close(database);
-        database = NULL;
-        if (!quarantine_invalid_registry_binary(binary_path, load_error, error, error_size)) {
-            if (lock_fd >= 0) {
-                flock(lock_fd, LOCK_UN);
-                close(lock_fd);
-            }
-            return NULL;
-        }
-        result = sqlite3_open_v2(":memory:", &database,
-                                 SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX, NULL);
-        if (result != SQLITE_OK) {
-            snprintf(error, error_size, "%s", database ? sqlite3_errmsg(database) : "failed to open in-memory registry database");
-            if (database) sqlite3_close(database);
-            if (lock_fd >= 0) {
-                flock(lock_fd, LOCK_UN);
-                close(lock_fd);
-            }
-            return NULL;
-        }
-        sqlite3_busy_timeout(database, 5000);
-        ok = ensure_registry_schema(database, error, error_size);
-    }
-    if (!ok) {
-        sqlite3_close(database);
-        if (lock_fd >= 0) {
-            flock(lock_fd, LOCK_UN);
-            close(lock_fd);
-        }
-        return NULL;
-    }
-
-    if (writable) {
-        if (g_registry_write_lock_fd >= 0) {
-            snprintf(error, error_size, "registry writer lock is already held");
-            sqlite3_close(database);
-            if (lock_fd >= 0) {
-                flock(lock_fd, LOCK_UN);
-                close(lock_fd);
-            }
-            return NULL;
-        }
-        g_registry_write_lock_fd = lock_fd;
-        snprintf(g_registry_write_lock_path, sizeof(g_registry_write_lock_path), "%s", binary_path);
-    }
-    return database;
-}
-
-static bool close_registry_readwrite_at(sqlite3 *database, const char *path, bool commit, char *error, size_t error_size) {
-    bool ok = true;
-    if (database && commit) {
-        ok = export_registry_binary_from_sqlite(database, path, error, error_size);
-    }
-    if (database && sqlite3_close(database) != SQLITE_OK && ok) {
-        snprintf(error, error_size, "failed to close registry database");
-        ok = false;
-    }
-    if (g_registry_write_lock_fd >= 0) {
-        flock(g_registry_write_lock_fd, LOCK_UN);
-        close(g_registry_write_lock_fd);
-        g_registry_write_lock_fd = -1;
-        g_registry_write_lock_path[0] = '\0';
-    }
-    return ok;
-}
-
-static sqlite3 *open_registry_readwrite_at(const char *path, char *error, size_t error_size) {
-    return open_registry_memory_at(path, true, error, error_size);
-}
-
-static bool sqlite_exec_ok(sqlite3 *database, const char *sql, char *error, size_t error_size) {
-    char *raw_error = NULL;
-    int result = sqlite3_exec(database, sql, NULL, NULL, &raw_error);
-    if (result == SQLITE_OK) return true;
-    snprintf(error, error_size, "%s", raw_error ? raw_error : sqlite3_errmsg(database));
-    if (raw_error) sqlite3_free(raw_error);
-    return false;
-}
-
-static bool table_has_column(sqlite3 *database, const char *table_name, const char *name, char *error, size_t error_size) {
-    sqlite3_stmt *statement = NULL;
-    char sql[160];
-    snprintf(sql, sizeof(sql), "PRAGMA table_info(%s);", table_name);
-    if (sqlite3_prepare_v2(database, sql, -1, &statement, NULL) != SQLITE_OK) {
-        snprintf(error, error_size, "%s", sqlite3_errmsg(database));
-        return false;
-    }
-    bool has_column = false;
-    while (sqlite3_step(statement) == SQLITE_ROW) {
-        const char *column_name = (const char *)sqlite3_column_text(statement, 1);
-        if (column_name && strcmp(column_name, name) == 0) {
-            has_column = true;
-            break;
-        }
-    }
-    sqlite3_finalize(statement);
-    return has_column;
-}
-
-static bool table_column_is_primary_key(sqlite3 *database, const char *table_name, const char *name, bool *is_primary_key, char *error, size_t error_size) {
-    *is_primary_key = false;
-    sqlite3_stmt *statement = NULL;
-    char sql[160];
-    snprintf(sql, sizeof(sql), "PRAGMA table_info(%s);", table_name);
-    if (sqlite3_prepare_v2(database, sql, -1, &statement, NULL) != SQLITE_OK) {
-        snprintf(error, error_size, "%s", sqlite3_errmsg(database));
-        return false;
-    }
-    while (sqlite3_step(statement) == SQLITE_ROW) {
-        const char *column_name = (const char *)sqlite3_column_text(statement, 1);
-        if (column_name && strcmp(column_name, name) == 0) {
-            *is_primary_key = sqlite3_column_int(statement, 5) != 0;
-            break;
-        }
-    }
-    sqlite3_finalize(statement);
-    return true;
-}
-
-static bool frontends_has_column(sqlite3 *database, const char *name, char *error, size_t error_size) {
-    return table_has_column(database, "frontends", name, error, error_size);
-}
-
-static bool file_openers_has_column(sqlite3 *database, const char *name, char *error, size_t error_size) {
-    return table_has_column(database, "file_openers", name, error, error_size);
-}
-
-static bool sqlite_table_exists(sqlite3 *database, const char *table_name);
-
-static bool ensure_registry_schema(sqlite3 *database, char *error, size_t error_size) {
-    if (!sqlite_exec_ok(database,
-                        "CREATE TABLE IF NOT EXISTS backends ("
-                        "service_id TEXT PRIMARY KEY,"
-                        "display_name TEXT NOT NULL DEFAULT '',"
-                        "service_unit TEXT"
-                        ");"
-                        "CREATE TABLE IF NOT EXISTS frontends ("
-                        "frontend_id TEXT PRIMARY KEY,"
-                        "url TEXT NOT NULL DEFAULT '',"
-                        "service_id TEXT,"
-                        "display_name TEXT NOT NULL DEFAULT '',"
-                        "port INTEGER NOT NULL DEFAULT 0,"
-                        "socket_path TEXT NOT NULL DEFAULT '',"
-                        "icon TEXT,"
-                        "icon_path TEXT,"
-                        "list TEXT"
-                        ");"
-                        "CREATE INDEX IF NOT EXISTS frontends_service_id_idx ON frontends(service_id);"
-                        "CREATE TABLE IF NOT EXISTS log_files ("
-                        "path TEXT PRIMARY KEY,"
-                        "service_id TEXT NOT NULL"
-                        ");"
-                        "CREATE INDEX IF NOT EXISTS log_files_service_id_idx ON log_files(service_id);"
-                        "CREATE TABLE IF NOT EXISTS systemd_backends ("
-                        "service_id TEXT PRIMARY KEY,"
-                        "unit_name TEXT NOT NULL,"
-                        "scope TEXT NOT NULL DEFAULT 'user'"
-                        ");"
-                        "CREATE TABLE IF NOT EXISTS launchd_backends ("
-                        "service_id TEXT PRIMARY KEY,"
-                        "plist_path TEXT NOT NULL,"
-                        "owns_plist INTEGER NOT NULL DEFAULT 0"
-                        ");"
-                        "CREATE TABLE IF NOT EXISTS file_openers ("
-                        "extension TEXT NOT NULL,"
-                        "frontend_id TEXT NOT NULL,"
-                        "url_template TEXT NOT NULL DEFAULT '?file={file}',"
-                        "rank INTEGER NOT NULL DEFAULT 0,"
-                        "capabilities INTEGER NOT NULL DEFAULT 3,"
-                        "PRIMARY KEY(extension, frontend_id)"
-                        ");",
-                        error,
-                        error_size)) {
-        return false;
-    }
-    if (!sqlite_exec_ok(database,
-                        "CREATE INDEX IF NOT EXISTS file_openers_extension_idx ON file_openers(extension, rank, frontend_id);"
-                        "CREATE INDEX IF NOT EXISTS file_openers_frontend_id_idx ON file_openers(frontend_id);",
-                        error,
-                        error_size)) {
-        return false;
-    }
-    bool has_frontend_display_name_column = frontends_has_column(database, "display_name", error, error_size);
-    bool has_frontend_name_column = frontends_has_column(database, "name", error, error_size);
-    bool had_frontend_layouts_table = sqlite_table_exists(database, "frontend_layouts");
-    bool has_file_opener_capabilities_column = file_openers_has_column(database, "capabilities", error, error_size);
-    if (!has_frontend_display_name_column) {
-        if (!sqlite_exec_ok(database,
-                            "ALTER TABLE frontends ADD COLUMN display_name TEXT NOT NULL DEFAULT '';",
-                            error,
-                            error_size)) {
-            return false;
-        }
-    }
-    if (has_frontend_name_column) {
-        if (!sqlite_exec_ok(database,
-                            "UPDATE frontends SET display_name = name WHERE display_name = '';",
-                            error,
-                            error_size)) {
-            return false;
-        }
-    }
-    if (!has_file_opener_capabilities_column) {
-        if (!sqlite_exec_ok(database,
-                            "ALTER TABLE file_openers ADD COLUMN capabilities INTEGER NOT NULL DEFAULT 3;",
-                            error,
-                            error_size)) {
-            return false;
-        }
-    }
-    if (!frontends_has_column(database, "icon_path", error, error_size)) {
-        if (!sqlite_exec_ok(database,
-                            "ALTER TABLE frontends ADD COLUMN icon_path TEXT;",
-                            error,
-                            error_size)) {
-            return false;
-        }
-    }
-    if (!sqlite_exec_ok(database,
-                        "UPDATE frontends SET icon_path = icon "
-                        "WHERE (icon_path IS NULL OR icon_path = '') "
-                        "AND icon IS NOT NULL AND icon != '' AND substr(icon, 1, 5) != 'data:';",
-                        error,
-                        error_size)) {
-        return false;
-    }
-    if (!frontends_has_column(database, "list", error, error_size)) {
-        if (!sqlite_exec_ok(database,
-                            "ALTER TABLE frontends ADD COLUMN list TEXT;",
-                            error,
-                            error_size)) {
-            return false;
-        }
-    }
-    if (!frontends_has_column(database, "frontend_id", error, error_size)) {
-        if (!sqlite_exec_ok(database,
-                            "ALTER TABLE frontends ADD COLUMN frontend_id TEXT NOT NULL DEFAULT '';"
-                            "UPDATE frontends SET frontend_id = COALESCE(NULLIF(service_id, ''), 'app') || ':' || rowid WHERE frontend_id = '';",
-                            error,
-                            error_size)) {
-            return false;
-        }
-    }
-    if (!sqlite_exec_ok(database,
-                        "UPDATE frontends SET frontend_id = COALESCE(NULLIF(service_id, ''), 'app') || ':' || rowid WHERE frontend_id = '';",
-                        error,
-                        error_size)) {
-        return false;
-    }
-    bool frontend_id_is_primary_key = false;
-    if (!table_column_is_primary_key(database, "frontends", "frontend_id", &frontend_id_is_primary_key, error, error_size)) {
-        return false;
-    }
-    if (has_frontend_name_column || !frontend_id_is_primary_key) {
-        const char *copy_frontends_sql = has_frontend_name_column
-            ? "INSERT OR REPLACE INTO frontends_new(frontend_id, url, service_id, display_name, port, socket_path, icon, icon_path, list) "
-              "SELECT frontend_id, COALESCE(url, ''), service_id, COALESCE(NULLIF(display_name, ''), name, ''), COALESCE(port, 0), COALESCE(socket_path, ''), icon, icon_path, list FROM frontends;"
-            : "INSERT OR REPLACE INTO frontends_new(frontend_id, url, service_id, display_name, port, socket_path, icon, icon_path, list) "
-              "SELECT frontend_id, COALESCE(url, ''), service_id, COALESCE(display_name, ''), COALESCE(port, 0), COALESCE(socket_path, ''), icon, icon_path, list FROM frontends;";
-        if (!sqlite_exec_ok(database,
-                            "DROP INDEX IF EXISTS frontends_service_id_idx;"
-                            "DROP INDEX IF EXISTS frontends_frontend_id_unique;"
-                            "CREATE TABLE frontends_new ("
-                            "frontend_id TEXT PRIMARY KEY,"
-                            "url TEXT NOT NULL DEFAULT '',"
-                            "service_id TEXT,"
-                            "display_name TEXT NOT NULL DEFAULT '',"
-                            "port INTEGER NOT NULL DEFAULT 0,"
-                            "socket_path TEXT NOT NULL DEFAULT '',"
-                            "icon TEXT,"
-                            "icon_path TEXT,"
-                            "list TEXT"
-                            ");",
-                            error,
-                            error_size) ||
-            !sqlite_exec_ok(database, copy_frontends_sql, error, error_size) ||
-            !sqlite_exec_ok(database,
-                            "DROP TABLE frontends;"
-                            "ALTER TABLE frontends_new RENAME TO frontends;"
-                            "CREATE INDEX IF NOT EXISTS frontends_service_id_idx ON frontends(service_id);",
-                            error,
-                            error_size)) {
-            return false;
-        }
-    } else if (!sqlite_exec_ok(database,
-                               "CREATE INDEX IF NOT EXISTS frontends_service_id_idx ON frontends(service_id);",
-                               error,
-                               error_size)) {
-        return false;
-    }
-    if (!sqlite_exec_ok(database,
-                        "CREATE TABLE IF NOT EXISTS frontend_layouts ("
-                        "url TEXT PRIMARY KEY,"
-                        "list TEXT NOT NULL DEFAULT '',"
-                        "frontend_id TEXT"
-                        ");",
-                        error,
-                        error_size)) {
-        return false;
-    }
-    if (!table_has_column(database, "frontend_layouts", "frontend_id", error, error_size)) {
-        if (!sqlite_exec_ok(database,
-                            "ALTER TABLE frontend_layouts ADD COLUMN frontend_id TEXT;",
-                            error,
-                            error_size)) {
-            return false;
-        }
-    }
-    if (!sqlite_exec_ok(database,
-                        "UPDATE frontend_layouts "
-                        "SET frontend_id = (SELECT f.frontend_id FROM frontends f WHERE f.url = frontend_layouts.url LIMIT 1) "
-                        "WHERE frontend_id IS NULL OR frontend_id = '';"
-                        "CREATE INDEX IF NOT EXISTS frontend_layouts_frontend_id_idx ON frontend_layouts(frontend_id);",
-                        error,
-                        error_size)) {
-        return false;
-    }
-    if (!had_frontend_layouts_table) {
-        if (!sqlite_exec_ok(database,
-                            "INSERT OR IGNORE INTO frontend_layouts(url, list) "
-                            "SELECT url, COALESCE(list, '') FROM frontends;",
-                            error,
-                            error_size)) {
-            return false;
-        }
-    }
-    if (!sqlite_exec_ok(database,
-                        "DELETE FROM frontend_layouts "
-                        "WHERE url IN ("
-                        "  SELECT raw.url FROM frontends raw "
-                        "  JOIN frontends canonical "
-                        "    ON canonical.service_id = raw.service_id "
-                        "   AND canonical.socket_path = raw.socket_path "
-                        "   AND canonical.url = raw.url || '/' "
-                        "  WHERE raw.socket_path != '' AND raw.url = raw.socket_path"
-                        ");"
-                        "UPDATE frontend_layouts "
-                        "SET url = url || '/' "
-                        "WHERE EXISTS ("
-                        "  SELECT 1 FROM frontends f "
-                        "  WHERE f.url = frontend_layouts.url "
-                        "    AND f.socket_path != '' "
-                        "    AND f.url = f.socket_path"
-                        ") "
-                        "AND NOT EXISTS ("
-                        "  SELECT 1 FROM frontend_layouts existing "
-                        "  WHERE existing.url = frontend_layouts.url || '/'"
-                        ");"
-                        "DELETE FROM frontends "
-                        "WHERE socket_path != '' "
-                        "AND url = socket_path "
-                        "AND EXISTS ("
-                        "  SELECT 1 FROM frontends canonical "
-                        "  WHERE canonical.service_id = frontends.service_id "
-                        "    AND canonical.socket_path = frontends.socket_path "
-                        "    AND canonical.url = frontends.url || '/'"
-                        ");"
-                        "UPDATE frontends "
-                        "SET url = url || '/' "
-                        "WHERE socket_path != '' AND url = socket_path;",
-                        error,
-                        error_size)) {
-        return false;
-    }
-    return true;
-}
-
-static bool sqlite_exec_formatted(sqlite3 *database, char *error, size_t error_size, const char *format, ...) {
-    va_list args;
-    va_start(args, format);
-    char *sql = sqlite3_vmprintf(format, args);
-    va_end(args);
-    if (!sql) {
-        snprintf(error, error_size, "Out of memory.");
-        return false;
-    }
-    bool ok = sqlite_exec_ok(database, sql, error, error_size);
-    sqlite3_free(sql);
-    return ok;
-}
-
-static bool sqlite_file_uri_for_readonly_immutable_path(const char *path, char *out, size_t out_size) {
-    if (!path || !out || out_size == 0) return false;
-    size_t offset = 0;
-    int written = snprintf(out, out_size, "file:");
-    if (written < 0 || (size_t)written >= out_size) return false;
-    offset = (size_t)written;
-    static const char hex[] = "0123456789ABCDEF";
-    for (const unsigned char *p = (const unsigned char *)path; *p; p++) {
-        unsigned char c = *p;
-        bool literal = (c >= 'A' && c <= 'Z') ||
-                       (c >= 'a' && c <= 'z') ||
-                       (c >= '0' && c <= '9') ||
-                       c == '/' || c == '.' || c == '_' || c == '-' || c == '~';
-        if (literal) {
-            if (offset + 1 >= out_size) return false;
-            out[offset++] = (char)c;
-        } else {
-            if (offset + 3 >= out_size) return false;
-            out[offset++] = '%';
-            out[offset++] = hex[(c >> 4) & 0xF];
-            out[offset++] = hex[c & 0xF];
-        }
-    }
-    written = snprintf(out + offset, out_size - offset, "?mode=ro&immutable=1");
-    return written >= 0 && (size_t)written < out_size - offset;
-}
-
-static sqlite3 *open_readonly_immutable_sqlite_database(const char *path, char *error, size_t error_size) {
-    char uri[PATH_MAX * 3 + 64];
-    if (!sqlite_file_uri_for_readonly_immutable_path(path, uri, sizeof(uri))) {
-        snprintf(error, error_size, "Could not build read-only SQLite URI for %s.", path);
-        return NULL;
-    }
-    sqlite3 *database = NULL;
-    int result = sqlite3_open_v2(uri,
-                                 &database,
-                                 SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX | SQLITE_OPEN_URI,
-                                 NULL);
-    if (result != SQLITE_OK) {
-        snprintf(error, error_size, "%s", database ? sqlite3_errmsg(database) : "failed to open source registry database");
-        if (database) sqlite3_close(database);
-        return NULL;
-    }
-    return database;
-}
-
-static bool copy_registry_rows(sqlite3 *source,
-                               sqlite3 *destination,
-                               const char *select_sql,
-                               const char *insert_sql,
-                               char *error,
-                               size_t error_size) {
-    sqlite3_stmt *select_statement = NULL;
-    int result = sqlite3_prepare_v2(source, select_sql, -1, &select_statement, NULL);
-    if (result != SQLITE_OK) {
-        return true;
-    }
-    sqlite3_stmt *insert_statement = NULL;
-    result = sqlite3_prepare_v2(destination, insert_sql, -1, &insert_statement, NULL);
-    if (result != SQLITE_OK) {
-        snprintf(error, error_size, "%s", sqlite3_errmsg(destination));
-        sqlite3_finalize(select_statement);
-        return false;
-    }
-    bool ok = true;
-    int column_count = sqlite3_column_count(select_statement);
-    while ((result = sqlite3_step(select_statement)) == SQLITE_ROW) {
-        sqlite3_reset(insert_statement);
-        sqlite3_clear_bindings(insert_statement);
-        for (int i = 0; i < column_count; i++) {
-            sqlite3_bind_value(insert_statement, i + 1, sqlite3_column_value(select_statement, i));
-        }
-        int insert_result = sqlite3_step(insert_statement);
-        if (insert_result != SQLITE_DONE) {
-            snprintf(error, error_size, "%s", sqlite3_errmsg(destination));
-            ok = false;
-            break;
-        }
-    }
-    if (ok && result != SQLITE_DONE) {
-        snprintf(error, error_size, "%s", sqlite3_errmsg(source));
-        ok = false;
-    }
-    sqlite3_finalize(insert_statement);
-    sqlite3_finalize(select_statement);
-    return ok;
-}
-
-static bool merge_registry_database(const char *old_path,
-                                    const char *new_path,
-                                    const TextReplacement *replacements,
-                                    size_t replacement_count,
-                                    char *error,
-                                    size_t error_size) {
-    if (!old_path || !new_path || strcmp(old_path, new_path) == 0 || access(old_path, R_OK) != 0) {
-        return true;
-    }
-    sqlite3 *database = open_registry_readwrite_at(new_path, error, error_size);
-    if (!database) return false;
-    sqlite3 *old_database = open_readonly_immutable_sqlite_database(old_path, error, error_size);
-    if (!old_database) {
-        close_registry_readwrite_at(database, new_path, false, error, error_size);
-        return false;
-    }
-    bool old_frontends_have_display_name = frontends_has_column(old_database, "display_name", error, error_size);
-    bool old_frontends_have_name = frontends_has_column(old_database, "name", error, error_size);
-    bool old_frontends_have_list = frontends_has_column(old_database, "list", error, error_size);
-    const char *old_frontend_display_name_expression = old_frontends_have_display_name
-        ? (old_frontends_have_name ? "COALESCE(NULLIF(display_name, ''), name, '')" : "COALESCE(display_name, '')")
-        : (old_frontends_have_name ? "COALESCE(name, '')" : "''");
-    const char *old_frontend_list_expression = old_frontends_have_list ? "COALESCE(list, '')" : "''";
-    char *old_frontends_sql = sqlite3_mprintf("SELECT COALESCE(NULLIF(service_id, ''), 'app') || ':' || rowid, url, service_id, %s, COALESCE(port, 0), COALESCE(socket_path, ''), icon, CASE WHEN icon IS NOT NULL AND substr(icon, 1, 5) != 'data:' THEN icon ELSE NULL END, %s FROM frontends WHERE COALESCE(service_id, '') != 'dev.outergroup.Top';",
-                                             old_frontend_display_name_expression,
-                                             old_frontend_list_expression);
-    if (!old_frontends_sql) {
-        snprintf(error, error_size, "Out of memory.");
-        sqlite3_close(old_database);
-        close_registry_readwrite_at(database, new_path, false, error, error_size);
-        return false;
-    }
-    bool ok = ensure_registry_schema(database, error, error_size);
-    if (ok) ok = sqlite_exec_ok(database, "BEGIN IMMEDIATE TRANSACTION;", error, error_size);
-    if (ok) ok = copy_registry_rows(old_database, database,
-                                    "SELECT service_id, COALESCE(display_name, ''), service_unit FROM backends WHERE service_id != 'dev.outergroup.Top';",
-                                    "INSERT OR REPLACE INTO backends(service_id, display_name, service_unit) VALUES (?, ?, ?);",
-                                    error, error_size);
-    if (ok) ok = copy_registry_rows(old_database, database,
-                                    old_frontends_sql,
-                                    "INSERT OR REPLACE INTO frontends(frontend_id, url, service_id, display_name, port, socket_path, icon, icon_path, list) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);",
-                                    error, error_size);
-    if (ok) ok = sqlite_exec_ok(database,
-                                "INSERT OR REPLACE INTO frontend_layouts(url, list) "
-                                "SELECT url, COALESCE(list, '') FROM frontends;",
-                                error,
-                                error_size);
-    if (ok) ok = copy_registry_rows(old_database, database,
-                                    "SELECT path, service_id FROM log_files WHERE service_id != 'dev.outergroup.Top';",
-                                    "INSERT OR REPLACE INTO log_files(path, service_id) VALUES (?, ?);",
-                                    error, error_size);
-    if (ok) ok = copy_registry_rows(old_database, database,
-                                    "SELECT service_id, unit_name, COALESCE(scope, 'user') FROM systemd_backends WHERE service_id != 'dev.outergroup.Top';",
-                                    "INSERT OR REPLACE INTO systemd_backends(service_id, unit_name, scope) VALUES (?, ?, ?);",
-                                    error, error_size);
-    if (ok) ok = copy_registry_rows(old_database, database,
-                                    "SELECT service_id, plist_path, COALESCE(owns_plist, 0) FROM launchd_backends WHERE service_id != 'dev.outergroup.Top';",
-                                    "INSERT OR REPLACE INTO launchd_backends(service_id, plist_path, owns_plist) VALUES (?, ?, ?);",
-                                    error, error_size);
-    for (size_t i = 0; ok && i < replacement_count; i++) {
-        const char *old_text = replacements[i].old_text;
-        const char *new_text = replacements[i].new_text ? replacements[i].new_text : "";
-        if (!old_text || !old_text[0]) continue;
-        ok = sqlite_exec_formatted(database, error, error_size,
-                                   "UPDATE log_files SET path = replace(path, %Q, %Q);"
-                                   "UPDATE frontends SET url = replace(url, %Q, %Q), socket_path = replace(socket_path, %Q, %Q);"
-                                   "UPDATE launchd_backends SET plist_path = replace(plist_path, %Q, %Q);",
-                                   old_text, new_text,
-                                   old_text, new_text,
-                                   old_text, new_text,
-                                   old_text, new_text);
-    }
-    if (ok) {
-        ok = sqlite_exec_ok(database, "COMMIT;", error, error_size);
-    } else {
-        sqlite3_exec(database, "ROLLBACK;", NULL, NULL, NULL);
-    }
-    sqlite3_free(old_frontends_sql);
-    sqlite3_close(old_database);
-    ok = close_registry_readwrite_at(database, new_path, ok, error, error_size) && ok;
-    if (ok) {
-        archive_migrated_sqlite_registry(old_path);
-    }
-    return ok;
-}
-
-static void rename_if_possible(const char *old_path, const char *new_path) {
-    if (!old_path || !new_path || access(old_path, F_OK) != 0 || access(new_path, F_OK) == 0) return;
-    char directory[PATH_MAX];
-    snprintf(directory, sizeof(directory), "%s", new_path);
-    char *slash = strrchr(directory, '/');
-    if (slash) {
-        *slash = '\0';
-        (void)mkdir_p(directory);
-    }
-    (void)rename(old_path, new_path);
-}
-
-static void migrate_user_app_directories(const char *old_apps_root, const char *new_apps_root) {
-    DIR *dir = opendir(old_apps_root);
-    if (!dir) return;
-    (void)mkdir_p(new_apps_root);
-    struct dirent *entry;
-    while ((entry = readdir(dir)) != NULL) {
-        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
-        if (strcmp(entry->d_name, "registry.sqlite3") == 0 ||
-            strcmp(entry->d_name, "registry.lock") == 0 ||
-            strcmp(entry->d_name, "registry.bin") == 0 ||
-            strcmp(entry->d_name, "outerctl") == 0 ||
-            strcmp(entry->d_name, "dev.outergroup.Top") == 0) {
-            continue;
-        }
-        char old_path[PATH_MAX];
-        snprintf(old_path, sizeof(old_path), "%s/%s", old_apps_root, entry->d_name);
-        struct stat st;
-        if (lstat(old_path, &st) != 0 || !S_ISDIR(st.st_mode)) continue;
-        char new_path[PATH_MAX];
-        snprintf(new_path, sizeof(new_path), "%s/%s", new_apps_root, entry->d_name);
-        rename_if_possible(old_path, new_path);
-        char old_log[PATH_MAX];
-        char new_log[PATH_MAX];
-        snprintf(old_log, sizeof(old_log), "%s/outeragent.log", access(new_path, F_OK) == 0 ? new_path : old_path);
-        snprintf(new_log, sizeof(new_log), "%s/backend.log", access(new_path, F_OK) == 0 ? new_path : old_path);
-        rename_if_possible(old_log, new_log);
-    }
-    closedir(dir);
-}
-
-static bool string_has_suffix(const char *value, const char *suffix) {
-    if (!value || !suffix) return false;
-    size_t value_length = strlen(value);
-    size_t suffix_length = strlen(suffix);
-    return value_length >= suffix_length &&
-           strcmp(value + value_length - suffix_length, suffix) == 0;
-}
-
-#ifdef __APPLE__
-static bool legacy_macos_launch_agent_should_be_removed(const char *plist_name, const char *plist_path) {
-    if (!plist_name || !plist_path || !string_has_suffix(plist_name, ".plist")) return false;
-    if (strcmp(plist_name, "dev.outergroup.Top.plist") == 0 ||
-        strcmp(plist_name, "dev.outergroup.OuterLoopServiceList.plist") == 0) {
-        return true;
-    }
-    size_t size = 0;
-    char *contents = read_text_file_alloc(plist_path, &size);
-    (void)size;
-    if (!contents) return false;
-    bool remove = strstr(contents, "dev.outergroup.Top") ||
-                  strstr(contents, "BuiltinBackends/Top");
-    free(contents);
-    return remove;
-}
-
-static void cleanup_legacy_macos_launch_agents(void) {
-    char launch_agents_dir[PATH_MAX];
-    snprintf(launch_agents_dir, sizeof(launch_agents_dir), "%s/Library/LaunchAgents", home_directory());
-    DIR *dir = opendir(launch_agents_dir);
-    if (dir) {
-        struct dirent *entry;
-        while ((entry = readdir(dir)) != NULL) {
-            if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
-            char plist_path[PATH_MAX];
-            snprintf(plist_path, sizeof(plist_path), "%s/%s", launch_agents_dir, entry->d_name);
-            struct stat st;
-            if (lstat(plist_path, &st) != 0 || (!S_ISREG(st.st_mode) && !S_ISLNK(st.st_mode))) continue;
-            if (!legacy_macos_launch_agent_should_be_removed(entry->d_name, plist_path)) continue;
-
-            char label[PATH_MAX];
-            snprintf(label, sizeof(label), "%s", entry->d_name);
-            char *suffix = strstr(label, ".plist");
-            if (suffix && suffix[6] == '\0') *suffix = '\0';
-
-            char launchd_target[PATH_MAX + 32];
-            snprintf(launchd_target, sizeof(launchd_target), "gui/%ld/%s", (long)getuid(), label);
-            char quoted_target[PATH_MAX * 2];
-            char quoted_label[PATH_MAX * 2];
-            char quoted_path[PATH_MAX * 2];
-            char command[PATH_MAX * 6];
-            shell_quote(launchd_target, quoted_target, sizeof(quoted_target));
-            shell_quote(label, quoted_label, sizeof(quoted_label));
-            shell_quote(plist_path, quoted_path, sizeof(quoted_path));
-            snprintf(command, sizeof(command),
-                     "launchctl bootout %s >/dev/null 2>&1 || launchctl remove %s >/dev/null 2>&1 || true; rm -f %s",
-                     quoted_target, quoted_label, quoted_path);
-            run_shell_ignored(command);
-            log_event("Removed legacy macOS launch agent %s.", entry->d_name);
-        }
-        closedir(dir);
-    }
-
-    char user_outerloop_pattern[PATH_MAX * 2];
-    char user_outershell_pattern[PATH_MAX * 2];
-    char system_outershell_pattern[PATH_MAX * 2];
-    char outer_loop_services_pattern[PATH_MAX * 2];
-    char command[PATH_MAX * 10];
-    char pattern[PATH_MAX];
-    snprintf(pattern, sizeof(pattern), "%s/Library/dev.outergroup.OuterLoop/.*TopBackend", home_directory());
-    shell_quote(pattern, user_outerloop_pattern, sizeof(user_outerloop_pattern));
-    snprintf(pattern, sizeof(pattern), "%s/Library/Application Support/outershell/apps/dev\\.outergroup\\.Top/.*TopBackend", home_directory());
-    shell_quote(pattern, user_outershell_pattern, sizeof(user_outershell_pattern));
-    shell_quote("/Library/Application Support/outershell/apps/dev\\.outergroup\\.Top/.*TopBackend",
-                system_outershell_pattern,
-                sizeof(system_outershell_pattern));
-    shell_quote("/Applications/Outer Loop.app/Contents/Resources/Outer Loop Services.app/.*BuiltinBackends/Top/.*TopBackend",
-                outer_loop_services_pattern,
-                sizeof(outer_loop_services_pattern));
-    snprintf(command, sizeof(command),
-             "pkill -f %s >/dev/null 2>&1 || true; "
-             "pkill -f %s >/dev/null 2>&1 || true; "
-             "pkill -f %s >/dev/null 2>&1 || true; "
-             "pkill -f %s >/dev/null 2>&1 || true",
-             user_outerloop_pattern,
-             user_outershell_pattern,
-             system_outershell_pattern,
-             outer_loop_services_pattern);
-    run_shell_ignored(command);
-}
-#else
-static bool legacy_outeragent_user_unit_should_be_removed(const char *unit_name, const char *unit_path) {
-    if (!unit_name || !unit_path || !string_has_suffix(unit_name, ".service")) return false;
-    if (strcmp(unit_name, "outeragent.service") == 0 ||
-        strcmp(unit_name, "dev.outergroup.Top.service") == 0) {
-        return true;
-    }
-    size_t size = 0;
-    char *contents = read_text_file_alloc(unit_path, &size);
-    (void)size;
-    if (!contents) return false;
-    bool remove = strstr(contents, "dev.outergroup.Top");
-    free(contents);
-    return remove;
-}
-
-static void cleanup_legacy_outeragent_user_units(void) {
-    char user_units_dir[PATH_MAX];
-    snprintf(user_units_dir, sizeof(user_units_dir), "%s/.config/systemd/user", home_directory());
-    DIR *dir = opendir(user_units_dir);
-    if (!dir) return;
-    struct dirent *entry;
-    bool removed_any = false;
-    while ((entry = readdir(dir)) != NULL) {
-        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
-        char unit_path[PATH_MAX];
-        snprintf(unit_path, sizeof(unit_path), "%s/%s", user_units_dir, entry->d_name);
-        struct stat st;
-        if (lstat(unit_path, &st) != 0 || (!S_ISREG(st.st_mode) && !S_ISLNK(st.st_mode))) continue;
-        if (!legacy_outeragent_user_unit_should_be_removed(entry->d_name, unit_path)) continue;
-
-        char quoted_unit[PATH_MAX * 2];
-        char quoted_path[PATH_MAX * 2];
-        char command[PATH_MAX * 5];
-        shell_quote(entry->d_name, quoted_unit, sizeof(quoted_unit));
-        shell_quote(unit_path, quoted_path, sizeof(quoted_path));
-        snprintf(command, sizeof(command),
-                 "systemctl --user disable --now %s >/dev/null 2>&1 || true; "
-                 "rm -f %s; "
-                 "systemctl --user reset-failed %s >/dev/null 2>&1 || true",
-                 quoted_unit, quoted_path, quoted_unit);
-        run_shell_ignored(command);
-        removed_any = true;
-        log_event("Removed legacy outeragent user unit %s.", entry->d_name);
-    }
-    closedir(dir);
-    if (removed_any) {
-        run_shell_ignored("systemctl --user daemon-reload >/dev/null 2>&1 || true");
-    }
-}
-#endif
-
-static void migrate_user_outershell_state(void) {
-    char old_registry[PATH_MAX];
-    char old_apps_root[PATH_MAX];
-    char new_apps_root[PATH_MAX];
-    char old_outerctl[PATH_MAX];
-    char old_outer_shell_outerctl[PATH_MAX];
-    char new_outerctl[PATH_MAX];
-    legacy_user_registry_database_path(old_registry, sizeof(old_registry));
-    legacy_user_apps_root(old_apps_root, sizeof(old_apps_root));
-    default_user_outershell_apps_root(new_apps_root, sizeof(new_apps_root));
-    legacy_user_outerctl_path(old_outerctl, sizeof(old_outerctl));
-    legacy_outer_shell_outerctl_path(old_outer_shell_outerctl, sizeof(old_outer_shell_outerctl));
-    default_user_outerctl_path(new_outerctl, sizeof(new_outerctl));
-    char new_root[PATH_MAX];
-    default_user_outershell_root(new_root, sizeof(new_root));
-    (void)mkdir_p(new_root);
-    (void)mkdir_p(new_apps_root);
-
-#ifndef __APPLE__
-    cleanup_legacy_outeragent_user_units();
-#else
-    cleanup_legacy_macos_launch_agents();
-#endif
-
-    TextReplacement replacements[] = {
-        {old_outer_shell_outerctl, new_outerctl},
-        {old_outerctl, new_outerctl},
-        {old_apps_root, new_apps_root},
-        {"outeragent.log", "backend.log"},
-        {"OUTERAGENT_ROOT", "OUTERSHELL_HOME"},
-        {"/var/lib/outergroup/outeragent", kSystemOuterShellRoot},
-        {"/var/lib/outershell/outeragent", kSystemOuterShellRoot}
-    };
-
-    char error[1024] = "";
-    if (access(old_registry, R_OK) == 0) {
-        if (merge_registry_database(old_registry,
-                                    g_registry_database_path,
-                                    replacements,
-                                    sizeof(replacements) / sizeof(replacements[0]),
-                                    error,
-                                    sizeof(error))) {
-            log_event("Migrated legacy registry from %s to %s, excluding dev.outergroup.Top.", old_registry, g_registry_database_path);
-        } else {
-            log_event("Failed to migrate legacy registry from %s: %s", old_registry, error);
-        }
-    }
-
-    migrate_user_app_directories(old_apps_root, new_apps_root);
-
-#ifndef __APPLE__
-    char user_units_dir[PATH_MAX];
-    snprintf(user_units_dir, sizeof(user_units_dir), "%s/.config/systemd/user", home_directory());
-    rewrite_files_in_directory_replacing_text(user_units_dir, replacements, sizeof(replacements) / sizeof(replacements[0]), false);
-    run_shell_ignored("systemctl --user daemon-reload >/dev/null 2>&1 || true");
-#else
-    char launch_agents_dir[PATH_MAX];
-    snprintf(launch_agents_dir, sizeof(launch_agents_dir), "%s/Library/LaunchAgents", home_directory());
-    rewrite_files_in_directory_replacing_text(launch_agents_dir, replacements, sizeof(replacements) / sizeof(replacements[0]), false);
-#endif
-}
-
-static const char *sqlite_column_text_or_empty(sqlite3_stmt *statement, int column) {
-    const unsigned char *value = sqlite3_column_text(statement, column);
-    return value ? (const char *)value : "";
-}
-
-static bool sqlite_table_exists(sqlite3 *database, const char *table_name) {
-    sqlite3_stmt *statement = NULL;
-    const char *sql =
-        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1;";
-    if (sqlite3_prepare_v2(database, sql, -1, &statement, NULL) != SQLITE_OK) {
-        return false;
-    }
-    sqlite3_bind_text(statement, 1, table_name, -1, SQLITE_TRANSIENT);
-    bool exists = sqlite3_step(statement) == SQLITE_ROW;
-    sqlite3_finalize(statement);
-    return exists;
-}
-#else
-static bool migrate_sqlite_registry_to_binary_if_needed(const char *sqlite_path, const char *binary_path, char *error, size_t error_size) {
-    (void)sqlite_path;
-    (void)binary_path;
-    (void)error;
-    (void)error_size;
-    return true;
-}
-
-static void migrate_user_outershell_state(void) {
-}
-#endif
-
 enum {
     ORWA_TABLE_BACKENDS = 0,
     ORWA_TABLE_FRONTENDS = 1,
@@ -3308,35 +2300,16 @@ static bool registry_binary_append_string_list_ref(RegistryBinaryStringPool *poo
     return true;
 }
 
-#ifndef OUTER_SHELL_BACKEND_LIBRARY
-static uint64_t registry_binary_count_rows(sqlite3 *database, const char *table_name) {
-    if (!sqlite_table_exists(database, table_name)) return 0;
-    char sql[160];
-    snprintf(sql, sizeof(sql), "SELECT COUNT(*) FROM %s;", table_name);
-    sqlite3_stmt *statement = NULL;
-    if (sqlite3_prepare_v2(database, sql, -1, &statement, NULL) != SQLITE_OK) {
-        return 0;
-    }
-    uint64_t count = 0;
-    if (sqlite3_step(statement) == SQLITE_ROW) {
-        sqlite3_int64 value = sqlite3_column_int64(statement, 0);
-        count = value > 0 ? (uint64_t)value : 0;
-    }
-    sqlite3_finalize(statement);
-    return count;
-}
-#endif
-
-static bool registry_binary_output_path(const char *sqlite_path, char *out, size_t out_size) {
-    if (!sqlite_path || !sqlite_path[0]) return false;
-    const char *basename = strrchr(sqlite_path, '/');
-    basename = basename ? basename + 1 : sqlite_path;
+static bool registry_binary_output_path(const char *registry_path, char *out, size_t out_size) {
+    if (!registry_path || !registry_path[0]) return false;
+    const char *basename = strrchr(registry_path, '/');
+    basename = basename ? basename + 1 : registry_path;
     if (strcmp(basename, "registry.orwa") == 0) {
-        int written = snprintf(out, out_size, "%s", sqlite_path);
+        int written = snprintf(out, out_size, "%s", registry_path);
         return written >= 0 && (size_t)written < out_size;
     }
     char directory[PATH_MAX];
-    snprintf(directory, sizeof(directory), "%s", sqlite_path);
+    snprintf(directory, sizeof(directory), "%s", registry_path);
     char *slash = strrchr(directory, '/');
     if (!slash) {
         return snprintf(out, out_size, "registry.orwa") > 0;
@@ -3350,27 +2323,12 @@ static bool registry_binary_output_path(const char *sqlite_path, char *out, size
     return written >= 0 && (size_t)written < out_size;
 }
 
-static bool registry_legacy_sqlite_path(const char *registry_path, char *out, size_t out_size) {
-    if (!registry_path || !registry_path[0]) return false;
-    const char *basename = strrchr(registry_path, '/');
-    basename = basename ? basename + 1 : registry_path;
-    if (strcmp(basename, "registry.orwa") != 0) {
-        int written = snprintf(out, out_size, "%s", registry_path);
-        return written >= 0 && (size_t)written < out_size;
-    }
-    char directory[PATH_MAX];
-    snprintf(directory, sizeof(directory), "%s", registry_path);
-    char *slash = strrchr(directory, '/');
-    if (!slash) {
-        return snprintf(out, out_size, "registry.sqlite3") > 0;
-    }
-    if (slash == directory) {
-        slash[1] = '\0';
-    } else {
-        *slash = '\0';
-    }
-    int written = snprintf(out, out_size, "%s/registry.sqlite3", directory);
-    return written >= 0 && (size_t)written < out_size;
+static bool registry_storage_exists_at(const char *registry_path) {
+    char binary_path[PATH_MAX];
+    struct stat st;
+    return registry_binary_output_path(registry_path, binary_path, sizeof(binary_path)) &&
+           stat(binary_path, &st) == 0 &&
+           S_ISREG(st.st_mode);
 }
 
 static bool registry_binary_lock_path(const char *registry_path, char *out, size_t out_size) {
@@ -3397,153 +2355,6 @@ static int registry_binary_lock(const char *registry_path, int operation, char *
     }
     return fd;
 }
-
-#ifndef OUTER_SHELL_BACKEND_LIBRARY
-static bool registry_binary_append_query(sqlite3 *database,
-                                         const char *sql,
-                                         int expected_columns,
-                                         bool (*append_row)(sqlite3_stmt *,
-                                                            RegistryBinaryStringPool *,
-                                                            StringBuilder *,
-                                                            StringBuilder *),
-                                         RegistryBinaryStringPool *pool,
-                                         StringBuilder *variable_region,
-                                         StringBuilder *rows,
-                                         char *error,
-                                         size_t error_size) {
-    sqlite3_stmt *statement = NULL;
-    if (sqlite3_prepare_v2(database, sql, -1, &statement, NULL) != SQLITE_OK) {
-        snprintf(error, error_size, "%s", sqlite3_errmsg(database));
-        return false;
-    }
-    if (sqlite3_column_count(statement) != expected_columns) {
-        sqlite3_finalize(statement);
-        snprintf(error, error_size, "Unexpected column count while exporting registry.");
-        return false;
-    }
-    bool ok = true;
-    int step_result = SQLITE_ROW;
-    while ((step_result = sqlite3_step(statement)) == SQLITE_ROW) {
-        if (!append_row(statement, pool, variable_region, rows)) {
-            snprintf(error, error_size, "Out of memory while exporting registry.");
-            ok = false;
-            break;
-        }
-    }
-    if (ok && step_result != SQLITE_DONE) {
-        snprintf(error, error_size, "%s", sqlite3_errmsg(database));
-        ok = false;
-    }
-    sqlite3_finalize(statement);
-    return ok;
-}
-
-static bool registry_binary_append_backend_row(sqlite3_stmt *statement,
-                                               RegistryBinaryStringPool *pool,
-                                               StringBuilder *variable_region,
-                                               StringBuilder *rows) {
-    uint32_t flags = sqlite3_column_int(statement, 4) != 0 ? 1u : 0u;
-    return registry_binary_append_string_ref(pool, variable_region, rows, sqlite_column_text_or_empty(statement, 0)) &&
-           registry_binary_append_string_ref(pool, variable_region, rows, sqlite_column_text_or_empty(statement, 1)) &&
-           registry_binary_append_string_ref(pool, variable_region, rows, sqlite_column_text_or_empty(statement, 2)) &&
-           registry_binary_append_string_ref(pool, variable_region, rows, sqlite_column_text_or_empty(statement, 3)) &&
-           binary_append_u32(rows, flags);
-}
-
-static void registry_frontend_parse_legacy_endpoint(const char *raw_url,
-                                                    uint32_t raw_port,
-                                                    const char *raw_socket_path,
-                                                    uint16_t *endpoint_kind,
-                                                    uint16_t *endpoint_scheme,
-                                                    char *host,
-                                                    size_t host_size,
-                                                    uint16_t *port,
-                                                    char *path,
-                                                    size_t path_size);
-static bool registry_frontend_build_url(uint16_t endpoint_kind,
-                                        uint16_t endpoint_scheme,
-                                        const char *host,
-                                        uint16_t port,
-                                        const char *path,
-                                        char *out,
-                                        size_t out_size);
-
-static bool registry_binary_append_frontend_row(sqlite3_stmt *statement,
-                                                RegistryBinaryStringPool *pool,
-                                                StringBuilder *variable_region,
-                                                StringBuilder *rows) {
-    const char *url = sqlite_column_text_or_empty(statement, 0);
-    const char *socket_path = sqlite_column_text_or_empty(statement, 4);
-    uint32_t port = (uint32_t)sqlite3_column_int(statement, 3);
-    uint16_t endpoint_kind = OUTERSHELLD_API_FRONTEND_ENDPOINT_NONE;
-    uint16_t endpoint_scheme = OUTERSHELLD_API_FRONTEND_SCHEME_HTTP;
-    uint16_t endpoint_port = 0;
-    char host[PATH_MAX];
-    char path[PATH_MAX * 2];
-    registry_frontend_parse_legacy_endpoint(url,
-                                            port,
-                                            socket_path,
-                                            &endpoint_kind,
-                                            &endpoint_scheme,
-                                            host,
-                                            sizeof(host),
-                                            &endpoint_port,
-                                            path,
-                                            sizeof(path));
-    bool ok = registry_binary_append_string_ref32(pool, variable_region, rows, sqlite_column_text_or_empty(statement, 7)) &&
-              registry_binary_append_string_ref32(pool, variable_region, rows, sqlite_column_text_or_empty(statement, 1)) &&
-              registry_binary_append_string_ref32(pool, variable_region, rows, sqlite_column_text_or_empty(statement, 2)) &&
-              registry_binary_append_string_ref32(pool, variable_region, rows, sqlite_column_text_or_empty(statement, 5)) &&
-              registry_binary_append_string_ref32(pool, variable_region, rows, sqlite_column_text_or_empty(statement, 6)) &&
-              binary_append_u16(rows, endpoint_kind) &&
-              binary_append_u16(rows, 0) &&
-              binary_append_u16(rows, endpoint_scheme) &&
-              binary_append_u16(rows, 0) &&
-              registry_binary_append_string_ref32(pool, variable_region, rows, path);
-    if (!ok) return false;
-    if (endpoint_kind == OUTERSHELLD_API_FRONTEND_ENDPOINT_UNIX) {
-        ok = registry_binary_append_string_ref32(pool, variable_region, rows, socket_path) &&
-             binary_append_zero(rows, 16);
-    } else if (endpoint_kind == OUTERSHELLD_API_FRONTEND_ENDPOINT_TCP) {
-        ok = registry_binary_append_string_ref32(pool, variable_region, rows, host) &&
-             binary_append_u16(rows, endpoint_port) &&
-             binary_append_zero(rows, 14);
-    } else {
-        ok = registry_binary_append_string_ref32(pool, variable_region, rows, "") &&
-             binary_append_zero(rows, 16);
-    }
-    return ok;
-}
-
-static bool registry_binary_append_frontend_layout_row(sqlite3_stmt *statement,
-                                                       RegistryBinaryStringPool *pool,
-                                                       StringBuilder *variable_region,
-                                                       StringBuilder *rows) {
-    return registry_binary_append_string_ref(pool, variable_region, rows, sqlite_column_text_or_empty(statement, 0)) &&
-           registry_binary_append_string_ref(pool, variable_region, rows, sqlite_column_text_or_empty(statement, 1));
-}
-
-static bool registry_binary_append_log_file_row(sqlite3_stmt *statement,
-                                                RegistryBinaryStringPool *pool,
-                                                StringBuilder *variable_region,
-                                                StringBuilder *rows) {
-    return registry_binary_append_string_ref(pool, variable_region, rows, sqlite_column_text_or_empty(statement, 0)) &&
-           registry_binary_append_string_ref(pool, variable_region, rows, sqlite_column_text_or_empty(statement, 1));
-}
-
-static bool registry_binary_append_file_opener_row(sqlite3_stmt *statement,
-                                                   RegistryBinaryStringPool *pool,
-                                                   StringBuilder *variable_region,
-                                                   StringBuilder *rows) {
-    uint32_t rank = (uint32_t)sqlite3_column_int(statement, 3);
-    uint32_t capabilities = normalize_opener_capabilities((uint32_t)sqlite3_column_int(statement, 4));
-    return registry_binary_append_string_ref(pool, variable_region, rows, sqlite_column_text_or_empty(statement, 0)) &&
-           registry_binary_append_string_ref(pool, variable_region, rows, sqlite_column_text_or_empty(statement, 1)) &&
-           registry_binary_append_string_ref(pool, variable_region, rows, sqlite_column_text_or_empty(statement, 2)) &&
-           binary_append_u32(rows, rank) &&
-           binary_append_u32(rows, capabilities);
-}
-#endif
 
 static bool registry_binary_write_file(const char *path, const void *data, size_t length, char *error, size_t error_size) {
     char temp_path[PATH_MAX];
@@ -3677,616 +2488,6 @@ static bool registry_binary_read_string_ref32(const unsigned char *file,
                                        error,
                                        error_size);
 }
-
-#ifndef OUTER_SHELL_BACKEND_LIBRARY
-static bool registry_binary_step(sqlite3 *database, sqlite3_stmt *statement, char *error, size_t error_size) {
-    int result = sqlite3_step(statement);
-    if (result == SQLITE_DONE) return true;
-    snprintf(error, error_size, "%s", sqlite3_errmsg(database));
-    return false;
-}
-
-static bool registry_binary_import_backend(sqlite3 *database,
-                                           const char *service_id,
-                                           const char *display_name,
-                                           const char *unit_name,
-                                           const char *unit_path,
-                                           bool owns_unit,
-                                           char *error,
-                                           size_t error_size) {
-    sqlite3_stmt *statement = NULL;
-    bool ok = sqlite3_prepare_v2(database,
-                                 "INSERT INTO backends(service_id, display_name, service_unit) VALUES(?, ?, NULLIF(?, '')) "
-                                 "ON CONFLICT(service_id) DO UPDATE SET display_name=excluded.display_name, service_unit=excluded.service_unit;",
-                                 -1,
-                                 &statement,
-                                 NULL) == SQLITE_OK;
-    if (ok) {
-        sqlite3_bind_text(statement, 1, service_id, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(statement, 2, display_name, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(statement, 3, unit_name, -1, SQLITE_TRANSIENT);
-        ok = registry_binary_step(database, statement, error, error_size);
-    } else {
-        snprintf(error, error_size, "%s", sqlite3_errmsg(database));
-    }
-    if (statement) sqlite3_finalize(statement);
-    if (!ok) return false;
-
-    if (unit_path && unit_path[0]) {
-        ok = sqlite3_prepare_v2(database,
-                                "INSERT INTO launchd_backends(service_id, plist_path, owns_plist) VALUES(?, ?, ?) "
-                                "ON CONFLICT(service_id) DO UPDATE SET plist_path=excluded.plist_path, owns_plist=excluded.owns_plist;",
-                                -1,
-                                &statement,
-                                NULL) == SQLITE_OK;
-        if (ok) {
-            sqlite3_bind_text(statement, 1, service_id, -1, SQLITE_TRANSIENT);
-            sqlite3_bind_text(statement, 2, unit_path, -1, SQLITE_TRANSIENT);
-            sqlite3_bind_int(statement, 3, owns_unit ? 1 : 0);
-            ok = registry_binary_step(database, statement, error, error_size);
-        } else {
-            snprintf(error, error_size, "%s", sqlite3_errmsg(database));
-        }
-        if (statement) sqlite3_finalize(statement);
-        return ok;
-    }
-    if (unit_name && unit_name[0]) {
-        ok = sqlite3_prepare_v2(database,
-                                "INSERT INTO systemd_backends(service_id, unit_name, scope) VALUES(?, ?, 'user') "
-                                "ON CONFLICT(service_id) DO UPDATE SET unit_name=excluded.unit_name;",
-                                -1,
-                                &statement,
-                                NULL) == SQLITE_OK;
-        if (ok) {
-            sqlite3_bind_text(statement, 1, service_id, -1, SQLITE_TRANSIENT);
-            sqlite3_bind_text(statement, 2, unit_name, -1, SQLITE_TRANSIENT);
-            ok = registry_binary_step(database, statement, error, error_size);
-        } else {
-            snprintf(error, error_size, "%s", sqlite3_errmsg(database));
-        }
-        if (statement) sqlite3_finalize(statement);
-    }
-    return ok;
-}
-
-static bool registry_binary_import_frontend(sqlite3 *database,
-                                            const char *frontend_id,
-                                            const char *url,
-                                            const char *service_id,
-                                            const char *display_name,
-                                            uint32_t port,
-                                            const char *socket_path,
-                                            const char *icon_path,
-                                            const char *list,
-                                            char *error,
-                                            size_t error_size) {
-    sqlite3_stmt *statement = NULL;
-    bool ok = sqlite3_prepare_v2(database,
-                                 "INSERT INTO frontends(frontend_id, url, service_id, display_name, port, socket_path, icon_path, list) VALUES(?, ?, ?, ?, ?, ?, NULLIF(?, ''), NULLIF(?, '')) "
-                                 "ON CONFLICT(frontend_id) DO UPDATE SET url=excluded.url, service_id=excluded.service_id, display_name=excluded.display_name, port=excluded.port, socket_path=excluded.socket_path, icon_path=excluded.icon_path, list=excluded.list;",
-                                 -1,
-                                 &statement,
-                                 NULL) == SQLITE_OK;
-    if (ok) {
-        sqlite3_bind_text(statement, 1, frontend_id && frontend_id[0] ? frontend_id : service_id, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(statement, 2, url, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(statement, 3, service_id, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(statement, 4, display_name, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int(statement, 5, (int)port);
-        sqlite3_bind_text(statement, 6, socket_path, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(statement, 7, icon_path, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(statement, 8, list, -1, SQLITE_TRANSIENT);
-        ok = registry_binary_step(database, statement, error, error_size);
-    } else {
-        snprintf(error, error_size, "%s", sqlite3_errmsg(database));
-    }
-    if (statement) sqlite3_finalize(statement);
-    return ok;
-}
-
-static bool registry_binary_import_frontend_layout(sqlite3 *database,
-                                                   const char *url,
-                                                   const char *list,
-                                                   char *error,
-                                                   size_t error_size) {
-    sqlite3_stmt *statement = NULL;
-    bool ok = sqlite3_prepare_v2(database,
-                                 "INSERT OR REPLACE INTO frontend_layouts(url, list) VALUES(?, ?);",
-                                 -1,
-                                 &statement,
-                                 NULL) == SQLITE_OK;
-    if (ok) {
-        sqlite3_bind_text(statement, 1, url, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(statement, 2, list ? list : "", -1, SQLITE_TRANSIENT);
-        ok = registry_binary_step(database, statement, error, error_size);
-    } else {
-        snprintf(error, error_size, "%s", sqlite3_errmsg(database));
-    }
-    if (statement) sqlite3_finalize(statement);
-    return ok;
-}
-
-static bool registry_binary_import_log_file(sqlite3 *database,
-                                            const char *path,
-                                            const char *service_id,
-                                            char *error,
-                                            size_t error_size) {
-    sqlite3_stmt *statement = NULL;
-    bool ok = sqlite3_prepare_v2(database,
-                                 "INSERT OR REPLACE INTO log_files(path, service_id) VALUES(?, ?);",
-                                 -1,
-                                 &statement,
-                                 NULL) == SQLITE_OK;
-    if (ok) {
-        sqlite3_bind_text(statement, 1, path, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(statement, 2, service_id, -1, SQLITE_TRANSIENT);
-        ok = registry_binary_step(database, statement, error, error_size);
-    } else {
-        snprintf(error, error_size, "%s", sqlite3_errmsg(database));
-    }
-    if (statement) sqlite3_finalize(statement);
-    return ok;
-}
-
-static bool registry_binary_import_file_opener(sqlite3 *database,
-                                               const char *extension,
-                                               const char *frontend_id,
-                                               const char *url_template,
-                                               uint32_t rank,
-                                               uint32_t capabilities,
-                                               char *error,
-                                               size_t error_size) {
-    sqlite3_stmt *statement = NULL;
-    bool ok = sqlite3_prepare_v2(database,
-                                 "INSERT INTO file_openers(extension, frontend_id, url_template, rank, capabilities) VALUES(?, ?, ?, ?, ?) "
-                                 "ON CONFLICT(extension, frontend_id) DO UPDATE SET url_template=excluded.url_template, rank=excluded.rank, capabilities=excluded.capabilities;",
-                                 -1,
-                                 &statement,
-                                 NULL) == SQLITE_OK;
-    if (ok) {
-        sqlite3_bind_text(statement, 1, extension, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(statement, 2, frontend_id, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(statement, 3, url_template, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int(statement, 4, (int)rank);
-        sqlite3_bind_int(statement, 5, (int)normalize_opener_capabilities(capabilities));
-        ok = registry_binary_step(database, statement, error, error_size);
-    } else {
-        snprintf(error, error_size, "%s", sqlite3_errmsg(database));
-    }
-    if (statement) sqlite3_finalize(statement);
-    return ok;
-}
-
-static bool import_registry_binary_into_sqlite(sqlite3 *database, const char *sqlite_path, char *error, size_t error_size) {
-    char path[PATH_MAX];
-    if (!registry_binary_output_path(sqlite_path, path, sizeof(path))) {
-        snprintf(error, error_size, "Could not build registry.orwa path.");
-        return false;
-    }
-    struct stat st;
-    if (stat(path, &st) != 0) {
-        if (errno == ENOENT) return true;
-        snprintf(error, error_size, "Failed to inspect %s: %s", path, strerror(errno));
-        return false;
-    }
-    if (!S_ISREG(st.st_mode)) return true;
-
-    size_t file_size = 0;
-    char *file_data = read_text_file_alloc(path, &file_size);
-    if (!file_data) {
-        snprintf(error, error_size, "Failed to read %s.", path);
-        return false;
-    }
-    const unsigned char *bytes = (const unsigned char *)file_data;
-    if (file_size < ORWA_LEGACY_THREE_TABLE_HEADER_SIZE ||
-        memcmp(file_data, "ORWA", 4) != 0 ||
-        read_uint32_le(bytes + 4) != 1) {
-        free(file_data);
-        snprintf(error, error_size, "Registry binary has an unsupported header.");
-        return false;
-    }
-
-    RegistryBinaryTableDescriptor descriptors[ORWA_TABLE_COUNT] = {0};
-    uint64_t first_table_offset = read_uint64_le(bytes + 8);
-    size_t table_count = first_table_offset == ORWA_HEADER_SIZE ? ORWA_TABLE_COUNT :
-                         first_table_offset == ORWA_LEGACY_FOUR_TABLE_HEADER_SIZE ? ORWA_LEGACY_FOUR_TABLE_COUNT :
-                         first_table_offset == ORWA_LEGACY_THREE_TABLE_HEADER_SIZE ? ORWA_LEGACY_THREE_TABLE_COUNT :
-                         0;
-    if (table_count == 0) {
-        free(file_data);
-        snprintf(error, error_size, "Registry binary has an unsupported table layout.");
-        return false;
-    }
-    if (file_size < 8 + table_count * ORWA_TABLE_DESCRIPTOR_SIZE) {
-        free(file_data);
-        snprintf(error, error_size, "Registry binary table descriptors are truncated.");
-        return false;
-    }
-    uint64_t variable_offset = 0;
-    /* Reset only the opener table when a bounded pre-release row layout is stale. */
-    bool file_openers_table_supported = true;
-    for (size_t i = 0; i < table_count; i++) {
-        size_t descriptor_offset = 8 + i * ORWA_TABLE_DESCRIPTOR_SIZE;
-        descriptors[i].offset = read_uint64_le(bytes + descriptor_offset);
-        descriptors[i].row_count = read_uint64_le(bytes + descriptor_offset + 8);
-        descriptors[i].row_size = read_uint32_le(bytes + descriptor_offset + 16);
-        uint32_t expected_row_size = i == ORWA_TABLE_BACKENDS ? ORWA_BACKENDS_ROW_SIZE :
-                                     i == ORWA_TABLE_FRONTENDS ? descriptors[i].row_size :
-                                     i == ORWA_TABLE_FRONTEND_LAYOUTS && table_count != ORWA_LEGACY_THREE_TABLE_COUNT ? ORWA_FRONTEND_LAYOUTS_ROW_SIZE :
-                                     i == ORWA_TABLE_CONTENT_TYPES ? descriptors[i].row_size :
-                                     i == ORWA_TABLE_FILE_OPENERS ? ORWA_FILE_OPENERS_ROW_SIZE :
-                                     ORWA_LOG_FILES_ROW_SIZE;
-        bool row_size_supported = descriptors[i].row_size == expected_row_size;
-        bool bounds_valid = descriptors[i].offset <= (uint64_t)file_size &&
-                            !(descriptors[i].row_count > 0 && descriptors[i].row_size == 0) &&
-                            !(descriptors[i].row_size > 0 && descriptors[i].row_count > UINT64_MAX / descriptors[i].row_size);
-        uint64_t table_end = 0;
-        if (bounds_valid) {
-            uint64_t table_size = descriptors[i].row_count * descriptors[i].row_size;
-            bounds_valid = table_size <= (uint64_t)file_size - descriptors[i].offset;
-            table_end = descriptors[i].offset + table_size;
-        }
-        if ((i == ORWA_TABLE_BACKENDS
-                ? (descriptors[i].row_size != ORWA_BACKENDS_ROW_SIZE && descriptors[i].row_size != ORWA_LEGACY_BACKENDS_ROW_SIZE)
-                : i == ORWA_TABLE_FRONTENDS
-                ? (descriptors[i].row_size != ORWA_STRUCTURED_FRONTENDS_ROW_SIZE &&
-                   descriptors[i].row_size != ORWA_FRONTENDS_ROW_SIZE &&
-                   descriptors[i].row_size != ORWA_FRONTENDS_ROW_SIZE_WITH_FLAGS &&
-                   descriptors[i].row_size != ORWA_LEGACY_FRONTENDS_ROW_SIZE)
-                : i == ORWA_TABLE_CONTENT_TYPES
-                ? false
-                : i == ORWA_TABLE_FILE_OPENERS
-                ? false
-                : !row_size_supported) ||
-            (i != ORWA_TABLE_CONTENT_TYPES && !bounds_valid)) {
-            free(file_data);
-            snprintf(error, error_size, "Registry binary table descriptor is invalid.");
-            return false;
-        }
-        if (i == ORWA_TABLE_FILE_OPENERS && descriptors[i].row_size != ORWA_FILE_OPENERS_ROW_SIZE) {
-            file_openers_table_supported = false;
-        }
-        if (bounds_valid && table_end > variable_offset) variable_offset = table_end;
-    }
-
-    bool ok = sqlite_exec_ok(database, "BEGIN IMMEDIATE TRANSACTION;", error, error_size) &&
-              sqlite_exec_ok(database, "DELETE FROM file_openers; DELETE FROM frontend_layouts; DELETE FROM frontends; DELETE FROM log_files; DELETE FROM systemd_backends; DELETE FROM launchd_backends; DELETE FROM backends;", error, error_size);
-
-    for (uint64_t row = 0; ok && row < descriptors[ORWA_TABLE_BACKENDS].row_count; row++) {
-        const unsigned char *row_bytes = bytes + descriptors[ORWA_TABLE_BACKENDS].offset + row * descriptors[ORWA_TABLE_BACKENDS].row_size;
-        char *service_id = NULL, *display_name = NULL, *unit_name = NULL, *unit_path = NULL;
-        ok = registry_binary_read_string(bytes, file_size, variable_offset, read_uint64_le(row_bytes), read_uint64_le(row_bytes + 8), &service_id, error, error_size) &&
-             registry_binary_read_string(bytes, file_size, variable_offset, read_uint64_le(row_bytes + 16), read_uint64_le(row_bytes + 24), &display_name, error, error_size);
-        if (ok && descriptors[ORWA_TABLE_BACKENDS].row_size == ORWA_LEGACY_BACKENDS_ROW_SIZE) {
-            ok = registry_binary_read_string(bytes, file_size, variable_offset, read_uint64_le(row_bytes + 48), read_uint64_le(row_bytes + 56), &unit_name, error, error_size) &&
-                 registry_binary_read_string(bytes, file_size, variable_offset, read_uint64_le(row_bytes + 64), read_uint64_le(row_bytes + 72), &unit_path, error, error_size);
-        } else if (ok) {
-            ok = registry_binary_read_string(bytes, file_size, variable_offset, read_uint64_le(row_bytes + 32), read_uint64_le(row_bytes + 40), &unit_name, error, error_size) &&
-                 registry_binary_read_string(bytes, file_size, variable_offset, read_uint64_le(row_bytes + 48), read_uint64_le(row_bytes + 56), &unit_path, error, error_size);
-        }
-        if (ok) {
-            size_t flags_offset = descriptors[ORWA_TABLE_BACKENDS].row_size == ORWA_LEGACY_BACKENDS_ROW_SIZE ? 80 : 64;
-            bool owns_unit = (read_uint32_le(row_bytes + flags_offset) & 1u) != 0;
-            ok = registry_binary_import_backend(database, service_id, display_name, unit_name, unit_path, owns_unit, error, error_size);
-        }
-        free(service_id);
-        free(display_name);
-        free(unit_name);
-        free(unit_path);
-    }
-
-    for (uint64_t row = 0; ok && row < descriptors[ORWA_TABLE_FRONTENDS].row_count; row++) {
-        const unsigned char *row_bytes = bytes + descriptors[ORWA_TABLE_FRONTENDS].offset + row * descriptors[ORWA_TABLE_FRONTENDS].row_size;
-        char *url = NULL, *service_id = NULL, *display_name = NULL, *icon_path = NULL, *list = NULL, *socket_path = NULL, *frontend_id = NULL, *host = NULL, *path_value = NULL;
-        uint32_t port = 0;
-        if (descriptors[ORWA_TABLE_FRONTENDS].row_size == ORWA_STRUCTURED_FRONTENDS_ROW_SIZE) {
-            uint16_t endpoint_kind = read_uint16_le(row_bytes + 40);
-            uint16_t endpoint_scheme = read_uint16_le(row_bytes + 44);
-            ok = registry_binary_read_string_ref32(bytes, file_size, variable_offset, row_bytes, 0, &frontend_id, error, error_size) &&
-                 registry_binary_read_string_ref32(bytes, file_size, variable_offset, row_bytes, 8, &service_id, error, error_size) &&
-                 registry_binary_read_string_ref32(bytes, file_size, variable_offset, row_bytes, 16, &display_name, error, error_size) &&
-                 registry_binary_read_string_ref32(bytes, file_size, variable_offset, row_bytes, 24, &icon_path, error, error_size) &&
-                 registry_binary_read_string_ref32(bytes, file_size, variable_offset, row_bytes, 32, &list, error, error_size) &&
-                 registry_binary_read_string_ref32(bytes, file_size, variable_offset, row_bytes, 48, &path_value, error, error_size);
-            if (ok && endpoint_kind == OUTERSHELLD_API_FRONTEND_ENDPOINT_TCP) {
-                port = read_uint16_le(row_bytes + 64);
-                ok = registry_binary_read_string_ref32(bytes, file_size, variable_offset, row_bytes, 56, &host, error, error_size);
-                if (ok) socket_path = strdup("");
-            } else if (ok && endpoint_kind == OUTERSHELLD_API_FRONTEND_ENDPOINT_UNIX) {
-                ok = registry_binary_read_string_ref32(bytes, file_size, variable_offset, row_bytes, 56, &socket_path, error, error_size);
-                if (ok) host = strdup("");
-            } else if (ok && endpoint_kind == OUTERSHELLD_API_FRONTEND_ENDPOINT_NONE) {
-                host = strdup("");
-                socket_path = strdup("");
-            } else if (ok) {
-                snprintf(error, error_size, "Registry binary frontend endpoint kind is unsupported.");
-                ok = false;
-            }
-            if (ok && (!host || !socket_path)) {
-                snprintf(error, error_size, "Out of memory.");
-                ok = false;
-            }
-            if (ok) {
-                char url_buffer[PATH_MAX * 3];
-                ok = registry_frontend_build_url(endpoint_kind, endpoint_scheme, host, (uint16_t)port, path_value, url_buffer, sizeof(url_buffer));
-                if (ok) {
-                    url = strdup(url_buffer);
-                    if (!url) {
-                        snprintf(error, error_size, "Out of memory.");
-                        ok = false;
-                    }
-                }
-            }
-        } else {
-            ok = registry_binary_read_string(bytes, file_size, variable_offset, read_uint64_le(row_bytes), read_uint64_le(row_bytes + 8), &url, error, error_size) &&
-                 registry_binary_read_string(bytes, file_size, variable_offset, read_uint64_le(row_bytes + 16), read_uint64_le(row_bytes + 24), &service_id, error, error_size) &&
-                 registry_binary_read_string(bytes, file_size, variable_offset, read_uint64_le(row_bytes + 32), read_uint64_le(row_bytes + 40), &display_name, error, error_size) &&
-                 registry_binary_read_string(bytes, file_size, variable_offset, read_uint64_le(row_bytes + 48), read_uint64_le(row_bytes + 56), &icon_path, error, error_size) &&
-                 registry_binary_read_string(bytes, file_size, variable_offset, read_uint64_le(row_bytes + 64), read_uint64_le(row_bytes + 72), &list, error, error_size);
-            if (ok) {
-                uint8_t endpoint_kind = row_bytes[80];
-                if (endpoint_kind == 1u) {
-                    port = read_uint32_le(row_bytes + 81);
-                    socket_path = strdup("");
-                    if (!socket_path) {
-                        snprintf(error, error_size, "Out of memory.");
-                        ok = false;
-                    }
-                } else if (endpoint_kind == 2u) {
-                    ok = registry_binary_read_string(bytes, file_size, variable_offset, read_uint64_le(row_bytes + 81), read_uint64_le(row_bytes + 89), &socket_path, error, error_size);
-                } else if (endpoint_kind == 0u) {
-                    socket_path = strdup("");
-                    if (!socket_path) {
-                        snprintf(error, error_size, "Out of memory.");
-                        ok = false;
-                    }
-                } else {
-                    snprintf(error, error_size, "Registry binary frontend endpoint kind is unsupported.");
-                    ok = false;
-                }
-            }
-            if (ok && descriptors[ORWA_TABLE_FRONTENDS].row_size >= ORWA_FRONTENDS_ROW_SIZE) {
-                ok = registry_binary_read_string(bytes, file_size, variable_offset, read_uint64_le(row_bytes + 97), read_uint64_le(row_bytes + 105), &frontend_id, error, error_size);
-            } else if (ok) {
-                size_t needed = strlen(service_id ? service_id : "") + strlen(url ? url : "") + 2;
-                frontend_id = (char *)malloc(needed);
-                if (frontend_id) {
-                    snprintf(frontend_id, needed, "%s:%s", service_id ? service_id : "app", url && url[0] ? url : "main");
-                } else {
-                    snprintf(error, error_size, "Out of memory.");
-                    ok = false;
-                }
-            }
-        }
-        if (ok) {
-            ok = registry_binary_import_frontend(database, frontend_id, url, service_id, display_name, port, socket_path, icon_path, list, error, error_size);
-        }
-        if (ok && table_count == ORWA_LEGACY_THREE_TABLE_COUNT) {
-            ok = registry_binary_import_frontend_layout(database, url, list, error, error_size);
-        }
-        free(url);
-        free(service_id);
-        free(display_name);
-        free(icon_path);
-        free(list);
-        free(socket_path);
-        free(frontend_id);
-        free(host);
-        free(path_value);
-    }
-
-    if (table_count != ORWA_LEGACY_THREE_TABLE_COUNT) {
-        for (uint64_t row = 0; ok && row < descriptors[ORWA_TABLE_FRONTEND_LAYOUTS].row_count; row++) {
-            const unsigned char *row_bytes = bytes + descriptors[ORWA_TABLE_FRONTEND_LAYOUTS].offset + row * ORWA_FRONTEND_LAYOUTS_ROW_SIZE;
-            char *url = NULL, *list = NULL;
-            ok = registry_binary_read_string(bytes, file_size, variable_offset, read_uint64_le(row_bytes), read_uint64_le(row_bytes + 8), &url, error, error_size) &&
-                 registry_binary_read_string(bytes, file_size, variable_offset, read_uint64_le(row_bytes + 16), read_uint64_le(row_bytes + 24), &list, error, error_size);
-            if (ok) {
-                ok = registry_binary_import_frontend_layout(database, url, list, error, error_size);
-            }
-            free(url);
-            free(list);
-        }
-    }
-
-    size_t log_table_index = table_count == ORWA_LEGACY_THREE_TABLE_COUNT ? 2 : ORWA_TABLE_LOG_FILES;
-    for (uint64_t row = 0; ok && row < descriptors[log_table_index].row_count; row++) {
-        const unsigned char *row_bytes = bytes + descriptors[log_table_index].offset + row * ORWA_LOG_FILES_ROW_SIZE;
-        char *path_value = NULL, *service_id = NULL;
-        ok = registry_binary_read_string(bytes, file_size, variable_offset, read_uint64_le(row_bytes), read_uint64_le(row_bytes + 8), &path_value, error, error_size) &&
-             registry_binary_read_string(bytes, file_size, variable_offset, read_uint64_le(row_bytes + 16), read_uint64_le(row_bytes + 24), &service_id, error, error_size);
-        if (ok) {
-            ok = registry_binary_import_log_file(database, path_value, service_id, error, error_size);
-        }
-        free(path_value);
-        free(service_id);
-    }
-
-    if (table_count == ORWA_TABLE_COUNT && file_openers_table_supported) {
-        for (uint64_t row = 0; ok && row < descriptors[ORWA_TABLE_FILE_OPENERS].row_count; row++) {
-            const unsigned char *row_bytes = bytes + descriptors[ORWA_TABLE_FILE_OPENERS].offset + row * descriptors[ORWA_TABLE_FILE_OPENERS].row_size;
-            char *extension = NULL, *frontend_id = NULL, *url_template = NULL;
-            ok = registry_binary_read_string(bytes, file_size, variable_offset, read_uint64_le(row_bytes), read_uint64_le(row_bytes + 8), &extension, error, error_size) &&
-                 registry_binary_read_string(bytes, file_size, variable_offset, read_uint64_le(row_bytes + 16), read_uint64_le(row_bytes + 24), &frontend_id, error, error_size) &&
-                 registry_binary_read_string(bytes, file_size, variable_offset, read_uint64_le(row_bytes + 32), read_uint64_le(row_bytes + 40), &url_template, error, error_size);
-            if (ok) {
-                ok = registry_binary_import_file_opener(database,
-                                                        extension,
-                                                        frontend_id,
-                                                        url_template,
-                                                        read_uint32_le(row_bytes + 48),
-                                                        read_uint32_le(row_bytes + 52),
-                                                        error,
-                                                        error_size);
-            }
-            free(extension);
-            free(frontend_id);
-            free(url_template);
-        }
-    }
-
-    if (ok) {
-        ok = sqlite_exec_ok(database, "COMMIT;", error, error_size);
-    } else {
-        sqlite3_exec(database, "ROLLBACK;", NULL, NULL, NULL);
-    }
-    free(file_data);
-    return ok;
-}
-
-static bool export_registry_binary_from_sqlite(sqlite3 *database, const char *sqlite_path, char *error, size_t error_size) {
-    if (!database || !sqlite_path || !sqlite_path[0]) return false;
-
-    RegistryBinaryTableDescriptor descriptors[ORWA_TABLE_COUNT] = {
-        {.row_count = registry_binary_count_rows(database, "backends"), .row_size = ORWA_BACKENDS_ROW_SIZE},
-        {.row_count = registry_binary_count_rows(database, "frontends"), .row_size = ORWA_STRUCTURED_FRONTENDS_ROW_SIZE},
-        {.row_count = registry_binary_count_rows(database, "frontend_layouts"), .row_size = ORWA_FRONTEND_LAYOUTS_ROW_SIZE},
-        {.row_count = registry_binary_count_rows(database, "log_files"), .row_size = ORWA_LOG_FILES_ROW_SIZE},
-        {.row_count = 0, .row_size = ORWA_CONTENT_TYPES_ROW_SIZE},
-        {.row_count = registry_binary_count_rows(database, "file_openers"), .row_size = ORWA_FILE_OPENERS_ROW_SIZE},
-    };
-
-    uint64_t offset = ORWA_HEADER_SIZE;
-    for (size_t i = 0; i < ORWA_TABLE_COUNT; i++) {
-        descriptors[i].offset = offset;
-        offset += descriptors[i].row_count * descriptors[i].row_size;
-    }
-    uint64_t variable_region_offset = offset;
-
-    StringBuilder rows = {0};
-    StringBuilder variable_region = {0};
-    RegistryBinaryStringPool pool = {.variable_base_offset = variable_region_offset};
-    bool ok = true;
-
-    if (ok && descriptors[ORWA_TABLE_BACKENDS].row_count > 0) {
-        bool has_systemd_table = sqlite_table_exists(database, "systemd_backends");
-        bool has_launchd_table = sqlite_table_exists(database, "launchd_backends");
-        const char *systemd_join = has_systemd_table ? "LEFT JOIN systemd_backends s ON s.service_id = b.service_id" : "";
-        const char *launchd_join = has_launchd_table ? "LEFT JOIN launchd_backends l ON l.service_id = b.service_id" : "";
-        const char *unit_name_expression = "COALESCE(NULLIF(b.service_unit, ''), '')";
-        const char *unit_path_expression = "''";
-        const char *owns_unit_expression = "CASE WHEN COALESCE(b.service_unit, '') != '' THEN 1 ELSE 0 END";
-        if (has_systemd_table && has_launchd_table) {
-            unit_name_expression = "CASE WHEN COALESCE(l.plist_path, '') != '' THEN b.service_id ELSE COALESCE(NULLIF(s.unit_name, ''), NULLIF(b.service_unit, ''), '') END";
-            unit_path_expression = "COALESCE(l.plist_path, '')";
-            owns_unit_expression = "CASE WHEN COALESCE(l.plist_path, '') != '' THEN COALESCE(l.owns_plist, 0) WHEN COALESCE(s.unit_name, '') != '' OR COALESCE(b.service_unit, '') != '' THEN 1 ELSE 0 END";
-        } else if (has_systemd_table) {
-            unit_name_expression = "COALESCE(NULLIF(s.unit_name, ''), NULLIF(b.service_unit, ''), '')";
-            owns_unit_expression = "CASE WHEN COALESCE(s.unit_name, '') != '' OR COALESCE(b.service_unit, '') != '' THEN 1 ELSE 0 END";
-        } else if (has_launchd_table) {
-            unit_name_expression = "CASE WHEN COALESCE(l.plist_path, '') != '' THEN b.service_id ELSE COALESCE(NULLIF(b.service_unit, ''), '') END";
-            unit_path_expression = "COALESCE(l.plist_path, '')";
-            owns_unit_expression = "CASE WHEN COALESCE(l.plist_path, '') != '' THEN COALESCE(l.owns_plist, 0) WHEN COALESCE(b.service_unit, '') != '' THEN 1 ELSE 0 END";
-        }
-        char *sql = sqlite3_mprintf("SELECT b.service_id, COALESCE(b.display_name, ''), %s, %s, %s FROM backends b %s %s ORDER BY b.service_id;",
-                                    unit_name_expression,
-                                    unit_path_expression,
-                                    owns_unit_expression,
-                                    systemd_join,
-                                    launchd_join);
-        if (!sql) {
-            snprintf(error, error_size, "Out of memory while exporting registry.");
-            ok = false;
-        }
-        if (ok) {
-            ok = registry_binary_append_query(database,
-                                              sql,
-                                              5,
-                                              registry_binary_append_backend_row,
-                                              &pool,
-                                              &variable_region,
-                                              &rows,
-                                              error,
-                                              error_size);
-        }
-        sqlite3_free(sql);
-    }
-    if (ok && descriptors[ORWA_TABLE_FRONTENDS].row_count > 0) {
-        ok = registry_binary_append_query(database,
-                                          "SELECT url, COALESCE(service_id, ''), COALESCE(display_name, ''), COALESCE(port, 0), COALESCE(socket_path, ''), COALESCE(icon_path, ''), COALESCE(list, ''), COALESCE(frontend_id, '') FROM frontends ORDER BY service_id, COALESCE(list, ''), display_name, url;",
-                                          8,
-                                          registry_binary_append_frontend_row,
-                                          &pool,
-                                          &variable_region,
-                                          &rows,
-                                          error,
-                                          error_size);
-    }
-    if (ok && descriptors[ORWA_TABLE_FRONTEND_LAYOUTS].row_count > 0) {
-        ok = registry_binary_append_query(database,
-                                          "SELECT url, COALESCE(list, '') FROM frontend_layouts ORDER BY url;",
-                                          2,
-                                          registry_binary_append_frontend_layout_row,
-                                          &pool,
-                                          &variable_region,
-                                          &rows,
-                                          error,
-                                          error_size);
-    }
-    if (ok && descriptors[ORWA_TABLE_LOG_FILES].row_count > 0) {
-        ok = registry_binary_append_query(database,
-                                          "SELECT path, service_id FROM log_files ORDER BY service_id, path;",
-                                          2,
-                                          registry_binary_append_log_file_row,
-                                          &pool,
-                                          &variable_region,
-                                          &rows,
-                                          error,
-                                          error_size);
-    }
-    if (ok && descriptors[ORWA_TABLE_FILE_OPENERS].row_count > 0) {
-        ok = registry_binary_append_query(database,
-                                          "SELECT extension, frontend_id, COALESCE(url_template, ''), COALESCE(rank, 0), COALESCE(capabilities, 3) FROM file_openers ORDER BY extension, rank, frontend_id;",
-                                          5,
-                                          registry_binary_append_file_opener_row,
-                                          &pool,
-                                          &variable_region,
-                                          &rows,
-                                          error,
-                                          error_size);
-    }
-    uint64_t expected_rows_length = variable_region_offset - ORWA_HEADER_SIZE;
-    if (ok && rows.length != expected_rows_length) {
-        snprintf(error, error_size, "Registry binary row length mismatch.");
-        ok = false;
-    }
-
-    StringBuilder file = {0};
-    if (ok) {
-        ok = sb_append_n(&file, "ORWA", 4) &&
-             binary_append_u32(&file, 1);
-    }
-    for (size_t i = 0; ok && i < ORWA_TABLE_COUNT; i++) {
-        ok = binary_append_u64(&file, descriptors[i].offset) &&
-             binary_append_u64(&file, descriptors[i].row_count) &&
-             binary_append_u32(&file, descriptors[i].row_size);
-    }
-    if (ok && file.length != ORWA_HEADER_SIZE) {
-        snprintf(error, error_size, "Registry binary header length mismatch.");
-        ok = false;
-    }
-    if (ok) {
-        ok = sb_append_n(&file, rows.data ? rows.data : "", rows.length) &&
-             sb_append_n(&file, variable_region.data ? variable_region.data : "", variable_region.length);
-    }
-
-    if (ok) {
-        char output_path[PATH_MAX];
-        ok = registry_binary_output_path(sqlite_path, output_path, sizeof(output_path));
-        if (!ok) {
-            snprintf(error, error_size, "Could not build registry.orwa path.");
-        } else {
-            ok = registry_binary_write_file(output_path, file.data, file.length, error, error_size);
-        }
-    }
-
-    registry_binary_string_pool_free(&pool);
-    free(rows.data);
-    free(variable_region.data);
-    free(file.data);
-    return ok;
-}
-#endif
 
 typedef struct {
     char *service_id;
@@ -5670,12 +3871,6 @@ static bool registry_store_open_at(RegistryStore *store, const char *database_pa
         return false;
     }
     if (writable && !ensure_parent_directory(store->binary_path, error, error_size)) return false;
-    char sqlite_path[PATH_MAX];
-    if (!registry_legacy_sqlite_path(database_path, sqlite_path, sizeof(sqlite_path))) {
-        snprintf(error, error_size, "Registry path is too long.");
-        return false;
-    }
-    if (!migrate_sqlite_registry_to_binary_if_needed(sqlite_path, store->binary_path, error, error_size)) return false;
     if (writable) {
         store->lock_fd = registry_binary_lock(store->binary_path, LOCK_EX, error, error_size);
         if (store->lock_fd < 0) return false;
@@ -6773,7 +4968,6 @@ static bool lookup_launchd_backend_any_for_scope(const char *service_id,
 #define BACKEND_FLAG_CAN_UNINSTALL 0x02u
 #define BACKEND_FLAG_IS_BUNDLED 0x04u
 #define BACKEND_FLAG_IS_INSTALLED 0x08u
-#define BACKEND_FLAG_IS_MIGRATION 0x10u
 #define BACKEND_FLAG_OWNS_LAUNCHD_PLIST 0x20u
 #define BACKEND_FLAG_SUPPORTS_ROOT 0x40u
 #define BACKEND_FLAG_ROOT_ONLY 0x80u
@@ -6785,7 +4979,6 @@ static bool lookup_launchd_backend_any_for_scope(const char *service_id,
 #define ACTION_FLAG_NEEDS_PASSWORD 0x02u
 #define ACTION_FLAG_UPDATE_AVAILABLE 0x04u
 
-static bool root_outershell_migration_pending(void);
 static bool installed_home_screen_version(char *out, size_t out_size);
 static bool fetch_home_screen_available_version(const char *heartbeat, char *out, size_t out_size, char *message, size_t message_size);
 static int compare_versions(const char *installed, const char *available);
@@ -7133,41 +5326,6 @@ static bool append_registered_backend_payloads(const RegistryStore *database,
     return ok;
 }
 
-static bool append_root_migration_backend_payload(BinaryPayloadList *payloads) {
-    if (!root_outershell_migration_pending()) return true;
-    StringBuilder frontends = {0};
-    StringBuilder logs = {0};
-    StringBuilder payload = {0};
-#ifdef __APPLE__
-    const char *path = "/Library/dev.outergroup.OuterLoop";
-#else
-    const char *path = "/var/lib/outershell/outeragent";
-#endif
-    bool ok = build_empty_array_payload(&frontends) &&
-              build_empty_array_payload(&logs) &&
-              build_backend_payload(kMigrationServiceID,
-                                    "Migrate old root services",
-                                    "",
-                                    path,
-                                    "system",
-                                    "pending",
-                                    BACKEND_FLAG_CAN_CONTROL | BACKEND_FLAG_IS_INSTALLED | BACKEND_FLAG_IS_MIGRATION,
-                                    "",
-                                    "",
-                                    "",
-                                    "",
-                                    "",
-                                    "",
-                                    &frontends,
-                                    &logs,
-                                    &payload) &&
-              binary_payload_list_append(payloads, &payload);
-    free(frontends.data);
-    free(logs.data);
-    if (!ok) free(payload.data);
-    return ok;
-}
-
 static bool append_bundled_backend_placeholder_payload(BinaryPayloadList *payloads, const BundledAppDefinition *app) {
     StringBuilder frontends = {0};
     StringBuilder logs = {0};
@@ -7198,57 +5356,6 @@ static bool append_bundled_backend_placeholder_payload(BinaryPayloadList *payloa
     free(logs.data);
     if (!ok) free(payload.data);
     return ok;
-}
-
-static bool file_contains_any_legacy_outershell_text(const char *path) {
-    size_t size = 0;
-    char *contents = read_text_file_alloc(path, &size);
-    (void)size;
-    if (!contents) return false;
-    bool found = strstr(contents, "OUTERAGENT_ROOT") ||
-                 strstr(contents, ".outeragent/outerctl") ||
-                 strstr(contents, ".outerloop/outer-shell/bin/outerctl") ||
-                 strstr(contents, "/var/lib/outergroup/outeragent") ||
-                 strstr(contents, "/var/lib/outershell/outeragent") ||
-                 strstr(contents, "outeragent.log");
-    free(contents);
-    return found;
-}
-
-static bool directory_contains_legacy_outershell_text(const char *directory, bool recursive) {
-    DIR *dir = opendir(directory);
-    if (!dir) return false;
-    bool found = false;
-    struct dirent *entry;
-    while (!found && (entry = readdir(dir)) != NULL) {
-        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
-        char path[PATH_MAX];
-        snprintf(path, sizeof(path), "%s/%s", directory, entry->d_name);
-        struct stat st;
-        if (lstat(path, &st) != 0) continue;
-        if (S_ISDIR(st.st_mode)) {
-            found = recursive && directory_contains_legacy_outershell_text(path, true);
-        } else if (S_ISREG(st.st_mode)) {
-            found = file_contains_any_legacy_outershell_text(path);
-        }
-    }
-    closedir(dir);
-    return found;
-}
-
-static bool root_outershell_migration_pending(void) {
-#ifdef __APPLE__
-    struct stat st;
-    return stat("/Library/dev.outergroup.OuterLoop/registry.sqlite3", &st) == 0 ||
-           stat("/Library/dev.outergroup.OuterLoop", &st) == 0 ||
-           directory_contains_legacy_outershell_text("/Library/LaunchDaemons", false);
-#else
-    struct stat st;
-    return stat("/var/lib/outershell/outeragent/registry.sqlite3", &st) == 0 ||
-           stat("/var/lib/outershell/outeragent", &st) == 0 ||
-           directory_contains_legacy_outershell_text("/opt/outershell", true) ||
-           directory_contains_legacy_outershell_text("/etc/systemd/system", false);
-#endif
 }
 
 static void send_backends_response(int fd) {
@@ -7284,8 +5391,6 @@ static void send_backends_response(int fd) {
                                                        sizeof(bundled_installed) / sizeof(bundled_installed[0]),
                                                        "system");
     }
-    ok = ok && append_root_migration_backend_payload(&payloads);
-
     for (size_t i = 0; ok && i < sizeof(kBundledApps) / sizeof(kBundledApps[0]); i++) {
         if (!bundled_app_is_available_on_platform(&kBundledApps[i])) continue;
         if (bundled_installed[i]) continue;
@@ -7344,10 +5449,10 @@ static bool resolve_log_path_any(const char *service_id, int log_index, char *pa
     return false;
 }
 
-static uint64_t registry_file_state_token(const char *sqlite_path) {
-    uint64_t token = file_state_token(sqlite_path);
+static uint64_t registry_file_state_token(const char *registry_path) {
+    uint64_t token = file_state_token(registry_path);
     char binary_path[PATH_MAX] = "";
-    if (registry_binary_output_path(sqlite_path, binary_path, sizeof(binary_path))) {
+    if (registry_binary_output_path(registry_path, binary_path, sizeof(binary_path))) {
         token = mix_u64(token, file_state_token(binary_path));
     }
     return token;
@@ -7552,21 +5657,8 @@ static bool install_bundled_app_user_launchagent_for_system_payload(const Bundle
                                                                     size_t message_size);
 #endif
 static bool uninstall_backend(const char *service_id, const char *sudo_password, bool *needs_password, char *message, size_t message_size);
-static bool run_root_outershell_migration(const char *sudo_password, bool *needs_password, char *message, size_t message_size);
 
-static bool registry_storage_exists_at(const char *database_path) {
-    struct stat st;
-    if (database_path && database_path[0] && stat(database_path, &st) == 0 && S_ISREG(st.st_mode)) {
-        return true;
-    }
-    char binary_path[PATH_MAX];
-    return database_path &&
-           registry_binary_output_path(database_path, binary_path, sizeof(binary_path)) &&
-           stat(binary_path, &st) == 0 &&
-           S_ISREG(st.st_mode);
-}
-
-static bool frontend_exists_in_registry_at(const char *database_path,
+static bool frontend_exists_in_registry_at(const char *registry_path,
                                            const char *service_id,
                                            const char *frontend_id,
                                            const char *frontend_url,
@@ -7575,7 +5667,7 @@ static bool frontend_exists_in_registry_at(const char *database_path,
                                            size_t error_size) {
     if (found) *found = false;
     RegistryStore database;
-    if (!registry_store_open_at(&database, database_path, false, error, error_size)) return false;
+    if (!registry_store_open_at(&database, registry_path, false, error, error_size)) return false;
     bool use_frontend_id = frontend_id && frontend_id[0];
     for (size_t i = 0; i < database.frontend_count; i++) {
         RegistryFrontendRecord *record = &database.frontends[i];
@@ -7638,16 +5730,17 @@ static bool update_frontend_list_any_registry(const char *service_id,
         }
     }
 
-    if (found) {
-        if (update_frontend_layout_in_user_registry(frontend_id, frontend_url, list_name, error, sizeof(error))) {
-            snprintf(message, message_size, "Updated app list.");
-            return true;
-        }
-        snprintf(message, message_size, "Could not update app layout: %s", error);
+    if (!found) {
+        snprintf(message, message_size, "Frontend was not found.");
         return false;
     }
 
-    snprintf(message, message_size, "Frontend was not found.");
+    if (update_frontend_layout_in_user_registry(frontend_id, frontend_url, list_name, error, sizeof(error))) {
+        snprintf(message, message_size, "Updated app list.");
+        return true;
+    }
+
+    snprintf(message, message_size, "Could not update app layout: %s", error);
     return false;
 }
 
@@ -7696,20 +5789,6 @@ static void send_control_response(int fd, const char *query, const char *body) {
                   message);
         if (ok) mark_backend_event_changed();
         send_action_response(fd, ok ? 200 : 500, ok, message);
-        return;
-    }
-
-    if (strcmp(service_id, kMigrationServiceID) == 0) {
-        if (strcmp(operation, "migrateRoot") != 0 && strcmp(operation, "start") != 0) {
-            send_action_response(fd, 400, false, "Unsupported migration operation.");
-            return;
-        }
-        char message[4096] = "";
-        bool needs_password = false;
-        bool ok = run_root_outershell_migration(sudo_password, &needs_password, message, sizeof(message));
-        log_event("%s root outershell migration: %s", ok ? "Completed" : "Failed", message);
-        if (ok) mark_backend_event_changed();
-        send_action_response_ex(fd, ok ? 200 : (needs_password ? 401 : 500), ok, message, needs_password);
         return;
     }
 
@@ -8062,72 +6141,6 @@ static void send_control_response(int fd, const char *query, const char *body) {
     if (ok) mark_backend_event_changed();
     send_action_response_ex(fd, ok ? 200 : (needs_password ? 401 : 500), ok, message, needs_password);
 }
-
-#ifndef OUTER_SHELL_BACKEND_LIBRARY
-static bool append_replaced_text(StringBuilder *builder, const char *text, const TextReplacement *replacements, size_t replacement_count, bool *changed) {
-    const char *cursor = text ? text : "";
-    while (*cursor) {
-        size_t best_index = replacement_count;
-        size_t best_length = 0;
-        for (size_t i = 0; i < replacement_count; i++) {
-            const char *old_text = replacements[i].old_text;
-            if (!old_text || !old_text[0]) continue;
-            size_t old_length = strlen(old_text);
-            if (strncmp(cursor, old_text, old_length) == 0 && old_length > best_length) {
-                best_index = i;
-                best_length = old_length;
-            }
-        }
-        if (best_index < replacement_count) {
-            if (!sb_append(builder, replacements[best_index].new_text ? replacements[best_index].new_text : "")) return false;
-            cursor += best_length;
-            if (changed) *changed = true;
-        } else {
-            if (!sb_append_n(builder, cursor, 1)) return false;
-            cursor++;
-        }
-    }
-    return true;
-}
-
-static bool rewrite_file_replacing_text(const char *path, const TextReplacement *replacements, size_t replacement_count) {
-    size_t size = 0;
-    char *contents = read_text_file_alloc(path, &size);
-    if (!contents) return false;
-    bool changed = false;
-    StringBuilder builder = {0};
-    bool ok = append_replaced_text(&builder, contents, replacements, replacement_count, &changed);
-    free(contents);
-    if (ok && changed) {
-        char error[512] = "";
-        ok = write_text_file(path, builder.data ? builder.data : "", error, sizeof(error));
-    }
-    free(builder.data);
-    return ok;
-}
-
-static void rewrite_files_in_directory_replacing_text(const char *directory,
-                                                      const TextReplacement *replacements,
-                                                      size_t replacement_count,
-                                                      bool recursive) {
-    DIR *dir = opendir(directory);
-    if (!dir) return;
-    struct dirent *entry;
-    while ((entry = readdir(dir)) != NULL) {
-        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
-        char path[PATH_MAX];
-        snprintf(path, sizeof(path), "%s/%s", directory, entry->d_name);
-        struct stat st;
-        if (lstat(path, &st) != 0) continue;
-        if (S_ISDIR(st.st_mode)) {
-            if (recursive) rewrite_files_in_directory_replacing_text(path, replacements, replacement_count, true);
-        } else if (S_ISREG(st.st_mode)) {
-            (void)rewrite_file_replacing_text(path, replacements, replacement_count);
-        }
-    }
-    closedir(dir);
-}
-#endif
 
 static void home_screen_install_root(char *out, size_t out_size) {
     default_user_home_screen_install_root(out, out_size);
@@ -9031,8 +7044,7 @@ static bool ensure_root_helper_installed(const char *sudo_password, bool *needs_
             "ln -s %s %s\n"
             "systemctl --system daemon-reload\n"
             "systemctl --system enable outershelld.socket >/dev/null 2>&1\n"
-            "systemctl --system start outershelld.socket\n"
-            "OUTERSHELL_HOME=/var/lib/outershell %s --migrate-user-state-only >> /var/log/outershell/outershelld.log 2>&1\n",
+            "systemctl --system start outershelld.socket\n",
             quoted_service_name,
             quoted_socket_name,
             service_name,
@@ -9069,8 +7081,7 @@ static bool ensure_root_helper_installed(const char *sudo_password, bool *needs_
             quoted_system_outershelld,
             quoted_user_outershelld,
             quoted_system_outerctl,
-            quoted_user_outerctl,
-            quoted_system_outershelld);
+            quoted_user_outerctl);
 #else
     (void)owner_uid;
     (void)owner_name;
@@ -9196,7 +7207,6 @@ static bool ensure_root_helper_installed(const char *sudo_password, bool *needs_
             "chmod 0644 %s\n"
             "touch %s\n"
             "chmod 0644 %s\n"
-            "OUTERSHELL_HOME=%s %s --migrate-user-state-only >> %s 2>&1\n"
             "launchctl bootstrap system %s\n"
             "launchctl enable system/org.outershell.outershelld >/dev/null 2>&1 || true\n",
             quoted_system_root,
@@ -9233,9 +7243,6 @@ static bool ensure_root_helper_installed(const char *sudo_password, bool *needs_
             system_api_socket,
             quoted_system_daemon_plist,
             quoted_system_daemon_log,
-            quoted_system_daemon_log,
-            quoted_system_root,
-            quoted_system_outershelld,
             quoted_system_daemon_log,
             quoted_system_daemon_plist);
 #endif
@@ -9339,241 +7346,6 @@ static void write_root_apps_marker_cleanup_shell(FILE *script) {
     fprintf(script, "remove_system_binaries_if_unused\n");
 }
 #endif
-
-static bool run_root_outershell_migration(const char *sudo_password, bool *needs_password, char *message, size_t message_size) {
-    if (needs_password) *needs_password = false;
-    char old_outerctl[PATH_MAX];
-    char old_outer_shell_outerctl[PATH_MAX];
-    char new_outerctl[PATH_MAX];
-    char old_user_apps[PATH_MAX];
-    char new_user_apps[PATH_MAX];
-    legacy_user_outerctl_path(old_outerctl, sizeof(old_outerctl));
-    legacy_outer_shell_outerctl_path(old_outer_shell_outerctl, sizeof(old_outer_shell_outerctl));
-    default_user_outerctl_path(new_outerctl, sizeof(new_outerctl));
-    legacy_user_apps_root(old_user_apps, sizeof(old_user_apps));
-    default_user_outershell_apps_root(new_user_apps, sizeof(new_user_apps));
-
-    const char *legacy_system_root =
-#ifdef __APPLE__
-        "/Library/dev.outergroup.OuterLoop";
-#else
-        "/var/lib/outershell/outeragent";
-#endif
-
-    char legacy_system_apps_root[PATH_MAX];
-    char new_system_apps_root[PATH_MAX];
-#ifdef __APPLE__
-    snprintf(legacy_system_apps_root, sizeof(legacy_system_apps_root), "%s/backends", legacy_system_root);
-#else
-    snprintf(legacy_system_apps_root, sizeof(legacy_system_apps_root), "%s", legacy_system_root);
-#endif
-    snprintf(new_system_apps_root, sizeof(new_system_apps_root), "%s/apps", kSystemOuterShellRoot);
-
-    char quoted_old_outerctl[PATH_MAX + 8];
-    char quoted_old_outer_shell_outerctl[PATH_MAX + 8];
-    char quoted_new_outerctl[PATH_MAX + 8];
-    char quoted_old_user_apps[PATH_MAX + 8];
-    char quoted_new_user_apps[PATH_MAX + 8];
-    char quoted_legacy_system_root[PATH_MAX + 8];
-    char quoted_legacy_system_apps_root[PATH_MAX + 8];
-    char quoted_new_root[PATH_MAX + 8];
-    char quoted_new_system_apps_root[PATH_MAX + 8];
-    shell_quote(old_outerctl, quoted_old_outerctl, sizeof(quoted_old_outerctl));
-    shell_quote(old_outer_shell_outerctl, quoted_old_outer_shell_outerctl, sizeof(quoted_old_outer_shell_outerctl));
-    shell_quote(new_outerctl, quoted_new_outerctl, sizeof(quoted_new_outerctl));
-    shell_quote(old_user_apps, quoted_old_user_apps, sizeof(quoted_old_user_apps));
-    shell_quote(new_user_apps, quoted_new_user_apps, sizeof(quoted_new_user_apps));
-    shell_quote(legacy_system_root, quoted_legacy_system_root, sizeof(quoted_legacy_system_root));
-    shell_quote(legacy_system_apps_root, quoted_legacy_system_apps_root, sizeof(quoted_legacy_system_apps_root));
-    shell_quote(kSystemOuterShellRoot, quoted_new_root, sizeof(quoted_new_root));
-    shell_quote(new_system_apps_root, quoted_new_system_apps_root, sizeof(quoted_new_system_apps_root));
-
-    char script_template[] = "/tmp/outershell-root-migration-XXXXXX";
-    int script_fd = mkstemp(script_template);
-    if (script_fd < 0) {
-        snprintf(message, message_size, "Failed to create privileged migration script: %s", strerror(errno));
-        return false;
-    }
-    FILE *script = fdopen(script_fd, "w");
-    if (!script) {
-        close(script_fd);
-        unlink(script_template);
-        snprintf(message, message_size, "Failed to write privileged migration script: %s", strerror(errno));
-        return false;
-    }
-    fprintf(script,
-            "set -eu\n"
-            "mkdir -p %s\n"
-            "OLD_ROOT=%s\n"
-            "NEW_ROOT=%s\n"
-            "OLD_SYSTEM_APPS=%s\n"
-            "NEW_SYSTEM_APPS=%s\n"
-            "OLD_DB=\"$OLD_ROOT/registry.sqlite3\"\n"
-            "NEW_DB=\"$NEW_ROOT/registry.sqlite3\"\n"
-            "OLD_OUTERCTL=%s\n"
-            "OLD_OUTER_SHELL_OUTERCTL=%s\n"
-            "NEW_OUTERCTL=%s\n"
-            "OLD_USER_APPS=%s\n"
-            "NEW_USER_APPS=%s\n"
-            "mkdir -p \"$NEW_SYSTEM_APPS\"\n"
-            "if [ -d \"$OLD_SYSTEM_APPS\" ]; then\n"
-            "  for child in \"$OLD_SYSTEM_APPS\"/*; do\n"
-            "    [ -e \"$child\" ] || continue\n"
-            "    name=$(basename \"$child\")\n"
-            "    [ \"$name\" != \"dev.outergroup.Top\" ] || continue\n"
-            "    if [ ! -e \"$NEW_SYSTEM_APPS/$name\" ]; then mv \"$child\" \"$NEW_SYSTEM_APPS/$name\"; fi\n"
-            "  done\n"
-            "fi\n"
-            "find \"$NEW_SYSTEM_APPS\" -name outeragent.log -type f -exec sh -c 'for path do mv \"$path\" \"$(dirname \"$path\")/backend.log\" 2>/dev/null || true; done' sh {} + 2>/dev/null || true\n"
-            "export OLD_DB NEW_DB OLD_ROOT NEW_ROOT OLD_SYSTEM_APPS NEW_SYSTEM_APPS OLD_OUTERCTL OLD_OUTER_SHELL_OUTERCTL NEW_OUTERCTL OLD_USER_APPS NEW_USER_APPS\n"
-            "python3 - <<'__OUTERSHELL_ROOT_MIGRATION__'\n"
-            "import os, sqlite3, urllib.parse\n"
-            "old_db = os.environ['OLD_DB']\n"
-            "new_db = os.environ['NEW_DB']\n"
-            "replacements = [\n"
-            "    (os.environ['OLD_OUTERCTL'], os.environ['NEW_OUTERCTL']),\n"
-            "    (os.environ['OLD_OUTER_SHELL_OUTERCTL'], os.environ['NEW_OUTERCTL']),\n"
-            "    (os.environ['OLD_USER_APPS'], os.environ['NEW_USER_APPS']),\n"
-            "    (os.environ['OLD_SYSTEM_APPS'], os.environ['NEW_SYSTEM_APPS']),\n"
-            "    (os.environ['OLD_ROOT'], os.environ['NEW_ROOT']),\n"
-            "    ('OUTERAGENT_ROOT', 'OUTERSHELL_HOME'),\n"
-            "    ('outeragent.log', 'backend.log'),\n"
-            "]\n"
-            "os.makedirs(os.path.dirname(new_db), exist_ok=True)\n"
-            "db = sqlite3.connect(new_db)\n"
-            "db.executescript('''\n"
-            "CREATE TABLE IF NOT EXISTS backends (service_id TEXT PRIMARY KEY, display_name TEXT NOT NULL DEFAULT '', service_unit TEXT);\n"
-            "CREATE TABLE IF NOT EXISTS frontends (url TEXT PRIMARY KEY, service_id TEXT, display_name TEXT NOT NULL DEFAULT '', port INTEGER NOT NULL DEFAULT 0, socket_path TEXT NOT NULL DEFAULT '', icon TEXT, icon_path TEXT, list TEXT);\n"
-            "CREATE INDEX IF NOT EXISTS frontends_service_id_idx ON frontends(service_id);\n"
-            "CREATE TABLE IF NOT EXISTS frontend_layouts (url TEXT PRIMARY KEY, list TEXT NOT NULL DEFAULT '');\n"
-            "CREATE TABLE IF NOT EXISTS log_files (path TEXT PRIMARY KEY, service_id TEXT NOT NULL);\n"
-            "CREATE INDEX IF NOT EXISTS log_files_service_id_idx ON log_files(service_id);\n"
-            "CREATE TABLE IF NOT EXISTS systemd_backends (service_id TEXT PRIMARY KEY, unit_name TEXT NOT NULL, scope TEXT NOT NULL DEFAULT 'user');\n"
-            "CREATE TABLE IF NOT EXISTS launchd_backends (service_id TEXT PRIMARY KEY, plist_path TEXT NOT NULL, owns_plist INTEGER NOT NULL DEFAULT 0);\n"
-            "CREATE TABLE IF NOT EXISTS file_openers (extension TEXT NOT NULL, frontend_id TEXT NOT NULL, url_template TEXT NOT NULL DEFAULT '?file={file}', rank INTEGER NOT NULL DEFAULT 0, capabilities INTEGER NOT NULL DEFAULT 3, PRIMARY KEY(extension, frontend_id));\n"
-            "CREATE INDEX IF NOT EXISTS file_openers_extension_idx ON file_openers(extension, rank, frontend_id);\n"
-            "CREATE INDEX IF NOT EXISTS file_openers_frontend_id_idx ON file_openers(frontend_id);\n"
-            "''')\n"
-            "def open_old_registry(path):\n"
-            "    uri = 'file:' + urllib.parse.quote(path) + '?mode=ro&immutable=1'\n"
-            "    old = sqlite3.connect(uri, uri=True)\n"
-            "    old.row_factory = sqlite3.Row\n"
-            "    return old\n"
-            "def old_columns(old, table):\n"
-            "    try:\n"
-            "        return {row['name'] for row in old.execute(f'PRAGMA table_info({table})')}\n"
-            "    except sqlite3.OperationalError:\n"
-            "        return set()\n"
-            "def old_rows(old, table):\n"
-            "    try:\n"
-            "        return old.execute(f'SELECT * FROM {table}')\n"
-            "    except sqlite3.OperationalError:\n"
-            "        return []\n"
-            "if os.path.exists(old_db):\n"
-            "    old = open_old_registry(old_db)\n"
-            "    try:\n"
-            "        for row in old_rows(old, 'backends'):\n"
-            "            if row['service_id'] == 'dev.outergroup.Top':\n"
-            "                continue\n"
-            "            db.execute('INSERT OR REPLACE INTO backends(service_id, display_name, service_unit) VALUES (?, ?, ?)',\n"
-            "                       (row['service_id'], row['display_name'] if 'display_name' in row.keys() and row['display_name'] is not None else '', row['service_unit'] if 'service_unit' in row.keys() else None))\n"
-            "        for row in old_rows(old, 'frontends'):\n"
-            "            if 'service_id' in row.keys() and row['service_id'] == 'dev.outergroup.Top':\n"
-            "                continue\n"
-            "            icon = row['icon'] if 'icon' in row.keys() and row['icon'] is not None else None\n"
-            "            icon_path = icon if icon and not str(icon).startswith('data:') else None\n"
-            "            display_name = row['display_name'] if 'display_name' in row.keys() and row['display_name'] is not None else (row['name'] if 'name' in row.keys() and row['name'] is not None else '')\n"
-            "            db.execute('INSERT OR REPLACE INTO frontends(url, service_id, display_name, port, socket_path, icon, icon_path, list) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',\n"
-            "                       (row['url'], row['service_id'] if 'service_id' in row.keys() else None, display_name, row['port'] if 'port' in row.keys() and row['port'] is not None else 0, row['socket_path'] if 'socket_path' in row.keys() and row['socket_path'] is not None else '', icon, icon_path, row['list'] if 'list' in row.keys() else None))\n"
-            "            db.execute('INSERT OR REPLACE INTO frontend_layouts(url, list) VALUES (?, ?)',\n"
-            "                       (row['url'], row['list'] if 'list' in row.keys() and row['list'] is not None else ''))\n"
-            "        for row in old_rows(old, 'log_files'):\n"
-            "            if row['service_id'] == 'dev.outergroup.Top':\n"
-            "                continue\n"
-            "            db.execute('INSERT OR REPLACE INTO log_files(path, service_id) VALUES (?, ?)', (row['path'], row['service_id']))\n"
-            "        for row in old_rows(old, 'systemd_backends'):\n"
-            "            if row['service_id'] == 'dev.outergroup.Top':\n"
-            "                continue\n"
-            "            db.execute('INSERT OR REPLACE INTO systemd_backends(service_id, unit_name, scope) VALUES (?, ?, ?)',\n"
-            "                       (row['service_id'], row['unit_name'], row['scope'] if 'scope' in row.keys() and row['scope'] is not None else 'system'))\n"
-            "        for row in old_rows(old, 'launchd_backends'):\n"
-            "            if row['service_id'] == 'dev.outergroup.Top':\n"
-            "                continue\n"
-            "            db.execute('INSERT OR REPLACE INTO launchd_backends(service_id, plist_path, owns_plist) VALUES (?, ?, ?)',\n"
-            "                       (row['service_id'], row['plist_path'], row['owns_plist'] if 'owns_plist' in row.keys() and row['owns_plist'] is not None else 1))\n"
-            "    finally:\n"
-            "        old.close()\n"
-            "for old, new in replacements:\n"
-            "    if not old:\n"
-            "        continue\n"
-            "    for sql in [\n"
-            "        'UPDATE log_files SET path = replace(path, ?, ?)',\n"
-            "        'UPDATE frontends SET url = replace(url, ?, ?), socket_path = replace(socket_path, ?, ?)',\n"
-            "        'UPDATE launchd_backends SET plist_path = replace(plist_path, ?, ?)',\n"
-            "    ]:\n"
-            "        try:\n"
-            "            if sql.count('?') == 2:\n"
-            "                db.execute(sql, (old, new))\n"
-            "            else:\n"
-            "                db.execute(sql, (old, new, old, new))\n"
-            "        except sqlite3.OperationalError:\n"
-            "            pass\n"
-            "db.commit()\n"
-            "db.close()\n"
-            "for root in (os.environ['NEW_SYSTEM_APPS'], '/opt/outershell', '/etc/systemd/system', '/Library/LaunchDaemons'):\n"
-            "    if not os.path.isdir(root):\n"
-            "        continue\n"
-            "    for dirpath, _, filenames in os.walk(root):\n"
-            "        for filename in filenames:\n"
-            "            path = os.path.join(dirpath, filename)\n"
-            "            try:\n"
-            "                with open(path, 'r', encoding='utf-8') as f:\n"
-            "                    text = f.read()\n"
-            "            except (OSError, UnicodeDecodeError):\n"
-            "                continue\n"
-            "            new_text = text\n"
-            "            for old, new in replacements:\n"
-            "                if old:\n"
-            "                    new_text = new_text.replace(old, new)\n"
-            "            if new_text != text:\n"
-            "                with open(path, 'w', encoding='utf-8') as f:\n"
-            "                    f.write(new_text)\n"
-            "__OUTERSHELL_ROOT_MIGRATION__\n"
-            "chmod 0755 \"$NEW_ROOT\" >/dev/null 2>&1 || true\n"
-            "if [ -d \"$OLD_ROOT\" ]; then mv \"$OLD_ROOT\" \"$OLD_ROOT.migrated.$(date +%%s)\" >/dev/null 2>&1 || true; fi\n"
-            "chmod 0644 \"$NEW_DB\" >/dev/null 2>&1 || true\n"
-            "if command -v launchctl >/dev/null 2>&1; then\n"
-            "  for plist in /Library/LaunchDaemons/*.plist; do\n"
-            "    [ -f \"$plist\" ] || continue\n"
-            "    if grep -E -q 'outershell' \"$plist\" 2>/dev/null; then\n"
-            "      label=$(/usr/libexec/PlistBuddy -c 'Print :Label' \"$plist\" 2>/dev/null || true)\n"
-            "      [ -n \"$label\" ] || continue\n"
-            "      launchctl bootout \"system/$label\" >/dev/null 2>&1 || true\n"
-            "      launchctl bootstrap system \"$plist\" >/dev/null 2>&1 || true\n"
-            "      launchctl kickstart -k \"system/$label\" >/dev/null 2>&1 || true\n"
-            "    fi\n"
-            "  done\n"
-            "fi\n"
-            "systemctl --system daemon-reload >/dev/null 2>&1 || true\n",
-            quoted_new_root,
-            quoted_legacy_system_root,
-            quoted_new_root,
-            quoted_legacy_system_apps_root,
-            quoted_new_system_apps_root,
-            quoted_old_outerctl,
-            quoted_old_outer_shell_outerctl,
-            quoted_new_outerctl,
-            quoted_old_user_apps,
-            quoted_new_user_apps);
-    fclose(script);
-    chmod(script_template, 0700);
-    bool ok = run_root_script(script_template, sudo_password, needs_password, message, message_size);
-    unlink(script_template);
-    if (ok) {
-        snprintf(message, message_size, "Migrated old root registry and wrappers.");
-    }
-    return ok;
-}
 
 static void unit_description_text(const char *value, char *out, size_t out_size) {
     size_t offset = 0;
@@ -16086,7 +13858,7 @@ static void run_api_reactor(int api_listener) {
 }
 
 static void outershelld_usage(const char *program) {
-    fprintf(stderr, "Usage: %s [--api-socket-path PATH] [--database PATH] [--system-database PATH] [--bundled-apps-dir DIR] [--public-base-url URL] [--stay-alive] [--migrate-user-state-only]\n", program);
+    fprintf(stderr, "Usage: %s [--api-socket-path PATH] [--database PATH] [--system-database PATH] [--bundled-apps-dir DIR] [--public-base-url URL] [--stay-alive]\n", program);
 }
 
 static void initialize_runtime_paths(char *api_socket_path, size_t api_socket_path_size) {
@@ -16106,7 +13878,6 @@ static void initialize_runtime_paths(char *api_socket_path, size_t api_socket_pa
 int OuterShelldMain(int argc, char **argv) {
     char api_socket_path[PATH_MAX] = "";
     initialize_runtime_paths(api_socket_path, sizeof(api_socket_path));
-    bool migrate_user_state_only = false;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--api-socket-path") == 0 && i + 1 < argc) {
@@ -16123,26 +13894,18 @@ int OuterShelldMain(int argc, char **argv) {
             expand_tilde_path(argv[++i], g_system_registry_database_path, sizeof(g_system_registry_database_path));
         } else if (strcmp(argv[i], "--stay-alive") == 0) {
             g_stay_alive_when_socket_idle = true;
-        } else if (strcmp(argv[i], "--migrate-user-state-only") == 0) {
-            migrate_user_state_only = true;
         } else {
             outershelld_usage(argv[0]);
             return 2;
         }
     }
 
-    if (migrate_user_state_only) {
-        migrate_user_outershell_state();
-        char upgrade_error[512] = "";
-        if (!registry_store_upgrade_current(upgrade_error, sizeof(upgrade_error))) {
-            fprintf(stderr, "Failed to upgrade Outer Shell registry: %s\n",
-                    upgrade_error[0] ? upgrade_error : "unknown error");
-            return 1;
-        }
-        return 0;
+    char upgrade_error[512] = "";
+    if (!registry_store_upgrade_current(upgrade_error, sizeof(upgrade_error))) {
+        fprintf(stderr, "Failed to upgrade Outer Shell registry: %s\n",
+                upgrade_error[0] ? upgrade_error : "unknown error");
+        return 1;
     }
-
-    migrate_user_outershell_state();
 
     signal(SIGINT, handle_shutdown_signal);
     signal(SIGTERM, handle_shutdown_signal);

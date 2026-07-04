@@ -5,7 +5,6 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 RESOURCES_DIR="${REPO_ROOT}/Resources"
-SQLITE_DIR="${RESOURCES_DIR}/ThirdParty/sqlite"
 
 case "$(uname -m)" in
     aarch64|arm64)
@@ -27,8 +26,6 @@ require_file() {
     fi
 }
 
-require_file "${SQLITE_DIR}/sqlite3.c"
-require_file "${SQLITE_DIR}/sqlite3.h"
 require_file "${RESOURCES_DIR}/outerctl.cpp"
 
 install_linux_static_build_deps() {
@@ -282,13 +279,11 @@ done
 OUTPUT_DIR="${REPO_ROOT}/build/linux-package/RemoteLinuxBinaries/${ARCH}"
 mkdir -p "${OUTPUT_DIR}"
 cc -std=gnu17 -Os -ffunction-sections -fdata-sections -flto \
-    -I"${SQLITE_DIR}" \
     -o "${OUTPUT_DIR}/outershelld" \
     "${REPO_ROOT}/Backend/OuterShellBuffer.c" \
     "${REPO_ROOT}/Backend/OuterShellAPI.c" \
     "${REPO_ROOT}/Backend/OuterShellPlatform.c" \
     "${REPO_ROOT}/outershelld/outershelld.c" \
-    "${SQLITE_DIR}/sqlite3.c" \
     -Wl,--gc-sections \
     -ldl -lpthread -lm
 

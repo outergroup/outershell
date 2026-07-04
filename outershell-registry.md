@@ -1,8 +1,6 @@
 # OuterShell Registry Binary Format
 
-This file format is the source of truth for the outershell registry. Older
-`registry.sqlite3` files are read only by migration code, which publishes a
-`registry.orwa` file next to the old database.
+This file format is the source of truth for the outershell registry.
 
 All scalar values are little-endian. Strings are UTF-8 without a trailing NUL.
 Offsets are absolute offsets from byte 0 of the file. A string or data reference
@@ -124,25 +122,6 @@ Row size: 32 bytes.
 bytes 0..15:   StringRef64 path
 bytes 16..31:  StringRef64 service_id
 ```
-
-## Migration From SQLite
-
-The migration/export step reads these SQLite tables:
-
-```text
-backends(service_id, display_name, unit_name, unit_path, owns_unit)
-frontends(url, service_id, display_name, port, socket_path, icon_path, suggested_list, frontend_id)
-frontend_layouts(url, list)
-log_files(path, service_id)
-```
-
-Current migration code also understands older SQLite registries that keep
-systemd and launchd metadata in side tables. Those values are folded into the
-backend row during export. Older backend icon columns are ignored; app/frontend
-icons remain part of the `frontends` table.
-
-Missing optional string values become empty references. Missing boolean values
-become zero.
 
 ## Locking And Atomic Writes
 
