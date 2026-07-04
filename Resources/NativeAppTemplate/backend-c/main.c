@@ -159,20 +159,6 @@ static void serve_file(int fd, const char *path, const char *content_type) {
     free(body);
 }
 
-static void json_escape(char *out, size_t out_size, const char *input) {
-    size_t offset = 0;
-    for (const unsigned char *p = (const unsigned char *)input; *p && offset + 2 < out_size; p++) {
-        if (*p == '"' || *p == '\\') {
-            if (offset + 2 >= out_size) break;
-            out[offset++] = '\\';
-            out[offset++] = (char)*p;
-        } else if (*p >= 0x20) {
-            out[offset++] = (char)*p;
-        }
-    }
-    if (out_size > 0) out[offset < out_size ? offset : out_size - 1] = '\0';
-}
-
 static const char *platform_os(void) {
 #if defined(__APPLE__)
     return "darwin";
@@ -197,40 +183,66 @@ static const char *platform_arch(void) {
 #endif
 }
 
+static void write_u32_le(unsigned char *out, uint32_t value) {
+    out[0] = (unsigned char)(value & 0xff);
+    out[1] = (unsigned char)((value >> 8) & 0xff);
+    out[2] = (unsigned char)((value >> 16) & 0xff);
+    out[3] = (unsigned char)((value >> 24) & 0xff);
+}
+
 static void serve_hello(int fd) {
+    const char *message = "Hello from your C backend!";
     char hostname[256] = "";
-    char escaped_hostname[512] = "";
+    char os[64] = "";
     char now[64] = "";
     time_t t = time(NULL);
     struct tm tm_value;
 
     (void)gethostname(hostname, sizeof(hostname) - 1);
-    json_escape(escaped_hostname, sizeof(escaped_hostname), hostname);
+    snprintf(os, sizeof(os), "%s/%s", platform_os(), platform_arch());
     if (gmtime_r(&t, &tm_value)) {
         strftime(now, sizeof(now), "%Y-%m-%dT%H:%M:%SZ", &tm_value);
     }
 
-    char body[1024];
-    int body_length = snprintf(body,
-                               sizeof(body),
-                               "{\"message\":\"Hello from your C backend!\","
-                               "\"hostname\":\"%s\","
-                               "\"os\":\"%s/%s\","
-                               "\"time\":\"%s\"}\n",
-                               escaped_hostname,
-                               platform_os(),
-                               platform_arch(),
-                               now);
-    if (body_length < 0 || (size_t)body_length >= sizeof(body)) {
+    const char *strings[] = { message, hostname, os, now };
+    uint32_t offsets[4];
+    uint32_t lengths[4];
+    size_t body_length = 32;
+    for (size_t i = 0; i < 4; i++) {
+        size_t length = strlen(strings[i]);
+        if (length > UINT32_MAX || body_length > SIZE_MAX - length) {
+            send_text(fd, 500, "Internal Server Error", "response too large\n");
+            return;
+        }
+        if (body_length > UINT32_MAX) {
+            send_text(fd, 500, "Internal Server Error", "response too large\n");
+            return;
+        }
+        offsets[i] = (uint32_t)body_length;
+        lengths[i] = (uint32_t)length;
+        body_length += length;
+    }
+
+    unsigned char *body = malloc(body_length);
+    if (!body) {
         send_text(fd, 500, "Internal Server Error", "response too large\n");
         return;
     }
+    for (size_t i = 0; i < 4; i++) {
+        write_u32_le(body + (i * 8), offsets[i]);
+        write_u32_le(body + (i * 8) + 4, lengths[i]);
+    }
+    for (size_t i = 0; i < 4; i++) {
+        memcpy(body + offsets[i], strings[i], lengths[i]);
+    }
+
     send_response(fd,
                   200,
                   "OK",
-                  "application/json",
+                  "application/octet-stream",
                   body,
-                  (size_t)body_length);
+                  body_length);
+    free(body);
 }
 
 static const char *origin_form_path(const char *raw_path) {

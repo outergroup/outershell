@@ -4,7 +4,7 @@
 //
 //	GET /                    the .outer descriptor (Content-Type: application/vnd.outerframe)
 //	GET /frontend/<platform> the platform bundle archives (macos-arm, macos-x86)
-//	GET /api/hello           a JSON greeting -- replace this with your app's real API
+//	GET /api/hello           a tiny binary greeting -- replace this with your app's real API
 //
 // It listens on a Unix domain socket by default (--socket), or a TCP port
 // (--port) for local development. Static files are served from --root, which
@@ -12,7 +12,7 @@
 package main
 
 import (
-	"encoding/json"
+	"encoding/binary"
 	"errors"
 	"flag"
 	"fmt"
@@ -134,12 +134,26 @@ func serveFrontend(root string) http.HandlerFunc {
 // tunnel and displays the result. Replace it with your own endpoints.
 func serveHello(w http.ResponseWriter, r *http.Request) {
 	hostname, _ := os.Hostname()
-	response := map[string]any{
-		"message":  "Hello from your backend!",
-		"hostname": hostname,
-		"os":       runtime.GOOS + "/" + runtime.GOARCH,
-		"time":     time.Now().UTC().Format(time.RFC3339),
+	strings := []string{
+		"Hello from your Go backend!",
+		hostname,
+		runtime.GOOS + "/" + runtime.GOARCH,
+		time.Now().UTC().Format(time.RFC3339),
 	}
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(response)
+
+	bodyLength := 32
+	for _, s := range strings {
+		bodyLength += len(s)
+	}
+	body := make([]byte, bodyLength)
+	offset := 32
+	for i, s := range strings {
+		binary.LittleEndian.PutUint32(body[i*8:(i*8)+4], uint32(offset))
+		binary.LittleEndian.PutUint32(body[(i*8)+4:(i*8)+8], uint32(len(s)))
+		copy(body[offset:], s)
+		offset += len(s)
+	}
+
+	w.Header().Set("Content-Type", "application/octet-stream")
+	_, _ = w.Write(body)
 }

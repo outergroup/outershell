@@ -3,6 +3,7 @@
 
 #import <AppKit/AppKit.h>
 #import <CFNetwork/CFNetwork.h>
+#import <stdint.h>
 #import <stdlib.h>
 
 typedef struct {
@@ -66,20 +67,44 @@ static void HelloFullstackApplyProxy(NSURLSessionConfiguration *configuration, c
 }
 
 static NSString *HelloFullstackBackendSubtitleFromData(NSData *data) {
-    if (!data) {
+    if (!data || data.length < 32) {
         return nil;
     }
 
-    NSError *error = nil;
-    id json = [NSJSONSerialization JSONObjectWithData:data options:0 error:&error];
-    if (![json isKindOfClass:NSDictionary.class]) {
-        return nil;
+    const uint8_t *bytes = data.bytes;
+    uint32_t offsets[4] = {0};
+    uint32_t lengths[4] = {0};
+    for (NSUInteger index = 0; index < 4; index++) {
+        NSUInteger record_offset = index * 8;
+        offsets[index] = ((uint32_t)bytes[record_offset]) |
+            ((uint32_t)bytes[record_offset + 1] << 8) |
+            ((uint32_t)bytes[record_offset + 2] << 16) |
+            ((uint32_t)bytes[record_offset + 3] << 24);
+        lengths[index] = ((uint32_t)bytes[record_offset + 4]) |
+            ((uint32_t)bytes[record_offset + 5] << 8) |
+            ((uint32_t)bytes[record_offset + 6] << 16) |
+            ((uint32_t)bytes[record_offset + 7] << 24);
     }
 
-    NSDictionary *object = (NSDictionary *)json;
-    NSString *message = [object[@"message"] isKindOfClass:NSString.class] ? object[@"message"] : nil;
-    NSString *hostname = [object[@"hostname"] isKindOfClass:NSString.class] ? object[@"hostname"] : nil;
-    NSString *os = [object[@"os"] isKindOfClass:NSString.class] ? object[@"os"] : nil;
+    NSMutableArray<NSString *> *strings = [NSMutableArray arrayWithCapacity:4];
+    for (NSUInteger index = 0; index < 4; index++) {
+        uint32_t offset = offsets[index];
+        uint32_t length = lengths[index];
+        if (offset < 32 || offset > data.length || length > data.length - offset) {
+            return nil;
+        }
+        NSString *string = [[NSString alloc] initWithBytes:bytes + offset
+                                                    length:length
+                                                  encoding:NSUTF8StringEncoding];
+        if (!string) {
+            return nil;
+        }
+        [strings addObject:string];
+    }
+
+    NSString *message = strings[0];
+    NSString *hostname = strings[1];
+    NSString *os = strings[2];
     if (!message || !hostname || !os) {
         return nil;
     }

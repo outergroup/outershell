@@ -7,8 +7,8 @@ locally or on a Linux server, serving a native macOS frontend to
 
 The frontend is a CALayer-based macOS bundle generated as Swift or
 Objective-C. The backend is generated as Go or C. It serves the `.outer`
-descriptor, the platform bundle archives, and a small JSON API that the
-Swift frontend calls over the SSH tunnel.
+descriptor, the platform bundle archives, and a small binary API that the
+frontend calls over the SSH tunnel.
 
 ## Requirements
 
@@ -93,8 +93,27 @@ deploy/             systemd unit template + scripts that run on the server
    choose, no port collisions.
 4. When you open the app, Outer Loop fetches `/` (the `.outer` descriptor),
    downloads `/frontend/macos-arm`, and runs the bundle in a sandboxed
-   process. The frontend then calls `/api/hello` through the SOCKS proxy --
+   process. The frontend then calls `/api/hello` through the SOCKS proxy,
    i.e. over the same SSH connection.
+
+## Backend API style
+
+The generated `/api/hello` endpoint intentionally does not use JSON. Outer
+Shell apps usually use small little-endian binary messages so the backend can
+be written in C without bringing in a parser dependency. The endpoint uses
+`Content-Type: application/octet-stream`; the endpoint path identifies the payload
+format. The sample response is:
+
+```
+8 bytes   little-endian uint32 offset, uint32 length for message
+8 bytes   little-endian uint32 offset, uint32 length for hostname
+8 bytes   little-endian uint32 offset, uint32 length for os
+8 bytes   little-endian uint32 offset, uint32 length for time
+N bytes   UTF-8 string data referenced by those records
+```
+
+For your real app, prefer similarly explicit binary records over generic text
+serialization unless a human-editable format is part of the product.
 
 ## Renaming this app
 

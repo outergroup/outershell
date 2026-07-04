@@ -273,7 +273,7 @@ enum NativeAppProjectGenerator {
     private static func patchTemplateFiles(projectURL: URL,
                                            configuration: NativeAppProjectConfiguration) throws {
         let replacements: [(String, String)] = [
-            ("com.example.HelloFullstack.sock", configuration.socketFilename),
+            ("com.example.HelloFullstackSocket", configuration.socketFilename),
             ("com.example.HelloFullstack", configuration.appID),
             ("HelloFullstackContent", "\(configuration.xcodeScheme)Content"),
             ("HelloFullstackHandler", "\(configuration.xcodeScheme)Handler"),

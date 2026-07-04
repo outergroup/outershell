@@ -2158,7 +2158,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                          label: "Socket Filename",
                                          defaultValue: "",
                                          fieldType: "text",
-                                         placeholder: "org.example.HelloWorld.sock",
+                                         placeholder: "org.example.HelloWorld",
                                          suggestions: [],
                                          choices: []),
                        value: createValues["nativeSocketFilename", default: ""],
@@ -4831,7 +4831,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             "nativeBackendLanguage": ("Backend", "Go"),
             "nativeProjectFolder": ("Project Folder", "hello-world"),
             "nativeAppID": ("App ID", "org.example.HelloWorld"),
-            "nativeSocketFilename": ("Socket Filename", "org.example.HelloWorld.sock")
+            "nativeSocketFilename": ("Socket Filename", "org.example.HelloWorld")
         ]
         if let description = nativeLabels[key] {
             return (description.0, createValues[key], description.1.isEmpty ? nil : description.1)
@@ -6314,7 +6314,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             let socket = createValues["nativeSocketFilename", default: ""]
             if socket.isEmpty ||
                 socket == suggestedSocketFilename(fromAppID: appID.isEmpty ? oldSuggestedAppID : appID) ||
-                socket == "\(oldNativeFolder).sock" {
+                socket == "\(oldNativeFolder).sock" ||
+                socket == oldNativeFolder {
                 createValues["nativeSocketFilename"] = suggestedSocketFilename(fromAppID: newAppID)
             }
             if appID.isEmpty || appID == oldSuggestedAppID {
@@ -8730,7 +8731,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
     private func suggestedSocketFilename(fromAppID appID: String) -> String {
         let component = NativeAppProjectGenerator.safePathComponent(appID.trimmingCharacters(in: .whitespacesAndNewlines))
-        return component.isEmpty ? "org.example.OuterframeApp.sock" : "\(component).sock"
+        return component.isEmpty ? "org.example.OuterframeApp" : component
     }
 
     private func suggestedProjectFolderName(from name: String) -> String {

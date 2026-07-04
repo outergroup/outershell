@@ -81,11 +81,56 @@ private final class HelloFullstackHandler: NSObject, OuterframeHostDelegate {
 
     // MARK: - Backend API
 
-    /// The response shape served by `backend/main.go` at `/api/hello`.
-    private struct HelloResponse: Decodable {
+    /// The binary response served by `backend/` at `/api/hello`.
+    ///
+    /// Format:
+    /// - 4 little-endian uint32 offset/length pairs: message, hostname, os, time
+    /// - UTF-8 string bytes referenced by those records
+    private struct HelloResponse {
         let message: String
         let hostname: String
         let os: String
+
+        init(data: Data) throws {
+            struct InvalidHelloResponse: Error {}
+            guard data.count >= 32 else {
+                throw InvalidHelloResponse()
+            }
+
+            var records: [(offset: Int, length: Int)] = []
+            for index in 0..<4 {
+                let recordOffset = index * 8
+                let offset = UInt32(data[recordOffset]) |
+                    (UInt32(data[recordOffset + 1]) << 8) |
+                    (UInt32(data[recordOffset + 2]) << 16) |
+                    (UInt32(data[recordOffset + 3]) << 24)
+                let lengthOffset = recordOffset + 4
+                let length = UInt32(data[lengthOffset]) |
+                    (UInt32(data[lengthOffset + 1]) << 8) |
+                    (UInt32(data[lengthOffset + 2]) << 16) |
+                    (UInt32(data[lengthOffset + 3]) << 24)
+                records.append((Int(offset), Int(length)))
+            }
+
+            var strings: [String] = []
+            for record in records {
+                let offset = record.offset
+                let length = record.length
+                guard offset >= 32,
+                      offset <= data.count,
+                      length <= data.count - offset,
+                      let string = String(data: data[offset..<(offset + length)], encoding: .utf8) else {
+                    throw InvalidHelloResponse()
+                }
+                strings.append(string)
+            }
+            guard strings.count == 4 else {
+                throw InvalidHelloResponse()
+            }
+            message = strings[0]
+            hostname = strings[1]
+            os = strings[2]
+        }
     }
 
     /// Fetches a greeting from this app's own backend. The request goes to the
@@ -110,7 +155,7 @@ private final class HelloFullstackHandler: NSObject, OuterframeHostDelegate {
         Task {
             do {
                 let (data, _) = try await session.data(from: apiURL)
-                let hello = try JSONDecoder().decode(HelloResponse.self, from: data)
+                let hello = try HelloResponse(data: data)
                 self.subtitleLayer.string = "\(hello.message) — \(hello.os) on \(hello.hostname)"
             } catch {
                 self.subtitleLayer.string = "Backend request failed: \(error.localizedDescription)"
