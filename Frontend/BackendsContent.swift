@@ -1673,9 +1673,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private func offsetCreateFormWithoutRerender(deltaY: CGFloat) {
         guard abs(deltaY) > 0.001 else { return }
 
-        for layer in createFormContentLayer.sublayers ?? [] {
-            layer.frame = layer.frame.offsetBy(dx: 0, dy: deltaY)
-        }
+        createFormContentLayer.frame = createFormContentLayer.frame.offsetBy(dx: 0, dy: deltaY)
 
         createSectionFrames = createSectionFrames.map { ($0.frame.offsetBy(dx: 0, dy: deltaY), $0.section) }
         recipeFrames = recipeFrames.map { ($0.frame.offsetBy(dx: 0, dy: deltaY), $0.recipeID) }
@@ -8084,7 +8082,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             let scrollDelta = createScroll - previousCreateScroll
             if abs(scrollDelta) > 0.1 {
                 scrollCurrentModeWithoutRerender(deltaY: scrollDelta)
-                scheduleCreateLayoutUpdate()
             }
         } else {
             updateLayout()
