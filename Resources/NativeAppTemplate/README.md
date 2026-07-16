@@ -12,9 +12,11 @@ frontend calls over the SSH tunnel.
 
 ## Requirements
 
-- **Mac**: Xcode (for the frontend bundle) and Docker Desktop (for the Linux
-  backend build). No Apple ID or signing setup is needed; the bundle builds
-  with code signing disabled.
+- **Mac**: Xcode (for the frontend bundle) and Docker Desktop (for reproducible
+  Linux backend builds). No Apple ID or signing setup is needed; the bundle
+  builds with code signing disabled. If Docker is unavailable, an SSH deploy
+  of a C backend builds on the target instead when `cc` and `make` are
+  installed there; it also uses `strip` when available.
 - **Server**: Linux with systemd and [Outer Shell installed](https://outershell.org/install/).
 - **Outer Loop** on the Mac, with an SSH connection to the server.
 
@@ -50,6 +52,17 @@ Full redeploy after backend changes:
 ./app deploy
 ```
 
+Build every Linux release variant:
+
+```bash
+./app build-matrix
+```
+
+C backends produce glibc and musl binaries for aarch64 and x86_64. glibc uses
+the manylinux2014 (glibc 2.17) baseline and musl uses musllinux 1.2. Go
+backends are built once per architecture because `CGO_ENABLED=0` makes them
+independent of the target libc. Release binaries are stripped.
+
 Watch the backend:
 
 ```bash
@@ -73,7 +86,7 @@ frontend/           Xcode project producing HelloFullstack.bundle
   Frontend/         the app's own code (start here)
   Vendor/           outerframe host plumbing (socket protocol, layer registration)
   Scripts/          generate_outer.py writes the .outer descriptor
-backend/            HTTP server + Dockerfile pinning the backend toolchain
+backend/            HTTP server; Go projects include a pinned toolchain Dockerfile
 deploy/             systemd unit template + scripts that run on the server
 ```
 
@@ -82,7 +95,8 @@ deploy/             systemd unit template + scripts that run on the server
 1. `./app build` compiles the bundle with xcodebuild, thins it per
    architecture, packs each slice as an Apple Archive, writes `app.outer`
    (pointing at `/frontend`), and builds the backend for the selected deploy
-   target.
+   target. For C backends it detects glibc versus musl and uses the matching
+   manylinux2014 or musllinux 1.2 toolchain.
 2. `./app deploy` installs locally when `OUTER_TARGET_KIND=local`. For SSH
    targets, it streams the payload as a tarball over your exact SSH command (no
    scp/rsync assumptions), then streams `deploy/remote-install.sh`, which swaps

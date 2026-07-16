@@ -28,6 +28,96 @@ require_file() {
 
 require_file "${RESOURCES_DIR}/outerctl.cpp"
 
+build_musl_static_resources() {
+    local output_dir="${REPO_ROOT}/build/linux-package/RemoteLinuxBinariesMusl/${ARCH}"
+    local curl_version="${OUTER_SHELL_CURL_VERSION:-8.20.0}"
+    local deps_root="${REPO_ROOT}/build/linux-deps-musl/${ARCH}"
+    local curl_prefix="${deps_root}/curl-${curl_version}-install"
+    local curl_archive="${deps_root}/curl-${curl_version}.tar.gz"
+    local curl_source="${deps_root}/curl-${curl_version}"
+    if [[ ! -f "${curl_prefix}/lib/libcurl.a" || ! -f "${curl_prefix}/include/curl/curl.h" ]]; then
+        mkdir -p "${deps_root}"
+        if [[ ! -f "${curl_archive}" ]]; then
+            echo "==> Downloading curl ${curl_version} for static musl build"
+            wget -q "https://curl.se/download/curl-${curl_version}.tar.gz" -O "${curl_archive}"
+        fi
+        rm -rf "${curl_source}" "${curl_prefix}"
+        tar -xzf "${curl_archive}" -C "${deps_root}"
+        echo "==> Building static curl ${curl_version} for musl ${ARCH}"
+        (
+            cd "${curl_source}"
+            CFLAGS="-Os -ffunction-sections -fdata-sections" \
+            LDFLAGS="-Wl,--gc-sections" \
+            ./configure \
+                --prefix="${curl_prefix}" \
+                --disable-shared --enable-static \
+                --with-openssl=/usr \
+                --without-libpsl --without-libidn2 --without-nghttp2 \
+                --without-brotli --without-zstd \
+                --enable-threaded-resolver \
+                --disable-alt-svc --disable-ftp --disable-file --disable-ipfs \
+                --disable-ldap --disable-ldaps --disable-rtsp --disable-dict \
+                --disable-telnet --disable-tftp --disable-pop3 --disable-imap \
+                --disable-smb --disable-smtp --disable-gopher --disable-mqtt \
+                --disable-websockets --disable-cookies --disable-mime \
+                --disable-form-api --disable-netrc --disable-http-auth \
+                --disable-aws --disable-tls-srp --disable-hsts \
+                --disable-headers-api --disable-libcurl-option \
+                --disable-verbose --disable-progress-meter \
+                --disable-get-easy-options --disable-dateparse --disable-manual
+            make -j"$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2)"
+            make install
+        ) >"${deps_root}/curl-${curl_version}.build.log" 2>&1
+    fi
+    mkdir -p "${output_dir}"
+
+    cc -std=gnu17 -Os -ffunction-sections -fdata-sections -static \
+        -o "${output_dir}/outershelld" \
+        "${REPO_ROOT}/Backend/OuterShellBuffer.c" \
+        "${REPO_ROOT}/Backend/OuterShellAPI.c" \
+        "${REPO_ROOT}/Backend/OuterShellPlatform.c" \
+        "${REPO_ROOT}/outershelld/OuterService.c" \
+        "${REPO_ROOT}/outershelld/outershelld.c" \
+        -Wl,--gc-sections -ldl -lpthread -lm
+
+    cc -std=gnu17 -Os -ffunction-sections -fdata-sections -static \
+        -DOUTER_SHELL_BACKEND_STANDALONE=1 \
+        -DOUTER_SHELL_USE_LIBCURL=1 \
+        -DCURL_STATICLIB \
+        -I"${curl_prefix}/include" \
+        -Wl,--gc-sections \
+        -o "${output_dir}/OuterShellBackend" \
+        "${REPO_ROOT}/Backend/OuterShellBuffer.c" \
+        "${REPO_ROOT}/Backend/OuterShellAPI.c" \
+        "${REPO_ROOT}/Backend/OuterShellPlatform.c" \
+        "${REPO_ROOT}/Backend/OuterShellDownloader.c" \
+        "${REPO_ROOT}/Backend/OuterShellBackend.c" \
+        "${curl_prefix}/lib/libcurl.a" \
+        /usr/lib/libssl.a /usr/lib/libcrypto.a /usr/lib/libz.a \
+        -ldl -lpthread -lm
+
+    c++ -std=c++17 -Os -ffunction-sections -fdata-sections -static \
+        -Wl,--gc-sections \
+        -o "${output_dir}/outerctl" \
+        "${RESOURCES_DIR}/outerctl.cpp"
+
+    if command -v strip >/dev/null 2>&1; then
+        strip --strip-unneeded "${output_dir}/outershelld" || true
+        strip --strip-unneeded "${output_dir}/OuterShellBackend" || true
+        strip --strip-unneeded "${output_dir}/outerctl" || true
+    fi
+    echo "Built static musl Outer Shell Linux resource for ${ARCH}"
+}
+
+if [[ "${OUTER_SHELL_LINUX_LIBC:-glibc}" == "musl" ]]; then
+    if ! command -v wget >/dev/null 2>&1 || [[ ! -f /usr/lib/libssl.a || ! -f /usr/lib/libz.a ]]; then
+        echo "error: musl build requires bash, build-base, openssl-dev, openssl-libs-static, zlib-dev, and zlib-static" >&2
+        exit 1
+    fi
+    build_musl_static_resources
+    exit 0
+fi
+
 install_linux_static_build_deps() {
     if [[ -f /usr/lib64/libz.a ]]; then
         return
@@ -283,6 +373,7 @@ cc -std=gnu17 -Os -ffunction-sections -fdata-sections -flto \
     "${REPO_ROOT}/Backend/OuterShellBuffer.c" \
     "${REPO_ROOT}/Backend/OuterShellAPI.c" \
     "${REPO_ROOT}/Backend/OuterShellPlatform.c" \
+    "${REPO_ROOT}/outershelld/OuterService.c" \
     "${REPO_ROOT}/outershelld/outershelld.c" \
     -Wl,--gc-sections \
     -ldl -lpthread -lm

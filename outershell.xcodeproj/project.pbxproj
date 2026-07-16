@@ -14,6 +14,8 @@
 		37B4F9DF2FA1B00100873894 /* OuterShellAPI.c in Sources */ = {isa = PBXBuildFile; fileRef = 37B4F9E02FA1B00100873894 /* OuterShellAPI.c */; };
 		37B4F9E42FA1B00100873894 /* OuterShellPlatform.c in Sources */ = {isa = PBXBuildFile; fileRef = 37B4F9E22FA1B00100873894 /* OuterShellPlatform.c */; };
 		37B4F9EE2FA1B00100873894 /* OuterShellBackend.c in Sources */ = {isa = PBXBuildFile; fileRef = 37B4F9EC2FA1B00100873894 /* OuterShellBackend.c */; };
+		4F5554455253564300000003 /* OuterService.c in Sources */ = {isa = PBXBuildFile; fileRef = 4F5554455253564300000001 /* OuterService.c */; };
+		4F5554455253564300000004 /* OuterService.c in Sources */ = {isa = PBXBuildFile; fileRef = 4F5554455253564300000001 /* OuterService.c */; };
 		AG0000000000000000000004 /* OuterShellAgent.swift in Sources */ = {isa = PBXBuildFile; fileRef = AG0000000000000000000003 /* OuterShellAgent.swift */; };
 		AG0000000000000000000005 /* outershelld.c in Sources */ = {isa = PBXBuildFile; fileRef = 37B4F9D02FA1B00100873894 /* outershelld.c */; };
 		AG0000000000000000000018 /* OuterShellBuffer.c in Sources */ = {isa = PBXBuildFile; fileRef = 37B4F9DC2FA1B00100873894 /* OuterShellBuffer.c */; };
@@ -58,6 +60,8 @@
 		37B4F9F02FA1B00100873894 /* OuterShellDownloader.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = OuterShellDownloader.h; sourceTree = "<group>"; };
 		37B4F9F12FA1B00100873894 /* OuterShellDownloader.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = OuterShellDownloader.c; sourceTree = "<group>"; };
 		37B4F9F22FA1B00100873894 /* OuterShellDownloaderApple.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = OuterShellDownloaderApple.m; sourceTree = "<group>"; };
+		4F5554455253564300000001 /* OuterService.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = OuterService.c; sourceTree = "<group>"; };
+		4F5554455253564300000002 /* OuterService.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = OuterService.h; sourceTree = "<group>"; };
 		AG0000000000000000000001 /* Outer Shell.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "Outer Shell.app"; sourceTree = BUILT_PRODUCTS_DIR; };
 		AG0000000000000000000003 /* OuterShellAgent.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OuterShellAgent.swift; sourceTree = "<group>"; };
 		AG0000000000000000000023 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
@@ -157,6 +161,8 @@
 		37B4F9EA2FA1B00100873894 /* outershelld */ = {
 			isa = PBXGroup;
 			children = (
+				4F5554455253564300000001 /* OuterService.c */,
+				4F5554455253564300000002 /* OuterService.h */,
 				37B4F9D02FA1B00100873894 /* outershelld.c */,
 			);
 			path = outershelld;
@@ -314,6 +320,7 @@
 				37B4F9DE2FA1B00100873894 /* OuterShellBuffer.c in Sources */,
 				37B4F9DF2FA1B00100873894 /* OuterShellAPI.c in Sources */,
 				37B4F9E42FA1B00100873894 /* OuterShellPlatform.c in Sources */,
+				4F5554455253564300000003 /* OuterService.c in Sources */,
 				37B4F9D12FA1B00100873894 /* outershelld.c in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -328,6 +335,7 @@
 				AG0000000000000000000020 /* OuterShellPlatform.c in Sources */,
 				AG0000000000000000000021 /* OuterShellDownloader.c in Sources */,
 				AG0000000000000000000022 /* OuterShellDownloaderApple.m in Sources */,
+				4F5554455253564300000004 /* OuterService.c in Sources */,
 				AG0000000000000000000005 /* outershelld.c in Sources */,
 				37B4F9EE2FA1B00100873894 /* OuterShellBackend.c in Sources */,
 			);

@@ -25,6 +25,7 @@ if [[ -z "${OUTER_SHELL_VERSION}" ]]; then
 fi
 OUTER_SHELL_CODESIGN_IDENTITY="${OUTER_SHELL_CODESIGN_IDENTITY:-${CODE_SIGN_IDENTITY:--}}"
 OUTER_SHELL_NOTARY_PROFILE="${OUTER_SHELL_NOTARY_PROFILE:-}"
+OUTER_SHELL_PACKAGE_VARIANTS="${OUTER_SHELL_PACKAGE_VARIANTS:-linux-aarch64 linux-x86_64 linux-aarch64-musl linux-x86_64-musl macos-arm64 macos-x86_64}"
 
 if [[ -z "${PUBLIC_BASE_URL}" ]]; then
     echo "error: set PUBLIC_BASE_URL to the public Outer Shell asset base URL" >&2
@@ -39,18 +40,33 @@ require_file() {
     fi
 }
 
-require_file "${PACKAGE_ROOT}/RemoteLinuxBinaries/aarch64/outershelld"
-require_file "${PACKAGE_ROOT}/RemoteLinuxBinaries/x86_64/outershelld"
-require_file "${PACKAGE_ROOT}/RemoteLinuxBinaries/aarch64/OuterShellBackend"
-require_file "${PACKAGE_ROOT}/RemoteLinuxBinaries/x86_64/OuterShellBackend"
-require_file "${PACKAGE_ROOT}/RemoteLinuxBinaries/aarch64/outerctl"
-require_file "${PACKAGE_ROOT}/RemoteLinuxBinaries/x86_64/outerctl"
+wants_variant() {
+    case " ${OUTER_SHELL_PACKAGE_VARIANTS} " in
+        *" $1 "*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 require_file "${RUN_ROOT}/bundles/OuterShell.bundle.macos-arm.aar"
 require_file "${RUN_ROOT}/bundles/OuterShell.bundle.macos-x86.aar"
-require_file "${MACOS_BUILD_ROOT}/Outer Shell.app/Contents/MacOS/Outer Shell"
-require_file "${MACOS_BUILD_ROOT}/outershelld"
 require_file "${REPO_ROOT}/app-icon.png"
 require_file "${REPO_ROOT}/OuterShell.icns"
+for arch in aarch64 x86_64; do
+    if wants_variant "linux-${arch}"; then
+        require_file "${PACKAGE_ROOT}/RemoteLinuxBinaries/${arch}/outershelld"
+        require_file "${PACKAGE_ROOT}/RemoteLinuxBinaries/${arch}/OuterShellBackend"
+        require_file "${PACKAGE_ROOT}/RemoteLinuxBinaries/${arch}/outerctl"
+    fi
+    if wants_variant "linux-${arch}-musl"; then
+        require_file "${PACKAGE_ROOT}/RemoteLinuxBinariesMusl/${arch}/outershelld"
+        require_file "${PACKAGE_ROOT}/RemoteLinuxBinariesMusl/${arch}/OuterShellBackend"
+        require_file "${PACKAGE_ROOT}/RemoteLinuxBinariesMusl/${arch}/outerctl"
+    fi
+done
+if wants_variant macos-arm64 || wants_variant macos-x86_64; then
+    require_file "${MACOS_BUILD_ROOT}/Outer Shell.app/Contents/MacOS/Outer Shell"
+    require_file "${MACOS_BUILD_ROOT}/outershelld"
+fi
 if [[ -n "${APP_CATALOG_PATH}" ]]; then
     require_file "${APP_CATALOG_PATH}"
 fi
@@ -126,6 +142,22 @@ stage_home_screen() {
     tar --format ustar --no-xattrs -C "${STAGING_ROOT}/${package_name}" -czf "${OUTPUT_ROOT}/latest/${package_name}.tar.gz" OuterShell
 }
 
+stage_home_screen_musl() {
+    local arch="$1"
+    local package_name="outer-shell-linux-${arch}-musl"
+    local root="${STAGING_ROOT}/${package_name}/OuterShell"
+    local app_root="${root}/apps/org.outershell.OuterShell"
+    mkdir -p "${root}/tools" "${app_root}/bundles"
+    install -m 0755 "${PACKAGE_ROOT}/RemoteLinuxBinariesMusl/${arch}/outershelld" "${root}/tools/outershelld"
+    install -m 0755 "${PACKAGE_ROOT}/RemoteLinuxBinariesMusl/${arch}/outerctl" "${root}/tools/outerctl"
+    install -m 0755 "${PACKAGE_ROOT}/RemoteLinuxBinariesMusl/${arch}/OuterShellBackend" "${app_root}/OuterShellBackend"
+    install -m 0644 "${REPO_ROOT}/app-icon.png" "${app_root}/app-icon.png"
+    install -m 0644 "${RUN_ROOT}/bundles/OuterShell.bundle.macos-arm.aar" "${app_root}/bundles/OuterShell.bundle.macos-arm.aar"
+    install -m 0644 "${RUN_ROOT}/bundles/OuterShell.bundle.macos-x86.aar" "${app_root}/bundles/OuterShell.bundle.macos-x86.aar"
+    ditto "${REPO_ROOT}/Resources/NativeAppTemplate" "${app_root}/native-app-template"
+    tar --format ustar --no-xattrs -C "${STAGING_ROOT}/${package_name}" -czf "${OUTPUT_ROOT}/latest/${package_name}.tar.gz" OuterShell
+}
+
 stage_home_screen_macos() {
     local package_arch="$1"
     local macho_arch="$2"
@@ -155,10 +187,12 @@ stage_home_screen_macos() {
     notarize_macos_archive_if_requested "${OUTPUT_ROOT}/latest/${package_name}.zip"
 }
 
-stage_home_screen aarch64
-stage_home_screen x86_64
-stage_home_screen_macos arm64 arm64
-stage_home_screen_macos x86_64 x86_64
+wants_variant linux-aarch64 && stage_home_screen aarch64
+wants_variant linux-x86_64 && stage_home_screen x86_64
+wants_variant linux-aarch64-musl && stage_home_screen_musl aarch64
+wants_variant linux-x86_64-musl && stage_home_screen_musl x86_64
+wants_variant macos-arm64 && stage_home_screen_macos arm64 arm64
+wants_variant macos-x86_64 && stage_home_screen_macos x86_64 x86_64
 
 ASSET_VERSION="$(date -u +%Y%m%d%H%M%S)"
 printf '%s\n' "${OUTER_SHELL_VERSION}" > "${OUTPUT_ROOT}/latest/version.txt"
@@ -643,6 +677,82 @@ else
     api_listen_stream="%t/outershelld-api"
 fi
 
+service_manager="${OUTERSHELL_SERVICE_MANAGER:-auto}"
+case "$service_manager" in
+    auto)
+        if command -v systemctl >/dev/null 2>&1 &&
+           [ -d /run/systemd/system ] &&
+           systemctl "$systemctl_scope" show-environment >/dev/null 2>&1; then
+            service_manager=systemd
+        else
+            service_manager=internal
+        fi
+        ;;
+    systemd)
+        if ! command -v systemctl >/dev/null 2>&1 ||
+           [ ! -d /run/systemd/system ] ||
+           ! systemctl "$systemctl_scope" show-environment >/dev/null 2>&1; then
+            echo "OUTERSHELL_SERVICE_MANAGER=systemd was requested, but systemd is not operational for this user." >&2
+            exit 1
+        fi
+        ;;
+    internal)
+        ;;
+    *)
+        echo "OUTERSHELL_SERVICE_MANAGER must be auto, systemd, or internal." >&2
+        exit 1
+        ;;
+esac
+services_dir="$daemon_root/services"
+outer_shell_service_file="$services_dir/org.outershell.OuterShell.outerservice"
+outershelld_pid_path="$daemon_root/outershelld.pid"
+printf 'Outer Shell selected service manager: %s\n' "$service_manager"
+
+stop_internal_service_manager() {
+    [ -f "$outershelld_pid_path" ] || return 0
+    daemon_pid="$(cat "$outershelld_pid_path" 2>/dev/null || true)"
+    case "$daemon_pid" in
+        *[!0-9]*|'')
+            rm -f "$outershelld_pid_path"
+            return 0
+            ;;
+    esac
+    if kill -0 "$daemon_pid" 2>/dev/null; then
+        kill -TERM "$daemon_pid" 2>/dev/null || true
+        attempts=50
+        while [ "$attempts" -gt 0 ] && kill -0 "$daemon_pid" 2>/dev/null; do
+            sleep 0.1
+            attempts=$((attempts - 1))
+        done
+        if kill -0 "$daemon_pid" 2>/dev/null; then
+            kill -KILL "$daemon_pid" 2>/dev/null || true
+        fi
+    fi
+    rm -f "$outershelld_pid_path"
+}
+
+start_internal_service_manager() {
+    stop_internal_service_manager
+    rm -f "$api_socket_path"
+    if command -v setsid >/dev/null 2>&1; then
+        OUTERSHELL_HOME="$outershell_home" OUTER_SHELL_PUBLIC_BASE_URL="$public_base_url" \
+            nohup setsid "$outershelld_path" \
+                --service-manager internal \
+                --services-dir "$services_dir" \
+                --api-socket-path "$api_socket_path" \
+                --stay-alive >>"$broker_log_path" 2>&1 </dev/null &
+    else
+        OUTERSHELL_HOME="$outershell_home" OUTER_SHELL_PUBLIC_BASE_URL="$public_base_url" \
+            nohup "$outershelld_path" \
+                --service-manager internal \
+                --services-dir "$services_dir" \
+                --api-socket-path "$api_socket_path" \
+                --stay-alive >>"$broker_log_path" 2>&1 </dev/null &
+    fi
+    daemon_pid=$!
+    printf '%s\n' "$daemon_pid" > "$outershelld_pid_path"
+}
+
 root_binaries_match=false
 
 current_user_uses_system_binaries() {
@@ -677,7 +787,10 @@ rollback_failed_linux_install() {
         if [ -x "$outerctl_path" ]; then
             run_outerctl backend remove --backend org.outershell.OuterShell >/dev/null 2>&1 || true
         fi
-        if [ "$root_install" = true ]; then
+        if [ "$service_manager" = internal ]; then
+            stop_internal_service_manager
+            rm -f "$outer_shell_service_file" "$socket_path" "$api_socket_path"
+        elif [ "$root_install" = true ]; then
             systemctl --system disable org.outershell.OuterShell.socket >/dev/null 2>&1 || true
             systemctl --system stop org.outershell.OuterShell.socket org.outershell.OuterShell.service >/dev/null 2>&1 || true
             rm -f "$unit_dir/org.outershell.OuterShell.service" "$unit_dir/org.outershell.OuterShell.socket" "$socket_path"
@@ -701,6 +814,7 @@ rollback_failed_linux_install() {
 trap rollback_failed_linux_install EXIT
 
 cleanup_legacy_outeragent_user_units() {
+    [ "$service_manager" = systemd ] || return 0
     [ "$root_install" = false ] || return 0
     mkdir -p "$unit_dir"
     for unit_path in "$unit_dir"/*.service; do
@@ -726,6 +840,7 @@ cleanup_legacy_outeragent_user_units() {
 }
 
 cleanup_legacy_outeragent_system_units() {
+    [ "$service_manager" = systemd ] || return 0
     [ "$root_install" = true ] || return 0
     for unit_path in /etc/systemd/system/*.service; do
         [ -e "$unit_path" ] || continue
@@ -895,7 +1010,9 @@ EOF
 }
 
 if [ "$command" = "uninstall" ]; then
-    if [ "$root_install" = true ]; then
+    if [ "$service_manager" = internal ]; then
+        stop_internal_service_manager
+    elif [ "$root_install" = true ]; then
         systemctl --system disable org.outershell.OuterShell.socket >/dev/null 2>&1 || true
     else
         systemctl --user disable org.outershell.OuterShell.socket outershelld.socket outershelld.service >/dev/null 2>&1 || true
@@ -908,7 +1025,9 @@ if [ "$command" = "uninstall" ]; then
     cat > "$cleanup_script" <<EOF
 #!/bin/sh
 sleep 0.25
-    if [ "$root_install" = true ]; then
+    if [ "$service_manager" = internal ]; then
+        rm -f "$outer_shell_service_file" "$outershelld_pid_path" "$socket_path" "$api_socket_path"
+    elif [ "$root_install" = true ]; then
         systemctl --system stop org.outershell.OuterShell.socket org.outershell.OuterShell.service >/dev/null 2>&1 || true
     else
         systemctl --user stop org.outershell.OuterShell.socket outershelld.socket org.outershell.OuterShell.service outershelld.service >/dev/null 2>&1 || true
@@ -918,7 +1037,9 @@ sleep 0.25
     else
         rm -f "$unit_dir/org.outershell.OuterShell.service" "$unit_dir/outershelld.service" "$unit_dir/outershelld.socket" "$unit_dir/org.outershell.OuterShell.socket" "$socket_path" "$api_socket_path"
     fi
-systemctl $systemctl_scope daemon-reload >/dev/null 2>&1 || true
+if [ "$service_manager" = systemd ]; then
+    systemctl $systemctl_scope daemon-reload >/dev/null 2>&1 || true
+fi
 if [ "$root_install" = true ]; then
     rm -rf "$install_root"
     rm -f "$log_path"
@@ -957,19 +1078,35 @@ EOF
     exit 0
 fi
 
-mkdir -p "$install_root" "$daemon_root" "$outershell_home/bin" "$unit_dir" "$app_log_dir" "$daemon_log_dir"
+mkdir -p "$install_root" "$daemon_root" "$outershell_home/bin" "$app_log_dir" "$daemon_log_dir"
+if [ "$service_manager" = systemd ]; then
+    mkdir -p "$unit_dir"
+else
+    mkdir -p "$services_dir"
+fi
 cleanup_legacy_outeragent_user_units
 cleanup_legacy_outeragent_system_units
 archive_path="$(mktemp)"
 payload_outerctl_path="$(mktemp)"
 payload_root="$(mktemp -d)"
-stage_archive "${public_base_url%/}/latest/outer-shell-linux-${arch}.tar.gz?v=__ASSET_VERSION__" "$archive_path"
+linux_package_name="outer-shell-linux-${arch}"
+if [ -e "/lib/ld-musl-${machine_arch}.so.1" ] ||
+   { command -v ldd >/dev/null 2>&1 && ldd --version 2>&1 | grep -qi musl; }; then
+    linux_package_name="${linux_package_name}-musl"
+fi
+stage_archive "${public_base_url%/}/latest/${linux_package_name}.tar.gz?v=__ASSET_VERSION__" "$archive_path"
 tar -xzf "$archive_path" -C "$payload_root"
 rm -f "$archive_path"
 payload="$payload_root/OuterShell"
 app_payload="$payload/apps/org.outershell.OuterShell"
 rm -rf "$install_root"
-mkdir -p "$install_root/bundles" "$daemon_root" "$outershell_home/bin" "$unit_dir" "$app_log_dir" "$daemon_log_dir"
+mkdir -p "$install_root/bundles" "$daemon_root" "$outershell_home/bin" "$app_log_dir" "$daemon_log_dir"
+if [ "$service_manager" = systemd ]; then
+    mkdir -p "$unit_dir"
+else
+    mkdir -p "$services_dir"
+    stop_internal_service_manager
+fi
 install -m 0755 "$payload/tools/outershelld" "$outershelld_path"
 install -m 0755 "$payload/tools/outerctl" "$payload_outerctl_path"
 install -m 0755 "$app_payload/OuterShellBackend" "$install_root/OuterShellBackend"
@@ -1004,6 +1141,7 @@ touch "$log_path" "$broker_log_path"
 
 outer_shell_exec="$(systemd_quote_arg "$install_root/OuterShellBackend") --socket-path $(systemd_quote_arg "$socket_path") --api-socket-path $(systemd_quote_arg "$api_socket_path") --bundles-dir $(systemd_quote_arg "$install_root/bundles") --bundled-apps-dir $(systemd_quote_arg "$install_root/bundled-apps") --app-base-url $(systemd_quote_arg "$app_base_url") --public-base-url $(systemd_quote_arg "$public_base_url") --native-app-template-dir $(systemd_quote_arg "$install_root/native-app-template")"
 
+if [ "$service_manager" = systemd ]; then
 cat > "$unit_dir/org.outershell.OuterShell.service" <<EOF
 [Unit]
 Description=Outer Shell
@@ -1065,21 +1203,76 @@ StandardError=append:$broker_log_path
 WantedBy=$service_wanted_by
 EOF
 
+else
+cat > "$outer_shell_service_file" <<EOF
+[Service]
+Format=1
+Name=Outer Shell
+Executable=$install_root/OuterShellBackend
+Argument=--socket-path
+Argument=$socket_path
+Argument=--api-socket-path
+Argument=$api_socket_path
+Argument=--bundles-dir
+Argument=$install_root/bundles
+Argument=--bundled-apps-dir
+Argument=$install_root/bundled-apps
+Argument=--app-base-url
+Argument=$app_base_url
+Argument=--public-base-url
+Argument=$public_base_url
+Argument=--native-app-template-dir
+Argument=$install_root/native-app-template
+Environment=OUTERSHELL_HOME=$outershell_home
+Start=socket
+Restart=never
+LogPath=$log_path
+
+[Socket.http]
+Type=unix
+Path=$socket_path
+Mode=0600
+Backlog=64
+EOF
+fi
+
 printf '[%s] %s Outer Shell package %s from %s.\n' "$(timestamp)" "$command" "__OUTER_SHELL_VERSION__" "$public_base_url" >> "$log_path"
 
-if [ "$command" = "install" ]; then
+if [ "$service_manager" = internal ]; then
+    rm -f "$socket_path" "$api_socket_path"
+    start_internal_service_manager
+    attempts=100
+    while [ "$attempts" -gt 0 ]; do
+        if [ -S "$api_socket_path" ]; then
+            break
+        fi
+        sleep 0.1
+        attempts=$((attempts - 1))
+    done
+    if [ ! -S "$api_socket_path" ]; then
+        echo "Internal outershelld did not create $api_socket_path." >&2
+        tail -50 "$broker_log_path" >&2 2>/dev/null || true
+        exit 1
+    fi
+elif [ "$command" = "install" ]; then
     systemctl $systemctl_scope stop org.outershell.OuterShell.service >/dev/null 2>&1 || true
 fi
-systemctl $systemctl_scope daemon-reload
-systemctl $systemctl_scope enable org.outershell.OuterShell.socket outershelld.socket
-systemctl $systemctl_scope stop org.outershell.OuterShell.socket outershelld.socket >/dev/null 2>&1 || true
-systemctl $systemctl_scope stop org.outershell.OuterShell.service outershelld.service >/dev/null 2>&1 || true
-systemctl $systemctl_scope reset-failed org.outershell.OuterShell.socket outershelld.socket org.outershell.OuterShell.service outershelld.service >/dev/null 2>&1 || true
-rm -f "$socket_path" "$api_socket_path"
-systemctl $systemctl_scope start outershelld.socket
-systemctl $systemctl_scope start org.outershell.OuterShell.socket
+if [ "$service_manager" = systemd ]; then
+    systemctl $systemctl_scope daemon-reload
+    systemctl $systemctl_scope enable org.outershell.OuterShell.socket outershelld.socket
+    systemctl $systemctl_scope stop org.outershell.OuterShell.socket outershelld.socket >/dev/null 2>&1 || true
+    systemctl $systemctl_scope stop org.outershell.OuterShell.service outershelld.service >/dev/null 2>&1 || true
+    systemctl $systemctl_scope reset-failed org.outershell.OuterShell.socket outershelld.socket org.outershell.OuterShell.service outershelld.service >/dev/null 2>&1 || true
+    rm -f "$socket_path" "$api_socket_path"
+    systemctl $systemctl_scope start outershelld.socket
+    systemctl $systemctl_scope start org.outershell.OuterShell.socket
+fi
 
-run_outerctl backend upsert --backend org.outershell.OuterShell --name "Outer Shell" --systemd-unit org.outershell.OuterShell.service
+if [ "$service_manager" = internal ]; then
+    run_outerctl backend upsert --backend org.outershell.OuterShell --name "Outer Shell" --service-file "$outer_shell_service_file" --outershell-owns true
+else
+    run_outerctl backend upsert --backend org.outershell.OuterShell --name "Outer Shell" --systemd-unit org.outershell.OuterShell.service
+fi
 run_outerctl app remove --backend org.outershell.OuterShell --frontend-id org.outershell.OuterShell:main
 run_outerctl app upsert --backend org.outershell.OuterShell --socket-path "$socket_path" --name "Outer Shell" --url "/" --icon-path "$install_root/app-icon.png"
 if [ "$root_install" = true ]; then
@@ -1091,7 +1284,11 @@ run_outerctl log remove --backend org.outershell.OuterShell --path "$log_path"
 run_outerctl log add --backend org.outershell.OuterShell --path "$log_path"
 
 if [ "$command" = "update" ]; then
-    printf 'Outer Shell updated to %s. The new version will run the next time Outer Shell starts.\n' "__OUTER_SHELL_VERSION__"
+    if [ "$service_manager" = internal ]; then
+        printf 'Outer Shell updated to %s and restarted.\n' "__OUTER_SHELL_VERSION__"
+    else
+        printf 'Outer Shell updated to %s. The new version will run the next time Outer Shell starts.\n' "__OUTER_SHELL_VERSION__"
+    fi
     exit 0
 fi
 

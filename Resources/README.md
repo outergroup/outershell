@@ -4,6 +4,8 @@ Outer Shell is packaged as a small installer plus platform-specific native
 archives. The public repository only defines the generic asset shape; any
 site-specific publishing belongs in a separate deployment repository.
 
+`NativeAppTemplate/` is the only generated app template.
+
 ## Expected Payloads
 
 Each Outer Shell archive expands to:
@@ -48,6 +50,9 @@ expands to:
   RemoteLinuxBinaries/
     aarch64/<BackendBinary>
     x86_64/<BackendBinary>
+  RemoteLinuxBinariesMusl/
+    aarch64/<BackendBinary>
+    x86_64/<BackendBinary>
   bundles/                        # Linux/SSH payload resources
     <ContentName>.bundle.macos-arm.aar
     <ContentName>.bundle.macos-x86.aar
@@ -70,6 +75,8 @@ The script writes binaries to:
 ```text
 build/linux-package/RemoteLinuxBinaries/<arch>/outershelld
 build/linux-package/RemoteLinuxBinaries/<arch>/outerctl
+build/linux-package/RemoteLinuxBinariesMusl/<arch>/outershelld
+build/linux-package/RemoteLinuxBinariesMusl/<arch>/outerctl
 ```
 
 `outerctl` lives in this repository under:

@@ -42,6 +42,7 @@ Resources/RemoteLinuxBinaries/
 .env
 .env.*
 !.env.example
+target.env
 
 # SwiftPM/editor scratch
 .swiftpm/

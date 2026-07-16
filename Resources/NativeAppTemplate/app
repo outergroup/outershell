@@ -17,6 +17,7 @@ BACKEND_EXECUTABLE_NAME="${BACKEND_EXECUTABLE_NAME:-${XCODE_SCHEME}Backend}"
 BUILD_DIR="${ROOT}/build"
 PAYLOAD_DIR="${BUILD_DIR}/payload"
 DERIVED_DATA_DIR="${BUILD_DIR}/DerivedData"
+LINUX_MATRIX_DIR="${BUILD_DIR}/linux-matrix"
 LOCAL_PORT="${LOCAL_PORT:-8787}"
 
 # Server-side locations. Must agree with deploy/app.service.in and the
@@ -39,6 +40,9 @@ REMOTE_APP_DIR=".local/share/outershell-apps/${APP_ID}"   # relative to \$HOME
 
 TARGET_KIND="ssh"
 SSH_BASE=()
+TARGET_OS=""
+TARGET_ARCH=""
+TARGET_LIBC=""
 
 load_target() {
     if [[ ! -f "${ROOT}/target.env" ]]; then
@@ -102,18 +106,37 @@ shell_quote() {
     printf "'%s'" "${value//\'/\'\\\'\'}"
 }
 
-# Ask the server for its architecture so the backend build targets the right
-# one. Cached per build; ControlMaster makes repeat probes free anyway.
-probe_goarch() {
-    local machine
-    machine="$(run_ssh uname -m </dev/null)"
-    case "${machine}" in
-        x86_64)          echo amd64 ;;
-        aarch64|arm64)   echo arm64 ;;
+# Ask the server for the Linux ABI so a C backend is built for both the target
+# architecture and its native libc. Go backends are libc-independent, but use
+# the same architecture probe.
+probe_linux_target() {
+    load_target
+    TARGET_OS="$(run_ssh uname -s </dev/null)"
+    TARGET_ARCH="$(run_ssh uname -m </dev/null)"
+    if [[ "${TARGET_OS}" != "Linux" ]]; then
+        echo "error: SSH deploy targets must run Linux" >&2
+        exit 1
+    fi
+    case "${TARGET_ARCH}" in
+        x86_64|amd64) TARGET_ARCH=x86_64 ;;
+        aarch64|arm64) TARGET_ARCH=aarch64 ;;
         *)
-            echo "error: unsupported server architecture '${machine}'" >&2
+            echo "error: unsupported server architecture '${TARGET_ARCH}'" >&2
             exit 1
             ;;
+    esac
+    if run_ssh 'test -e "/lib/ld-musl-$(uname -m).so.1" || (command -v ldd >/dev/null 2>&1 && ldd --version 2>&1 | grep -qi musl)' </dev/null; then
+        TARGET_LIBC=musl
+    else
+        TARGET_LIBC=glibc
+    fi
+}
+
+linux_arch_to_goarch() {
+    case "$1" in
+        x86_64) echo amd64 ;;
+        aarch64) echo arm64 ;;
+        *) echo "error: unsupported Linux architecture '$1'" >&2; exit 1 ;;
     esac
 }
 
@@ -232,7 +255,7 @@ cmd_build_frontend() {
 }
 
 # ---------------------------------------------------------------------------
-# Backend build (Linux static binary, via Docker Desktop)
+# Backend build
 # ---------------------------------------------------------------------------
 
 DOCKER_IMAGE_TAG="app-backend-toolchain-$(printf '%s' "${APP_ID}" \
@@ -262,33 +285,64 @@ backend_build_go_in_docker() {
         go build -trimpath -ldflags="-s -w" -o "/out/$(basename "${output}")" .
 }
 
-backend_build_c_in_docker() {
-    local target_arch="$1"
-    local output="$2"
-    local cc
+linux_backend_image() {
+    local libc="$1" arch="$2"
+    if [[ "${libc}" == musl ]]; then
+        printf 'quay.io/pypa/musllinux_1_2_%s\n' "${arch}"
+    else
+        printf 'quay.io/pypa/manylinux2014_%s\n' "${arch}"
+    fi
+}
 
-    case "${target_arch}" in
-        amd64) cc=x86_64-linux-gnu-gcc ;;
-        arm64) cc=aarch64-linux-gnu-gcc ;;
-        *)
-            echo "error: unsupported C backend architecture '${target_arch}'" >&2
-            exit 1
-            ;;
-    esac
+linux_backend_platform() {
+    [[ "$1" == aarch64 ]] && printf 'linux/arm64\n' || printf 'linux/amd64\n'
+}
 
+linux_matrix_output() {
+    local libc="$1" arch="$2"
+    if [[ "${libc}" == musl ]]; then
+        printf '%s/RemoteLinuxBinariesMusl/%s/%s\n' "${LINUX_MATRIX_DIR}" "${arch}" "${BACKEND_EXECUTABLE_NAME}"
+    else
+        printf '%s/RemoteLinuxBinaries/%s/%s\n' "${LINUX_MATRIX_DIR}" "${arch}" "${BACKEND_EXECUTABLE_NAME}"
+    fi
+}
+
+backend_build_c_linux_in_docker() {
+    local libc="$1" arch="$2" output="$3"
+    local image platform
+    image="$(linux_backend_image "${libc}" "${arch}")"
+    platform="$(linux_backend_platform "${arch}")"
     require_tool docker
     mkdir -p "$(dirname "${output}")"
 
-    docker build -q -t "${DOCKER_IMAGE_TAG}" "${ROOT}/backend" >/dev/null
-
-    docker run --rm \
-        -v "${ROOT}/backend":/src \
-        -v "$(dirname "${output}")":/out \
+    echo "==> Building C backend for Linux/${arch}/${libc}"
+    docker run --rm --platform "${platform}" \
+        -v "${ROOT}/backend:/src:ro" \
+        -v "$(dirname "${output}"):/out" \
         -w /src \
-        -e CC="${cc}" \
-        -e OUTPUT="/out/$(basename "${output}")" \
-        "${DOCKER_IMAGE_TAG}" \
-        make
+        -e CC=gcc \
+        -e "OUTPUT=/out/$(basename "${output}")" \
+        "${image}" \
+        bash -lc 'make LDFLAGS= && strip --strip-unneeded "$OUTPUT"'
+}
+
+backend_build_c_on_target() {
+    local output="$1"
+    local remote_build=".cache/outershell-app-build/${APP_ID}"
+    echo "==> Docker is unavailable; building C backend on the ${TARGET_ARCH}/${TARGET_LIBC} target"
+    COPYFILE_DISABLE=1 tar czf - -C "${ROOT}" backend | run_ssh "
+        set -e
+        rm -rf \"\$HOME/${remote_build}\"
+        mkdir -p \"\$HOME/${remote_build}\"
+        tar xzf - -C \"\$HOME/${remote_build}\"
+        make -C \"\$HOME/${remote_build}/backend\" OUTPUT=\"\$HOME/${remote_build}/${BACKEND_EXECUTABLE_NAME}\" LDFLAGS=
+        if command -v strip >/dev/null 2>&1; then
+            strip --strip-unneeded \"\$HOME/${remote_build}/${BACKEND_EXECUTABLE_NAME}\"
+        fi
+    "
+    mkdir -p "$(dirname "${output}")"
+    run_ssh "cat \"\$HOME/${remote_build}/${BACKEND_EXECUTABLE_NAME}\"" > "${output}"
+    chmod 0755 "${output}"
 }
 
 cmd_build_backend() {
@@ -323,21 +377,56 @@ cmd_build_backend() {
         return
     fi
 
-    local goarch
-    goarch="$(probe_goarch)"
-    echo "==> Building ${BACKEND_LANGUAGE} backend for linux/${goarch} (via Docker)"
+    probe_linux_target
     case "${BACKEND_LANGUAGE}" in
         go)
+            local goarch
+            goarch="$(linux_arch_to_goarch "${TARGET_ARCH}")"
+            echo "==> Building Go backend for Linux/${TARGET_ARCH}"
             backend_build_go_in_docker linux "${goarch}" "${PAYLOAD_DIR}/${BACKEND_EXECUTABLE_NAME}"
             ;;
         c)
-            backend_build_c_in_docker "${goarch}" "${PAYLOAD_DIR}/${BACKEND_EXECUTABLE_NAME}"
+            if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+                backend_build_c_linux_in_docker "${TARGET_LIBC}" "${TARGET_ARCH}" "${PAYLOAD_DIR}/${BACKEND_EXECUTABLE_NAME}"
+            else
+                backend_build_c_on_target "${PAYLOAD_DIR}/${BACKEND_EXECUTABLE_NAME}"
+            fi
             ;;
         *)
             echo "error: unsupported BACKEND_LANGUAGE '${BACKEND_LANGUAGE}'" >&2
             exit 1
             ;;
     esac
+}
+
+cmd_build_matrix() {
+    require_tool docker
+    docker info >/dev/null
+    rm -rf "${LINUX_MATRIX_DIR}"
+    local arch libc output goarch
+    case "${BACKEND_LANGUAGE}" in
+        go)
+            for arch in aarch64 x86_64; do
+                goarch="$(linux_arch_to_goarch "${arch}")"
+                output="$(linux_matrix_output glibc "${arch}")"
+                echo "==> Building libc-independent Go backend for Linux/${arch}"
+                backend_build_go_in_docker linux "${goarch}" "${output}"
+            done
+            ;;
+        c)
+            for libc in glibc musl; do
+                for arch in aarch64 x86_64; do
+                    output="$(linux_matrix_output "${libc}" "${arch}")"
+                    backend_build_c_linux_in_docker "${libc}" "${arch}" "${output}"
+                done
+            done
+            ;;
+        *)
+            echo "error: unsupported BACKEND_LANGUAGE '${BACKEND_LANGUAGE}'" >&2
+            exit 1
+            ;;
+    esac
+    echo "==> Linux backend variants ready at ${LINUX_MATRIX_DIR}"
 }
 
 # ---------------------------------------------------------------------------
@@ -684,6 +773,7 @@ ${APP_NAME} -- outerframe app tasks
   ./app target local       set localhost as the deploy target
   ./app target "ssh ..."   set an SSH deploy target (writes target.env)
   ./app build              build frontend + backend + payload
+  ./app build-matrix       build Linux release variants (C: libc + arch; Go: arch)
   ./app deploy             build, upload, install, and register on the server
   ./app push-frontend      update only the frontend on the server (fast)
   ./app run-local          run the app locally; open the printed URL in Outer Loop
@@ -707,6 +797,7 @@ case "${command}" in
     build)           cmd_build ;;
     build-frontend)  cmd_build_frontend ;;
     build-backend)   cmd_build_backend ;;
+    build-matrix)    cmd_build_matrix ;;
     deploy)          cmd_deploy ;;
     push-frontend)   cmd_push_frontend ;;
     run-local)       cmd_run_local ;;

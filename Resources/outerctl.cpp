@@ -352,6 +352,7 @@ enum : uint16_t {
     kMessageOpenerUpsertRequest = 22,
     kMessageOpenerRemoveRequest = 23,
     kMessageOpenerListRequest = 24,
+    kMessageBundledAppControlRequest = 27,
     kMessageCommandResponse = 100,
     kMessageBackendListResponse = 101,
     kMessageAppListResponse = 102,
@@ -362,7 +363,8 @@ enum : uint16_t {
 
 enum : uint16_t {
     kFlagOwnsServiceManagerEntry = 0x01,
-    kFlagIncludeIcons = 0x02
+    kFlagIncludeIcons = 0x02,
+    kFlagOuterServiceEntry = 0x04
 };
 
 enum : uint16_t {
@@ -403,6 +405,11 @@ struct CommandRequest {
     const char *extensions = "";
     const char *mimeTypes = "";
     const char *urlTemplate = "";
+    const char *action = "";
+    const char *scope = "";
+    const char *stageRoot = "";
+    const char *sudoPassword = "";
+    bool readSudoPasswordFromStdin = false;
 };
 
 bool parseUInt32(const char *raw, uint32_t maxValue, uint32_t &out) {
@@ -588,6 +595,12 @@ bool mapCommand(const char *resource, const char *action, uint16_t &messageType)
         else if (strcmp(action, "remove") == 0) messageType = kMessageOpenerRemoveRequest;
         else if (strcmp(action, "list") == 0) messageType = kMessageOpenerListRequest;
         else return false;
+    } else if (strcmp(resource, "bundled-app") == 0) {
+        if (strcmp(action, "install") == 0 || strcmp(action, "uninstall") == 0) {
+            messageType = kMessageBundledAppControlRequest;
+        } else {
+            return false;
+        }
     } else {
         return false;
     }
@@ -603,6 +616,7 @@ bool parseCommandRequest(int argc, char *argv[], CommandRequest &request, Buffer
         assignCString(errorMessage, "Unknown outerctl command.");
         return false;
     }
+    request.action = argv[2];
 
     for (int i = 3; i < argc; i += 1) {
         const char *arg = argv[i];
@@ -631,6 +645,14 @@ bool parseCommandRequest(int argc, char *argv[], CommandRequest &request, Buffer
             }
             REQUIRE_VALUE("--unit", request.serviceManagerPath);
             request.hasServiceManagerPath = true;
+        } else if (strcmp(arg, "--service-file") == 0 || strcmp(arg, "--outerservice") == 0) {
+            if (request.hasServiceManagerPath) {
+                assignCString(errorMessage, "Specify only one service-manager value.");
+                return false;
+            }
+            REQUIRE_VALUE("--service-file", request.serviceManagerPath);
+            request.hasServiceManagerPath = true;
+            request.flags |= kFlagOuterServiceEntry;
         } else if (strcmp(arg, "--path") == 0) {
             if (strcmp(argv[1], "app") == 0) {
                 REQUIRE_VALUE("--path", request.path);
@@ -699,6 +721,16 @@ bool parseCommandRequest(int argc, char *argv[], CommandRequest &request, Buffer
             if (truthy(raw)) request.flags |= kFlagOwnsServiceManagerEntry;
         } else if (strcmp(arg, "--icons") == 0) {
             request.flags |= kFlagIncludeIcons;
+        } else if (strcmp(arg, "--scope") == 0) {
+            REQUIRE_VALUE("--scope", request.scope);
+            if (strcmp(request.scope, "user") != 0 && strcmp(request.scope, "system") != 0) {
+                assignCString(errorMessage, "Invalid bundled-app scope; use user or system.");
+                return false;
+            }
+        } else if (strcmp(arg, "--stage-root") == 0) {
+            REQUIRE_VALUE("--stage-root", request.stageRoot);
+        } else if (strcmp(arg, "--sudo-password-stdin") == 0) {
+            request.readSudoPasswordFromStdin = true;
         } else {
             errorMessage.size = 0;
             if (errorMessage.data) errorMessage.data[0] = '\0';
@@ -707,6 +739,17 @@ bool parseCommandRequest(int argc, char *argv[], CommandRequest &request, Buffer
             return false;
         }
 #undef REQUIRE_VALUE
+    }
+    if (request.messageType == kMessageBundledAppControlRequest) {
+        if (!request.backend[0]) {
+            assignCString(errorMessage, "Missing bundled-app backend identifier.");
+            return false;
+        }
+        if (!request.scope[0]) request.scope = "user";
+        if (strcmp(request.action, "install") == 0 && !request.stageRoot[0]) {
+            assignCString(errorMessage, "Missing --stage-root for bundled-app install.");
+            return false;
+        }
     }
     return true;
 }
@@ -787,6 +830,11 @@ bool appendCommandRequestMessage(Buffer &message, const CommandRequest &request)
     case kMessageOpenerListRequest: {
         const char *values[] = {request.backend, request.frontendId, request.contentType};
         ok = ok && appendStringRefs(message, values, 3);
+        break;
+    }
+    case kMessageBundledAppControlRequest: {
+        const char *values[] = {request.action, request.backend, request.scope, request.stageRoot, request.sudoPassword};
+        ok = ok && appendStringRefs(message, values, 5);
         break;
     }
     default:
@@ -1089,6 +1137,16 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "%s\n", apiError.data ? apiError.data : "Invalid outerctl command.");
         freeBuffer(apiError);
         return 1;
+    }
+    char sudoPassword[1024] = "";
+    if (request.readSudoPasswordFromStdin) {
+        if (!fgets(sudoPassword, sizeof(sudoPassword), stdin)) {
+            fprintf(stderr, "Failed to read sudo password from stdin.\n");
+            freeBuffer(apiError);
+            return 1;
+        }
+        sudoPassword[strcspn(sudoPassword, "\r\n")] = '\0';
+        request.sudoPassword = sudoPassword;
     }
     Buffer endpointHost;
     Buffer endpointPath;

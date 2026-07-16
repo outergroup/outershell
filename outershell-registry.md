@@ -2,6 +2,8 @@
 
 This file format is the source of truth for the outershell registry.
 
+The backend `unit_path` field can contain either a launchd plist path or a portable `.outerservice` path. A `.outerservice` suffix selects `outershelld`'s internal manager; `unit_name` remains empty. This preserves the registry row layout. See [outerservice.md](outerservice.md).
+
 All scalar values are little-endian. Strings are UTF-8 without a trailing NUL.
 Offsets are absolute offsets from byte 0 of the file. A string or data reference
 with `offset = 0` and `length = 0` means the value is absent or empty.

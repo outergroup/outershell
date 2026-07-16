@@ -5,6 +5,8 @@ Each `outerctl <resource> <action>` command maps to one dedicated structured
 binary request message. Tools can call the same socket messages directly when a
 command-line process would be unnecessary overhead.
 
+For backend upserts, flags bit `0x04` means the service-manager path is a portable `.outerservice` file. `outerctl backend upsert --service-file PATH` sets this bit. Without it, the path retains the platform-specific launchd/systemd interpretation. See [outerservice.md](outerservice.md).
+
 The socket API is intended for fast local control. A client sends a
 length-prefixed frame to the `outershelld` API socket, and `outershelld` returns
 a structured binary response. `outerctl` is only a convenient CLI wrapper
@@ -35,7 +37,7 @@ Every message begins with:
 bytes 0..1: UInt16 messageType
 ```
 
-Request message types are allocated contiguously from `10` through `26`.
+Request message types are allocated contiguously from `10` through `27`.
 Dedicated responses are allocated contiguously from `100` through `107`.
 
 Strings are encoded as offset-based references into the same message:
@@ -595,6 +597,45 @@ bytes 28..31:  UInt32 capability flags
 
 `outerctl` prints these rows as TSV columns `content_type`, `frontend_id`,
 `url_template`, `rank`, and `capabilities`.
+
+## Bundled App Deployment
+
+Official bundled-app repositories can install a locally built staging payload
+through the same platform installer used by the Outer Shell UI:
+
+```bash
+outerctl bundled-app install \
+  --backend org.outershell.Top \
+  --scope user \
+  --stage-root /path/to/Top
+
+outerctl bundled-app uninstall \
+  --backend org.outershell.Top \
+  --scope user
+```
+
+Use `--scope system` for a root-capable installation. When the current user
+needs to authorize that operation, pipe the administrator password to
+`--sudo-password-stdin`. The password is carried only in the local socket
+request and is not persisted.
+
+On Linux, the installer chooses
+`RemoteLinuxBinaries/<arch>/<BackendBinary>` on glibc systems and
+`RemoteLinuxBinariesMusl/<arch>/<BackendBinary>` on musl systems. Published app
+archives therefore use the platform names `linux-aarch64`, `linux-x86_64`,
+`linux-aarch64-musl`, and `linux-x86_64-musl`.
+
+Socket message: `bundledAppControlRequest` (`messageType = 27`)
+
+```text
+bytes 2..9:    StringRef32 action, install or uninstall
+bytes 10..17:  StringRef32 backend service id
+bytes 18..25:  StringRef32 scope, user or system
+bytes 26..33:  StringRef32 staging root, required for install
+bytes 34..41:  StringRef32 administrator password, optional
+```
+
+Response: `commandResponse` (`messageType = 100`).
 
 ## Querying File Openers Directly
 

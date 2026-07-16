@@ -38,6 +38,7 @@
 #include "../Backend/OuterShellBuffer.h"
 #include "../Backend/OuterShellPlatform.h"
 #include "../Resources/OuterShellPaths.h"
+#include "OuterService.h"
 
 #ifdef __APPLE__
 #include <mach-o/dyld.h>
@@ -890,6 +891,9 @@ static volatile sig_atomic_t g_listener_fd = -1;
 static volatile sig_atomic_t g_api_listener_fd = -1;
 static int g_registry_write_lock_fd = -1;
 static char g_registry_write_lock_path[PATH_MAX] = "";
+static OuterServiceManager *g_outer_service_manager = NULL;
+static bool g_internal_service_manager = false;
+static char g_outer_services_directory[PATH_MAX] = "";
 
 typedef struct {
     int fd;
@@ -1130,6 +1134,20 @@ static void handle_shutdown_signal(int signal_number) {
     if (g_api_listener_fd >= 0) {
         close((int)g_api_listener_fd);
     }
+}
+
+static bool is_outerservice_path(const char *path) {
+    if (!path) return false;
+    size_t length = strlen(path);
+    const char *suffix = ".outerservice";
+    size_t suffix_length = strlen(suffix);
+    return length > suffix_length && strcmp(path + length - suffix_length, suffix) == 0;
+}
+
+static void outer_service_event(void *context, const char *service_id) {
+    (void)context;
+    (void)service_id;
+    mark_backend_event_changed();
 }
 
 void OuterShelldRequestShutdown(void) {
@@ -1418,6 +1436,8 @@ static void cleanup_bundled_app_cache(const BundledAppDefinition *app) {
     char legacy_archive_path[PATH_MAX];
     char linux_aarch64_archive_path[PATH_MAX];
     char linux_x86_64_archive_path[PATH_MAX];
+    char linux_aarch64_musl_archive_path[PATH_MAX];
+    char linux_x86_64_musl_archive_path[PATH_MAX];
     char macos_arm64_archive_path[PATH_MAX];
     char macos_x86_64_archive_path[PATH_MAX];
     char outer_shell_cache_root[PATH_MAX];
@@ -1429,6 +1449,8 @@ static void cleanup_bundled_app_cache(const BundledAppDefinition *app) {
     snprintf(legacy_archive_path, sizeof(legacy_archive_path), "%s/%s.tar.gz", cache_root, app->stage_directory_name);
     snprintf(linux_aarch64_archive_path, sizeof(linux_aarch64_archive_path), "%s/%s-linux-aarch64.tar.gz", cache_root, app->stage_directory_name);
     snprintf(linux_x86_64_archive_path, sizeof(linux_x86_64_archive_path), "%s/%s-linux-x86_64.tar.gz", cache_root, app->stage_directory_name);
+    snprintf(linux_aarch64_musl_archive_path, sizeof(linux_aarch64_musl_archive_path), "%s/%s-linux-aarch64-musl.tar.gz", cache_root, app->stage_directory_name);
+    snprintf(linux_x86_64_musl_archive_path, sizeof(linux_x86_64_musl_archive_path), "%s/%s-linux-x86_64-musl.tar.gz", cache_root, app->stage_directory_name);
     snprintf(macos_arm64_archive_path, sizeof(macos_arm64_archive_path), "%s/%s-macos-arm64.tar.gz", cache_root, app->stage_directory_name);
     snprintf(macos_x86_64_archive_path, sizeof(macos_x86_64_archive_path), "%s/%s-macos-x86_64.tar.gz", cache_root, app->stage_directory_name);
 
@@ -1436,6 +1458,8 @@ static void cleanup_bundled_app_cache(const BundledAppDefinition *app) {
     char quoted_legacy_archive_path[PATH_MAX + 8];
     char quoted_linux_aarch64_archive_path[PATH_MAX + 8];
     char quoted_linux_x86_64_archive_path[PATH_MAX + 8];
+    char quoted_linux_aarch64_musl_archive_path[PATH_MAX + 8];
+    char quoted_linux_x86_64_musl_archive_path[PATH_MAX + 8];
     char quoted_macos_arm64_archive_path[PATH_MAX + 8];
     char quoted_macos_x86_64_archive_path[PATH_MAX + 8];
     char quoted_cache_root[PATH_MAX + 8];
@@ -1445,20 +1469,24 @@ static void cleanup_bundled_app_cache(const BundledAppDefinition *app) {
     shell_quote(legacy_archive_path, quoted_legacy_archive_path, sizeof(quoted_legacy_archive_path));
     shell_quote(linux_aarch64_archive_path, quoted_linux_aarch64_archive_path, sizeof(quoted_linux_aarch64_archive_path));
     shell_quote(linux_x86_64_archive_path, quoted_linux_x86_64_archive_path, sizeof(quoted_linux_x86_64_archive_path));
+    shell_quote(linux_aarch64_musl_archive_path, quoted_linux_aarch64_musl_archive_path, sizeof(quoted_linux_aarch64_musl_archive_path));
+    shell_quote(linux_x86_64_musl_archive_path, quoted_linux_x86_64_musl_archive_path, sizeof(quoted_linux_x86_64_musl_archive_path));
     shell_quote(macos_arm64_archive_path, quoted_macos_arm64_archive_path, sizeof(quoted_macos_arm64_archive_path));
     shell_quote(macos_x86_64_archive_path, quoted_macos_x86_64_archive_path, sizeof(quoted_macos_x86_64_archive_path));
     shell_quote(cache_root, quoted_cache_root, sizeof(quoted_cache_root));
     shell_quote(outer_shell_cache_root, quoted_outer_shell_cache_root, sizeof(quoted_outer_shell_cache_root));
     shell_quote(outershell_cache_root, quoted_outershell_cache_root, sizeof(quoted_outershell_cache_root));
 
-    char command[PATH_MAX * 9 + 128];
+    char command[PATH_MAX * 11 + 128];
     snprintf(command,
              sizeof(command),
-             "rm -rf -- %s; rm -f -- %s %s %s %s %s; rmdir -- %s %s %s >/dev/null 2>&1 || true",
+             "rm -rf -- %s; rm -f -- %s %s %s %s %s %s %s; rmdir -- %s %s %s >/dev/null 2>&1 || true",
              quoted_app_root,
              quoted_legacy_archive_path,
              quoted_linux_aarch64_archive_path,
              quoted_linux_x86_64_archive_path,
+             quoted_linux_aarch64_musl_archive_path,
+             quoted_linux_x86_64_musl_archive_path,
              quoted_macos_arm64_archive_path,
              quoted_macos_x86_64_archive_path,
              quoted_cache_root,
@@ -1785,6 +1813,33 @@ static bool remote_machine_architecture(char *out, size_t out_size) {
     snprintf(out, out_size, "%s", names.machine);
     return false;
 }
+
+static bool remote_machine_uses_musl(void) {
+    FILE *pipe = popen("ldd --version 2>&1", "r");
+    if (pipe) {
+        char line[256];
+        bool saw_output = false;
+        bool found_musl = false;
+        while (fgets(line, sizeof(line), pipe)) {
+            saw_output = true;
+            if (strstr(line, "musl") || strstr(line, "Musl") || strstr(line, "MUSL")) {
+                found_musl = true;
+            }
+        }
+        pclose(pipe);
+        if (saw_output) return found_musl;
+    }
+
+    struct utsname names;
+    if (uname(&names) != 0) return false;
+    char loader[PATH_MAX];
+    snprintf(loader, sizeof(loader), "/lib/ld-musl-%s.so.1", names.machine);
+    return access(loader, F_OK) == 0;
+}
+
+static const char *remote_linux_binary_directory(void) {
+    return remote_machine_uses_musl() ? "RemoteLinuxBinariesMusl" : "RemoteLinuxBinaries";
+}
 #endif
 
 static bool directory_exists(const char *path) {
@@ -2024,7 +2079,7 @@ static bool bundled_app_stage_has_expected_files(const BundledAppDefinition *app
     char architecture[64];
     if (!remote_machine_architecture(architecture, sizeof(architecture))) return false;
     char linux_binary[PATH_MAX];
-    snprintf(linux_binary, sizeof(linux_binary), "%s/RemoteLinuxBinaries/%s/%s", stage_root, architecture, app->binary_name);
+    snprintf(linux_binary, sizeof(linux_binary), "%s/%s/%s/%s", stage_root, remote_linux_binary_directory(), architecture, app->binary_name);
     return stat(linux_binary, &st) == 0 && S_ISREG(st.st_mode);
 #endif
 }
@@ -5243,10 +5298,12 @@ static bool append_registered_backend_payloads(const RegistryStore *database,
         char status[32] = "unknown";
         bool has_launchd_unit = plist_path[0];
         bool has_systemd_unit = service_unit[0];
+        bool has_outerservice = is_outerservice_path(plist_path);
+        if (has_outerservice) has_launchd_unit = false;
 #ifdef __APPLE__
         has_systemd_unit = false;
 #endif
-        if (bundled_app && (has_launchd_unit || has_systemd_unit)) {
+        if (bundled_app && (has_launchd_unit || has_systemd_unit || has_outerservice)) {
             size_t bundled_index = (size_t)(bundled_app - kBundledApps);
             if (bundled_index < bundled_installed_count) bundled_installed[bundled_index] = true;
         }
@@ -5261,6 +5318,14 @@ static bool append_registered_backend_payloads(const RegistryStore *database,
 #endif
         if (has_systemd_unit) {
             systemd_status(service_unit, effective_service_scope, status, sizeof(status));
+        } else if (has_outerservice && g_outer_service_manager) {
+            OuterServiceStatus service_status = {0};
+            if (outer_service_manager_status(g_outer_service_manager, service_id, &service_status)) {
+                snprintf(status, sizeof(status), "%s",
+                         service_status.running ? "running" :
+                         (service_status.available ? "available" :
+                          (service_status.failed ? "failed" : "stopped")));
+            }
         }
 
         char service_unit_path[PATH_MAX] = "";
@@ -5278,7 +5343,7 @@ static bool append_registered_backend_payloads(const RegistryStore *database,
         uint32_t flags = BACKEND_FLAG_IS_INSTALLED;
         char installed_version[128] = "";
         char available_version[128] = "";
-        if ((has_systemd_unit || has_launchd_unit) && !is_self) flags |= BACKEND_FLAG_CAN_CONTROL | BACKEND_FLAG_CAN_UNINSTALL;
+        if ((has_systemd_unit || has_launchd_unit || has_outerservice) && !is_self) flags |= BACKEND_FLAG_CAN_CONTROL | BACKEND_FLAG_CAN_UNINSTALL;
         if (is_self) {
             installed_home_screen_version(installed_version, sizeof(installed_version));
             flags |= BACKEND_FLAG_CAN_UNINSTALL;
@@ -6056,6 +6121,25 @@ static void send_control_response(int fd, const char *query, const char *body) {
     }
 #endif
 
+    if (g_outer_service_manager && outer_service_manager_has_service(g_outer_service_manager, service_id)) {
+        char message[512] = "";
+        bool ok = outer_service_manager_operate(g_outer_service_manager,
+                                                service_id,
+                                                operation,
+                                                message,
+                                                sizeof(message));
+        if (ok) {
+            snprintf(message, sizeof(message), "%s requested.",
+                     strcmp(operation, "start") == 0 ? "Start" :
+                     (strcmp(operation, "stop") == 0 ? "Stop" : "Restart"));
+            mark_backend_event_changed();
+        }
+        log_event("%s internal service operation %s for %s: %s",
+                  ok ? "Completed" : "Failed", operation, service_id, message);
+        send_action_response(fd, ok ? 200 : 500, ok, message);
+        return;
+    }
+
     char unit_name[256] = "";
     char scope[32] = "user";
     bool found = lookup_systemd_backend_any_for_scope(service_id,
@@ -6065,7 +6149,7 @@ static void send_control_response(int fd, const char *query, const char *body) {
                                                       scope,
                                                       sizeof(scope));
     if (!found) {
-        send_action_response(fd, 404, false, "This backend does not have a registered systemd unit.");
+        send_action_response(fd, 404, false, "This backend does not have a registered service-manager entry.");
         return;
     }
 
@@ -8651,6 +8735,7 @@ static int outershelld_handle_outerctl(int argc, char **argv, StringBuilder *std
     const char *display_name = NULL;
     const char *plist_path = NULL;
     const char *systemd_unit = NULL;
+    const char *service_file = NULL;
     const char *log_path = NULL;
     const char *url = NULL;
     const char *frontend_host = NULL;
@@ -8689,6 +8774,8 @@ static int outershelld_handle_outerctl(int argc, char **argv, StringBuilder *std
             REQUIRE_VALUE("--plist", plist_path);
         } else if (strcmp(arg, "--unit") == 0 || strcmp(arg, "--systemd-unit") == 0) {
             REQUIRE_VALUE("--unit", systemd_unit);
+        } else if (strcmp(arg, "--service-file") == 0 || strcmp(arg, "--outerservice") == 0) {
+            REQUIRE_VALUE("--service-file", service_file);
         } else if (strcmp(arg, "--path") == 0) {
             if (strcmp(resource, "app") == 0) {
                 REQUIRE_VALUE("--path", frontend_path);
@@ -8808,15 +8895,17 @@ static int outershelld_handle_outerctl(int argc, char **argv, StringBuilder *std
             if (icon_path && icon_path[0]) {
                 snprintf(error, sizeof(error), "Backend icons are no longer supported. Put icons on app entries instead.");
                 ok = false;
-            } else if (systemd_unit && systemd_unit[0] && plist_path && plist_path[0]) {
-                snprintf(error, sizeof(error), "Specify either --unit or --plist, not both.");
+            } else if (((systemd_unit && systemd_unit[0]) ? 1 : 0) +
+                       ((plist_path && plist_path[0]) ? 1 : 0) +
+                       ((service_file && service_file[0]) ? 1 : 0) > 1) {
+                snprintf(error, sizeof(error), "Specify only one of --unit, --plist, or --service-file.");
                 ok = false;
             } else {
                 ok = registry_store_upsert_backend(&database,
                                                    backend,
                                                    (display_name && display_name[0]) ? display_name : backend,
                                                    (systemd_unit && systemd_unit[0]) ? systemd_unit : (plist_path && plist_path[0] ? backend : ""),
-                                                   (plist_path && plist_path[0]) ? plist_path : "",
+                                                   (service_file && service_file[0]) ? service_file : ((plist_path && plist_path[0]) ? plist_path : ""),
                                                    owns_plist);
                 if (!ok) snprintf(error, sizeof(error), "Out of memory.");
             }
@@ -9131,6 +9220,48 @@ static bool registry_store_upsert_bundled_app_openers(RegistryStore *database,
 }
 
 #ifndef __APPLE__
+static bool upsert_outerservice_backend_registry(const char *service_id,
+                                                 const char *display_name,
+                                                 const char *service_file,
+                                                 const char *scope,
+                                                 const char *socket_path,
+                                                 const char *log_path,
+                                                 const char *icon_path,
+                                                 char *error,
+                                                 size_t error_size) {
+    RegistryStore database;
+    if (!registry_store_open_user_readwrite(&database, error, error_size)) return false;
+    bool ok = registry_store_upsert_backend(&database, service_id, display_name, "", service_file, true);
+    if (!ok) snprintf(error, error_size, "Out of memory.");
+    if (ok) registry_store_clear_backend_frontends(&database, service_id);
+    if (ok && socket_path && socket_path[0]) {
+        char frontend_id[PATH_MAX * 2];
+        snprintf(frontend_id, sizeof(frontend_id), "%s:main", service_id);
+        char *icon_value = registry_icon_path_value(icon_path);
+        ok = registry_store_upsert_frontend(&database, frontend_id, "", service_id, display_name, 0,
+                                            socket_path, icon_value ? icon_value : "", "", false);
+        free(icon_value);
+        if (!ok) snprintf(error, error_size, "Out of memory.");
+    }
+    if (ok) registry_store_clear_backend_logs(&database, service_id);
+    if (ok) {
+        ok = registry_store_upsert_log(&database, log_path, service_id);
+        if (!ok) snprintf(error, error_size, "Out of memory.");
+    }
+    const BundledAppDefinition *app = bundled_app_for_service_id(service_id);
+    if (ok && app) {
+        ok = registry_store_upsert_bundled_app_openers(&database, app, socket_path, error, error_size);
+    }
+    ok = registry_store_close(&database, ok, error, error_size) && ok;
+    if (ok && socket_path && socket_path[0]) {
+        ok = append_outerloop_http_unix_allowlist_entry(socket_path,
+                                                        scope && strcmp(scope, "system") == 0,
+                                                        error,
+                                                        error_size);
+    }
+    return ok;
+}
+
 static bool upsert_systemd_backend_registry(const char *service_id,
                                             const char *display_name,
                                             const char *unit_name,
@@ -9785,6 +9916,172 @@ static bool remove_bundled_root_support(const BundledAppDefinition *app,
                                         size_t message_size);
 #endif
 
+#ifndef __APPLE__
+static bool install_bundled_app_internal(const BundledAppDefinition *app,
+                                         const char *source_binary,
+                                         const char *source_bundle_arm,
+                                         const char *source_bundle_x86,
+                                         const char *source_icon,
+                                         char *message,
+                                         size_t message_size) {
+    bool system_scope = direct_root_session_uses_system_scope();
+    char install_root[PATH_MAX];
+    if (system_scope) {
+        snprintf(install_root, sizeof(install_root), "/opt/outershell/%s", app->install_directory_name);
+    } else {
+        default_user_outershell_app_root(app->install_directory_name, install_root, sizeof(install_root));
+    }
+    char bundles_dir[PATH_MAX];
+    snprintf(bundles_dir, sizeof(bundles_dir), "%s/bundles", install_root);
+    char target_binary[PATH_MAX];
+    snprintf(target_binary, sizeof(target_binary), "%s/%s", install_root, app->binary_name);
+    char target_bundle_arm[PATH_MAX];
+    snprintf(target_bundle_arm, sizeof(target_bundle_arm), "%s/%s.bundle.macos-arm.aar", bundles_dir, app->bundle_prefix);
+    char target_bundle_x86[PATH_MAX];
+    snprintf(target_bundle_x86, sizeof(target_bundle_x86), "%s/%s.bundle.macos-x86.aar", bundles_dir, app->bundle_prefix);
+    char target_icon[PATH_MAX] = "";
+    if (source_icon && source_icon[0]) snprintf(target_icon, sizeof(target_icon), "%s/%s", install_root, app->icon_name);
+    char version_path[PATH_MAX];
+    snprintf(version_path, sizeof(version_path), "%s/version", install_root);
+    char log_path[PATH_MAX];
+    if (system_scope) snprintf(log_path, sizeof(log_path), "/var/log/outershell/%s.log", app->service_id);
+    else snprintf(log_path, sizeof(log_path), "%s/backend.log", install_root);
+    char service_state_root[PATH_MAX];
+    if (system_scope) snprintf(service_state_root, sizeof(service_state_root), "%s/apps/%s", kSystemOuterShellRoot, app->install_directory_name);
+    else snprintf(service_state_root, sizeof(service_state_root), "%s", install_root);
+    char socket_path[PATH_MAX] = "";
+    bundled_socket_path_for_scope(app, system_scope ? "system" : "user", socket_path, sizeof(socket_path));
+    char service_file[PATH_MAX];
+    snprintf(service_file, sizeof(service_file), "%s/%s.outerservice", g_outer_services_directory, app->service_id);
+
+    char error[1024] = "";
+    if (!outer_service_manager_unload_service(g_outer_service_manager, app->service_id, error, sizeof(error))) {
+        snprintf(message, message_size, "Could not stop the previous %s service: %s", app->display_name, error);
+        return false;
+    }
+
+    char quoted_install_root[PATH_MAX + 8];
+    shell_quote(install_root, quoted_install_root, sizeof(quoted_install_root));
+    char remove_command[PATH_MAX + 64];
+    snprintf(remove_command, sizeof(remove_command), "rm -rf -- %s", quoted_install_root);
+    if (system(remove_command) != 0 || !mkdir_p(bundles_dir) || !mkdir_p(service_state_root)) {
+        snprintf(message, message_size, "Failed to prepare %s: %s", install_root, strerror(errno));
+        return false;
+    }
+    if (system_scope && !mkdir_p("/var/log/outershell")) {
+        snprintf(message, message_size, "Failed to prepare /var/log/outershell: %s", strerror(errno));
+        return false;
+    }
+
+    mode_t binary_mode = system_scope ? 0755 : 0700;
+    mode_t data_mode = system_scope ? 0644 : 0600;
+    if (!copy_file(source_binary, target_binary, binary_mode, error, sizeof(error)) ||
+        !copy_file(source_bundle_arm, target_bundle_arm, data_mode, error, sizeof(error)) ||
+        !copy_file(source_bundle_x86, target_bundle_x86, data_mode, error, sizeof(error)) ||
+        (target_icon[0] && !copy_file(source_icon, target_icon, data_mode, error, sizeof(error))) ||
+        !write_text_file(version_path, app->version, error, sizeof(error))) {
+        snprintf(message, message_size, "%s", error);
+        return false;
+    }
+    chmod(version_path, data_mode);
+
+    const char *home = system_scope ? "/root" : home_directory();
+    struct passwd *pw = getpwuid(getuid());
+    const char *user_name = system_scope ? "root" : (pw && pw->pw_name ? pw->pw_name : "");
+    const char *api_socket_path = g_api_socket_path[0] ? g_api_socket_path : "/run/outershelld-api";
+    char icon_arguments[PATH_MAX + 64] = "";
+    if (target_icon[0]) snprintf(icon_arguments, sizeof(icon_arguments), "Argument=--icon-file\nArgument=%s\n", target_icon);
+    char socket_arguments[PATH_MAX + 64] = "";
+    char socket_section[PATH_MAX + 160] = "";
+    if (app->socket_activated && socket_path[0]) {
+        snprintf(socket_arguments, sizeof(socket_arguments), "Argument=--socket-path\nArgument=%s\n", socket_path);
+        snprintf(socket_section, sizeof(socket_section),
+                 "\n[Socket.http]\nType=unix\nPath=%s\nMode=0600\nBacklog=64\n", socket_path);
+    }
+    char service_contents[16000];
+    int service_length = snprintf(service_contents, sizeof(service_contents),
+                                  "[Service]\n"
+                                  "Format=1\n"
+                                  "Name=%s\n"
+                                  "Executable=%s\n"
+                                  "Argument=--label\n"
+                                  "Argument=%s\n"
+                                  "%s"
+                                  "Argument=--bundles-dir\n"
+                                  "Argument=%s\n"
+                                  "%s"
+                                  "WorkingDirectory=%s\n"
+                                  "Environment=HOME=%s\n"
+                                  "Environment=USER=%s\n"
+                                  "Environment=LOGNAME=%s\n"
+                                  "Environment=OUTERSHELL_SERVICE_STATE_DIR=%s\n"
+                                  "Environment=OUTERSHELLD_API_SOCKET=%s\n"
+                                  "EnvironmentPolicy=clean\n"
+                                  "Start=%s\n"
+                                  "Restart=on-failure\n"
+                                  "LogPath=%s\n"
+                                  "%s",
+                                  app->display_name,
+                                  target_binary,
+                                  app->service_id,
+                                  socket_arguments,
+                                  bundles_dir,
+                                  icon_arguments,
+                                  install_root,
+                                  home,
+                                  user_name,
+                                  user_name,
+                                  service_state_root,
+                                  api_socket_path,
+                                  app->socket_activated ? "socket" : "eager",
+                                  log_path,
+                                  socket_section);
+    if (service_length < 0 || (size_t)service_length >= sizeof(service_contents)) {
+        snprintf(message, message_size, "The generated %s service definition is too large.", app->display_name);
+        return false;
+    }
+    if (!write_text_file(service_file, service_contents, error, sizeof(error))) {
+        snprintf(message, message_size, "%s", error);
+        return false;
+    }
+    chmod(service_file, data_mode);
+
+    if (!outer_service_manager_load_service(g_outer_service_manager, app->service_id, error, sizeof(error))) {
+        snprintf(message, message_size, "Installed %s, but could not load its service: %s", app->display_name, error);
+        return false;
+    }
+    if (!upsert_outerservice_backend_registry(app->service_id,
+                                              app->display_name,
+                                              service_file,
+                                              system_scope ? "system" : "user",
+                                              socket_path,
+                                              log_path,
+                                              target_icon,
+                                              error,
+                                              sizeof(error))) {
+        char registry_error[1024];
+        char cleanup_error[1024] = "";
+        snprintf(registry_error, sizeof(registry_error), "%s", error);
+        (void)outer_service_manager_unload_service(g_outer_service_manager, app->service_id, cleanup_error, sizeof(cleanup_error));
+        unlink(service_file);
+        snprintf(message, message_size, "Installed %s, but could not register it: %s", app->display_name, registry_error);
+        return false;
+    }
+
+    if (system_scope) {
+        char users_dir[PATH_MAX];
+        char marker_path[PATH_MAX];
+        system_binary_users_dir(users_dir, sizeof(users_dir));
+        system_binary_root_apps_marker_path(marker_path, sizeof(marker_path));
+        if (mkdir_p(users_dir)) chmod(users_dir, 01777);
+        int marker = open(marker_path, O_WRONLY | O_CREAT, 0644);
+        if (marker >= 0) close(marker);
+    }
+    snprintf(message, message_size, "Installed %s.", app->display_name);
+    return true;
+}
+#endif
+
 static bool install_bundled_app(const BundledAppDefinition *app,
                                 const char *scope,
                                 const char *requested_stage_root,
@@ -9820,7 +10117,7 @@ static bool install_bundled_app(const BundledAppDefinition *app,
         return false;
     }
     char source_binary[PATH_MAX];
-    snprintf(source_binary, sizeof(source_binary), "%s/RemoteLinuxBinaries/%s/%s", stage_root, architecture, app->binary_name);
+    snprintf(source_binary, sizeof(source_binary), "%s/%s/%s/%s", stage_root, remote_linux_binary_directory(), architecture, app->binary_name);
     char source_bundle_arm[PATH_MAX];
     snprintf(source_bundle_arm, sizeof(source_bundle_arm), "%s/bundles/%s.bundle.macos-arm.aar", stage_root, app->bundle_prefix);
     char source_bundle_x86[PATH_MAX];
@@ -9847,6 +10144,16 @@ static bool install_bundled_app(const BundledAppDefinition *app,
     if (source_icon[0] && (stat(source_icon, &st) != 0 || !S_ISREG(st.st_mode))) {
         snprintf(message, message_size, "Missing %s icon at %s.", app->display_name, source_icon);
         return false;
+    }
+
+    if (g_internal_service_manager) {
+        return install_bundled_app_internal(app,
+                                            source_binary,
+                                            source_bundle_arm,
+                                            source_bundle_x86,
+                                            source_icon,
+                                            message,
+                                            message_size);
     }
 
     if (install_as_root) {
@@ -11287,6 +11594,74 @@ static bool uninstall_backend(const char *service_id, const char *sudo_password,
             (void)run_launchd_operation(service_id, plist_path, "stop", stop_message, sizeof(stop_message));
             if (owns_plist && plist_path[0]) {
                 unlink(plist_path);
+            }
+        }
+    }
+#endif
+
+#ifndef __APPLE__
+    if (g_internal_service_manager && g_outer_service_manager) {
+        char service_file[PATH_MAX];
+        snprintf(service_file, sizeof(service_file), "%s/%s.outerservice", g_outer_services_directory, service_id);
+        bool loaded = outer_service_manager_has_service(g_outer_service_manager, service_id);
+        if (loaded || access(service_file, F_OK) == 0) {
+            found_any = true;
+            if (!outer_service_manager_unload_service(g_outer_service_manager, service_id, error, sizeof(error))) {
+                snprintf(message, message_size, "Could not stop %s: %s", service_id, error);
+                return false;
+            }
+            if (unlink(service_file) != 0 && errno != ENOENT) {
+                snprintf(message, message_size, "Could not remove %s: %s", service_file, strerror(errno));
+                return false;
+            }
+
+            const BundledAppDefinition *app = bundled_app_for_service_id(service_id);
+            char install_name[PATH_MAX];
+            snprintf(install_name, sizeof(install_name), "%s", app ? app->install_directory_name : service_id);
+            if (safe_service_directory_name(install_name)) {
+                char install_root[PATH_MAX];
+                if (direct_root_session_uses_system_scope()) {
+                    snprintf(install_root, sizeof(install_root), "/opt/outershell/%s", install_name);
+                } else {
+                    default_user_outershell_app_root(install_name, install_root, sizeof(install_root));
+                }
+                char quoted_root[PATH_MAX + 8];
+                shell_quote(install_root, quoted_root, sizeof(quoted_root));
+                char command[PATH_MAX + 64];
+                snprintf(command, sizeof(command), "rm -rf -- %s", quoted_root);
+                if (system(command) != 0) {
+                    snprintf(message, message_size, "Could not remove %s.", install_root);
+                    return false;
+                }
+            }
+            char log_path[PATH_MAX];
+            if (direct_root_session_uses_system_scope()) {
+                snprintf(log_path, sizeof(log_path), "/var/log/outershell/%s.log", service_id);
+            } else {
+                char user_root[PATH_MAX];
+                default_user_outershell_app_root(install_name, user_root, sizeof(user_root));
+                snprintf(log_path, sizeof(log_path), "%s/backend.log", user_root);
+            }
+            unlink(log_path);
+
+            if (direct_root_session_uses_system_scope()) {
+                DIR *apps = opendir("/opt/outershell");
+                bool has_apps = false;
+                if (apps) {
+                    struct dirent *entry;
+                    while ((entry = readdir(apps)) != NULL) {
+                        if (strcmp(entry->d_name, ".") != 0 && strcmp(entry->d_name, "..") != 0) {
+                            has_apps = true;
+                            break;
+                        }
+                    }
+                    closedir(apps);
+                }
+                if (!has_apps) {
+                    char marker_path[PATH_MAX];
+                    system_binary_root_apps_marker_path(marker_path, sizeof(marker_path));
+                    unlink(marker_path);
+                }
             }
         }
     }
@@ -13216,9 +13591,17 @@ static bool process_api_command_request(ReactorClient *client, const unsigned ch
              api_command_append_option(argv, &argc, 64, "--backend", backend) &&
              api_command_append_option(argv, &argc, 64, "--name", display_name);
 #if defined(__APPLE__)
-        ok = ok && api_command_append_option(argv, &argc, 64, "--launchd-plist", service_manager_path);
+        if (flags & OUTERSHELLD_API_FLAG_OUTERSERVICE_ENTRY) {
+            ok = ok && api_command_append_option(argv, &argc, 64, "--service-file", service_manager_path);
+        } else {
+            ok = ok && api_command_append_option(argv, &argc, 64, "--launchd-plist", service_manager_path);
+        }
 #else
-        ok = ok && api_command_append_option(argv, &argc, 64, "--systemd-unit", service_manager_path);
+        if (flags & OUTERSHELLD_API_FLAG_OUTERSERVICE_ENTRY) {
+            ok = ok && api_command_append_option(argv, &argc, 64, "--service-file", service_manager_path);
+        } else {
+            ok = ok && api_command_append_option(argv, &argc, 64, "--systemd-unit", service_manager_path);
+        }
 #endif
         if (ok && (flags & OUTERSHELLD_API_FLAG_OWNS_SERVICE_MANAGER_ENTRY)) {
             ok = api_command_append_option(argv, &argc, 64, "--outershell-owns", "true");
@@ -13408,6 +13791,103 @@ static bool process_api_command_request(ReactorClient *client, const unsigned ch
     return false;
 }
 
+static bool process_api_bundled_app_control_request(ReactorClient *client,
+                                                    const unsigned char *message,
+                                                    size_t message_length) {
+    StringBuilder stdout_buffer = {0};
+    StringBuilder stderr_buffer = {0};
+    char *action = NULL;
+    char *backend = NULL;
+    char *scope = NULL;
+    char *stage_root = NULL;
+    char *sudo_password = NULL;
+    bool decoded = message_length >= 42 &&
+        api_read_string_ref(message, message_length, 2, &action) &&
+        api_read_string_ref(message, message_length, 10, &backend) &&
+        api_read_string_ref(message, message_length, 18, &scope) &&
+        api_read_string_ref(message, message_length, 26, &stage_root) &&
+        api_read_string_ref(message, message_length, 34, &sudo_password);
+    int status = 1;
+    char result[4096] = "";
+    bool needs_password = false;
+
+    const BundledAppDefinition *app = decoded ? bundled_app_for_service_id(backend) : NULL;
+    if (!decoded) {
+        sb_append(&stderr_buffer, "Invalid bundled-app request.\n");
+    } else if (!app) {
+        sb_append(&stderr_buffer, "Unknown bundled app.\n");
+    } else if (strcmp(scope, "user") != 0 && strcmp(scope, "system") != 0) {
+        sb_append(&stderr_buffer, "Invalid bundled-app scope; use user or system.\n");
+    } else if (strcmp(action, "install") == 0) {
+        bool ok = install_bundled_app(app,
+                                      scope,
+                                      stage_root,
+                                      sudo_password,
+                                      &needs_password,
+                                      result,
+                                      sizeof(result));
+#ifdef __APPLE__
+        if (ok && strcmp(scope, "system") == 0 && !app->root_only) {
+            char user_message[4096] = "";
+            ok = install_bundled_app_user_launchagent_for_system_payload(app,
+                                                                         user_message,
+                                                                         sizeof(user_message));
+            if (ok) {
+                snprintf(result, sizeof(result), "Installed %s for user and root.", app->display_name);
+            } else {
+                snprintf(result,
+                         sizeof(result),
+                         "Installed %s as root, but failed to install its user LaunchAgent: %s",
+                         app->display_name,
+                         user_message);
+            }
+        }
+#endif
+        if (ok) {
+            mark_backend_event_changed();
+            sb_append(&stdout_buffer, result[0] ? result : "Installed bundled app.");
+            sb_append(&stdout_buffer, "\n");
+            status = 0;
+        } else {
+            sb_append(&stderr_buffer, result[0] ? result : "Failed to install bundled app.");
+            if (needs_password) {
+                sb_append(&stderr_buffer, " Supply the administrator password with --sudo-password-stdin.");
+            }
+            sb_append(&stderr_buffer, "\n");
+        }
+    } else if (strcmp(action, "uninstall") == 0) {
+        bool ok = uninstall_backend(app->service_id,
+                                    sudo_password,
+                                    &needs_password,
+                                    result,
+                                    sizeof(result));
+        if (ok) {
+            mark_backend_event_changed();
+            sb_append(&stdout_buffer, result[0] ? result : "Uninstalled bundled app.");
+            sb_append(&stdout_buffer, "\n");
+            status = 0;
+        } else {
+            sb_append(&stderr_buffer, result[0] ? result : "Failed to uninstall bundled app.");
+            if (needs_password) {
+                sb_append(&stderr_buffer, " Supply the administrator password with --sudo-password-stdin.");
+            }
+            sb_append(&stderr_buffer, "\n");
+        }
+    } else {
+        sb_append(&stderr_buffer, "Unsupported bundled-app action.\n");
+    }
+
+    api_send_command_response(client->fd, status, &stdout_buffer, &stderr_buffer);
+    free(action);
+    free(backend);
+    free(scope);
+    free(stage_root);
+    free(sudo_password);
+    free(stdout_buffer.data);
+    free(stderr_buffer.data);
+    return false;
+}
+
 static bool api_message_is_command_request(uint16_t message_type) {
     switch (message_type) {
     case OUTERSHELLD_API_BACKEND_UPSERT_REQUEST:
@@ -13436,6 +13916,9 @@ static bool process_api_client_request(ReactorClient *client, char *request, siz
     }
     if (api_message_is_command_request(message_type)) {
         return process_api_command_request(client, message, message_length);
+    }
+    if (message_type == OUTERSHELLD_API_BUNDLED_APP_CONTROL_REQUEST) {
+        return process_api_bundled_app_control_request(client, message, message_length);
     }
     if (message_type == OUTERSHELLD_API_FILE_OPENERS_QUERY) {
         return process_api_file_openers_request(client, message, message_length);
@@ -13538,6 +14021,7 @@ static int create_unix_listener(const char *socket_path) {
         unlink(socket_path);
         return -1;
     }
+    fcntl(fd, F_SETFD, fcntl(fd, F_GETFD) | FD_CLOEXEC);
     return fd;
 }
 
@@ -13640,6 +14124,7 @@ static void add_reactor_client(ReactorClient *clients, size_t *client_count, int
         close(client_fd);
         return;
     }
+    fcntl(client_fd, F_SETFD, fcntl(client_fd, F_GETFD) | FD_CLOEXEC);
     set_fd_nonblocking(client_fd, true);
     ReactorClient *client = &clients[(*client_count)++];
     memset(client, 0, sizeof(*client));
@@ -13784,7 +14269,7 @@ static void run_api_reactor(int api_listener) {
     }
     size_t client_count = 0;
     set_fd_nonblocking(api_listener, true);
-    while (!g_shutdown_requested) {
+    while (!g_shutdown_requested && !outer_service_manager_exit_requested(g_outer_service_manager)) {
         flush_ready_event_clients(clients, &client_count);
         struct pollfd poll_fds[MAX_REACTOR_CLIENTS + 1];
         size_t polled_client_count = client_count;
@@ -13858,7 +14343,7 @@ static void run_api_reactor(int api_listener) {
 }
 
 static void outershelld_usage(const char *program) {
-    fprintf(stderr, "Usage: %s [--api-socket-path PATH] [--database PATH] [--system-database PATH] [--bundled-apps-dir DIR] [--public-base-url URL] [--stay-alive]\n", program);
+    fprintf(stderr, "Usage: %s [--api-socket-path PATH] [--database PATH] [--system-database PATH] [--bundled-apps-dir DIR] [--public-base-url URL] [--service-manager system|internal] [--services-dir DIR] [--stay-alive]\n", program);
 }
 
 static void initialize_runtime_paths(char *api_socket_path, size_t api_socket_path_size) {
@@ -13876,8 +14361,12 @@ static void initialize_runtime_paths(char *api_socket_path, size_t api_socket_pa
 }
 
 int OuterShelldMain(int argc, char **argv) {
+    if (argc >= 2 && strcmp(argv[1], "--outerservice-exec") == 0) {
+        return outer_service_exec_child(argc, argv);
+    }
     char api_socket_path[PATH_MAX] = "";
     initialize_runtime_paths(api_socket_path, sizeof(api_socket_path));
+    const char *service_manager = "system";
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--api-socket-path") == 0 && i + 1 < argc) {
@@ -13894,6 +14383,14 @@ int OuterShelldMain(int argc, char **argv) {
             expand_tilde_path(argv[++i], g_system_registry_database_path, sizeof(g_system_registry_database_path));
         } else if (strcmp(argv[i], "--stay-alive") == 0) {
             g_stay_alive_when_socket_idle = true;
+        } else if (strcmp(argv[i], "--service-manager") == 0 && i + 1 < argc) {
+            service_manager = argv[++i];
+            if (strcmp(service_manager, "system") != 0 && strcmp(service_manager, "internal") != 0) {
+                outershelld_usage(argv[0]);
+                return 2;
+            }
+        } else if (strcmp(argv[i], "--services-dir") == 0 && i + 1 < argc) {
+            expand_tilde_path(argv[++i], g_outer_services_directory, sizeof(g_outer_services_directory));
         } else {
             outershelld_usage(argv[0]);
             return 2;
@@ -13905,6 +14402,31 @@ int OuterShelldMain(int argc, char **argv) {
         fprintf(stderr, "Failed to upgrade Outer Shell registry: %s\n",
                 upgrade_error[0] ? upgrade_error : "unknown error");
         return 1;
+    }
+
+    g_internal_service_manager = strcmp(service_manager, "internal") == 0;
+    if (g_internal_service_manager) {
+        if (!g_outer_services_directory[0]) {
+            snprintf(g_outer_services_directory, sizeof(g_outer_services_directory), "%s/services", kSystemOuterShellRoot);
+        }
+        char executable[PATH_MAX] = "";
+        char manager_error[1024] = "";
+        if (!current_executable_path(executable, sizeof(executable))) {
+            fprintf(stderr, "Could not resolve outershelld executable path.\n");
+            return 1;
+        }
+        OuterServiceManagerOptions options = {
+            .services_directory = g_outer_services_directory,
+            .launcher_path = executable,
+            .event_callback = outer_service_event,
+            .event_context = NULL
+        };
+        g_outer_service_manager = outer_service_manager_create(&options, manager_error, sizeof(manager_error));
+        if (!g_outer_service_manager) {
+            fprintf(stderr, "Could not start internal service manager: %s\n", manager_error);
+            return 1;
+        }
+        g_stay_alive_when_socket_idle = true;
     }
 
     signal(SIGINT, handle_shutdown_signal);
@@ -13922,7 +14444,12 @@ int OuterShelldMain(int argc, char **argv) {
     if (api_socket_path[0]) {
         snprintf(g_api_socket_path, sizeof(g_api_socket_path), "%s", api_socket_path);
     }
-    if (api_listener < 0) return 1;
+    if (api_listener < 0) {
+        outer_service_manager_destroy(g_outer_service_manager);
+        g_outer_service_manager = NULL;
+        return 1;
+    }
+    fcntl(api_listener, F_SETFD, fcntl(api_listener, F_GETFD) | FD_CLOEXEC);
     g_api_listener_fd = api_listener;
     fprintf(stderr, "outershelld API listening on %s\n", api_socket_path[0] ? api_socket_path : "(socket activated)");
     fprintf(stderr, "Registry database: %s\n", g_registry_database_path);
@@ -13930,7 +14457,7 @@ int OuterShelldMain(int argc, char **argv) {
         fprintf(stderr, "System registry database: %s\n", g_system_registry_database_path);
     }
 #ifndef __APPLE__
-    start_systemd_status_watcher();
+    if (!g_internal_service_manager) start_systemd_status_watcher();
 #endif
     run_api_reactor(api_listener);
     close(api_listener);
@@ -13938,7 +14465,10 @@ int OuterShelldMain(int argc, char **argv) {
     if (g_api_socket_path[0] && !g_api_systemd_socket_activation) {
         unlink(g_api_socket_path);
     }
-    return 0;
+    int manager_exit_status = outer_service_manager_exit_status(g_outer_service_manager);
+    outer_service_manager_destroy(g_outer_service_manager);
+    g_outer_service_manager = NULL;
+    return manager_exit_status;
 }
 
 #if !defined(OUTER_SHELL_BACKEND_LIBRARY) || defined(OUTER_SHELL_BACKEND_STANDALONE)

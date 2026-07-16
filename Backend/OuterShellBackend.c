@@ -498,6 +498,33 @@ static bool remote_machine_architecture(char *out, size_t out_size) {
     snprintf(out, out_size, "%s", names.machine);
     return false;
 }
+
+static bool remote_machine_uses_musl(void) {
+    FILE *pipe = popen("ldd --version 2>&1", "r");
+    if (pipe) {
+        char line[256];
+        bool saw_output = false;
+        bool found_musl = false;
+        while (fgets(line, sizeof(line), pipe)) {
+            saw_output = true;
+            if (strstr(line, "musl") || strstr(line, "Musl") || strstr(line, "MUSL")) {
+                found_musl = true;
+            }
+        }
+        pclose(pipe);
+        if (saw_output) return found_musl;
+    }
+
+    struct utsname names;
+    if (uname(&names) != 0) return false;
+    char loader[PATH_MAX];
+    snprintf(loader, sizeof(loader), "/lib/ld-musl-%s.so.1", names.machine);
+    return access(loader, F_OK) == 0;
+}
+
+static const char *remote_linux_binary_directory(void) {
+    return remote_machine_uses_musl() ? "RemoteLinuxBinariesMusl" : "RemoteLinuxBinaries";
+}
 #endif
 
 static bool current_bundled_app_archive_platform(const BundledAppDefinition *app, char *out, size_t out_size) {
@@ -516,15 +543,9 @@ static bool current_bundled_app_archive_platform(const BundledAppDefinition *app
 #else
     char architecture[64];
     if (!remote_machine_architecture(architecture, sizeof(architecture))) return false;
-    if (strcmp(architecture, "aarch64") == 0) {
-        snprintf(out, out_size, "linux-aarch64");
-        return true;
-    }
-    if (strcmp(architecture, "x86_64") == 0) {
-        snprintf(out, out_size, "linux-x86_64");
-        return true;
-    }
-    return false;
+    if (strcmp(architecture, "aarch64") != 0 && strcmp(architecture, "x86_64") != 0) return false;
+    snprintf(out, out_size, "linux-%s%s", architecture, remote_machine_uses_musl() ? "-musl" : "");
+    return true;
 #endif
 }
 
@@ -632,7 +653,7 @@ static bool bundled_app_stage_has_expected_files(const BundledAppDefinition *app
     char architecture[64];
     if (!remote_machine_architecture(architecture, sizeof(architecture))) return false;
     char linux_binary[PATH_MAX];
-    snprintf(linux_binary, sizeof(linux_binary), "%s/RemoteLinuxBinaries/%s/%s", stage_root, architecture, app->binary_name);
+    snprintf(linux_binary, sizeof(linux_binary), "%s/%s/%s/%s", stage_root, remote_linux_binary_directory(), architecture, app->binary_name);
     return stat(linux_binary, &st) == 0 && S_ISREG(st.st_mode);
 #endif
 }
@@ -807,7 +828,7 @@ static bool stage_home_screen_installer(char *script_path, size_t script_path_si
         return false;
     }
     char linux_archive_name[128];
-    snprintf(linux_archive_name, sizeof(linux_archive_name), "outer-shell-linux-%s.tar.gz", architecture);
+    snprintf(linux_archive_name, sizeof(linux_archive_name), "outer-shell-linux-%s%s.tar.gz", architecture, remote_machine_uses_musl() ? "-musl" : "");
     const char *archive_name = linux_archive_name;
 #endif
     snprintf(archive_path, archive_path_size, "%s/%s", cache_root, archive_name);

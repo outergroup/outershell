@@ -61,6 +61,22 @@ Then open:
 http://127.0.0.1:7354/
 ```
 
+## Deploy From This Checkout
+
+Configure an SSH target once, then build and install Outer Shell with the same
+task-runner workflow used by generated native apps:
+
+```bash
+./app target "ssh -p 22 you@server"
+./app deploy
+```
+
+`target.env` is gitignored. `./app deploy` probes the target operating system
+and CPU architecture, builds a static-musl package for Linux (or the matching
+macOS package), streams it over the configured SSH command, and runs the normal
+Outer Shell installer with the locally built archive. Run `./app help` for
+frontend-only push, status, logs, SSH, uninstall, and clean commands.
+
 ## Registry And Installed Files
 
 Outer Shell stores its registry as an `.orwa` file. The default user registry is:
@@ -97,8 +113,9 @@ See:
   commands.
 
 Installed app payloads are copied into user or root locations appropriate for the
-platform, registered with `outershelld`, and launched through launchd on macOS or
-systemd on Linux.
+platform, registered with `outershelld`, and launched through launchd on macOS,
+systemd where it is operational, or the portable internal manager on init-less
+Unix/container hosts.
 
 ## Release Packaging
 
@@ -118,13 +135,32 @@ build/release/outer-shell/latest/install.sh
 build/release/outer-shell/latest/version.txt
 build/release/outer-shell/latest/outer-shell-linux-aarch64.tar.gz
 build/release/outer-shell/latest/outer-shell-linux-x86_64.tar.gz
+build/release/outer-shell/latest/outer-shell-linux-aarch64-musl.tar.gz
+build/release/outer-shell/latest/outer-shell-linux-x86_64-musl.tar.gz
 build/release/outer-shell/latest/outer-shell-macos-arm64.zip
 build/release/outer-shell/latest/outer-shell-macos-x86_64.zip
 build/release/outer-shell/app-catalog.json
 ```
 
+The musl archives are statically linked and are selected automatically on
+Alpine and other musl-based Linux systems. See [outerservice.md](outerservice.md)
+for the internal manager and portable service format.
+
 Publishing to a website, object storage, or CDN is intentionally handled outside
 this repository.
+
+## Tests
+
+Run the focused daemon integration tests with:
+
+```bash
+./Scripts/test_bundled_app_control.sh
+./Scripts/test_outerservice.sh
+```
+
+The first test covers the `outerctl bundled-app` request path. The second
+covers `.outerservice` parsing, dynamic service loading, socket activation,
+restart behavior, essential-service exits, and shutdown.
 
 ## Related Documentation
 

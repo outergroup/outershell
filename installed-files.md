@@ -78,6 +78,11 @@ Linux public install:
 - `<user-runtime>/org.outershell.OuterShell`
 - `<user-runtime>/outershelld-api`
 
+When the portable internal manager is selected, the four user systemd unit/socket files above are replaced by:
+
+- `<user-state>/outershelld/services/org.outershell.OuterShell.outerservice`
+- `<user-state>/outershelld/outershelld.pid`
+
 Linux public install when connected directly as root:
 
 - `<system-state>/outer-shell/OuterShellBackend`
@@ -98,6 +103,11 @@ Linux public install when connected directly as root:
 - `<system-state>/system-binary-users/uid-0`
 - `<system-cache>/outer-shell/install/` for downloaded public install/update artifacts while install or update is in progress
 - `<system-cache>/outer-shell/bundled-apps/` for downloaded bundled app staging while install is in progress
+
+When the portable internal manager is selected, the four systemd unit/socket files above are replaced by:
+
+- `<system-state>/outershelld/services/org.outershell.OuterShell.outerservice`
+- `<system-state>/outershelld/outershelld.pid`
 
 In this direct-root Linux mode, Outer Shell treats bundled app installs as system installs. It should not create `/root/.local/state/outershell` or `$HOME/.config/systemd/user` units for the root account.
 
@@ -177,6 +187,10 @@ Linux user install:
 - `$HOME/.config/systemd/user/<service-id>.socket` for socket-activated apps
 - `<user-runtime>/<service-id>` for socket-activated apps
 
+With the portable internal manager, the systemd service/socket files are replaced by
+`<user-state>/outershelld/services/<service-id>.outerservice`. `outershelld` adds,
+updates, and removes that definition live without restarting unrelated apps.
+
 Linux root install:
 
 - `/opt/outershell/<service-id>/<binary-name>`
@@ -190,6 +204,10 @@ Linux root install:
 - `<system-state>/apps/<service-id>` for root service state, exposed to the app as `OUTERSHELL_SERVICE_STATE_DIR`
 - `/run/<service-id>` for socket-activated apps
 - `<system-state>/system-binary-users/root-apps`
+
+With the portable internal manager, the systemd service/socket files are replaced by
+`<system-state>/outershelld/services/<service-id>.outerservice`. The payload, log,
+state, and runtime socket paths remain the same.
 
 Linux root app services use `<system-state>/bin/outerctl` directly. A root install initiated from a non-root Outer Shell session first installs Linux root support, then writes the root app systemd unit with `OUTERCTL_PATH=<system-state>/bin/outerctl`.
 
