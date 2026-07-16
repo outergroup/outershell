@@ -44,6 +44,7 @@ private struct BackendRecord: Decodable {
     let launchdPlistPath: String
     let ownsLaunchdPlist: Bool
     let menuBarVisibilityEnabled: Bool?
+    let menuBarVisibilityAvailable: Bool
     let frontends: [FrontendRecord]
     let logFiles: [LogFileRecord]
 
@@ -295,6 +296,7 @@ private extension BackendRecord {
                              launchdPlistPath: try reader.stringRef(at: 56),
                              ownsLaunchdPlist: (flags & 0x20) != 0,
                              menuBarVisibilityEnabled: (flags & 0x200) != 0,
+                             menuBarVisibilityAvailable: (flags & 0x400) != 0,
                              frontends: try reader.child(at: 68).payloadArray().map(FrontendRecord.decodeBinary),
                              logFiles: try reader.child(at: 76).payloadArray().map(LogFileRecord.decodeBinary))
     }
@@ -5329,6 +5331,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                  launchdPlistPath: backend.launchdPlistPath,
                                  ownsLaunchdPlist: backend.ownsLaunchdPlist,
                                  menuBarVisibilityEnabled: backend.menuBarVisibilityEnabled,
+                                 menuBarVisibilityAvailable: backend.menuBarVisibilityAvailable,
                                  frontends: backend.frontends,
                                  logFiles: backend.logFiles)
         }
@@ -5372,6 +5375,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                  launchdPlistPath: backend.launchdPlistPath,
                                  ownsLaunchdPlist: backend.ownsLaunchdPlist,
                                  menuBarVisibilityEnabled: backend.menuBarVisibilityEnabled,
+                                 menuBarVisibilityAvailable: backend.menuBarVisibilityAvailable,
                                  frontends: frontends,
                                  logFiles: backend.logFiles)
         }
@@ -8900,6 +8904,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                              launchdPlistPath: "",
                              ownsLaunchdPlist: true,
                              menuBarVisibilityEnabled: nil,
+                             menuBarVisibilityAvailable: false,
                              frontends: [],
                              logFiles: [])
     }
@@ -9435,11 +9440,13 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             items.append(OuterframeContextMenuItem(id: "showLogs",
                                                    title: "View Logs for Outer Shell",
                                                    isEnabled: true))
-            operationByItemID["menuBarVisibility"] = "toggleMenuBarVisibility"
-            items.append(OuterframeContextMenuItem(id: "menuBarVisibility",
-                                                   title: "Show in macOS menu bar when backends are running",
-                                                   isEnabled: true,
-                                                   state: (backend.menuBarVisibilityEnabled ?? true) ? .on : .off))
+            if backend.menuBarVisibilityAvailable {
+                operationByItemID["menuBarVisibility"] = "toggleMenuBarVisibility"
+                items.append(OuterframeContextMenuItem(id: "menuBarVisibility",
+                                                       title: "Show in macOS menu bar when backends are running",
+                                                       isEnabled: true,
+                                                       state: (backend.menuBarVisibilityEnabled ?? true) ? .on : .off))
+            }
             operationByItemID["checkUpdate"] = "checkUpdate"
             items.append(OuterframeContextMenuItem(id: "checkUpdate",
                                                    title: "Check for Updates",
