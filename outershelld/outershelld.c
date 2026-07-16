@@ -1118,6 +1118,14 @@ static bool set_agent_menu_bar_visibility(bool enabled) {
     return true;
 }
 
+static bool agent_menu_bar_visibility_available(void) {
+#ifdef __APPLE__
+    return g_menu_bar_visibility_callback != NULL;
+#else
+    return false;
+#endif
+}
+
 static bool get_agent_menu_bar_visibility(void) {
     if (!g_menu_bar_visibility_getter) return true;
     return g_menu_bar_visibility_getter() != 0;
@@ -5028,6 +5036,7 @@ static bool lookup_launchd_backend_any_for_scope(const char *service_id,
 #define BACKEND_FLAG_ROOT_ONLY 0x80u
 #define BACKEND_FLAG_HAS_ROOT_SUPPORT 0x100u
 #define BACKEND_FLAG_MENU_BAR_VISIBILITY_ENABLED 0x200u
+#define BACKEND_FLAG_MENU_BAR_VISIBILITY_AVAILABLE 0x400u
 #define LOG_FILE_FLAG_READABLE 0x01u
 #define FILE_PICKER_FLAG_IS_DIRECTORY 0x01u
 #define ACTION_FLAG_OK 0x01u
@@ -5347,7 +5356,10 @@ static bool append_registered_backend_payloads(const RegistryStore *database,
         if (is_self) {
             installed_home_screen_version(installed_version, sizeof(installed_version));
             flags |= BACKEND_FLAG_CAN_UNINSTALL;
-            if (get_agent_menu_bar_visibility()) flags |= BACKEND_FLAG_MENU_BAR_VISIBILITY_ENABLED;
+            if (agent_menu_bar_visibility_available()) {
+                flags |= BACKEND_FLAG_MENU_BAR_VISIBILITY_AVAILABLE;
+                if (get_agent_menu_bar_visibility()) flags |= BACKEND_FLAG_MENU_BAR_VISIBILITY_ENABLED;
+            }
             if (home_screen_update_available(available_version, sizeof(available_version))) {
                 snprintf(status, sizeof(status), "update available");
             }
@@ -5937,19 +5949,17 @@ static void send_control_response(int fd, const char *query, const char *body) {
                 if (ok) mark_backend_event_changed();
                 send_action_response_ex(fd, ok ? 200 : (needs_password ? 401 : 500), ok, message, needs_password);
                 return;
-            } else {
-#else
-            if (strcmp(installer_command, "uninstall") == 0) {
-                unlink_advertised_home_screen_socket();
             }
 #endif
-                ok = run_home_screen_install_script(installer_command,
-                                                    installer_script_path,
-                                                    installer_archive_path,
-                                                    remove_user_state,
-                                                    message,
-                                                    sizeof(message));
-#ifdef __APPLE__
+            ok = run_home_screen_install_script(installer_command,
+                                                installer_script_path,
+                                                installer_archive_path,
+                                                remove_user_state,
+                                                message,
+                                                sizeof(message));
+#ifndef __APPLE__
+            if (ok && strcmp(installer_command, "uninstall") == 0) {
+                unlink_advertised_home_screen_socket();
             }
 #endif
             log_event("%s Outer Shell %s: %s", ok ? "Completed" : "Failed", installer_command, message);
@@ -6547,6 +6557,99 @@ static bool run_home_screen_install_script(const char *subcommand,
 
 #ifdef __linux__
     if (strcmp(subcommand, "update") == 0 || strcmp(subcommand, "uninstall") == 0) {
+        if (g_internal_service_manager) {
+            char detached_command[10000];
+            int written = snprintf(detached_command,
+                                   sizeof(detached_command),
+                                   "sleep 0.2; %s",
+                                   command);
+            if (written < 0 || (size_t)written >= sizeof(detached_command)) {
+                snprintf(message, message_size, "Failed to start Outer Shell %s: %s", subcommand, strerror(E2BIG));
+                return false;
+            }
+            int error_pipe[2] = {-1, -1};
+            if (pipe(error_pipe) != 0) {
+                snprintf(message, message_size, "Failed to start Outer Shell %s: %s", subcommand, strerror(errno));
+                return false;
+            }
+            int descriptor_flags = fcntl(error_pipe[1], F_GETFD);
+            if (descriptor_flags < 0 || fcntl(error_pipe[1], F_SETFD, descriptor_flags | FD_CLOEXEC) != 0) {
+                int saved_errno = errno;
+                close(error_pipe[0]);
+                close(error_pipe[1]);
+                snprintf(message, message_size, "Failed to start Outer Shell %s: %s", subcommand, strerror(saved_errno));
+                return false;
+            }
+
+            pid_t launcher_pid = fork();
+            if (launcher_pid < 0) {
+                int saved_errno = errno;
+                close(error_pipe[0]);
+                close(error_pipe[1]);
+                snprintf(message, message_size, "Failed to start Outer Shell %s: %s", subcommand, strerror(saved_errno));
+                return false;
+            }
+            if (launcher_pid == 0) {
+                close(error_pipe[0]);
+                if (setsid() < 0) {
+                    int launch_errno = errno;
+                    (void)write(error_pipe[1], &launch_errno, sizeof(launch_errno));
+                    _exit(127);
+                }
+                pid_t installer_pid = fork();
+                if (installer_pid < 0) {
+                    int launch_errno = errno;
+                    (void)write(error_pipe[1], &launch_errno, sizeof(launch_errno));
+                    _exit(127);
+                }
+                if (installer_pid > 0) {
+                    _exit(0);
+                }
+
+                int null_fd = open("/dev/null", O_RDONLY);
+                if (null_fd >= 0) {
+                    (void)dup2(null_fd, STDIN_FILENO);
+                    if (null_fd != STDIN_FILENO) close(null_fd);
+                }
+                execl("/bin/sh", "sh", "-c", detached_command, (char *)NULL);
+                int launch_errno = errno;
+                (void)write(error_pipe[1], &launch_errno, sizeof(launch_errno));
+                _exit(127);
+            }
+
+            close(error_pipe[1]);
+            int launcher_status = 0;
+            while (waitpid(launcher_pid, &launcher_status, 0) < 0) {
+                if (errno == EINTR) continue;
+                launcher_status = -1;
+                break;
+            }
+            int launch_errno = 0;
+            size_t error_bytes = 0;
+            while (error_bytes < sizeof(launch_errno)) {
+                ssize_t bytes_read = read(error_pipe[0],
+                                          (unsigned char *)&launch_errno + error_bytes,
+                                          sizeof(launch_errno) - error_bytes);
+                if (bytes_read > 0) {
+                    error_bytes += (size_t)bytes_read;
+                    continue;
+                }
+                if (bytes_read < 0 && errno == EINTR) continue;
+                break;
+            }
+            close(error_pipe[0]);
+            if (error_bytes > 0) {
+                snprintf(message, message_size, "Failed to start Outer Shell %s: %s", subcommand, strerror(launch_errno));
+                return false;
+            }
+            if (launcher_status == -1 || !WIFEXITED(launcher_status) || WEXITSTATUS(launcher_status) != 0) {
+                snprintf(message, message_size, "Failed to start Outer Shell %s.", subcommand);
+                return false;
+            }
+            snprintf(message, message_size, "Outer Shell %s started.", subcommand);
+            return true;
+        }
+
         char quoted_command[18000];
         shell_quote(command, quoted_command, sizeof(quoted_command));
         const char *scope = (geteuid() == 0) ? "--system" : "--user";
@@ -6642,6 +6745,21 @@ static bool run_home_screen_install_script(const char *subcommand,
     if (!message[0]) snprintf(message, message_size, "Outer Shell %s failed.", subcommand);
     return false;
 }
+
+#ifdef OUTER_SHELL_LIFECYCLE_TESTING
+bool outer_shell_test_run_internal_lifecycle_script(const char *subcommand,
+                                                    const char *script_path,
+                                                    char *message,
+                                                    size_t message_size) {
+    g_internal_service_manager = true;
+    return run_home_screen_install_script(subcommand,
+                                          script_path,
+                                          "",
+                                          false,
+                                          message,
+                                          message_size);
+}
+#endif
 
 static bool sudo_failure_needs_password(const char *output, int exit_status) {
     if (exit_status == 0) return false;
