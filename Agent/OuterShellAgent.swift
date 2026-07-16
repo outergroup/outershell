@@ -880,6 +880,10 @@ private final class OuterShellAgentDelegate: NSObject, NSApplicationDelegate, NS
             args.append("--bundles-dir")
             args.append(defaultBundlesPath())
         }
+        if !containsOption(args, "--web-root") {
+            args.append("--web-root")
+            args.append(defaultWebRootPath())
+        }
         if !containsOption(args, "--bundled-apps-dir") && !containsOption(args, "--app-base-url") {
             args.append("--bundled-apps-dir")
             args.append(defaultBundledAppsPath())
@@ -1476,6 +1480,14 @@ private func defaultBundlesPath() -> String {
         return resourcePath
     }
     return (FileManager.default.currentDirectoryPath as NSString).appendingPathComponent("build/run/bundles")
+}
+
+private func defaultWebRootPath() -> String {
+    if let resourcePath = Bundle.main.resourceURL?.appendingPathComponent("web").path,
+       FileManager.default.fileExists(atPath: resourcePath) {
+        return resourcePath
+    }
+    return (FileManager.default.currentDirectoryPath as NSString).appendingPathComponent("Resources/OuterShellWeb")
 }
 
 private func defaultBundledAppsPath() -> String {

@@ -24,6 +24,8 @@ repositories and publish their own payload archives.
 - `outerctl`: the small command-line client used by installers and apps to update
   the registry through `outershelld`.
 - `Outer Shell` Xcode target: the Outerframe frontend bundle for the Outer Shell UI.
+- `Resources/OuterShellWeb`: the HTML and JavaScript frontend served to clients
+  that do not advertise native Outerframe support.
 - `Resources/app-catalog.example.json`: the app catalog schema used to discover
   installable starter apps.
 
@@ -60,6 +62,11 @@ Then open:
 ```text
 http://127.0.0.1:7354/
 ```
+
+Top-level requests use the cross-platform negotiation header. Clients sending
+`Outerframe-Accept: application/vnd.outerframe` receive the compiled native
+descriptor; ordinary browsers receive the web frontend. Both frontends use the
+same `/api/*` operations and therefore see and control the same apps.
 
 ## Deploy From This Checkout
 

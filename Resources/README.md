@@ -19,6 +19,10 @@ OuterShell/
     org.outershell.OuterShell/
       OuterShellBackend                 # Linux archives
       app-icon.png                      # Linux archives
+      web/                              # HTML/JavaScript Outer Shell frontend
+        index.html
+        style.css
+        app.js
       bundles/
         OuterShell.bundle.macos-arm.aar
         OuterShell.bundle.macos-x86.aar
@@ -27,6 +31,7 @@ OuterShell/
           MacOS/Outer Shell
           Resources/
             app-icon.png
+            web/                        # HTML/JavaScript Outer Shell frontend
             bundles/
               OuterShell.bundle.macos-arm.aar
               OuterShell.bundle.macos-x86.aar

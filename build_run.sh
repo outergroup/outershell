@@ -67,6 +67,9 @@ cp "${SCRIPT_DIR}/app-icon.png" \
     "${BUILD_ROOT}/${CONFIGURATION}/Outer Shell.app/Contents/Resources/app-icon.png"
 cp "${SCRIPT_DIR}/OuterShell.icns" \
     "${BUILD_ROOT}/${CONFIGURATION}/Outer Shell.app/Contents/Resources/OuterShell.icns"
+rm -rf "${BUILD_ROOT}/${CONFIGURATION}/Outer Shell.app/Contents/Resources/web"
+cp -R "${SCRIPT_DIR}/Resources/OuterShellWeb" \
+    "${BUILD_ROOT}/${CONFIGURATION}/Outer Shell.app/Contents/Resources/web"
 rm -rf "${BUILD_ROOT}/${CONFIGURATION}/Outer Shell.app/Contents/Resources/bundled-apps"
 
 echo "Built:"
@@ -77,5 +80,5 @@ echo
 echo "Run:"
 echo "  API_SOCKET=\"$(getconf DARWIN_USER_TEMP_DIR)outershelld-api\""
 echo "  \"${BUILD_ROOT}/${CONFIGURATION}/outershelld\" --api-socket-path \"\$API_SOCKET\" &"
-echo "  clang -std=gnu17 -DOUTER_SHELL_BACKEND_STANDALONE=1 Backend/OuterShellBuffer.c Backend/OuterShellAPI.c Backend/OuterShellPlatform.c Backend/OuterShellDownloaderApple.m Backend/OuterShellBackend.c -framework Foundation -o /tmp/OuterShellBackend && /tmp/OuterShellBackend --port 7354 --api-socket-path \"\$API_SOCKET\" --bundles-dir \"${RUN_ROOT}/bundles\" --native-app-template-dir \"${SCRIPT_DIR}/Resources/NativeAppTemplate\""
+echo "  clang -std=gnu17 -DOUTER_SHELL_BACKEND_STANDALONE=1 Backend/OuterShellBuffer.c Backend/OuterShellAPI.c Backend/OuterShellPlatform.c Backend/OuterShellDownloaderApple.m Backend/OuterShellBackend.c -framework Foundation -o /tmp/OuterShellBackend && /tmp/OuterShellBackend --port 7354 --api-socket-path \"\$API_SOCKET\" --bundles-dir \"${RUN_ROOT}/bundles\" --web-root \"${SCRIPT_DIR}/Resources/OuterShellWeb\" --native-app-template-dir \"${SCRIPT_DIR}/Resources/NativeAppTemplate\""
 echo "  \"${BUILD_ROOT}/${CONFIGURATION}/Outer Shell.app/Contents/MacOS/Outer Shell\" --socket-path \"$(getconf DARWIN_USER_TEMP_DIR)org.outershell.OuterShell\" --app-base-url \"https://outershell.org/outer-shell/apps\""

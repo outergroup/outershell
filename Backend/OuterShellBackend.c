@@ -139,6 +139,7 @@ static char g_bundle_file_path_macos_arm[PATH_MAX] = "";
 static char g_bundle_file_path_macos_x86[PATH_MAX] = "";
 static char g_bundled_apps_directory[PATH_MAX] = "";
 static char g_native_app_template_directory[PATH_MAX] = "";
+static char g_web_root_directory[PATH_MAX] = "";
 static char g_bundled_apps_base_url[2048] = "";
 static char g_home_screen_public_base_url[2048] = "";
 static char g_listen_socket_path[PATH_MAX] = "";
@@ -285,6 +286,7 @@ static void send_response(int fd, int status, const char *status_text, const cha
                               "Content-Length: %zu\r\n"
                               "Connection: close\r\n"
                               "Cache-Control: no-store\r\n"
+                              "Vary: Outerframe-Accept\r\n"
                               "\r\n",
                               status, status_text, content_type, body_len);
     if (header_len > 0 && (size_t)header_len < sizeof(header)) {
@@ -981,6 +983,54 @@ static void send_bundle_file(int fd, const char *path) {
     free(data);
 }
 
+static void send_web_file(int fd, const char *filename, const char *content_type) {
+    if (!g_web_root_directory[0]) {
+        send_text_response(fd, 404, "Outer Shell web frontend is not installed.\n");
+        return;
+    }
+    if (!filename || !filename[0] || strchr(filename, '/') || strstr(filename, "..")) {
+        send_text_response(fd, 404, "not found\n");
+        return;
+    }
+
+    char path[PATH_MAX];
+    append_path_component(path, sizeof(path), g_web_root_directory, filename);
+    int file_fd = open(path, O_RDONLY);
+    if (file_fd < 0) {
+        send_text_response(fd, 404, "not found\n");
+        return;
+    }
+    struct stat st;
+    if (fstat(file_fd, &st) != 0 || st.st_size < 0 || !S_ISREG(st.st_mode)) {
+        close(file_fd);
+        send_text_response(fd, 404, "not found\n");
+        return;
+    }
+    size_t size = (size_t)st.st_size;
+    unsigned char *data = malloc(size > 0 ? size : 1);
+    if (!data) {
+        close(file_fd);
+        send_text_response(fd, 500, "out of memory\n");
+        return;
+    }
+    size_t offset = 0;
+    while (offset < size) {
+        ssize_t got = read(file_fd, data + offset, size - offset);
+        if (got < 0) {
+            if (errno == EINTR) continue;
+            free(data);
+            close(file_fd);
+            send_text_response(fd, 500, "failed to read web frontend\n");
+            return;
+        }
+        if (got == 0) break;
+        offset += (size_t)got;
+    }
+    close(file_fd);
+    send_response(fd, 200, "OK", content_type, data, offset);
+    free(data);
+}
+
 static bool archive_append_u16(StringBuilder *archive, uint16_t value) {
     unsigned char bytes[2];
     write_uint16_le(bytes, value);
@@ -1303,6 +1353,32 @@ static bool is_navigator_route(const char *target) {
            strcmp(target, "/backends.outer") == 0;
 }
 
+static bool request_accepts_outerframe(const char *request, size_t header_length) {
+    const char *header_name = "Outerframe-Accept:";
+    size_t header_name_length = strlen(header_name);
+    const char *cursor = request;
+    const char *end = request + header_length;
+    while (cursor < end) {
+        const char *line_end = strstr(cursor, "\r\n");
+        if (!line_end || line_end > end) line_end = end;
+        if ((size_t)(line_end - cursor) >= header_name_length &&
+            strncasecmp(cursor, header_name, header_name_length) == 0) {
+            const char *value = cursor + header_name_length;
+            while (value < line_end && isspace((unsigned char)*value)) value++;
+            size_t value_length = (size_t)(line_end - value);
+            const char *media_type = "application/vnd.outerframe";
+            size_t media_type_length = strlen(media_type);
+            for (size_t i = 0; i + media_type_length <= value_length; i++) {
+                if (strncasecmp(value + i, media_type, media_type_length) == 0) return true;
+            }
+            return false;
+        }
+        if (line_end >= end) break;
+        cursor = line_end + 2;
+    }
+    return false;
+}
+
 static bool parsed_content_length(const char *request,
                                   size_t header_length,
                                   size_t *content_length) {
@@ -1547,7 +1623,15 @@ static bool process_http_client_request(ReactorClient *client, char *request, si
     } else if (strcmp(target, "/api/native-app-template") == 0) {
         send_native_app_template_archive(fd);
     } else if (is_navigator_route(target)) {
-        send_outer_descriptor(fd);
+        if (strcmp(target, "/backends.outer") == 0 || request_accepts_outerframe(request, header_length)) {
+            send_outer_descriptor(fd);
+        } else {
+            send_web_file(fd, "index.html", "text/html; charset=utf-8");
+        }
+    } else if (strcmp(target, "/web/style.css") == 0) {
+        send_web_file(fd, "style.css", "text/css; charset=utf-8");
+    } else if (strcmp(target, "/web/app.js") == 0) {
+        send_web_file(fd, "app.js", "text/javascript; charset=utf-8");
     } else {
         char bundle_path[PATH_MAX];
         char bundle_path_macos_arm[PATH_MAX];
@@ -1951,7 +2035,7 @@ static void run_http_reactor(int listener) {
 }
 
 static void outer_shell_backend_usage(const char *program) {
-    fprintf(stderr, "Usage: %s [--port PORT | --socket-path PATH] [--api-socket-path PATH] [--launchd-socket-name NAME] [--bundles-dir DIR] [--native-app-template-dir DIR] [--stay-alive]\n", program);
+    fprintf(stderr, "Usage: %s [--port PORT | --socket-path PATH] [--api-socket-path PATH] [--launchd-socket-name NAME] [--bundles-dir DIR] [--web-root DIR] [--native-app-template-dir DIR] [--stay-alive]\n", program);
 }
 
 static void initialize_runtime_paths(char *api_socket_path, size_t api_socket_path_size) {
@@ -1990,6 +2074,8 @@ int OuterShellBackendMain(int argc, char **argv) {
             snprintf(launchd_socket_name, sizeof(launchd_socket_name), "%s", argv[++i]);
         } else if (strcmp(argv[i], "--bundles-dir") == 0 && i + 1 < argc) {
             bundles_dir = argv[++i];
+        } else if (strcmp(argv[i], "--web-root") == 0 && i + 1 < argc) {
+            expand_tilde_path(argv[++i], g_web_root_directory, sizeof(g_web_root_directory));
         } else if (strcmp(argv[i], "--native-app-template-dir") == 0 && i + 1 < argc) {
             expand_tilde_path(argv[++i], g_native_app_template_directory, sizeof(g_native_app_template_directory));
         } else if (strcmp(argv[i], "--bundled-apps-dir") == 0 && i + 1 < argc) {

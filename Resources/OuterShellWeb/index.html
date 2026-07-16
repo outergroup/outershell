@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light dark">
+  <meta name="theme-color" content="#f4f4f2" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#171816" media="(prefers-color-scheme: dark)">
+  <title>Outer Shell</title>
+  <link rel="stylesheet" href="/web/style.css">
+</head>
+<body>
+  <div id="app" class="shell" aria-busy="true">
+    <main>
+      <div class="page-tools">
+        <button id="refresh-button" class="home-menu-button" type="button" aria-label="Refresh apps" title="Refresh apps">⋯</button>
+      </div>
+      <button id="add-button" type="button" hidden>Add app</button>
+      <label class="visually-hidden" for="search-input">Search apps</label>
+      <input id="search-input" type="search" hidden>
+      <p id="app-summary" class="visually-hidden">Loading the apps registered with Outer Shell…</p>
+      <section id="status-banner" class="status-banner" hidden></section>
+      <div id="app-sections" class="app-sections" aria-live="polite"></div>
+      <section id="empty-state" class="empty-state" hidden>
+        <div class="empty-glyph" aria-hidden="true">⌘</div>
+        <h2>No apps here yet</h2>
+        <p>Install a bundled app or turn a Bash command into one.</p>
+        <button class="primary-button" type="button" data-action="open-add">Add an app</button>
+      </section>
+    </main>
+  </div>
+
+  <div id="dialog-layer"></div>
+  <div id="toast-region" class="toast-region" aria-live="polite" aria-atomic="true"></div>
+
+  <template id="dialog-template">
+    <div class="dialog-backdrop" data-action="close-dialog">
+      <section class="dialog" role="dialog" aria-modal="true" aria-labelledby="dialog-title"></section>
+    </div>
+  </template>
+
+  <script src="/web/app.js" defer></script>
+</body>
+</html>
