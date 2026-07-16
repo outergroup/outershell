@@ -871,6 +871,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private let installOverlayLayer = CALayer()
     private let updateOverlayLayer = CALayer()
     private let aboutOverlayLayer = CALayer()
+    private let aboutSelectionLayer = CALayer()
     private let passwordOverlayLayer = CALayer()
     private let filePickerOverlayLayer = CALayer()
     private let filePickerListLayer = CALayer()
@@ -3062,6 +3063,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         aboutOverlayLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
         guard let backend = pendingAboutBackend else {
             aboutOverlayLayer.isHidden = true
+            aboutSelectionLayer.removeFromSuperlayer()
+            aboutSelectionLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
             aboutPanelFrame = .zero
             aboutDoneFrame = .zero
             aboutTextFrame = .zero
@@ -3107,7 +3110,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         textBackground.borderColor = resolvedCGColor(.separatorColor)
         panel.addSublayer(textBackground)
 
-        renderAboutSelection(in: textBackground)
+        aboutSelectionLayer.frame = textBackground.bounds
+        textBackground.addSublayer(aboutSelectionLayer)
+        updateAboutSelectionLayers()
         renderAboutTextLines(in: textBackground)
 
         let done = makeButtonLayer(title: "Done", emphasized: true)
@@ -3129,6 +3134,13 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                 height: lineHeight)
             text.font = font
             layer.addSublayer(text)
+        }
+    }
+
+    private func updateAboutSelectionLayers() {
+        withoutImplicitAnimations {
+            aboutSelectionLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
+            renderAboutSelection(in: aboutSelectionLayer)
         }
     }
 
@@ -7083,9 +7095,11 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func setAboutSelectionRange(_ range: NSRange?) {
-        aboutSelectionRange = normalizedAboutSelectionRange(range)
+        let nextRange = normalizedAboutSelectionRange(range)
+        guard nextRange != aboutSelectionRange else { return }
+        aboutSelectionRange = nextRange
+        updateAboutSelectionLayers()
         updateEditingAndPasteboardState()
-        updateLayout()
     }
 
     private func selectedAboutAttributedText() -> NSAttributedString? {
@@ -7171,12 +7185,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         }
         if let wordRange = aboutWordRange(containing: offset),
            wordRange.length > 0 {
-            aboutSelectionRange = wordRange
+            setAboutSelectionRange(wordRange)
         } else {
-            aboutSelectionRange = NSRange(location: 0, length: (renderedAboutText as NSString).length)
+            setAboutSelectionRange(NSRange(location: 0, length: (renderedAboutText as NSString).length))
         }
-        updateEditingAndPasteboardState()
-        updateLayout()
         if let selectedText = selectedAboutAttributedText() {
             outerframeHost.showContextMenu(for: selectedText, at: point)
         }
