@@ -66,6 +66,7 @@ static void send_response(int fd,
                                  "HTTP/1.1 %d %s\r\n"
                                  "Content-Type: %s\r\n"
                                  "Content-Length: %zu\r\n"
+                                 "Vary: Outerframe-Accept\r\n"
                                  "Connection: close\r\n"
                                  "\r\n",
                                  status,
@@ -157,6 +158,58 @@ static void serve_file(int fd, const char *path, const char *content_type) {
     }
     send_response(fd, 200, "OK", content_type, body, body_length);
     free(body);
+}
+
+static bool regular_file_exists(const char *path) {
+    struct stat st;
+    return stat(path, &st) == 0 && S_ISREG(st.st_mode);
+}
+
+static bool value_contains_case_insensitive(const char *value,
+                                            size_t value_length,
+                                            const char *needle) {
+    size_t needle_length = strlen(needle);
+    if (needle_length == 0 || value_length < needle_length) return false;
+    for (size_t i = 0; i + needle_length <= value_length; i++) {
+        if (strncasecmp(value + i, needle, needle_length) == 0) return true;
+    }
+    return false;
+}
+
+static bool request_accepts_outerframe(const char *request) {
+    const char *line = strstr(request, "\r\n");
+    while (line) {
+        line += 2;
+        if (line[0] == '\r' && line[1] == '\n') break;
+        const char *end = strstr(line, "\r\n");
+        if (!end) break;
+        const char *colon = memchr(line, ':', (size_t)(end - line));
+        if (colon && (size_t)(colon - line) == strlen("Outerframe-Accept") &&
+            strncasecmp(line, "Outerframe-Accept", strlen("Outerframe-Accept")) == 0) {
+            const char *value = colon + 1;
+            while (value < end && (*value == ' ' || *value == '\t')) value++;
+            return value_contains_case_insensitive(value,
+                                                   (size_t)(end - value),
+                                                   "application/vnd.outerframe");
+        }
+        line = end;
+    }
+    return false;
+}
+
+static const char *content_type_for_path(const char *path) {
+    const char *extension = strrchr(path, '.');
+    if (!extension) return "application/octet-stream";
+    if (strcasecmp(extension, ".html") == 0) return "text/html; charset=utf-8";
+    if (strcasecmp(extension, ".css") == 0) return "text/css; charset=utf-8";
+    if (strcasecmp(extension, ".js") == 0) return "text/javascript; charset=utf-8";
+    if (strcasecmp(extension, ".svg") == 0) return "image/svg+xml";
+    if (strcasecmp(extension, ".png") == 0) return "image/png";
+    if (strcasecmp(extension, ".jpg") == 0 || strcasecmp(extension, ".jpeg") == 0) return "image/jpeg";
+    if (strcasecmp(extension, ".webp") == 0) return "image/webp";
+    if (strcasecmp(extension, ".ico") == 0) return "image/x-icon";
+    if (strcasecmp(extension, ".json") == 0) return "application/json";
+    return "application/octet-stream";
 }
 
 static const char *platform_os(void) {
@@ -269,12 +322,24 @@ static void handle_client(int fd, const char *root) {
         send_text(fd, 405, "Method Not Allowed", "method not allowed\n");
         return;
     }
-    const char *request_path = origin_form_path(path);
+    char *request_path = (char *)origin_form_path(path);
+    char *query = strpbrk(request_path, "?#");
+    if (query) *query = '\0';
 
     if (strcmp(request_path, "/") == 0) {
         char outer_path[PATH_MAX];
+        char html_path[PATH_MAX];
         snprintf(outer_path, sizeof(outer_path), "%s/app.outer", root);
-        serve_file(fd, outer_path, "application/vnd.outerframe");
+        snprintf(html_path, sizeof(html_path), "%s/web/index.html", root);
+        if (request_accepts_outerframe(request) && regular_file_exists(outer_path)) {
+            serve_file(fd, outer_path, "application/vnd.outerframe");
+        } else if (regular_file_exists(html_path)) {
+            serve_file(fd, html_path, "text/html; charset=utf-8");
+        } else if (regular_file_exists(outer_path)) {
+            send_text(fd, 406, "Not Acceptable", "This app requires an outerframe-aware browser.\n");
+        } else {
+            send_text(fd, 404, "Not Found", "not found\n");
+        }
         return;
     }
 
@@ -297,6 +362,16 @@ static void handle_client(int fd, const char *root) {
     if (strcmp(request_path, "/api/hello") == 0) {
         serve_hello(fd);
         return;
+    }
+
+    if (request_path[0] == '/' && request_path[1] != '\0' &&
+        !strstr(request_path, "..") && !strchr(request_path, '\\')) {
+        char web_path[PATH_MAX];
+        int length = snprintf(web_path, sizeof(web_path), "%s/web%s", root, request_path);
+        if (length > 0 && (size_t)length < sizeof(web_path) && regular_file_exists(web_path)) {
+            serve_file(fd, web_path, content_type_for_path(web_path));
+            return;
+        }
     }
 
     send_text(fd, 404, "Not Found", "not found\n");
@@ -333,6 +408,7 @@ static void executable_directory(char *out, size_t out_size, char **argv) {
 int main(int argc, char **argv) {
     const char *socket_path = argument_value(argc, argv, "--socket");
     int port = argument_int(argc, argv, "--port");
+    const char *host = argument_value(argc, argv, "--host");
     const char *root_arg = argument_value(argc, argv, "--root");
     char root[PATH_MAX];
 
@@ -344,9 +420,15 @@ int main(int argc, char **argv) {
     } else {
         executable_directory(root, sizeof(root), argv);
     }
+    if (!host || !host[0]) host = "127.0.0.1";
 
-    signal(SIGTERM, handle_signal);
-    signal(SIGINT, handle_signal);
+    struct sigaction action;
+    memset(&action, 0, sizeof(action));
+    action.sa_handler = handle_signal;
+    sigemptyset(&action.sa_mask);
+    if (sigaction(SIGTERM, &action, NULL) != 0 || sigaction(SIGINT, &action, NULL) != 0) {
+        fatal("sigaction: %s", strerror(errno));
+    }
 
     int listener = -1;
     if (socket_path) {
@@ -376,12 +458,14 @@ int main(int argc, char **argv) {
         struct sockaddr_in addr;
         memset(&addr, 0, sizeof(addr));
         addr.sin_family = AF_INET;
-        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        if (inet_pton(AF_INET, host, &addr.sin_addr) != 1) {
+            fatal("invalid IPv4 listen address: %s", host);
+        }
         addr.sin_port = htons((uint16_t)port);
         if (bind(listener, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
             fatal("bind port %d: %s", port, strerror(errno));
         }
-        fprintf(stderr, "listening on http://127.0.0.1:%d/, serving %s\n", port, root);
+        fprintf(stderr, "listening on http://%s:%d/, serving %s\n", host, port, root);
     }
 
     if (listen(listener, 32) != 0) {

@@ -13,16 +13,38 @@ cd "${ROOT}"
 # shellcheck source=app.env
 source "${ROOT}/app.env"
 BACKEND_EXECUTABLE_NAME="${BACKEND_EXECUTABLE_NAME:-${XCODE_SCHEME}Backend}"
+APP_TARGETS="${APP_TARGETS:-macos}"
+ISOLATION_MODE="${ISOLATION_MODE:-host}"
 
 BUILD_DIR="${ROOT}/build"
 PAYLOAD_DIR="${BUILD_DIR}/payload"
+ARTIFACTS_DIR="${ROOT}/artifacts"
 DERIVED_DATA_DIR="${BUILD_DIR}/DerivedData"
 LINUX_MATRIX_DIR="${BUILD_DIR}/linux-matrix"
 LOCAL_PORT="${LOCAL_PORT:-8787}"
+CONTAINER_IMAGE="outerframe-app-$(printf '%s' "${APP_ID}" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9._-]/-/g')"
 
 # Server-side locations. Must agree with deploy/app.service.in and the
 # deploy/remote-*.sh scripts.
 REMOTE_APP_DIR=".local/share/outershell-apps/${APP_ID}"   # relative to \$HOME
+REMOTE_CONTAINER_BUILD_DIR=".cache/outershell-container-build/${APP_ID}"
+
+target_enabled() {
+    [[ " ${APP_TARGETS} " == *" $1 "* ]]
+}
+
+validate_configuration() {
+    if ! target_enabled html && ! target_enabled macos; then
+        echo "error: APP_TARGETS must contain at least one supported platform (html or macos)" >&2
+        exit 1
+    fi
+    case "${ISOLATION_MODE}" in
+        container|host) ;;
+        *) echo "error: unsupported ISOLATION_MODE '${ISOLATION_MODE}'" >&2; exit 1 ;;
+    esac
+}
+
+validate_configuration
 
 # ---------------------------------------------------------------------------
 # SSH target
@@ -152,7 +174,7 @@ host_goarch() {
 }
 
 # ---------------------------------------------------------------------------
-# Frontend build (macOS bundle -> platform archives + .outer descriptor)
+# Platform builds
 # ---------------------------------------------------------------------------
 
 require_tool() {
@@ -181,7 +203,7 @@ archive_platform_bundle() {
     local source_bundle="$1"
     local platform="$2"
     local slice_arch="$3"
-    local archive_path="${PAYLOAD_DIR}/frontends/${platform}"
+    local archive_path="${ARTIFACTS_DIR}/frontends/${platform}"
 
     local temp_root temp_bundle executable_name executable_path executable_archs
     temp_root="$(mktemp -d)"
@@ -214,9 +236,13 @@ archive_platform_bundle() {
     rm -rf "${temp_root}"
 }
 
-cmd_build_frontend() {
+cmd_build_macos() {
+    if ! target_enabled macos; then
+        echo "error: macOS is not enabled in APP_TARGETS" >&2
+        exit 1
+    fi
     if [[ "$(uname -s)" != "Darwin" ]]; then
-        echo "error: the frontend is a macOS bundle; build it on a Mac with Xcode" >&2
+        echo "error: the macOS implementation must be built on a Mac with Xcode" >&2
         exit 1
     fi
     require_tool /usr/bin/xcodebuild
@@ -224,11 +250,12 @@ cmd_build_frontend() {
     require_tool lipo
     require_tool /usr/bin/python3
 
-    mkdir -p "${PAYLOAD_DIR}/frontends"
+    rm -rf "${ARTIFACTS_DIR}/frontends"
+    mkdir -p "${ARTIFACTS_DIR}/frontends"
 
     echo "==> Building ${XCODE_SCHEME}.bundle"
     /usr/bin/xcodebuild \
-        -project "${ROOT}/frontend/${XCODE_SCHEME}.xcodeproj" \
+        -project "${ROOT}/macos/${XCODE_SCHEME}.xcodeproj" \
         -scheme "${XCODE_SCHEME}" \
         -configuration Release \
         -derivedDataPath "${DERIVED_DATA_DIR}" \
@@ -249,9 +276,42 @@ cmd_build_frontend() {
     archive_platform_bundle "${built_bundle}" macos-x86 x86_64
 
     echo "==> Writing app.outer"
-    /usr/bin/python3 "${ROOT}/frontend/Scripts/generate_outer.py" \
+    /usr/bin/python3 "${ROOT}/macos/Scripts/generate_outer.py" \
         --bundle-url "${FRONTEND_PATH}" \
-        --output "${PAYLOAD_DIR}/app.outer"
+        --output "${ARTIFACTS_DIR}/app.outer"
+}
+
+stage_platforms() {
+    rm -rf "${PAYLOAD_DIR}/web" "${PAYLOAD_DIR}/frontends"
+    rm -f "${PAYLOAD_DIR}/app.outer"
+
+    if target_enabled html; then
+        cp -R "${ROOT}/html" "${PAYLOAD_DIR}/web"
+    fi
+    if target_enabled macos; then
+        if [[ -f "${ARTIFACTS_DIR}/app.outer" && -f "${ARTIFACTS_DIR}/frontends/macos-arm" && -f "${ARTIFACTS_DIR}/frontends/macos-x86" ]]; then
+            cp "${ARTIFACTS_DIR}/app.outer" "${PAYLOAD_DIR}/app.outer"
+            mkdir -p "${PAYLOAD_DIR}/frontends"
+            cp "${ARTIFACTS_DIR}/frontends/macos-arm" "${PAYLOAD_DIR}/frontends/macos-arm"
+            cp "${ARTIFACTS_DIR}/frontends/macos-x86" "${PAYLOAD_DIR}/frontends/macos-x86"
+        else
+            echo "==> macOS implementation is pending its first platform publish"
+        fi
+    fi
+}
+
+cmd_build_platforms() {
+    mkdir -p "${PAYLOAD_DIR}"
+    if target_enabled macos; then
+        if [[ "$(uname -s)" == "Darwin" ]]; then
+            cmd_build_macos
+        elif [[ -f "${ARTIFACTS_DIR}/app.outer" && -d "${ARTIFACTS_DIR}/frontends" ]]; then
+            echo "==> Using prebuilt macOS artifacts from ${ARTIFACTS_DIR}"
+        else
+            echo "==> No macOS artifacts yet; the server will deploy the available platforms"
+        fi
+    fi
+    stage_platforms
 }
 
 # ---------------------------------------------------------------------------
@@ -269,11 +329,11 @@ backend_build_go_in_docker() {
     require_tool docker
     mkdir -p "$(dirname "${output}")"
 
-    docker build -q -t "${DOCKER_IMAGE_TAG}" "${ROOT}/backend" >/dev/null
+    docker build -q -t "${DOCKER_IMAGE_TAG}" "${ROOT}/server" >/dev/null
 
     # The named volume keeps Go's build cache warm between runs.
     docker run --rm \
-        -v "${ROOT}/backend":/src \
+        -v "${ROOT}/server":/src \
         -v "$(dirname "${output}")":/out \
         -v app-go-cache:/gocache \
         -w /src \
@@ -317,7 +377,7 @@ backend_build_c_linux_in_docker() {
 
     echo "==> Building C backend for Linux/${arch}/${libc}"
     docker run --rm --platform "${platform}" \
-        -v "${ROOT}/backend:/src:ro" \
+        -v "${ROOT}/server:/src:ro" \
         -v "$(dirname "${output}"):/out" \
         -w /src \
         -e CC=gcc \
@@ -330,12 +390,12 @@ backend_build_c_on_target() {
     local output="$1"
     local remote_build=".cache/outershell-app-build/${APP_ID}"
     echo "==> Docker is unavailable; building C backend on the ${TARGET_ARCH}/${TARGET_LIBC} target"
-    COPYFILE_DISABLE=1 tar czf - -C "${ROOT}" backend | run_ssh "
+    COPYFILE_DISABLE=1 tar czf - -C "${ROOT}" server | run_ssh "
         set -e
         rm -rf \"\$HOME/${remote_build}\"
         mkdir -p \"\$HOME/${remote_build}\"
         tar xzf - -C \"\$HOME/${remote_build}\"
-        make -C \"\$HOME/${remote_build}/backend\" OUTPUT=\"\$HOME/${remote_build}/${BACKEND_EXECUTABLE_NAME}\" LDFLAGS=
+        make -C \"\$HOME/${remote_build}/server\" OUTPUT=\"\$HOME/${remote_build}/${BACKEND_EXECUTABLE_NAME}\" LDFLAGS=
         if command -v strip >/dev/null 2>&1; then
             strip --strip-unneeded \"\$HOME/${remote_build}/${BACKEND_EXECUTABLE_NAME}\"
         fi
@@ -346,6 +406,36 @@ backend_build_c_on_target() {
 }
 
 cmd_build_backend() {
+    if [[ "$(uname -s)" == "Linux" ]]; then
+        local native_arch
+        case "$(uname -m)" in
+            x86_64|amd64) native_arch=amd64 ;;
+            aarch64|arm64) native_arch=arm64 ;;
+            *) echo "error: unsupported Linux architecture '$(uname -m)'" >&2; exit 1 ;;
+        esac
+        mkdir -p "${PAYLOAD_DIR}"
+        echo "==> Building ${BACKEND_LANGUAGE} backend on the project server"
+        case "${BACKEND_LANGUAGE}" in
+            go)
+                if command -v go >/dev/null 2>&1; then
+                    (cd "${ROOT}/server" && CGO_ENABLED=0 go build -trimpath -o "${PAYLOAD_DIR}/${BACKEND_EXECUTABLE_NAME}" .)
+                elif command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+                    backend_build_go_in_docker linux "${native_arch}" "${PAYLOAD_DIR}/${BACKEND_EXECUTABLE_NAME}"
+                else
+                    echo "error: Go or Docker is required to build this backend" >&2
+                    exit 1
+                fi
+                ;;
+            c)
+                require_tool make
+                require_tool cc
+                (cd "${ROOT}/server" && make OUTPUT="${PAYLOAD_DIR}/${BACKEND_EXECUTABLE_NAME}" LDFLAGS=)
+                ;;
+            *) echo "error: unsupported BACKEND_LANGUAGE '${BACKEND_LANGUAGE}'" >&2; exit 1 ;;
+        esac
+        return
+    fi
+
     load_target
     if [[ "${TARGET_KIND}" == "local" ]]; then
         if [[ "$(uname -s)" != "Darwin" ]]; then
@@ -358,7 +448,7 @@ cmd_build_backend() {
         case "${BACKEND_LANGUAGE}" in
             go)
                 if command -v go >/dev/null 2>&1; then
-                    (cd "${ROOT}/backend" && CGO_ENABLED=0 go build -o "${PAYLOAD_DIR}/${BACKEND_EXECUTABLE_NAME}" .)
+                    (cd "${ROOT}/server" && CGO_ENABLED=0 go build -o "${PAYLOAD_DIR}/${BACKEND_EXECUTABLE_NAME}" .)
                 else
                     backend_build_go_in_docker darwin "${host_arch}" "${PAYLOAD_DIR}/${BACKEND_EXECUTABLE_NAME}"
                 fi
@@ -367,7 +457,7 @@ cmd_build_backend() {
                 require_tool cc
                 require_tool make
                 mkdir -p "${PAYLOAD_DIR}"
-                (cd "${ROOT}/backend" && make OUTPUT="${PAYLOAD_DIR}/${BACKEND_EXECUTABLE_NAME}" LDFLAGS=)
+                (cd "${ROOT}/server" && make OUTPUT="${PAYLOAD_DIR}/${BACKEND_EXECUTABLE_NAME}" LDFLAGS=)
                 ;;
             *)
                 echo "error: unsupported BACKEND_LANGUAGE '${BACKEND_LANGUAGE}'" >&2
@@ -435,12 +525,55 @@ cmd_build_matrix() {
 
 render_unit() {
     mkdir -p "${PAYLOAD_DIR}/deploy"
+    local template="${ROOT}/deploy/app.service.in"
+    if [[ "${ISOLATION_MODE}" == "container" ]]; then
+        template="${ROOT}/deploy/app-container.service.in"
+        sed -e "s/@APP_ID@/${APP_ID}/g" \
+            -e "s/@SOCKET_FILENAME@/${SOCKET_FILENAME}/g" \
+            -e "s/@CONTAINER_IMAGE@/${CONTAINER_IMAGE}/g" \
+            "${ROOT}/deploy/run-container.sh" \
+            > "${PAYLOAD_DIR}/deploy/run-container.sh"
+        chmod +x "${PAYLOAD_DIR}/deploy/run-container.sh"
+    fi
     sed -e "s/@APP_ID@/${APP_ID}/g" \
         -e "s/@APP_NAME@/${APP_NAME}/g" \
         -e "s/@SOCKET_FILENAME@/${SOCKET_FILENAME}/g" \
         -e "s/@BACKEND_EXECUTABLE_NAME@/${BACKEND_EXECUTABLE_NAME}/g" \
-        "${ROOT}/deploy/app.service.in" \
+        -e "s/@CONTAINER_IMAGE@/${CONTAINER_IMAGE}/g" \
+        "${template}" \
         > "${PAYLOAD_DIR}/deploy/${APP_ID}.service"
+}
+
+build_local_container_image() {
+    require_tool docker
+    docker info >/dev/null
+    echo "==> Building container image ${CONTAINER_IMAGE}"
+    docker build -t "${CONTAINER_IMAGE}" "${ROOT}"
+}
+
+build_remote_container_image() {
+    load_target
+    if [[ "${TARGET_KIND}" != "ssh" ]]; then
+        echo "error: private container deployment currently requires an SSH target" >&2
+        echo "       use ./app run-container to test the web deployment locally" >&2
+        exit 1
+    fi
+
+    mkdir -p "${ARTIFACTS_DIR}"
+    local paths=(Dockerfile deploy/container-entrypoint.sh server artifacts)
+    if target_enabled html; then
+        paths+=(html)
+    fi
+
+    echo "==> Uploading container build context"
+    COPYFILE_DISABLE=1 tar czf - -C "${ROOT}" "${paths[@]}" | run_ssh "
+        set -e
+        rm -rf \"\$HOME/${REMOTE_CONTAINER_BUILD_DIR}\"
+        mkdir -p \"\$HOME/${REMOTE_CONTAINER_BUILD_DIR}\"
+        tar xzf - -C \"\$HOME/${REMOTE_CONTAINER_BUILD_DIR}\"
+        command -v docker >/dev/null 2>&1 || { echo 'error: Docker is required for this containerized app' >&2; exit 1; }
+        docker build -t '${CONTAINER_IMAGE}' \"\$HOME/${REMOTE_CONTAINER_BUILD_DIR}\"
+    "
 }
 
 stage_app_icon() {
@@ -501,6 +634,11 @@ PY
 }
 
 cmd_deploy_local_macos() {
+    if [[ "${ISOLATION_MODE}" == "container" ]]; then
+        echo "error: private container deployment currently requires an SSH target" >&2
+        echo "       use ./app run-container to test locally" >&2
+        exit 1
+    fi
     cmd_build
 
     local outerctl_path app_root staging_root old_root log_path socket_path plist_path
@@ -575,21 +713,51 @@ cmd_deploy_local_macos() {
 }
 
 cmd_build() {
-    cmd_build_frontend
-    cmd_build_backend
+    rm -rf "${PAYLOAD_DIR}"
+    mkdir -p "${PAYLOAD_DIR}"
+    cmd_build_platforms
+    if [[ "${ISOLATION_MODE}" == "container" ]]; then
+        build_local_container_image
+    else
+        cmd_build_backend
+    fi
     render_unit
     stage_app_icon
     echo "==> Payload ready at ${PAYLOAD_DIR}"
 }
 
 cmd_deploy() {
+    if [[ "$(uname -s)" == "Linux" ]]; then
+        cmd_build
+        echo "==> Staging the server-built payload"
+        rm -rf "${HOME}/${REMOTE_APP_DIR}.staging"
+        mkdir -p "$(dirname "${HOME}/${REMOTE_APP_DIR}")"
+        cp -R "${PAYLOAD_DIR}" "${HOME}/${REMOTE_APP_DIR}.staging"
+        echo "==> Installing on this server"
+        APP_ID="${APP_ID}" APP_NAME="${APP_NAME}" SOCKET_FILENAME="${SOCKET_FILENAME}" \
+            ISOLATION_MODE="${ISOLATION_MODE}" CONTAINER_IMAGE="${CONTAINER_IMAGE}" \
+            bash "${ROOT}/deploy/remote-install.sh"
+        echo
+        echo "Deployed from the canonical server project. Reload '${APP_NAME}' in Outer Loop."
+        return
+    fi
+
     load_target
     if [[ "${TARGET_KIND}" == "local" ]]; then
         cmd_deploy_local_macos
         return
     fi
 
-    cmd_build
+    if [[ "${ISOLATION_MODE}" == "container" ]]; then
+        rm -rf "${PAYLOAD_DIR}"
+        mkdir -p "${PAYLOAD_DIR}"
+        cmd_build_platforms
+        render_unit
+        stage_app_icon
+        build_remote_container_image
+    else
+        cmd_build
+    fi
 
     echo "==> Uploading payload"
     COPYFILE_DISABLE=1 tar czf - -C "${PAYLOAD_DIR}" . | run_ssh "
@@ -600,25 +768,54 @@ cmd_deploy() {
     "
 
     echo "==> Installing on server"
-    run_ssh "APP_ID='${APP_ID}' APP_NAME='${APP_NAME}' SOCKET_FILENAME='${SOCKET_FILENAME}' bash -s" \
+    run_ssh "APP_ID='${APP_ID}' APP_NAME='${APP_NAME}' SOCKET_FILENAME='${SOCKET_FILENAME}' ISOLATION_MODE='${ISOLATION_MODE}' CONTAINER_IMAGE='${CONTAINER_IMAGE}' bash -s" \
         < "${ROOT}/deploy/remote-install.sh"
 
     echo
     echo "Deployed. Open this server in Outer Loop; '${APP_NAME}' is in its app list."
 }
 
-# Frontend-only update: re-archive the bundle and drop it into the live app
-# directory. The backend serves these files from disk per request, so no
-# restart is needed -- just reload in Outer Loop.
-cmd_push_frontend() {
+# Receives the output of a platform-specific build machine. Source and server
+# code remain canonical here; only compiled platform artifacts cross the SSH
+# boundary. Redeploying is required for containers because the assets are
+# baked into the image.
+cmd_accept_platform() {
+    local platform="${1:-}" incoming="${2:-}"
+    if [[ "${platform}" != macos ]]; then
+        echo "error: unsupported platform '${platform}'" >&2
+        exit 1
+    fi
+    target_enabled macos || { echo "error: macOS is not enabled for this app" >&2; exit 1; }
+    [[ -d "${incoming}" ]] || { echo "error: incoming artifact directory is missing" >&2; exit 1; }
+    [[ -f "${incoming}/app.outer" ]] || { echo "error: app.outer is missing" >&2; exit 1; }
+    [[ -f "${incoming}/frontends/macos-arm" ]] || { echo "error: macos-arm is missing" >&2; exit 1; }
+    [[ -f "${incoming}/frontends/macos-x86" ]] || { echo "error: macos-x86 is missing" >&2; exit 1; }
+
+    echo "==> Accepting compiled macOS artifacts"
+    mkdir -p "${ARTIFACTS_DIR}/frontends"
+    cp "${incoming}/app.outer" "${ARTIFACTS_DIR}/app.outer.incoming"
+    cp "${incoming}/frontends/macos-arm" "${ARTIFACTS_DIR}/frontends/macos-arm.incoming"
+    cp "${incoming}/frontends/macos-x86" "${ARTIFACTS_DIR}/frontends/macos-x86.incoming"
+    mv "${ARTIFACTS_DIR}/app.outer.incoming" "${ARTIFACTS_DIR}/app.outer"
+    mv "${ARTIFACTS_DIR}/frontends/macos-arm.incoming" "${ARTIFACTS_DIR}/frontends/macos-arm"
+    mv "${ARTIFACTS_DIR}/frontends/macos-x86.incoming" "${ARTIFACTS_DIR}/frontends/macos-x86"
+    cmd_deploy
+}
+
+# Update every selected platform without rebuilding an uncontainerized server.
+cmd_push_platforms() {
     load_target
     if [[ "${TARGET_KIND}" == "local" ]]; then
-        cmd_build_frontend
+        cmd_build_platforms
         stage_app_icon
         local app_root
         app_root="$(local_app_root)"
         test -d "${app_root}" || { echo "error: app not deployed yet; run ./app deploy first" >&2; exit 1; }
-        cp -R "${PAYLOAD_DIR}/app.outer" "${PAYLOAD_DIR}/frontends" "${app_root}/"
+        rm -rf "${app_root}/web" "${app_root}/frontends"
+        rm -f "${app_root}/app.outer"
+        [[ ! -d "${PAYLOAD_DIR}/web" ]] || cp -R "${PAYLOAD_DIR}/web" "${app_root}/web"
+        [[ ! -d "${PAYLOAD_DIR}/frontends" ]] || cp -R "${PAYLOAD_DIR}/frontends" "${app_root}/frontends"
+        [[ ! -f "${PAYLOAD_DIR}/app.outer" ]] || cp "${PAYLOAD_DIR}/app.outer" "${app_root}/app.outer"
         if [[ -f "${PAYLOAD_DIR}/app-icon.png" ]]; then
             cp "${PAYLOAD_DIR}/app-icon.png" "${app_root}/app-icon.png"
         fi
@@ -626,11 +823,18 @@ cmd_push_frontend() {
         return
     fi
 
-    cmd_build_frontend
+    cmd_build_platforms
     stage_app_icon
 
-    echo "==> Pushing frontend"
-    COPYFILE_DISABLE=1 tar czf - -C "${PAYLOAD_DIR}" app.outer frontends app-icon.png | run_ssh "
+    if [[ "${ISOLATION_MODE}" == "container" ]]; then
+        build_remote_container_image
+        run_ssh "systemctl --user restart '${APP_ID}.service'"
+        echo "Pushed platform implementations and restarted the container."
+        return
+    fi
+
+    echo "==> Pushing platform implementations"
+    COPYFILE_DISABLE=1 tar czf - -C "${PAYLOAD_DIR}" . | run_ssh "
         set -e
         test -d \"\$HOME/${REMOTE_APP_DIR}\" || { echo 'error: app not deployed yet; run ./app deploy first' >&2; exit 1; }
         COPYFILE_DISABLE=1 tar xzf - -C \"\$HOME/${REMOTE_APP_DIR}\"
@@ -643,7 +847,9 @@ cmd_push_frontend() {
 # ---------------------------------------------------------------------------
 
 cmd_run_local() {
-    cmd_build_frontend
+    rm -rf "${PAYLOAD_DIR}"
+    mkdir -p "${PAYLOAD_DIR}"
+    cmd_build_platforms
 
     local host_goarch
     host_goarch="$(host_goarch)"
@@ -653,7 +859,7 @@ cmd_run_local() {
         go)
             if command -v go >/dev/null 2>&1; then
                 echo "==> Building backend for this Mac (local Go toolchain)"
-                (cd "${ROOT}/backend" && CGO_ENABLED=0 go build -o "${backend_bin}" .)
+                (cd "${ROOT}/server" && CGO_ENABLED=0 go build -o "${backend_bin}" .)
             else
                 echo "==> Building backend for this Mac (via Docker)"
                 backend_build_go_in_docker darwin "${host_goarch}" "${backend_bin}"
@@ -663,7 +869,7 @@ cmd_run_local() {
             require_tool cc
             require_tool make
             echo "==> Building backend for this Mac (local C toolchain)"
-            (cd "${ROOT}/backend" && make OUTPUT="${backend_bin}" LDFLAGS=)
+            (cd "${ROOT}/server" && make OUTPUT="${backend_bin}" LDFLAGS=)
             ;;
         *)
             echo "error: unsupported BACKEND_LANGUAGE '${BACKEND_LANGUAGE}'" >&2
@@ -675,6 +881,100 @@ cmd_run_local() {
     echo "Open in Outer Loop:  http://127.0.0.1:${LOCAL_PORT}/"
     echo
     exec "${backend_bin}" --port "${LOCAL_PORT}" --root "${PAYLOAD_DIR}"
+}
+
+cmd_run_container() {
+    cmd_build_platforms
+    build_local_container_image
+    echo
+    echo "Open in a browser or Outer Loop:  http://127.0.0.1:${LOCAL_PORT}/"
+    echo
+    exec docker run --rm \
+        --name "${CONTAINER_IMAGE}-dev" \
+        --read-only \
+        --tmpfs /tmp \
+        -e PORT=8080 \
+        -p "127.0.0.1:${LOCAL_PORT}:8080" \
+        "${CONTAINER_IMAGE}"
+}
+
+web_provider_path() {
+    local provider="$1"
+    if [[ ! "${provider}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+        return 1
+    fi
+
+    local project_provider="${ROOT}/deploy/web-providers/${provider}"
+    if [[ -f "${project_provider}" && -x "${project_provider}" ]]; then
+        printf '%s\n' "${project_provider}"
+        return 0
+    fi
+
+    local config_root="${XDG_CONFIG_HOME:-${HOME}/.config}"
+    local user_provider="${config_root}/outerframe/web-providers/${provider}"
+    if [[ -f "${user_provider}" && -x "${user_provider}" ]]; then
+        printf '%s\n' "${user_provider}"
+        return 0
+    fi
+
+    command -v "outerframe-web-provider-${provider}" 2>/dev/null
+}
+
+print_web_providers() {
+    local found=false directory provider
+    for directory in \
+        "${ROOT}/deploy/web-providers" \
+        "${XDG_CONFIG_HOME:-${HOME}/.config}/outerframe/web-providers"; do
+        [[ -d "${directory}" ]] || continue
+        for provider in "${directory}"/*; do
+            [[ -f "${provider}" && -x "${provider}" ]] || continue
+            printf '  %s\n' "$(basename "${provider}")"
+            found=true
+        done
+    done
+    if [[ "${found}" == false ]]; then
+        echo "  (none installed)"
+    fi
+    echo
+    echo "PATH adapters use the name outerframe-web-provider-<provider>."
+}
+
+cmd_web_providers() {
+    echo "Available web deployment providers:"
+    print_web_providers
+}
+
+cmd_deploy_web() {
+    if [[ "${ISOLATION_MODE}" != "container" ]]; then
+        echo "error: open-web deployment requires ISOLATION_MODE=container" >&2
+        exit 1
+    fi
+    local provider="${1:-}"
+    if [[ -z "${provider}" ]]; then
+        echo "usage: ./app deploy-web <provider> [provider options...]" >&2
+        echo >&2
+        cmd_web_providers >&2
+        exit 2
+    fi
+    shift
+
+    local provider_path
+    if ! provider_path="$(web_provider_path "${provider}")"; then
+        echo "error: web deployment provider '${provider}' is not installed" >&2
+        echo >&2
+        cmd_web_providers >&2
+        exit 2
+    fi
+
+    cmd_build_platforms
+    echo "==> Deploying with ${provider}"
+    OUTERFRAME_PROJECT_ROOT="${ROOT}" \
+    OUTERFRAME_APP_ID="${APP_ID}" \
+    OUTERFRAME_APP_NAME="${APP_NAME}" \
+    OUTERFRAME_CONTAINER_IMAGE="${CONTAINER_IMAGE}" \
+    OUTERFRAME_CONTAINER_PORT=8080 \
+    OUTERFRAME_DOCKERFILE="${ROOT}/Dockerfile" \
+        "${provider_path}" deploy "$@"
 }
 
 # ---------------------------------------------------------------------------
@@ -711,6 +1011,10 @@ cmd_target() {
 }
 
 cmd_logs() {
+    if [[ "$(uname -s)" == "Linux" ]]; then
+        journalctl --user -u "${APP_ID}.service" -f
+        return
+    fi
     load_target
     if [[ "${TARGET_KIND}" == "local" ]]; then
         tail -f "$(local_log_path)"
@@ -720,6 +1024,10 @@ cmd_logs() {
 }
 
 cmd_status() {
+    if [[ "$(uname -s)" == "Linux" ]]; then
+        systemctl --user status "${APP_ID}.service" --no-pager || true
+        return
+    fi
     load_target
     if [[ "${TARGET_KIND}" == "local" ]]; then
         launchctl print "gui/$(id -u)/${APP_ID}" || true
@@ -734,6 +1042,11 @@ cmd_ssh() {
 }
 
 cmd_uninstall() {
+    if [[ "$(uname -s)" == "Linux" ]]; then
+        APP_ID="${APP_ID}" SOCKET_FILENAME="${SOCKET_FILENAME}" ISOLATION_MODE="${ISOLATION_MODE}" \
+            CONTAINER_IMAGE="${CONTAINER_IMAGE}" bash "${ROOT}/deploy/remote-uninstall.sh"
+        return
+    fi
     load_target
     if [[ "${TARGET_KIND}" == "local" ]]; then
         local outerctl_path app_root plist_path log_path
@@ -758,7 +1071,7 @@ cmd_uninstall() {
         echo "Uninstalled local ${APP_ID}."
         return
     fi
-    run_ssh "APP_ID='${APP_ID}' SOCKET_FILENAME='${SOCKET_FILENAME}' bash -s" < "${ROOT}/deploy/remote-uninstall.sh"
+    run_ssh "APP_ID='${APP_ID}' SOCKET_FILENAME='${SOCKET_FILENAME}' ISOLATION_MODE='${ISOLATION_MODE}' CONTAINER_IMAGE='${CONTAINER_IMAGE}' bash -s" < "${ROOT}/deploy/remote-uninstall.sh"
 }
 
 cmd_clean() {
@@ -768,22 +1081,29 @@ cmd_clean() {
 
 cmd_help() {
     cat <<EOF
-${APP_NAME} -- outerframe app tasks
+${APP_NAME} -- multi-platform outerframe app tasks
 
+  ./app deploy             build and deploy from this canonical server project
+  ./app accept-platform    install compiled output from a platform build machine
   ./app target local       set localhost as the deploy target
   ./app target "ssh ..."   set an SSH deploy target (writes target.env)
-  ./app build              build frontend + backend + payload
+  ./app build              build selected platforms and the server/container
+  ./app build-macos        refresh compiled macOS artifacts
+  ./app build-platforms    build and stage every selected platform
   ./app build-matrix       build Linux release variants (C: libc + arch; Go: arch)
-  ./app deploy             build, upload, install, and register on the server
-  ./app push-frontend      update only the frontend on the server (fast)
+  ./app deploy             build, install, and register the canonical project
+  ./app web-providers      list installed web deployment adapters
+  ./app deploy-web NAME    deploy the same container with a provider adapter
+  ./app push-platforms     update HTML/macOS implementations on the server
   ./app run-local          run the app locally; open the printed URL in Outer Loop
+  ./app run-container      build and run the public-web container locally
   ./app logs               follow the backend's journal on the server
   ./app status             show the backend service status
   ./app ssh [cmd]          open a shell (or run a command) on the target
   ./app uninstall          deregister and remove the app from the server
   ./app clean              delete the local build directory
 
-Identity lives in app.env. The deploy target lives in target.env (gitignored).
+Identity lives in app.env. On Linux, this directory is the deployment target.
 EOF
 }
 
@@ -795,12 +1115,19 @@ shift $(( $# > 0 ? 1 : 0 ))
 case "${command}" in
     target)          cmd_target "$@" ;;
     build)           cmd_build ;;
-    build-frontend)  cmd_build_frontend ;;
+    build-macos)     cmd_build_macos ;;
+    build-platforms) cmd_build_platforms ;;
+    build-frontend)  cmd_build_macos ;;
     build-backend)   cmd_build_backend ;;
     build-matrix)    cmd_build_matrix ;;
     deploy)          cmd_deploy ;;
-    push-frontend)   cmd_push_frontend ;;
+    accept-platform) cmd_accept_platform "$@" ;;
+    deploy-web)      cmd_deploy_web "$@" ;;
+    web-providers)   cmd_web_providers ;;
+    push-platforms)  cmd_push_platforms ;;
+    push-frontend)   cmd_push_platforms ;;
     run-local)       cmd_run_local ;;
+    run-container)   cmd_run_container ;;
     logs)            cmd_logs ;;
     status)          cmd_status ;;
     ssh)             cmd_ssh "$@" ;;

@@ -13,6 +13,11 @@ private struct NativeAppProjectFileError: LocalizedError {
 }
 
 struct NativeAppProjectConfiguration {
+    enum PlatformTarget: String, CaseIterable {
+        case html
+        case macos
+    }
+
     enum FrontendLanguage: String {
         case swift
         case objc
@@ -23,13 +28,21 @@ struct NativeAppProjectConfiguration {
         case c
     }
 
+    enum IsolationMode: String {
+        case container
+        case host
+    }
+
     let appName: String
     let appID: String
     let xcodeScheme: String
+    let projectRootPath: String
     let projectFolderName: String
     let socketFilename: String
+    let platformTargets: Set<PlatformTarget>
     let frontendLanguage: FrontendLanguage
     let backendLanguage: BackendLanguage
+    let isolationMode: IsolationMode
     let sshCommandArguments: [String]
 
     var backendExecutableName: String {
@@ -38,8 +51,11 @@ struct NativeAppProjectConfiguration {
 }
 
 struct GeneratedNativeAppProject {
+    let canonicalProjectURL: URL
     let projectURL: URL
     let folderName: String
+    let remoteProjectPath: String
+    let hasPlatformWorkspace: Bool
 }
 
 enum NativeAppProjectGeneratorError: LocalizedError {
@@ -51,9 +67,9 @@ enum NativeAppProjectGeneratorError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .missingTemplate:
-            return "Native app template is unavailable from the Outer Shell backend."
+            return "App template is unavailable from the Outer Shell backend."
         case .invalidTemplate:
-            return "Native app template is invalid."
+            return "App template is invalid."
         case .missingStagingDirectory:
             return "Outerframe staging directory is unavailable."
         case .invalidName:
@@ -63,6 +79,36 @@ enum NativeAppProjectGeneratorError: LocalizedError {
 }
 
 enum NativeAppProjectGenerator {
+    private struct RemoteProjectLocation {
+        let displayPath: String
+        let scriptPath: String
+        let isHomeRelative: Bool
+    }
+
+    private static func remoteProjectLocation(rootPath: String,
+                                              folderName: String) -> RemoteProjectLocation {
+        var root = rootPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        if root.isEmpty { root = "~/outerframe-apps" }
+        while root.count > 1 && root.hasSuffix("/") {
+            root.removeLast()
+        }
+        if root == "~" {
+            return RemoteProjectLocation(displayPath: "~/\(folderName)",
+                                         scriptPath: folderName,
+                                         isHomeRelative: true)
+        }
+        if root.hasPrefix("~/") {
+            return RemoteProjectLocation(displayPath: "\(root)/\(folderName)",
+                                         scriptPath: "\(root.dropFirst(2))/\(folderName)",
+                                         isHomeRelative: true)
+        }
+        let separator = root == "/" ? "" : "/"
+        let path = "\(root)\(separator)\(folderName)"
+        return RemoteProjectLocation(displayPath: path,
+                                     scriptPath: path,
+                                     isHomeRelative: false)
+    }
+
     static func generate(configuration: NativeAppProjectConfiguration,
                          stagingDirectory: URL,
                          templateArchiveData: Data) throws -> GeneratedNativeAppProject {
@@ -79,17 +125,28 @@ enum NativeAppProjectGenerator {
         try createWritableDirectory(at: generationRoot)
         try materializeTemplateArchive(templateArchiveData, to: projectURL)
 
-        try materializeFrontendTemplate(projectURL: projectURL,
-                                        frontendLanguage: configuration.frontendLanguage)
+        try materializePlatformTemplates(projectURL: projectURL,
+                                         configuration: configuration)
         try materializeBackendTemplate(projectURL: projectURL,
                                        backendLanguage: configuration.backendLanguage)
+        try materializeContainerTemplate(projectURL: projectURL,
+                                         configuration: configuration)
         try renameTemplateFiles(projectURL: projectURL, scheme: configuration.xcodeScheme)
         try patchTemplateFiles(projectURL: projectURL, configuration: configuration)
         try writeGeneratedIcon(projectURL: projectURL, configuration: configuration)
-        try writeTargetEnvironment(projectURL: projectURL, sshCommandArguments: configuration.sshCommandArguments)
+        let workspaceURL = try materializeMacOSWorkspace(projectURL: projectURL,
+                                                         generationRoot: generationRoot,
+                                                         folderName: folderName,
+                                                         configuration: configuration)
         try makeProjectWritable(generationRoot)
 
-        return GeneratedNativeAppProject(projectURL: projectURL, folderName: folderName)
+        let remoteProject = remoteProjectLocation(rootPath: configuration.projectRootPath,
+                                                  folderName: folderName)
+        return GeneratedNativeAppProject(canonicalProjectURL: projectURL,
+                                         projectURL: workspaceURL ?? projectURL,
+                                         folderName: workspaceURL?.lastPathComponent ?? folderName,
+                                         remoteProjectPath: remoteProject.displayPath,
+                                         hasPlatformWorkspace: workspaceURL != nil)
     }
 
     private static func materializeTemplateArchive(_ data: Data, to projectURL: URL) throws {
@@ -166,7 +223,7 @@ enum NativeAppProjectGenerator {
         let fileManager = FileManager.default
         let goURL = projectURL.appendingPathComponent("backend-go", isDirectory: true)
         let cURL = projectURL.appendingPathComponent("backend-c", isDirectory: true)
-        let backendURL = projectURL.appendingPathComponent("backend", isDirectory: true)
+        let backendURL = projectURL.appendingPathComponent("server", isDirectory: true)
 
         switch backendLanguage {
         case .go:
@@ -186,28 +243,86 @@ enum NativeAppProjectGenerator {
         }
     }
 
-    private static func materializeFrontendTemplate(projectURL: URL,
-                                                    frontendLanguage: NativeAppProjectConfiguration.FrontendLanguage) throws {
+    private static func materializePlatformTemplates(projectURL: URL,
+                                                     configuration: NativeAppProjectConfiguration) throws {
         let fileManager = FileManager.default
         let swiftURL = projectURL.appendingPathComponent("frontend-swift", isDirectory: true)
         let objcURL = projectURL.appendingPathComponent("frontend-objc", isDirectory: true)
-        let frontendURL = projectURL.appendingPathComponent("frontend", isDirectory: true)
+        let macOSURL = projectURL.appendingPathComponent("macos", isDirectory: true)
+        let htmlURL = projectURL.appendingPathComponent("html", isDirectory: true)
 
-        switch frontendLanguage {
-        case .swift:
+        if configuration.platformTargets.contains(.macos) {
+            switch configuration.frontendLanguage {
+            case .swift:
+                if fileManager.fileExists(atPath: swiftURL.path) {
+                    try fileManager.moveItem(at: swiftURL, to: macOSURL)
+                }
+                if fileManager.fileExists(atPath: objcURL.path) {
+                    try fileManager.removeItem(at: objcURL)
+                }
+            case .objc:
+                if fileManager.fileExists(atPath: objcURL.path) {
+                    try fileManager.moveItem(at: objcURL, to: macOSURL)
+                }
+                if fileManager.fileExists(atPath: swiftURL.path) {
+                    try fileManager.removeItem(at: swiftURL)
+                }
+            }
+        } else {
             if fileManager.fileExists(atPath: swiftURL.path) {
-                try fileManager.moveItem(at: swiftURL, to: frontendURL)
+                try fileManager.removeItem(at: swiftURL)
             }
             if fileManager.fileExists(atPath: objcURL.path) {
                 try fileManager.removeItem(at: objcURL)
             }
-        case .objc:
-            if fileManager.fileExists(atPath: objcURL.path) {
-                try fileManager.moveItem(at: objcURL, to: frontendURL)
+        }
+
+        if !configuration.platformTargets.contains(.html),
+           fileManager.fileExists(atPath: htmlURL.path) {
+            try fileManager.removeItem(at: htmlURL)
+        }
+    }
+
+    private static func materializeContainerTemplate(projectURL: URL,
+                                                     configuration: NativeAppProjectConfiguration) throws {
+        let fileManager = FileManager.default
+        let goURL = projectURL.appendingPathComponent("Dockerfile-go")
+        let cURL = projectURL.appendingPathComponent("Dockerfile-c")
+        let dockerfileURL = projectURL.appendingPathComponent("Dockerfile")
+
+        guard configuration.isolationMode == .container else {
+            if fileManager.fileExists(atPath: goURL.path) {
+                try fileManager.removeItem(at: goURL)
             }
-            if fileManager.fileExists(atPath: swiftURL.path) {
-                try fileManager.removeItem(at: swiftURL)
+            if fileManager.fileExists(atPath: cURL.path) {
+                try fileManager.removeItem(at: cURL)
             }
+            let entrypointURL = projectURL.appendingPathComponent("deploy/container-entrypoint.sh")
+            if fileManager.fileExists(atPath: entrypointURL.path) {
+                try fileManager.removeItem(at: entrypointURL)
+            }
+            let serviceURL = projectURL.appendingPathComponent("deploy/app-container.service.in")
+            if fileManager.fileExists(atPath: serviceURL.path) {
+                try fileManager.removeItem(at: serviceURL)
+            }
+            let runnerURL = projectURL.appendingPathComponent("deploy/run-container.sh")
+            if fileManager.fileExists(atPath: runnerURL.path) {
+                try fileManager.removeItem(at: runnerURL)
+            }
+            let webProvidersURL = projectURL.appendingPathComponent("deploy/web-providers", isDirectory: true)
+            if fileManager.fileExists(atPath: webProvidersURL.path) {
+                try fileManager.removeItem(at: webProvidersURL)
+            }
+            return
+        }
+
+        let selectedURL = configuration.backendLanguage == .go ? goURL : cURL
+        let unselectedURL = configuration.backendLanguage == .go ? cURL : goURL
+        if fileManager.fileExists(atPath: selectedURL.path) {
+            try fileManager.moveItem(at: selectedURL, to: dockerfileURL)
+        }
+        if fileManager.fileExists(atPath: unselectedURL.path) {
+            try fileManager.removeItem(at: unselectedURL)
         }
     }
 
@@ -237,7 +352,7 @@ enum NativeAppProjectGenerator {
 
     private static func renameTemplateFiles(projectURL: URL, scheme: String) throws {
         let fileManager = FileManager.default
-        let frontendURL = projectURL.appendingPathComponent("frontend", isDirectory: true)
+        let frontendURL = projectURL.appendingPathComponent("macos", isDirectory: true)
 
         let oldProject = frontendURL.appendingPathComponent("HelloFullstack.xcodeproj", isDirectory: true)
         let newProject = frontendURL.appendingPathComponent("\(scheme).xcodeproj", isDirectory: true)
@@ -282,10 +397,10 @@ enum NativeAppProjectGenerator {
             ("HelloFullstack", configuration.xcodeScheme),
             ("Hello World", configuration.appName),
             ("Hello world", configuration.appName),
-            ("hellofullstack/backend", "\(modulePathComponent(configuration.projectFolderName))/backend")
+            ("hellofullstack/server", "\(modulePathComponent(configuration.projectFolderName))/server")
         ]
 
-        let textExtensions: Set<String> = ["", "swift", "go", "mod", "c", "h", "m", "mk", "md", "env", "in", "sh", "py", "plist", "pbxproj", "xcscheme", "xcworkspacedata", "gitignore", "Dockerfile", "Makefile"]
+        let textExtensions: Set<String> = ["", "swift", "go", "mod", "c", "h", "m", "mk", "md", "env", "in", "sh", "py", "plist", "pbxproj", "xcscheme", "xcworkspacedata", "gitignore", "html", "css", "js", "Dockerfile", "Makefile"]
         let resourceKeys: Set<URLResourceKey> = [.isDirectoryKey, .isRegularFileKey]
         guard let enumerator = FileManager.default.enumerator(at: projectURL,
                                                               includingPropertiesForKeys: Array(resourceKeys),
@@ -304,10 +419,18 @@ enum NativeAppProjectGenerator {
             for (old, new) in replacements {
                 contents = contents.replacingOccurrences(of: old, with: new)
             }
+            let targets = NativeAppProjectConfiguration.PlatformTarget.allCases
+                .filter { configuration.platformTargets.contains($0) }
+                .map(\.rawValue)
+                .joined(separator: " ")
+            contents = contents.replacingOccurrences(of: "APP_TARGETS=\"html macos\"",
+                                                     with: "APP_TARGETS=\"\(targets)\"")
+            contents = contents.replacingOccurrences(of: "ISOLATION_MODE=\"container\"",
+                                                     with: "ISOLATION_MODE=\"\(configuration.isolationMode.rawValue)\"")
             contents = contents.replacingOccurrences(of: "BACKEND_LANGUAGE=\"go\"",
                                                      with: "BACKEND_LANGUAGE=\"\(configuration.backendLanguage.rawValue)\"")
-            contents = contents.replacingOccurrences(of: "FRONTEND_LANGUAGE=\"swift\"",
-                                                     with: "FRONTEND_LANGUAGE=\"\(configuration.frontendLanguage.rawValue)\"")
+            contents = contents.replacingOccurrences(of: "MACOS_LANGUAGE=\"swift\"",
+                                                     with: "MACOS_LANGUAGE=\"\(configuration.frontendLanguage.rawValue)\"")
             contents = contents.replacingOccurrences(of: "BACKEND_EXECUTABLE_NAME=\"HelloFullstackBackend\"",
                                                      with: "BACKEND_EXECUTABLE_NAME=\"\(configuration.backendExecutableName)\"")
             try writeFile(Data(contents.utf8),
@@ -321,26 +444,210 @@ enum NativeAppProjectGenerator {
         return (attributes[.posixPermissions] as? NSNumber)?.intValue ?? 0o644
     }
 
-    private static func writeTargetEnvironment(projectURL: URL, sshCommandArguments: [String]) throws {
+    private static func writeConnectionEnvironment(workspaceURL: URL, sshCommandArguments: [String]) throws {
         let body: String
         if sshCommandArguments.isEmpty {
             body = """
-            # Generated by Outer Shell for a local Outer Loop session.
-            OUTER_TARGET_KIND=local
-            OUTER_TARGET_SSH=()
+            # This workspace was generated from a local Outer Loop session.
+            OUTER_SERVER_KIND=local
+            OUTER_SERVER_SSH=()
             """
         } else {
             body = """
             # Generated by Outer Shell from Outer Loop's SSH connection arguments.
-            OUTER_TARGET_KIND=ssh
-            OUTER_TARGET_SSH=(
+            OUTER_SERVER_KIND=ssh
+            OUTER_SERVER_SSH=(
             \(sshCommandArguments.map { "    \(shellSingleQuotedValue($0))" }.joined(separator: "\n"))
             )
             """
         }
         try writeFile(Data(body.utf8),
-                      to: projectURL.appendingPathComponent("target.env"),
+                      to: workspaceURL.appendingPathComponent("connection.env"),
                       permissions: 0o644)
+    }
+
+    private static func materializeMacOSWorkspace(projectURL: URL,
+                                                  generationRoot: URL,
+                                                  folderName: String,
+                                                  configuration: NativeAppProjectConfiguration) throws -> URL? {
+        guard configuration.platformTargets.contains(.macos) else { return nil }
+
+        let workspaceURL = generationRoot.appendingPathComponent("\(folderName)-macOS", isDirectory: true)
+        try createWritableDirectory(at: workspaceURL, withIntermediateDirectories: false)
+        let fileManager = FileManager.default
+        for name in ["macos", "app.env", "app-icon.png"] {
+            let source = projectURL.appendingPathComponent(name)
+            let destination = workspaceURL.appendingPathComponent(name)
+            if fileManager.fileExists(atPath: source.path) {
+                try fileManager.copyItem(at: source, to: destination)
+            }
+        }
+
+        try writeConnectionEnvironment(workspaceURL: workspaceURL,
+                                       sshCommandArguments: configuration.sshCommandArguments)
+        let remoteProject = remoteProjectLocation(rootPath: configuration.projectRootPath,
+                                                  folderName: folderName)
+        try writeFile(Data(macOSPlatformScript(configuration: configuration,
+                                              remoteProjectPath: remoteProject.scriptPath,
+                                              remoteProjectIsHomeRelative: remoteProject.isHomeRelative).utf8),
+                      to: workspaceURL.appendingPathComponent("platform"),
+                      permissions: 0o755)
+        try writeFile(Data(macOSWorkspaceREADME(configuration: configuration,
+                                                remoteProjectPath: remoteProject.displayPath).utf8),
+                      to: workspaceURL.appendingPathComponent("README.md"),
+                      permissions: 0o644)
+        return workspaceURL
+    }
+
+    private static func macOSPlatformScript(configuration: NativeAppProjectConfiguration,
+                                            remoteProjectPath: String,
+                                            remoteProjectIsHomeRelative: Bool) -> String {
+        let remoteProjectCommandPath = remoteProjectIsHomeRelative
+            ? "\\$HOME/${REMOTE_PROJECT}"
+            : "${REMOTE_PROJECT}"
+        return """
+        #!/bin/bash
+        # macOS platform builder for \(configuration.appName). The canonical project
+        # stays on the server; this workspace only compiles and publishes macOS.
+
+        set -euo pipefail
+        ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+        source "${ROOT}/app.env"
+        source "${ROOT}/connection.env"
+
+        REMOTE_PROJECT="\(remoteProjectPath)"
+        ARTIFACTS_DIR="${ROOT}/artifacts"
+        DERIVED_DATA_DIR="${ROOT}/build/DerivedData"
+        SSH_BASE=()
+
+        load_connection() {
+            if [[ "${OUTER_SERVER_KIND:-ssh}" == local ]]; then
+                echo "error: publishing from a local-server workspace is not implemented" >&2
+                exit 1
+            fi
+            if [[ "$(declare -p OUTER_SERVER_SSH 2>/dev/null)" != declare\\ -a* || "${#OUTER_SERVER_SSH[@]}" -eq 0 ]]; then
+                echo "error: connection.env does not contain an SSH command" >&2
+                exit 1
+            fi
+            SSH_BASE=("${OUTER_SERVER_SSH[@]}")
+        }
+
+        run_ssh() {
+            load_connection
+            "${SSH_BASE[@]}" "$@"
+        }
+
+        require_tool() {
+            command -v "$1" >/dev/null 2>&1 || { echo "error: required tool '$1' was not found" >&2; exit 1; }
+        }
+
+        bundle_executable_name() {
+            local bundle_path="$1" executable_name=""
+            if [[ -f "${bundle_path}/Contents/Info.plist" ]]; then
+                executable_name="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "${bundle_path}/Contents/Info.plist" 2>/dev/null || true)"
+            fi
+            [[ -n "${executable_name}" ]] || executable_name="$(basename "${bundle_path}" .bundle)"
+            printf '%s\\n' "${executable_name}"
+        }
+
+        archive_bundle() {
+            local source_bundle="$1" platform="$2" arch="$3"
+            local temp_root temp_bundle executable_name executable_path executable_archs
+            temp_root="$(mktemp -d)"
+            temp_bundle="${temp_root}/$(basename "${source_bundle}")"
+            cp -R "${source_bundle}" "${temp_bundle}"
+            executable_name="$(bundle_executable_name "${temp_bundle}")"
+            executable_path="${temp_bundle}/Contents/MacOS/${executable_name}"
+            executable_archs="$(lipo -archs "${executable_path}")"
+            [[ " ${executable_archs} " == *" ${arch} "* ]] || { echo "error: missing ${arch} slice" >&2; exit 1; }
+            if [[ "${executable_archs}" != "${arch}" ]]; then
+                lipo "${executable_path}" -thin "${arch}" -output "${temp_root}/thin"
+                mv "${temp_root}/thin" "${executable_path}"
+                chmod +x "${executable_path}"
+            fi
+            aa archive -d "${temp_root}" -subdir "$(basename "${temp_bundle}")" -o "${ARTIFACTS_DIR}/frontends/${platform}" -a lzfse
+            rm -rf "${temp_root}"
+        }
+
+        cmd_sync() {
+            echo "==> Syncing macOS source from the canonical server project"
+            rm -rf "${ROOT}/macos.incoming"
+            mkdir -p "${ROOT}/macos.incoming"
+            run_ssh "set -e; project=\\\"\(remoteProjectCommandPath)\\\"; test -d \\${project}/macos; tar czf - -C \\${project} macos app.env app-icon.png" \
+                | tar xzf - -C "${ROOT}/macos.incoming"
+            rm -rf "${ROOT}/macos"
+            mv "${ROOT}/macos.incoming/macos" "${ROOT}/macos"
+            mv "${ROOT}/macos.incoming/app.env" "${ROOT}/app.env"
+            [[ ! -f "${ROOT}/macos.incoming/app-icon.png" ]] || mv "${ROOT}/macos.incoming/app-icon.png" "${ROOT}/app-icon.png"
+            rmdir "${ROOT}/macos.incoming"
+            echo "Synced. Local changes under macos/ were replaced by the server copy."
+        }
+
+        cmd_build() {
+            require_tool /usr/bin/xcodebuild
+            require_tool aa
+            require_tool lipo
+            require_tool /usr/bin/python3
+            rm -rf "${ARTIFACTS_DIR}" "${DERIVED_DATA_DIR}"
+            mkdir -p "${ARTIFACTS_DIR}/frontends"
+            echo "==> Building ${XCODE_SCHEME}.bundle"
+            /usr/bin/xcodebuild -project "${ROOT}/macos/${XCODE_SCHEME}.xcodeproj" -scheme "${XCODE_SCHEME}" \
+                -configuration Release -derivedDataPath "${DERIVED_DATA_DIR}" ARCHS="arm64 x86_64" \
+                ONLY_ACTIVE_ARCH=NO CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build
+            local bundle="${DERIVED_DATA_DIR}/Build/Products/Release/${XCODE_SCHEME}.bundle"
+            [[ -d "${bundle}" ]] || { echo "error: expected bundle at ${bundle}" >&2; exit 1; }
+            archive_bundle "${bundle}" macos-arm arm64
+            archive_bundle "${bundle}" macos-x86 x86_64
+            /usr/bin/python3 "${ROOT}/macos/Scripts/generate_outer.py" --bundle-url "${FRONTEND_PATH}" --output "${ARTIFACTS_DIR}/app.outer"
+            echo "==> macOS artifacts ready"
+        }
+
+        cmd_publish() {
+            cmd_build
+            echo "==> Publishing only the compiled macOS implementation"
+            COPYFILE_DISABLE=1 tar czf - -C "${ARTIFACTS_DIR}" app.outer frontends | run_ssh "
+                set -e
+                project=\\\"\(remoteProjectCommandPath)\\\"
+                incoming=\\\"\\$(mktemp -d)\\\"
+                tar xzf - -C \\${incoming}
+                cd \\${project}
+                ./app accept-platform macos \\${incoming}
+                rm -rf \\${incoming}
+            "
+            echo "Published. Reload \(configuration.appName) in Outer Loop."
+        }
+
+        case "${1:-help}" in
+            sync)    cmd_sync ;;
+            build)   cmd_build ;;
+            publish) cmd_publish ;;
+            help|--help|-h)
+                echo "usage: ./platform sync | build | publish"
+                echo "  sync     replace macos/ with the canonical server source"
+                echo "  build    compile macOS artifacts locally"
+                echo "  publish  build and send only compiled artifacts to the server"
+                ;;
+            *) echo "error: unknown command '$1'" >&2; exit 1 ;;
+        esac
+        """
+    }
+
+    private static func macOSWorkspaceREADME(configuration: NativeAppProjectConfiguration,
+                                             remoteProjectPath: String) -> String {
+        """
+        # \(configuration.appName) — macOS builder
+
+        This is a platform build workspace, not the app's main project. The
+        canonical project lives on the server at `\(remoteProjectPath)`.
+
+        - `./platform sync` replaces `macos/` with the source from the server.
+        - `./platform build` compiles universal macOS artifacts locally.
+        - `./platform publish` builds and sends only those compiled artifacts
+          back to the canonical project, which redeploys the app.
+
+        Edit the canonical source over SSH (directly or with a coding agent),
+        sync it here, then publish it from this Mac.
+        """
     }
 
     private static func writeGeneratedIcon(projectURL: URL,
@@ -350,9 +657,11 @@ enum NativeAppProjectGenerator {
         try writeFile(data, to: rootIconURL, permissions: 0o644)
 
         let frontendIconURL = projectURL
-            .appendingPathComponent("frontend", isDirectory: true)
+            .appendingPathComponent("macos", isDirectory: true)
             .appendingPathComponent("app-icon.png")
-        try writeFile(data, to: frontendIconURL, permissions: 0o644)
+        if FileManager.default.fileExists(atPath: frontendIconURL.deletingLastPathComponent().path) {
+            try writeFile(data, to: frontendIconURL, permissions: 0o644)
+        }
     }
 
     private static func generatedIconPNGData(appName: String, appID: String) throws -> Data {

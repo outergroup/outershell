@@ -1,0 +1,5 @@
+.git
+build
+macos
+target.env
+*.log

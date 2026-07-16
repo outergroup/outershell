@@ -181,6 +181,7 @@ private struct FilePickerEntryRecord: Decodable {
     let name: String
     let path: String
     let isDirectory: Bool
+    let willCreate: Bool
     let size: UInt64
     let modified: Double
 }
@@ -425,6 +426,7 @@ private extension FilePickerEntryRecord {
         return FilePickerEntryRecord(name: try reader.stringRef(at: 0),
                                      path: try reader.stringRef(at: 8),
                                      isDirectory: (flags & 0x01) != 0,
+                                     willCreate: (flags & 0x02) != 0,
                                      size: try reader.uint64(at: 20),
                                      modified: try reader.double(at: 28))
     }
@@ -744,6 +746,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private var filePickerEndpoint: URL?
     private var eventsEndpoint: URL?
     private var nativeAppTemplateEndpoint: URL?
+    private var nativeAppProjectEndpoint: URL?
+    private var nativeAppInstallSession: URLSession?
     private var eventWatchTask: URLSessionDataTask?
     private var eventWatchGeneration = 0
     private var eventWatchRetryDelay: TimeInterval = 1
@@ -1153,6 +1157,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             filePickerEndpoint = URL(string: "/api/file-picker", relativeTo: base)?.absoluteURL
             eventsEndpoint = URL(string: "/api/events", relativeTo: base)?.absoluteURL
             nativeAppTemplateEndpoint = URL(string: "/api/native-app-template", relativeTo: base)?.absoluteURL
+            nativeAppProjectEndpoint = URL(string: "/api/native-app-projects", relativeTo: base)?.absoluteURL
         }
         let configuration = URLSessionConfiguration.ephemeral
         configuration.timeoutIntervalForRequest = 40
@@ -1160,6 +1165,13 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         configuration.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
         outerframeHost.applyProxy(to: configuration)
         urlSession = URLSession(configuration: configuration)
+
+        let installConfiguration = URLSessionConfiguration.ephemeral
+        installConfiguration.timeoutIntervalForRequest = 600
+        installConfiguration.timeoutIntervalForResource = 600
+        installConfiguration.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        outerframeHost.applyProxy(to: installConfiguration)
+        nativeAppInstallSession = URLSession(configuration: installConfiguration)
     }
 
     private func recoverNetworkingIfNeeded(after error: Error) -> Bool {
@@ -1177,6 +1189,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             eventWatchTask = nil
             eventWatchRetryDelay = 1
             urlSession?.invalidateAndCancel()
+            nativeAppInstallSession?.invalidateAndCancel()
             configureNetworking()
             startEventWatch()
             return true
@@ -1544,6 +1557,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                     createLayer.frame = CGRect(x: 0, y: 0, width: width, height: contentHeight)
                     renderCreateForm()
                 }
+                if mode == .create {
+                    renderFilePickerIfNeeded(width: createLayer.bounds.width,
+                                             height: createLayer.bounds.height)
+                }
                 updateStatusText()
                 renderInstallPromptIfNeeded(width: width, height: height)
                 renderUpdatePromptIfNeeded(width: width, height: height)
@@ -1886,7 +1903,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         let sections: [(CreateSection, String, String)] = [
             (.appCatalog, "Outer Shell app catalog", "square.grid.2x2"),
             (.bashCommands, "Run bash commands", "terminal"),
-            (.nativeApp, "New Native App", "hammer"),
+            (.nativeApp, "New App", "hammer"),
             (.otherRecipes, "Other recipes", "list.bullet.rectangle")
         ]
 
@@ -2083,7 +2100,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         var y = top - 18
 
         let help = makeTextLayer(size: 12, weight: .regular, color: .secondaryLabelColor)
-        help.string = "Generate a full-stack outerframe app project for this server"
+        help.string = "Create user-owned source on this server with separate implementations per platform"
         help.frame = CGRect(x: detailLeft, y: y, width: detailWidth, height: 18)
         addCreateFormSublayer(help)
         y -= 58
@@ -2099,21 +2116,38 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                        frame: CGRect(x: detailLeft, y: y, width: detailWidth, height: 46))
         y -= 72
 
-        let frontendLanguageField = RecipeFieldRecord(key: "nativeFrontendLanguage",
-                                                      label: "Frontend",
-                                                      defaultValue: "swift",
-                                                      fieldType: "choice",
-                                                      placeholder: "",
-                                                      suggestions: [],
-                                                      choices: [
-                                                        RecipeChoiceRecord(title: "Swift", value: "swift"),
-                                                        RecipeChoiceRecord(title: "Objective-C", value: "objc")
-                                                      ])
-        addCreateChoiceField(frontendLanguageField, frame: CGRect(x: detailLeft,
-                                                                  y: y,
-                                                                  width: min(detailWidth, 300),
-                                                                  height: 50))
+        let targetsLabel = makeTextLayer(size: 11, weight: .medium, color: .secondaryLabelColor)
+        targetsLabel.string = "Platforms"
+        targetsLabel.frame = CGRect(x: detailLeft, y: y + 34, width: detailWidth, height: 14)
+        addCreateFormSublayer(targetsLabel)
+        let targetWidth = min(floor((detailWidth - 10) / 2), 210)
+        addCreateCheckbox(key: "nativeTargetHTML",
+                          title: "HTML",
+                          subtitle: "Browsers and web views",
+                          frame: CGRect(x: detailLeft, y: y - 8, width: targetWidth, height: 36))
+        addCreateCheckbox(key: "nativeTargetMacOS",
+                          title: "macOS",
+                          subtitle: "Compiled outerframe bundle",
+                          frame: CGRect(x: detailLeft + targetWidth + 10, y: y - 8, width: targetWidth, height: 36))
         y -= 72
+
+        if createValues["nativeTargetMacOS", default: "true"] == "true" {
+            let frontendLanguageField = RecipeFieldRecord(key: "nativeFrontendLanguage",
+                                                          label: "macOS Language",
+                                                          defaultValue: "swift",
+                                                          fieldType: "choice",
+                                                          placeholder: "",
+                                                          suggestions: [],
+                                                          choices: [
+                                                            RecipeChoiceRecord(title: "Swift", value: "swift"),
+                                                            RecipeChoiceRecord(title: "Objective-C", value: "objc")
+                                                          ])
+            addCreateChoiceField(frontendLanguageField, frame: CGRect(x: detailLeft,
+                                                                      y: y,
+                                                                      width: min(detailWidth, 300),
+                                                                      height: 50))
+            y -= 72
+        }
 
         let backendLanguageField = RecipeFieldRecord(key: "nativeBackendLanguage",
                                                      label: "Backend",
@@ -2129,6 +2163,34 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                                                  y: y,
                                                                  width: min(detailWidth, 220),
                                                                  height: 50))
+        y -= 72
+
+        let isolationField = RecipeFieldRecord(key: "nativeIsolationMode",
+                                               label: "Server Isolation",
+                                               defaultValue: "container",
+                                               fieldType: "choice",
+                                               placeholder: "",
+                                               suggestions: [],
+                                               choices: [
+                                                RecipeChoiceRecord(title: "Containerized", value: "container"),
+                                                RecipeChoiceRecord(title: "Full Host Access", value: "host")
+                                               ])
+        addCreateChoiceField(isolationField, frame: CGRect(x: detailLeft,
+                                                           y: y,
+                                                           width: min(detailWidth, 360),
+                                                           height: 50))
+        y -= 72
+
+        addCreateField(RecipeFieldRecord(key: "nativeProjectRoot",
+                                         label: "Project Location",
+                                         defaultValue: "~/outerframe-apps",
+                                         fieldType: "directory",
+                                         placeholder: "~/outerframe-apps",
+                                         suggestions: [],
+                                         choices: []),
+                       value: createValues["nativeProjectRoot", default: "~/outerframe-apps"],
+                       frame: CGRect(x: detailLeft, y: y, width: detailWidth, height: 46),
+                       monospaced: true)
         y -= 72
 
         addCreateField(RecipeFieldRecord(key: "nativeProjectFolder",
@@ -2177,7 +2239,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                                 y: y + 6,
                                                 width: max(detailWidth - 108, 1),
                                                 height: 18),
-                                  color: createMessage.hasPrefix("Generated") ? .secondaryLabelColor : .systemRed)
+                                  color: createMessage.hasPrefix("Installed") ? .secondaryLabelColor : .systemRed)
         }
         return y - 56
     }
@@ -2189,18 +2251,22 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         let top = max(panelFrame.maxY - 102, 0) + createScroll
 
         let title = makeTextLayer(size: 18, weight: .semibold, color: .labelColor, alignment: .center)
-        title.string = generatedNativeProjectWasExported
-            ? "To deploy to this device, open the folder in your terminal and run \"./app deploy\""
-            : "Drag this folder to a location on your Mac."
-        let titleHeight: CGFloat = generatedNativeProjectWasExported ? 54 : 24
+        if !project.hasPlatformWorkspace {
+            title.string = "Installed on the server at \(project.remoteProjectPath)."
+        } else if generatedNativeProjectWasExported {
+            title.string = "The canonical project stays at \(project.remoteProjectPath). Run \"./platform publish\" in the Mac builder to compile and publish only macOS."
+        } else {
+            title.string = "Installed on the server at \(project.remoteProjectPath). Drag this macOS builder to your Mac."
+        }
+        let titleHeight: CGFloat = 58
         title.frame = CGRect(x: panelFrame.minX + 42,
-                             y: generatedNativeProjectWasExported ? panelFrame.midY - titleHeight / 2 : top,
+                             y: (!project.hasPlatformWorkspace || generatedNativeProjectWasExported) ? panelFrame.midY - titleHeight / 2 : top,
                              width: max(panelFrame.width - 84, 1),
                              height: titleHeight)
         title.isWrapped = true
         addCreateFormSublayer(title)
 
-        if generatedNativeProjectWasExported {
+        if !project.hasPlatformWorkspace || generatedNativeProjectWasExported {
             nativeProjectDragFrame = .zero
             return top - 84
         }
@@ -3216,7 +3282,13 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         filePickerOverlayLayer.addSublayer(panel)
 
         let title = makeTextLayer(size: 15, weight: .semibold, color: .labelColor)
-        title.string = isChooseFile ? "Choose Icon" : "Choose Folder"
+        if isChooseFile {
+            title.string = "Choose Icon"
+        } else if picker.targetFieldKey == "nativeProjectRoot" {
+            title.string = "Choose Project Location"
+        } else {
+            title.string = "Choose Folder"
+        }
         title.frame = CGRect(x: 18, y: panelHeight - 38, width: panelWidth - 36, height: 20)
         panel.addSublayer(title)
 
@@ -3285,6 +3357,15 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         let save = makeButtonLayer(title: "Choose", emphasized: true)
         save.frame = saveLocal
         panel.addSublayer(save)
+        if let proposed = picker.entries.first(where: \.willCreate) {
+            let note = makeTextLayer(size: 11, weight: .regular, color: .secondaryLabelColor)
+            note.string = "\(proposed.name) will be created if chosen."
+            note.frame = CGRect(x: 18,
+                                y: 34,
+                                width: max(cancelLocal.minX - 30, 1),
+                                height: 16)
+            panel.addSublayer(note)
+        }
         sendCreateFieldTextInputGeometryUpdate()
     }
 
@@ -3298,6 +3379,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
         let name = makeTextLayer(size: 12, weight: .regular, color: .labelColor)
         row.addSublayer(name)
+        let detail = makeTextLayer(size: 11, weight: .regular, color: .secondaryLabelColor, alignment: .right)
+        row.addSublayer(detail)
         return row
     }
 
@@ -3309,13 +3392,17 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         let isSelected = filePickerSelectedIndex == index
         row.backgroundColor = isSelected ? resolvedCGColor(.selectedContentBackgroundColor) : nil
 
-        if row.sublayers?.count != 2 {
+        if row.sublayers?.count != 3 {
             row.sublayers?.forEach { $0.removeFromSuperlayer() }
             let icon = CALayer()
             icon.contentsGravity = .resizeAspect
             icon.contentsScale = 2
             row.addSublayer(icon)
             row.addSublayer(makeTextLayer(size: 12, weight: .regular, color: .labelColor))
+            row.addSublayer(makeTextLayer(size: 11,
+                                          weight: .regular,
+                                          color: .secondaryLabelColor,
+                                          alignment: .right))
         }
 
         let icon = row.sublayers?[0]
@@ -3327,7 +3414,18 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         if let name = row.sublayers?[1] as? CATextLayer {
             name.string = entry.name
             name.foregroundColor = resolvedCGColor(isSelected ? .white : .labelColor)
-            name.frame = CGRect(x: 58, y: 6, width: max(frame.width - 70, 1), height: 16)
+            name.frame = CGRect(x: 58,
+                                y: 6,
+                                width: max(frame.width - (entry.willCreate ? 170 : 70), 1),
+                                height: 16)
+        }
+        if let detail = row.sublayers?[2] as? CATextLayer {
+            detail.string = entry.willCreate ? "New Folder" : ""
+            detail.foregroundColor = resolvedCGColor(isSelected ? .white : .secondaryLabelColor)
+            detail.frame = CGRect(x: max(frame.width - 108, 58),
+                                  y: 6,
+                                  width: min(92, max(frame.width - 120, 1)),
+                                  height: 16)
         }
     }
 
@@ -4003,7 +4101,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         dismiss.frame = createDismissFrame
         createLayer.addSublayer(dismiss)
 
-        if let generatedNativeProject {
+        if let generatedNativeProject, !isPerformingAction {
             createContentBottom = renderGeneratedNativeProjectView(generatedNativeProject,
                                                                    panelFrame: panelFrame,
                                                                    width: pageWidth)
@@ -4042,7 +4140,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             if clampCreateScrollUsingRenderedContent() {
                 renderCreateForm()
             }
-            renderFilePickerIfNeeded(width: createLayer.bounds.width, height: createLayer.bounds.height)
             return
         case .bashCommands:
             createContentBottom = renderBashCommandsSection(left: left,
@@ -4051,7 +4148,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             if clampCreateScrollUsingRenderedContent() {
                 renderCreateForm()
             }
-            renderFilePickerIfNeeded(width: createLayer.bounds.width, height: createLayer.bounds.height)
             sendCreateFieldTextInputGeometryUpdate()
             return
         case .nativeApp:
@@ -4155,7 +4251,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         if clampCreateScrollUsingRenderedContent() {
             renderCreateForm()
         }
-        renderFilePickerIfNeeded(width: createLayer.bounds.width, height: createLayer.bounds.height)
     }
 
     private func addCreateField(_ field: RecipeFieldRecord,
@@ -4370,6 +4465,43 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             addCreateFormSublayer(button)
             x += width + 8
         }
+    }
+
+    private func addCreateCheckbox(key: String,
+                                   title: String,
+                                   subtitle: String,
+                                   frame: CGRect) {
+        let selected = createValues[key, default: "true"] == "true"
+        createChoiceFrames.append((frame, key, "true"))
+
+        let background = CALayer()
+        background.frame = frame
+        background.cornerRadius = 7
+        background.borderWidth = selected ? 1.5 : 1
+        background.borderColor = resolvedCGColor(selected ? .controlAccentColor : .separatorColor)
+        background.backgroundColor = resolvedCGColor(selected
+            ? NSColor.controlAccentColor.withAlphaComponent(0.1)
+            : NSColor.controlBackgroundColor.withAlphaComponent(0.4))
+        addCreateFormSublayer(background)
+
+        let icon = CALayer()
+        icon.frame = CGRect(x: 10, y: 9, width: 18, height: 18)
+        icon.contentsGravity = .resizeAspect
+        icon.contentsScale = 2
+        icon.contents = symbolCGImage(named: selected ? "checkmark.square.fill" : "square",
+                                      pointSize: 18,
+                                      color: selected ? .controlAccentColor : .secondaryLabelColor)
+        background.addSublayer(icon)
+
+        let titleLayer = makeTextLayer(size: 12, weight: .semibold, color: .labelColor)
+        titleLayer.string = title
+        titleLayer.frame = CGRect(x: 36, y: 18, width: max(frame.width - 44, 1), height: 15)
+        background.addSublayer(titleLayer)
+
+        let subtitleLayer = makeTextLayer(size: 9, weight: .regular, color: .secondaryLabelColor)
+        subtitleLayer.string = subtitle
+        subtitleLayer.frame = CGRect(x: 36, y: 5, width: max(frame.width - 44, 1), height: 12)
+        background.addSublayer(subtitleLayer)
     }
 
     private func buildAccessibilitySnapshot() -> OuterframeAccessibilitySnapshot {
@@ -4636,13 +4768,14 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         }
 
         if let generatedNativeProject,
+           generatedNativeProject.hasPlatformWorkspace,
            let frame = accessibilityFrame(nativeProjectDragFrame, from: createLayer, clippedBy: clipFrame) {
             nodes.append(accessibilityNode(nextIdentifier: &nextIdentifier,
                                            role: .button,
                                            frame: frame,
-                                           label: "Generated project folder",
+                                           label: "macOS platform builder folder",
                                            value: generatedNativeProject.folderName,
-                                           hint: "Drag this folder to a location on your Mac."))
+                                           hint: "Drag this builder to your Mac; the canonical project remains on the server."))
         }
 
         if let frame = accessibilityFrame(bashIconSelectFrame, from: createLayer, clippedBy: clipFrame) {
@@ -4776,7 +4909,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             children.append(accessibilityNode(nextIdentifier: &nextIdentifier,
                                               role: .button,
                                               frame: frame,
-                                              label: entry.entry.isDirectory ? "\(entry.entry.name) folder" : entry.entry.name,
+                                              label: entry.entry.willCreate
+                                                ? "\(entry.entry.name) folder, will be created"
+                                                : (entry.entry.isDirectory ? "\(entry.entry.name) folder" : entry.entry.name),
                                               value: entry.entry.path))
         }
 
@@ -4799,7 +4934,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         case .chooseFile:
             title = "Choose Icon"
         case .chooseDirectory:
-            title = "Choose Folder"
+            title = picker.targetFieldKey == "nativeProjectRoot" ? "Choose Project Location" : "Choose Folder"
         }
         return [
             accessibilityNode(nextIdentifier: &nextIdentifier,
@@ -4818,7 +4953,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         case .bashCommands:
             return "Run bash commands"
         case .nativeApp:
-            return "New Native App"
+            return "New App"
         case .otherRecipes:
             return "Other recipes"
         }
@@ -4839,8 +4974,12 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         }
         let nativeLabels: [String: (String, String)] = [
             "nativeAppName": ("Name", "Hello World"),
-            "nativeFrontendLanguage": ("Frontend", "Swift"),
+            "nativeTargetHTML": ("HTML platform", "Enabled"),
+            "nativeTargetMacOS": ("macOS platform", "Enabled"),
+            "nativeFrontendLanguage": ("macOS Language", "Swift"),
             "nativeBackendLanguage": ("Backend", "Go"),
+            "nativeIsolationMode": ("Server Isolation", "Containerized"),
+            "nativeProjectRoot": ("Project Location", "~/outerframe-apps"),
             "nativeProjectFolder": ("Project Folder", "hello-world"),
             "nativeAppID": ("App ID", "org.example.HelloWorld"),
             "nativeSocketFilename": ("Socket Filename", "org.example.HelloWorld")
@@ -4885,6 +5024,22 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 return value
             }
         }
+        if key == "nativeIsolationMode" {
+            switch value {
+            case "container":
+                return "Containerized"
+            case "host":
+                return "Full Host Access"
+            default:
+                return value
+            }
+        }
+        if key == "nativeTargetHTML" {
+            return "HTML"
+        }
+        if key == "nativeTargetMacOS" {
+            return "macOS"
+        }
         return selectedRecipe()?.fields.first(where: { $0.key == key })?.choices.first(where: { $0.value == value })?.title ?? value
     }
 
@@ -4897,6 +5052,12 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         }
         if key == "nativeFrontendLanguage" {
             return createValues[key, default: "swift"]
+        }
+        if key == "nativeIsolationMode" {
+            return createValues[key, default: "container"]
+        }
+        if key == "nativeTargetHTML" || key == "nativeTargetMacOS" {
+            return createValues[key, default: "true"]
         }
         if let field = selectedRecipe()?.fields.first(where: { $0.key == key }) {
             return createValue(for: field)
@@ -5769,10 +5930,19 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
         let appName = createValues["nativeAppName", default: ""].trimmingCharacters(in: .whitespacesAndNewlines)
         let socketFilename = NativeAppProjectGenerator.safePathComponent(createValues["nativeSocketFilename", default: ""].trimmingCharacters(in: .whitespacesAndNewlines))
+        let projectRoot = createValues["nativeProjectRoot", default: "~/outerframe-apps"].trimmingCharacters(in: .whitespacesAndNewlines)
         let projectFolder = NativeAppProjectGenerator.safePathComponent(createValues["nativeProjectFolder", default: ""].trimmingCharacters(in: .whitespacesAndNewlines))
         let appID = createValues["nativeAppID", default: ""].trimmingCharacters(in: .whitespacesAndNewlines)
         let frontendLanguage = NativeAppProjectConfiguration.FrontendLanguage(rawValue: createValues["nativeFrontendLanguage", default: "swift"]) ?? .swift
         let backendLanguage = NativeAppProjectConfiguration.BackendLanguage(rawValue: createValues["nativeBackendLanguage", default: "go"]) ?? .go
+        let isolationMode = NativeAppProjectConfiguration.IsolationMode(rawValue: createValues["nativeIsolationMode", default: "container"]) ?? .container
+        var platformTargets: Set<NativeAppProjectConfiguration.PlatformTarget> = []
+        if createValues["nativeTargetHTML", default: "true"] == "true" {
+            platformTargets.insert(.html)
+        }
+        if createValues["nativeTargetMacOS", default: "true"] == "true" {
+            platformTargets.insert(.macos)
+        }
         let scheme = suggestedSwiftIdentifier(from: appName)
 
         if appName.isEmpty {
@@ -5780,8 +5950,28 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             updateLayout()
             return
         }
+        if appName.rangeOfCharacter(from: CharacterSet(charactersIn: "\"\\$`\n\r")) != nil {
+            createMessage = "Name cannot contain quotes, backslashes, dollar signs, or backticks."
+            updateLayout()
+            return
+        }
         if socketFilename.isEmpty {
             createMessage = "Socket Filename is required."
+            updateLayout()
+            return
+        }
+        if projectRoot.isEmpty {
+            createMessage = "Project Location is required."
+            updateLayout()
+            return
+        }
+        if projectRoot != "~" && !projectRoot.hasPrefix("~/") && !projectRoot.hasPrefix("/") {
+            createMessage = "Project Location must be an absolute path or start with ~/."
+            updateLayout()
+            return
+        }
+        if projectRoot.rangeOfCharacter(from: CharacterSet(charactersIn: "\"\\$`\n\r")) != nil {
+            createMessage = "Project Location cannot contain quotes, backslashes, dollar signs, or backticks."
             updateLayout()
             return
         }
@@ -5792,6 +5982,11 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         }
         if appID.isEmpty {
             createMessage = "App ID is required."
+            updateLayout()
+            return
+        }
+        if platformTargets.isEmpty {
+            createMessage = "Choose at least one platform."
             updateLayout()
             return
         }
@@ -5817,26 +6012,87 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                     let configuration = NativeAppProjectConfiguration(appName: appName,
                                                                       appID: appID,
                                                                       xcodeScheme: scheme,
+                                                                      projectRootPath: projectRoot,
                                                                       projectFolderName: projectFolder,
                                                                       socketFilename: socketFilename,
+                                                                      platformTargets: platformTargets,
                                                                       frontendLanguage: frontendLanguage,
                                                                       backendLanguage: backendLanguage,
+                                                                      isolationMode: isolationMode,
                                                                       sshCommandArguments: arguments)
                     self.generatedNativeProject = try NativeAppProjectGenerator.generate(configuration: configuration,
                                                                                          stagingDirectory: stagingDirectory,
                                                                                          templateArchiveData: templateArchiveData)
-                    self.nativeProjectSelectionState = .none
-                    self.generatedNativeProjectWasExported = false
-                    self.createScroll = 0
-                    self.isPerformingAction = false
-                    self.createMessage = "Generated \(projectFolder)."
+                    guard let project = self.generatedNativeProject else { return }
+                    self.createMessage = "Installing on server..."
+                    self.updateLayout()
+                    self.installGeneratedNativeProject(project, configuration: configuration)
                 } catch {
                     self.isPerformingAction = false
                     self.createMessage = error.localizedDescription
+                    self.updateLayout()
+                }
+            }
+        }
+    }
+
+    private func installGeneratedNativeProject(_ project: GeneratedNativeAppProject,
+                                               configuration: NativeAppProjectConfiguration) {
+        guard let nativeAppProjectEndpoint, let nativeAppInstallSession else {
+            isPerformingAction = false
+            discardGeneratedNativeProject()
+            createMessage = "The Outer Shell backend cannot create server projects."
+            updateLayout()
+            return
+        }
+
+        let targets = NativeAppProjectConfiguration.PlatformTarget.allCases
+            .filter { configuration.platformTargets.contains($0) }
+            .map(\.rawValue)
+            .joined(separator: " ")
+        var form = URLComponents()
+        form.queryItems = [
+            URLQueryItem(name: "name", value: configuration.appName),
+            URLQueryItem(name: "appID", value: configuration.appID),
+            URLQueryItem(name: "scheme", value: configuration.xcodeScheme),
+            URLQueryItem(name: "sourceRoot", value: configuration.projectRootPath),
+            URLQueryItem(name: "folder", value: configuration.projectFolderName),
+            URLQueryItem(name: "socket", value: configuration.socketFilename),
+            URLQueryItem(name: "targets", value: targets),
+            URLQueryItem(name: "macOSLanguage", value: configuration.frontendLanguage.rawValue),
+            URLQueryItem(name: "backendLanguage", value: configuration.backendLanguage.rawValue),
+            URLQueryItem(name: "isolation", value: configuration.isolationMode.rawValue)
+        ]
+        var request = URLRequest(url: nativeAppProjectEndpoint)
+        request.httpMethod = "POST"
+        request.timeoutInterval = 600
+        request.setValue("application/x-www-form-urlencoded; charset=utf-8", forHTTPHeaderField: "Content-Type")
+        request.httpBody = form.percentEncodedQuery?.data(using: .utf8)
+
+        nativeAppInstallSession.dataTask(with: request) { [weak self] data, response, error in
+            Task { @MainActor in
+                guard let self else { return }
+                self.isPerformingAction = false
+                if let error {
+                    self.discardGeneratedNativeProject()
+                    self.createMessage = error.localizedDescription
+                } else if let httpResponse = response as? HTTPURLResponse,
+                          (200..<300).contains(httpResponse.statusCode) {
+                    try? FileManager.default.removeItem(at: project.canonicalProjectURL)
+                    self.nativeProjectSelectionState = .none
+                    self.generatedNativeProjectWasExported = false
+                    self.createScroll = 0
+                    self.createMessage = "Installed \(configuration.projectFolderName) on the server."
+                    self.fetchBackends()
+                } else {
+                    let message = data.flatMap { String(data: $0, encoding: .utf8) }?
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                    self.discardGeneratedNativeProject()
+                    self.createMessage = (message?.isEmpty == false) ? message! : "Server installation failed."
                 }
                 self.updateLayout()
             }
-        }
+        }.resume()
     }
 
     private func fetchNativeAppTemplateArchive(completion: @escaping @MainActor @Sendable (Result<Data, Error>) -> Void) {
@@ -5868,6 +6124,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func beginDraggingGeneratedNativeProject(_ project: GeneratedNativeAppProject) {
+        guard project.hasPlatformWorkspace else { return }
         let promiseID = UUID()
         nativeFilePromiseURLs[promiseID] = project.projectURL
         let dragPreview = nativeProjectDragPreview(for: project)
@@ -6113,7 +6370,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                     self.pendingFilePicker?.directory = response.path
                     self.pendingFilePicker?.parent = response.parent
                     self.pendingFilePicker?.entries = response.entries
-                    self.filePickerSelectedIndex = nil
+                    self.filePickerSelectedIndex = response.entries.firstIndex(where: \.willCreate)
                     self.resetFilePickerTypeahead()
                 } catch {
                     self.pendingFilePicker?.error = "Could not decode directory."
@@ -6174,7 +6431,17 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
     private func activateFilePickerEntry(_ entry: FilePickerEntryRecord) {
         blurCreateField()
-        if entry.isDirectory {
+        if entry.willCreate,
+           let targetFieldKey = pendingFilePicker?.targetFieldKey {
+            createValues[targetFieldKey] = entry.path
+            pendingFilePicker = nil
+            filePickerScroll = 0
+            filePickerSelectedIndex = nil
+            resetFilePickerTypeahead()
+            focusCreateField(targetFieldKey, cursorPosition: entry.path.count)
+            createMessage = ""
+            updateLayout()
+        } else if entry.isDirectory {
             fetchFilePickerDirectory(path: entry.path)
         } else if pendingFilePicker?.mode == .chooseFile,
                   let targetFieldKey = pendingFilePicker?.targetFieldKey {
@@ -7660,7 +7927,11 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         case .createCancel:
             dismissCreateOverlay()
         case .createChoice(let key, let value):
-            createValues[key] = value
+            if key == "nativeTargetHTML" || key == "nativeTargetMacOS" {
+                createValues[key] = createValues[key, default: "true"] == "true" ? "false" : "true"
+            } else {
+                createValues[key] = value
+            }
             if createInputController.isFocused, activeCreateFieldKey == key {
                 focusCreateField(key)
             }
@@ -8685,7 +8956,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func visibleNativeCreateFieldKeys() -> [String] {
-        ["nativeAppName", "nativeProjectFolder", "nativeAppID", "nativeSocketFilename"]
+        ["nativeAppName", "nativeProjectRoot", "nativeProjectFolder", "nativeAppID", "nativeSocketFilename"]
     }
 
     private func visibleLocalCreateFieldKeys() -> [String] {
@@ -8725,8 +8996,20 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         if createValues["nativeBackendLanguage", default: ""].trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             createValues["nativeBackendLanguage"] = "go"
         }
+        if createValues["nativeIsolationMode", default: ""].trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            createValues["nativeIsolationMode"] = "container"
+        }
+        if createValues["nativeTargetHTML"] == nil {
+            createValues["nativeTargetHTML"] = "true"
+        }
+        if createValues["nativeTargetMacOS"] == nil {
+            createValues["nativeTargetMacOS"] = "true"
+        }
         if createValues["nativeFrontendLanguage", default: ""].trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             createValues["nativeFrontendLanguage"] = "swift"
+        }
+        if createValues["nativeProjectRoot", default: ""].trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            createValues["nativeProjectRoot"] = "~/outerframe-apps"
         }
         let effectiveName = createValues["nativeAppName", default: "Hello World"].trimmingCharacters(in: .whitespacesAndNewlines)
         let folder = suggestedProjectFolderName(from: effectiveName)

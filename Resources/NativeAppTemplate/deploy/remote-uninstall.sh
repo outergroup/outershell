@@ -10,6 +10,8 @@ set -euo pipefail
 
 : "${APP_ID:?APP_ID must be set}"
 : "${SOCKET_FILENAME:?SOCKET_FILENAME must be set}"
+ISOLATION_MODE="${ISOLATION_MODE:-host}"
+CONTAINER_IMAGE="${CONTAINER_IMAGE:-}"
 
 export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=${XDG_RUNTIME_DIR}/bus}"
@@ -39,6 +41,10 @@ fi
 
 echo "==> Removing systemd user unit"
 systemctl --user disable --now "${UNIT_NAME}" 2>/dev/null || true
+if [[ "${ISOLATION_MODE}" == "container" ]] && command -v docker >/dev/null 2>&1; then
+    docker rm -f "${CONTAINER_IMAGE}" >/dev/null 2>&1 || true
+    docker image rm "${CONTAINER_IMAGE}" >/dev/null 2>&1 || true
+fi
 rm -f "${UNIT_PATH}"
 systemctl --user daemon-reload
 

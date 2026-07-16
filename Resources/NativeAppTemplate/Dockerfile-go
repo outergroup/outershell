@@ -1,0 +1,18 @@
+FROM golang:1.23-alpine AS build
+WORKDIR /src
+COPY server/go.mod ./
+COPY server/main.go ./
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/server .
+
+FROM alpine:3.21
+WORKDIR /app
+COPY --from=build /out/server /app/server
+COPY . /project
+RUN if [ -d /project/html ]; then cp -R /project/html /app/web; fi \
+    && cp -R /project/artifacts/. /app/ \
+    && cp /project/deploy/container-entrypoint.sh /app/container-entrypoint.sh \
+    && chmod 0755 /app/server /app/container-entrypoint.sh \
+    && rm -rf /project
+ENV APP_DATA_DIR=/data
+EXPOSE 8080
+ENTRYPOINT ["/app/container-entrypoint.sh"]

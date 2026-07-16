@@ -1,0 +1,22 @@
+FROM debian:bookworm-slim AS build
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends build-essential ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+COPY server/ ./
+RUN mkdir -p /out \
+    && make OUTPUT=/out/server LDFLAGS= \
+    && strip --strip-unneeded /out/server
+
+FROM debian:bookworm-slim
+WORKDIR /app
+COPY --from=build /out/server /app/server
+COPY . /project
+RUN if [ -d /project/html ]; then cp -R /project/html /app/web; fi \
+    && cp -R /project/artifacts/. /app/ \
+    && cp /project/deploy/container-entrypoint.sh /app/container-entrypoint.sh \
+    && chmod 0755 /app/server /app/container-entrypoint.sh \
+    && rm -rf /project
+ENV APP_DATA_DIR=/data
+EXPOSE 8080
+ENTRYPOINT ["/app/container-entrypoint.sh"]

@@ -925,6 +925,7 @@ typedef struct {
     char name[NAME_MAX + 1];
     char path[PATH_MAX];
     bool is_directory;
+    bool will_create;
     uint64_t size;
     double modified;
     mode_t mode;
@@ -5039,6 +5040,7 @@ static bool lookup_launchd_backend_any_for_scope(const char *service_id,
 #define BACKEND_FLAG_MENU_BAR_VISIBILITY_AVAILABLE 0x400u
 #define LOG_FILE_FLAG_READABLE 0x01u
 #define FILE_PICKER_FLAG_IS_DIRECTORY 0x01u
+#define FILE_PICKER_FLAG_WILL_CREATE 0x02u
 #define ACTION_FLAG_OK 0x01u
 #define ACTION_FLAG_NEEDS_PASSWORD 0x02u
 #define ACTION_FLAG_UPDATE_AVAILABLE 0x04u
@@ -7620,6 +7622,7 @@ static bool build_file_picker_entry_payload(const FilePickerEntry *entry, String
     if (!binary_append_zero(payload, 40)) return false;
     uint32_t flags = 0;
     if (entry->is_directory) flags |= FILE_PICKER_FLAG_IS_DIRECTORY;
+    if (entry->will_create) flags |= FILE_PICKER_FLAG_WILL_CREATE;
     return binary_append_string_ref_at(payload, 0, entry->name) &&
            binary_append_string_ref_at(payload, 8, entry->path) &&
            binary_write_u32_at(payload, 16, flags) &&
@@ -7632,14 +7635,22 @@ static void send_file_picker_response(int fd, const char *query) {
     char extension[64] = "";
     char directories_only_raw[16] = "";
     char path[PATH_MAX];
+    char requested_path[PATH_MAX];
     query_value(query, "path", requested, sizeof(requested));
     query_value(query, "extension", extension, sizeof(extension));
     query_value(query, "directoriesOnly", directories_only_raw, sizeof(directories_only_raw));
     bool directories_only = strcmp(directories_only_raw, "1") == 0 ||
                             strcasecmp(directories_only_raw, "true") == 0;
-    expand_tilde_path(requested[0] ? requested : "~", path, sizeof(path));
+    expand_tilde_path(requested[0] ? requested : "~", requested_path, sizeof(requested_path));
+    size_t requested_path_length = strlen(requested_path);
+    while (requested_path_length > 1 && requested_path[requested_path_length - 1] == '/') {
+        requested_path[--requested_path_length] = '\0';
+    }
+    snprintf(path, sizeof(path), "%s", requested_path);
 
     DIR *dir = opendir(path);
+    int requested_path_errno = dir ? 0 : errno;
+    bool will_offer_requested_path = !dir && directories_only && requested_path_errno == ENOENT;
     if (!dir && directories_only) {
         char candidate[PATH_MAX];
         snprintf(candidate, sizeof(candidate), "%s", path);
@@ -7715,6 +7726,29 @@ static void send_file_picker_response(int fd, const char *query) {
     }
 
     closedir(dir);
+
+    if (will_offer_requested_path && strcmp(requested_path, path) != 0) {
+        if (count == capacity) {
+            size_t new_capacity = capacity ? capacity * 2 : 64;
+            FilePickerEntry *new_entries = realloc(entries, new_capacity * sizeof(FilePickerEntry));
+            if (!new_entries) {
+                free(entries);
+                send_text_response(fd, 500, "out of memory\n");
+                return;
+            }
+            entries = new_entries;
+            capacity = new_capacity;
+        }
+        const char *name = strrchr(requested_path, '/');
+        name = name ? name + 1 : requested_path;
+        FilePickerEntry *proposed = &entries[count++];
+        memset(proposed, 0, sizeof(*proposed));
+        snprintf(proposed->name, sizeof(proposed->name), "%s", name[0] ? name : requested_path);
+        snprintf(proposed->path, sizeof(proposed->path), "%s", requested_path);
+        proposed->is_directory = true;
+        proposed->will_create = true;
+        proposed->mode = S_IFDIR | 0755;
+    }
 
     qsort(entries, count, sizeof(FilePickerEntry), compare_file_picker_entries);
 

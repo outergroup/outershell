@@ -81,7 +81,7 @@ private final class HelloFullstackHandler: NSObject, OuterframeHostDelegate {
 
     // MARK: - Backend API
 
-    /// The binary response served by `backend/` at `/api/hello`.
+    /// The binary response served by `server/` at `/api/hello`.
     ///
     /// Format:
     /// - 4 little-endian uint32 offset/length pairs: message, hostname, os, time

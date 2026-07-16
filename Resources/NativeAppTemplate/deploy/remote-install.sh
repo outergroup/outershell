@@ -11,6 +11,8 @@ set -euo pipefail
 : "${APP_ID:?APP_ID must be set}"
 : "${APP_NAME:?APP_NAME must be set}"
 : "${SOCKET_FILENAME:?SOCKET_FILENAME must be set}"
+ISOLATION_MODE="${ISOLATION_MODE:-host}"
+CONTAINER_IMAGE="${CONTAINER_IMAGE:-}"
 
 # Non-interactive ssh sessions don't always export these, but pam_systemd has
 # created the runtime dir and user bus; point at them explicitly so
@@ -30,6 +32,18 @@ LOG_PATH="${LOG_DIR}/backend.log"
 if [[ ! -d "${STAGING_DIR}" ]]; then
     echo "error: expected payload at ${STAGING_DIR}; run this via ./app deploy" >&2
     exit 1
+fi
+
+if [[ "${ISOLATION_MODE}" == "container" ]]; then
+    command -v docker >/dev/null 2>&1 || {
+        echo "error: Docker is required for this containerized app" >&2
+        exit 1
+    }
+    docker image inspect "${CONTAINER_IMAGE}" >/dev/null 2>&1 || {
+        echo "error: expected container image ${CONTAINER_IMAGE}; run this via ./app deploy" >&2
+        exit 1
+    }
+    chmod +x "${STAGING_DIR}/deploy/run-container.sh"
 fi
 
 find_outerctl() {

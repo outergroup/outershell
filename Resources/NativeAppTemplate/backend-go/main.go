@@ -1,8 +1,9 @@
 // Backend for a full-stack outerframe app.
 //
-// Serves three things:
+// Serves four things:
 //
-//	GET /                    the .outer descriptor (Content-Type: application/vnd.outerframe)
+//	GET /                    HTML or .outer, negotiated with Outerframe-Accept
+//	GET /<web asset>         the HTML implementation
 //	GET /frontend/<platform> the platform bundle archives (macos-arm, macos-x86)
 //	GET /api/hello           a tiny binary greeting -- replace this with your app's real API
 //
@@ -31,7 +32,8 @@ import (
 func main() {
 	socketPath := flag.String("socket", "", "Unix domain socket path to listen on")
 	port := flag.Int("port", 0, "TCP port to listen on (127.0.0.1), for local development")
-	root := flag.String("root", "", "directory containing app.outer and frontends/ (default: executable's directory)")
+	host := flag.String("host", "127.0.0.1", "TCP address to listen on when --port is used")
+	root := flag.String("root", "", "directory containing web/, app.outer, and frontends/ (default: executable's directory)")
 	flag.Parse()
 
 	if (*socketPath == "") == (*port == 0) {
@@ -47,9 +49,9 @@ func main() {
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /{$}", serveOuter(*root))
 	mux.HandleFunc("GET /frontend/", serveFrontend(*root))
 	mux.HandleFunc("GET /api/hello", serveHello)
+	mux.Handle("GET /", serveApp(*root))
 
 	var listener net.Listener
 	var err error
@@ -65,11 +67,11 @@ func main() {
 		}
 		log.Printf("listening on unix socket %s, serving %s", *socketPath, *root)
 	} else {
-		listener, err = net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", *port))
+		listener, err = net.Listen("tcp", fmt.Sprintf("%s:%d", *host, *port))
 		if err != nil {
 			log.Fatalf("cannot listen on port %d: %v", *port, err)
 		}
-		log.Printf("listening on http://127.0.0.1:%d/, serving %s", *port, *root)
+		log.Printf("listening on http://%s:%d/, serving %s", *host, *port, *root)
 	}
 
 	server := &http.Server{Handler: mux}
@@ -89,15 +91,50 @@ func main() {
 	}
 }
 
-// serveOuter serves the .outer descriptor at the root path. The special
-// content type is what tells Outer Loop to launch an outerframe rather than
-// render a page.
-func serveOuter(root string) http.HandlerFunc {
+// serveApp is the cross-platform handoff. Outerframe-aware browsers announce
+// support on top-level navigation; everyone else receives the HTML target.
+func serveApp(root string) http.Handler {
 	outerPath := filepath.Join(root, "app.outer")
-	return func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/vnd.outerframe")
-		http.ServeFile(w, r, outerPath)
-	}
+	webRoot := filepath.Join(root, "web")
+	webIndexPath := filepath.Join(webRoot, "index.html")
+	webFiles := http.FileServer(http.Dir(webRoot))
+
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			if fileExists(webIndexPath) {
+				webFiles.ServeHTTP(w, r)
+				return
+			}
+			http.NotFound(w, r)
+			return
+		}
+
+		w.Header().Add("Vary", "Outerframe-Accept")
+		if acceptsOuterframe(r) && fileExists(outerPath) {
+			w.Header().Set("Content-Type", "application/vnd.outerframe")
+			http.ServeFile(w, r, outerPath)
+			return
+		}
+		if fileExists(webIndexPath) {
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			http.ServeFile(w, r, webIndexPath)
+			return
+		}
+		if fileExists(outerPath) {
+			http.Error(w, "This app requires an outerframe-aware browser.\n", http.StatusNotAcceptable)
+			return
+		}
+		http.NotFound(w, r)
+	})
+}
+
+func acceptsOuterframe(r *http.Request) bool {
+	return strings.Contains(strings.ToLower(r.Header.Get("Outerframe-Accept")), "application/vnd.outerframe")
+}
+
+func fileExists(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && info.Mode().IsRegular()
 }
 
 // serveFrontend serves the platform bundle archives referenced by the .outer

@@ -1,144 +1,173 @@
 # Hello World
 
-A full-stack [outerframe](https://outerframe.org) app: a backend that runs
-locally or on a Linux server, serving a native macOS frontend to
-[Outer Loop](https://outerloop.sh), registered as an app with
-[Outer Shell](https://outershell.org).
+A multi-platform [outerframe](https://outerframe.org) app. One server exposes a
+shared API and negotiates between independent HTML and macOS implementations.
+The enabled platforms and server isolation policy live in `app.env`.
 
-The frontend is a CALayer-based macOS bundle generated as Swift or
-Objective-C. The backend is generated as Go or C. It serves the `.outer`
-descriptor, the platform bundle archives, and a small binary API that the
-frontend calls over the SSH tunnel.
+This is deliberately multi-platform, not cross-platform: `html/` is ordinary
+HTML/CSS/JavaScript, while `macos/` is a compiled CALayer-based bundle written
+in Swift or Objective-C. They share behavior through `server/`; they do not
+share a UI toolkit.
 
-## Requirements
+## What happens at `/`
 
-- **Mac**: Xcode (for the frontend bundle) and Docker Desktop (for reproducible
-  Linux backend builds). No Apple ID or signing setup is needed; the bundle
-  builds with code signing disabled. If Docker is unavailable, an SSH deploy
-  of a C backend builds on the target instead when `cc` and `make` are
-  installed there; it also uses `strip` when available.
-- **Server**: Linux with systemd and [Outer Shell installed](https://outershell.org/install/).
-- **Outer Loop** on the Mac, with an SSH connection to the server.
+- A normal browser receives `html/index.html`.
+- Outer Loop sends `Outerframe-Accept: application/vnd.outerframe`. When the
+  macOS target is enabled, the server returns `app.outer`, and Outer Loop then
+  fetches `/frontend/macos-arm` or `/frontend/macos-x86`.
+- Outer Loop’s **Develop → Outerframe → Always Use HTML** option suppresses the
+  capability header, so the same URL loads the HTML implementation.
 
-## Quick start
+If only one platform is enabled, the server behaves predictably: an HTML-only
+app always serves HTML, while a macOS-only app returns `406 Not Acceptable` to
+ordinary browsers.
 
-```bash
-./app target "ssh -p 22 you@your-server"   # optional; generated projects are prefilled
-./app deploy
+## Project layout
+
+```text
+app                 build, development, deployment, and sync commands
+app.env             app identity, enabled platforms, isolation, languages
+html/               HTML implementation, when enabled
+macos/              Xcode bundle project, when enabled
+server/             shared HTTP server and API, generated as Go or C
+artifacts/          compiled platform payloads; macOS builds land here
+deploy/             host/container service definitions and install scripts
+Dockerfile          runtime image, for containerized apps
 ```
 
-Then open the server in Outer Loop. "Hello World" appears in its app
-list; opening it starts the backend, downloads the frontend, and shows a
-greeting fetched live from the server.
+This directory is user-owned canonical source. New App defaults to
+`~/outerframe-apps/<project>` on the server, but its Project Location picker can
+put the source root anywhere writable by your server account. It is an ordinary
+project folder: open it over SSH, let coding agents edit it there, initialize a
+Git repository, and push it to the Git host of your choice. The HTML
+implementation lives beside the server, while platform build machines return
+compiled output to `artifacts/`.
 
-## Development loops
+The running app never reads files directly from this source directory.
+`./app deploy` builds a snapshot and installs it under Outer Shell's private
+runtime directory (or bakes the snapshot into the container image). Source
+edits become live only after another deploy. `./app run-local` is the explicit
+live-source development path.
 
-Local, no server involved (the fast loop):
+`artifacts/` is also part of the canonical project contract, but its generated
+contents are gitignored. A Mac publishes `app.outer` and compiled frontend
+archives there; the next deployment includes them in the runtime snapshot or
+container image. Keep `artifacts/.gitkeep` so the handoff location exists in a
+fresh clone.
+
+Outer Shell also creates a small macOS builder folder when macOS is enabled.
+That folder is intentionally not a copy of this project. It contains the Xcode
+source needed by a Mac plus three commands:
+
+```bash
+./platform sync       # replace local macos/ with this server's source
+./platform build      # compile locally with Xcode
+./platform publish    # send only compiled macOS artifacts back here
+```
+
+Publishing calls `./app accept-platform macos` on this server. Host-mode apps
+update their installed payload; containerized apps rebuild so the new assets
+are included in the image. This same contract can support future Windows and
+other platform builders without moving the canonical project.
+
+## Local development
+
+Run all selected implementations through the same local server:
 
 ```bash
 ./app run-local
-# open http://127.0.0.1:8787/ in Outer Loop
 ```
 
-Frontend-only update to the live server (no backend rebuild or restart):
+Open the printed URL in a normal browser for HTML or in Outer Loop for the
+native macOS implementation. If macOS is enabled, Xcode is required.
+
+For a containerized app, exercise the exact public-web image locally:
 
 ```bash
-./app push-frontend
+./app run-container
 ```
 
-Full redeploy after backend changes:
+## Private Outer Shell deployment
+
+New App installs this project on the current server and performs the first
+deployment automatically. Later, from this directory on the server, run:
 
 ```bash
 ./app deploy
 ```
 
-Build every Linux release variant:
+Host-mode apps install a native binary as a systemd user service. Containerized
+apps build their image on this host, run with a read-only root filesystem,
+and receive only two writable mounts: persistent `/data` and the runtime
+directory containing the Outer Shell Unix socket. The server needs Docker,
+systemd, and Outer Shell.
+
+The deployed service is disposable output. Make lasting changes in the
+canonical Project Location chosen in New App, then deploy again; do not edit
+`~/.local/share/outershell-apps`.
+
+Platform build machines publish through the narrow artifact command:
 
 ```bash
-./app build-matrix
+./app accept-platform macos /path/to/incoming-artifacts
 ```
 
-C backends produce glibc and musl binaries for aarch64 and x86_64. glibc uses
-the manylinux2014 (glibc 2.17) baseline and musl uses musllinux 1.2. Go
-backends are built once per architecture because `CGO_ENABLED=0` makes them
-independent of the target libc. Release binaries are stripped.
+For containerized apps this rebuilds and restarts the image, because platform
+assets are part of the image.
 
-Watch the backend:
+## Open-web deployment
+
+Containerized apps use the same standard Dockerfile on private hosts and
+public container platforms. The entrypoint listens on `$PORT` when supplied,
+or port 8080 otherwise. The image and task runner do not select or require a
+hosting provider.
+
+Web deployment is a small Bash plugin interface. List the adapters available to
+this project, then choose one explicitly:
 
 ```bash
-./app logs
-./app status
+./app web-providers
+./app deploy-web railway
 ```
 
-Remove everything from the server:
+Railway is included as one optional adapter; it is not the default. Additional
+adapters can be checked into `deploy/web-providers/<name>`, installed for the
+current user at `~/.config/outerframe/web-providers/<name>`, or exposed on
+`PATH` as `outerframe-web-provider-<name>`.
+
+The dispatcher stages every selected platform, then invokes the adapter with
+`deploy` as its first argument. It exports `OUTERFRAME_PROJECT_ROOT`,
+`OUTERFRAME_APP_ID`, `OUTERFRAME_APP_NAME`, `OUTERFRAME_CONTAINER_IMAGE`,
+`OUTERFRAME_CONTAINER_PORT`, and `OUTERFRAME_DOCKERFILE`. Remaining command-line
+arguments are forwarded unchanged, so provider-native project, service, and
+environment options remain available:
 
 ```bash
-./app uninstall
+./app deploy-web railway --service my-service --environment production
 ```
 
-## Layout
+An adapter owns provider authentication, upload, status, and domain behavior.
+It exits with the provider command's status. Outer Shell and `outerctl` are not
+part of this path; the canonical folder remains deployable over an ordinary SSH
+shell or by a coding agent.
 
-```
-app                 task runner; all build/deploy logic lives here and in deploy/
-app.env             app identity and frontend/backend languages -- single source of truth
-target.env          deploy target kind + optional ssh argv (gitignored)
-frontend/           Xcode project producing HelloFullstack.bundle
-  Frontend/         the app's own code (start here)
-  Vendor/           outerframe host plumbing (socket protocol, layer registration)
-  Scripts/          generate_outer.py writes the .outer descriptor
-backend/            HTTP server; Go projects include a pinned toolchain Dockerfile
-deploy/             systemd unit template + scripts that run on the server
-```
+## Useful commands
 
-## How it fits together
-
-1. `./app build` compiles the bundle with xcodebuild, thins it per
-   architecture, packs each slice as an Apple Archive, writes `app.outer`
-   (pointing at `/frontend`), and builds the backend for the selected deploy
-   target. For C backends it detects glibc versus musl and uses the matching
-   manylinux2014 or musllinux 1.2 toolchain.
-2. `./app deploy` installs locally when `OUTER_TARGET_KIND=local`. For SSH
-   targets, it streams the payload as a tarball over your exact SSH command (no
-   scp/rsync assumptions), then streams `deploy/remote-install.sh`, which swaps
-   the payload into `~/.local/share/outershell-apps/<app-id>/`, installs a
-   systemd user unit, and registers the backend and app with `outerctl`.
-3. The backend listens on a Unix domain socket in `$XDG_RUNTIME_DIR`; Outer
-   Shell knows the socket path and starts the service on demand. No ports to
-   choose, no port collisions.
-4. When you open the app, Outer Loop fetches `/` (the `.outer` descriptor),
-   downloads `/frontend/macos-arm`, and runs the bundle in a sandboxed
-   process. The frontend then calls `/api/hello` through the SOCKS proxy,
-   i.e. over the same SSH connection.
-
-## Backend API style
-
-The generated `/api/hello` endpoint intentionally does not use JSON. Outer
-Shell apps usually use small little-endian binary messages so the backend can
-be written in C without bringing in a parser dependency. The endpoint uses
-`Content-Type: application/octet-stream`; the endpoint path identifies the payload
-format. The sample response is:
-
-```
-8 bytes   little-endian uint32 offset, uint32 length for message
-8 bytes   little-endian uint32 offset, uint32 length for hostname
-8 bytes   little-endian uint32 offset, uint32 length for os
-8 bytes   little-endian uint32 offset, uint32 length for time
-N bytes   UTF-8 string data referenced by those records
+```text
+./app build             build the selected platforms and server/container
+./app build-platforms   stage every selected platform
+./app deploy            build and deploy from this server project
+./app accept-platform   accept output from a platform build machine
+./app web-providers     list installed web deployment adapters
+./app deploy-web NAME   deploy through a selected provider adapter
+./app logs              follow private-server logs
+./app status            inspect the private service
+./app uninstall         remove the private deployment
+./app clean             remove local build products (not artifacts/)
 ```
 
-For your real app, prefer similarly explicit binary records over generic text
-serialization unless a human-editable format is part of the product.
+## Shared API
 
-## Renaming this app
-
-Edit `app.env`. The one identity baked into the frontend project is the Xcode
-target name (`HelloFullstack`); if you rename the target, scheme, and
-`Frontend/HelloFullstackContent.swift` class, update `XCODE_SCHEME` to match.
-Then `./app deploy` registers the new id and `./app uninstall` (before
-renaming) removes the old one.
-
-`BACKEND_LANGUAGE` is generated as either `go` or `c`. It controls the backend
-build path used by `./app`; changing it after generation means replacing the
-contents of `backend/` with an implementation in that language.
-`FRONTEND_LANGUAGE` records whether this project was generated from the Swift
-or Objective-C frontend template.
+Both starter implementations call `GET /api/hello`. The endpoint uses four
+little-endian offset/length string records rather than JSON, keeping the
+contract equally natural for C, Swift, Objective-C, Go, and JavaScript.

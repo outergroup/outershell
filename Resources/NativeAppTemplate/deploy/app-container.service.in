@@ -1,0 +1,16 @@
+# systemd user unit for the containerized @APP_NAME@ server.
+
+[Unit]
+Description=@APP_NAME@ (containerized outerframe app server)
+After=docker.service
+
+[Service]
+Type=simple
+ExecStart=%h/.local/share/outershell-apps/@APP_ID@/deploy/run-container.sh
+ExecStop=-/usr/bin/env docker stop -t 10 @CONTAINER_IMAGE@
+StandardOutput=append:%h/.local/state/outershell/apps/@APP_ID@/backend.log
+StandardError=append:%h/.local/state/outershell/apps/@APP_ID@/backend.log
+Restart=on-failure
+
+[Install]
+WantedBy=default.target

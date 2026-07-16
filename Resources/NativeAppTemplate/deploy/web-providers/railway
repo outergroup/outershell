@@ -1,0 +1,20 @@
+#!/bin/bash
+# Optional Railway adapter for the provider-neutral web deployment interface.
+
+set -euo pipefail
+
+action="${1:-}"
+shift $(( $# > 0 ? 1 : 0 ))
+
+if [[ "${action}" != deploy ]]; then
+    echo "error: Railway provider does not support action '${action}'" >&2
+    exit 2
+fi
+if ! command -v railway >/dev/null 2>&1; then
+    echo "error: Railway CLI is required for the Railway provider" >&2
+    echo "       https://docs.railway.com/cli/installation" >&2
+    exit 1
+fi
+
+cd "${OUTERFRAME_PROJECT_ROOT:?}"
+exec railway up -m "Deploy ${OUTERFRAME_APP_NAME:-outerframe app}" "$@"

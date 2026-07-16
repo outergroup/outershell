@@ -1144,6 +1144,157 @@ static void send_native_app_template_archive(int fd) {
     free(archive.data);
 }
 
+static bool native_app_value_has_no_controls(const char *value, size_t maximum_length) {
+    size_t length = value ? strlen(value) : 0;
+    if (length == 0 || length > maximum_length) return false;
+    for (const unsigned char *p = (const unsigned char *)value; *p; p++) {
+        if (*p < 0x20 || *p == 0x7f) return false;
+    }
+    return true;
+}
+
+static bool native_app_value_uses_characters(const char *value,
+                                             const char *characters,
+                                             size_t maximum_length) {
+    if (!native_app_value_has_no_controls(value, maximum_length)) return false;
+    return strspn(value, characters) == strlen(value);
+}
+
+static bool native_app_scheme_is_valid(const char *value) {
+    if (!native_app_value_has_no_controls(value, 128)) return false;
+    if (!(isalpha((unsigned char)value[0]) || value[0] == '_')) return false;
+    for (const unsigned char *p = (const unsigned char *)value + 1; *p; p++) {
+        if (!(isalnum(*p) || *p == '_')) return false;
+    }
+    return true;
+}
+
+static void send_native_app_project_creation(int fd, const char *query, const char *body) {
+    char name[256], app_id[256], scheme[160], folder[160], socket_name[256];
+    char source_root[PATH_MAX] = "~/outerframe-apps";
+    char targets[64], macos_language[32], backend_language[32], isolation[32];
+    if (!query_value_any(query, body, "name", name, sizeof(name)) ||
+        !query_value_any(query, body, "appID", app_id, sizeof(app_id)) ||
+        !query_value_any(query, body, "scheme", scheme, sizeof(scheme)) ||
+        !query_value_any(query, body, "folder", folder, sizeof(folder)) ||
+        !query_value_any(query, body, "socket", socket_name, sizeof(socket_name)) ||
+        !query_value_any(query, body, "targets", targets, sizeof(targets)) ||
+        !query_value_any(query, body, "macOSLanguage", macos_language, sizeof(macos_language)) ||
+        !query_value_any(query, body, "backendLanguage", backend_language, sizeof(backend_language)) ||
+        !query_value_any(query, body, "isolation", isolation, sizeof(isolation))) {
+        send_text_response(fd, 400, "missing native app project configuration\n");
+        return;
+    }
+    (void)query_value_any(query, body, "sourceRoot", source_root, sizeof(source_root));
+
+    static const char *component_characters =
+        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.";
+    if (!native_app_value_has_no_controls(name, 200) || strpbrk(name, "\"\\$`") != NULL ||
+        !native_app_value_uses_characters(app_id, component_characters, 200) ||
+        !native_app_value_has_no_controls(source_root, sizeof(source_root) - 1) ||
+        (source_root[0] != '/' && strcmp(source_root, "~") != 0 && strncmp(source_root, "~/", 2) != 0) ||
+        strpbrk(source_root, "\"\\$`") != NULL ||
+        !native_app_value_uses_characters(folder, component_characters, 128) ||
+        strcmp(folder, ".") == 0 || strcmp(folder, "..") == 0 ||
+        !native_app_value_uses_characters(socket_name, component_characters, 200) ||
+        !native_app_scheme_is_valid(scheme) ||
+        (strcmp(targets, "html") != 0 && strcmp(targets, "macos") != 0 && strcmp(targets, "html macos") != 0) ||
+        (strcmp(macos_language, "swift") != 0 && strcmp(macos_language, "objc") != 0) ||
+        (strcmp(backend_language, "go") != 0 && strcmp(backend_language, "c") != 0) ||
+        (strcmp(isolation, "container") != 0 && strcmp(isolation, "host") != 0)) {
+        send_text_response(fd, 400, "invalid native app project configuration\n");
+        return;
+    }
+
+    if (!g_native_app_template_directory[0]) {
+        send_text_response(fd, 503, "native app template directory is not configured\n");
+        return;
+    }
+    char helper[PATH_MAX];
+    snprintf(helper, sizeof(helper), "%s/create-project.py", g_native_app_template_directory);
+    struct stat helper_stat;
+    if (stat(helper, &helper_stat) != 0 || !S_ISREG(helper_stat.st_mode)) {
+        send_text_response(fd, 503, "native app project creator is unavailable\n");
+        return;
+    }
+
+    char quoted_helper[PATH_MAX * 4 + 8];
+    char quoted_source_root[PATH_MAX * 4 + 8];
+    char quoted_name[sizeof(name) * 4 + 8];
+    char quoted_app_id[sizeof(app_id) * 4 + 8];
+    char quoted_scheme[sizeof(scheme) * 4 + 8];
+    char quoted_folder[sizeof(folder) * 4 + 8];
+    char quoted_socket[sizeof(socket_name) * 4 + 8];
+    char quoted_targets[sizeof(targets) * 4 + 8];
+    shell_quote(helper, quoted_helper, sizeof(quoted_helper));
+    shell_quote(source_root, quoted_source_root, sizeof(quoted_source_root));
+    shell_quote(name, quoted_name, sizeof(quoted_name));
+    shell_quote(app_id, quoted_app_id, sizeof(quoted_app_id));
+    shell_quote(scheme, quoted_scheme, sizeof(quoted_scheme));
+    shell_quote(folder, quoted_folder, sizeof(quoted_folder));
+    shell_quote(socket_name, quoted_socket, sizeof(quoted_socket));
+    shell_quote(targets, quoted_targets, sizeof(quoted_targets));
+
+    char command[PATH_MAX * 10 + 8192];
+    int command_length = snprintf(command, sizeof(command),
+                                  "python3 %s --name %s --app-id %s --scheme %s --source-root %s --folder %s "
+                                  "--socket %s --targets %s --macos-language %s "
+                                  "--backend-language %s --isolation %s 2>&1",
+                                  quoted_helper, quoted_name, quoted_app_id, quoted_scheme,
+                                  quoted_source_root, quoted_folder, quoted_socket, quoted_targets, macos_language,
+                                  backend_language, isolation);
+    if (command_length < 0 || (size_t)command_length >= sizeof(command)) {
+        send_text_response(fd, 500, "native app project command is too long\n");
+        return;
+    }
+
+    FILE *pipe = popen(command, "r");
+    if (!pipe) {
+        send_text_response(fd, 500, "failed to start native app project creation\n");
+        return;
+    }
+    StringBuilder output = {0};
+    char chunk[4096];
+    while (fgets(chunk, sizeof(chunk), pipe)) {
+        if (output.length < 128 * 1024) {
+            size_t available = 128 * 1024 - output.length;
+            size_t length = strlen(chunk);
+            (void)sb_append_n(&output, chunk, length < available ? length : available);
+        }
+    }
+    int wait_status = pclose(pipe);
+    int exit_status = WIFEXITED(wait_status) ? WEXITSTATUS(wait_status) : -1;
+    if (!output.data || output.length == 0) {
+        (void)sb_append(&output, exit_status == 0
+            ? "native app project installed\n"
+            : "native app project creation failed\n");
+    }
+    int http_status = exit_status == 0 ? 200 : (exit_status == 17 ? 409 : (exit_status == 2 ? 400 : 500));
+    const char *reason = http_status == 200 ? "OK" :
+                         (http_status == 409 ? "Conflict" :
+                         (http_status == 400 ? "Bad Request" : "Internal Server Error"));
+    send_response(fd, http_status, reason, "text/plain; charset=utf-8", output.data, output.length);
+    free(output.data);
+}
+
+static void dispatch_native_app_project_creation(int fd, const char *query, const char *body) {
+    pid_t worker = fork();
+    if (worker < 0) {
+        send_text_response(fd, 500, "failed to start native app project worker\n");
+        return;
+    }
+    if (worker != 0) return;
+
+    long descriptor_limit = sysconf(_SC_OPEN_MAX);
+    if (descriptor_limit < 0 || descriptor_limit > 65536) descriptor_limit = 65536;
+    for (int candidate = 3; candidate < descriptor_limit; candidate++) {
+        if (candidate != fd) close(candidate);
+    }
+    send_native_app_project_creation(fd, query, body);
+    close(fd);
+    _exit(0);
+}
+
 static bool is_navigator_route(const char *target) {
     return strcmp(target, "/") == 0 ||
            strcmp(target, "/apps") == 0 ||
@@ -1389,7 +1540,9 @@ static bool process_http_client_request(ReactorClient *client, char *request, si
         return proxy_ui_request_to_api(client, ui_route, query, body, body_length);
     }
 
-    if (strcasecmp(method, "POST") == 0) {
+    if (strcasecmp(method, "POST") == 0 && strcmp(target, "/api/native-app-projects") == 0) {
+        dispatch_native_app_project_creation(fd, query, body);
+    } else if (strcasecmp(method, "POST") == 0) {
         send_text_response(fd, 404, "not found\n");
     } else if (strcmp(target, "/api/native-app-template") == 0) {
         send_native_app_template_archive(fd);
@@ -1788,6 +1941,7 @@ static void run_http_reactor(int listener) {
                 close_reactor_client(clients, &client_count, index);
             }
         }
+        while (waitpid(-1, NULL, WNOHANG) > 0) {}
     }
 
     for (size_t i = 0; i < client_count; i++) {
