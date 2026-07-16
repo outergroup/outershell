@@ -546,6 +546,11 @@ EOF
     <string>--native-app-template-dir</string>
     <string>$native_template_path_xml</string>
   </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>OUTER_SHELL_SERVICE_MANAGER</key>
+    <string>launchd</string>
+  </dict>
   <key>Sockets</key>
   <dict>
     <key>Listener</key>
@@ -736,6 +741,7 @@ start_internal_service_manager() {
     rm -f "$api_socket_path"
     if command -v setsid >/dev/null 2>&1; then
         OUTERSHELL_HOME="$outershell_home" OUTER_SHELL_PUBLIC_BASE_URL="$public_base_url" \
+            OUTER_SHELL_SERVICE_MANAGER=internal \
             nohup setsid "$outershelld_path" \
                 --service-manager internal \
                 --services-dir "$services_dir" \
@@ -743,6 +749,7 @@ start_internal_service_manager() {
                 --stay-alive >>"$broker_log_path" 2>&1 </dev/null &
     else
         OUTERSHELL_HOME="$outershell_home" OUTER_SHELL_PUBLIC_BASE_URL="$public_base_url" \
+            OUTER_SHELL_SERVICE_MANAGER=internal \
             nohup "$outershelld_path" \
                 --service-manager internal \
                 --services-dir "$services_dir" \
@@ -1150,6 +1157,7 @@ Wants=outershelld.socket
 
 [Service]
 Environment=OUTERSHELL_HOME=$outershell_home
+Environment=OUTER_SHELL_SERVICE_MANAGER=systemd
 ExecStart=$outer_shell_exec
 Restart=no
 StandardOutput=append:$log_path
@@ -1194,6 +1202,7 @@ Description=Outer Shell daemon
 [Service]
 Environment=OUTERSHELL_HOME=$outershell_home
 Environment=OUTER_SHELL_PUBLIC_BASE_URL=$public_base_url
+Environment=OUTER_SHELL_SERVICE_MANAGER=systemd
 ExecStart=$outershelld_path
 Restart=no
 StandardOutput=append:$broker_log_path
@@ -1224,6 +1233,7 @@ Argument=$public_base_url
 Argument=--native-app-template-dir
 Argument=$install_root/native-app-template
 Environment=OUTERSHELL_HOME=$outershell_home
+Environment=OUTER_SHELL_SERVICE_MANAGER=internal
 Start=socket
 Restart=never
 LogPath=$log_path

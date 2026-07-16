@@ -146,6 +146,13 @@ The musl archives are statically linked and are selected automatically on
 Alpine and other musl-based Linux systems. See [outerservice.md](outerservice.md)
 for the internal manager and portable service format.
 
+Update checks request `latest/version.txt` with coarse platform fields in the
+query string: `heartbeat`, `os`, `osVersion`, `arch`, `serviceManager`, and the
+installed `appVersion` when available. Linux also reports the binary's `libc`
+(`glibc` or `musl`) and, when detectable, the installed `systemd` major version.
+`serviceManager` is the manager Outer Shell actually selected (`systemd`,
+`internal`, or `launchd`), rather than a guess based on container detection.
+
 Publishing to a website, object storage, or CDN is intentionally handled outside
 this repository.
 
@@ -156,6 +163,7 @@ Run the focused daemon integration tests with:
 ```bash
 ./Scripts/test_bundled_app_control.sh
 ./Scripts/test_outerservice.sh
+./Scripts/test_update_query.sh
 ```
 
 The first test covers the `outerctl bundled-app` request path. The second

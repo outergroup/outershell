@@ -16,6 +16,8 @@
 #include <sys/stat.h>
 #ifdef __APPLE__
 #include <sys/sysctl.h>
+#else
+#include <features.h>
 #endif
 #include <sys/utsname.h>
 #include <time.h>
@@ -196,7 +198,24 @@ static bool systemd_major_version(char *out, size_t out_size) {
 }
 #endif
 
-bool outer_shell_append_update_query(StringBuilder *builder, const char *heartbeat, const char *app_version) {
+static const char *normalized_service_manager(const char *service_manager) {
+    if (service_manager &&
+        (strcmp(service_manager, "systemd") == 0 ||
+         strcmp(service_manager, "internal") == 0 ||
+         strcmp(service_manager, "launchd") == 0)) {
+        return service_manager;
+    }
+#ifdef __APPLE__
+    return "launchd";
+#else
+    return "unknown";
+#endif
+}
+
+bool outer_shell_append_update_query(StringBuilder *builder,
+                                     const char *heartbeat,
+                                     const char *app_version,
+                                     const char *service_manager) {
     char arch[64];
     char os_version[64];
     normalized_architecture(arch, sizeof(arch));
@@ -214,9 +233,23 @@ bool outer_shell_append_update_query(StringBuilder *builder, const char *heartbe
         !sb_append(builder, "&osVersion=") ||
         !append_url_encoded(builder, os_version) ||
         !sb_append(builder, "&arch=") ||
-        !append_url_encoded(builder, arch)) {
+        !append_url_encoded(builder, arch) ||
+        !sb_append(builder, "&serviceManager=") ||
+        !append_url_encoded(builder, normalized_service_manager(service_manager))) {
         return false;
     }
+
+#ifndef __APPLE__
+#if defined(__GLIBC__)
+    const char *libc = "glibc";
+#else
+    const char *libc = "musl";
+#endif
+    if (!sb_append(builder, "&libc=") ||
+        !append_url_encoded(builder, libc)) {
+        return false;
+    }
+#endif
 
     if (app_version && app_version[0]) {
         if (!sb_append(builder, "&appVersion=") ||

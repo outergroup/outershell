@@ -6371,12 +6371,17 @@ static bool build_home_screen_update_url(const char *path, const char *heartbeat
 
     char installed_version[128] = "";
     installed_home_screen_version(installed_version, sizeof(installed_version));
+#ifdef __APPLE__
+    const char *service_manager = g_internal_service_manager ? "internal" : "launchd";
+#else
+    const char *service_manager = g_internal_service_manager ? "internal" : "systemd";
+#endif
     StringBuilder url = {0};
     bool ok = sb_append(&url, base_url) &&
               sb_append(&url, "/") &&
               sb_append(&url, trimmed_path) &&
               sb_append(&url, "?") &&
-              outer_shell_append_update_query(&url, heartbeat, installed_version);
+              outer_shell_append_update_query(&url, heartbeat, installed_version, service_manager);
     if (ok) snprintf(out, out_size, "%s", url.data ? url.data : "");
     free(url.data);
     return ok && out[0] != '\0';

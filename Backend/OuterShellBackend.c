@@ -745,7 +745,10 @@ static bool build_home_screen_update_url(const char *path, const char *heartbeat
               sb_append(&url, "/") &&
               sb_append(&url, trimmed_path) &&
               sb_append(&url, "?") &&
-              outer_shell_append_update_query(&url, heartbeat, NULL);
+              outer_shell_append_update_query(&url,
+                                              heartbeat,
+                                              NULL,
+                                              getenv("OUTER_SHELL_SERVICE_MANAGER"));
     if (ok) snprintf(out, out_size, "%s", url.data ? url.data : "");
     free(url.data);
     return ok && out[0] != '\0';
