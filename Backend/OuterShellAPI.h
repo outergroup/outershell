@@ -41,6 +41,7 @@ enum {
 
 enum {
     OUTERSHELLD_API_FLAG_OWNS_SERVICE_MANAGER_ENTRY = 0x01,
+    /* Deprecated no-op. Keep the value reserved for source and wire compatibility. */
     OUTERSHELLD_API_FLAG_INCLUDE_ICONS = 0x02,
     OUTERSHELLD_API_FLAG_OUTERSERVICE_ENTRY = 0x04
 };

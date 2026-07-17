@@ -175,13 +175,16 @@ Run the focused daemon integration tests with:
 
 ```bash
 ./Scripts/test_bundled_app_control.sh
+./Scripts/test_registry_list_responses.sh
 ./Scripts/test_outerservice.sh
 ./Scripts/test_update_query.sh
 ```
 
-The first test covers the `outerctl bundled-app` request path. The second
-covers `.outerservice` parsing, dynamic service loading, socket activation,
-restart behavior, essential-service exits, and shutdown.
+The bundled-app test covers the `outerctl bundled-app` request path. The
+registry-list test verifies multi-row binary responses, including nested string
+lists, across every list resource. The outerservice test covers `.outerservice`
+parsing, dynamic service loading, socket activation, restart behavior,
+essential-service exits, and shutdown.
 
 ## Related Documentation
 

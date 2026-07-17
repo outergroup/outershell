@@ -9034,7 +9034,6 @@ static int outershelld_handle_outerctl(int argc, char **argv, StringBuilder *std
     uint32_t opener_capabilities = OUTERSHELLD_API_OPENER_CAPABILITY_DEFAULT;
     bool has_port = false;
     bool owns_plist = false;
-    bool include_icons = false;
 
     for (int i = 3; i < argc; i++) {
         const char *arg = argv[i];
@@ -9116,7 +9115,7 @@ static int outershelld_handle_outerctl(int argc, char **argv, StringBuilder *std
             REQUIRE_VALUE("--outershell-owns", raw);
             owns_plist = strcmp(raw, "true") == 0 || strcmp(raw, "1") == 0 || strcmp(raw, "yes") == 0;
         } else if (strcmp(arg, "--icons") == 0) {
-            include_icons = true;
+            /* Deprecated no-op retained so older callers do not fail. */
         } else {
             sb_append(stderr_buffer, "Unknown argument: ");
             sb_append(stderr_buffer, arg);
@@ -9150,7 +9149,6 @@ static int outershelld_handle_outerctl(int argc, char **argv, StringBuilder *std
     char allowlist_socket_path[PATH_MAX] = "";
 
     if (is_list) {
-        (void)include_icons;
         char normalized_content_type[160] = "";
         if ((strcmp(resource, "opener") == 0 || strcmp(resource, "content-type") == 0 || strcmp(resource, "type") == 0) &&
             content_type && content_type[0]) {
@@ -13260,27 +13258,6 @@ static void api_send_command_response(int fd, int status, StringBuilder *stdout_
     free(message.data);
 }
 
-static bool api_append_string_list_ref32_items_at(StringBuilder *message,
-                                                  size_t ref_offset,
-                                                  const char *const *items,
-                                                  size_t count) {
-    if (count == 0) {
-        return binary_write_u32_at(message, ref_offset, 0) &&
-               binary_write_u32_at(message, ref_offset + 4, 0);
-    }
-    if (count > UINT32_MAX || count > SIZE_MAX / 8 || message->length > UINT32_MAX) return false;
-    size_t list_offset = message->length;
-    if (!binary_write_u32_at(message, ref_offset, (uint32_t)list_offset) ||
-        !binary_write_u32_at(message, ref_offset + 4, (uint32_t)count) ||
-        !binary_append_zero(message, count * 8)) {
-        return false;
-    }
-    for (size_t i = 0; i < count; i++) {
-        if (!binary_append_string_ref_at(message, list_offset + i * 8, items[i] ? items[i] : "")) return false;
-    }
-    return true;
-}
-
 static bool api_read_string_list_ref32(const unsigned char *message,
                                        size_t message_length,
                                        size_t ref_offset,
@@ -13341,78 +13318,196 @@ static bool api_registry_list_row_size(uint16_t response_type, uint32_t *row_siz
     }
 }
 
-static bool api_list_response_init(StringBuilder *message, uint16_t response_type, uint32_t status, const char *error) {
+typedef struct {
+    /* Row and nested refs stay relative to variable until every fixed row exists. */
+    StringBuilder message;
+    StringBuilder rows;
+    StringBuilder variable;
+    size_t *row_ref_offsets;
+    size_t row_ref_count;
+    size_t row_ref_capacity;
+    size_t *variable_ref_offsets;
+    size_t variable_ref_count;
+    size_t variable_ref_capacity;
+    uint32_t row_count;
+    uint32_t row_size;
+} ApiListResponseBuilder;
+
+static void api_list_response_free(ApiListResponseBuilder *response) {
+    if (!response) return;
+    free(response->message.data);
+    free(response->rows.data);
+    free(response->variable.data);
+    free(response->row_ref_offsets);
+    free(response->variable_ref_offsets);
+    memset(response, 0, sizeof(*response));
+}
+
+static bool api_list_response_record_ref(size_t **offsets,
+                                         size_t *count,
+                                         size_t *capacity,
+                                         size_t offset) {
+    if (!offsets || !count || !capacity) return false;
+    if (*count == *capacity) {
+        size_t new_capacity = *capacity ? *capacity * 2 : 32;
+        if (new_capacity < *capacity || new_capacity > SIZE_MAX / sizeof(size_t)) return false;
+        size_t *new_offsets = realloc(*offsets, new_capacity * sizeof(size_t));
+        if (!new_offsets) return false;
+        *offsets = new_offsets;
+        *capacity = new_capacity;
+    }
+    (*offsets)[(*count)++] = offset;
+    return true;
+}
+
+static bool api_list_response_write_relative_ref_at(ApiListResponseBuilder *response,
+                                                    StringBuilder *container,
+                                                    size_t ref_offset,
+                                                    size_t data_offset,
+                                                    size_t data_length) {
+    if (!response || !container || data_offset > UINT32_MAX || data_length > UINT32_MAX) return false;
+    if (!binary_write_ref32_at(container, ref_offset, data_offset, data_length)) return false;
+    if (container == &response->rows) {
+        return api_list_response_record_ref(&response->row_ref_offsets,
+                                            &response->row_ref_count,
+                                            &response->row_ref_capacity,
+                                            ref_offset);
+    }
+    if (container == &response->variable) {
+        return api_list_response_record_ref(&response->variable_ref_offsets,
+                                            &response->variable_ref_count,
+                                            &response->variable_ref_capacity,
+                                            ref_offset);
+    }
+    return false;
+}
+
+static bool api_list_response_append_string_ref_at(ApiListResponseBuilder *response,
+                                                   StringBuilder *container,
+                                                   size_t ref_offset,
+                                                   const char *text) {
+    if (!response) return false;
+    const char *safe_text = text ? text : "";
+    size_t text_length = strlen(safe_text);
+    size_t data_offset = response->variable.length;
+    if (text_length > UINT32_MAX || data_offset > UINT32_MAX - text_length) return false;
+    if (text_length > 0 && !sb_append_n(&response->variable, safe_text, text_length)) return false;
+    return api_list_response_write_relative_ref_at(response,
+                                                   container,
+                                                   ref_offset,
+                                                   data_offset,
+                                                   text_length);
+}
+
+static bool api_list_response_append_string_list_ref_at(ApiListResponseBuilder *response,
+                                                        size_t ref_offset,
+                                                        const char *const *items,
+                                                        size_t count) {
+    if (!response) return false;
+    if (count == 0) {
+        return binary_write_u32_at(&response->rows, ref_offset, 0) &&
+               binary_write_u32_at(&response->rows, ref_offset + 4, 0);
+    }
+    if (count > UINT32_MAX / 8 || count > SIZE_MAX / 8 ||
+        response->variable.length > UINT32_MAX - count * 8) {
+        return false;
+    }
+    size_t list_offset = response->variable.length;
+    if (!binary_append_zero(&response->variable, count * 8) ||
+        !api_list_response_write_relative_ref_at(response,
+                                                 &response->rows,
+                                                 ref_offset,
+                                                 list_offset,
+                                                 count)) {
+        return false;
+    }
+    for (size_t i = 0; i < count; i++) {
+        if (!api_list_response_append_string_ref_at(response,
+                                                    &response->variable,
+                                                    list_offset + i * 8,
+                                                    items[i] ? items[i] : "")) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool api_list_response_init(ApiListResponseBuilder *response,
+                                   uint16_t response_type,
+                                   uint32_t status,
+                                   const char *error) {
+    if (!response) return false;
     uint32_t row_size = 0;
     if (!api_registry_list_row_size(response_type, &row_size)) return false;
-    return binary_append_zero(message, 22) &&
-           binary_write_u16_at(message, 0, response_type) &&
-           binary_write_u32_at(message, 2, status) &&
-           binary_append_string_ref_at(message, 6, error ? error : "") &&
-           binary_write_u32_at(message, 14, 0) &&
-           binary_write_u32_at(message, 18, row_size);
+    response->row_size = row_size;
+    return binary_append_zero(&response->message, 22) &&
+           binary_write_u16_at(&response->message, 0, response_type) &&
+           binary_write_u32_at(&response->message, 2, status) &&
+           binary_append_string_ref_at(&response->message, 6, error ? error : "") &&
+           binary_write_u32_at(&response->message, 14, 0) &&
+           binary_write_u32_at(&response->message, 18, row_size);
 }
 
-static bool api_list_response_append_row(StringBuilder *message, size_t row_size, size_t *row_offset) {
-    if (!message || !row_offset) return false;
-    *row_offset = message->length;
-    return binary_append_zero(message, row_size);
+static bool api_list_response_append_row(ApiListResponseBuilder *response,
+                                         size_t row_size,
+                                         size_t *row_offset) {
+    if (!response || !row_offset) return false;
+    *row_offset = response->rows.length;
+    return binary_append_zero(&response->rows, row_size);
 }
 
-static bool api_list_response_finish_row(StringBuilder *message, uint32_t *row_count) {
-    if (!row_count || *row_count == UINT32_MAX) return false;
-    *row_count += 1;
-    return binary_write_u32_at(message, 14, *row_count);
+static bool api_list_response_finish_row(ApiListResponseBuilder *response) {
+    if (!response || response->row_count == UINT32_MAX) return false;
+    response->row_count += 1;
+    return true;
 }
 
-static bool api_backend_list_response_append_row(StringBuilder *message,
-                                                 const RegistryBackendRecord *record,
-                                                 uint32_t *row_count) {
+static bool api_backend_list_response_append_row(ApiListResponseBuilder *response,
+                                                 const RegistryBackendRecord *record) {
     size_t row_offset = 0;
-    return api_list_response_append_row(message, 36, &row_offset) &&
-           binary_write_u32_at(message, row_offset, record && record->owns_unit ? 1u : 0u) &&
-           binary_append_string_ref_at(message, row_offset + 4, record ? record->service_id : "") &&
-           binary_append_string_ref_at(message, row_offset + 12, record ? record->display_name : "") &&
-           binary_append_string_ref_at(message, row_offset + 20, record ? record->unit_name : "") &&
-           binary_append_string_ref_at(message, row_offset + 28, record ? record->unit_path : "") &&
-           api_list_response_finish_row(message, row_count);
+    return api_list_response_append_row(response, 36, &row_offset) &&
+           binary_write_u32_at(&response->rows, row_offset, record && record->owns_unit ? 1u : 0u) &&
+           api_list_response_append_string_ref_at(response, &response->rows, row_offset + 4, record ? record->service_id : "") &&
+           api_list_response_append_string_ref_at(response, &response->rows, row_offset + 12, record ? record->display_name : "") &&
+           api_list_response_append_string_ref_at(response, &response->rows, row_offset + 20, record ? record->unit_name : "") &&
+           api_list_response_append_string_ref_at(response, &response->rows, row_offset + 28, record ? record->unit_path : "") &&
+           api_list_response_finish_row(response);
 }
 
-static bool api_app_list_response_append_row(StringBuilder *message,
+static bool api_app_list_response_append_row(ApiListResponseBuilder *response,
                                              const RegistryStore *database,
-                                             const RegistryFrontendRecord *record,
-                                             uint32_t *row_count) {
+                                             const RegistryFrontendRecord *record) {
     const RegistryFrontendLayoutRecord *layout =
         registry_store_find_layout_const(database, record && record->frontend_id && record->frontend_id[0] ? record->frontend_id : (record ? record->url : ""));
     if (!layout && record) layout = registry_store_find_layout_const(database, record->url);
     size_t row_offset = 0;
-    return api_list_response_append_row(message, 80, &row_offset) &&
-           binary_write_u16_at(message, row_offset, record ? record->endpoint_kind : 0) &&
-           binary_write_u16_at(message, row_offset + 2, record ? record->endpoint_scheme : 0) &&
-           binary_write_u16_at(message, row_offset + 4, record ? record->endpoint_flags : 0) &&
-           binary_write_u16_at(message, row_offset + 6, record && record->port > 0 ? (uint16_t)record->port : 0u) &&
-           binary_append_string_ref_at(message, row_offset + 8, record ? record->frontend_id : "") &&
-           binary_append_string_ref_at(message, row_offset + 16, record ? record->service_id : "") &&
-           binary_append_string_ref_at(message, row_offset + 24, record ? record->display_name : "") &&
-           binary_append_string_ref_at(message, row_offset + 32, record ? record->host : "") &&
-           binary_append_string_ref_at(message, row_offset + 40, record ? record->socket_path : "") &&
-           binary_append_string_ref_at(message, row_offset + 48, record ? record->path : "") &&
-           binary_append_string_ref_at(message, row_offset + 56, record ? record->url : "") &&
-           binary_append_string_ref_at(message, row_offset + 64, record ? record->icon_path : "") &&
-           binary_append_string_ref_at(message, row_offset + 72, layout ? layout->list : (record ? record->list : "")) &&
-           api_list_response_finish_row(message, row_count);
+    return api_list_response_append_row(response, 80, &row_offset) &&
+           binary_write_u16_at(&response->rows, row_offset, record ? record->endpoint_kind : 0) &&
+           binary_write_u16_at(&response->rows, row_offset + 2, record ? record->endpoint_scheme : 0) &&
+           binary_write_u16_at(&response->rows, row_offset + 4, record ? record->endpoint_flags : 0) &&
+           binary_write_u16_at(&response->rows, row_offset + 6, record && record->port > 0 ? (uint16_t)record->port : 0u) &&
+           api_list_response_append_string_ref_at(response, &response->rows, row_offset + 8, record ? record->frontend_id : "") &&
+           api_list_response_append_string_ref_at(response, &response->rows, row_offset + 16, record ? record->service_id : "") &&
+           api_list_response_append_string_ref_at(response, &response->rows, row_offset + 24, record ? record->display_name : "") &&
+           api_list_response_append_string_ref_at(response, &response->rows, row_offset + 32, record ? record->host : "") &&
+           api_list_response_append_string_ref_at(response, &response->rows, row_offset + 40, record ? record->socket_path : "") &&
+           api_list_response_append_string_ref_at(response, &response->rows, row_offset + 48, record ? record->path : "") &&
+           api_list_response_append_string_ref_at(response, &response->rows, row_offset + 56, record ? record->url : "") &&
+           api_list_response_append_string_ref_at(response, &response->rows, row_offset + 64, record ? record->icon_path : "") &&
+           api_list_response_append_string_ref_at(response, &response->rows, row_offset + 72, layout ? layout->list : (record ? record->list : "")) &&
+           api_list_response_finish_row(response);
 }
 
-static bool api_log_list_response_append_row(StringBuilder *message,
-                                             const RegistryLogFileRecord *record,
-                                             uint32_t *row_count) {
+static bool api_log_list_response_append_row(ApiListResponseBuilder *response,
+                                             const RegistryLogFileRecord *record) {
     size_t row_offset = 0;
-    return api_list_response_append_row(message, 16, &row_offset) &&
-           binary_append_string_ref_at(message, row_offset, record ? record->path : "") &&
-           binary_append_string_ref_at(message, row_offset + 8, record ? record->service_id : "") &&
-           api_list_response_finish_row(message, row_count);
+    return api_list_response_append_row(response, 16, &row_offset) &&
+           api_list_response_append_string_ref_at(response, &response->rows, row_offset, record ? record->path : "") &&
+           api_list_response_append_string_ref_at(response, &response->rows, row_offset + 8, record ? record->service_id : "") &&
+           api_list_response_finish_row(response);
 }
 
-static bool api_content_type_list_response_append_row(StringBuilder *message,
+static bool api_content_type_list_response_append_row(ApiListResponseBuilder *response,
                                                       const char *service_id,
                                                       const char *identifier,
                                                       const char *display_name,
@@ -13421,41 +13516,90 @@ static bool api_content_type_list_response_append_row(StringBuilder *message,
                                                       const char *const *extensions,
                                                       size_t extension_count,
                                                       const char *const *mime_types,
-                                                      size_t mime_type_count,
-                                                      uint32_t *row_count) {
+                                                      size_t mime_type_count) {
     size_t row_offset = 0;
-    return api_list_response_append_row(message, 48, &row_offset) &&
-           binary_append_string_ref_at(message, row_offset, service_id) &&
-           binary_append_string_ref_at(message, row_offset + 8, identifier) &&
-           binary_append_string_ref_at(message, row_offset + 16, display_name) &&
-           api_append_string_list_ref32_items_at(message, row_offset + 24, conforms_to, conforms_to_count) &&
-           api_append_string_list_ref32_items_at(message, row_offset + 32, extensions, extension_count) &&
-           api_append_string_list_ref32_items_at(message, row_offset + 40, mime_types, mime_type_count) &&
-           api_list_response_finish_row(message, row_count);
+    return api_list_response_append_row(response, 48, &row_offset) &&
+           api_list_response_append_string_ref_at(response, &response->rows, row_offset, service_id) &&
+           api_list_response_append_string_ref_at(response, &response->rows, row_offset + 8, identifier) &&
+           api_list_response_append_string_ref_at(response, &response->rows, row_offset + 16, display_name) &&
+           api_list_response_append_string_list_ref_at(response, row_offset + 24, conforms_to, conforms_to_count) &&
+           api_list_response_append_string_list_ref_at(response, row_offset + 32, extensions, extension_count) &&
+           api_list_response_append_string_list_ref_at(response, row_offset + 40, mime_types, mime_type_count) &&
+           api_list_response_finish_row(response);
 }
 
-static bool api_opener_list_response_append_row(StringBuilder *message,
-                                                const RegistryFileOpenerRecord *record,
-                                                uint32_t *row_count) {
+static bool api_opener_list_response_append_row(ApiListResponseBuilder *response,
+                                                const RegistryFileOpenerRecord *record) {
     size_t row_offset = 0;
-    return api_list_response_append_row(message, 32, &row_offset) &&
-         binary_write_u32_at(message, row_offset, record && record->rank > 0 ? (uint32_t)record->rank : 0u) &&
-         binary_append_string_ref_at(message, row_offset + 4, record ? record->extension : "") &&
-         binary_append_string_ref_at(message, row_offset + 12, record ? record->frontend_id : "") &&
-         binary_append_string_ref_at(message, row_offset + 20, record ? record->url_template : "") &&
-         binary_write_u32_at(message, row_offset + 28, record ? normalize_opener_capabilities(record->capabilities) : OUTERSHELLD_API_OPENER_CAPABILITY_DEFAULT) &&
-         api_list_response_finish_row(message, row_count);
+    return api_list_response_append_row(response, 32, &row_offset) &&
+         binary_write_u32_at(&response->rows, row_offset, record && record->rank > 0 ? (uint32_t)record->rank : 0u) &&
+         api_list_response_append_string_ref_at(response, &response->rows, row_offset + 4, record ? record->extension : "") &&
+         api_list_response_append_string_ref_at(response, &response->rows, row_offset + 12, record ? record->frontend_id : "") &&
+         api_list_response_append_string_ref_at(response, &response->rows, row_offset + 20, record ? record->url_template : "") &&
+         binary_write_u32_at(&response->rows, row_offset + 28, record ? normalize_opener_capabilities(record->capabilities) : OUTERSHELLD_API_OPENER_CAPABILITY_DEFAULT) &&
+         api_list_response_finish_row(response);
 }
 
-static void api_send_list_response_frame(int fd, StringBuilder *message, bool ok, uint16_t response_type, const char *error) {
-    if (!ok) {
-        free(message->data);
-        memset(message, 0, sizeof(*message));
-        ok = api_list_response_init(message, response_type, 1, error && error[0] ? error : "out of memory");
+static bool api_list_response_patch_refs(StringBuilder *container,
+                                         const size_t *ref_offsets,
+                                         size_t ref_count,
+                                         uint32_t variable_offset) {
+    if (!container) return false;
+    for (size_t i = 0; i < ref_count; i++) {
+        size_t ref_offset = ref_offsets[i];
+        if (ref_offset > container->length || container->length - ref_offset < 8) return false;
+        uint32_t relative_offset = read_uint32_le((const unsigned char *)container->data + ref_offset);
+        if (relative_offset > UINT32_MAX - variable_offset) return false;
+        if (!binary_write_u32_at(container, ref_offset, relative_offset + variable_offset)) return false;
     }
-    if (ok) api_send_frame(fd, message);
-    free(message->data);
-    memset(message, 0, sizeof(*message));
+    return true;
+}
+
+static bool api_list_response_finish(ApiListResponseBuilder *response) {
+    if (!response || response->row_size == 0 ||
+        response->row_count > SIZE_MAX / response->row_size ||
+        response->rows.length != (size_t)response->row_count * response->row_size ||
+        response->message.length > UINT32_MAX ||
+        response->rows.length > UINT32_MAX - response->message.length) {
+        return false;
+    }
+    uint32_t variable_offset = (uint32_t)(response->message.length + response->rows.length);
+    if (!api_list_response_patch_refs(&response->rows,
+                                      response->row_ref_offsets,
+                                      response->row_ref_count,
+                                      variable_offset) ||
+        !api_list_response_patch_refs(&response->variable,
+                                      response->variable_ref_offsets,
+                                      response->variable_ref_count,
+                                      variable_offset) ||
+        !binary_write_u32_at(&response->message, 14, response->row_count) ||
+        !sb_append_n(&response->message,
+                     response->rows.data ? response->rows.data : "",
+                     response->rows.length) ||
+        !sb_append_n(&response->message,
+                     response->variable.data ? response->variable.data : "",
+                     response->variable.length)) {
+        return false;
+    }
+    return response->message.length <= UINT32_MAX;
+}
+
+static void api_send_list_response_frame(int fd,
+                                         ApiListResponseBuilder *response,
+                                         bool ok,
+                                         uint16_t response_type,
+                                         const char *error) {
+    if (ok) ok = api_list_response_finish(response);
+    if (!ok) {
+        api_list_response_free(response);
+        ok = api_list_response_init(response,
+                                    response_type,
+                                    1,
+                                    error && error[0] ? error : "out of memory") &&
+             api_list_response_finish(response);
+    }
+    if (ok) api_send_frame(fd, &response->message);
+    api_list_response_free(response);
 }
 
 static bool api_command_append_arg(char **argv, int *argc, int capacity, const char *value) {
@@ -13699,8 +13843,7 @@ static bool process_api_registry_list_request(ReactorClient *client, const unsig
     char *content_type = NULL;
     char normalized_content_type[160] = "";
     char error[512] = "";
-    StringBuilder response = {0};
-    uint32_t row_count = 0;
+    ApiListResponseBuilder response = {0};
 
     bool ok = response_type != 0;
     if (ok) {
@@ -13741,21 +13884,21 @@ static bool process_api_registry_list_request(ReactorClient *client, const unsig
             for (size_t i = 0; ok && i < database.backend_count; i++) {
                 const RegistryBackendRecord *record = &database.backends[i];
                 if (backend && backend[0] && strcmp(record->service_id, backend) != 0) continue;
-                ok = api_backend_list_response_append_row(&response, record, &row_count);
+                ok = api_backend_list_response_append_row(&response, record);
             }
             break;
         case OUTERSHELLD_API_APP_LIST_REQUEST:
             for (size_t i = 0; ok && i < database.frontend_count; i++) {
                 const RegistryFrontendRecord *record = &database.frontends[i];
                 if (backend && backend[0] && strcmp(record->service_id, backend) != 0) continue;
-                ok = api_app_list_response_append_row(&response, &database, record, &row_count);
+                ok = api_app_list_response_append_row(&response, &database, record);
             }
             break;
         case OUTERSHELLD_API_LOG_LIST_REQUEST:
             for (size_t i = 0; ok && i < database.log_count; i++) {
                 const RegistryLogFileRecord *record = &database.logs[i];
                 if (backend && backend[0] && strcmp(record->service_id, backend) != 0) continue;
-                ok = api_log_list_response_append_row(&response, record, &row_count);
+                ok = api_log_list_response_append_row(&response, record);
             }
             break;
         case OUTERSHELLD_API_CONTENT_TYPE_LIST_REQUEST:
@@ -13772,8 +13915,7 @@ static bool process_api_registry_list_request(ReactorClient *client, const unsig
                                                                    record->extensions.items,
                                                                    record->extensions.count,
                                                                    record->mime_types.items,
-                                                                   record->mime_types.count,
-                                                                   &row_count);
+                                                                   record->mime_types.count);
                 }
             }
             for (size_t i = 0; ok && i < database.content_type_count; i++) {
@@ -13789,8 +13931,7 @@ static bool process_api_registry_list_request(ReactorClient *client, const unsig
                                                                (const char *const *)record->extensions.items,
                                                                record->extensions.count,
                                                                (const char *const *)record->mime_types.items,
-                                                               record->mime_types.count,
-                                                               &row_count);
+                                                               record->mime_types.count);
             }
             break;
         case OUTERSHELLD_API_OPENER_LIST_REQUEST:
@@ -13801,7 +13942,7 @@ static bool process_api_registry_list_request(ReactorClient *client, const unsig
                     (!frontend || strcmp(frontend->service_id ? frontend->service_id : "", backend) != 0)) continue;
                 if (frontend_id && frontend_id[0] && strcmp(record->frontend_id ? record->frontend_id : "", frontend_id) != 0) continue;
                 if (normalized_content_type[0] && strcmp(record->extension, normalized_content_type) != 0) continue;
-                ok = api_opener_list_response_append_row(&response, record, &row_count);
+                ok = api_opener_list_response_append_row(&response, record);
             }
             break;
         default:

@@ -363,7 +363,6 @@ enum : uint16_t {
 
 enum : uint16_t {
     kFlagOwnsServiceManagerEntry = 0x01,
-    kFlagIncludeIcons = 0x02,
     kFlagOuterServiceEntry = 0x04
 };
 
@@ -409,6 +408,7 @@ struct CommandRequest {
     const char *scope = "";
     const char *stageRoot = "";
     const char *sudoPassword = "";
+    bool usedDeprecatedIcons = false;
     bool readSudoPasswordFromStdin = false;
 };
 
@@ -720,7 +720,7 @@ bool parseCommandRequest(int argc, char *argv[], CommandRequest &request, Buffer
             REQUIRE_VALUE("--outershell-owns", raw);
             if (truthy(raw)) request.flags |= kFlagOwnsServiceManagerEntry;
         } else if (strcmp(arg, "--icons") == 0) {
-            request.flags |= kFlagIncludeIcons;
+            request.usedDeprecatedIcons = true;
         } else if (strcmp(arg, "--scope") == 0) {
             REQUIRE_VALUE("--scope", request.scope);
             if (strcmp(request.scope, "user") != 0 && strcmp(request.scope, "system") != 0) {
@@ -1137,6 +1137,10 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "%s\n", apiError.data ? apiError.data : "Invalid outerctl command.");
         freeBuffer(apiError);
         return 1;
+    }
+    if (request.usedDeprecatedIcons && isatty(STDERR_FILENO)) {
+        fputs("warning: --icons is deprecated and has no effect; app list already includes icon_path.\n",
+              stderr);
     }
     char sudoPassword[1024] = "";
     if (request.readSudoPasswordFromStdin) {

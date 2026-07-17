@@ -92,7 +92,8 @@ Flags:
 
 ```text
 0x01 owns platform service-manager entry
-0x02 include icons
+0x02 reserved; the deprecated include-icons flag is ignored
+0x04 service-manager entry is a portable .outerservice file
 ```
 
 ### Backend
@@ -351,16 +352,14 @@ bytes 40..47:  StringListRef32 MIME types
 `openerListResponse` (`105`) uses the common list response header. Its `row
 count` field tells you how many opener rows follow at byte 22. Use the
 header's `row size` field as the stride between rows; the current row size is
-48 bytes:
+32 bytes:
 
 ```text
 bytes 0..3:    UInt32 rank
 bytes 4..11:   StringRef32 content type
-bytes 12..19:  StringRef32 backend service id
-bytes 20..27:  StringRef32 display name
-bytes 28..35:  StringRef32 socket path
-bytes 36..43:  StringRef32 URL template
-bytes 44..47:  UInt32 capability flags
+bytes 12..19:  StringRef32 frontend id
+bytes 20..27:  StringRef32 URL template
+bytes 28..31:  UInt32 capability flags
 ```
 
 ## `fileOpenersQuery` (`messageType = 25`)
