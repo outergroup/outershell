@@ -14,6 +14,8 @@ final class SingleLineTextInputController<DelegateClass: SingleLineTextInputCont
     var onSubmit: (() -> Void)?
     var allowsNewlines = false
     var visualLineWidth: CGFloat?
+    /// Makes word-based editing follow a masked display value instead of the underlying text.
+    var masksWordBoundaries = false
 
     private(set) var text: String
     private(set) var cursorPosition: Int
@@ -614,6 +616,7 @@ final class SingleLineTextInputController<DelegateClass: SingleLineTextInputCont
         guard !text.isEmpty else { return 0 }
         let clamped = clamp(position)
         if clamped == 0 { return 0 }
+        if masksWordBoundaries { return 0 }
 
         let cfString = text as CFString
         let tokenizer = CFStringTokenizerCreate(kCFAllocatorDefault,
@@ -641,6 +644,7 @@ final class SingleLineTextInputController<DelegateClass: SingleLineTextInputCont
         guard !text.isEmpty else { return 0 }
         let clamped = clamp(position)
         if clamped >= text.count { return text.count }
+        if masksWordBoundaries { return text.count }
 
         let cfString = text as CFString
         let tokenizer = CFStringTokenizerCreate(kCFAllocatorDefault,

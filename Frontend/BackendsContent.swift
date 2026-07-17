@@ -850,6 +850,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             identifier: Self.passwordFieldInputID,
             acceptedPasteboardTypeIdentifiers: Self.passwordFieldPasteboardTypes
         )
+        controller.masksWordBoundaries = true
         controller.delegate = self
         controller.onSubmit = { [weak self] in
             Task { @MainActor in self?.submitPasswordPrompt() }
@@ -7019,6 +7020,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             if requestedCommands.contains(.paste) {
                 enabledCommands.insert(.paste)
             }
+            if requestedCommands.contains(.selectAll), !passwordInputController.text.isEmpty {
+                enabledCommands.insert(.selectAll)
+            }
             return enabledCommands
         }
 
@@ -8483,12 +8487,11 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             } else if passwordFieldFrame.contains(point) {
                 let wasFocused = passwordInputController.isFocused
                 let index = characterIndexForPasswordField(xPosition: point.x)
-                focusPasswordField(selectAll: clickCount >= 3)
+                focusPasswordField(selectAll: clickCount >= 2)
                 switch clickCount {
-                case 3...:
+                case 2...:
+                    // Word selection would reveal word boundaries in the masked value.
                     passwordInputController.selectAll()
-                case 2:
-                    passwordInputController.selectWord(at: index)
                 default:
                     passwordInputController.setCursorPosition(index,
                                                               modifySelection: modifierFlags.contains(.shift) && wasFocused)
