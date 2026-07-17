@@ -6,6 +6,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_ROOT="${BUILD_ROOT:-${SCRIPT_DIR}/build/macos}"
 RUN_ROOT="${RUN_ROOT:-${SCRIPT_DIR}/build/run}"
 CONFIGURATION="${CONFIGURATION:-Release}"
+CLEAN_FRONTEND_BUILD="${CLEAN_FRONTEND_BUILD:-0}"
 
 require_tool() {
     if ! command -v "$1" >/dev/null 2>&1; then
@@ -16,7 +17,80 @@ require_tool() {
 
 require_tool /usr/bin/xcodebuild
 require_tool aa
+require_tool dwarfdump
 require_tool lipo
+
+frontend_symbols_are_usable() {
+    local dsym_path="$1"
+    local dsym_statistics
+
+    [[ -d "${dsym_path}" ]] || return 1
+    dsym_statistics="$(dwarfdump --statistics "${dsym_path}" 2>/dev/null)" || return 1
+    [[ "${dsym_statistics}" == *'"#functions":'* ]] &&
+        [[ "${dsym_statistics}" != *'"#functions": 0'* ]] &&
+        [[ "${dsym_statistics}" == *'"#bytes with line information":'* ]] &&
+        [[ "${dsym_statistics}" != *'"#bytes with line information": 0'* ]]
+}
+
+frontend_symbols_match_bundle() {
+    local bundle_binary="$1"
+    local dsym_path="$2"
+    local bundle_uuids
+    local dsym_uuids
+
+    bundle_uuids="$(dwarfdump --uuid "${bundle_binary}" | awk '{ print $2, $3 }' | LC_ALL=C sort)"
+    dsym_uuids="$(dwarfdump --uuid "${dsym_path}" | awk '{ print $2, $3 }' | LC_ALL=C sort)"
+    [[ -n "${bundle_uuids}" && "${bundle_uuids}" == "${dsym_uuids}" ]]
+}
+
+validate_frontend_symbols() {
+    local bundle_path="$1"
+    local dsym_path="$2"
+    local bundle_binary="${bundle_path}/Contents/MacOS/Outer Shell"
+    local bundle_uuids
+    local dsym_uuids
+
+    if [[ ! -f "${bundle_binary}" ]]; then
+        echo "error: frontend executable not found at ${bundle_binary}" >&2
+        exit 1
+    fi
+    if [[ ! -d "${dsym_path}" ]]; then
+        echo "error: frontend dSYM not found at ${dsym_path}" >&2
+        exit 1
+    fi
+
+    if ! frontend_symbols_are_usable "${dsym_path}"; then
+        echo "error: frontend dSYM has no usable function or source-line information" >&2
+        echo "       ${dsym_path}" >&2
+        echo "       Run a clean frontend build before packaging." >&2
+        exit 1
+    fi
+
+    if ! frontend_symbols_match_bundle "${bundle_binary}" "${dsym_path}"; then
+        bundle_uuids="$(dwarfdump --uuid "${bundle_binary}" | awk '{ print $2, $3 }' | LC_ALL=C sort)"
+        dsym_uuids="$(dwarfdump --uuid "${dsym_path}" | awk '{ print $2, $3 }' | LC_ALL=C sort)"
+        echo "error: frontend executable and dSYM UUIDs do not match" >&2
+        echo "Executable UUIDs:" >&2
+        printf '%s\n' "${bundle_uuids}" >&2
+        echo "dSYM UUIDs:" >&2
+        printf '%s\n' "${dsym_uuids}" >&2
+        exit 1
+    fi
+}
+
+build_frontend() {
+    /usr/bin/xcodebuild \
+        -project "${SCRIPT_DIR}/outershell.xcodeproj" \
+        -scheme "Outer Shell" \
+        -configuration "${CONFIGURATION}" \
+        SYMROOT="${BUILD_ROOT}" \
+        ARCHS="arm64 x86_64" \
+        ONLY_ACTIVE_ARCH=NO \
+        CODE_SIGNING_ALLOWED=NO \
+        CODE_SIGNING_REQUIRED=NO \
+        "$@" \
+        build
+}
 
 rm -rf "${RUN_ROOT}"
 mkdir -p \
@@ -24,16 +98,45 @@ mkdir -p \
     "${RUN_ROOT}/bundles"
 
 echo "==> Building Outer Shell.bundle"
-/usr/bin/xcodebuild \
-    -project "${SCRIPT_DIR}/outershell.xcodeproj" \
-    -scheme "Outer Shell" \
-    -configuration "${CONFIGURATION}" \
-    SYMROOT="${BUILD_ROOT}" \
-    ARCHS="arm64 x86_64" \
-    ONLY_ACTIVE_ARCH=NO \
-    CODE_SIGNING_ALLOWED=NO \
-    CODE_SIGNING_REQUIRED=NO \
-    build
+frontend_bundle_path="${BUILD_ROOT}/${CONFIGURATION}/Outer Shell.bundle"
+frontend_bundle_binary="${frontend_bundle_path}/Contents/MacOS/Outer Shell"
+frontend_dsym_path="${BUILD_ROOT}/${CONFIGURATION}/Outer Shell.bundle.dSYM"
+frontend_object_root=""
+frontend_dsym_backup_root=""
+frontend_dsym_backup=""
+if [[ "${CLEAN_FRONTEND_BUILD}" == 1 ]]; then
+    frontend_object_root="$(mktemp -d "${TMPDIR:-/tmp}/outershell-frontend-build.XXXXXX")"
+    trap 'rm -rf "${frontend_object_root}"' EXIT
+    build_frontend "OBJROOT=${frontend_object_root}"
+else
+    if frontend_symbols_are_usable "${frontend_dsym_path}" &&
+       frontend_symbols_match_bundle "${frontend_bundle_binary}" "${frontend_dsym_path}"; then
+        frontend_dsym_backup_root="$(mktemp -d "${TMPDIR:-/tmp}/outershell-symbol-backup.XXXXXX")"
+        frontend_dsym_backup="${frontend_dsym_backup_root}/Outer Shell.bundle.dSYM"
+        trap 'rm -rf "${frontend_dsym_backup_root}"' EXIT
+        ditto "${frontend_dsym_path}" "${frontend_dsym_backup}"
+    fi
+    build_frontend
+    if ! frontend_symbols_are_usable "${frontend_dsym_path}" &&
+       [[ -n "${frontend_dsym_backup}" ]] &&
+       frontend_symbols_match_bundle "${frontend_bundle_binary}" "${frontend_dsym_backup}"; then
+        echo "==> Restoring matching frontend dSYM after unchanged incremental build"
+        ditto "${frontend_dsym_backup}" "${frontend_dsym_path}"
+    fi
+fi
+
+validate_frontend_symbols \
+    "${frontend_bundle_path}" \
+    "${frontend_dsym_path}"
+if [[ -n "${frontend_object_root}" ]]; then
+    rm -rf "${frontend_object_root}"
+    frontend_object_root=""
+fi
+if [[ -n "${frontend_dsym_backup_root}" ]]; then
+    rm -rf "${frontend_dsym_backup_root}"
+    frontend_dsym_backup_root=""
+fi
+trap - EXIT
 
 echo "==> Building outershelld"
 /usr/bin/xcodebuild \

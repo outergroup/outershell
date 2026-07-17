@@ -84,6 +84,12 @@ macOS package), streams it over the configured SSH command, and runs the normal
 Outer Shell installer with the locally built archive. Run `./app help` for
 frontend-only push, status, logs, SSH, uninstall, and clean commands.
 
+Deploys rebuild the macOS frontend with fresh intermediates and verify that its
+dSYM contains function and source-line information with UUIDs matching the
+packaged bundle. The matching dSYM is retained by arm64 UUID under
+`build/app-deploy/symbols/`, and `./app deploy` prints its exact path for use in
+Instruments.
+
 ## Registry And Installed Files
 
 Outer Shell stores its registry as an `.orwa` file. The default user registry is:

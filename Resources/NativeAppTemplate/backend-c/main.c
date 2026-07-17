@@ -66,6 +66,7 @@ static void send_response(int fd,
                                  "HTTP/1.1 %d %s\r\n"
                                  "Content-Type: %s\r\n"
                                  "Content-Length: %zu\r\n"
+                                 "Cache-Control: no-store\r\n"
                                  "Vary: Outerframe-Accept\r\n"
                                  "Connection: close\r\n"
                                  "\r\n",
@@ -112,51 +113,272 @@ static bool append_relative_path(char *out, size_t out_size, const char *root, c
     return true;
 }
 
-static bool read_file(const char *path, char **out, size_t *out_length) {
-    *out = NULL;
-    *out_length = 0;
+static bool request_header_value(const char *request,
+                                 const char *header_name,
+                                 const char **out_value,
+                                 size_t *out_value_length) {
+    const char *line = strstr(request, "\r\n");
+    size_t header_name_length = strlen(header_name);
+    while (line) {
+        line += 2;
+        if (line[0] == '\r' && line[1] == '\n') break;
+        const char *end = strstr(line, "\r\n");
+        if (!end) break;
+        const char *colon = memchr(line, ':', (size_t)(end - line));
+        if (colon && (size_t)(colon - line) == header_name_length &&
+            strncasecmp(line, header_name, header_name_length) == 0) {
+            const char *value = colon + 1;
+            while (value < end && (*value == ' ' || *value == '\t')) value++;
+            while (end > value && (end[-1] == ' ' || end[-1] == '\t')) end--;
+            *out_value = value;
+            *out_value_length = (size_t)(end - value);
+            return true;
+        }
+        line = end;
+    }
+    return false;
+}
 
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) return false;
+static long stat_mtime_nanoseconds(const struct stat *st) {
+#if defined(__APPLE__)
+    return st->st_mtimespec.tv_nsec;
+#else
+    return st->st_mtim.tv_nsec;
+#endif
+}
 
+static long stat_ctime_nanoseconds(const struct stat *st) {
+#if defined(__APPLE__)
+    return st->st_ctimespec.tv_nsec;
+#else
+    return st->st_ctim.tv_nsec;
+#endif
+}
+
+static void file_etag(const struct stat *st, char *out, size_t out_size) {
+    snprintf(out, out_size, "W/\"%llx-%lx-%llx-%lx-%llx\"",
+             (unsigned long long)st->st_mtime,
+             (unsigned long)stat_mtime_nanoseconds(st),
+             (unsigned long long)st->st_ctime,
+             (unsigned long)stat_ctime_nanoseconds(st),
+             (unsigned long long)st->st_size);
+}
+
+static void format_http_date(time_t value, char *out, size_t out_size) {
+    static const char *weekdays[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
+    static const char *months[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                                   "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+    struct tm date;
+    if (!gmtime_r(&value, &date) || date.tm_wday < 0 || date.tm_wday > 6 ||
+        date.tm_mon < 0 || date.tm_mon > 11) {
+        snprintf(out, out_size, "Thu, 01 Jan 1970 00:00:00 GMT");
+        return;
+    }
+    snprintf(out, out_size, "%s, %02d %s %04d %02d:%02d:%02d GMT",
+             weekdays[date.tm_wday], date.tm_mday, months[date.tm_mon], date.tm_year + 1900,
+             date.tm_hour, date.tm_min, date.tm_sec);
+}
+
+static bool parse_http_date(const char *value, size_t value_length, time_t *out) {
+    if (value_length == 0 || value_length >= 128) return false;
+    char date_string[128];
+    memcpy(date_string, value, value_length);
+    date_string[value_length] = '\0';
+    const char *formats[] = {
+        "%a, %d %b %Y %H:%M:%S GMT",
+        "%A, %d-%b-%y %H:%M:%S GMT",
+        "%a %b %e %H:%M:%S %Y"
+    };
+    for (size_t i = 0; i < sizeof(formats) / sizeof(formats[0]); i++) {
+        struct tm date;
+        memset(&date, 0, sizeof(date));
+        char *end = strptime(date_string, formats[i], &date);
+        if (end && *end == '\0') {
+            date.tm_isdst = 0;
+            time_t timestamp = timegm(&date);
+            struct tm normalized;
+            if (gmtime_r(&timestamp, &normalized) &&
+                normalized.tm_year == date.tm_year &&
+                normalized.tm_mon == date.tm_mon &&
+                normalized.tm_mday == date.tm_mday &&
+                normalized.tm_hour == date.tm_hour &&
+                normalized.tm_min == date.tm_min &&
+                normalized.tm_sec == date.tm_sec) {
+                *out = timestamp;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+static void trim_optional_whitespace(const char **value, size_t *value_length) {
+    while (*value_length > 0 && (**value == ' ' || **value == '\t')) {
+        (*value)++;
+        (*value_length)--;
+    }
+    while (*value_length > 0 &&
+           ((*value)[*value_length - 1] == ' ' || (*value)[*value_length - 1] == '\t')) {
+        (*value_length)--;
+    }
+}
+
+static bool weak_etag_equal(const char *candidate,
+                            size_t candidate_length,
+                            const char *etag) {
+    trim_optional_whitespace(&candidate, &candidate_length);
+    if (candidate_length >= 2 && candidate[0] == 'W' && candidate[1] == '/') {
+        candidate += 2;
+        candidate_length -= 2;
+    }
+    const char *current = etag;
+    size_t current_length = strlen(etag);
+    if (current_length >= 2 && current[0] == 'W' && current[1] == '/') {
+        current += 2;
+        current_length -= 2;
+    }
+    return candidate_length == current_length &&
+           memcmp(candidate, current, current_length) == 0;
+}
+
+static bool if_none_match_matches(const char *value, size_t value_length, const char *etag) {
+    const char *cursor = value;
+    const char *end = value + value_length;
+    while (cursor < end) {
+        while (cursor < end && (*cursor == ' ' || *cursor == '\t' || *cursor == ',')) cursor++;
+        if (cursor >= end) break;
+        if (*cursor == '*') {
+            const char *after = cursor + 1;
+            while (after < end && (*after == ' ' || *after == '\t')) after++;
+            if (after == end || *after == ',') return true;
+        }
+        const char *candidate = cursor;
+        bool quoted = false;
+        while (cursor < end) {
+            if (*cursor == '"') quoted = !quoted;
+            if (*cursor == ',' && !quoted) break;
+            cursor++;
+        }
+        if (weak_etag_equal(candidate, (size_t)(cursor - candidate), etag)) return true;
+        if (cursor < end) cursor++;
+    }
+    return false;
+}
+
+static bool file_is_not_modified(const char *request, const char *etag, time_t last_modified) {
+    const char *condition = NULL;
+    size_t condition_length = 0;
+    bool has_if_none_match = request_header_value(request, "If-None-Match",
+                                                   &condition, &condition_length);
+    if (has_if_none_match) {
+        return if_none_match_matches(condition, condition_length, etag);
+    }
+    if (request_header_value(request, "If-Modified-Since",
+                             &condition, &condition_length)) {
+        time_t modified_since;
+        return parse_http_date(condition, condition_length, &modified_since) &&
+               last_modified <= modified_since;
+    }
+    return false;
+}
+
+static void send_cached_file_header(int fd,
+                                    int status,
+                                    const char *content_type,
+                                    size_t content_length,
+                                    const char *etag,
+                                    const char *last_modified,
+                                    bool vary_outerframe_accept) {
+    char header[1024];
+    const char *vary = vary_outerframe_accept ? "Vary: Outerframe-Accept\r\n" : "";
+    int header_length;
+    if (status == 304) {
+        header_length = snprintf(header, sizeof(header),
+                                 "HTTP/1.1 304 Not Modified\r\n"
+                                 "Cache-Control: public, max-age=0, must-revalidate\r\n"
+                                 "ETag: %s\r\n"
+                                 "Last-Modified: %s\r\n"
+                                 "%s"
+                                 "Connection: close\r\n"
+                                 "\r\n",
+                                 etag, last_modified, vary);
+    } else {
+        header_length = snprintf(header, sizeof(header),
+                                 "HTTP/1.1 200 OK\r\n"
+                                 "Content-Type: %s\r\n"
+                                 "Content-Length: %zu\r\n"
+                                 "Cache-Control: public, max-age=0, must-revalidate\r\n"
+                                 "ETag: %s\r\n"
+                                 "Last-Modified: %s\r\n"
+                                 "%s"
+                                 "Connection: close\r\n"
+                                 "\r\n",
+                                 content_type, content_length, etag, last_modified, vary);
+    }
+    if (header_length > 0 && (size_t)header_length < sizeof(header)) {
+        (void)write_all(fd, header, (size_t)header_length);
+    }
+}
+
+static void serve_file(int fd,
+                       const char *path,
+                       const char *content_type,
+                       const char *request,
+                       bool send_body,
+                       bool vary_outerframe_accept) {
+    int file_fd = open(path, O_RDONLY);
+    if (file_fd < 0) {
+        send_text(fd, 404, "Not Found", "not found\n");
+        return;
+    }
     struct stat st;
-    if (fstat(fd, &st) != 0 || st.st_size < 0) {
-        close(fd);
-        return false;
-    }
-    size_t length = (size_t)st.st_size;
-    char *buffer = malloc(length == 0 ? 1 : length);
-    if (!buffer) {
-        close(fd);
-        return false;
+    if (fstat(file_fd, &st) != 0 || st.st_size < 0 || !S_ISREG(st.st_mode)) {
+        close(file_fd);
+        send_text(fd, 404, "Not Found", "not found\n");
+        return;
     }
 
+    char etag[96];
+    char last_modified[64];
+    file_etag(&st, etag, sizeof(etag));
+    format_http_date(st.st_mtime, last_modified, sizeof(last_modified));
+    if (file_is_not_modified(request, etag, st.st_mtime)) {
+        close(file_fd);
+        send_cached_file_header(fd, 304, content_type, 0, etag, last_modified,
+                                vary_outerframe_accept);
+        return;
+    }
+
+    size_t length = (size_t)st.st_size;
+    if (!send_body) {
+        close(file_fd);
+        send_cached_file_header(fd, 200, content_type, length, etag, last_modified,
+                                vary_outerframe_accept);
+        return;
+    }
+    char *body = malloc(length == 0 ? 1 : length);
+    if (!body) {
+        close(file_fd);
+        send_text(fd, 500, "Internal Server Error", "out of memory\n");
+        return;
+    }
     size_t offset = 0;
     while (offset < length) {
-        ssize_t got = read(fd, buffer + offset, length - offset);
+        ssize_t got = read(file_fd, body + offset, length - offset);
         if (got < 0) {
             if (errno == EINTR) continue;
-            free(buffer);
-            close(fd);
-            return false;
+            free(body);
+            close(file_fd);
+            send_text(fd, 500, "Internal Server Error", "failed to read file\n");
+            return;
         }
         if (got == 0) break;
         offset += (size_t)got;
     }
-    close(fd);
-    *out = buffer;
-    *out_length = offset;
-    return true;
-}
-
-static void serve_file(int fd, const char *path, const char *content_type) {
-    char *body = NULL;
-    size_t body_length = 0;
-    if (!read_file(path, &body, &body_length)) {
-        send_text(fd, 404, "Not Found", "not found\n");
-        return;
-    }
-    send_response(fd, 200, "OK", content_type, body, body_length);
+    close(file_fd);
+    send_cached_file_header(fd, 200, content_type, offset, etag, last_modified,
+                            vary_outerframe_accept);
+    if (offset > 0) (void)write_all(fd, body, offset);
     free(body);
 }
 
@@ -322,6 +544,7 @@ static void handle_client(int fd, const char *root) {
         send_text(fd, 405, "Method Not Allowed", "method not allowed\n");
         return;
     }
+    bool send_body = strcmp(method, "HEAD") != 0;
     char *request_path = (char *)origin_form_path(path);
     char *query = strpbrk(request_path, "?#");
     if (query) *query = '\0';
@@ -332,9 +555,9 @@ static void handle_client(int fd, const char *root) {
         snprintf(outer_path, sizeof(outer_path), "%s/app.outer", root);
         snprintf(html_path, sizeof(html_path), "%s/web/index.html", root);
         if (request_accepts_outerframe(request) && regular_file_exists(outer_path)) {
-            serve_file(fd, outer_path, "application/vnd.outerframe");
+            serve_file(fd, outer_path, "application/vnd.outerframe", request, send_body, true);
         } else if (regular_file_exists(html_path)) {
-            serve_file(fd, html_path, "text/html; charset=utf-8");
+            serve_file(fd, html_path, "text/html; charset=utf-8", request, send_body, true);
         } else if (regular_file_exists(outer_path)) {
             send_text(fd, 406, "Not Acceptable", "This app requires an outerframe-aware browser.\n");
         } else {
@@ -355,7 +578,7 @@ static void handle_client(int fd, const char *root) {
             send_text(fd, 400, "Bad Request", "bad path\n");
             return;
         }
-        serve_file(fd, frontend_path, "application/octet-stream");
+        serve_file(fd, frontend_path, "application/octet-stream", request, send_body, false);
         return;
     }
 
@@ -369,7 +592,7 @@ static void handle_client(int fd, const char *root) {
         char web_path[PATH_MAX];
         int length = snprintf(web_path, sizeof(web_path), "%s/web%s", root, request_path);
         if (length > 0 && (size_t)length < sizeof(web_path) && regular_file_exists(web_path)) {
-            serve_file(fd, web_path, content_type_for_path(web_path));
+            serve_file(fd, web_path, content_type_for_path(web_path), request, send_body, false);
             return;
         }
     }

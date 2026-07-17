@@ -97,12 +97,12 @@ func serveApp(root string) http.Handler {
 	outerPath := filepath.Join(root, "app.outer")
 	webRoot := filepath.Join(root, "web")
 	webIndexPath := filepath.Join(webRoot, "index.html")
-	webFiles := http.FileServer(http.Dir(webRoot))
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store")
 		if r.URL.Path != "/" {
-			if fileExists(webIndexPath) {
-				webFiles.ServeHTTP(w, r)
+			if webPath, ok := webFilePath(webRoot, r.URL.Path); ok && fileExists(webPath) {
+				serveStaticFile(w, r, webPath, "", false)
 				return
 			}
 			http.NotFound(w, r)
@@ -111,13 +111,11 @@ func serveApp(root string) http.Handler {
 
 		w.Header().Add("Vary", "Outerframe-Accept")
 		if acceptsOuterframe(r) && fileExists(outerPath) {
-			w.Header().Set("Content-Type", "application/vnd.outerframe")
-			http.ServeFile(w, r, outerPath)
+			serveStaticFile(w, r, outerPath, "application/vnd.outerframe", true)
 			return
 		}
 		if fileExists(webIndexPath) {
-			w.Header().Set("Content-Type", "text/html; charset=utf-8")
-			http.ServeFile(w, r, webIndexPath)
+			serveStaticFile(w, r, webIndexPath, "text/html; charset=utf-8", true)
 			return
 		}
 		if fileExists(outerPath) {
@@ -126,6 +124,18 @@ func serveApp(root string) http.Handler {
 		}
 		http.NotFound(w, r)
 	})
+}
+
+func webFilePath(webRoot, requestPath string) (string, bool) {
+	relative := strings.TrimPrefix(requestPath, "/")
+	if relative == "" || strings.Contains(relative, "\\") {
+		return "", false
+	}
+	clean := filepath.Clean(filepath.FromSlash(relative))
+	if clean == "." || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+		return "", false
+	}
+	return filepath.Join(webRoot, clean), true
 }
 
 func acceptsOuterframe(r *http.Request) bool {
@@ -137,12 +147,42 @@ func fileExists(path string) bool {
 	return err == nil && info.Mode().IsRegular()
 }
 
+func serveStaticFile(w http.ResponseWriter,
+	r *http.Request,
+	path string,
+	contentType string,
+	varyOuterframeAccept bool,
+) {
+	file, err := os.Open(path)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil || !info.Mode().IsRegular() {
+		http.NotFound(w, r)
+		return
+	}
+
+	w.Header().Set("Cache-Control", "public, max-age=0, must-revalidate")
+	w.Header().Set("ETag", fmt.Sprintf(`W/"%x-%x"`, info.ModTime().UnixNano(), info.Size()))
+	if contentType != "" {
+		w.Header().Set("Content-Type", contentType)
+	}
+	if varyOuterframeAccept {
+		w.Header().Set("Vary", "Outerframe-Accept")
+	}
+	http.ServeContent(w, r, info.Name(), info.ModTime(), file)
+}
+
 // serveFrontend serves the platform bundle archives referenced by the .outer
 // descriptor's bundle URL (/frontend). Outer Loop requests
 // /frontend/<platform> directly for its current platform.
 func serveFrontend(root string) http.HandlerFunc {
 	frontendsDir := filepath.Join(root, "frontends")
 	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store")
 		name := strings.TrimPrefix(r.URL.Path, "/frontend/")
 		if name == "" {
 			// Plain-text platform listing; current Outer Loop builds don't
@@ -162,14 +202,14 @@ func serveFrontend(root string) http.HandlerFunc {
 			http.Error(w, "bad path", http.StatusBadRequest)
 			return
 		}
-		w.Header().Set("Content-Type", "application/octet-stream")
-		http.ServeFile(w, r, filepath.Join(frontendsDir, name))
+		serveStaticFile(w, r, filepath.Join(frontendsDir, name), "application/octet-stream", false)
 	}
 }
 
 // serveHello is the app's "real" API. The frontend calls this over the SSH
 // tunnel and displays the result. Replace it with your own endpoints.
 func serveHello(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
 	hostname, _ := os.Hostname()
 	strings := []string{
 		"Hello from your Go backend!",

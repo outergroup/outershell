@@ -8,6 +8,8 @@ cd "${ROOT}"
 
 BUILD_DIR="${ROOT}/build/app-deploy"
 RELEASE_DIR="${BUILD_DIR}/release"
+SYMBOLS_DIR="${BUILD_DIR}/symbols"
+BUILD_CONFIGURATION="${CONFIGURATION:-Release}"
 TARGET_KIND=ssh
 SSH_BASE=()
 TARGET_OS=""
@@ -113,12 +115,15 @@ archive_name() {
 }
 
 cmd_build_frontend() {
+    local clean_build="${1:-0}"
     [[ "$(uname -s)" == Darwin ]] || {
         echo "error: Outer Shell frontend and macOS agent must be built on macOS" >&2
         exit 1
     }
     echo "==> Building Outer Shell macOS and frontend resources"
-    "${ROOT}/build_run.sh"
+    CLEAN_FRONTEND_BUILD="${clean_build}" \
+    CONFIGURATION="${BUILD_CONFIGURATION}" \
+        "${ROOT}/build_run.sh"
 }
 
 build_linux_target() {
@@ -133,9 +138,27 @@ build_linux_target() {
         sh -lc 'apk add --no-cache bash build-base openssl-dev openssl-libs-static zlib-dev zlib-static wget && ln -sf /lib/libz.a /usr/lib/libz.a && OUTER_SHELL_LINUX_LIBC=musl bash ./Scripts/build_linux_resources.sh'
 }
 
+archive_frontend_symbols() {
+    local source_dsym="${ROOT}/build/macos/${BUILD_CONFIGURATION}/Outer Shell.bundle.dSYM"
+    local arm64_uuid
+    local destination_dsym
+
+    arm64_uuid="$(dwarfdump --uuid "${source_dsym}" | awk '$3 == "(arm64)" { print $2; exit }')"
+    if [[ -z "${arm64_uuid}" ]]; then
+        echo "error: frontend dSYM does not contain an arm64 UUID" >&2
+        exit 1
+    fi
+
+    destination_dsym="${SYMBOLS_DIR}/${arm64_uuid}/Outer Shell.bundle.dSYM"
+    mkdir -p "$(dirname "${destination_dsym}")"
+    ditto "${source_dsym}" "${destination_dsym}"
+    FRONTEND_SYMBOLS_PATH="${destination_dsym}"
+}
+
 cmd_build() {
+    local clean_frontend="${1:-0}"
     probe_target
-    cmd_build_frontend
+    cmd_build_frontend "${clean_frontend}"
     if [[ "${TARGET_OS}" == Linux ]]; then
         build_linux_target
     fi
@@ -146,14 +169,17 @@ cmd_build() {
     echo "==> Packaging ${variant}"
     OUTPUT_ROOT="${RELEASE_DIR}" \
     PUBLIC_BASE_URL="${public_base_url}" \
+    MACOS_BUILD_ROOT="${ROOT}/build/macos/${BUILD_CONFIGURATION}" \
     OUTER_SHELL_PACKAGE_VARIANTS="${variant}" \
     OUTER_SHELL_CODESIGN_IDENTITY="${OUTER_SHELL_CODESIGN_IDENTITY:--}" \
         "${ROOT}/Scripts/package_release.sh"
+    archive_frontend_symbols
     echo "==> Deployable archive: ${RELEASE_DIR}/latest/$(archive_name)"
+    echo "==> Frontend profiling symbols: ${FRONTEND_SYMBOLS_PATH}"
 }
 
 cmd_deploy() {
-    cmd_build
+    cmd_build 1
     local archive remote_dir install_command
     archive="$(archive_name)"
     remote_dir=".cache/outershell-deploy"
@@ -173,6 +199,8 @@ cmd_deploy() {
         run_ssh "${install_command}"
     fi
     echo "Deployed Outer Shell."
+    echo "Frontend profiling symbols: ${FRONTEND_SYMBOLS_PATH}"
+    dwarfdump --uuid "${FRONTEND_SYMBOLS_PATH}"
 }
 
 cmd_push_frontend() {
