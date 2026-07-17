@@ -1,6 +1,7 @@
 import AppKit
 import CoreText
 import Foundation
+import OSLog
 import QuartzCore
 
 @MainActor
@@ -732,11 +733,15 @@ private struct PendingFilePicker {
 private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLineTextInputControllerDelegate, ScrollbarControllerDelegate {
     private let outerframeHost: OuterframeHost
     private let appConnection: OuterframeAppConnection
+    private let layoutLogger = Logger(subsystem: "org.outershell.OuterShell", category: "Layout")
     private var retainedSelf: BackendsHandler?
     private var appearance: NSAppearance?
+    private var didReceiveSystemAppearanceUpdate = false
     private var currentSize = CGSize(width: 900, height: 620)
-    private var resizeLayoutUpdateScheduled = false
-    private var createLayoutUpdateScheduled = false
+    private var layoutUpdateScheduled = false
+    private var scheduledLayoutNeedsScrollClamping = false
+    private var scheduledLayoutReasons: Set<String> = []
+    private var layoutUpdateSequence: UInt64 = 0
     private var urlSession: URLSession?
     private var backendsEndpoint: URL?
     private var logsEndpoint: URL?
@@ -993,11 +998,11 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             outerframeHost.setTitle("Outer Shell")
             outerframeHost.setIcon(.bundleResource(path: "Contents/Resources/app-icon.png"))
             mode = modeFromURL(arguments.url)
+            didReceiveSystemAppearanceUpdate = false
             appearance = arguments.appearance ?? NSAppearance.currentDrawing()
             currentSize = arguments.contentSize ?? currentSize
             configureNetworking()
             configureLayersIfNeeded()
-            updateLayout()
             updateColors()
             registerRootLayerIfNeeded()
             updateInputMode()
@@ -1012,8 +1017,12 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             scheduleResizeLayoutUpdate()
 
         case .systemAppearanceUpdate(let appearance):
+            let repeatsInitialAppearance = !didReceiveSystemAppearanceUpdate && self.appearance?.name == appearance.name
+            didReceiveSystemAppearanceUpdate = true
             self.appearance = appearance
-            updateColors()
+            if !repeatsInitialAppearance {
+                updateColors()
+            }
 
         case .scrollWheelEvent(let point, let delta, _, _, _, let hasPreciseScrollingDeltas):
             handleScroll(at: point, delta: delta, precise: hasPreciseScrollingDeltas)
@@ -1089,8 +1098,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             updateEditingAndPasteboardState()
 
         case .windowActiveUpdate(let isActive):
+            guard windowIsActive != isActive else { return }
             windowIsActive = isActive
-            updateLayout()
+            updateWindowActiveAppearance()
 
         case .selectionToPasteboardCopyRequest(let requestID):
             outerframeHost.sendCopySelectedPasteboardResponse(requestID: requestID,
@@ -1501,9 +1511,21 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         .controlBackgroundColor
     }
 
-    private func updateLayout() {
+    private func updateLayout(inCurrentTransaction: Bool = false,
+                              reason: String = #function) {
+        layoutUpdateSequence &+= 1
+        let sequence = layoutUpdateSequence
+        let startedAt = CACurrentMediaTime()
+        let transactionDescription = inCurrentTransaction ? "current" : "standalone"
+        let beginMessage = "#\(sequence) begin reason=\(reason) mode=\(mode) size=\(Int(currentSize.width))x\(Int(currentSize.height)) backends=\(backends.count) transaction=\(transactionDescription)"
+        layoutLogger.info("\(beginMessage, privacy: .public)")
+        defer {
+            let durationMS = (CACurrentMediaTime() - startedAt) * 1_000
+            let endMessage = String(format: "#%llu end duration=%.2fms", sequence, durationMS)
+            layoutLogger.info("\(endMessage, privacy: .public)")
+        }
         withEffectiveAppearance {
-            withoutImplicitAnimations {
+            let update = { [self] in
                 let width = max(currentSize.width, 1)
                 let height = max(currentSize.height, 1)
                 rootLayer.frame = CGRect(origin: .zero, size: CGSize(width: width, height: height))
@@ -1568,28 +1590,61 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 renderPasswordPromptIfNeeded(width: width, height: height)
                 notifyAccessibilityLayoutChanged()
             }
+            if inCurrentTransaction {
+                update()
+            } else {
+                withoutImplicitAnimations(update)
+            }
+        }
+    }
+
+    private func scheduleLayoutUpdate(reason: String = #function,
+                                      needsScrollClamping: Bool = false) {
+        scheduledLayoutReasons.insert(reason)
+        scheduledLayoutNeedsScrollClamping = scheduledLayoutNeedsScrollClamping || needsScrollClamping
+        guard !layoutUpdateScheduled else { return }
+        layoutUpdateScheduled = true
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let needsScrollClamping = scheduledLayoutNeedsScrollClamping
+            let reasons = scheduledLayoutReasons.sorted()
+            layoutUpdateScheduled = false
+            scheduledLayoutNeedsScrollClamping = false
+            scheduledLayoutReasons.removeAll(keepingCapacity: true)
+            if needsScrollClamping {
+                clampScrollOffsets()
+            }
+            updateLayout(reason: "scheduled: \(reasons.joined(separator: ", "))")
         }
     }
 
     private func scheduleResizeLayoutUpdate() {
-        guard !resizeLayoutUpdateScheduled else { return }
-        resizeLayoutUpdateScheduled = true
-        Task { @MainActor [weak self] in
-            guard let self else { return }
-            resizeLayoutUpdateScheduled = false
-            clampScrollOffsets()
-            updateLayout()
-        }
+        scheduleLayoutUpdate(needsScrollClamping: true)
     }
 
     private func scheduleCreateLayoutUpdate() {
-        guard !createLayoutUpdateScheduled else { return }
-        createLayoutUpdateScheduled = true
-        Task { @MainActor [weak self] in
-            guard let self else { return }
-            createLayoutUpdateScheduled = false
-            clampScrollOffsets()
-            updateLayout()
+        scheduleLayoutUpdate(needsScrollClamping: true)
+    }
+
+    private func updateWindowActiveAppearance() {
+        let createContentNeedsLayout = mode == .create &&
+            (createInputController.isFocused || normalizedCreateMessageSelectionRange() != nil)
+        let passwordPromptNeedsLayout = pendingPasswordAction != nil && passwordInputController.isFocused
+        if createContentNeedsLayout || passwordPromptNeedsLayout {
+            scheduleLayoutUpdate(reason: "windowActiveUpdate")
+            return
+        }
+
+        if logHeaderDetailSelectionRange != nil {
+            withoutImplicitAnimations {
+                renderLogHeader()
+            }
+        }
+        if logTextSelectionRange != nil {
+            updateLogTextSelectionLayers(force: true)
+        }
+        if aboutSelectionRange != nil {
+            updateAboutSelectionLayers()
         }
     }
 
@@ -1620,7 +1675,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                     layer.font = NSFont.systemFont(ofSize: 12, weight: .medium)
                     layer.fontSize = 12
                 }
-                updateLayout()
+                updateLayout(inCurrentTransaction: true)
             }
         }
     }
@@ -5102,21 +5157,21 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                         }
                     }
                     if !quiet || self.backends.isEmpty {
-                        self.updateLayout()
+                        self.scheduleLayoutUpdate()
                     }
                     return
                 }
                 if let http = response as? HTTPURLResponse, http.statusCode >= 400 {
                     if !quiet || self.backends.isEmpty {
                         self.backendError = "Outer Shell API returned HTTP \(http.statusCode)."
-                        self.updateLayout()
+                        self.scheduleLayoutUpdate()
                     }
                     return
                 }
                 guard let data else {
                     if !quiet || self.backends.isEmpty {
                         self.backendError = "Outer Shell API returned no data."
-                        self.updateLayout()
+                        self.scheduleLayoutUpdate()
                     }
                     return
                 }
@@ -5140,7 +5195,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                     }
                     self.clampScrollOffsets()
                     if !(quiet && self.mode == .apps && previousAppsSignature == nextAppsSignature) {
-                        self.updateLayout()
+                        self.scheduleLayoutUpdate()
                     }
                     self.showAutomaticOuterShellUpdatePromptIfNeeded()
                     if self.selectedLog != nil {
@@ -5148,7 +5203,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                     }
                 } catch {
                     self.backendError = "Could not decode Outer Shell API response."
-                    self.updateLayout()
+                    self.scheduleLayoutUpdate()
                 }
             }
         }.resume()
@@ -5172,7 +5227,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                                           availableVersion: availableVersion,
                                                           message: "Outer Shell \(availableVersion) is available.")
         backendError = ""
-        updateLayout()
+        scheduleLayoutUpdate()
     }
 
     private func fetchRecipes(didRecoverNetworking: Bool = false) {
@@ -5187,11 +5242,15 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                         self.fetchRecipes(didRecoverNetworking: true)
                         return
                     }
-                    self.updateLayout()
+                    if self.mode == .create {
+                        self.scheduleLayoutUpdate()
+                    }
                     return
                 }
                 guard let data else {
-                    self.updateLayout()
+                    if self.mode == .create {
+                        self.scheduleLayoutUpdate()
+                    }
                     return
                 }
                 do {
@@ -5201,9 +5260,13 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                         self.selectedRecipeID = self.recipes.first?.identifier ?? "command-port"
                     }
                     self.applyRecipeDefaults(overwrite: false)
-                    self.updateLayout()
+                    if self.mode == .create {
+                        self.scheduleLayoutUpdate()
+                    }
                 } catch {
-                    self.updateLayout()
+                    if self.mode == .create {
+                        self.scheduleLayoutUpdate()
+                    }
                 }
             }
         }.resume()
