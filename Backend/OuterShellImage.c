@@ -147,6 +147,35 @@ bool outer_shell_resize_png(const char *source_path,
 #else
 
 #include <png.h>
+#include <setjmp.h>
+
+typedef struct {
+    char *error;
+    size_t error_size;
+    unsigned char *pixels;
+    png_bytep *rows;
+} OuterShellPNGContext;
+
+static void outer_shell_libpng_error(png_structp png, png_const_charp message) {
+    OuterShellPNGContext *context = png_get_error_ptr(png);
+    if (context) set_image_error(context->error, context->error_size, message);
+    longjmp(png_jmpbuf(png), 1);
+}
+
+static void outer_shell_libpng_warning(png_structp png, png_const_charp message) {
+    (void)png;
+    (void)message;
+}
+
+static bool read_png_signature(FILE *file, char *error, size_t error_size) {
+    png_byte signature[8];
+    if (fread(signature, 1, sizeof(signature), file) != sizeof(signature) ||
+        png_sig_cmp(signature, 0, sizeof(signature)) != 0) {
+        set_image_error(error, error_size, "file is not a PNG");
+        return false;
+    }
+    return true;
+}
 
 bool outer_shell_png_dimensions(const char *path,
                                 size_t *width,
@@ -155,16 +184,253 @@ bool outer_shell_png_dimensions(const char *path,
                                 size_t error_size) {
     if (width) *width = 0;
     if (height) *height = 0;
-    png_image image;
-    memset(&image, 0, sizeof(image));
-    image.version = PNG_IMAGE_VERSION;
-    if (!path || !png_image_begin_read_from_file(&image, path)) {
-        set_image_error(error, error_size, image.message[0] ? image.message : "could not open PNG");
+    if (!path) {
+        set_image_error(error, error_size, "invalid PNG path");
         return false;
     }
-    if (width) *width = image.width;
-    if (height) *height = image.height;
-    png_image_free(&image);
+
+    FILE *file = fopen(path, "rb");
+    if (!file) {
+        set_image_error(error, error_size, strerror(errno));
+        return false;
+    }
+    if (!read_png_signature(file, error, error_size)) {
+        fclose(file);
+        return false;
+    }
+
+    OuterShellPNGContext *context = calloc(1, sizeof(*context));
+    if (!context) {
+        fclose(file);
+        set_image_error(error, error_size, "not enough memory to read PNG");
+        return false;
+    }
+    context->error = error;
+    context->error_size = error_size;
+
+    png_structp png = png_create_read_struct(PNG_LIBPNG_VER_STRING,
+                                             context,
+                                             outer_shell_libpng_error,
+                                             outer_shell_libpng_warning);
+    png_infop info = png ? png_create_info_struct(png) : NULL;
+    if (!png || !info) {
+        if (png) png_destroy_read_struct(&png, NULL, NULL);
+        free(context);
+        fclose(file);
+        set_image_error(error, error_size, "could not initialize PNG reader");
+        return false;
+    }
+    if (setjmp(png_jmpbuf(png))) {
+        png_destroy_read_struct(&png, &info, NULL);
+        free(context);
+        fclose(file);
+        return false;
+    }
+
+    png_init_io(png, file);
+    png_set_sig_bytes(png, 8);
+    png_read_info(png, info);
+    png_uint_32 decoded_width = png_get_image_width(png, info);
+    png_uint_32 decoded_height = png_get_image_height(png, info);
+    bool ok = decoded_width > 0 && decoded_height > 0;
+    if (ok) {
+        if (width) *width = decoded_width;
+        if (height) *height = decoded_height;
+    } else {
+        set_image_error(error, error_size, "PNG has invalid dimensions");
+    }
+    png_destroy_read_struct(&png, &info, NULL);
+    free(context);
+    fclose(file);
+    if (!ok) return false;
+    return true;
+}
+
+static bool read_png_rgba(const char *path,
+                          png_uint_32 *width,
+                          png_uint_32 *height,
+                          unsigned char **pixels,
+                          char *error,
+                          size_t error_size) {
+    *width = 0;
+    *height = 0;
+    *pixels = NULL;
+
+    FILE *file = fopen(path, "rb");
+    if (!file) {
+        set_image_error(error, error_size, strerror(errno));
+        return false;
+    }
+    if (!read_png_signature(file, error, error_size)) {
+        fclose(file);
+        return false;
+    }
+
+    OuterShellPNGContext *context = calloc(1, sizeof(*context));
+    if (!context) {
+        fclose(file);
+        set_image_error(error, error_size, "not enough memory to decode PNG");
+        return false;
+    }
+    context->error = error;
+    context->error_size = error_size;
+
+    png_structp png = png_create_read_struct(PNG_LIBPNG_VER_STRING,
+                                             context,
+                                             outer_shell_libpng_error,
+                                             outer_shell_libpng_warning);
+    png_infop info = png ? png_create_info_struct(png) : NULL;
+    if (!png || !info) {
+        if (png) png_destroy_read_struct(&png, NULL, NULL);
+        free(context);
+        fclose(file);
+        set_image_error(error, error_size, "could not initialize PNG reader");
+        return false;
+    }
+    if (setjmp(png_jmpbuf(png))) {
+        png_destroy_read_struct(&png, &info, NULL);
+        free(context->rows);
+        free(context->pixels);
+        free(context);
+        fclose(file);
+        return false;
+    }
+
+    png_init_io(png, file);
+    png_set_sig_bytes(png, 8);
+    png_read_info(png, info);
+
+    png_uint_32 decoded_width;
+    png_uint_32 decoded_height;
+    int bit_depth;
+    int color_type;
+    if (!png_get_IHDR(png,
+                      info,
+                      &decoded_width,
+                      &decoded_height,
+                      &bit_depth,
+                      &color_type,
+                      NULL,
+                      NULL,
+                      NULL) ||
+        decoded_width == 0 || decoded_height == 0 ||
+        decoded_width > 16384 || decoded_height > 16384) {
+        png_error(png, "PNG dimensions are unsupported");
+    }
+
+    bool has_transparency = png_get_valid(png, info, PNG_INFO_tRNS) != 0;
+    if (bit_depth == 16) png_set_strip_16(png);
+    if (color_type == PNG_COLOR_TYPE_PALETTE) png_set_palette_to_rgb(png);
+    if (color_type == PNG_COLOR_TYPE_GRAY && bit_depth < 8) png_set_expand_gray_1_2_4_to_8(png);
+    if (has_transparency) png_set_tRNS_to_alpha(png);
+    if (color_type == PNG_COLOR_TYPE_GRAY || color_type == PNG_COLOR_TYPE_GRAY_ALPHA) {
+        png_set_gray_to_rgb(png);
+    }
+    if (!(color_type & PNG_COLOR_MASK_ALPHA) && !has_transparency) {
+        png_set_filler(png, 0xff, PNG_FILLER_AFTER);
+    }
+    png_set_interlace_handling(png);
+    png_read_update_info(png, info);
+
+    size_t row_bytes = png_get_rowbytes(png, info);
+    if (png_get_bit_depth(png, info) != 8 ||
+        png_get_channels(png, info) != 4 ||
+        row_bytes != (size_t)decoded_width * 4 ||
+        decoded_height > SIZE_MAX / row_bytes) {
+        png_error(png, "PNG pixel format is unsupported");
+    }
+
+    context->pixels = malloc(row_bytes * decoded_height);
+    context->rows = malloc(sizeof(*context->rows) * decoded_height);
+    if (!context->pixels || !context->rows) {
+        png_error(png, "not enough memory to decode PNG");
+    }
+    for (png_uint_32 row = 0; row < decoded_height; row++) {
+        context->rows[row] = context->pixels + (size_t)row * row_bytes;
+    }
+    png_read_image(png, context->rows);
+    png_read_end(png, info);
+
+    *width = decoded_width;
+    *height = decoded_height;
+    *pixels = context->pixels;
+    context->pixels = NULL;
+    png_destroy_read_struct(&png, &info, NULL);
+    free(context->rows);
+    free(context);
+    fclose(file);
+    return true;
+}
+
+static bool write_png_rgba(const char *path,
+                           png_uint_32 width,
+                           png_uint_32 height,
+                           unsigned char *pixels,
+                           char *error,
+                           size_t error_size) {
+    FILE *file = fopen(path, "wb");
+    if (!file) {
+        set_image_error(error, error_size, strerror(errno));
+        return false;
+    }
+
+    OuterShellPNGContext *context = calloc(1, sizeof(*context));
+    if (!context) {
+        fclose(file);
+        set_image_error(error, error_size, "not enough memory to write PNG");
+        return false;
+    }
+    context->error = error;
+    context->error_size = error_size;
+
+    png_structp png = png_create_write_struct(PNG_LIBPNG_VER_STRING,
+                                              context,
+                                              outer_shell_libpng_error,
+                                              outer_shell_libpng_warning);
+    png_infop info = png ? png_create_info_struct(png) : NULL;
+    if (!png || !info) {
+        if (png) png_destroy_write_struct(&png, NULL);
+        free(context);
+        fclose(file);
+        set_image_error(error, error_size, "could not initialize PNG writer");
+        return false;
+    }
+    if (setjmp(png_jmpbuf(png))) {
+        png_destroy_write_struct(&png, &info);
+        free(context->rows);
+        free(context);
+        fclose(file);
+        return false;
+    }
+
+    context->rows = malloc(sizeof(*context->rows) * height);
+    if (!context->rows) png_error(png, "not enough memory to write PNG");
+    for (png_uint_32 row = 0; row < height; row++) {
+        context->rows[row] = pixels + (size_t)row * width * 4;
+    }
+
+    png_init_io(png, file);
+    png_set_IHDR(png,
+                 info,
+                 width,
+                 height,
+                 8,
+                 PNG_COLOR_TYPE_RGBA,
+                 PNG_INTERLACE_NONE,
+                 PNG_COMPRESSION_TYPE_DEFAULT,
+                 PNG_FILTER_TYPE_DEFAULT);
+    png_write_info(png, info);
+    png_write_image(png, context->rows);
+    png_write_end(png, info);
+
+    png_destroy_write_struct(&png, &info);
+    free(context->rows);
+    free(context);
+    if (fclose(file) != 0) {
+        set_image_error(error, error_size, strerror(errno));
+        return false;
+    }
+    chmod(path, 0644);
     return true;
 }
 
@@ -235,48 +501,29 @@ bool outer_shell_resize_png(const char *source_path,
         set_image_error(error, error_size, "invalid PNG resize arguments");
         return false;
     }
-    png_image source_image;
-    memset(&source_image, 0, sizeof(source_image));
-    source_image.version = PNG_IMAGE_VERSION;
-    if (!png_image_begin_read_from_file(&source_image, source_path)) {
-        set_image_error(error, error_size, source_image.message[0] ? source_image.message : "could not open PNG");
-        return false;
-    }
-    if (source_image.width == 0 || source_image.height == 0 ||
-        source_image.width > 16384 || source_image.height > 16384) {
-        png_image_free(&source_image);
-        set_image_error(error, error_size, "PNG dimensions are unsupported");
-        return false;
-    }
-    source_image.format = PNG_FORMAT_RGBA;
-    size_t source_size = PNG_IMAGE_SIZE(source_image);
-    unsigned char *source_pixels = malloc(source_size);
-    if (!source_pixels) {
-        png_image_free(&source_image);
-        set_image_error(error, error_size, "not enough memory to decode PNG");
-        return false;
-    }
-    if (!png_image_finish_read(&source_image, NULL, source_pixels, 0, NULL)) {
-        set_image_error(error, error_size, source_image.message[0] ? source_image.message : "could not decode PNG");
-        free(source_pixels);
-        png_image_free(&source_image);
-        return false;
-    }
+    png_uint_32 source_width;
+    png_uint_32 source_height;
+    unsigned char *source_pixels;
+    if (!read_png_rgba(source_path,
+                       &source_width,
+                       &source_height,
+                       &source_pixels,
+                       error,
+                       error_size)) return false;
 
     size_t destination_width;
     size_t destination_height;
-    if (source_image.width >= source_image.height) {
+    if (source_width >= source_height) {
         destination_width = max_pixel_size;
-        destination_height = ((size_t)source_image.height * max_pixel_size + source_image.width / 2) / source_image.width;
+        destination_height = ((size_t)source_height * max_pixel_size + source_width / 2) / source_width;
     } else {
         destination_height = max_pixel_size;
-        destination_width = ((size_t)source_image.width * max_pixel_size + source_image.height / 2) / source_image.height;
+        destination_width = ((size_t)source_width * max_pixel_size + source_height / 2) / source_height;
     }
     if (destination_width == 0) destination_width = 1;
     if (destination_height == 0) destination_height = 1;
     if (destination_width > SIZE_MAX / destination_height / 4) {
         free(source_pixels);
-        png_image_free(&source_image);
         set_image_error(error, error_size, "resized PNG dimensions overflow");
         return false;
     }
@@ -284,40 +531,23 @@ bool outer_shell_resize_png(const char *source_path,
     unsigned char *destination_pixels = malloc(destination_size);
     if (!destination_pixels) {
         free(source_pixels);
-        png_image_free(&source_image);
         set_image_error(error, error_size, "not enough memory to resize PNG");
         return false;
     }
     resize_rgba_area(source_pixels,
-                     source_image.width,
-                     source_image.height,
+                     source_width,
+                     source_height,
                      destination_pixels,
                      destination_width,
                      destination_height);
     free(source_pixels);
-    png_image_free(&source_image);
-
-    png_image destination_image;
-    memset(&destination_image, 0, sizeof(destination_image));
-    destination_image.version = PNG_IMAGE_VERSION;
-    destination_image.width = (png_uint_32)destination_width;
-    destination_image.height = (png_uint_32)destination_height;
-    destination_image.format = PNG_FORMAT_RGBA;
-    bool ok = png_image_write_to_file(&destination_image,
-                                      destination_path,
-                                      0,
-                                      destination_pixels,
-                                      0,
-                                      NULL) != 0;
-    if (!ok) {
-        set_image_error(error,
-                        error_size,
-                        destination_image.message[0] ? destination_image.message : "could not write resized PNG");
-    } else {
-        chmod(destination_path, 0644);
-    }
+    bool ok = write_png_rgba(destination_path,
+                             (png_uint_32)destination_width,
+                             (png_uint_32)destination_height,
+                             destination_pixels,
+                             error,
+                             error_size);
     free(destination_pixels);
-    png_image_free(&destination_image);
     return ok;
 }
 
