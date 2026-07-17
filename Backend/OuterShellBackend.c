@@ -128,6 +128,7 @@ static int connect_unix_stream(const char *socket_path, char *error, size_t erro
 
 #define DEFAULT_PORT 7354
 #define READ_BUFFER_SIZE 65536
+#define MAX_HTTP_REQUEST_SIZE (8u * 1024u * 1024u)
 #define MAX_REACTOR_CLIENTS 128
 #define CLIENT_IDLE_TIMEOUT_MS 10000
 
@@ -156,7 +157,8 @@ typedef struct {
     bool is_api;
     uid_t peer_uid;
     bool has_peer_uid;
-    char request[READ_BUFFER_SIZE];
+    char *request;
+    size_t request_capacity;
     size_t length;
     int64_t last_activity_ms;
     bool waiting_for_api_response;
@@ -1513,23 +1515,134 @@ static bool native_app_scheme_is_valid(const char *value) {
     return true;
 }
 
-static void send_native_app_project_creation(int fd, const char *query, const char *body) {
+typedef struct {
+    char *form;
+    const unsigned char *icon_png;
+    size_t icon_png_length;
+} NativeAppProjectRequest;
+
+static bool parse_native_app_project_request(const char *body,
+                                             size_t body_length,
+                                             NativeAppProjectRequest *request) {
+    memset(request, 0, sizeof(*request));
+    const unsigned char *bytes = (const unsigned char *)body;
+    size_t form_length = body_length;
+    if (body_length >= 16 && memcmp(bytes, "OSNREQ1\0", 8) == 0) {
+        form_length = read_uint32_le(bytes + 8);
+        size_t icon_length = read_uint32_le(bytes + 12);
+        if (form_length > 16 * 1024 || icon_length > 4 * 1024 * 1024 ||
+            form_length > body_length - 16 || icon_length != body_length - 16 - form_length) {
+            return false;
+        }
+        request->icon_png = bytes + 16 + form_length;
+        request->icon_png_length = icon_length;
+        bytes += 16;
+    } else if (memchr(body, '\0', body_length) != NULL) {
+        return false;
+    }
+    request->form = malloc(form_length + 1);
+    if (!request->form) return false;
+    memcpy(request->form, bytes, form_length);
+    request->form[form_length] = '\0';
+    return true;
+}
+
+static bool write_native_app_file(const char *path, const void *bytes, size_t length) {
+    int output = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    if (output < 0) return false;
+    const unsigned char *cursor = bytes;
+    size_t remaining = length;
+    bool ok = true;
+    while (remaining > 0) {
+        ssize_t written = write(output, cursor, remaining);
+        if (written < 0) {
+            if (errno == EINTR) continue;
+            ok = false;
+            break;
+        }
+        if (written == 0) {
+            ok = false;
+            break;
+        }
+        cursor += written;
+        remaining -= (size_t)written;
+    }
+    if (close(output) != 0) ok = false;
+    if (!ok) unlink(path);
+    return ok;
+}
+
+static bool native_app_icon_is_valid(const unsigned char *png, size_t length) {
+    static const unsigned char signature[] = {0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a};
+    if (!png || length < 33 || length > 4 * 1024 * 1024 ||
+        memcmp(png, signature, sizeof(signature)) != 0 ||
+        memcmp(png + 12, "IHDR", 4) != 0) {
+        return false;
+    }
+    uint32_t width = ((uint32_t)png[16] << 24) | ((uint32_t)png[17] << 16) |
+                     ((uint32_t)png[18] << 8) | png[19];
+    uint32_t height = ((uint32_t)png[20] << 24) | ((uint32_t)png[21] << 16) |
+                      ((uint32_t)png[22] << 8) | png[23];
+    return width == 1024 && height == 1024;
+}
+
+static bool remove_native_app_tree(const char *path) {
+    struct stat st;
+    if (lstat(path, &st) != 0) return errno == ENOENT;
+    if (!S_ISDIR(st.st_mode)) return unlink(path) == 0;
+    DIR *directory = opendir(path);
+    if (!directory) return false;
+    bool ok = true;
+    struct dirent *entry;
+    while ((entry = readdir(directory)) != NULL) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
+        char child[PATH_MAX];
+        int child_length = snprintf(child, sizeof(child), "%s/%s", path, entry->d_name);
+        if (child_length < 0 || (size_t)child_length >= sizeof(child) ||
+            !remove_native_app_tree(child)) {
+            ok = false;
+        }
+    }
+    closedir(directory);
+    return rmdir(path) == 0 && ok;
+}
+
+static bool make_native_app_temp_directory(char *path, size_t path_size) {
+    const char *base = getenv("TMPDIR");
+    if (!base || !base[0]) base = "/tmp";
+    int length = snprintf(path, path_size, "%s%soutershell-native-project.XXXXXX",
+                          base, base[strlen(base) - 1] == '/' ? "" : "/");
+    return length > 0 && (size_t)length < path_size && mkdtemp(path) != NULL;
+}
+
+static void send_native_app_project_creation(int fd,
+                                             const char *query,
+                                             const char *body,
+                                             size_t body_length) {
+    NativeAppProjectRequest request;
+    if (!parse_native_app_project_request(body, body_length, &request)) {
+        send_text_response(fd, 400, "invalid native app project request\n");
+        return;
+    }
+
     char name[256], app_id[256], scheme[160], folder[160], socket_name[256];
     char source_root[PATH_MAX] = "~/outerframe-apps";
     char targets[64], macos_language[32], backend_language[32], isolation[32];
-    if (!query_value_any(query, body, "name", name, sizeof(name)) ||
-        !query_value_any(query, body, "appID", app_id, sizeof(app_id)) ||
-        !query_value_any(query, body, "scheme", scheme, sizeof(scheme)) ||
-        !query_value_any(query, body, "folder", folder, sizeof(folder)) ||
-        !query_value_any(query, body, "socket", socket_name, sizeof(socket_name)) ||
-        !query_value_any(query, body, "targets", targets, sizeof(targets)) ||
-        !query_value_any(query, body, "macOSLanguage", macos_language, sizeof(macos_language)) ||
-        !query_value_any(query, body, "backendLanguage", backend_language, sizeof(backend_language)) ||
-        !query_value_any(query, body, "isolation", isolation, sizeof(isolation))) {
+    if (!query_value_any(query, request.form, "name", name, sizeof(name)) ||
+        !query_value_any(query, request.form, "appID", app_id, sizeof(app_id)) ||
+        !query_value_any(query, request.form, "scheme", scheme, sizeof(scheme)) ||
+        !query_value_any(query, request.form, "folder", folder, sizeof(folder)) ||
+        !query_value_any(query, request.form, "socket", socket_name, sizeof(socket_name)) ||
+        !query_value_any(query, request.form, "targets", targets, sizeof(targets)) ||
+        !query_value_any(query, request.form, "macOSLanguage", macos_language, sizeof(macos_language)) ||
+        !query_value_any(query, request.form, "backendLanguage", backend_language, sizeof(backend_language)) ||
+        !query_value_any(query, request.form, "isolation", isolation, sizeof(isolation))) {
+        free(request.form);
         send_text_response(fd, 400, "missing native app project configuration\n");
         return;
     }
-    (void)query_value_any(query, body, "sourceRoot", source_root, sizeof(source_root));
+    (void)query_value_any(query, request.form, "sourceRoot", source_root, sizeof(source_root));
+    free(request.form);
 
     static const char *component_characters =
         "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.";
@@ -1550,6 +1663,11 @@ static void send_native_app_project_creation(int fd, const char *query, const ch
         return;
     }
 
+    if (request.icon_png_length > 0 && !native_app_icon_is_valid(request.icon_png, request.icon_png_length)) {
+        send_text_response(fd, 400, "invalid native app icon\n");
+        return;
+    }
+
     if (!g_native_app_template_directory[0]) {
         send_text_response(fd, 503, "native app template directory is not configured\n");
         return;
@@ -1562,7 +1680,25 @@ static void send_native_app_project_creation(int fd, const char *query, const ch
         return;
     }
 
+    char temp_root[PATH_MAX];
+    if (!make_native_app_temp_directory(temp_root, sizeof(temp_root))) {
+        send_text_response(fd, 500, "failed to create native app project workspace\n");
+        return;
+    }
+    char builder_output[PATH_MAX];
+    char icon_path[PATH_MAX];
+    snprintf(builder_output, sizeof(builder_output), "%s/response", temp_root);
+    snprintf(icon_path, sizeof(icon_path), "%s/app-icon.png", temp_root);
+    if (request.icon_png_length > 0 &&
+        !write_native_app_file(icon_path, request.icon_png, request.icon_png_length)) {
+        (void)remove_native_app_tree(temp_root);
+        send_text_response(fd, 500, "failed to stage native app icon\n");
+        return;
+    }
+
     char quoted_helper[PATH_MAX * 4 + 8];
+    char quoted_builder_output[PATH_MAX * 4 + 8];
+    char quoted_icon_path[PATH_MAX * 4 + 8];
     char quoted_source_root[PATH_MAX * 4 + 8];
     char quoted_name[sizeof(name) * 4 + 8];
     char quoted_app_id[sizeof(app_id) * 4 + 8];
@@ -1571,6 +1707,8 @@ static void send_native_app_project_creation(int fd, const char *query, const ch
     char quoted_socket[sizeof(socket_name) * 4 + 8];
     char quoted_targets[sizeof(targets) * 4 + 8];
     shell_quote(helper, quoted_helper, sizeof(quoted_helper));
+    shell_quote(builder_output, quoted_builder_output, sizeof(quoted_builder_output));
+    shell_quote(icon_path, quoted_icon_path, sizeof(quoted_icon_path));
     shell_quote(source_root, quoted_source_root, sizeof(quoted_source_root));
     shell_quote(name, quoted_name, sizeof(quoted_name));
     shell_quote(app_id, quoted_app_id, sizeof(quoted_app_id));
@@ -1579,21 +1717,27 @@ static void send_native_app_project_creation(int fd, const char *query, const ch
     shell_quote(socket_name, quoted_socket, sizeof(quoted_socket));
     shell_quote(targets, quoted_targets, sizeof(quoted_targets));
 
-    char command[PATH_MAX * 10 + 8192];
+    char icon_option[PATH_MAX * 4 + 32] = "";
+    if (request.icon_png_length > 0) {
+        snprintf(icon_option, sizeof(icon_option), " --icon %s", quoted_icon_path);
+    }
+    char command[PATH_MAX * 16 + 8192];
     int command_length = snprintf(command, sizeof(command),
                                   "python3 %s --name %s --app-id %s --scheme %s --source-root %s --folder %s "
                                   "--socket %s --targets %s --macos-language %s "
-                                  "--backend-language %s --isolation %s 2>&1",
+                                  "--backend-language %s --isolation %s --builder-output %s%s 2>&1",
                                   quoted_helper, quoted_name, quoted_app_id, quoted_scheme,
                                   quoted_source_root, quoted_folder, quoted_socket, quoted_targets, macos_language,
-                                  backend_language, isolation);
+                                  backend_language, isolation, quoted_builder_output, icon_option);
     if (command_length < 0 || (size_t)command_length >= sizeof(command)) {
+        (void)remove_native_app_tree(temp_root);
         send_text_response(fd, 500, "native app project command is too long\n");
         return;
     }
 
     FILE *pipe = popen(command, "r");
     if (!pipe) {
+        (void)remove_native_app_tree(temp_root);
         send_text_response(fd, 500, "failed to start native app project creation\n");
         return;
     }
@@ -1614,14 +1758,32 @@ static void send_native_app_project_creation(int fd, const char *query, const ch
             : "native app project creation failed\n");
     }
     int http_status = exit_status == 0 ? 200 : (exit_status == 17 ? 409 : (exit_status == 2 ? 400 : 500));
-    const char *reason = http_status == 200 ? "OK" :
-                         (http_status == 409 ? "Conflict" :
-                         (http_status == 400 ? "Bad Request" : "Internal Server Error"));
-    send_response(fd, http_status, reason, "text/plain; charset=utf-8", output.data, output.length);
+    if (http_status == 200) {
+        StringBuilder archive = {0};
+        bool archive_ok = sb_append_n(&archive, "OSNTPL1", 7) &&
+                          sb_append_n(&archive, "\0", 1) &&
+                          archive_append_template_directory(&archive, builder_output, "") &&
+                          archive_append_u16(&archive, 0);
+        if (archive_ok) {
+            send_response(fd, 200, "OK", "application/vnd.outershell.native-app-project",
+                          archive.data, archive.length);
+        } else {
+            send_text_response(fd, 500, "failed to package native app project response\n");
+        }
+        free(archive.data);
+    } else {
+        const char *reason = http_status == 409 ? "Conflict" :
+                             (http_status == 400 ? "Bad Request" : "Internal Server Error");
+        send_response(fd, http_status, reason, "text/plain; charset=utf-8", output.data, output.length);
+    }
     free(output.data);
+    (void)remove_native_app_tree(temp_root);
 }
 
-static void dispatch_native_app_project_creation(int fd, const char *query, const char *body) {
+static void dispatch_native_app_project_creation(int fd,
+                                                 const char *query,
+                                                 const char *body,
+                                                 size_t body_length) {
     pid_t worker = fork();
     if (worker < 0) {
         send_text_response(fd, 500, "failed to start native app project worker\n");
@@ -1634,7 +1796,7 @@ static void dispatch_native_app_project_creation(int fd, const char *query, cons
     for (int candidate = 3; candidate < descriptor_limit; candidate++) {
         if (candidate != fd) close(candidate);
     }
-    send_native_app_project_creation(fd, query, body);
+    send_native_app_project_creation(fd, query, body, body_length);
     close(fd);
     _exit(0);
 }
@@ -1713,8 +1875,9 @@ static bool request_is_complete(const char *request, size_t length, size_t *comp
     if (!parsed_content_length(request, header_length, &content_length)) {
         return false;
     }
-    if (content_length > READ_BUFFER_SIZE || header_length + content_length > READ_BUFFER_SIZE) {
-        *complete_length = READ_BUFFER_SIZE + 1;
+    if (content_length > MAX_HTTP_REQUEST_SIZE ||
+        header_length > MAX_HTTP_REQUEST_SIZE - content_length) {
+        *complete_length = MAX_HTTP_REQUEST_SIZE + 1;
         return true;
     }
     if (length < header_length + content_length) {
@@ -1875,13 +2038,7 @@ static bool process_http_client_request(ReactorClient *client, char *request, si
     if (content_length_header && (!body || content_length_header < body)) {
         content_length = (size_t)strtoull(content_length_header + 17, NULL, 10);
     }
-    while (body && body_length < content_length && (size_t)n < sizeof(request) - 1) {
-        ssize_t more = read(fd, request + n, sizeof(request) - 1 - (size_t)n);
-        if (more <= 0) break;
-        n += more;
-        request[n] = '\0';
-        body_length += (size_t)more;
-    }
+    if (body_length > content_length) body_length = content_length;
     if (body) {
         *body = '\0';
         body += 4;
@@ -1911,7 +2068,7 @@ static bool process_http_client_request(ReactorClient *client, char *request, si
     }
 
     if (strcasecmp(method, "POST") == 0 && strcmp(target, "/api/native-app-projects") == 0) {
-        dispatch_native_app_project_creation(fd, query, body);
+        dispatch_native_app_project_creation(fd, query, body, body_length);
     } else if (strcasecmp(method, "POST") == 0) {
         send_text_response(fd, 404, "not found\n");
     } else if (strcmp(target, "/api/native-app-template") == 0) {
@@ -2117,6 +2274,8 @@ static void close_reactor_client(ReactorClient *clients, size_t *client_count, s
     if (clients[index].api_response_fd >= 0) {
         close(clients[index].api_response_fd);
     }
+    free(clients[index].request);
+    clients[index].request = NULL;
     if (index + 1 < *client_count) {
         memmove(&clients[index],
                 &clients[index + 1],
@@ -2133,6 +2292,13 @@ static void add_reactor_client(ReactorClient *clients, size_t *client_count, int
     set_fd_nonblocking(client_fd, true);
     ReactorClient *client = &clients[(*client_count)++];
     memset(client, 0, sizeof(*client));
+    client->request_capacity = READ_BUFFER_SIZE;
+    client->request = malloc(client->request_capacity);
+    if (!client->request) {
+        close(client_fd);
+        (*client_count)--;
+        return;
+    }
     client->fd = client_fd;
     client->api_response_fd = -1;
     client->is_api = is_api;
@@ -2163,14 +2329,28 @@ static bool read_reactor_client_from_fd(ReactorClient *client,
     *should_close = false;
 
     for (;;) {
-        if (client->length >= sizeof(client->request) - 1) {
-            *complete_length = READ_BUFFER_SIZE + 1;
-            return true;
+        size_t maximum_size = parse_api_frame ? READ_BUFFER_SIZE : MAX_HTTP_REQUEST_SIZE;
+        if (client->length >= client->request_capacity - 1) {
+            size_t maximum_capacity = maximum_size + 1;
+            if (client->request_capacity >= maximum_capacity) {
+                *complete_length = maximum_size + 1;
+                return true;
+            }
+            size_t new_capacity = client->request_capacity <= maximum_capacity / 2
+                ? client->request_capacity * 2
+                : maximum_capacity;
+            char *grown = realloc(client->request, new_capacity);
+            if (!grown) {
+                *should_close = true;
+                return false;
+            }
+            client->request = grown;
+            client->request_capacity = new_capacity;
         }
 
         ssize_t got = read(fd,
                            client->request + client->length,
-                           sizeof(client->request) - client->length - 1);
+                           client->request_capacity - client->length - 1);
         if (got > 0) {
             client->length += (size_t)got;
             client->request[client->length] = '\0';
@@ -2297,7 +2477,7 @@ static void run_http_reactor(int listener) {
                     bool complete = read_reactor_client(&clients[index], &complete_length, &should_close);
                     if (complete) {
                         set_fd_nonblocking(clients[index].fd, false);
-                        if (complete_length > READ_BUFFER_SIZE) {
+                        if (complete_length > MAX_HTTP_REQUEST_SIZE) {
                             send_text_response(clients[index].fd, 400, "request too large\n");
                             close_reactor_client(clients, &client_count, index);
                         } else {
@@ -2330,6 +2510,8 @@ static void run_http_reactor(int listener) {
 
     for (size_t i = 0; i < client_count; i++) {
         close(clients[i].fd);
+        if (clients[i].api_response_fd >= 0) close(clients[i].api_response_fd);
+        free(clients[i].request);
     }
     free(clients);
 }

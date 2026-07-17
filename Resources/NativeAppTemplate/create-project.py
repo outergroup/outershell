@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from typing import Optional
 
 
 def arguments() -> argparse.Namespace:
@@ -25,6 +26,9 @@ def arguments() -> argparse.Namespace:
     parser.add_argument("--macos-language", choices=("swift", "objc"), required=True)
     parser.add_argument("--backend-language", choices=("go", "c"), required=True)
     parser.add_argument("--isolation", choices=("container", "host"), required=True)
+    parser.add_argument("--icon")
+    parser.add_argument("--builder-output")
+    parser.add_argument("--skip-deploy", action="store_true", help=argparse.SUPPRESS)
     return parser.parse_args()
 
 
@@ -143,13 +147,65 @@ def patch_text(project: Path, args: argparse.Namespace, ordered_targets: list[st
             path.write_text(updated, encoding="utf-8")
 
 
-def install_default_icon(project: Path, template: Path) -> None:
+def install_icon(project: Path, template: Path, icon_path: Optional[str]) -> None:
+    if icon_path is not None:
+        source = Path(icon_path)
+        if not source.is_file():
+            raise ValueError("generated icon is unavailable")
+        shutil.copy2(source, project / "app-icon.png")
+        if (project / "macos").is_dir():
+            shutil.copy2(source, project / "macos" / "app-icon.png")
+        return
     for candidate in (template.parent / "app-icon.png", template.parent.parent / "app-icon.png"):
         if candidate.is_file():
             shutil.copy2(candidate, project / "app-icon.png")
             if (project / "macos").is_dir():
                 shutil.copy2(candidate, project / "macos" / "app-icon.png")
             return
+
+
+def remote_project_location(source_root: str, folder: str) -> tuple[str, str, bool]:
+    root = source_root.rstrip("/") or "/"
+    if root == "~":
+        return f"~/{folder}", folder, True
+    if root.startswith("~/"):
+        relative = f"{root[2:]}/{folder}"
+        return f"~/{relative}", relative, True
+    separator = "" if root == "/" else "/"
+    path = f"{root}{separator}{folder}"
+    return path, path, False
+
+
+def create_macos_builder(project: Path, args: argparse.Namespace, output: Path) -> None:
+    display_path, script_path, is_home_relative = remote_project_location(args.source_root, args.folder)
+    output.mkdir(parents=True, exist_ok=True)
+    (output / ".outershell-remote-project-path").write_text(display_path, encoding="utf-8")
+
+    if "macos" not in args.targets.split():
+        return
+
+    builder = output / "builder" / f"{args.folder}-macOS"
+    builder.mkdir(parents=True, exist_ok=False)
+    for name in ("macos", "app.env", "app-icon.png"):
+        source = project / name
+        destination = builder / name
+        if source.is_dir():
+            shutil.copytree(source, destination)
+        elif source.is_file():
+            shutil.copy2(source, destination)
+
+    templates = project / "macos-builder"
+    remote_command_path = r"\$HOME/${REMOTE_PROJECT}" if is_home_relative else "${REMOTE_PROJECT}"
+    platform = (templates / "platform.in").read_text(encoding="utf-8")
+    platform = platform.replace("__REMOTE_PROJECT__", script_path)
+    platform = platform.replace("__REMOTE_PROJECT_COMMAND__", remote_command_path)
+    platform_path = builder / "platform"
+    platform_path.write_text(platform, encoding="utf-8")
+    platform_path.chmod(0o755)
+
+    readme = (templates / "README.md.in").read_text(encoding="utf-8")
+    readme = readme.replace("__REMOTE_PROJECT_DISPLAY__", display_path)
+    (builder / "README.md").write_text(readme, encoding="utf-8")
 
 
 def main() -> int:
@@ -188,11 +244,18 @@ def main() -> int:
         specialize_layout(incoming, args, targets)
         rename_macos_files(incoming, args.scheme)
         patch_text(incoming, args, ordered_targets)
-        install_default_icon(incoming, template)
+        install_icon(incoming, template, args.icon)
+        if args.builder_output is not None:
+            create_macos_builder(incoming, args, Path(args.builder_output))
+        remove(incoming / "macos-builder")
         os.rename(incoming, project)
     except BaseException:
         remove(incoming)
         raise
+
+    if args.skip_deploy:
+        print(f"Canonical project: {project}")
+        return 0
 
     result = subprocess.run([str(project / "app"), "deploy"], cwd=project, check=False)
     if result.returncode != 0:

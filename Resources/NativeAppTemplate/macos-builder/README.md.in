@@ -1,0 +1,12 @@
+# Hello World — macOS builder
+
+This is a platform build workspace, not the app's main project. The canonical
+project lives on the server at `__REMOTE_PROJECT_DISPLAY__`.
+
+- `./platform sync` replaces `macos/` with the source from the server.
+- `./platform build` compiles universal macOS artifacts locally.
+- `./platform publish` builds and sends only those compiled artifacts back to
+  the canonical project, which redeploys the app.
+
+Edit the canonical source over SSH (directly or with a coding agent), sync it
+here, then publish it from this Mac.

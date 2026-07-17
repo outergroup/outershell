@@ -750,7 +750,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private var recipesEndpoint: URL?
     private var filePickerEndpoint: URL?
     private var eventsEndpoint: URL?
-    private var nativeAppTemplateEndpoint: URL?
     private var nativeAppProjectEndpoint: URL?
     private var nativeAppInstallSession: URLSession?
     private var eventWatchTask: URLSessionDataTask?
@@ -1172,7 +1171,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             recipesEndpoint = URL(string: "/api/recipes", relativeTo: base)?.absoluteURL
             filePickerEndpoint = URL(string: "/api/file-picker", relativeTo: base)?.absoluteURL
             eventsEndpoint = URL(string: "/api/events", relativeTo: base)?.absoluteURL
-            nativeAppTemplateEndpoint = URL(string: "/api/native-app-template", relativeTo: base)?.absoluteURL
             nativeAppProjectEndpoint = URL(string: "/api/native-app-projects", relativeTo: base)?.absoluteURL
         }
         let configuration = URLSessionConfiguration.ephemeral
@@ -1333,10 +1331,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func discardGeneratedNativeProject() {
-        let projectURL = generatedNativeProject?.projectURL
+        let stagingRootURL = generatedNativeProject?.stagingRootURL
         clearGeneratedNativeProjectState()
-        if let projectURL {
-            try? FileManager.default.removeItem(at: projectURL.deletingLastPathComponent())
+        if let stagingRootURL {
+            try? FileManager.default.removeItem(at: stagingRootURL)
         }
     }
 
@@ -2318,6 +2316,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             nativeProjectDragFrame = .zero
             return top - 84
         }
+        guard let projectURL = project.projectURL else { return top - 84 }
 
         let iconSize: CGFloat = 96
         let iconPlateSize: CGFloat = 116
@@ -2352,7 +2351,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                             height: iconSize)
         icon.contentsGravity = .resizeAspect
         icon.contentsScale = max(NSScreen.main?.backingScaleFactor ?? 2, 1)
-        icon.contents = folderIconCGImage(for: project.projectURL, pointSize: iconSize)
+        icon.contents = folderIconCGImage(for: projectURL, pointSize: iconSize)
         addCreateFormSublayer(icon)
 
         let labelFrame = CGRect(x: nativeProjectDragFrame.midX - labelWidth / 2,
@@ -6058,51 +6057,42 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             return
         }
 
-        isPerformingAction = true
-        createMessage = "Generating..."
-        updateLayout()
+        let configuration = NativeAppProjectConfiguration(appName: appName,
+                                                          appID: appID,
+                                                          xcodeScheme: scheme,
+                                                          projectRootPath: projectRoot,
+                                                          projectFolderName: projectFolder,
+                                                          socketFilename: socketFilename,
+                                                          platformTargets: platformTargets,
+                                                          frontendLanguage: frontendLanguage,
+                                                          backendLanguage: backendLanguage,
+                                                          isolationMode: isolationMode)
+        let iconPNGData: Data
+        do {
+            iconPNGData = try NativeAppProjectGenerator.generatedIconPNGData(appName: appName, appID: appID)
+        } catch {
+            createMessage = error.localizedDescription
+            updateLayout()
+            return
+        }
 
+        isPerformingAction = true
+        createMessage = "Installing on server..."
+        updateLayout()
         outerframeHost.requestOuterLoopSSHCommandArguments { [weak self] arguments in
-            guard let self else { return }
-            let arguments = arguments ?? []
-            self.createMessage = "Downloading template..."
-            self.updateLayout()
-            self.fetchNativeAppTemplateArchive { [weak self] result in
-                guard let self else { return }
-                do {
-                    let templateArchiveData = try result.get()
-                    let configuration = NativeAppProjectConfiguration(appName: appName,
-                                                                      appID: appID,
-                                                                      xcodeScheme: scheme,
-                                                                      projectRootPath: projectRoot,
-                                                                      projectFolderName: projectFolder,
-                                                                      socketFilename: socketFilename,
-                                                                      platformTargets: platformTargets,
-                                                                      frontendLanguage: frontendLanguage,
-                                                                      backendLanguage: backendLanguage,
-                                                                      isolationMode: isolationMode,
-                                                                      sshCommandArguments: arguments)
-                    self.generatedNativeProject = try NativeAppProjectGenerator.generate(configuration: configuration,
-                                                                                         stagingDirectory: stagingDirectory,
-                                                                                         templateArchiveData: templateArchiveData)
-                    guard let project = self.generatedNativeProject else { return }
-                    self.createMessage = "Installing on server..."
-                    self.updateLayout()
-                    self.installGeneratedNativeProject(project, configuration: configuration)
-                } catch {
-                    self.isPerformingAction = false
-                    self.createMessage = error.localizedDescription
-                    self.updateLayout()
-                }
-            }
+            self?.installGeneratedNativeProject(configuration: configuration,
+                                                iconPNGData: iconPNGData,
+                                                stagingDirectory: stagingDirectory,
+                                                sshCommandArguments: arguments ?? [])
         }
     }
 
-    private func installGeneratedNativeProject(_ project: GeneratedNativeAppProject,
-                                               configuration: NativeAppProjectConfiguration) {
+    private func installGeneratedNativeProject(configuration: NativeAppProjectConfiguration,
+                                               iconPNGData: Data,
+                                               stagingDirectory: URL,
+                                               sshCommandArguments: [String]) {
         guard let nativeAppProjectEndpoint, let nativeAppInstallSession else {
             isPerformingAction = false
-            discardGeneratedNativeProject()
             createMessage = "The Outer Shell backend cannot create server projects."
             updateLayout()
             return
@@ -6128,28 +6118,54 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         var request = URLRequest(url: nativeAppProjectEndpoint)
         request.httpMethod = "POST"
         request.timeoutInterval = 600
-        request.setValue("application/x-www-form-urlencoded; charset=utf-8", forHTTPHeaderField: "Content-Type")
-        request.httpBody = form.percentEncodedQuery?.data(using: .utf8)
+        request.setValue("application/vnd.outershell.native-app-project", forHTTPHeaderField: "Content-Type")
+        guard let formData = form.percentEncodedQuery?.data(using: .utf8),
+              formData.count <= Int(UInt32.max),
+              iconPNGData.count <= Int(UInt32.max) else {
+            isPerformingAction = false
+            createMessage = "Native app project request is too large."
+            updateLayout()
+            return
+        }
+        var requestBody = Data([0x4f, 0x53, 0x4e, 0x52, 0x45, 0x51, 0x31, 0x00])
+        var formLength = UInt32(formData.count).littleEndian
+        var iconLength = UInt32(iconPNGData.count).littleEndian
+        withUnsafeBytes(of: &formLength) { requestBody.append(contentsOf: $0) }
+        withUnsafeBytes(of: &iconLength) { requestBody.append(contentsOf: $0) }
+        requestBody.append(formData)
+        requestBody.append(iconPNGData)
+        request.httpBody = requestBody
 
         nativeAppInstallSession.dataTask(with: request) { [weak self] data, response, error in
             Task { @MainActor in
                 guard let self else { return }
                 self.isPerformingAction = false
                 if let error {
-                    self.discardGeneratedNativeProject()
                     self.createMessage = error.localizedDescription
                 } else if let httpResponse = response as? HTTPURLResponse,
                           (200..<300).contains(httpResponse.statusCode) {
-                    try? FileManager.default.removeItem(at: project.canonicalProjectURL)
-                    self.nativeProjectSelectionState = .none
-                    self.generatedNativeProjectWasExported = false
-                    self.createScroll = 0
-                    self.createMessage = "Installed \(configuration.projectFolderName) on the server."
-                    self.fetchBackends()
+                    do {
+                        guard let data, !data.isEmpty else {
+                            throw NativeAppProjectGeneratorError.invalidResponse
+                        }
+                        self.generatedNativeProject = try NativeAppProjectGenerator.materializeProjectResponse(
+                            data,
+                            configuration: configuration,
+                            stagingDirectory: stagingDirectory,
+                            sshCommandArguments: sshCommandArguments
+                        )
+                        self.nativeProjectSelectionState = .none
+                        self.generatedNativeProjectWasExported = false
+                        self.createScroll = 0
+                        self.createMessage = "Installed \(configuration.projectFolderName) on the server."
+                        self.fetchBackends()
+                    } catch {
+                        self.discardGeneratedNativeProject()
+                        self.createMessage = error.localizedDescription
+                    }
                 } else {
                     let message = data.flatMap { String(data: $0, encoding: .utf8) }?
                         .trimmingCharacters(in: .whitespacesAndNewlines)
-                    self.discardGeneratedNativeProject()
                     self.createMessage = (message?.isEmpty == false) ? message! : "Server installation failed."
                 }
                 self.updateLayout()
@@ -6157,38 +6173,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         }.resume()
     }
 
-    private func fetchNativeAppTemplateArchive(completion: @escaping @MainActor @Sendable (Result<Data, Error>) -> Void) {
-        guard let nativeAppTemplateEndpoint, let urlSession else {
-            completion(.failure(NativeAppProjectGeneratorError.missingTemplate))
-            return
-        }
-        urlSession.dataTask(with: nativeAppTemplateEndpoint) { data, response, error in
-            Task { @MainActor in
-                if let error {
-                    completion(.failure(error))
-                    return
-                }
-                if let httpResponse = response as? HTTPURLResponse,
-                   !(200..<300).contains(httpResponse.statusCode) {
-                    let message = data.flatMap { String(data: $0, encoding: .utf8) } ?? "HTTP \(httpResponse.statusCode)"
-                    completion(.failure(NSError(domain: "OuterShell.NativeAppTemplate",
-                                                code: httpResponse.statusCode,
-                                                userInfo: [NSLocalizedDescriptionKey: message.trimmingCharacters(in: .whitespacesAndNewlines)])))
-                    return
-                }
-                guard let data, !data.isEmpty else {
-                    completion(.failure(NativeAppProjectGeneratorError.missingTemplate))
-                    return
-                }
-                completion(.success(data))
-            }
-        }.resume()
-    }
-
     private func beginDraggingGeneratedNativeProject(_ project: GeneratedNativeAppProject) {
-        guard project.hasPlatformWorkspace else { return }
+        guard let projectURL = project.projectURL else { return }
         let promiseID = UUID()
-        nativeFilePromiseURLs[promiseID] = project.projectURL
+        nativeFilePromiseURLs[promiseID] = projectURL
         let dragPreview = nativeProjectDragPreview(for: project)
         guard let pasteboardItem = outerframeHost.filePromisePasteboardItem(promiseID: promiseID,
                                                                             name: project.folderName,
@@ -10294,6 +10282,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func nativeProjectDragPreview(for project: GeneratedNativeAppProject) -> NativeProjectDragPreview? {
+        guard let projectURL = project.projectURL else { return nil }
         let scale = max(NSScreen.main?.backingScaleFactor ?? 2, 1)
         let iconSize: CGFloat = 96
         let labelHeight: CGFloat = 24
@@ -10329,7 +10318,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             NSColor.clear.setFill()
             NSBezierPath(rect: NSRect(x: 0, y: 0, width: width, height: height)).fill()
 
-            let icon = NSWorkspace.shared.icon(forFile: project.projectURL.path)
+            let icon = NSWorkspace.shared.icon(forFile: projectURL.path)
             icon.draw(in: NSRect(x: (width - iconSize) / 2,
                                  y: labelHeight + iconLabelGap,
                                  width: iconSize,

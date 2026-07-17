@@ -1,0 +1,123 @@
+#!/bin/bash
+# macOS platform builder for Hello World. The canonical project stays on the
+# server; this workspace only compiles and publishes macOS.
+
+set -euo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${ROOT}/app.env"
+source "${ROOT}/connection.env"
+
+REMOTE_PROJECT="__REMOTE_PROJECT__"
+ARTIFACTS_DIR="${ROOT}/artifacts"
+DERIVED_DATA_DIR="${ROOT}/build/DerivedData"
+SSH_BASE=()
+
+load_connection() {
+    if [[ "${OUTER_SERVER_KIND:-ssh}" == local ]]; then
+        echo "error: publishing from a local-server workspace is not implemented" >&2
+        exit 1
+    fi
+    if [[ "$(declare -p OUTER_SERVER_SSH 2>/dev/null)" != declare\ -a* || "${#OUTER_SERVER_SSH[@]}" -eq 0 ]]; then
+        echo "error: connection.env does not contain an SSH command" >&2
+        exit 1
+    fi
+    SSH_BASE=("${OUTER_SERVER_SSH[@]}")
+}
+
+run_ssh() {
+    load_connection
+    "${SSH_BASE[@]}" "$@"
+}
+
+require_tool() {
+    command -v "$1" >/dev/null 2>&1 || { echo "error: required tool '$1' was not found" >&2; exit 1; }
+}
+
+bundle_executable_name() {
+    local bundle_path="$1" executable_name=""
+    if [[ -f "${bundle_path}/Contents/Info.plist" ]]; then
+        executable_name="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "${bundle_path}/Contents/Info.plist" 2>/dev/null || true)"
+    fi
+    [[ -n "${executable_name}" ]] || executable_name="$(basename "${bundle_path}" .bundle)"
+    printf '%s\n' "${executable_name}"
+}
+
+archive_bundle() {
+    local source_bundle="$1" platform="$2" arch="$3"
+    local temp_root temp_bundle executable_name executable_path executable_archs
+    temp_root="$(mktemp -d)"
+    temp_bundle="${temp_root}/$(basename "${source_bundle}")"
+    cp -R "${source_bundle}" "${temp_bundle}"
+    executable_name="$(bundle_executable_name "${temp_bundle}")"
+    executable_path="${temp_bundle}/Contents/MacOS/${executable_name}"
+    executable_archs="$(lipo -archs "${executable_path}")"
+    [[ " ${executable_archs} " == *" ${arch} "* ]] || { echo "error: missing ${arch} slice" >&2; exit 1; }
+    if [[ "${executable_archs}" != "${arch}" ]]; then
+        lipo "${executable_path}" -thin "${arch}" -output "${temp_root}/thin"
+        mv "${temp_root}/thin" "${executable_path}"
+        chmod +x "${executable_path}"
+    fi
+    aa archive -d "${temp_root}" -subdir "$(basename "${temp_bundle}")" -o "${ARTIFACTS_DIR}/frontends/${platform}" -a lzfse
+    rm -rf "${temp_root}"
+}
+
+cmd_sync() {
+    echo "==> Syncing macOS source from the canonical server project"
+    rm -rf "${ROOT}/macos.incoming"
+    mkdir -p "${ROOT}/macos.incoming"
+    run_ssh "set -e; project=\"__REMOTE_PROJECT_COMMAND__\"; test -d \${project}/macos; tar czf - -C \${project} macos app.env app-icon.png" \
+        | tar xzf - -C "${ROOT}/macos.incoming"
+    rm -rf "${ROOT}/macos"
+    mv "${ROOT}/macos.incoming/macos" "${ROOT}/macos"
+    mv "${ROOT}/macos.incoming/app.env" "${ROOT}/app.env"
+    [[ ! -f "${ROOT}/macos.incoming/app-icon.png" ]] || mv "${ROOT}/macos.incoming/app-icon.png" "${ROOT}/app-icon.png"
+    rmdir "${ROOT}/macos.incoming"
+    echo "Synced. Local changes under macos/ were replaced by the server copy."
+}
+
+cmd_build() {
+    require_tool /usr/bin/xcodebuild
+    require_tool aa
+    require_tool lipo
+    require_tool /usr/bin/python3
+    rm -rf "${ARTIFACTS_DIR}" "${DERIVED_DATA_DIR}"
+    mkdir -p "${ARTIFACTS_DIR}/frontends"
+    echo "==> Building ${XCODE_SCHEME}.bundle"
+    /usr/bin/xcodebuild -project "${ROOT}/macos/${XCODE_SCHEME}.xcodeproj" -scheme "${XCODE_SCHEME}" \
+        -configuration Release -derivedDataPath "${DERIVED_DATA_DIR}" ARCHS="arm64 x86_64" \
+        ONLY_ACTIVE_ARCH=NO CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build
+    local bundle="${DERIVED_DATA_DIR}/Build/Products/Release/${XCODE_SCHEME}.bundle"
+    [[ -d "${bundle}" ]] || { echo "error: expected bundle at ${bundle}" >&2; exit 1; }
+    archive_bundle "${bundle}" macos-arm arm64
+    archive_bundle "${bundle}" macos-x86 x86_64
+    /usr/bin/python3 "${ROOT}/macos/Scripts/generate_outer.py" --bundle-url "${FRONTEND_PATH}" --output "${ARTIFACTS_DIR}/app.outer"
+    echo "==> macOS artifacts ready"
+}
+
+cmd_publish() {
+    cmd_build
+    echo "==> Publishing only the compiled macOS implementation"
+    COPYFILE_DISABLE=1 tar czf - -C "${ARTIFACTS_DIR}" app.outer frontends | run_ssh "
+        set -e
+        project=\"__REMOTE_PROJECT_COMMAND__\"
+        incoming=\"\$(mktemp -d)\"
+        tar xzf - -C \${incoming}
+        cd \${project}
+        ./app accept-platform macos \${incoming}
+        rm -rf \${incoming}
+    "
+    echo "Published. Reload Hello World in Outer Loop."
+}
+
+case "${1:-help}" in
+    sync)    cmd_sync ;;
+    build)   cmd_build ;;
+    publish) cmd_publish ;;
+    help|--help|-h)
+        echo "usage: ./platform sync | build | publish"
+        echo "  sync     replace macos/ with the canonical server source"
+        echo "  build    compile macOS artifacts locally"
+        echo "  publish  build and send only compiled artifacts to the server"
+        ;;
+    *) echo "error: unknown command '$1'" >&2; exit 1 ;;
+esac
