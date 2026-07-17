@@ -14,6 +14,36 @@ extension ScrollbarControllerDelegate {
 }
 
 @MainActor
+struct ScrollbarColorConfiguration {
+    let trackColor: CGColor
+    let knobColor: CGColor
+
+    init(appearance: NSAppearance) {
+        // performAsCurrentDrawingAppearance runs synchronously. These inexpensive
+        // device colors are only defensive defaults.
+        var resolvedTrack = CGColor(gray: 0.72, alpha: 0.4)
+        var resolvedKnob = CGColor(gray: 0.45, alpha: 0.75)
+
+        appearance.performAsCurrentDrawingAppearance {
+            let controlBackground = NSColor.controlBackgroundColor
+            let label = NSColor.labelColor
+            let secondaryLabel = NSColor.secondaryLabelColor
+            let inactiveSelection = NSColor.unemphasizedSelectedTextBackgroundColor
+            let isLightTheme = controlBackground.ol_brightness > 0.6
+            let fallbackTrackBase = controlBackground.ol_blended(withFraction: isLightTheme ? 0.25 : 0.45, toward: label)
+            let trackBaseColor = inactiveSelection.ol_isApproxEqual(to: controlBackground) ? fallbackTrackBase : inactiveSelection
+            let trackAlpha: CGFloat = isLightTheme ? 0.35 : 0.6
+            let knobAlpha: CGFloat = isLightTheme ? 0.75 : 0.85
+            resolvedTrack = trackBaseColor.ol_withAlpha(trackAlpha).cgColor
+            resolvedKnob = secondaryLabel.ol_withAlpha(knobAlpha).cgColor
+        }
+
+        trackColor = resolvedTrack
+        knobColor = resolvedKnob
+    }
+}
+
+@MainActor
 final class ScrollbarController<Delegate: ScrollbarControllerDelegate> {
     struct Metrics {
         let viewportSize: CGSize
@@ -26,44 +56,6 @@ final class ScrollbarController<Delegate: ScrollbarControllerDelegate> {
             self.contentHeight = contentHeight
             self.scrollOffset = scrollOffset
             self.magnification = magnification
-        }
-    }
-
-    struct ColorConfiguration {
-        let trackColor: CGColor
-        let knobColor: CGColor
-
-        static var fallback: ColorConfiguration {
-            let track = NSColor.unemphasizedSelectedTextBackgroundColor.withAlphaComponent(0.4).cgColor
-            let knob = NSColor.secondaryLabelColor.withAlphaComponent(0.75).cgColor
-            return ColorConfiguration(trackColor: track, knobColor: knob)
-        }
-
-        init(trackColor: CGColor, knobColor: CGColor) {
-            self.trackColor = trackColor
-            self.knobColor = knobColor
-        }
-
-        init(appearance: NSAppearance) {
-            var resolvedTrack = Self.fallback.trackColor
-            var resolvedKnob = Self.fallback.knobColor
-
-            appearance.performAsCurrentDrawingAppearance {
-                let controlBackground = NSColor.controlBackgroundColor
-                let label = NSColor.labelColor
-                let secondaryLabel = NSColor.secondaryLabelColor
-                let inactiveSelection = NSColor.unemphasizedSelectedTextBackgroundColor
-                let isLightTheme = controlBackground.ol_brightness > 0.6
-                let fallbackTrackBase = controlBackground.ol_blended(withFraction: isLightTheme ? 0.25 : 0.45, toward: label)
-                let trackBaseColor = inactiveSelection.ol_isApproxEqual(to: controlBackground) ? fallbackTrackBase : inactiveSelection
-                let trackAlpha: CGFloat = isLightTheme ? 0.35 : 0.6
-                let knobAlpha: CGFloat = isLightTheme ? 0.75 : 0.85
-                resolvedTrack = trackBaseColor.ol_withAlpha(trackAlpha).cgColor
-                resolvedKnob = secondaryLabel.ol_withAlpha(knobAlpha).cgColor
-            }
-
-            trackColor = resolvedTrack
-            knobColor = resolvedKnob
         }
     }
 
@@ -80,7 +72,7 @@ final class ScrollbarController<Delegate: ScrollbarControllerDelegate> {
     private let maxMagnification: CGFloat
     private let scrollOffsetOrigin: ScrollOffsetOrigin
     private let supportsMagnification: Bool
-    private var colorConfiguration: ColorConfiguration
+    private var colorConfiguration: ScrollbarColorConfiguration
     private var currentMetrics: Metrics?
     var delegate: Delegate!
 
@@ -99,7 +91,7 @@ final class ScrollbarController<Delegate: ScrollbarControllerDelegate> {
 
     init(appConnection: OuterframeHost,
          viewportLayer: CALayer,
-         appearance: NSAppearance,
+         colorConfiguration: ScrollbarColorConfiguration,
          width: CGFloat = 8,
          inset: CGFloat = 4,
          supportsMagnification: Bool = false,
@@ -136,7 +128,7 @@ final class ScrollbarController<Delegate: ScrollbarControllerDelegate> {
         knobLayer.masksToBounds = true
         trackLayer.addSublayer(knobLayer)
         self.knobLayer = knobLayer
-        self.colorConfiguration = ColorConfiguration(appearance: appearance)
+        self.colorConfiguration = colorConfiguration
         applyColorConfiguration()
     }
 
@@ -330,8 +322,8 @@ final class ScrollbarController<Delegate: ScrollbarControllerDelegate> {
         containerLayer.removeFromSuperlayer()
     }
 
-    func updateAppearance(_ appearance: NSAppearance) {
-        colorConfiguration = ColorConfiguration(appearance: appearance)
+    func updateColorConfiguration(_ colorConfiguration: ScrollbarColorConfiguration) {
+        self.colorConfiguration = colorConfiguration
         applyColorConfiguration()
     }
 

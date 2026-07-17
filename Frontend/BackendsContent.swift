@@ -1,7 +1,7 @@
 import AppKit
 import CoreText
 import Foundation
-import OSLog
+import ImageIO
 import QuartzCore
 
 @MainActor
@@ -17,12 +17,12 @@ import QuartzCore
     }
 }
 
-private struct BackendsResponse: Decodable {
+private struct BackendsResponse {
     let error: String
     let backends: [BackendRecord]
 }
 
-private struct BackendRecord: Decodable {
+private struct BackendRecord {
     let serviceID: String
     let displayName: String
     let serviceUnit: String
@@ -76,14 +76,15 @@ private struct BundledCatalogEntry {
     let isInstalled: Bool
 }
 
-private struct FrontendRecord: Decodable {
+private struct FrontendRecord {
     let id: String
     let name: String
     let url: String
     let port: Int
     let socketPath: String
     let iconPath: String?
-    let iconData: Data?
+    let iconByteCount: Int
+    let iconCGImage: CGImage?
     let list: String?
     let isRunning: Bool
 
@@ -95,18 +96,19 @@ private struct FrontendRecord: Decodable {
         return URL(string: trimmedURL)?.scheme != nil
     }
 
-    var iconImage: NSImage? {
-        guard let iconData,
-              !iconData.isEmpty else {
-            return nil
-        }
-        return NSImage(data: iconData)
-    }
-
     var listName: String {
         list?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     }
 
+}
+
+private func decodedIconCGImage(_ data: Data) -> CGImage? {
+    guard !data.isEmpty,
+          let source = CGImageSourceCreateWithData(data as CFData, nil) else {
+        return nil
+    }
+    let options = [kCGImageSourceShouldCacheImmediately: true] as CFDictionary
+    return CGImageSourceCreateImageAtIndex(source, 0, options)
 }
 
 private struct LogFileRecord: Decodable {
@@ -315,7 +317,8 @@ private extension FrontendRecord {
                               port: Int(try reader.uint32(at: 48)),
                               socketPath: try reader.stringRef(at: 16),
                               iconPath: emptyToNil(try reader.stringRef(at: 24)),
-                              iconData: iconData.isEmpty ? nil : iconData,
+                              iconByteCount: iconData.count,
+                              iconCGImage: decodedIconCGImage(iconData),
                               list: emptyToNil(try reader.stringRef(at: 40)),
                               isRunning: (flags & 0x01) != 0)
     }
@@ -486,8 +489,8 @@ private struct AppLauncherItem {
         return backendName.isEmpty || backendName == displayName ? backend.serviceID : backendName
     }
 
-    var iconImage: NSImage? {
-        frontend.iconImage
+    var iconCGImage: CGImage? {
+        frontend.iconCGImage
     }
 
     var iconKey: String {
@@ -549,7 +552,7 @@ private struct PendingOuterShellUpdate {
 
 private struct IconMatchState {
     let frame: CGRect
-    let image: NSImage?
+    let image: CGImage?
     let symbolName: String?
     let title: String
 }
@@ -733,15 +736,12 @@ private struct PendingFilePicker {
 private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLineTextInputControllerDelegate, ScrollbarControllerDelegate {
     private let outerframeHost: OuterframeHost
     private let appConnection: OuterframeAppConnection
-    private let layoutLogger = Logger(subsystem: "org.outershell.OuterShell", category: "Layout")
     private var retainedSelf: BackendsHandler?
     private var appearance: NSAppearance?
     private var didReceiveSystemAppearanceUpdate = false
     private var currentSize = CGSize(width: 900, height: 620)
     private var layoutUpdateScheduled = false
     private var scheduledLayoutNeedsScrollClamping = false
-    private var scheduledLayoutReasons: Set<String> = []
-    private var layoutUpdateSequence: UInt64 = 0
     private var urlSession: URLSession?
     private var backendsEndpoint: URL?
     private var logsEndpoint: URL?
@@ -911,6 +911,12 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private var pendingAboutBackend: BackendRecord?
     private var iconMatchStates: [String: IconMatchState] = [:]
     private var iconMatchLayers: [String: CALayer] = [:]
+    private struct RunningBadgeSymbolKey: Hashable {
+        let symbolName: String
+        let pointSize: CGFloat
+        let isRoot: Bool
+    }
+    private var runningBadgeSymbolImages: [RunningBadgeSymbolKey: (image: CGImage, size: CGSize)] = [:]
     private var textMatchStates: [String: TextMatchState] = [:]
     private var textMatchLayers: [String: CATextLayer] = [:]
     private var pendingMenuActions: [UUID: (serviceID: String, serviceScope: String, operationByItemID: [String: String])] = [:]
@@ -1445,15 +1451,16 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         contentLayer.addSublayer(logRowsClipLayer)
         logRowsClipLayer.addSublayer(logTextContentLayer)
         logTextContentLayer.addSublayer(logTextSelectionLayer)
+        let scrollbarColors = ScrollbarColorConfiguration(appearance: appearance ?? NSAppearance.currentDrawing())
         let scrollbar = ScrollbarController<BackendsHandler>(appConnection: outerframeHost,
                                                              viewportLayer: logRowsClipLayer,
-                                                             appearance: appearance ?? NSAppearance.currentDrawing(),
+                                                             colorConfiguration: scrollbarColors,
                                                              scrollOffsetOrigin: .bottom)
         scrollbar.delegate = self
         logScrollbarController = scrollbar
         let filePickerScrollbar = ScrollbarController<FilePickerScrollbarDelegate>(appConnection: outerframeHost,
                                                                                   viewportLayer: filePickerListLayer,
-                                                                                  appearance: appearance ?? NSAppearance.currentDrawing(),
+                                                                                  colorConfiguration: scrollbarColors,
                                                                                   width: 10,
                                                                                   inset: 4,
                                                                                   scrollOffsetOrigin: .bottom)
@@ -1511,19 +1518,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         .controlBackgroundColor
     }
 
-    private func updateLayout(inCurrentTransaction: Bool = false,
-                              reason: String = #function) {
-        layoutUpdateSequence &+= 1
-        let sequence = layoutUpdateSequence
-        let startedAt = CACurrentMediaTime()
-        let transactionDescription = inCurrentTransaction ? "current" : "standalone"
-        let beginMessage = "#\(sequence) begin reason=\(reason) mode=\(mode) size=\(Int(currentSize.width))x\(Int(currentSize.height)) backends=\(backends.count) transaction=\(transactionDescription)"
-        layoutLogger.info("\(beginMessage, privacy: .public)")
-        defer {
-            let durationMS = (CACurrentMediaTime() - startedAt) * 1_000
-            let endMessage = String(format: "#%llu end duration=%.2fms", sequence, durationMS)
-            layoutLogger.info("\(endMessage, privacy: .public)")
-        }
+    private func updateLayout(inCurrentTransaction: Bool = false) {
         withEffectiveAppearance {
             let update = { [self] in
                 let width = max(currentSize.width, 1)
@@ -1598,23 +1593,19 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         }
     }
 
-    private func scheduleLayoutUpdate(reason: String = #function,
-                                      needsScrollClamping: Bool = false) {
-        scheduledLayoutReasons.insert(reason)
+    private func scheduleLayoutUpdate(needsScrollClamping: Bool = false) {
         scheduledLayoutNeedsScrollClamping = scheduledLayoutNeedsScrollClamping || needsScrollClamping
         guard !layoutUpdateScheduled else { return }
         layoutUpdateScheduled = true
         Task { @MainActor [weak self] in
             guard let self else { return }
             let needsScrollClamping = scheduledLayoutNeedsScrollClamping
-            let reasons = scheduledLayoutReasons.sorted()
             layoutUpdateScheduled = false
             scheduledLayoutNeedsScrollClamping = false
-            scheduledLayoutReasons.removeAll(keepingCapacity: true)
             if needsScrollClamping {
                 clampScrollOffsets()
             }
-            updateLayout(reason: "scheduled: \(reasons.joined(separator: ", "))")
+            updateLayout()
         }
     }
 
@@ -1631,7 +1622,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             (createInputController.isFocused || normalizedCreateMessageSelectionRange() != nil)
         let passwordPromptNeedsLayout = pendingPasswordAction != nil && passwordInputController.isFocused
         if createContentNeedsLayout || passwordPromptNeedsLayout {
-            scheduleLayoutUpdate(reason: "windowActiveUpdate")
+            scheduleLayoutUpdate()
             return
         }
 
@@ -1649,6 +1640,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func updateColors() {
+        runningBadgeSymbolImages.removeAll(keepingCapacity: true)
         withEffectiveAppearance {
             withoutImplicitAnimations {
                 let pageBackground = pageBackgroundColor()
@@ -1665,8 +1657,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 updateLogTextContentIfNeeded(text: currentLogText(), force: true)
                 updateLogTextViewport()
                 updateLogTextSelectionLayers(force: true)
-                logScrollbarController?.updateAppearance(appearance ?? NSAppearance.currentDrawing())
-                filePickerScrollbarController?.updateAppearance(appearance ?? NSAppearance.currentDrawing())
+                let scrollbarColors = ScrollbarColorConfiguration(appearance: appearance ?? NSAppearance.currentDrawing())
+                logScrollbarController?.updateColorConfiguration(scrollbarColors)
+                filePickerScrollbarController?.updateColorConfiguration(scrollbarColors)
                 updateFilePickerVisibleRows(rebuild: true)
 
                 titleLayer.font = NSFont.systemFont(ofSize: 15, weight: .semibold)
@@ -2716,7 +2709,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         }
     }
 
-    private func makeLauncherIconLayer(image: NSImage?,
+    private func makeLauncherIconLayer(image: CGImage?,
                                        symbolName: String?,
                                        symbolColor: NSColor = .controlAccentColor,
                                        title: String,
@@ -2736,15 +2729,16 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func configureLauncherIconLayer(_ icon: CALayer,
-                                            image: NSImage?,
+                                            image: CGImage?,
                                             symbolName: String?,
                                             symbolColor: NSColor = .controlAccentColor,
                                             title: String,
                                             iconSize: CGFloat) {
         icon.cornerRadius = iconCornerRadius(for: iconSize)
-        if let image,
-           let cgImage = cgImage(for: image) {
-            icon.contents = cgImage
+        if let image {
+            if icon.contents.map({ ($0 as AnyObject) !== image }) ?? true {
+                icon.contents = image
+            }
             icon.backgroundColor = resolvedCGColor(.clear)
         } else if let symbolName,
                   !symbolName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
@@ -2815,25 +2809,29 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
     private func recordMatchedIcon(key: String,
                                    frame: CGRect,
-                                   image: NSImage?,
+                                   image: CGImage?,
                                    symbolName: String?,
                                    symbolColor: NSColor = .controlAccentColor,
                                    title: String) {
-        let existingLayer = iconMatchLayers[key]
-        let layer = existingLayer ?? makeLauncherIconLayer(image: image,
-                                                           symbolName: symbolName,
-                                                           symbolColor: symbolColor,
-                                                           title: title,
-                                                           iconSize: frame.width)
+        let layer: CALayer
+        if let existingLayer = iconMatchLayers[key] {
+            layer = existingLayer
+            configureLauncherIconLayer(layer,
+                                       image: image,
+                                       symbolName: symbolName,
+                                       symbolColor: symbolColor,
+                                       title: title,
+                                       iconSize: frame.width)
+        } else {
+            layer = makeLauncherIconLayer(image: image,
+                                          symbolName: symbolName,
+                                          symbolColor: symbolColor,
+                                          title: title,
+                                          iconSize: frame.width)
+        }
         if layer.superlayer == nil {
             iconTransitionLayer.addSublayer(layer)
         }
-        configureLauncherIconLayer(layer,
-                                   image: image,
-                                   symbolName: symbolName,
-                                   symbolColor: symbolColor,
-                                   title: title,
-                                   iconSize: frame.width)
         layer.frame = frame
         layer.isHidden = false
         layer.opacity = 1
@@ -5573,7 +5571,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                       port: frontend.port,
                                       socketPath: frontend.socketPath,
                                       iconPath: frontend.iconPath,
-                                      iconData: frontend.iconData,
+                                      iconByteCount: frontend.iconByteCount,
+                                      iconCGImage: frontend.iconCGImage,
                                       list: listName.isEmpty ? nil : listName,
                                       isRunning: frontend.isRunning)
             }
@@ -9370,12 +9369,12 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         appIconSymbolName(for: item.backend)
     }
 
-    private func launcherIconImage(for item: AppLauncherItem) -> NSImage? {
+    private func launcherIconImage(for item: AppLauncherItem) -> CGImage? {
         switch item.backend.serviceID {
         case "org.outershell.Top", "org.outershell.Plaintext":
             return nil
         default:
-            return item.iconImage
+            return item.iconCGImage
         }
     }
 
@@ -9417,14 +9416,14 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         let rootBadgeColor = NSColor.systemGreen
         let badges = runningEndpoints(for: item).compactMap { badge -> (endpoint: AppLauncherEndpoint, image: CGImage, size: CGSize, backgroundColor: NSColor?, shadowColor: NSColor)? in
             if badge.isRoot {
-                guard let symbol = naturalSymbolCGImage(named: badge.symbolName,
-                                                        pointSize: circleDiameter,
-                                                        color: rootBadgeColor) else { return nil }
+                guard let symbol = runningBadgeSymbol(named: badge.symbolName,
+                                                      pointSize: circleDiameter,
+                                                      isRoot: true) else { return nil }
                 return (badge.endpoint, symbol.image, symbol.size, nil, rootBadgeColor)
             }
-            guard let symbol = naturalSymbolCGImage(named: badge.symbolName,
-                                                    pointSize: pointSize,
-                                                    color: .white) else { return nil }
+            guard let symbol = runningBadgeSymbol(named: badge.symbolName,
+                                                  pointSize: pointSize,
+                                                  isRoot: false) else { return nil }
             return (badge.endpoint, symbol.image, symbol.size, .systemGreen, .systemGreen)
         }
         guard !badges.isEmpty else { return }
@@ -9473,6 +9472,24 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             appsScrollContentLayer.addSublayer(chipLayer)
             y -= gap
         }
+    }
+
+    private func runningBadgeSymbol(named symbolName: String,
+                                    pointSize: CGFloat,
+                                    isRoot: Bool) -> (image: CGImage, size: CGSize)? {
+        let key = RunningBadgeSymbolKey(symbolName: symbolName,
+                                        pointSize: pointSize,
+                                        isRoot: isRoot)
+        if let image = runningBadgeSymbolImages[key] {
+            return image
+        }
+        guard let image = naturalSymbolCGImage(named: symbolName,
+                                               pointSize: pointSize,
+                                               color: isRoot ? .systemGreen : .white) else {
+            return nil
+        }
+        runningBadgeSymbolImages[key] = image
+        return image
     }
 
     private func appLauncherItems(from records: [BackendRecord]) -> [AppLauncherItem] {
@@ -9535,7 +9552,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
     private func appLauncherSignature(for backends: [BackendRecord]) -> String {
         appLauncherItems(from: backends).map { item in
-            let iconBytes = item.frontend.iconData?.count ?? 0
+            let iconBytes = item.frontend.iconByteCount
             return [
                 item.identityKey,
                 item.backend.serviceID,
