@@ -36,6 +36,7 @@
 
 #include "../Backend/OuterShellAPI.h"
 #include "../Backend/OuterShellBuffer.h"
+#include "../Backend/OuterShellImage.h"
 #include "../Backend/OuterShellPlatform.h"
 #include "../Resources/OuterShellPaths.h"
 #include "OuterService.h"
@@ -5063,6 +5064,122 @@ static bool uninstall_local_home_screen(const char *sudo_password,
 static bool frontend_endpoint_is_passively_ready(int port, const char *socket_path);
 static uint64_t frontend_endpoint_readiness_state_token(void);
 
+static uint64_t frontend_icon_path_hash(const char *path) {
+    uint64_t hash = UINT64_C(1469598103934665603);
+    for (const unsigned char *byte = (const unsigned char *)(path ? path : ""); *byte; byte++) {
+        hash ^= *byte;
+        hash *= UINT64_C(1099511628211);
+    }
+    return hash;
+}
+
+static size_t frontend_icon_target_size(const char *list) {
+    return list && list[0] ? 60 : 92;
+}
+
+static const char *frontend_icon_data_path(const char *icon_path,
+                                           const char *list,
+                                           char *cached_path,
+                                           size_t cached_path_size) {
+    if (!icon_path || !icon_path[0] || !cached_path || cached_path_size == 0) return icon_path;
+
+    struct stat source_stat;
+    if (stat(icon_path, &source_stat) != 0 ||
+        !S_ISREG(source_stat.st_mode) ||
+        source_stat.st_size <= 0 ||
+        source_stat.st_size > 1024 * 1024) {
+        return icon_path;
+    }
+    size_t target_size = frontend_icon_target_size(list);
+    size_t source_width = 0;
+    size_t source_height = 0;
+    char image_error[256] = "";
+    if (!outer_shell_png_dimensions(icon_path,
+                                    &source_width,
+                                    &source_height,
+                                    image_error,
+                                    sizeof(image_error)) ||
+        source_width > 16384 ||
+        source_height > 16384 ||
+        (source_width <= target_size && source_height <= target_size)) {
+        return icon_path;
+    }
+
+    char cache_root[PATH_MAX];
+    char cache_directory[PATH_MAX];
+    default_user_outershell_cache_root(cache_root, sizeof(cache_root));
+    if (snprintf(cache_directory,
+                 sizeof(cache_directory),
+                 "%s/frontend-icons/v1",
+                 cache_root) >= (int)sizeof(cache_directory) ||
+        !mkdir_p(cache_directory)) {
+        return icon_path;
+    }
+
+#ifdef __APPLE__
+    long long modified_nanoseconds = source_stat.st_mtimespec.tv_nsec;
+#else
+    long long modified_nanoseconds = source_stat.st_mtim.tv_nsec;
+#endif
+    int path_length = snprintf(cached_path,
+                               cached_path_size,
+                               "%s/%016llx-%zu-%llx-%llx-%lld-%lld-%lld.png",
+                               cache_directory,
+                               (unsigned long long)frontend_icon_path_hash(icon_path),
+                               target_size,
+                               (unsigned long long)source_stat.st_dev,
+                               (unsigned long long)source_stat.st_ino,
+                               (long long)source_stat.st_size,
+                               (long long)source_stat.st_mtime,
+                               modified_nanoseconds);
+    if (path_length < 0 || (size_t)path_length >= cached_path_size) return icon_path;
+
+    struct stat cached_stat;
+    if (stat(cached_path, &cached_stat) == 0 && S_ISREG(cached_stat.st_mode) && cached_stat.st_size > 0) {
+        return cached_path;
+    }
+
+    static uint64_t temporary_sequence = 0;
+    uint64_t sequence = __sync_add_and_fetch(&temporary_sequence, 1);
+    char temporary_path[PATH_MAX];
+    int temporary_length = snprintf(temporary_path,
+                                    sizeof(temporary_path),
+                                    "%s.tmp.%ld.%llu",
+                                    cached_path,
+                                    (long)getpid(),
+                                    (unsigned long long)sequence);
+    if (temporary_length < 0 || temporary_length >= (int)sizeof(temporary_path)) return icon_path;
+
+    if (!outer_shell_resize_png(icon_path,
+                                temporary_path,
+                                target_size,
+                                image_error,
+                                sizeof(image_error))) {
+        unlink(temporary_path);
+        fprintf(stderr, "Could not resize frontend icon %s: %s\n", icon_path, image_error);
+        return icon_path;
+    }
+    size_t resized_width = 0;
+    size_t resized_height = 0;
+    if (!outer_shell_png_dimensions(temporary_path,
+                                    &resized_width,
+                                    &resized_height,
+                                    image_error,
+                                    sizeof(image_error)) ||
+        (resized_width != target_size && resized_height != target_size)) {
+        unlink(temporary_path);
+        fprintf(stderr, "Frontend icon resize produced the wrong dimensions for %s\n", icon_path);
+        return icon_path;
+    }
+    if (rename(temporary_path, cached_path) != 0) {
+        unlink(temporary_path);
+        if (stat(cached_path, &cached_stat) != 0 || !S_ISREG(cached_stat.st_mode) || cached_stat.st_size <= 0) {
+            return icon_path;
+        }
+    }
+    return cached_path;
+}
+
 static bool build_frontend_payload(const char *name,
                                    const char *frontend_id,
                                    const char *url,
@@ -5072,12 +5189,17 @@ static bool build_frontend_payload(const char *name,
                                    const char *list,
                                    bool running,
                                    StringBuilder *payload) {
+    char cached_icon_path[PATH_MAX];
+    const char *icon_data_path = frontend_icon_data_path(icon_path,
+                                                         list,
+                                                         cached_icon_path,
+                                                         sizeof(cached_icon_path));
     if (!binary_append_zero(payload, 64)) return false;
     return binary_append_string_ref_at(payload, 0, name) &&
            binary_append_string_ref_at(payload, 8, url) &&
            binary_append_string_ref_at(payload, 16, socket_path) &&
            binary_append_string_ref_at(payload, 24, icon_path) &&
-           binary_append_file_ref_at(payload, 32, icon_path) &&
+           binary_append_file_ref_at(payload, 32, icon_data_path) &&
            binary_append_string_ref_at(payload, 40, list) &&
            binary_write_u32_at(payload, 48, (uint32_t)(port < 0 ? 0 : port)) &&
            binary_append_string_ref_at(payload, 52, frontend_id) &&

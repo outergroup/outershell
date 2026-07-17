@@ -9,6 +9,10 @@ daemon_log="$build_dir/outershelld.log"
 cc_command="${CC:-cc}"
 cxx_command="${CXX:-c++}"
 daemon_pid=""
+image_libraries="-lpng -lz"
+if [ "$(uname -s)" = "Darwin" ]; then
+    image_libraries="-framework ImageIO -framework CoreGraphics -framework CoreFoundation"
+fi
 
 cleanup() {
     if [ -n "$daemon_pid" ]; then
@@ -23,10 +27,11 @@ mkdir -p "$build_dir/home/services"
 "$cc_command" -std=gnu17 -O2 -o "$build_dir/outershelld" \
     "$repo_root/Backend/OuterShellBuffer.c" \
     "$repo_root/Backend/OuterShellAPI.c" \
+    "$repo_root/Backend/OuterShellImage.c" \
     "$repo_root/Backend/OuterShellPlatform.c" \
     "$repo_root/outershelld/OuterService.c" \
     "$repo_root/outershelld/outershelld.c" \
-    -ldl -lpthread -lm
+    -ldl -lpthread -lm $image_libraries
 "$cxx_command" -std=c++17 -O2 -I "$repo_root/Resources" \
     -o "$build_dir/outerctl" "$repo_root/Resources/outerctl.cpp"
 

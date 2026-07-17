@@ -12,6 +12,10 @@ fail_once="$build_dir/fail-once"
 daemon_log="$build_dir/outershelld.log"
 cc_command="${CC:-cc}"
 test_cflags="${OUTERSERVICE_TEST_CFLAGS:--O2}"
+image_libraries="-lpng -lz"
+if [ "$(uname -s)" = "Darwin" ]; then
+    image_libraries="-framework ImageIO -framework CoreGraphics -framework CoreFoundation"
+fi
 
 cleanup() {
     if [ -n "${daemon_pid:-}" ]; then
@@ -32,10 +36,11 @@ mkdir -p "$services_dir"
 "$cc_command" -std=gnu17 $test_cflags -o "$build_dir/outershelld" \
     "$repo_root/Backend/OuterShellBuffer.c" \
     "$repo_root/Backend/OuterShellAPI.c" \
+    "$repo_root/Backend/OuterShellImage.c" \
     "$repo_root/Backend/OuterShellPlatform.c" \
     "$repo_root/outershelld/OuterService.c" \
     "$repo_root/outershelld/outershelld.c" \
-    -ldl -lpthread -lm
+    -ldl -lpthread -lm $image_libraries
 
 cat > "$services_dir/test.http.outerservice" <<EOF
 [Service]

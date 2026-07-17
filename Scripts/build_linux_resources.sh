@@ -75,10 +75,11 @@ build_musl_static_resources() {
         -o "${output_dir}/outershelld" \
         "${REPO_ROOT}/Backend/OuterShellBuffer.c" \
         "${REPO_ROOT}/Backend/OuterShellAPI.c" \
+        "${REPO_ROOT}/Backend/OuterShellImage.c" \
         "${REPO_ROOT}/Backend/OuterShellPlatform.c" \
         "${REPO_ROOT}/outershelld/OuterService.c" \
         "${REPO_ROOT}/outershelld/outershelld.c" \
-        -Wl,--gc-sections -ldl -lpthread -lm
+        -Wl,--gc-sections /usr/lib/libpng.a /usr/lib/libz.a -ldl -lpthread -lm
 
     cc -std=gnu17 -Os -ffunction-sections -fdata-sections -static \
         -DOUTER_SHELL_BACKEND_STANDALONE=1 \
@@ -110,8 +111,8 @@ build_musl_static_resources() {
 }
 
 if [[ "${OUTER_SHELL_LINUX_LIBC:-glibc}" == "musl" ]]; then
-    if ! command -v wget >/dev/null 2>&1 || [[ ! -f /usr/lib/libssl.a || ! -f /usr/lib/libz.a ]]; then
-        echo "error: musl build requires bash, build-base, openssl-dev, openssl-libs-static, zlib-dev, and zlib-static" >&2
+    if ! command -v wget >/dev/null 2>&1 || [[ ! -f /usr/lib/libssl.a || ! -f /usr/lib/libz.a || ! -f /usr/lib/libpng.a ]]; then
+        echo "error: musl build requires bash, build-base, openssl-dev, openssl-libs-static, zlib-dev, zlib-static, libpng-dev, and libpng-static" >&2
         exit 1
     fi
     build_musl_static_resources
@@ -119,7 +120,7 @@ if [[ "${OUTER_SHELL_LINUX_LIBC:-glibc}" == "musl" ]]; then
 fi
 
 install_linux_static_build_deps() {
-    if [[ -f /usr/lib64/libz.a ]]; then
+    if [[ -f /usr/lib64/libz.a && -f /usr/lib64/libpng.a ]]; then
         return
     fi
     if ! command -v yum >/dev/null 2>&1; then
@@ -130,7 +131,7 @@ install_linux_static_build_deps() {
         echo "error: static zlib is missing; rerun in the Docker build image or install it first" >&2
         exit 1
     fi
-    yum -y install pkgconfig perl-IPC-Cmd perl-Time-Piece zlib-devel zlib-static
+    yum -y install pkgconfig perl-IPC-Cmd perl-Time-Piece zlib-devel zlib-static libpng-devel libpng-static
 }
 
 download_build_file() {
@@ -372,11 +373,12 @@ cc -std=gnu17 -Os -ffunction-sections -fdata-sections -flto \
     -o "${OUTPUT_DIR}/outershelld" \
     "${REPO_ROOT}/Backend/OuterShellBuffer.c" \
     "${REPO_ROOT}/Backend/OuterShellAPI.c" \
+    "${REPO_ROOT}/Backend/OuterShellImage.c" \
     "${REPO_ROOT}/Backend/OuterShellPlatform.c" \
     "${REPO_ROOT}/outershelld/OuterService.c" \
     "${REPO_ROOT}/outershelld/outershelld.c" \
     -Wl,--gc-sections \
-    -ldl -lpthread -lm
+    /usr/lib64/libpng.a /usr/lib64/libz.a -ldl -lpthread -lm
 
 cc -std=gnu17 -Os -ffunction-sections -fdata-sections -flto \
     -DOUTER_SHELL_BACKEND_STANDALONE=1 \

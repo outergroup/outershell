@@ -31,10 +31,11 @@ ln -s "$(command -v sleep)" "$build_dir/bin/sleep"
     "$repo_root/Tests/HomeScreenLifecycleTest.c" \
     "$repo_root/Backend/OuterShellBuffer.c" \
     "$repo_root/Backend/OuterShellAPI.c" \
+    "$repo_root/Backend/OuterShellImage.c" \
     "$repo_root/Backend/OuterShellPlatform.c" \
     "$repo_root/outershelld/OuterService.c" \
     "$repo_root/outershelld/outershelld.c" \
-    -ldl -lpthread -lm
+    -ldl -lpthread -lm -lpng -lz
 
 PATH="$build_dir/bin" "$build_dir/test" "$build_dir/installer.sh" "$build_dir/marker"
 [ "$(cat "$build_dir/marker")" = "uninstall" ]

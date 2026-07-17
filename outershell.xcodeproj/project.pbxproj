@@ -7,6 +7,8 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		1A494D470000000000000001 /* OuterShellImage.c in Sources */ = {isa = PBXBuildFile; fileRef = 1A494D470000000000000003 /* OuterShellImage.c */; };
+		1A494D470000000000000002 /* OuterShellImage.c in Sources */ = {isa = PBXBuildFile; fileRef = 1A494D470000000000000003 /* OuterShellImage.c */; };
 		37AA00012FEA000000000009 /* app-icon.png in Resources */ = {isa = PBXBuildFile; fileRef = 37AA00022FEA000000000009 /* app-icon.png */; };
 		37AA00032FEA000000000009 /* OuterShell.icns in Resources */ = {isa = PBXBuildFile; fileRef = 37AA00042FEA000000000009 /* OuterShell.icns */; };
 		37B4F9D12FA1B00100873894 /* outershelld.c in Sources */ = {isa = PBXBuildFile; fileRef = 37B4F9D02FA1B00100873894 /* outershelld.c */; };
@@ -44,6 +46,8 @@
 		0F0000000000000000000008 /* README.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = README.md; sourceTree = "<group>"; };
 		0F0000000000000000000009 /* build_site.sh */ = {isa = PBXFileReference; lastKnownFileType = text.script.sh; path = build_site.sh; sourceTree = "<group>"; };
 		0F000000000000000000000A /* .gitignore */ = {isa = PBXFileReference; lastKnownFileType = text; path = .gitignore; sourceTree = "<group>"; };
+		1A494D470000000000000003 /* OuterShellImage.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = OuterShellImage.c; sourceTree = "<group>"; };
+		1A494D470000000000000004 /* OuterShellImage.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = OuterShellImage.h; sourceTree = "<group>"; };
 		37AA00022FEA000000000009 /* app-icon.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = "app-icon.png"; sourceTree = "<group>"; };
 		37AA00042FEA000000000009 /* OuterShell.icns */ = {isa = PBXFileReference; lastKnownFileType = image.icns; path = OuterShell.icns; sourceTree = "<group>"; };
 		37B4F9C12FA189AB00873894 /* AGENTS.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = AGENTS.md; sourceTree = "<group>"; };
@@ -144,6 +148,8 @@
 		37B4F9CE2FA1B00100873894 /* Backend */ = {
 			isa = PBXGroup;
 			children = (
+				1A494D470000000000000003 /* OuterShellImage.c */,
+				1A494D470000000000000004 /* OuterShellImage.h */,
 				37B4F9EC2FA1B00100873894 /* OuterShellBackend.c */,
 				37B4F9DC2FA1B00100873894 /* OuterShellBuffer.c */,
 				37B4F9DD2FA1B00100873894 /* OuterShellBuffer.h */,
@@ -317,6 +323,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				1A494D470000000000000001 /* OuterShellImage.c in Sources */,
 				37B4F9DE2FA1B00100873894 /* OuterShellBuffer.c in Sources */,
 				37B4F9DF2FA1B00100873894 /* OuterShellAPI.c in Sources */,
 				37B4F9E42FA1B00100873894 /* OuterShellPlatform.c in Sources */,
@@ -329,6 +336,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				1A494D470000000000000002 /* OuterShellImage.c in Sources */,
 				AG0000000000000000000004 /* OuterShellAgent.swift in Sources */,
 				AG0000000000000000000018 /* OuterShellBuffer.c in Sources */,
 				AG0000000000000000000019 /* OuterShellAPI.c in Sources */,
@@ -550,7 +558,15 @@
 				GENERATE_INFOPLIST_FILE = YES;
 				MACOSX_DEPLOYMENT_TARGET = 14.6;
 				MARKETING_VERSION = 1.0;
-				OTHER_LDFLAGS = "$(inherited)";
+				OTHER_LDFLAGS = (
+					"$(inherited)",
+					"-framework",
+					CoreFoundation,
+					"-framework",
+					CoreGraphics,
+					"-framework",
+					ImageIO,
+				);
 				PRODUCT_BUNDLE_IDENTIFIER = org.outershell.outershelld;
 				PRODUCT_NAME = outershelld;
 				SKIP_INSTALL = YES;
@@ -569,7 +585,15 @@
 				GENERATE_INFOPLIST_FILE = YES;
 				MACOSX_DEPLOYMENT_TARGET = 14.6;
 				MARKETING_VERSION = 1.0;
-				OTHER_LDFLAGS = "$(inherited)";
+				OTHER_LDFLAGS = (
+					"$(inherited)",
+					"-framework",
+					CoreFoundation,
+					"-framework",
+					CoreGraphics,
+					"-framework",
+					ImageIO,
+				);
 				PRODUCT_BUNDLE_IDENTIFIER = org.outershell.outershelld;
 				PRODUCT_NAME = outershelld;
 				SKIP_INSTALL = YES;
@@ -601,6 +625,10 @@
 					"$(inherited)",
 					"-framework",
 					Foundation,
+					"-framework",
+					CoreGraphics,
+					"-framework",
+					ImageIO,
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = org.outershell.OuterShell.Agent;
 				PRODUCT_NAME = "Outer Shell";
@@ -636,6 +664,10 @@
 					"$(inherited)",
 					"-framework",
 					Foundation,
+					"-framework",
+					CoreGraphics,
+					"-framework",
+					ImageIO,
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = org.outershell.OuterShell.Agent;
 				PRODUCT_NAME = "Outer Shell";

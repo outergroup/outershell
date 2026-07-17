@@ -135,7 +135,7 @@ build_linux_target() {
         -v "${ROOT}:/work" \
         -w /work \
         "${image}" \
-        sh -lc 'apk add --no-cache bash build-base openssl-dev openssl-libs-static zlib-dev zlib-static wget && ln -sf /lib/libz.a /usr/lib/libz.a && OUTER_SHELL_LINUX_LIBC=musl bash ./Scripts/build_linux_resources.sh'
+        sh -lc 'apk add --no-cache bash build-base openssl-dev openssl-libs-static zlib-dev zlib-static libpng-dev libpng-static wget && ln -sf /lib/libz.a /usr/lib/libz.a && OUTER_SHELL_LINUX_LIBC=musl bash ./Scripts/build_linux_resources.sh'
 }
 
 archive_frontend_symbols() {
