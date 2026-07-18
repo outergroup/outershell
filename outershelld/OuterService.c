@@ -660,6 +660,7 @@ static bool spawn_service(OuterServiceManager *manager,
     }
     for (size_t index = 0; index < service->socket_count; index++) copies[index] = -1;
     bool actions_ok = true;
+    int log_fd = -1;
     for (size_t index = 0; index < service->socket_count; index++) {
         copies[index] = fcntl(service->sockets[index].fd, F_DUPFD_CLOEXEC, 64);
         if (copies[index] < 0 || posix_spawn_file_actions_adddup2(&actions, copies[index], 3 + (int)index) != 0) {
@@ -683,14 +684,23 @@ static bool spawn_service(OuterServiceManager *manager,
     if (service->log_path && actions_ok) {
         if (!ensure_parent_directory(service->log_path, error, error_size)) actions_ok = false;
         else {
-            int log_fd = open(service->log_path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+            log_fd = open(service->log_path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
             if (log_fd < 0) {
                 snprintf(error, error_size, "open %s: %s", service->log_path, strerror(errno));
                 actions_ok = false;
             } else {
-                posix_spawn_file_actions_adddup2(&actions, log_fd, STDOUT_FILENO);
-                posix_spawn_file_actions_adddup2(&actions, log_fd, STDERR_FILENO);
-                posix_spawn_file_actions_addclose(&actions, log_fd);
+                int action_result = posix_spawn_file_actions_adddup2(&actions, log_fd, STDOUT_FILENO);
+                if (action_result == 0) {
+                    action_result = posix_spawn_file_actions_adddup2(&actions, log_fd, STDERR_FILENO);
+                }
+                if (action_result == 0) {
+                    action_result = posix_spawn_file_actions_addclose(&actions, log_fd);
+                }
+                if (action_result != 0) {
+                    snprintf(error, error_size, "redirect %s: %s",
+                             service->log_path, strerror(action_result));
+                    actions_ok = false;
+                }
             }
         }
     }
@@ -704,6 +714,7 @@ static bool spawn_service(OuterServiceManager *manager,
     for (size_t index = 0; index < service->socket_count; index++) {
         if (copies[index] >= 0) close(copies[index]);
     }
+    if (log_fd >= 0) close(log_fd);
     free(copies);
     posix_spawn_file_actions_destroy(&actions);
     posix_spawnattr_destroy(&attributes);
@@ -749,11 +760,13 @@ static void handle_exit(OuterServiceManager *manager, OuterService *service, int
     bool should_restart = service->restart_after_stop ||
                           (!explicitly_stopped && service->restart_mode == RESTART_ALWAYS) ||
                           (!explicitly_stopped && service->restart_mode == RESTART_ON_FAILURE && !clean);
+    bool activation_backoff = !explicitly_stopped && !clean && service->start_mode == START_SOCKET;
     service->stopping = false;
     service->restart_after_stop = false;
     service->desired_running = should_restart;
     service->failed = !clean && !should_restart;
-    service->restart_at_ms = monotonic_ms() + (should_restart ? service->restart_delay_ms : 0);
+    service->restart_at_ms = monotonic_ms() +
+                             ((should_restart || activation_backoff) ? service->restart_delay_ms : 0);
     service->state = should_restart ? "waiting-to-restart" : (service->failed ? "failed" : "stopped");
     notify_service(manager, service);
     if (service->essential && !manager->shutting_down && !should_restart) {
@@ -818,9 +831,15 @@ static void *supervisor_thread(void *context) {
                 if (service_index < manager->service_count &&
                     (poll_fds[index].revents & POLLIN) &&
                     manager->services[service_index].pid == 0) {
-                    manager->services[service_index].desired_running = true;
-                    manager->services[service_index].restart_at_ms = monotonic_ms();
-                    manager->services[service_index].state = "starting";
+                    OuterService *service = &manager->services[service_index];
+                    uint64_t activation_time = monotonic_ms();
+                    service->desired_running = true;
+                    if (service->restart_at_ms <= activation_time) {
+                        service->restart_at_ms = activation_time;
+                        service->state = "starting";
+                    } else {
+                        service->state = "waiting-to-restart";
+                    }
                 }
             }
         }

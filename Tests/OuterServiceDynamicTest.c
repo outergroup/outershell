@@ -1,6 +1,7 @@
 #include "../outershelld/OuterService.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -27,9 +28,37 @@ static bool write_file(const char *path, const char *contents) {
     return ok;
 }
 
+static int count_lines(const char *path) {
+    FILE *file = fopen(path, "r");
+    if (!file) return 0;
+    int count = 0;
+    int character;
+    while ((character = fgetc(file)) != EOF) {
+        if (character == '\n') count++;
+    }
+    fclose(file);
+    return count;
+}
+
+static int count_open_file_descriptors(void) {
+    int count = 0;
+    for (int descriptor = 0; descriptor < 4096; descriptor++) {
+        errno = 0;
+        if (fcntl(descriptor, F_GETFD) >= 0 || errno != EBADF) count++;
+    }
+    return count;
+}
+
 int main(int argc, char **argv) {
     if (argc >= 2 && strcmp(argv[1], "--outerservice-exec") == 0) {
         return outer_service_exec_child(argc, argv);
+    }
+    if (argc == 3 && strcmp(argv[1], "--fail-service") == 0) {
+        FILE *file = fopen(argv[2], "a");
+        if (!file) return 24;
+        bool wrote = fputs("started\n", file) >= 0;
+        if (fclose(file) != 0) wrote = false;
+        return wrote ? 23 : 24;
     }
     if (argc != 3 || argv[1][0] != '/' || argv[2][0] != '/') {
         fprintf(stderr, "usage: %s /absolute/test-root /absolute/fixture\n", argv[0]);
@@ -39,11 +68,19 @@ int main(int argc, char **argv) {
     char services[4096];
     char resident_file[4096];
     char dynamic_file[4096];
+    char failure_file[4096];
     char socket_path[4096];
+    char failure_socket_path[4096];
+    char failure_start_log[4096];
+    char failure_output_log[4096];
     snprintf(services, sizeof(services), "%s/services", argv[1]);
     snprintf(resident_file, sizeof(resident_file), "%s/resident.outerservice", services);
     snprintf(dynamic_file, sizeof(dynamic_file), "%s/dynamic.http.outerservice", services);
+    snprintf(failure_file, sizeof(failure_file), "%s/failure.http.outerservice", services);
     snprintf(socket_path, sizeof(socket_path), "%s/dynamic.socket", argv[1]);
+    snprintf(failure_socket_path, sizeof(failure_socket_path), "%s/failure.socket", argv[1]);
+    snprintf(failure_start_log, sizeof(failure_start_log), "%s/failure-starts.log", argv[1]);
+    snprintf(failure_output_log, sizeof(failure_output_log), "%s/failure-output.log", argv[1]);
     if (mkdir(argv[1], 0755) != 0 && errno != EEXIST) return 3;
     if (mkdir(services, 0755) != 0 && errno != EEXIST) return 3;
 
@@ -137,10 +174,70 @@ int main(int argc, char **argv) {
         outer_service_manager_destroy(manager);
         return 11;
     }
+
+    int descriptors_before_failure_test = count_open_file_descriptors();
+    char failure_contents[16000];
+    snprintf(failure_contents, sizeof(failure_contents),
+             "[Service]\n"
+             "Format=1\n"
+             "Executable=%s\n"
+             "Argument=--fail-service\n"
+             "Argument=%s\n"
+             "Start=socket\n"
+             "Restart=never\n"
+             "RestartDelayMilliseconds=1000\n"
+             "StopTimeoutMilliseconds=500\n"
+             "LogPath=%s\n"
+             "\n"
+             "[Socket.http]\n"
+             "Type=unix\n"
+             "Path=%s\n"
+             "Mode=0600\n",
+             argv[0], failure_start_log, failure_output_log, failure_socket_path);
+    if (!write_file(failure_file, failure_contents) ||
+        !outer_service_manager_load_service(manager, "failure.http", error, sizeof(error))) {
+        fprintf(stderr, "load failure service: %s\n", error);
+        outer_service_manager_destroy(manager);
+        return 12;
+    }
+
+    int failure_client = socket(AF_UNIX, SOCK_STREAM, 0);
+    memset(&address, 0, sizeof(address));
+    address.sun_family = AF_UNIX;
+    snprintf(address.sun_path, sizeof(address.sun_path), "%s", failure_socket_path);
+    if (failure_client < 0 ||
+        connect(failure_client, (struct sockaddr *)&address, sizeof(address)) != 0) {
+        perror("connect failure socket");
+        if (failure_client >= 0) close(failure_client);
+        outer_service_manager_destroy(manager);
+        return 13;
+    }
+    pause_milliseconds(1400);
+    int failure_starts = count_lines(failure_start_log);
+    if (failure_starts < 1 || failure_starts > 2) {
+        fprintf(stderr, "socket activation ignored restart backoff (%d starts)\n", failure_starts);
+        close(failure_client);
+        outer_service_manager_destroy(manager);
+        return 14;
+    }
+    close(failure_client);
+    if (!outer_service_manager_unload_service(manager, "failure.http", error, sizeof(error))) {
+        fprintf(stderr, "unload failure service: %s\n", error);
+        outer_service_manager_destroy(manager);
+        return 15;
+    }
+    int descriptors_after_failure_test = count_open_file_descriptors();
+    if (descriptors_after_failure_test != descriptors_before_failure_test) {
+        fprintf(stderr, "service launches leaked descriptors (%d before, %d after)\n",
+                descriptors_before_failure_test, descriptors_after_failure_test);
+        outer_service_manager_destroy(manager);
+        return 16;
+    }
+
     if (!outer_service_manager_unload_service(manager, "resident", error, sizeof(error))) {
         fprintf(stderr, "unload resident: %s\n", error);
         outer_service_manager_destroy(manager);
-        return 12;
+        return 17;
     }
     outer_service_manager_destroy(manager);
     return 0;
