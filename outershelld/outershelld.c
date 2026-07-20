@@ -520,6 +520,169 @@ static bool copy_file(const char *source, const char *destination, mode_t mode, 
 }
 
 
+static bool validate_directory_tree(const char *source, char *error, size_t error_size) {
+    DIR *directory = opendir(source);
+    if (!directory) {
+        snprintf(error, error_size, "Failed to open %s: %s", source, strerror(errno));
+        return false;
+    }
+
+    bool ok = true;
+    struct dirent *entry = NULL;
+    while ((entry = readdir(directory)) != NULL) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
+
+        char source_path[PATH_MAX];
+        int source_length = snprintf(source_path, sizeof(source_path), "%s/%s", source, entry->d_name);
+        if (source_length < 0 || (size_t)source_length >= sizeof(source_path)) {
+            snprintf(error, error_size, "Resource path is too long under %s.", source);
+            ok = false;
+            break;
+        }
+
+        struct stat st;
+        if (lstat(source_path, &st) != 0) {
+            snprintf(error, error_size, "Failed to inspect %s: %s", source_path, strerror(errno));
+            ok = false;
+            break;
+        }
+        if (S_ISDIR(st.st_mode)) {
+            if (!validate_directory_tree(source_path, error, error_size)) {
+                ok = false;
+                break;
+            }
+        } else if (!S_ISREG(st.st_mode)) {
+            snprintf(error, error_size,
+                     "Web resources must be regular files and directories; unsupported resource at %s.",
+                     source_path);
+            ok = false;
+            break;
+        }
+    }
+    closedir(directory);
+    return ok;
+}
+
+
+static bool remove_path_tree(const char *path, char *error, size_t error_size) {
+    struct stat st;
+    if (lstat(path, &st) != 0) {
+        if (errno == ENOENT) return true;
+        snprintf(error, error_size, "Failed to inspect %s: %s", path, strerror(errno));
+        return false;
+    }
+    if (!S_ISDIR(st.st_mode)) {
+        if (unlink(path) == 0) return true;
+        snprintf(error, error_size, "Failed to remove %s: %s", path, strerror(errno));
+        return false;
+    }
+
+    DIR *directory = opendir(path);
+    if (!directory) {
+        snprintf(error, error_size, "Failed to open %s: %s", path, strerror(errno));
+        return false;
+    }
+    bool ok = true;
+    struct dirent *entry = NULL;
+    while ((entry = readdir(directory)) != NULL) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
+        char child_path[PATH_MAX];
+        int child_length = snprintf(child_path, sizeof(child_path), "%s/%s", path, entry->d_name);
+        if (child_length < 0 || (size_t)child_length >= sizeof(child_path)) {
+            snprintf(error, error_size, "Resource path is too long under %s.", path);
+            ok = false;
+            break;
+        }
+        if (!remove_path_tree(child_path, error, error_size)) {
+            ok = false;
+            break;
+        }
+    }
+    closedir(directory);
+    if (!ok) return false;
+    if (rmdir(path) == 0) return true;
+    snprintf(error, error_size, "Failed to remove %s: %s", path, strerror(errno));
+    return false;
+}
+
+
+static bool copy_directory_tree(const char *source,
+                                const char *destination,
+                                mode_t file_mode,
+                                mode_t directory_mode,
+                                char *error,
+                                size_t error_size) {
+    if (!mkdir_p(destination)) {
+        snprintf(error, error_size, "Failed to create %s: %s", destination, strerror(errno));
+        return false;
+    }
+    chmod(destination, directory_mode);
+
+    DIR *directory = opendir(source);
+    if (!directory) {
+        snprintf(error, error_size, "Failed to open %s: %s", source, strerror(errno));
+        return false;
+    }
+
+    bool ok = true;
+    struct dirent *entry = NULL;
+    while ((entry = readdir(directory)) != NULL) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
+
+        char source_path[PATH_MAX];
+        char destination_path[PATH_MAX];
+        int source_length = snprintf(source_path, sizeof(source_path), "%s/%s", source, entry->d_name);
+        int destination_length = snprintf(destination_path, sizeof(destination_path), "%s/%s", destination, entry->d_name);
+        if (source_length < 0 || (size_t)source_length >= sizeof(source_path) ||
+            destination_length < 0 || (size_t)destination_length >= sizeof(destination_path)) {
+            snprintf(error, error_size, "Resource path is too long under %s.", source);
+            ok = false;
+            break;
+        }
+
+        struct stat st;
+        if (lstat(source_path, &st) != 0) {
+            snprintf(error, error_size, "Failed to inspect %s: %s", source_path, strerror(errno));
+            ok = false;
+            break;
+        }
+        if (S_ISDIR(st.st_mode)) {
+            if (!copy_directory_tree(source_path, destination_path, file_mode, directory_mode, error, error_size)) {
+                ok = false;
+                break;
+            }
+        } else if (S_ISREG(st.st_mode)) {
+            if (!copy_file(source_path, destination_path, file_mode, error, error_size)) {
+                ok = false;
+                break;
+            }
+        } else {
+            snprintf(error, error_size, "Unsupported resource type at %s.", source_path);
+            ok = false;
+            break;
+        }
+    }
+    closedir(directory);
+    return ok;
+}
+
+
+static bool replace_directory_tree(const char *source,
+                                   const char *destination,
+                                   mode_t file_mode,
+                                   mode_t directory_mode,
+                                   char *error,
+                                   size_t error_size) {
+    if (!remove_path_tree(destination, error, error_size)) return false;
+    if (!source || !source[0]) return true;
+    if (copy_directory_tree(source, destination, file_mode, directory_mode, error, error_size)) return true;
+
+    char cleanup_error[1024] = "";
+    (void)remove_path_tree(destination, cleanup_error, sizeof(cleanup_error));
+    return false;
+}
+
+
 static char *read_text_file_alloc(const char *path, size_t *out_size) {
     if (out_size) *out_size = 0;
     int fd = open(path, O_RDONLY);
@@ -10199,6 +10362,7 @@ static bool install_bundled_app_internal(const BundledAppDefinition *app,
                                          const char *source_bundle_arm,
                                          const char *source_bundle_x86,
                                          const char *source_icon,
+                                         const char *source_web_dir,
                                          char *message,
                                          size_t message_size) {
     bool system_scope = direct_root_session_uses_system_scope();
@@ -10218,6 +10382,8 @@ static bool install_bundled_app_internal(const BundledAppDefinition *app,
     snprintf(target_bundle_x86, sizeof(target_bundle_x86), "%s/%s.bundle.macos-x86.aar", bundles_dir, app->bundle_prefix);
     char target_icon[PATH_MAX] = "";
     if (source_icon && source_icon[0]) snprintf(target_icon, sizeof(target_icon), "%s/%s", install_root, app->icon_name);
+    char target_web_dir[PATH_MAX];
+    snprintf(target_web_dir, sizeof(target_web_dir), "%s/web", install_root);
     char version_path[PATH_MAX];
     snprintf(version_path, sizeof(version_path), "%s/version", install_root);
     char log_path[PATH_MAX];
@@ -10252,10 +10418,12 @@ static bool install_bundled_app_internal(const BundledAppDefinition *app,
 
     mode_t binary_mode = system_scope ? 0755 : 0700;
     mode_t data_mode = system_scope ? 0644 : 0600;
+    mode_t directory_mode = system_scope ? 0755 : 0700;
     if (!copy_file(source_binary, target_binary, binary_mode, error, sizeof(error)) ||
         !copy_file(source_bundle_arm, target_bundle_arm, data_mode, error, sizeof(error)) ||
         !copy_file(source_bundle_x86, target_bundle_x86, data_mode, error, sizeof(error)) ||
         (target_icon[0] && !copy_file(source_icon, target_icon, data_mode, error, sizeof(error))) ||
+        !replace_directory_tree(source_web_dir, target_web_dir, data_mode, directory_mode, error, sizeof(error)) ||
         !write_text_file(version_path, app->version, error, sizeof(error))) {
         snprintf(message, message_size, "%s", error);
         return false;
@@ -10405,6 +10573,8 @@ static bool install_bundled_app(const BundledAppDefinition *app,
     } else {
         source_icon[0] = '\0';
     }
+    char source_web_dir[PATH_MAX];
+    snprintf(source_web_dir, sizeof(source_web_dir), "%s/web", stage_root);
 
     char error[1024] = "";
     struct stat st;
@@ -10422,6 +10592,21 @@ static bool install_bundled_app(const BundledAppDefinition *app,
         snprintf(message, message_size, "Missing %s icon at %s.", app->display_name, source_icon);
         return false;
     }
+    if (lstat(source_web_dir, &st) != 0) {
+        if (errno != ENOENT) {
+            snprintf(message, message_size, "Failed to inspect %s: %s", source_web_dir, strerror(errno));
+            return false;
+        }
+        source_web_dir[0] = '\0';
+    } else if (!S_ISDIR(st.st_mode)) {
+        snprintf(message, message_size,
+                 "Web resources must be regular files and directories; unsupported resource at %s.",
+                 source_web_dir);
+        return false;
+    } else if (!validate_directory_tree(source_web_dir, error, sizeof(error))) {
+        snprintf(message, message_size, "%s", error);
+        return false;
+    }
 
     if (g_internal_service_manager) {
         return install_bundled_app_internal(app,
@@ -10429,6 +10614,7 @@ static bool install_bundled_app(const BundledAppDefinition *app,
                                             source_bundle_arm,
                                             source_bundle_x86,
                                             source_icon,
+                                            source_web_dir,
                                             message,
                                             message_size);
     }
@@ -10455,6 +10641,8 @@ static bool install_bundled_app(const BundledAppDefinition *app,
         } else {
             target_icon[0] = '\0';
         }
+        char target_web_dir[PATH_MAX];
+        snprintf(target_web_dir, sizeof(target_web_dir), "%s/web", install_root);
         char version_path[PATH_MAX];
         snprintf(version_path, sizeof(version_path), "%s/version", install_root);
         char system_users_dir[PATH_MAX];
@@ -10486,12 +10674,14 @@ static bool install_bundled_app(const BundledAppDefinition *app,
         char quoted_source_bundle_arm[PATH_MAX + 8];
         char quoted_source_bundle_x86[PATH_MAX + 8];
         char quoted_source_icon[PATH_MAX + 8];
+        char quoted_source_web_dir[PATH_MAX + 8];
         char quoted_install_root[PATH_MAX + 8];
         char quoted_bundles_dir[PATH_MAX + 8];
         char quoted_target_binary[PATH_MAX + 8];
         char quoted_target_bundle_arm[PATH_MAX + 8];
         char quoted_target_bundle_x86[PATH_MAX + 8];
         char quoted_target_icon[PATH_MAX + 8];
+        char quoted_target_web_dir[PATH_MAX + 8];
         char quoted_version_path[PATH_MAX + 8];
         char quoted_system_users_dir[PATH_MAX + 8];
         char quoted_root_apps_marker[PATH_MAX + 8];
@@ -10505,12 +10695,14 @@ static bool install_bundled_app(const BundledAppDefinition *app,
         shell_quote(source_bundle_arm, quoted_source_bundle_arm, sizeof(quoted_source_bundle_arm));
         shell_quote(source_bundle_x86, quoted_source_bundle_x86, sizeof(quoted_source_bundle_x86));
         if (source_icon[0]) shell_quote(source_icon, quoted_source_icon, sizeof(quoted_source_icon)); else quoted_source_icon[0] = '\0';
+        if (source_web_dir[0]) shell_quote(source_web_dir, quoted_source_web_dir, sizeof(quoted_source_web_dir)); else quoted_source_web_dir[0] = '\0';
         shell_quote(install_root, quoted_install_root, sizeof(quoted_install_root));
         shell_quote(bundles_dir, quoted_bundles_dir, sizeof(quoted_bundles_dir));
         shell_quote(target_binary, quoted_target_binary, sizeof(quoted_target_binary));
         shell_quote(target_bundle_arm, quoted_target_bundle_arm, sizeof(quoted_target_bundle_arm));
         shell_quote(target_bundle_x86, quoted_target_bundle_x86, sizeof(quoted_target_bundle_x86));
         if (target_icon[0]) shell_quote(target_icon, quoted_target_icon, sizeof(quoted_target_icon)); else quoted_target_icon[0] = '\0';
+        shell_quote(target_web_dir, quoted_target_web_dir, sizeof(quoted_target_web_dir));
         shell_quote(version_path, quoted_version_path, sizeof(quoted_version_path));
         shell_quote(system_users_dir, quoted_system_users_dir, sizeof(quoted_system_users_dir));
         shell_quote(root_apps_marker, quoted_root_apps_marker, sizeof(quoted_root_apps_marker));
@@ -10629,7 +10821,7 @@ static bool install_bundled_app(const BundledAppDefinition *app,
                 "systemctl --system daemon-reload >/dev/null 2>&1 || true\n"
                 "timeout 12s systemctl --system stop %s >/dev/null 2>&1 || true\n"
                 "timeout 5s systemctl --system reset-failed %s >/dev/null 2>&1 || true\n"
-                "rm -rf -- %s\n"
+                "rm -rf -- %s %s\n"
                 "mkdir -p %s %s /var/log/outershell %s %s\n"
                 "chmod 0755 %s\n"
                 "chmod 0700 %s\n"
@@ -10639,6 +10831,7 @@ static bool install_bundled_app(const BundledAppDefinition *app,
                 quoted_unit,
                 quoted_unit,
                 quoted_bundles_dir,
+                quoted_target_web_dir,
                 quoted_install_root,
                 quoted_bundles_dir,
                 quoted_system_outershell_root,
@@ -10651,6 +10844,29 @@ static bool install_bundled_app(const BundledAppDefinition *app,
                 quoted_target_bundle_arm,
                 quoted_source_bundle_x86,
                 quoted_target_bundle_x86);
+        if (quoted_source_web_dir[0]) {
+            fprintf(script,
+                    "if [ -L %s ] || [ -n \"$(find -P %s -mindepth 1 ! -type d ! -type f -print -quit)\" ]; then\n"
+                    "  echo 'Web resources must be regular files and directories.' >&2\n"
+                    "  exit 1\n"
+                    "fi\n"
+                    "mkdir -p %s\n"
+                    "cp -R -- %s/. %s/\n"
+                    "if [ -n \"$(find -P %s -mindepth 1 ! -type d ! -type f -print -quit)\" ]; then\n"
+                    "  echo 'Web resources must be regular files and directories.' >&2\n"
+                    "  rm -rf -- %s\n"
+                    "  exit 1\n"
+                    "fi\n"
+                    "chmod -R a+rX %s\n",
+                    quoted_source_web_dir,
+                    quoted_source_web_dir,
+                    quoted_target_web_dir,
+                    quoted_source_web_dir,
+                    quoted_target_web_dir,
+                    quoted_target_web_dir,
+                    quoted_target_web_dir,
+                    quoted_target_web_dir);
+        }
         fprintf(script,
                 "mkdir -p %s\n"
                 "chmod 1777 %s\n"
@@ -10803,6 +11019,8 @@ static bool install_bundled_app(const BundledAppDefinition *app,
     } else {
         target_icon[0] = '\0';
     }
+    char target_web_dir[PATH_MAX];
+    snprintf(target_web_dir, sizeof(target_web_dir), "%s/web", install_root);
     char version_path[PATH_MAX];
     snprintf(version_path, sizeof(version_path), "%s/version", install_root);
     char log_path[PATH_MAX];
@@ -10831,7 +11049,8 @@ static bool install_bundled_app(const BundledAppDefinition *app,
     }
     if (!copy_file(source_bundle_arm, target_bundle_arm, 0600, error, sizeof(error)) ||
         !copy_file(source_bundle_x86, target_bundle_x86, 0600, error, sizeof(error)) ||
-        (source_icon[0] && !copy_file(source_icon, target_icon, 0600, error, sizeof(error)))) {
+        (source_icon[0] && !copy_file(source_icon, target_icon, 0600, error, sizeof(error))) ||
+        !replace_directory_tree(source_web_dir, target_web_dir, 0600, 0700, error, sizeof(error))) {
         snprintf(message, message_size, "%s", error);
         return false;
     }

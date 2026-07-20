@@ -625,6 +625,13 @@ On Linux, the installer chooses
 archives therefore use the platform names `linux-aarch64`, `linux-x86_64`,
 `linux-aarch64-musl`, and `linux-x86_64-musl`.
 
+A staging payload may also contain a `web/` directory. The installer copies
+that directory recursively alongside `bundles/`, so a bundled backend can
+serve an HTML/JavaScript frontend from the same installed payload. Symlinks and
+other special files are rejected; web resources must be regular files and
+directories. Each installation replaces the previous web-resource tree;
+omitting `web/` removes resources left by an earlier version.
+
 Socket message: `bundledAppControlRequest` (`messageType = 27`)
 
 ```text

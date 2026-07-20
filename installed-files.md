@@ -181,6 +181,7 @@ Linux user install:
 - `<user-state>/apps/<service-id>/bundles/<bundle-prefix>.bundle.macos-arm.aar`
 - `<user-state>/apps/<service-id>/bundles/<bundle-prefix>.bundle.macos-x86.aar`
 - `<user-state>/apps/<service-id>/app-icon.png` when the app has a raster icon
+- `<user-state>/apps/<service-id>/web/` when the staged app includes browser resources
 - `<user-state>/apps/<service-id>/version`
 - `<user-state>/apps/<service-id>/backend.log`
 - `$HOME/.config/systemd/user/<service-id>.service`
@@ -197,6 +198,7 @@ Linux root install:
 - `/opt/outershell/<service-id>/bundles/<bundle-prefix>.bundle.macos-arm.aar`
 - `/opt/outershell/<service-id>/bundles/<bundle-prefix>.bundle.macos-x86.aar`
 - `/opt/outershell/<service-id>/app-icon.png` when the app has a raster icon
+- `/opt/outershell/<service-id>/web/` when the staged app includes browser resources
 - `/opt/outershell/<service-id>/version`
 - `/etc/systemd/system/<service-id>.service`
 - `/etc/systemd/system/<service-id>.socket` for socket-activated apps

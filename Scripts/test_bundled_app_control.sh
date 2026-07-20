@@ -9,9 +9,13 @@ daemon_log="$build_dir/outershelld.log"
 cc_command="${CC:-cc}"
 cxx_command="${CXX:-c++}"
 daemon_pid=""
+image_source="$repo_root/Backend/OuterShellImage.c"
 image_libraries="-lpng -lz"
 if [ "$(uname -s)" = "Darwin" ]; then
     image_libraries="-framework ImageIO -framework CoreGraphics -framework CoreFoundation"
+elif ! printf '#include <png.h>\n' | "$cc_command" -x c -fsyntax-only - >/dev/null 2>&1; then
+    image_source="$repo_root/Tests/OuterShellImageStubs.c"
+    image_libraries=""
 fi
 
 cleanup() {
@@ -27,7 +31,7 @@ mkdir -p "$build_dir/home/services"
 "$cc_command" -std=gnu17 -O2 -o "$build_dir/outershelld" \
     "$repo_root/Backend/OuterShellBuffer.c" \
     "$repo_root/Backend/OuterShellAPI.c" \
-    "$repo_root/Backend/OuterShellImage.c" \
+    "$image_source" \
     "$repo_root/Backend/OuterShellPlatform.c" \
     "$repo_root/outershelld/OuterService.c" \
     "$repo_root/outershelld/outershelld.c" \
@@ -47,7 +51,14 @@ while [ "$attempts" -gt 0 ] && [ ! -S "$api_socket" ]; do
     sleep 0.05
     attempts=$((attempts - 1))
 done
-[ -S "$api_socket" ]
+if [ ! -S "$api_socket" ]; then
+    printf 'outershelld did not create its test API socket\n' >&2
+    if [ -f "$daemon_log" ]; then
+        printf '%s\n' '--- outershelld test log ---' >&2
+        cat "$daemon_log" >&2
+    fi
+    exit 1
+fi
 
 set +e
 response="$(OUTERSHELLD_API_SOCKET="$api_socket" "$build_dir/outerctl" \
@@ -66,5 +77,72 @@ case "$response" in
         exit 1
         ;;
 esac
+
+if [ "$(uname -s)" = "Linux" ]; then
+    case "$(uname -m)" in
+        aarch64|arm64) architecture=aarch64 ;;
+        x86_64|amd64) architecture=x86_64 ;;
+        *) printf 'unsupported test architecture\n' >&2; exit 1 ;;
+    esac
+    stage_root="$build_dir/Top"
+    mkdir -p "$stage_root/RemoteLinuxBinaries/$architecture" "$stage_root/bundles" "$stage_root/web/assets"
+    printf '#!/bin/sh\nexit 0\n' > "$stage_root/RemoteLinuxBinaries/$architecture/TopBackend"
+    chmod 0755 "$stage_root/RemoteLinuxBinaries/$architecture/TopBackend"
+    : > "$stage_root/bundles/TopContent.bundle.macos-arm.aar"
+    : > "$stage_root/bundles/TopContent.bundle.macos-x86.aar"
+    : > "$stage_root/app-icon.png"
+    printf 'bundled web resource\n' > "$stage_root/web/index.html"
+    printf 'nested web resource\n' > "$stage_root/web/assets/example.txt"
+
+    OUTERSHELLD_API_SOCKET="$api_socket" "$build_dir/outerctl" \
+        bundled-app install \
+        --backend org.outershell.Top \
+        --scope user \
+        --stage-root "$stage_root" >/dev/null
+
+    cmp "$stage_root/web/index.html" "$build_dir/home/apps/org.outershell.Top/web/index.html"
+    cmp "$stage_root/web/assets/example.txt" "$build_dir/home/apps/org.outershell.Top/web/assets/example.txt"
+
+    printf 'stale web resource\n' > "$build_dir/home/apps/org.outershell.Top/web/stale.txt"
+    rm "$stage_root/web/assets/example.txt"
+    rmdir "$stage_root/web/assets"
+    printf 'updated bundled web resource\n' > "$stage_root/web/index.html"
+    OUTERSHELLD_API_SOCKET="$api_socket" "$build_dir/outerctl" \
+        bundled-app install \
+        --backend org.outershell.Top \
+        --scope user \
+        --stage-root "$stage_root" >/dev/null
+    cmp "$stage_root/web/index.html" "$build_dir/home/apps/org.outershell.Top/web/index.html"
+    [ ! -e "$build_dir/home/apps/org.outershell.Top/web/stale.txt" ]
+    [ ! -e "$build_dir/home/apps/org.outershell.Top/web/assets/example.txt" ]
+
+    rm -rf "$stage_root/web"
+    OUTERSHELLD_API_SOCKET="$api_socket" "$build_dir/outerctl" \
+        bundled-app install \
+        --backend org.outershell.Top \
+        --scope user \
+        --stage-root "$stage_root" >/dev/null
+    [ ! -e "$build_dir/home/apps/org.outershell.Top/web" ]
+
+    mkdir -p "$stage_root/web"
+    printf 'bundled web resource\n' > "$stage_root/web/index.html"
+    ln -s /etc/passwd "$stage_root/web/unsupported-link"
+    set +e
+    response="$(OUTERSHELLD_API_SOCKET="$api_socket" "$build_dir/outerctl" \
+        bundled-app install \
+        --backend org.outershell.Top \
+        --scope user \
+        --stage-root "$stage_root" 2>&1)"
+    status=$?
+    set -e
+    [ "$status" -ne 0 ]
+    case "$response" in
+        *"regular files and directories"*) ;;
+        *)
+            printf 'unexpected unsupported-web-resource response: %s\n' "$response" >&2
+            exit 1
+            ;;
+    esac
+fi
 
 printf 'bundled-app control request round-trip test passed\n'
