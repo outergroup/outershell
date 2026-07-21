@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
   <meta name="color-scheme" content="light dark">
   <meta name="theme-color" content="#f4f4f2" media="(prefers-color-scheme: light)">
   <meta name="theme-color" content="#171816" media="(prefers-color-scheme: dark)">
@@ -13,7 +13,9 @@
   <div id="app" class="shell" aria-busy="true">
     <main>
       <div class="page-tools">
-        <button id="refresh-button" class="home-menu-button" type="button" aria-label="Refresh apps" title="Refresh apps">⋯</button>
+        <button id="refresh-button" class="home-menu-button" type="button" aria-label="Outer Shell menu" title="Outer Shell menu">
+          <span class="menu-dots" aria-hidden="true"><i></i><i></i><i></i></span>
+        </button>
       </div>
       <button id="add-button" type="button" hidden>Add app</button>
       <label class="visually-hidden" for="search-input">Search apps</label>

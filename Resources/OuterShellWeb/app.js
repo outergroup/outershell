@@ -1,6 +1,8 @@
 (() => {
   "use strict";
 
+  document.documentElement.classList.toggle("outerloop-host", /(^|\.)outerlooplocal$/i.test(window.location.hostname));
+
   const decoder = new TextDecoder();
   const elements = {
     shell: document.querySelector("#app"),
@@ -26,7 +28,11 @@
     logVersion: 0n,
     logSelection: null,
     eventAbort: null,
-    stopped: false
+    stopped: false,
+    longPress: null,
+    suppressLaunchUntil: 0,
+    pageScrollY: null,
+    pressFeedback: null
   };
 
   class PayloadReader {
@@ -243,8 +249,8 @@
 
   function runningBadgesHTML(item) {
     const badges = [];
-    if (item.user && endpointRunning(item.user)) badges.push(`<span class="running-badge user-running-badge" title="Running as you" aria-label="Running as you"></span>`);
-    if (item.root && endpointRunning(item.root)) badges.push(`<span class="running-badge root-running-badge" title="Running as root" aria-label="Running as root">✓</span>`);
+    if (item.user && endpointRunning(item.user)) badges.push(`<a class="running-badge-button" href="${escapeHTML(navigationURL(item.user.frontend))}" data-action="launch-endpoint" data-app-key="${escapeHTML(item.identity)}" data-app-scope="user" aria-label="Open ${escapeHTML(item.displayName)} as you" title="Open as you"><span class="running-badge user-running-badge" aria-hidden="true"></span></a>`);
+    if (item.root && endpointRunning(item.root)) badges.push(`<a class="running-badge-button" href="${escapeHTML(navigationURL(item.root.frontend))}" data-action="launch-endpoint" data-app-key="${escapeHTML(item.identity)}" data-app-scope="root" aria-label="Open ${escapeHTML(item.displayName)} as root" title="Open as root"><span class="running-badge root-running-badge" aria-hidden="true"><svg viewBox="0 0 20 22"><path d="M10 1.15 17.25 3.9v5.55c0 4.9-2.85 8.62-7.25 11.4-4.4-2.78-7.25-6.5-7.25-11.4V3.9L10 1.15Z"/><path class="root-running-check" d="m6.15 10.8 2.5 2.55 5.25-5.6"/></svg></span></a>`);
     return badges.length ? `<span class="running-badges">${badges.join("")}</span>` : "";
   }
 
@@ -358,10 +364,10 @@
       listSections.get(name).push(item);
     });
     const orderedLists = [...listSections.entries()].sort(([left], [right]) => left.localeCompare(right, undefined, { sensitivity: "base" }));
-    const addTile = query ? "" : `<button class="launcher-tile add-app-tile" type="button" data-action="open-add">
-      <span class="add-app-icon" aria-hidden="true"><span></span></span>
+    const addTile = query ? "" : `<article class="launcher-tile add-app-tile">
+      <button class="launcher-link" type="button" data-action="open-add" aria-label="Add app"><span class="add-app-icon" aria-hidden="true"><span></span></span></button>
       <span class="launcher-name">Add app</span>
-    </button>`;
+    </article>`;
     elements.sections.classList.toggle("single-column", orderedLists.length === 0);
     elements.sections.innerHTML = `
       <section class="launcher-column" aria-label="Apps">
@@ -377,10 +383,8 @@
   function renderLauncherTile(item) {
     const readyURL = endpointReady(item.primary) ? navigationURL(item.frontend) : "#";
     return `<article class="launcher-tile">
-      <a class="launcher-link" href="${escapeHTML(readyURL)}" data-action="launch" data-app-key="${escapeHTML(item.identity)}" aria-label="Open ${escapeHTML(item.displayName)}"></a>
-      <span class="launcher-icon-row">${launcherIconHTML(item)}${runningBadgesHTML(item)}</span>
+      <span class="launcher-icon-row"><a class="launcher-link" href="${escapeHTML(readyURL)}" data-action="launch" data-app-key="${escapeHTML(item.identity)}" aria-label="Open ${escapeHTML(item.displayName)}" aria-keyshortcuts="Shift+F10">${launcherIconHTML(item)}</a>${runningBadgesHTML(item)}</span>
       <h2 class="launcher-name">${escapeHTML(item.displayName)}</h2>
-      <button class="launcher-menu-button" type="button" data-action="details" data-app-key="${escapeHTML(item.identity)}" aria-label="Options for ${escapeHTML(item.displayName)}" title="App options">⋯</button>
     </article>`;
   }
 
@@ -395,11 +399,8 @@
     const readyURL = endpointReady(item.primary) ? navigationURL(item.frontend) : "#";
     const badges = runningBadgesHTML(item);
     return `<article class="list-row ${badges ? "has-running-badges" : ""}">
-      <a class="list-link" href="${escapeHTML(readyURL)}" data-action="launch" data-app-key="${escapeHTML(item.identity)}" aria-label="Open ${escapeHTML(item.displayName)}"></a>
-      ${listIconHTML(item)}
+      <a class="list-link" href="${escapeHTML(readyURL)}" data-action="launch" data-app-key="${escapeHTML(item.identity)}" aria-label="Open ${escapeHTML(item.displayName)}" aria-keyshortcuts="Shift+F10">${listIconHTML(item)}<h3 class="list-name">${escapeHTML(item.displayName)}</h3></a>
       ${badges}
-      <h3 class="list-name">${escapeHTML(item.displayName)}</h3>
-      <button class="list-menu-button" type="button" data-action="details" data-app-key="${escapeHTML(item.identity)}" aria-label="Options for ${escapeHTML(item.displayName)}" title="App options">⋯</button>
     </article>`;
   }
 
@@ -450,22 +451,90 @@
     return launcherItems().find(item => item.identity === identity);
   }
 
-  async function launch(identity) {
+  function itemIdentityFromTarget(target) {
+    if (!(target instanceof Element)) return "";
+    return target.closest("[data-app-key]")?.dataset.appKey || "";
+  }
+
+  function cancelLongPress() {
+    if (!state.longPress) return;
+    window.clearTimeout(state.longPress.timer);
+    state.longPress = null;
+  }
+
+  function clearTextSelection() {
+    window.getSelection()?.removeAllRanges();
+  }
+
+  function beginLongPress(event) {
+    if (event.pointerType !== "touch" || !event.isPrimary || elements.dialogLayer.childElementCount) return;
+    const identity = itemIdentityFromTarget(event.target);
+    if (!identity) return;
+    cancelLongPress();
+    const press = {
+      identity,
+      pointerID: event.pointerId,
+      x: event.clientX,
+      y: event.clientY,
+      timer: 0
+    };
+    press.timer = window.setTimeout(() => {
+      if (state.longPress !== press) return;
+      state.longPress = null;
+      state.suppressLaunchUntil = Date.now() + 900;
+      navigator.vibrate?.(8);
+      openAppMenu(identity);
+      clearTextSelection();
+      window.requestAnimationFrame(clearTextSelection);
+    }, 520);
+    state.longPress = press;
+  }
+
+  function moveLongPress(event) {
+    const press = state.longPress;
+    if (!press || event.pointerId !== press.pointerID) return;
+    if (Math.hypot(event.clientX - press.x, event.clientY - press.y) > 10) cancelLongPress();
+  }
+
+  function beginPressFeedback(event) {
+    if (!event.isPrimary || !(event.target instanceof Element)) return;
+    const target = event.target.closest(".launcher-link, .list-link, .running-badge-button");
+    if (!target) return;
+    clearPressFeedback();
+    target.classList.add("pressed");
+    state.pressFeedback = { target, pointerID: event.pointerId, x: event.clientX, y: event.clientY };
+  }
+
+  function movePressFeedback(event) {
+    const feedback = state.pressFeedback;
+    if (!feedback || event.pointerId !== feedback.pointerID) return;
+    if (Math.hypot(event.clientX - feedback.x, event.clientY - feedback.y) > 10) clearPressFeedback();
+  }
+
+  function clearPressFeedback() {
+    state.pressFeedback?.target.classList.remove("pressed");
+    state.pressFeedback = null;
+  }
+
+  async function launch(identity, scope = "primary") {
     let item = findItem(identity);
     if (!item) return;
-    if (!endpointReady(item.primary)) {
+    let endpoint = item[scope];
+    if (!endpoint) throw new Error(`${item.displayName} is not available for this account.`);
+    if (!endpointReady(endpoint)) {
       toast(`Starting ${item.displayName}…`);
-      const action = await control(item.backend, "start");
+      const action = await control(endpoint.backend, "start");
       if (!action.ok) throw new Error(action.message || `Could not start ${item.displayName}.`);
       for (let attempt = 0; attempt < 30; attempt += 1) {
         await delay(500);
         await refreshBackends({ quiet: true });
         item = findItem(identity);
-        if (item && endpointReady(item.primary)) break;
+        endpoint = item?.[scope];
+        if (endpoint && endpointReady(endpoint)) break;
       }
     }
-    if (!item || !endpointReady(item.primary)) throw new Error(`Timed out waiting for ${item?.displayName || "the app"}.`);
-    window.location.assign(navigationURL(item.frontend));
+    if (!endpoint || !endpointReady(endpoint)) throw new Error(`Timed out waiting for ${item?.displayName || "the app"}.`);
+    window.location.assign(navigationURL(endpoint.frontend));
   }
 
   const delay = milliseconds => new Promise(resolve => window.setTimeout(resolve, milliseconds));
@@ -493,24 +562,63 @@
   }
 
   function openDialog(bodyHTML, className = "") {
+    lockPageScroll();
     elements.dialogLayer.replaceChildren();
     const fragment = elements.dialogTemplate.content.cloneNode(true);
     const backdrop = fragment.querySelector(".dialog-backdrop");
     const dialog = fragment.querySelector(".dialog");
     dialog.className = `dialog ${className}`.trim();
+    if (dialog.classList.contains("context-menu")) backdrop.classList.add("context-menu-backdrop");
     dialog.innerHTML = bodyHTML;
     backdrop.addEventListener("click", event => {
       if (event.target === backdrop) closeDialog();
     });
     elements.dialogLayer.append(fragment);
-    window.setTimeout(() => dialog.querySelector("button, input, select, textarea")?.focus(), 0);
+    window.setTimeout(() => {
+      if (dialog.classList.contains("context-menu")) {
+        dialog.tabIndex = -1;
+        dialog.focus({ preventScroll: true });
+      } else {
+        dialog.querySelector("button, a, input, select, textarea")?.focus();
+      }
+    }, 0);
     return dialog;
+  }
+
+  function positionContextMenu(dialog, point) {
+    if (!point || window.matchMedia("(max-width: 680px), (max-width: 950px) and (orientation: landscape)").matches) return;
+    dialog.dataset.anchored = "true";
+    dialog.style.visibility = "hidden";
+    const bounds = dialog.getBoundingClientRect();
+    const inset = 9;
+    const left = Math.min(Math.max(point.x, inset), window.innerWidth - bounds.width - inset);
+    const top = Math.min(Math.max(point.y, inset), window.innerHeight - bounds.height - inset);
+    dialog.style.left = `${left}px`;
+    dialog.style.top = `${top}px`;
+    dialog.style.visibility = "visible";
   }
 
   function closeDialog() {
     elements.dialogLayer.replaceChildren();
+    unlockPageScroll();
     state.logSelection = null;
     restartEventWatch();
+  }
+
+  function lockPageScroll() {
+    if (state.pageScrollY !== null) return;
+    state.pageScrollY = window.scrollY;
+    document.body.style.top = `-${state.pageScrollY}px`;
+    document.body.classList.add("dialog-open");
+  }
+
+  function unlockPageScroll() {
+    if (state.pageScrollY === null) return;
+    const scrollY = state.pageScrollY;
+    state.pageScrollY = null;
+    document.body.classList.remove("dialog-open");
+    document.body.style.top = "";
+    window.scrollTo(0, scrollY);
   }
 
   function requestPassword(name, message) {
@@ -527,7 +635,11 @@
           </div>
           <footer class="dialog-footer"><button class="secondary-button" type="button" data-password-cancel>Cancel</button><button class="primary-button" type="submit">Continue</button></footer>
         </form>`);
-      const finish = value => { elements.dialogLayer.replaceChildren(); resolve(value); };
+      const finish = value => {
+        elements.dialogLayer.replaceChildren();
+        unlockPageScroll();
+        resolve(value);
+      };
       dialog.querySelectorAll("[data-password-cancel]").forEach(button => button.addEventListener("click", () => finish(null)));
       dialog.querySelector("#password-form").addEventListener("submit", event => {
         event.preventDefault();
@@ -625,33 +737,69 @@
     }
   }
 
-  function openDetails(identity) {
+  function contextMenuGlyph(value) {
+    return `<span class="context-menu-glyph" aria-hidden="true">${value}</span>`;
+  }
+
+  function endpointContextMenuHTML(item, scope, title) {
+    const endpoint = item[scope];
+    if (!endpoint) return "";
+    const backend = endpoint.backend;
+    const running = endpointRunning(endpoint);
+    const showControl = backend.canControl && (running || !endpointReady(endpoint));
+    const key = escapeHTML(backendKey(backend));
+    const script = String(backend.scriptPath || "").trim();
+    return `<section class="context-menu-section">
+      <h3>${escapeHTML(title)}</h3>
+      <a class="context-menu-item" href="${escapeHTML(navigationURL(endpoint.frontend))}" data-action="launch-endpoint" data-app-key="${escapeHTML(item.identity)}" data-app-scope="${scope}" role="menuitem">${contextMenuGlyph("↗")}<span>Open</span></a>
+      ${showControl ? `<button class="context-menu-item" type="button" data-action="control" data-operation="${running ? "stop" : "start"}" data-backend-key="${key}" role="menuitem">${contextMenuGlyph(running ? "■" : "▶")}<span>${running ? "Stop" : "Start"}</span></button>` : ""}
+      ${backend.logFiles.length ? `<button class="context-menu-item" type="button" data-action="logs" data-backend-key="${key}" role="menuitem">${contextMenuGlyph("≡")}<span>View Logs</span></button>` : ""}
+      ${script ? `<button class="context-menu-item" type="button" data-action="copy-script" data-script="${escapeHTML(script)}" role="menuitem">${contextMenuGlyph("⧉")}<span>Copy Script Path</span></button>` : ""}
+    </section>`;
+  }
+
+  function showContextMenu(contents, point = null, label = "Actions") {
+    const dialog = openDialog(`<h2 id="dialog-title" class="context-menu-title">${escapeHTML(label)}</h2><div class="context-menu-scroll" role="menu">${contents}</div>`, "context-menu");
+    dialog.setAttribute("aria-label", label);
+    positionContextMenu(dialog, point);
+    return dialog;
+  }
+
+  function openAppMenu(identity, point = null) {
     const item = findItem(identity);
     if (!item) return;
     const backend = item.backend;
-    const running = endpointRunning(item.primary);
-    const controlButtons = backend.canControl ? `
-      <div class="action-group">
-        <button class="primary-button" type="button" data-action="control" data-operation="${running ? "restart" : "start"}" data-backend-key="${escapeHTML(backendKey(backend))}">${running ? "Restart" : "Start"}</button>
-        ${running ? `<button class="secondary-button" type="button" data-action="control" data-operation="stop" data-backend-key="${escapeHTML(backendKey(backend))}">Stop</button>` : ""}
-        ${backend.logFiles.length ? `<button class="secondary-button" type="button" data-action="logs" data-backend-key="${escapeHTML(backendKey(backend))}">View logs</button>` : ""}
-        ${backend.scriptPath ? `<button class="secondary-button" type="button" data-action="copy-script" data-script="${escapeHTML(backend.scriptPath)}">Copy script path</button>` : ""}
-      </div>` : "";
-    const rootButton = backend.supportsRoot && !backend.rootOnly ? `<button class="secondary-button" type="button" data-action="control" data-operation="${backend.hasRootSupport ? "removeRootSupport" : "addRootSupport"}" data-backend-key="${escapeHTML(backendKey(backend))}">${backend.hasRootSupport ? "Remove root support" : "Add root support"}</button>` : "";
-    openDialog(`
-      <header class="dialog-header"><div class="dialog-title-wrap"><h2 id="dialog-title">App details</h2></div><button class="dialog-close" type="button" data-action="close-dialog" aria-label="Close">×</button></header>
-      <div class="dialog-body">
-        <div class="detail-summary">${iconHTML(item)}<div><h3>${escapeHTML(item.displayName)}</h3><p>${escapeHTML(backend.serviceID)}</p></div></div>
-        <dl class="detail-list">
-          <div class="detail-row"><dt>Status</dt><dd><span class="running-dot ${running ? "" : "stopped-dot"}"></span>${escapeHTML(backend.status || (running ? "running" : "stopped"))}</dd></div>
-          <div class="detail-row"><dt>Scope</dt><dd>${escapeHTML(backend.serviceScope || "user")}</dd></div>
-          <div class="detail-row"><dt>Endpoint</dt><dd>${escapeHTML(navigationURL(item.frontend))}</dd></div>
-          ${backend.scriptPath ? `<div class="detail-row"><dt>Script</dt><dd>${escapeHTML(backend.scriptPath)}</dd></div>` : ""}
-        </dl>
-        ${controlButtons}
-        ${rootButton ? `<div class="action-group">${rootButton}</div>` : ""}
-        ${backend.canUninstall ? `<div class="danger-zone"><button class="danger-button" type="button" data-action="uninstall" data-backend-key="${escapeHTML(backendKey(backend))}">Uninstall ${escapeHTML(item.displayName)}</button></div>` : ""}
-      </div>`);
+    const managementBackend = item.user?.backend || backend;
+    const sections = [];
+    if (backend.rootOnly) {
+      sections.push(endpointContextMenuHTML(item, "root", "Root"));
+    } else {
+      sections.push(endpointContextMenuHTML(item, "user", "User"));
+      sections.push(endpointContextMenuHTML(item, "root", "Root"));
+    }
+    const management = [];
+    if (managementBackend.supportsRoot && !managementBackend.rootOnly) {
+      const hasRootSupport = Boolean(item.root || managementBackend.hasRootSupport);
+      management.push(`<button class="context-menu-item" type="button" data-action="control" data-operation="${hasRootSupport ? "removeRootSupport" : "addRootSupport"}" data-backend-key="${escapeHTML(backendKey(managementBackend))}" role="menuitem">${contextMenuGlyph("◇")}<span>${hasRootSupport ? "Reinstall as User-only" : "Reinstall with Root Support"}</span></button>`);
+    }
+    if (backend.canUninstall) {
+      management.push(`<button class="context-menu-item danger" type="button" data-action="uninstall" data-backend-key="${escapeHTML(backendKey(backend))}" role="menuitem">${contextMenuGlyph("−")}<span>Uninstall</span></button>`);
+    }
+    if (management.length) sections.push(`<section class="context-menu-section context-menu-management">${management.join("")}</section>`);
+    showContextMenu(`<div class="context-menu-app-heading">${iconHTML(item)}<strong>${escapeHTML(item.displayName)}</strong></div>${sections.filter(Boolean).join("")}`, point, `${item.displayName} actions`);
+  }
+
+  function openHomeMenu(anchor) {
+    const outerShell = state.backends.find(backend => backend.serviceID === "org.outershell.OuterShell" && backend.serviceScope !== "system")
+      || state.backends.find(backend => backend.serviceID === "org.outershell.OuterShell");
+    const actions = [
+      `<button class="context-menu-item" type="button" data-action="refresh-apps" role="menuitem">${contextMenuGlyph("↻")}<span>Refresh Apps</span></button>`,
+      `<button class="context-menu-item" type="button" data-action="open-add" role="menuitem">${contextMenuGlyph("+")}<span>Add App</span></button>`
+    ];
+    if (outerShell?.logFiles.length) actions.push(`<button class="context-menu-item" type="button" data-action="logs" data-backend-key="${escapeHTML(backendKey(outerShell))}" role="menuitem">${contextMenuGlyph("≡")}<span>View Outer Shell Logs</span></button>`);
+    const bounds = anchor.getBoundingClientRect();
+    const point = { x: Math.max(9, bounds.right - 280), y: bounds.bottom + 5 };
+    showContextMenu(`<section class="context-menu-section">${actions.join("")}</section>`, point, "Outer Shell");
   }
 
   async function performControl(key, operation, button) {
@@ -796,7 +944,25 @@
     render();
   });
   elements.add.addEventListener("click", () => openAddDialog());
-  elements.refresh.addEventListener("click", () => refreshBackends());
+  elements.refresh.addEventListener("click", event => openHomeMenu(event.currentTarget));
+  document.body.addEventListener("contextmenu", event => {
+    const identity = itemIdentityFromTarget(event.target);
+    if (!identity) return;
+    event.preventDefault();
+    cancelLongPress();
+    if (Date.now() < state.suppressLaunchUntil && elements.dialogLayer.childElementCount) return;
+    openAppMenu(identity, { x: event.clientX, y: event.clientY });
+  });
+  document.body.addEventListener("pointerdown", beginLongPress);
+  document.body.addEventListener("pointerdown", beginPressFeedback);
+  document.body.addEventListener("pointermove", moveLongPress);
+  document.body.addEventListener("pointermove", movePressFeedback);
+  document.body.addEventListener("pointerup", () => { cancelLongPress(); clearPressFeedback(); });
+  document.body.addEventListener("pointercancel", () => { cancelLongPress(); clearPressFeedback(); });
+  document.body.addEventListener("lostpointercapture", () => { cancelLongPress(); clearPressFeedback(); });
+  document.body.addEventListener("selectstart", event => {
+    if (itemIdentityFromTarget(event.target) || Date.now() < state.suppressLaunchUntil) event.preventDefault();
+  });
   document.body.addEventListener("click", async event => {
     const actionElement = event.target.closest("[data-action]");
     if (!actionElement) return;
@@ -805,8 +971,25 @@
     if (action === "close-dialog") { closeDialog(); return; }
     if (action === "open-add") { openAddDialog(); return; }
     if (action === "add-tab") { openAddDialog(actionElement.dataset.tab); return; }
-    if (action === "details") { openDetails(actionElement.dataset.appKey); return; }
+    if (action === "refresh-apps") { closeDialog(); await refreshBackends(); return; }
+    if (action === "launch-endpoint") {
+      if (Date.now() < state.suppressLaunchUntil && !actionElement.closest(".context-menu")) {
+        event.preventDefault();
+        return;
+      }
+      const item = findItem(actionElement.dataset.appKey);
+      const scope = actionElement.dataset.appScope;
+      const endpoint = item?.[scope];
+      if (endpoint && endpointReady(endpoint)) return;
+      event.preventDefault();
+      try { await launch(actionElement.dataset.appKey, scope); } catch (error) { toast(error.message || String(error), true); }
+      return;
+    }
     if (action === "launch") {
+      if (Date.now() < state.suppressLaunchUntil && !actionElement.closest(".context-menu")) {
+        event.preventDefault();
+        return;
+      }
       const item = findItem(actionElement.dataset.appKey);
       if (item && endpointReady(item.primary)) return;
       event.preventDefault();
@@ -816,7 +999,7 @@
     if (action === "install") { await installBackend(actionElement.dataset.backendKey, actionElement); return; }
     if (action === "control") { await performControl(actionElement.dataset.backendKey, actionElement.dataset.operation, actionElement); return; }
     if (action === "uninstall") { await uninstallBackend(actionElement.dataset.backendKey, actionElement); return; }
-    if (action === "copy-script") { await copyText(actionElement.dataset.script); return; }
+    if (action === "copy-script") { const script = actionElement.dataset.script; closeDialog(); await copyText(script); return; }
     if (action === "logs") { openLogs(actionElement.dataset.backendKey); return; }
     if (action === "refresh-log") { await fetchSelectedLog(); }
   });
@@ -829,6 +1012,13 @@
   });
   document.addEventListener("keydown", event => {
     if (event.key === "Escape" && elements.dialogLayer.childElementCount) closeDialog();
+    if (event.key === "ContextMenu" || (event.shiftKey && event.key === "F10")) {
+      const identity = itemIdentityFromTarget(event.target);
+      if (!identity) return;
+      event.preventDefault();
+      const bounds = event.target.getBoundingClientRect();
+      openAppMenu(identity, { x: bounds.left, y: bounds.bottom });
+    }
   });
   window.addEventListener("beforeunload", () => {
     state.stopped = true;
