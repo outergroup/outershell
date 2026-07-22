@@ -32,7 +32,8 @@
     longPress: null,
     suppressLaunchUntil: 0,
     pageScrollY: null,
-    pressFeedback: null
+    pressFeedback: null,
+    appDrag: null
   };
 
   class PayloadReader {
@@ -144,6 +145,7 @@
       list: reader.stringRef(40),
       port: reader.u32(48),
       id: reader.bytes.length >= 60 ? reader.stringRef(52) : "",
+      iconObservationToken: reader.bytes.length >= 72 ? reader.stringRef(64) : "",
       isRunning: Boolean(flags & 0x01)
     };
   }
@@ -244,7 +246,7 @@
     const content = source
       ? `<img src="${source}" alt="">`
       : `<span>${escapeHTML(initials(item.displayName).slice(0, 1))}</span>`;
-    return `<span class="list-icon" aria-hidden="true">${content}</span>`;
+    return `<span class="list-icon${source ? " has-image" : ""}" aria-hidden="true">${content}</span>`;
   }
 
   function runningBadgesHTML(item) {
@@ -283,9 +285,20 @@
 
   function navigationURL(frontend) {
     const socket = String(frontend.socketPath || "").trim();
-    if (socket) return `http+unix://${encodeURIComponent(socket)}${pathAndQuery(frontend)}`;
-    if (frontend.port > 0) return `http://127.0.0.1:${frontend.port}${pathAndQuery(frontend)}`;
-    return String(frontend.url || "").trim() || "#";
+    let target;
+    if (socket) target = `http+unix://${encodeURIComponent(socket)}${pathAndQuery(frontend)}`;
+    else if (frontend.port > 0) target = `http://127.0.0.1:${frontend.port}${pathAndQuery(frontend)}`;
+    else target = String(frontend.url || "").trim() || "#";
+
+    const token = String(frontend.iconObservationToken || "");
+    if (window.outerLoopPageIconObservationSupported === true && !frontend.iconData?.length && token) {
+      const callback = new URL("/api/icon-observation", window.location.href);
+      callback.search = new URLSearchParams({ token }).toString();
+      const observation = new URL("outerloop://observe-page-icon");
+      observation.search = new URLSearchParams({ url: target, callback: callback.href }).toString();
+      return observation.href;
+    }
+    return target;
   }
 
   function endpointRunning(endpoint) {
@@ -370,7 +383,7 @@
     </article>`;
     elements.sections.classList.toggle("single-column", orderedLists.length === 0);
     elements.sections.innerHTML = `
-      <section class="launcher-column" aria-label="Apps">
+      <section class="launcher-column" data-drop-list="" aria-label="Apps">
         <div class="launcher-grid">${iconItems.map(renderLauncherTile).join("")}${addTile}</div>
       </section>
       ${orderedLists.length ? `<section class="list-column" aria-label="App lists">${orderedLists.map(renderListGroup).join("")}</section>` : ""}`;
@@ -382,7 +395,7 @@
 
   function renderLauncherTile(item) {
     const readyURL = endpointReady(item.primary) ? navigationURL(item.frontend) : "#";
-    return `<article class="launcher-tile">
+    return `<article class="launcher-tile" data-drag-app-key="${escapeHTML(item.identity)}">
       <span class="launcher-icon-row"><a class="launcher-link" href="${escapeHTML(readyURL)}" data-action="launch" data-app-key="${escapeHTML(item.identity)}" aria-label="Open ${escapeHTML(item.displayName)}" aria-keyshortcuts="Shift+F10">${launcherIconHTML(item)}</a>${runningBadgesHTML(item)}</span>
       <h2 class="launcher-name">${escapeHTML(item.displayName)}</h2>
     </article>`;
@@ -390,7 +403,7 @@
 
   function renderListGroup([name, items]) {
     return `<section class="list-group" aria-labelledby="list-${slug(name)}">
-      <div class="list-widget">${items.map(renderListRow).join("")}</div>
+      <div class="list-widget" data-drop-list="${escapeHTML(name)}">${items.map(renderListRow).join("")}</div>
       <h2 id="list-${slug(name)}" class="list-label">${escapeHTML(name)}</h2>
     </section>`;
   }
@@ -398,7 +411,7 @@
   function renderListRow(item) {
     const readyURL = endpointReady(item.primary) ? navigationURL(item.frontend) : "#";
     const badges = runningBadgesHTML(item);
-    return `<article class="list-row ${badges ? "has-running-badges" : ""}">
+    return `<article class="list-row ${badges ? "has-running-badges" : ""}" data-drag-app-key="${escapeHTML(item.identity)}">
       <a class="list-link" href="${escapeHTML(readyURL)}" data-action="launch" data-app-key="${escapeHTML(item.identity)}" aria-label="Open ${escapeHTML(item.displayName)}" aria-keyshortcuts="Shift+F10">${listIconHTML(item)}<h3 class="list-name">${escapeHTML(item.displayName)}</h3></a>
       ${badges}
     </article>`;
@@ -481,6 +494,8 @@
     press.timer = window.setTimeout(() => {
       if (state.longPress !== press) return;
       state.longPress = null;
+      cancelAppDrag();
+      clearPressFeedback();
       state.suppressLaunchUntil = Date.now() + 900;
       navigator.vibrate?.(8);
       openAppMenu(identity);
@@ -497,7 +512,7 @@
   }
 
   function beginPressFeedback(event) {
-    if (!event.isPrimary || !(event.target instanceof Element)) return;
+    if (!event.isPrimary || event.button !== 0 || event.ctrlKey || !(event.target instanceof Element)) return;
     const target = event.target.closest(".launcher-link, .list-link, .running-badge-button");
     if (!target) return;
     clearPressFeedback();
@@ -514,6 +529,181 @@
   function clearPressFeedback() {
     state.pressFeedback?.target.classList.remove("pressed");
     state.pressFeedback = null;
+  }
+
+  function beginAppDrag(event) {
+    if (!event.isPrimary || event.button !== 0 || event.ctrlKey || elements.dialogLayer.childElementCount || !(event.target instanceof Element)) return;
+    const source = event.target.closest(".launcher-link[data-app-key], .list-link[data-app-key]");
+    if (!source || source.closest(".context-menu")) return;
+    const item = findItem(source.dataset.appKey);
+    if (!item) return;
+    cancelAppDrag();
+    const drag = {
+      identity: item.identity,
+      item,
+      source,
+      sourceContainer: source.closest("[data-drag-app-key]"),
+      pointerID: event.pointerId,
+      pointerType: event.pointerType,
+      startX: event.clientX,
+      startY: event.clientY,
+      x: event.clientX,
+      y: event.clientY,
+      currentList: String(item.frontend.list || "").trim(),
+      currentDropList: null,
+      dropTarget: null,
+      preview: null,
+      isDragging: false,
+      touchArmed: event.pointerType !== "touch",
+      armTimer: 0,
+      scrollVelocity: 0,
+      scrollFrame: 0
+    };
+    if (event.pointerType === "touch") {
+      drag.armTimer = window.setTimeout(() => {
+        if (state.appDrag === drag) drag.touchArmed = true;
+      }, 260);
+    }
+    state.appDrag = drag;
+  }
+
+  function startAppDrag(drag, event) {
+    if (drag.isDragging) return;
+    drag.isDragging = true;
+    window.clearTimeout(drag.armTimer);
+    drag.armTimer = 0;
+    cancelLongPress();
+    clearPressFeedback();
+    clearTextSelection();
+    state.suppressLaunchUntil = Date.now() + 900;
+    drag.source.setAttribute("aria-grabbed", "true");
+    drag.sourceContainer?.classList.add("app-drag-source");
+    document.body.classList.add("app-dragging");
+    const preview = document.createElement("div");
+    preview.className = "app-drag-preview";
+    preview.setAttribute("aria-hidden", "true");
+    preview.innerHTML = `${launcherIconHTML(drag.item)}<span>${escapeHTML(drag.item.displayName)}</span>`;
+    document.body.append(preview);
+    drag.preview = preview;
+    try { drag.source.setPointerCapture(event.pointerId); } catch (_) {}
+    updateAppDrag(drag, event.clientX, event.clientY);
+  }
+
+  function dropTargetAt(x, y) {
+    const node = document.elementFromPoint(x, y);
+    const target = node instanceof Element ? node.closest("[data-drop-list]") : null;
+    return target ? { element: target, list: target.dataset.dropList || "" } : null;
+  }
+
+  function updateAppDropTarget(drag) {
+    const target = dropTargetAt(drag.x, drag.y);
+    const changedTarget = target && target.list !== drag.currentList ? target : null;
+    if (drag.dropTarget !== changedTarget?.element) {
+      drag.dropTarget?.classList.remove("app-drop-target");
+      changedTarget?.element.classList.add("app-drop-target");
+      drag.dropTarget = changedTarget?.element || null;
+    }
+    drag.currentDropList = target?.list ?? null;
+  }
+
+  function stepAppDragScroll() {
+    const drag = state.appDrag;
+    if (!drag?.isDragging || !drag.scrollVelocity) return;
+    window.scrollBy(0, drag.scrollVelocity);
+    updateAppDropTarget(drag);
+    drag.scrollFrame = window.requestAnimationFrame(stepAppDragScroll);
+  }
+
+  function updateAppDragScroll(drag) {
+    const edge = Math.min(84, Math.max(54, window.innerHeight * 0.12));
+    let velocity = 0;
+    if (drag.y < edge) velocity = -Math.max(2, (edge - drag.y) * 0.12);
+    else if (drag.y > window.innerHeight - edge) velocity = Math.max(2, (drag.y - (window.innerHeight - edge)) * 0.12);
+    drag.scrollVelocity = Math.max(-13, Math.min(13, velocity));
+    if (drag.scrollVelocity && !drag.scrollFrame) drag.scrollFrame = window.requestAnimationFrame(stepAppDragScroll);
+    if (!drag.scrollVelocity && drag.scrollFrame) {
+      window.cancelAnimationFrame(drag.scrollFrame);
+      drag.scrollFrame = 0;
+    }
+  }
+
+  function updateAppDrag(drag, x, y) {
+    drag.x = x;
+    drag.y = y;
+    if (drag.preview) {
+      drag.preview.style.left = `${x}px`;
+      drag.preview.style.top = `${y}px`;
+    }
+    updateAppDropTarget(drag);
+    updateAppDragScroll(drag);
+  }
+
+  function moveAppDrag(event) {
+    const drag = state.appDrag;
+    if (!drag || event.pointerId !== drag.pointerID) return;
+    const distance = Math.hypot(event.clientX - drag.startX, event.clientY - drag.startY);
+    if (!drag.isDragging) {
+      if (drag.pointerType === "touch" && !drag.touchArmed) {
+        if (distance > 10) cancelAppDrag();
+        return;
+      }
+      if (distance < 4) return;
+      startAppDrag(drag, event);
+    }
+    if (event.cancelable) event.preventDefault();
+    updateAppDrag(drag, event.clientX, event.clientY);
+  }
+
+  function cancelAppDrag() {
+    const drag = state.appDrag;
+    if (!drag) return;
+    window.clearTimeout(drag.armTimer);
+    if (drag.scrollFrame) window.cancelAnimationFrame(drag.scrollFrame);
+    drag.dropTarget?.classList.remove("app-drop-target");
+    drag.sourceContainer?.classList.remove("app-drag-source");
+    drag.source.removeAttribute("aria-grabbed");
+    drag.preview?.remove();
+    document.body.classList.remove("app-dragging");
+    state.appDrag = null;
+  }
+
+  async function setFrontendList(item, listName) {
+    const serviceID = item.backend.serviceID;
+    const frontendID = item.frontend.id;
+    const frontendURL = item.frontend.url;
+    state.backends.forEach(backend => {
+      if (backend.serviceID !== serviceID) return;
+      backend.frontends.forEach(frontend => {
+        const matches = frontendID ? frontend.id === frontendID : frontend.url === frontendURL;
+        if (matches) frontend.list = listName;
+      });
+    });
+    render();
+    try {
+      const result = await control(item.backend, "setFrontendList", {
+        frontendID,
+        frontendURL,
+        list: listName
+      });
+      if (!result.ok) throw new Error(result.message || "Could not update the app list.");
+    } catch (error) {
+      await refreshBackends({ quiet: true });
+      toast(error.message || String(error), true);
+    }
+  }
+
+  function finishAppDrag(event) {
+    const drag = state.appDrag;
+    if (!drag || event.pointerId !== drag.pointerID) return;
+    const wasDragging = drag.isDragging;
+    const listName = drag.currentDropList;
+    const shouldMove = wasDragging && listName !== null && listName !== drag.currentList;
+    if (wasDragging) {
+      if (event.cancelable) event.preventDefault();
+      state.suppressLaunchUntil = Date.now() + 900;
+    }
+    cancelAppDrag();
+    if (shouldMove) setFrontendList(drag.item, listName);
   }
 
   async function launch(identity, scope = "primary") {
@@ -786,20 +976,100 @@
       management.push(`<button class="context-menu-item danger" type="button" data-action="uninstall" data-backend-key="${escapeHTML(backendKey(backend))}" role="menuitem">${contextMenuGlyph("−")}<span>Uninstall</span></button>`);
     }
     if (management.length) sections.push(`<section class="context-menu-section context-menu-management">${management.join("")}</section>`);
-    showContextMenu(`<div class="context-menu-app-heading">${iconHTML(item)}<strong>${escapeHTML(item.displayName)}</strong></div>${sections.filter(Boolean).join("")}`, point, `${item.displayName} actions`);
+    showContextMenu(`<div class="context-menu-app-heading">${launcherIconHTML(item)}<strong>${escapeHTML(item.displayName)}</strong></div>${sections.filter(Boolean).join("")}`, point, `${item.displayName} actions`);
   }
 
   function openHomeMenu(anchor) {
     const outerShell = state.backends.find(backend => backend.serviceID === "org.outershell.OuterShell" && backend.serviceScope !== "system")
       || state.backends.find(backend => backend.serviceID === "org.outershell.OuterShell");
+    if (!outerShell) return;
+    const key = escapeHTML(backendKey(outerShell));
     const actions = [
-      `<button class="context-menu-item" type="button" data-action="refresh-apps" role="menuitem">${contextMenuGlyph("↻")}<span>Refresh Apps</span></button>`,
-      `<button class="context-menu-item" type="button" data-action="open-add" role="menuitem">${contextMenuGlyph("+")}<span>Add App</span></button>`
+      `<button class="context-menu-item plain" type="button" data-action="about-outer-shell" data-backend-key="${key}" role="menuitem">About Outer Shell</button>`,
+      `<button class="context-menu-item plain" type="button" data-action="logs" data-backend-key="${key}" role="menuitem">View Logs for Outer Shell</button>`
     ];
-    if (outerShell?.logFiles.length) actions.push(`<button class="context-menu-item" type="button" data-action="logs" data-backend-key="${escapeHTML(backendKey(outerShell))}" role="menuitem">${contextMenuGlyph("≡")}<span>View Outer Shell Logs</span></button>`);
+    if (outerShell.menuBarVisibilityAvailable) {
+      actions.push(`<button class="context-menu-item menu-toggle" type="button" data-action="toggle-menu-bar" data-backend-key="${key}" data-enabled="${outerShell.menuBarVisibilityEnabled ? "true" : "false"}" role="menuitemcheckbox" aria-checked="${outerShell.menuBarVisibilityEnabled ? "true" : "false"}">${contextMenuGlyph(outerShell.menuBarVisibilityEnabled ? "✓" : "")}<span>Show in macOS menu bar when backends are running</span></button>`);
+    }
+    actions.push(`<button class="context-menu-item plain" type="button" data-action="check-outer-shell-update" data-backend-key="${key}" role="menuitem">Check for Updates</button>`);
+    actions.push(`<button class="context-menu-item plain" type="button" data-action="uninstall-outer-shell" data-backend-key="${key}" role="menuitem">Uninstall Outer Shell</button>`);
     const bounds = anchor.getBoundingClientRect();
     const point = { x: Math.max(9, bounds.right - 280), y: bounds.bottom + 5 };
     showContextMenu(`<section class="context-menu-section">${actions.join("")}</section>`, point, "Outer Shell");
+  }
+
+  function openOuterShellAbout(key) {
+    const backend = findBackend(key);
+    if (!backend) return;
+    const version = String(backend.installedVersion || "").trim() || "unknown";
+    const updateSource = String(backend.publicBaseURL || "").trim() || "unknown";
+    const text = [
+      "Outer Shell",
+      `Version: ${version}`,
+      `Service ID: ${backend.serviceID}`,
+      `Scope: ${backend.serviceScope}`,
+      `Status: ${backend.status}`,
+      `Update source: ${updateSource}`
+    ].join("\n");
+    openDialog(`
+      <header class="dialog-header"><div class="dialog-title-wrap"><h2 id="dialog-title">About Outer Shell</h2></div><button class="dialog-close" type="button" data-action="close-dialog" aria-label="Close">×</button></header>
+      <div class="dialog-body"><pre class="about-output">${escapeHTML(text)}</pre></div>
+      <footer class="dialog-footer"><button class="primary-button" type="button" data-action="close-dialog">OK</button></footer>`);
+  }
+
+  function openOuterShellUpdate(backend, result) {
+    const installed = String(result.installedVersion || backend.installedVersion || "").trim() || "unknown";
+    const available = String(result.availableVersion || backend.availableVersion || "").trim() || "the latest version";
+    openDialog(`
+      <header class="dialog-header"><div class="dialog-title-wrap"><h2 id="dialog-title">Update Outer Shell</h2><p>${escapeHTML(result.message || `Outer Shell ${available} is available.`)}</p></div><button class="dialog-close" type="button" data-action="close-dialog" aria-label="Close">×</button></header>
+      <div class="dialog-body"><p>Update Outer Shell from version <strong>${escapeHTML(installed)}</strong> to <strong>${escapeHTML(available)}</strong>?</p></div>
+      <footer class="dialog-footer"><button class="secondary-button" type="button" data-action="close-dialog">Cancel</button><button class="primary-button" type="button" data-action="update-outer-shell" data-backend-key="${escapeHTML(backendKey(backend))}">Update</button></footer>`);
+  }
+
+  async function checkOuterShellUpdate(key, button) {
+    const backend = findBackend(key);
+    if (!backend) return;
+    button.disabled = true;
+    const original = button.textContent;
+    button.textContent = "Checking for Updates…";
+    try {
+      const result = await control(backend, "checkUpdate");
+      if (!result.ok) throw new Error(result.message || "Could not check for updates.");
+      if (result.updateAvailable) {
+        openOuterShellUpdate(backend, result);
+      } else {
+        closeDialog();
+        toast(result.message || "Outer Shell is up to date.");
+      }
+    } catch (error) {
+      toast(error.message || String(error), true);
+      button.disabled = false;
+      button.textContent = original;
+    }
+  }
+
+  async function performOuterShellOperation(key, operation, button, reloadAfter = false) {
+    const backend = findBackend(key);
+    if (!backend) return;
+    button.disabled = true;
+    const original = button.textContent;
+    button.textContent = `${original}…`;
+    try {
+      const result = await control(backend, operation);
+      if (!result.ok) throw new Error(result.message || "The action failed.");
+      closeDialog();
+      toast(result.message);
+      if (reloadAfter) window.setTimeout(() => window.location.reload(), 1250);
+    } catch (error) {
+      toast(error.message || String(error), true);
+      button.disabled = false;
+      button.textContent = original;
+    }
+  }
+
+  async function uninstallOuterShell(key, button) {
+    if (!window.confirm("Uninstall Outer Shell?")) return;
+    await performOuterShellOperation(key, "uninstallOuterShell", button);
   }
 
   async function performControl(key, operation, button) {
@@ -863,7 +1133,15 @@
 
   function openLogs(key, selectedIndex = 0) {
     const backend = findBackend(key);
-    if (!backend || !backend.logFiles.length) return;
+    if (!backend) return;
+    if (!backend.logFiles.length) {
+      state.logSelection = null;
+      openDialog(`
+        <header class="dialog-header"><div class="dialog-title-wrap"><h2 id="dialog-title">${escapeHTML(backend.displayName)} logs</h2><p>No registered log file.</p></div><button class="dialog-close" type="button" data-action="close-dialog" aria-label="Close">×</button></header>
+        <pre class="log-output">No registered log file.</pre>`, "log-dialog");
+      restartEventWatch();
+      return;
+    }
     state.logSelection = { backendKey: key, index: Math.min(selectedIndex, backend.logFiles.length - 1) };
     openDialog(`
       <header class="dialog-header"><div class="dialog-title-wrap"><h2 id="dialog-title">${escapeHTML(backend.displayName)} logs</h2><p>Updates automatically while this window is open.</p></div><button class="dialog-close" type="button" data-action="close-dialog" aria-label="Close">×</button></header>
@@ -950,16 +1228,23 @@
     if (!identity) return;
     event.preventDefault();
     cancelLongPress();
+    cancelAppDrag();
+    clearPressFeedback();
     if (Date.now() < state.suppressLaunchUntil && elements.dialogLayer.childElementCount) return;
     openAppMenu(identity, { x: event.clientX, y: event.clientY });
   });
   document.body.addEventListener("pointerdown", beginLongPress);
   document.body.addEventListener("pointerdown", beginPressFeedback);
+  document.body.addEventListener("pointerdown", beginAppDrag);
   document.body.addEventListener("pointermove", moveLongPress);
   document.body.addEventListener("pointermove", movePressFeedback);
-  document.body.addEventListener("pointerup", () => { cancelLongPress(); clearPressFeedback(); });
-  document.body.addEventListener("pointercancel", () => { cancelLongPress(); clearPressFeedback(); });
-  document.body.addEventListener("lostpointercapture", () => { cancelLongPress(); clearPressFeedback(); });
+  document.body.addEventListener("pointermove", moveAppDrag, { passive: false });
+  document.body.addEventListener("touchmove", event => {
+    if (state.appDrag?.touchArmed || state.appDrag?.isDragging) event.preventDefault();
+  }, { passive: false });
+  document.body.addEventListener("pointerup", event => { finishAppDrag(event); cancelLongPress(); clearPressFeedback(); });
+  document.body.addEventListener("pointercancel", () => { cancelAppDrag(); cancelLongPress(); clearPressFeedback(); });
+  document.body.addEventListener("lostpointercapture", () => { cancelAppDrag(); cancelLongPress(); clearPressFeedback(); });
   document.body.addEventListener("selectstart", event => {
     if (itemIdentityFromTarget(event.target) || Date.now() < state.suppressLaunchUntil) event.preventDefault();
   });
@@ -968,10 +1253,22 @@
     if (!actionElement) return;
     if (actionElement.classList.contains("dialog-backdrop") && event.target !== actionElement) return;
     const action = actionElement.dataset.action;
+    if (Date.now() < state.suppressLaunchUntil && actionElement.closest(".app-sections")) {
+      event.preventDefault();
+      return;
+    }
     if (action === "close-dialog") { closeDialog(); return; }
     if (action === "open-add") { openAddDialog(); return; }
     if (action === "add-tab") { openAddDialog(actionElement.dataset.tab); return; }
-    if (action === "refresh-apps") { closeDialog(); await refreshBackends(); return; }
+    if (action === "about-outer-shell") { openOuterShellAbout(actionElement.dataset.backendKey); return; }
+    if (action === "check-outer-shell-update") { await checkOuterShellUpdate(actionElement.dataset.backendKey, actionElement); return; }
+    if (action === "update-outer-shell") { await performOuterShellOperation(actionElement.dataset.backendKey, "update", actionElement, true); return; }
+    if (action === "uninstall-outer-shell") { await uninstallOuterShell(actionElement.dataset.backendKey, actionElement); return; }
+    if (action === "toggle-menu-bar") {
+      const operation = actionElement.dataset.enabled === "true" ? "hideMenuBarWhenRunning" : "showMenuBarWhenRunning";
+      await performControl(actionElement.dataset.backendKey, operation, actionElement);
+      return;
+    }
     if (action === "launch-endpoint") {
       if (Date.now() < state.suppressLaunchUntil && !actionElement.closest(".context-menu")) {
         event.preventDefault();
@@ -1021,6 +1318,7 @@
     }
   });
   window.addEventListener("beforeunload", () => {
+    cancelAppDrag();
     state.stopped = true;
     state.eventAbort?.abort();
   });

@@ -1327,6 +1327,24 @@ static void send_web_file(int fd,
                      vary_outerframe_accept);
 }
 
+static void send_web_app_icon(int fd,
+                              const char *request,
+                              size_t header_length,
+                              bool send_body) {
+    if (!g_web_root_directory[0]) {
+        send_text_response(fd, 404, "Outer Shell web frontend is not installed.\n");
+        return;
+    }
+
+    char path[PATH_MAX];
+    int written = snprintf(path, sizeof(path), "%s/../app-icon.png", g_web_root_directory);
+    if (written < 0 || (size_t)written >= sizeof(path)) {
+        send_text_response(fd, 404, "not found\n");
+        return;
+    }
+    send_cached_file(fd, path, "image/png", request, header_length, send_body, false);
+}
+
 static bool archive_append_u16(StringBuilder *archive, uint16_t value) {
     unsigned char bytes[2];
     write_uint16_le(bytes, value);
@@ -1905,6 +1923,7 @@ static uint16_t ui_route_for_http_request(const char *method, const char *target
     if (strcasecmp(method, "POST") == 0) {
         if (strcmp(target, "/api/control") == 0) return OUTERSHELLD_UI_ROUTE_CONTROL;
         if (strcmp(target, "/api/create") == 0) return OUTERSHELLD_UI_ROUTE_CREATE;
+        if (strcmp(target, "/api/icon-observation") == 0) return OUTERSHELLD_UI_ROUTE_ICON_OBSERVATION;
         return OUTERSHELLD_UI_ROUTE_NONE;
     }
     if (strcasecmp(method, "GET") == 0 || strcasecmp(method, "HEAD") == 0) {
@@ -2087,6 +2106,8 @@ static bool process_http_client_request(ReactorClient *client, char *request, si
     } else if (strcmp(target, "/web/app.js") == 0) {
         send_web_file(fd, "app.js", "text/javascript; charset=utf-8",
                       request, header_length, strcasecmp(method, "HEAD") != 0, false);
+    } else if (strcmp(target, "/web/favicon.png") == 0) {
+        send_web_app_icon(fd, request, header_length, strcasecmp(method, "HEAD") != 0);
     } else {
         char bundle_path[PATH_MAX];
         char bundle_path_macos_arm[PATH_MAX];

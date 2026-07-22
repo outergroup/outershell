@@ -190,4 +190,6 @@ essential-service exits, and shutdown.
 
 - `custom-backend-integration.md`: how custom shell-command apps are generated
   and installed.
+- `outerloop-icon-observation.md`: the Outer Loop/Outer Shell icon-discovery
+  navigation protocol.
 - `Resources/README.md`: release asset and app archive layouts.

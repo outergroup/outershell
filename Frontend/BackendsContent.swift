@@ -85,6 +85,7 @@ private struct FrontendRecord {
     let iconPath: String?
     let iconByteCount: Int
     let iconCGImage: CGImage?
+    let iconObservationToken: String
     let list: String?
     let isRunning: Bool
 
@@ -319,6 +320,7 @@ private extension FrontendRecord {
                               iconPath: emptyToNil(try reader.stringRef(at: 24)),
                               iconByteCount: iconData.count,
                               iconCGImage: decodedIconCGImage(iconData),
+                              iconObservationToken: reader.data.count >= 72 ? try reader.stringRef(at: 64) : "",
                               list: emptyToNil(try reader.stringRef(at: 40)),
                               isRunning: (flags & 0x01) != 0)
     }
@@ -5573,6 +5575,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                       iconPath: frontend.iconPath,
                                       iconByteCount: frontend.iconByteCount,
                                       iconCGImage: frontend.iconCGImage,
+                                      iconObservationToken: frontend.iconObservationToken,
                                       list: listName.isEmpty ? nil : listName,
                                       isRunning: frontend.isRunning)
             }
@@ -5620,7 +5623,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                          opensInNewWindow: opensInNewWindow)
             return
         }
-        guard let url = frontendNavigationURL(endpoint) else {
+        guard let url = launcherNavigationURL(endpoint) else {
             startAndOpenLauncherEndpoint(endpoint,
                                          displayName: displayName,
                                          opensInNewTab: opensInNewTab,
@@ -5750,7 +5753,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                     if let nextEndpoint = self.findLauncherEndpoint(serviceID: endpoint.backend.serviceID,
                                                                     serviceScope: endpoint.backend.serviceScope,
                                                                     frontendID: endpoint.frontend.id),
-                       let url = self.frontendNavigationURL(nextEndpoint),
+                       let url = self.launcherNavigationURL(nextEndpoint),
                        self.endpointIsReadyToOpen(nextEndpoint) {
                         self.backendError = ""
                         self.updateLayout()
@@ -9559,6 +9562,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 item.frontend.isRunning ? "running" : "stopped",
                 item.frontend.iconPath ?? "",
                 String(iconBytes),
+                item.frontend.iconObservationToken,
                 item.frontend.listName,
                 item.userEndpoint.map { frontendIdentityKey(backend: $0.backend, frontend: $0.frontend, frontendIndex: $0.frontendIndex) } ?? "",
                 item.userEndpoint?.backend.status ?? "",
@@ -10071,6 +10075,29 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
     private func frontendNavigationURL(_ endpoint: AppLauncherEndpoint) -> URL? {
         frontendNavigationURL(endpoint.frontend)
+    }
+
+    private func launcherNavigationURL(_ endpoint: AppLauncherEndpoint) -> URL? {
+        guard let targetURL = frontendNavigationURL(endpoint) else { return nil }
+        let token = endpoint.frontend.iconObservationToken
+        guard endpoint.frontend.iconCGImage == nil,
+              !token.isEmpty,
+              let backendsEndpoint,
+              var callbackComponents = URLComponents(url: backendsEndpoint, resolvingAgainstBaseURL: false) else {
+            return targetURL
+        }
+        callbackComponents.path = "/api/icon-observation"
+        callbackComponents.queryItems = [URLQueryItem(name: "token", value: token)]
+        guard let callbackURL = callbackComponents.url else { return targetURL }
+
+        var observationComponents = URLComponents()
+        observationComponents.scheme = "outerloop"
+        observationComponents.host = "observe-page-icon"
+        observationComponents.queryItems = [
+            URLQueryItem(name: "url", value: targetURL.absoluteString),
+            URLQueryItem(name: "callback", value: callbackURL.absoluteString)
+        ]
+        return observationComponents.url ?? targetURL
     }
 
     private func frontendNavigationURL(_ frontend: FrontendRecord) -> URL? {

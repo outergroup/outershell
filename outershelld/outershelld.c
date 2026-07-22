@@ -3379,6 +3379,20 @@ static bool registry_store_upsert_layout(RegistryStore *store, const char *url, 
     return registry_assign_string(&record->list, list);
 }
 
+static void registry_store_remove_layout(RegistryStore *store, const char *key) {
+    if (!store || !key || !key[0]) return;
+    for (size_t index = store->layout_count; index > 0; index--) {
+        RegistryFrontendLayoutRecord *record = &store->layouts[index - 1];
+        if (strcmp(record->url ? record->url : "", key) != 0) continue;
+        free(record->url);
+        free(record->list);
+        memmove(record,
+                record + 1,
+                (store->layout_count - index) * sizeof(*record));
+        store->layout_count--;
+    }
+}
+
 static bool registry_store_upsert_log(RegistryStore *store, const char *path, const char *service_id) {
     RegistryLogFileRecord *record = registry_store_find_log_by_path(store, path);
     if (!record) {
@@ -4158,6 +4172,89 @@ static bool registry_store_open_system_readonly(RegistryStore *store, char *erro
 
 static bool registry_store_open_user_readwrite(RegistryStore *store, char *error, size_t error_size) {
     return registry_store_open_at(store, g_registry_database_path, true, error, error_size);
+}
+
+typedef struct IconObservationCapability {
+    char token[33];
+    char registry_path[PATH_MAX];
+    char service_id[PATH_MAX];
+    char frontend_id[PATH_MAX * 2];
+    struct IconObservationCapability *next;
+} IconObservationCapability;
+
+static IconObservationCapability *g_icon_observation_capabilities = NULL;
+
+static bool fill_random_bytes(unsigned char *bytes, size_t length) {
+    int fd = open("/dev/urandom", O_RDONLY);
+    if (fd < 0) return false;
+    size_t offset = 0;
+    while (offset < length) {
+        ssize_t count = read(fd, bytes + offset, length - offset);
+        if (count > 0) {
+            offset += (size_t)count;
+        } else if (count < 0 && errno == EINTR) {
+            continue;
+        } else {
+            close(fd);
+            return false;
+        }
+    }
+    close(fd);
+    return true;
+}
+
+static bool registry_store_is_primary(const RegistryStore *database) {
+    if (!database || !database->binary_path[0]) return false;
+    char primary_path[PATH_MAX];
+    return registry_binary_output_path(g_registry_database_path, primary_path, sizeof(primary_path)) &&
+           strcmp(database->binary_path, primary_path) == 0;
+}
+
+static const char *icon_observation_capability_token(const RegistryStore *database,
+                                                     const RegistryFrontendRecord *frontend) {
+    if (!database || !frontend || !frontend->frontend_id || !frontend->frontend_id[0] ||
+        (frontend->icon_path && frontend->icon_path[0]) ||
+        !registry_store_is_primary(database)) {
+        return "";
+    }
+    for (IconObservationCapability *capability = g_icon_observation_capabilities;
+         capability;
+         capability = capability->next) {
+        if (strcmp(capability->registry_path, database->binary_path) == 0 &&
+            strcmp(capability->frontend_id, frontend->frontend_id) == 0) {
+            return capability->token;
+        }
+    }
+
+    unsigned char random_bytes[16];
+    if (!fill_random_bytes(random_bytes, sizeof(random_bytes))) return "";
+    IconObservationCapability *capability = calloc(1, sizeof(*capability));
+    if (!capability) return "";
+    static const char hex[] = "0123456789abcdef";
+    for (size_t index = 0; index < sizeof(random_bytes); index++) {
+        capability->token[index * 2] = hex[random_bytes[index] >> 4];
+        capability->token[index * 2 + 1] = hex[random_bytes[index] & 0x0f];
+    }
+    capability->token[32] = '\0';
+    snprintf(capability->registry_path, sizeof(capability->registry_path), "%s", database->binary_path);
+    snprintf(capability->service_id,
+             sizeof(capability->service_id),
+             "%s",
+             frontend->service_id ? frontend->service_id : "");
+    snprintf(capability->frontend_id, sizeof(capability->frontend_id), "%s", frontend->frontend_id);
+    capability->next = g_icon_observation_capabilities;
+    g_icon_observation_capabilities = capability;
+    return capability->token;
+}
+
+static IconObservationCapability *icon_observation_capability_for_token(const char *token) {
+    if (!token || strlen(token) != 32) return NULL;
+    for (IconObservationCapability *capability = g_icon_observation_capabilities;
+         capability;
+         capability = capability->next) {
+        if (strcmp(capability->token, token) == 0) return capability;
+    }
+    return NULL;
 }
 
 static bool registry_store_upgrade_current(char *error, size_t error_size) {
@@ -5351,13 +5448,14 @@ static bool build_frontend_payload(const char *name,
                                    const char *icon_path,
                                    const char *list,
                                    bool running,
+                                   const char *icon_observation_token,
                                    StringBuilder *payload) {
     char cached_icon_path[PATH_MAX];
     const char *icon_data_path = frontend_icon_data_path(icon_path,
                                                          list,
                                                          cached_icon_path,
                                                          sizeof(cached_icon_path));
-    if (!binary_append_zero(payload, 64)) return false;
+    if (!binary_append_zero(payload, 72)) return false;
     return binary_append_string_ref_at(payload, 0, name) &&
            binary_append_string_ref_at(payload, 8, url) &&
            binary_append_string_ref_at(payload, 16, socket_path) &&
@@ -5366,7 +5464,8 @@ static bool build_frontend_payload(const char *name,
            binary_append_string_ref_at(payload, 40, list) &&
            binary_write_u32_at(payload, 48, (uint32_t)(port < 0 ? 0 : port)) &&
            binary_append_string_ref_at(payload, 52, frontend_id) &&
-           binary_write_u32_at(payload, 60, running ? FRONTEND_FLAG_RUNNING : 0);
+           binary_write_u32_at(payload, 60, running ? FRONTEND_FLAG_RUNNING : 0) &&
+           binary_append_string_ref_at(payload, 64, icon_observation_token);
 }
 
 static bool build_log_file_payload(const char *service_id,
@@ -5465,6 +5564,7 @@ static bool build_frontends_array_payload(const RegistryStore *database,
                                     record->icon_path,
                                     has_layout ? layout_list : suggested_list,
                                     frontend_running,
+                                    icon_observation_capability_token(database, record),
                                     &payload) &&
              binary_payload_list_append(&list, &payload);
         if (!ok) free(payload.data);
@@ -6008,6 +6108,106 @@ static void send_action_response(int fd, int status, bool ok_value, const char *
     send_action_response_ex(fd, status, ok_value, message, false);
 }
 
+static void send_icon_observation_response(int fd,
+                                           const char *query,
+                                           const char *body,
+                                           size_t body_length) {
+    char token[64] = "";
+    if (!query_value(query, "token", token, sizeof(token))) {
+        send_action_response(fd, 400, false, "Missing icon observation token.");
+        return;
+    }
+    IconObservationCapability *capability = icon_observation_capability_for_token(token);
+    if (!capability) {
+        send_action_response(fd, 403, false, "Invalid icon observation token.");
+        return;
+    }
+    if (!body || body_length == 0 || body_length > 48u * 1024u) {
+        send_action_response(fd, 400, false, "Icon must be a non-empty PNG no larger than 48 KiB.");
+        return;
+    }
+
+    char error[512] = "";
+    RegistryStore database;
+    if (!registry_store_open_at(&database, capability->registry_path, true, error, sizeof(error))) {
+        send_action_response(fd, 500, false, error[0] ? error : "Could not open the app registry.");
+        return;
+    }
+    RegistryFrontendRecord *frontend = registry_store_find_frontend(&database, capability->frontend_id);
+    if (!frontend ||
+        strcmp(frontend->service_id ? frontend->service_id : "", capability->service_id) != 0) {
+        registry_store_close(&database, false, error, sizeof(error));
+        send_action_response(fd, 404, false, "The app for this icon observation no longer exists.");
+        return;
+    }
+    if (frontend->icon_path && frontend->icon_path[0]) {
+        registry_store_close(&database, false, error, sizeof(error));
+        send_action_response(fd, 200, true, "The app already has an icon.");
+        return;
+    }
+
+    char root[PATH_MAX];
+    char icon_directory[PATH_MAX];
+    char destination[PATH_MAX];
+    char temporary_path[PATH_MAX];
+    default_user_outershell_root(root, sizeof(root));
+    int directory_length = snprintf(icon_directory, sizeof(icon_directory), "%s/icons/discovered", root);
+    int destination_length = snprintf(destination, sizeof(destination), "%s/%s.png", icon_directory, token);
+    int temporary_length = snprintf(temporary_path, sizeof(temporary_path), "%s/.%s.XXXXXX", icon_directory, token);
+    if (directory_length < 0 || (size_t)directory_length >= sizeof(icon_directory) ||
+        destination_length < 0 || (size_t)destination_length >= sizeof(destination) ||
+        temporary_length < 0 || (size_t)temporary_length >= sizeof(temporary_path) ||
+        !mkdir_p(icon_directory)) {
+        registry_store_close(&database, false, error, sizeof(error));
+        send_action_response(fd, 500, false, "Could not create the discovered icon directory.");
+        return;
+    }
+
+    int icon_fd = mkstemp(temporary_path);
+    bool wrote_icon = icon_fd >= 0 && queue_all(icon_fd, body, body_length);
+    if (icon_fd >= 0) {
+        if (wrote_icon && fsync(icon_fd) != 0) wrote_icon = false;
+        if (close(icon_fd) != 0) wrote_icon = false;
+    }
+    if (!wrote_icon) {
+        unlink(temporary_path);
+        registry_store_close(&database, false, error, sizeof(error));
+        send_action_response(fd, 500, false, "Could not save the discovered icon.");
+        return;
+    }
+    chmod(temporary_path, 0644);
+
+    size_t width = 0;
+    size_t height = 0;
+    if (!outer_shell_png_dimensions(temporary_path, &width, &height, error, sizeof(error)) ||
+        width == 0 || height == 0 || width > 4096 || height > 4096) {
+        unlink(temporary_path);
+        registry_store_close(&database, false, error, sizeof(error));
+        send_action_response(fd, 400, false, "The observed icon is not a valid PNG of a supported size.");
+        return;
+    }
+    if (rename(temporary_path, destination) != 0) {
+        unlink(temporary_path);
+        registry_store_close(&database, false, error, sizeof(error));
+        send_action_response(fd, 500, false, "Could not install the discovered icon.");
+        return;
+    }
+    if (!registry_assign_string(&frontend->icon_path, destination)) {
+        unlink(destination);
+        registry_store_close(&database, false, error, sizeof(error));
+        send_action_response(fd, 500, false, "Out of memory while assigning the discovered icon.");
+        return;
+    }
+    if (!registry_store_close(&database, true, error, sizeof(error))) {
+        unlink(destination);
+        send_action_response(fd, 500, false, error[0] ? error : "Could not update the app registry.");
+        return;
+    }
+
+    mark_backend_event_changed();
+    send_action_response(fd, 200, true, "Discovered icon saved.");
+}
+
 static bool install_bundled_app(const BundledAppDefinition *app,
                                 const char *scope,
                                 const char *stage_root,
@@ -6054,9 +6254,18 @@ static bool update_frontend_layout_in_user_registry(const char *frontend_id,
                                                     size_t error_size) {
     RegistryStore database;
     if (!registry_store_open_user_readwrite(&database, error, error_size)) return false;
+    const char *layout_key = (frontend_id && frontend_id[0])
+        ? frontend_id
+        : ((frontend_url && frontend_url[0]) ? frontend_url : "");
     bool ok = registry_store_upsert_layout(&database,
-                                           (frontend_url && frontend_url[0]) ? frontend_url : (frontend_id ? frontend_id : ""),
+                                           layout_key,
                                            list_name ? list_name : "");
+    if (ok && frontend_id && frontend_id[0] && frontend_url && frontend_url[0] && strcmp(frontend_id, frontend_url) != 0) {
+        /* Older versions keyed manual layout by URL. URLs such as "/" are shared by
+           many socket-backed apps, so retaining that row makes one drag relabel all
+           of them. A stable frontend ID supersedes and safely removes that fallback. */
+        registry_store_remove_layout(&database, frontend_url);
+    }
     if (!ok) snprintf(error, error_size, "Out of memory.");
     return registry_store_close(&database, ok, error, error_size) && ok;
 }
@@ -13237,6 +13446,9 @@ static void process_ui_route_request(uint16_t route, const char *query, const ch
         break;
     case OUTERSHELLD_UI_ROUTE_FILE_PICKER:
         send_file_picker_response(-1, query);
+        break;
+    case OUTERSHELLD_UI_ROUTE_ICON_OBSERVATION:
+        send_icon_observation_response(-1, query, body, body_length);
         break;
     default:
         send_text_response(-1, 400, "unsupported UI API route\n");
