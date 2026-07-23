@@ -32,7 +32,7 @@ macos/              Xcode bundle project, when enabled
 server/             shared HTTP server and API, generated as Go or C
 artifacts/          compiled platform payloads; macOS builds land here
 deploy/             host/container service definitions and install scripts
-Dockerfile          runtime image, for containerized apps
+Dockerfile          OCI runtime image recipe, for containerized apps
 ```
 
 This directory is user-owned canonical source. New App defaults to
@@ -87,6 +87,13 @@ For a containerized app, exercise the exact public-web image locally:
 ./app run-container
 ```
 
+Backend cross-builds, build matrices, local image builds, and `run-container`
+support both Apple's `container` tool and Docker. Automatic selection prefers
+Apple `container` on macOS and Docker elsewhere. Set
+`OUTER_BUILD_CONTAINER_RUNTIME=container` or
+`OUTER_BUILD_CONTAINER_RUNTIME=docker` to override that choice. Docker Desktop
+is not required on a Mac with Apple `container`.
+
 ## Private Outer Shell deployment
 
 New App installs this project on the current server and performs the first
@@ -117,10 +124,10 @@ assets are part of the image.
 
 ## Open-web deployment
 
-Containerized apps use the same standard Dockerfile on private hosts and
-public container platforms. The entrypoint listens on `$PORT` when supplied,
-or port 8080 otherwise. The image and task runner do not select or require a
-hosting provider.
+Containerized apps use the same standard OCI/Dockerfile recipe on private hosts,
+Apple `container`, and public container platforms. The entrypoint listens on
+`$PORT` when supplied, or port 8080 otherwise. The image and task runner do not
+select or require a hosting provider.
 
 Web deployment is a small Bash plugin interface. List the adapters available to
 this project, then choose one explicitly:
@@ -156,10 +163,12 @@ shell or by a coding agent.
 ```text
 ./app build             build the selected platforms and server/container
 ./app build-platforms   stage every selected platform
+./app build-matrix      build the Linux architecture/libc variants
 ./app deploy            build and deploy from this server project
 ./app accept-platform   accept output from a platform build machine
 ./app web-providers     list installed web deployment adapters
 ./app deploy-web NAME   deploy through a selected provider adapter
+./app run-container     build and run the public-web image locally
 ./app logs              follow private-server logs
 ./app status            inspect the private service
 ./app uninstall         remove the private deployment

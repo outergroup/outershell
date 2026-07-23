@@ -24,6 +24,83 @@ require_tool() {
     }
 }
 
+BUILD_CONTAINER_RUNTIME=""
+
+apple_container_is_ready() {
+    command -v container >/dev/null 2>&1 &&
+        container system status >/dev/null 2>&1
+}
+
+docker_is_ready() {
+    command -v docker >/dev/null 2>&1 &&
+        docker info >/dev/null 2>&1
+}
+
+select_build_container_runtime() {
+    case "${OUTER_BUILD_CONTAINER_RUNTIME:-auto}" in
+        auto)
+            if [[ "$(uname -s)" == Darwin ]] && apple_container_is_ready; then
+                BUILD_CONTAINER_RUNTIME=container
+            elif docker_is_ready; then
+                BUILD_CONTAINER_RUNTIME=docker
+            elif apple_container_is_ready; then
+                BUILD_CONTAINER_RUNTIME=container
+            else
+                return 1
+            fi
+            ;;
+        container)
+            apple_container_is_ready || return 1
+            BUILD_CONTAINER_RUNTIME=container
+            ;;
+        docker)
+            docker_is_ready || return 1
+            BUILD_CONTAINER_RUNTIME=docker
+            ;;
+        *)
+            echo "error: OUTER_BUILD_CONTAINER_RUNTIME must be auto, container, or docker" >&2
+            return 2
+            ;;
+    esac
+}
+
+require_build_container_runtime() {
+    select_build_container_runtime && return 0
+    local status=$?
+    [[ "${status}" -ne 2 ]] || exit 1
+    echo "error: no supported build container runtime is ready" >&2
+    echo "       start Apple container or Docker, or set OUTER_BUILD_CONTAINER_RUNTIME" >&2
+    exit 1
+}
+
+prepare_linux_source_archives() {
+    local curl_version="${OUTER_SHELL_CURL_VERSION:-8.20.0}"
+    local curl_url="${OUTER_SHELL_CURL_SOURCE_URL:-https://curl.se/download/curl-${curl_version}.tar.gz}"
+    local deps_root="${ROOT}/build/linux-deps-musl/${TARGET_ARCH}"
+    local curl_prefix="${deps_root}/curl-${curl_version}-install"
+    local curl_archive="${deps_root}/curl-${curl_version}.tar.gz"
+    local curl_download="${curl_archive}.download"
+
+    if [[ -f "${curl_prefix}/lib/libcurl.a" && -f "${curl_prefix}/include/curl/curl.h" ]]; then
+        return
+    fi
+    if [[ ! -f "${curl_archive}" ]]; then
+        require_tool curl
+        mkdir -p "${deps_root}"
+        echo "==> Downloading curl ${curl_version}"
+        curl --fail --location --silent --show-error \
+            --output "${curl_download}" "${curl_url}"
+        mv "${curl_download}" "${curl_archive}"
+    fi
+}
+
+ensure_internal_container_network() {
+    local network="$1"
+    if ! container network list --quiet | grep -Fxq "${network}"; then
+        container network create --internal "${network}" >/dev/null
+    fi
+}
+
 shell_quote() {
     local value="$1"
     printf "'%s'" "${value//\'/\'\\\'\'}"
@@ -127,15 +204,45 @@ cmd_build_frontend() {
 }
 
 build_linux_target() {
-    require_tool docker
-    local image="alpine:3.20" platform
+    require_build_container_runtime
+    local image="outer-shell-linux-toolchain-${TARGET_ARCH}"
+    local network="${image}-internal"
+    local platform
     [[ "${TARGET_ARCH}" == aarch64 ]] && platform=linux/arm64 || platform=linux/amd64
+    prepare_linux_source_archives
     echo "==> Building Outer Shell for Linux/${TARGET_ARCH} with musl"
-    docker run --rm --platform "${platform}" \
-        -v "${ROOT}:/work" \
-        -w /work \
-        "${image}" \
-        sh -lc 'apk add --no-cache bash build-base openssl-dev openssl-libs-static zlib-dev zlib-static libpng-dev libpng-static wget && ln -sf /lib/libz.a /usr/lib/libz.a && OUTER_SHELL_LINUX_LIBC=musl bash ./Scripts/build_linux_resources.sh'
+    if [[ "${BUILD_CONTAINER_RUNTIME}" == container ]]; then
+        container build --progress plain --platform "${platform}" \
+            --file "${ROOT}/Container/OuterShellLinux/Containerfile" \
+            --tag "${image}" \
+            "${ROOT}/Container/OuterShellLinux"
+        ensure_internal_container_network "${network}"
+        container run --rm --platform "${platform}" \
+            --network "${network}" \
+            --mount "type=bind,source=${ROOT}/Backend,target=/work/Backend,readonly" \
+            --mount "type=bind,source=${ROOT}/outershelld,target=/work/outershelld,readonly" \
+            --mount "type=bind,source=${ROOT}/Resources,target=/work/Resources,readonly" \
+            --mount "type=bind,source=${ROOT}/Scripts,target=/work/Scripts,readonly" \
+            --mount "type=bind,source=${ROOT}/build,target=/work/build" \
+            --workdir /work \
+            "${image}" \
+            bash -lc 'OUTER_SHELL_LINUX_LIBC=musl ./Scripts/build_linux_resources.sh'
+    else
+        docker build --platform "${platform}" \
+            --file "${ROOT}/Container/OuterShellLinux/Containerfile" \
+            --tag "${image}" \
+            "${ROOT}/Container/OuterShellLinux"
+        docker run --rm --platform "${platform}" \
+            --network none \
+            --mount "type=bind,source=${ROOT}/Backend,target=/work/Backend,readonly" \
+            --mount "type=bind,source=${ROOT}/outershelld,target=/work/outershelld,readonly" \
+            --mount "type=bind,source=${ROOT}/Resources,target=/work/Resources,readonly" \
+            --mount "type=bind,source=${ROOT}/Scripts,target=/work/Scripts,readonly" \
+            --mount "type=bind,source=${ROOT}/build,target=/work/build" \
+            --workdir /work \
+            "${image}" \
+            bash -lc 'OUTER_SHELL_LINUX_LIBC=musl ./Scripts/build_linux_resources.sh'
+    fi
 }
 
 archive_frontend_symbols() {
@@ -289,6 +396,9 @@ Outer Shell development tasks
   ./app ssh [command]     open a shell or run a target command
   ./app uninstall         uninstall Outer Shell from the target
   ./app clean             remove direct-deploy build products
+
+Builds auto-select Apple container on macOS and Docker elsewhere.
+Set OUTER_BUILD_CONTAINER_RUNTIME=container|docker to override.
 EOF
 }
 

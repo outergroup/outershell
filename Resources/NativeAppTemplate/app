@@ -23,6 +23,7 @@ DERIVED_DATA_DIR="${BUILD_DIR}/DerivedData"
 LINUX_MATRIX_DIR="${BUILD_DIR}/linux-matrix"
 LOCAL_PORT="${LOCAL_PORT:-8787}"
 CONTAINER_IMAGE="outerframe-app-$(printf '%s' "${APP_ID}" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9._-]/-/g')"
+BUILD_CONTAINER_RUNTIME=""
 
 # Server-side locations. Must agree with deploy/app.service.in and the
 # deploy/remote-*.sh scripts.
@@ -184,6 +185,75 @@ require_tool() {
     fi
 }
 
+apple_container_is_ready() {
+    command -v container >/dev/null 2>&1 &&
+        container system status >/dev/null 2>&1
+}
+
+require_apple_container() {
+    require_tool container
+    if ! container system status >/dev/null 2>&1; then
+        echo "error: the container service is not running; run 'container system start'" >&2
+        exit 1
+    fi
+}
+
+docker_is_ready() {
+    command -v docker >/dev/null 2>&1 &&
+        docker info >/dev/null 2>&1
+}
+
+select_build_container_runtime() {
+    case "${OUTER_BUILD_CONTAINER_RUNTIME:-auto}" in
+        auto)
+            if [[ "$(uname -s)" == Darwin ]] && apple_container_is_ready; then
+                BUILD_CONTAINER_RUNTIME=container
+            elif docker_is_ready; then
+                BUILD_CONTAINER_RUNTIME=docker
+            elif apple_container_is_ready; then
+                BUILD_CONTAINER_RUNTIME=container
+            else
+                return 1
+            fi
+            ;;
+        container)
+            apple_container_is_ready || return 1
+            BUILD_CONTAINER_RUNTIME=container
+            ;;
+        docker)
+            docker_is_ready || return 1
+            BUILD_CONTAINER_RUNTIME=docker
+            ;;
+        *)
+            echo "error: OUTER_BUILD_CONTAINER_RUNTIME must be auto, container, or docker" >&2
+            return 2
+            ;;
+    esac
+}
+
+build_container_runtime_is_ready() {
+    select_build_container_runtime && return 0
+    local status=$?
+    [[ "${status}" -ne 2 ]] || exit 1
+    return "${status}"
+}
+
+require_build_container_runtime() {
+    select_build_container_runtime && return 0
+    local status=$?
+    [[ "${status}" -ne 2 ]] || exit 1
+    echo "error: no supported build container runtime is ready" >&2
+    echo "       start Apple container or Docker, or set OUTER_BUILD_CONTAINER_RUNTIME" >&2
+    exit 1
+}
+
+ensure_internal_container_network() {
+    local network="$1"
+    if ! container network list --quiet | grep -Fxq "${network}"; then
+        container network create --internal "${network}" >/dev/null
+    fi
+}
+
 bundle_executable_name() {
     local bundle_path="$1"
     local info_plist="${bundle_path}/Contents/Info.plist"
@@ -318,8 +388,61 @@ cmd_build_platforms() {
 # Backend build
 # ---------------------------------------------------------------------------
 
-DOCKER_IMAGE_TAG="app-backend-toolchain-$(printf '%s' "${APP_ID}" \
+BACKEND_TOOLCHAIN_IMAGE="app-backend-toolchain-$(printf '%s' "${APP_ID}" \
     | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9._-]/-/g')"
+BACKEND_BUILD_NETWORK="${BACKEND_TOOLCHAIN_IMAGE}-internal"
+
+prepare_go_module_cache() {
+    local module_manifest="${BUILD_DIR}/go-module-manifest"
+    local module_cache="${BUILD_DIR}/go-module-cache"
+
+    rm -rf "${module_manifest}"
+    mkdir -p "${module_manifest}" "${module_cache}"
+    install -m 0644 "${ROOT}/server/go.mod" "${module_manifest}/go.mod"
+    if [[ -f "${ROOT}/server/go.sum" ]]; then
+        install -m 0644 "${ROOT}/server/go.sum" "${module_manifest}/go.sum"
+    fi
+
+    container run --rm \
+        --mount "type=bind,source=${module_manifest},target=/module" \
+        --mount "type=bind,source=${module_cache},target=/gomodcache" \
+        --workdir /module \
+        --env GOMODCACHE=/gomodcache \
+        "${BACKEND_TOOLCHAIN_IMAGE}" \
+        go mod download
+}
+
+backend_build_go_in_apple_container() {
+    local goos="$1"
+    local goarch="$2"
+    local output="$3"
+    local go_cache="${BUILD_DIR}/go-cache"
+    local module_cache="${BUILD_DIR}/go-module-cache"
+
+    require_apple_container
+    mkdir -p "$(dirname "${output}")" "${go_cache}" "${module_cache}"
+
+    container build --progress plain \
+        --tag "${BACKEND_TOOLCHAIN_IMAGE}" \
+        "${ROOT}/server"
+    prepare_go_module_cache
+    ensure_internal_container_network "${BACKEND_BUILD_NETWORK}"
+
+    container run --rm \
+        --network "${BACKEND_BUILD_NETWORK}" \
+        --mount "type=bind,source=${ROOT}/server,target=/src,readonly" \
+        --mount "type=bind,source=$(dirname "${output}"),target=/out" \
+        --mount "type=bind,source=${go_cache},target=/gocache" \
+        --mount "type=bind,source=${module_cache},target=/gomodcache" \
+        --workdir /src \
+        --env CGO_ENABLED=0 \
+        --env GOOS="${goos}" \
+        --env GOARCH="${goarch}" \
+        --env GOCACHE=/gocache \
+        --env GOMODCACHE=/gomodcache \
+        "${BACKEND_TOOLCHAIN_IMAGE}" \
+        go build -trimpath -ldflags="-s -w" -o "/out/$(basename "${output}")" .
+}
 
 backend_build_go_in_docker() {
     local goos="$1"
@@ -329,9 +452,7 @@ backend_build_go_in_docker() {
     require_tool docker
     mkdir -p "$(dirname "${output}")"
 
-    docker build -q -t "${DOCKER_IMAGE_TAG}" "${ROOT}/server" >/dev/null
-
-    # The named volume keeps Go's build cache warm between runs.
+    docker build -q -t "${BACKEND_TOOLCHAIN_IMAGE}" "${ROOT}/server" >/dev/null
     docker run --rm \
         -v "${ROOT}/server":/src \
         -v "$(dirname "${output}")":/out \
@@ -341,8 +462,17 @@ backend_build_go_in_docker() {
         -e GOOS="${goos}" \
         -e GOARCH="${goarch}" \
         -e GOCACHE=/gocache \
-        "${DOCKER_IMAGE_TAG}" \
+        "${BACKEND_TOOLCHAIN_IMAGE}" \
         go build -trimpath -ldflags="-s -w" -o "/out/$(basename "${output}")" .
+}
+
+backend_build_go_in_selected_container() {
+    require_build_container_runtime
+    if [[ "${BUILD_CONTAINER_RUNTIME}" == container ]]; then
+        backend_build_go_in_apple_container "$@"
+    else
+        backend_build_go_in_docker "$@"
+    fi
 }
 
 linux_backend_image() {
@@ -386,10 +516,40 @@ backend_build_c_linux_in_docker() {
         bash -lc 'make LDFLAGS= && strip --strip-unneeded "$OUTPUT"'
 }
 
+backend_build_c_linux_in_apple_container() {
+    local libc="$1" arch="$2" output="$3"
+    local image platform
+    image="$(linux_backend_image "${libc}" "${arch}")"
+    platform="$(linux_backend_platform "${arch}")"
+    require_apple_container
+    ensure_internal_container_network "${BACKEND_BUILD_NETWORK}"
+    mkdir -p "$(dirname "${output}")"
+
+    echo "==> Building C backend for Linux/${arch}/${libc}"
+    container run --rm --platform "${platform}" \
+        --network "${BACKEND_BUILD_NETWORK}" \
+        --mount "type=bind,source=${ROOT}/server,target=/src,readonly" \
+        --mount "type=bind,source=$(dirname "${output}"),target=/out" \
+        --workdir /src \
+        --env CC=gcc \
+        --env "OUTPUT=/out/$(basename "${output}")" \
+        "${image}" \
+        bash -lc 'make LDFLAGS= && strip --strip-unneeded "$OUTPUT"'
+}
+
+backend_build_c_linux_in_selected_container() {
+    require_build_container_runtime
+    if [[ "${BUILD_CONTAINER_RUNTIME}" == container ]]; then
+        backend_build_c_linux_in_apple_container "$@"
+    else
+        backend_build_c_linux_in_docker "$@"
+    fi
+}
+
 backend_build_c_on_target() {
     local output="$1"
     local remote_build=".cache/outershell-app-build/${APP_ID}"
-    echo "==> Docker is unavailable; building C backend on the ${TARGET_ARCH}/${TARGET_LIBC} target"
+    echo "==> Build container is unavailable; building C backend on the ${TARGET_ARCH}/${TARGET_LIBC} target"
     COPYFILE_DISABLE=1 tar czf - -C "${ROOT}" server | run_ssh "
         set -e
         rm -rf \"\$HOME/${remote_build}\"
@@ -450,7 +610,7 @@ cmd_build_backend() {
                 if command -v go >/dev/null 2>&1; then
                     (cd "${ROOT}/server" && CGO_ENABLED=0 go build -o "${PAYLOAD_DIR}/${BACKEND_EXECUTABLE_NAME}" .)
                 else
-                    backend_build_go_in_docker darwin "${host_arch}" "${PAYLOAD_DIR}/${BACKEND_EXECUTABLE_NAME}"
+                    backend_build_go_in_selected_container darwin "${host_arch}" "${PAYLOAD_DIR}/${BACKEND_EXECUTABLE_NAME}"
                 fi
                 ;;
             c)
@@ -473,11 +633,11 @@ cmd_build_backend() {
             local goarch
             goarch="$(linux_arch_to_goarch "${TARGET_ARCH}")"
             echo "==> Building Go backend for Linux/${TARGET_ARCH}"
-            backend_build_go_in_docker linux "${goarch}" "${PAYLOAD_DIR}/${BACKEND_EXECUTABLE_NAME}"
+            backend_build_go_in_selected_container linux "${goarch}" "${PAYLOAD_DIR}/${BACKEND_EXECUTABLE_NAME}"
             ;;
         c)
-            if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
-                backend_build_c_linux_in_docker "${TARGET_LIBC}" "${TARGET_ARCH}" "${PAYLOAD_DIR}/${BACKEND_EXECUTABLE_NAME}"
+            if build_container_runtime_is_ready; then
+                backend_build_c_linux_in_selected_container "${TARGET_LIBC}" "${TARGET_ARCH}" "${PAYLOAD_DIR}/${BACKEND_EXECUTABLE_NAME}"
             else
                 backend_build_c_on_target "${PAYLOAD_DIR}/${BACKEND_EXECUTABLE_NAME}"
             fi
@@ -490,8 +650,7 @@ cmd_build_backend() {
 }
 
 cmd_build_matrix() {
-    require_tool docker
-    docker info >/dev/null
+    require_build_container_runtime
     rm -rf "${LINUX_MATRIX_DIR}"
     local arch libc output goarch
     case "${BACKEND_LANGUAGE}" in
@@ -500,14 +659,14 @@ cmd_build_matrix() {
                 goarch="$(linux_arch_to_goarch "${arch}")"
                 output="$(linux_matrix_output glibc "${arch}")"
                 echo "==> Building libc-independent Go backend for Linux/${arch}"
-                backend_build_go_in_docker linux "${goarch}" "${output}"
+                backend_build_go_in_selected_container linux "${goarch}" "${output}"
             done
             ;;
         c)
             for libc in glibc musl; do
                 for arch in aarch64 x86_64; do
                     output="$(linux_matrix_output "${libc}" "${arch}")"
-                    backend_build_c_linux_in_docker "${libc}" "${arch}" "${output}"
+                    backend_build_c_linux_in_selected_container "${libc}" "${arch}" "${output}"
                 done
             done
             ;;
@@ -545,10 +704,15 @@ render_unit() {
 }
 
 build_local_container_image() {
-    require_tool docker
-    docker info >/dev/null
     echo "==> Building container image ${CONTAINER_IMAGE}"
-    docker build -t "${CONTAINER_IMAGE}" "${ROOT}"
+    require_build_container_runtime
+    if [[ "${BUILD_CONTAINER_RUNTIME}" == container ]]; then
+        container build --progress plain \
+            --tag "${CONTAINER_IMAGE}" \
+            "${ROOT}"
+    else
+        docker build -t "${CONTAINER_IMAGE}" "${ROOT}"
+    fi
 }
 
 build_remote_container_image() {
@@ -861,8 +1025,8 @@ cmd_run_local() {
                 echo "==> Building backend for this Mac (local Go toolchain)"
                 (cd "${ROOT}/server" && CGO_ENABLED=0 go build -o "${backend_bin}" .)
             else
-                echo "==> Building backend for this Mac (via Docker)"
-                backend_build_go_in_docker darwin "${host_goarch}" "${backend_bin}"
+                echo "==> Building backend for this Mac (via build container)"
+                backend_build_go_in_selected_container darwin "${host_goarch}" "${backend_bin}"
             fi
             ;;
         c)
@@ -889,6 +1053,15 @@ cmd_run_container() {
     echo
     echo "Open in a browser or Outer Loop:  http://127.0.0.1:${LOCAL_PORT}/"
     echo
+    if [[ "${BUILD_CONTAINER_RUNTIME}" == container ]]; then
+        exec container run --rm \
+            --name "${CONTAINER_IMAGE}-dev" \
+            --read-only \
+            --tmpfs /tmp \
+            --env PORT=8080 \
+            --publish "127.0.0.1:${LOCAL_PORT}:8080" \
+            "${CONTAINER_IMAGE}"
+    fi
     exec docker run --rm \
         --name "${CONTAINER_IMAGE}-dev" \
         --read-only \
@@ -1102,6 +1275,9 @@ ${APP_NAME} -- multi-platform outerframe app tasks
   ./app ssh [cmd]          open a shell (or run a command) on the target
   ./app uninstall          deregister and remove the app from the server
   ./app clean              delete the local build directory
+
+Builds auto-select Apple container on macOS and Docker elsewhere.
+Set OUTER_BUILD_CONTAINER_RUNTIME=container|docker to override.
 
 Identity lives in app.env. On Linux, this directory is the deployment target.
 EOF

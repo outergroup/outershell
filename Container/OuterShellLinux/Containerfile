@@ -1,0 +1,13 @@
+FROM docker.io/library/alpine:3.20
+
+RUN apk add --no-cache \
+        bash \
+        build-base \
+        libpng-dev \
+        libpng-static \
+        openssl-dev \
+        openssl-libs-static \
+        wget \
+        zlib-dev \
+        zlib-static \
+    && ln -sf /lib/libz.a /usr/lib/libz.a

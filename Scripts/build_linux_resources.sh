@@ -128,7 +128,7 @@ install_linux_static_build_deps() {
         exit 1
     fi
     if [[ "${EUID}" -ne 0 ]]; then
-        echo "error: static zlib is missing; rerun in the Docker build image or install it first" >&2
+        echo "error: static zlib is missing; rerun in the container build image or install it first" >&2
         exit 1
     fi
     yum -y install pkgconfig perl-IPC-Cmd perl-Time-Piece zlib-devel zlib-static libpng-devel libpng-static

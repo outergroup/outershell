@@ -20,6 +20,8 @@ PROJECT_ROOT="${PROJECTS_ROOT}/widget-works"
 BUILDER_ROOT="${RESPONSE_ROOT}/builder/widget-works-macOS"
 ICON_SOURCE="${REPO_ROOT}/app-icon.png"
 
+bash -n "${REPO_ROOT}/Resources/NativeAppTemplate/app"
+
 python3 "${REPO_ROOT}/Resources/NativeAppTemplate/create-project.py" \
     --name "Widget Works" \
     --app-id "com.example.WidgetWorks" \
@@ -45,6 +47,12 @@ test ! -e "${PROJECT_ROOT}/frontend-objc"
 test ! -e "${PROJECT_ROOT}/backend-go"
 test ! -e "${PROJECT_ROOT}/backend-c"
 test ! -e "${PROJECT_ROOT}/Dockerfile"
+test -f "${PROJECT_ROOT}/server/.dockerignore"
+bash -n "${PROJECT_ROOT}/app"
+grep -Fq 'backend_build_go_in_apple_container' "${PROJECT_ROOT}/app"
+grep -Fq 'backend_build_go_in_docker' "${PROJECT_ROOT}/app"
+grep -Fq 'container system status' "${PROJECT_ROOT}/app"
+grep -Fq 'OUTER_BUILD_CONTAINER_RUNTIME' "${PROJECT_ROOT}/app"
 
 cmp "${ICON_SOURCE}" "${PROJECT_ROOT}/app-icon.png"
 cmp "${ICON_SOURCE}" "${PROJECT_ROOT}/macos/app-icon.png"
@@ -81,7 +89,12 @@ python3 "${REPO_ROOT}/Resources/NativeAppTemplate/create-project.py" \
 
 test -d "${PROJECTS_ROOT}/web-only/html"
 test ! -e "${PROJECTS_ROOT}/web-only/macos"
+test -f "${PROJECTS_ROOT}/web-only/Dockerfile"
+test -x "${PROJECTS_ROOT}/web-only/app"
 test ! -e "${HTML_RESPONSE_ROOT}/builder"
 test "$(cat "${HTML_RESPONSE_ROOT}/.outershell-remote-project-path")" = "${PROJECTS_ROOT}/web-only"
+bash -n "${PROJECTS_ROOT}/web-only/app"
+grep -Fq 'container build --progress plain' "${PROJECTS_ROOT}/web-only/app"
+grep -Fq 'docker build -t' "${PROJECTS_ROOT}/web-only/app"
 
 echo "Native app project generator tests passed."
