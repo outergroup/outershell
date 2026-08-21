@@ -4,6 +4,7 @@
 #include <unistd.h>
 
 #include <errno.h>
+#include <glob.h>
 #include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -399,6 +400,7 @@ struct CommandRequest {
     const char *iconPath = "";
     const char *frontendList = "";
     const char *socketPath = "";
+    const char *externalSocketPath = "";
     const char *contentType = "";
     const char *conformsTo = "";
     const char *extensions = "";
@@ -680,6 +682,8 @@ bool parseCommandRequest(int argc, char *argv[], CommandRequest &request, Buffer
             REQUIRE_VALUE("--list", request.frontendList);
         } else if (strcmp(arg, "--socket-path") == 0) {
             REQUIRE_VALUE("--socket-path", request.socketPath);
+        } else if (strcmp(arg, "--external-socket-path") == 0) {
+            REQUIRE_VALUE("--external-socket-path", request.externalSocketPath);
         } else if (strcmp(arg, "--content-type") == 0 || strcmp(arg, "--type") == 0) {
             REQUIRE_VALUE("--content-type", request.contentType);
         } else if (strcmp(arg, "--conforms-to") == 0) {
@@ -780,13 +784,13 @@ bool appendCommandRequestMessage(Buffer &message, const CommandRequest &request)
         break;
     }
     case kMessageAppUpsertRequest: {
-        const char *values[] = {request.backend, request.frontendId, request.displayName, request.path, request.host, request.socketPath, request.iconPath, request.frontendList};
+        const char *values[] = {request.backend, request.frontendId, request.displayName, request.path, request.host, request.socketPath, request.iconPath, request.frontendList, request.externalSocketPath};
         ok = ok &&
             appendLittleEndianUInt16(message, request.endpointKind) &&
             appendLittleEndianUInt16(message, request.endpointScheme) &&
             appendLittleEndianUInt16(message, request.endpointFlags) &&
             appendLittleEndianUInt16(message, static_cast<uint16_t>(request.port)) &&
-            appendStringRefs(message, values, 8);
+            appendStringRefs(message, values, 9);
         break;
     }
     case kMessageAppRemoveRequest: {
@@ -893,7 +897,7 @@ bool writeRegistryListResponse(const CommandRequest &request, const Buffer &resp
     freeBuffer(errorBuffer);
 
     const char *backendHeaders[] = {"service_id", "display_name", "unit_name", "unit_path", "owns_unit"};
-    const char *appHeaders[] = {"frontend_id", "service_id", "display_name", "endpoint_kind", "scheme", "host", "port", "socket_path", "path", "url", "icon_path", "list"};
+    const char *appHeaders[] = {"frontend_id", "service_id", "display_name", "endpoint_kind", "scheme", "host", "port", "socket_path", "external_socket_path", "path", "url", "icon_path", "list"};
     const char *logHeaders[] = {"path", "service_id"};
     const char *contentTypeHeaders[] = {"service_id", "identifier", "display_name", "conforms_to", "extensions", "mime_types"};
     const char *openerHeaders[] = {"content_type", "frontend_id", "url_template", "rank", "capabilities"};
@@ -922,7 +926,7 @@ bool writeRegistryListResponse(const CommandRequest &request, const Buffer &resp
         }
         break;
     case kMessageAppListResponse:
-        minimumRowSize = 80;
+        minimumRowSize = 88;
         if (responseRowSize < minimumRowSize) {
             ok = false;
             break;
@@ -941,7 +945,7 @@ bool writeRegistryListResponse(const CommandRequest &request, const Buffer &resp
             snprintf(schemeBuffer, sizeof(schemeBuffer), "%u", readLittleEndianUInt16(bytes + offset + 2));
             snprintf(portBuffer, sizeof(portBuffer), "%u", readLittleEndianUInt16(bytes + offset + 6));
             const size_t firstRefs[] = {8, 16, 24};
-            const size_t lastRefs[] = {40, 48, 56, 64, 72};
+            const size_t lastRefs[] = {40, 48, 56, 64, 72, 80};
             ok = writeTsvRefs(response, offset, firstRefs, sizeof(firstRefs) / sizeof(firstRefs[0])) &&
                 fputc('\t', stdout) != EOF &&
                 writeTsvString(kindBuffer) &&
@@ -1127,9 +1131,728 @@ bool tryOuterctlApi(const CommandRequest &request, int &exitStatus, Buffer &erro
     return ok;
 }
 
+struct ImageAppRequest {
+    const char *id = "";
+    const char *displayName = "";
+    const char *url = "/";
+    const char *workingDirectory = "/root";
+    const char *socketArgument = "";
+    const char *iconPath = "";
+    const char *root = "/";
+    uint32_t tcpPort = 0;
+    int commandIndex = 0;
+};
+
+void printImageAddAppUsage(FILE *stream) {
+    fputs(
+        "Usage: outerctl image add-app --id ID --name NAME [options] -- EXECUTABLE [ARGUMENTS...]\n"
+        "Options:\n"
+        "  --url PATH                 Initial app URL (default: /)\n"
+        "  --working-directory PATH   Service working directory (default: /root)\n"
+        "  --socket-argument OPTION   Append OPTION=<unix socket path> to the command\n"
+        "  --tcp-port PORT            Relay this loopback TCP port through a Unix socket\n"
+        "  --icon-path PATH           Icon path inside the image\n",
+        stream
+    );
+}
+
+bool parseImageOption(int &index,
+                      int argc,
+                      char *argv[],
+                      const char *name,
+                      const char *&value) {
+    const char *argument = argv[index];
+    const size_t nameLength = strlen(name);
+    if (strcmp(argument, name) == 0) {
+        if (index + 1 >= argc) return false;
+        value = argv[++index];
+        return true;
+    }
+    if (strncmp(argument, name, nameLength) == 0 && argument[nameLength] == '=') {
+        value = argument + nameLength + 1;
+        return true;
+    }
+    return false;
+}
+
+bool isImageAppIdentifier(const char *value) {
+    if (!value || !value[0] || strlen(value) > 48 || strcmp(value, ".") == 0 ||
+        strcmp(value, "..") == 0) {
+        return false;
+    }
+    for (const char *cursor = value; *cursor; cursor += 1) {
+        const char character = *cursor;
+        if (!((character >= 'a' && character <= 'z') ||
+              (character >= 'A' && character <= 'Z') ||
+              (character >= '0' && character <= '9') ||
+              character == '.' || character == '_' || character == '-')) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool isSingleLine(const char *value) {
+    return value && !strchr(value, '\n') && !strchr(value, '\r');
+}
+
+bool parseImageAddAppRequest(int argc,
+                             char *argv[],
+                             ImageAppRequest &request,
+                             Buffer &errorMessage) {
+    const char *environmentRoot = getenv("OUTERCTL_IMAGE_ROOT");
+    if (environmentRoot && environmentRoot[0]) request.root = environmentRoot;
+    for (int index = 3; index < argc; index += 1) {
+        const char *argument = argv[index];
+        if (strcmp(argument, "--") == 0) {
+            request.commandIndex = index + 1;
+            break;
+        }
+        const char *value = nullptr;
+        if (parseImageOption(index, argc, argv, "--id", value)) {
+            request.id = value;
+        } else if (parseImageOption(index, argc, argv, "--name", value)) {
+            request.displayName = value;
+        } else if (parseImageOption(index, argc, argv, "--url", value)) {
+            request.url = value;
+        } else if (parseImageOption(index, argc, argv, "--working-directory", value)) {
+            request.workingDirectory = value;
+        } else if (parseImageOption(index, argc, argv, "--socket-argument", value)) {
+            request.socketArgument = value;
+        } else if (parseImageOption(index, argc, argv, "--icon-path", value)) {
+            request.iconPath = value;
+        } else if (parseImageOption(index, argc, argv, "--root", value)) {
+            request.root = value;
+        } else if (parseImageOption(index, argc, argv, "--tcp-port", value)) {
+            if (!parseUInt32(value, 65535, request.tcpPort) || request.tcpPort == 0) {
+                assignCString(errorMessage, "Invalid --tcp-port value.");
+                return false;
+            }
+        } else {
+            assignCString(errorMessage, "Unknown image add-app argument: ");
+            appendCString(errorMessage, argument);
+            return false;
+        }
+    }
+    if (!isImageAppIdentifier(request.id)) {
+        assignCString(errorMessage, "--id must contain 1-48 letters, digits, periods, underscores, or hyphens.");
+        return false;
+    }
+    if (!request.displayName[0] || !isSingleLine(request.displayName)) {
+        assignCString(errorMessage, "--name must be a non-empty single line.");
+        return false;
+    }
+    if (!request.url[0] || !isSingleLine(request.url) || request.url[0] != '/') {
+        assignCString(errorMessage, "--url must be an absolute path.");
+        return false;
+    }
+    if (!request.workingDirectory[0] || request.workingDirectory[0] != '/' ||
+        !isSingleLine(request.workingDirectory)) {
+        assignCString(errorMessage, "--working-directory must be an absolute path.");
+        return false;
+    }
+    if (!request.root[0] || request.root[0] != '/') {
+        assignCString(errorMessage, "--root must be an absolute path.");
+        return false;
+    }
+    if (request.commandIndex == 0 || request.commandIndex >= argc ||
+        argv[request.commandIndex][0] != '/') {
+        assignCString(errorMessage, "Specify an absolute executable path after --.");
+        return false;
+    }
+    for (int index = request.commandIndex; index < argc; index += 1) {
+        if (!isSingleLine(argv[index])) {
+            assignCString(errorMessage, "Command arguments must not contain newlines.");
+            return false;
+        }
+    }
+    if ((request.socketArgument[0] != '\0') == (request.tcpPort != 0)) {
+        assignCString(errorMessage, "Specify exactly one of --socket-argument or --tcp-port.");
+        return false;
+    }
+    if (!isSingleLine(request.socketArgument) || !isSingleLine(request.iconPath)) {
+        assignCString(errorMessage, "Image app options must not contain newlines.");
+        return false;
+    }
+    return true;
+}
+
+bool imagePath(const char *root, const char *path, char *output, size_t outputSize) {
+    if (!root || root[0] != '/' || !path || path[0] != '/') return false;
+    const size_t rootLength = strlen(root);
+    const bool rootHasSlash = rootLength > 0 && root[rootLength - 1] == '/';
+    const char *suffix = rootHasSlash ? path + 1 : path;
+    const int length = snprintf(output, outputSize, "%s%s", root, suffix);
+    return length >= 0 && static_cast<size_t>(length) < outputSize;
+}
+
+bool makeDirectories(const char *path, mode_t mode) {
+    if (!path || path[0] != '/') return false;
+    char current[PATH_MAX];
+    const size_t length = strlen(path);
+    if (length >= sizeof(current)) return false;
+    memcpy(current, path, length + 1);
+    for (char *cursor = current + 1; *cursor; cursor += 1) {
+        if (*cursor != '/') continue;
+        *cursor = '\0';
+        if (mkdir(current, mode) != 0 && errno != EEXIST) return false;
+        *cursor = '/';
+    }
+    return mkdir(current, mode) == 0 || errno == EEXIST;
+}
+
+bool makeParentDirectories(const char *path, mode_t mode) {
+    char parent[PATH_MAX];
+    const size_t length = strlen(path);
+    if (length >= sizeof(parent)) return false;
+    memcpy(parent, path, length + 1);
+    char *slash = strrchr(parent, '/');
+    if (!slash || slash == parent) return true;
+    *slash = '\0';
+    return makeDirectories(parent, mode);
+}
+
+bool shellQuote(FILE *file, const char *value) {
+    if (fputc('\'', file) == EOF) return false;
+    for (const char *cursor = value ? value : ""; *cursor; cursor += 1) {
+        if (*cursor == '\'') {
+            if (fputs("'\"'\"'", file) == EOF) return false;
+        } else if (fputc(*cursor, file) == EOF) {
+            return false;
+        }
+    }
+    return fputc('\'', file) != EOF;
+}
+
+bool finishImageFile(FILE *file, const char *path, mode_t mode) {
+    const bool flushed = fflush(file) == 0;
+    const bool closed = fclose(file) == 0;
+    return flushed && closed && chmod(path, mode) == 0;
+}
+
+bool writeImageAppRegistration(const ImageAppRequest &request,
+                               const char *serviceID,
+                               const char *servicePath,
+                               const char *socketPath,
+                               const char *logPath,
+                               const char *destination) {
+    if (!makeParentDirectories(destination, 0755)) return false;
+    FILE *file = fopen(destination, "w");
+    if (!file) return false;
+    bool ok = fputs("#!/bin/sh\nset -eu\n"
+                    "export HOME=/root USER=root LOGNAME=root XDG_RUNTIME_DIR=/run/user/0\n"
+                    "export OUTERSHELLD_API_SOCKET=/run/user/0/outershelld-api\n"
+                    "/usr/local/bin/outerctl backend upsert --backend ", file) != EOF;
+    if (ok) ok = shellQuote(file, serviceID);
+    if (ok) ok = fputs(" --name ", file) != EOF && shellQuote(file, request.displayName);
+    if (ok) ok = fputs(" --service-file ", file) != EOF && shellQuote(file, servicePath);
+    if (ok) ok = fputs(" --outershell-owns true\n/usr/local/bin/outerctl app upsert --backend ", file) != EOF &&
+        shellQuote(file, serviceID);
+    if (ok) ok = fputs(" --frontend-id ", file) != EOF;
+    if (ok) {
+        Buffer frontendID;
+        appendCString(frontendID, serviceID);
+        appendCString(frontendID, ":main");
+        ok = shellQuote(file, frontendID.data);
+        freeBuffer(frontendID);
+    }
+    if (ok) ok = fputs(" --socket-path ", file) != EOF && shellQuote(file, socketPath);
+    if (ok) ok = fputs(" --name ", file) != EOF && shellQuote(file, request.displayName);
+    if (ok) ok = fputs(" --url ", file) != EOF && shellQuote(file, request.url);
+    if (ok && request.iconPath[0]) {
+        ok = fputs(" --icon-path ", file) != EOF && shellQuote(file, request.iconPath);
+    }
+    if (ok) ok = fputs("\n/usr/local/bin/outerctl log add --backend ", file) != EOF &&
+        shellQuote(file, serviceID);
+    if (ok) ok = fputs(" --path ", file) != EOF && shellQuote(file, logPath);
+    if (ok) ok = fputc('\n', file) != EOF;
+    return ok && finishImageFile(file, destination, 0755);
+}
+
+bool writeTcpImageAppWrapper(int argc,
+                             char *argv[],
+                             const ImageAppRequest &request,
+                             const char *socketPath,
+                             const char *destination) {
+    if (!makeParentDirectories(destination, 0755)) return false;
+    FILE *file = fopen(destination, "w");
+    if (!file) return false;
+    bool ok = fputs("#!/bin/bash\nset -eu\nsocket=", file) != EOF &&
+        shellQuote(file, socketPath);
+    if (ok) ok = fprintf(file, "\nport=%u\nrm -f \"${socket}\"\ncommand=(", request.tcpPort) >= 0;
+    for (int index = request.commandIndex; ok && index < argc; index += 1) {
+        ok = fputc(' ', file) != EOF && shellQuote(file, argv[index]);
+    }
+    if (ok) ok = fputs(
+        " )\n"
+        "\"${command[@]}\" &\n"
+        "command_pid=$!\n"
+        "proxy_pid=\n"
+        "cleanup() {\n"
+        "    trap - EXIT INT TERM HUP\n"
+        "    if [ -n \"${proxy_pid}\" ]; then kill \"${proxy_pid}\" 2>/dev/null || true; fi\n"
+        "    kill \"${command_pid}\" 2>/dev/null || true\n"
+        "    wait \"${command_pid}\" 2>/dev/null || true\n"
+        "    rm -f \"${socket}\"\n"
+        "}\n"
+        "trap cleanup EXIT\n"
+        "trap 'exit 0' INT TERM HUP\n"
+        "attempts=0\n"
+        "until curl --silent --max-time 1 --output /dev/null \"http://127.0.0.1:${port}/\"; do\n"
+        "    kill -0 \"${command_pid}\" 2>/dev/null || { wait \"${command_pid}\"; exit $?; }\n"
+        "    attempts=$((attempts + 1))\n"
+        "    [ \"${attempts}\" -lt 120 ] || exit 1\n"
+        "    sleep 0.1\n"
+        "done\n"
+        "socat UNIX-LISTEN:\"${socket}\",fork,mode=0600 TCP:127.0.0.1:\"${port}\" &\n"
+        "proxy_pid=$!\n"
+        "wait -n \"${command_pid}\" \"${proxy_pid}\"\n",
+        file
+    ) != EOF;
+    return ok && finishImageFile(file, destination, 0755);
+}
+
+bool writeImageAppService(int argc,
+                          char *argv[],
+                          const ImageAppRequest &request,
+                          const char *socketPath,
+                          const char *logPath,
+                          const char *wrapperPath,
+                          const char *destination) {
+    if (!makeParentDirectories(destination, 0755)) return false;
+    FILE *file = fopen(destination, "w");
+    if (!file) return false;
+    const char *executable = request.tcpPort ? wrapperPath : argv[request.commandIndex];
+    bool ok = fprintf(file,
+                      "[Service]\nFormat=1\nName=%s\nExecutable=%s\n",
+                      request.displayName,
+                      executable) >= 0;
+    if (!request.tcpPort) {
+        for (int index = request.commandIndex + 1; ok && index < argc; index += 1) {
+            ok = fprintf(file, "Argument=%s\n", argv[index]) >= 0;
+        }
+        if (ok) ok = fprintf(file, "Argument=%s=%s\n", request.socketArgument, socketPath) >= 0;
+    }
+    if (ok) {
+        ok = fprintf(file,
+                     "WorkingDirectory=%s\n"
+                     "Environment=HOME=/root\n"
+                     "Environment=USER=root\n"
+                     "Environment=LOGNAME=root\n"
+                     "Environment=XDG_RUNTIME_DIR=/run/user/0\n"
+                     "Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n"
+                     "EnvironmentPolicy=clean\n"
+                     "Start=eager\n"
+                     "Restart=on-failure\n"
+                     "RestartDelayMilliseconds=1000\n"
+                     "StopTimeoutMilliseconds=10000\n"
+                     "LogPath=%s\n",
+                     request.workingDirectory,
+                     logPath) >= 0;
+    }
+    return ok && finishImageFile(file, destination, 0644);
+}
+
+int handleImageAddApp(int argc, char *argv[]) {
+    ImageAppRequest request;
+    Buffer errorMessage;
+    if (!parseImageAddAppRequest(argc, argv, request, errorMessage)) {
+        fprintf(stderr, "%s\n", errorMessage.data ? errorMessage.data : "Invalid image app definition.");
+        printImageAddAppUsage(stderr);
+        freeBuffer(errorMessage);
+        return 1;
+    }
+    char serviceID[96];
+    char servicePath[PATH_MAX];
+    char registrationPath[PATH_MAX];
+    char socketPath[108];
+    char appDirectory[PATH_MAX];
+    char logPath[PATH_MAX];
+    char wrapperPath[PATH_MAX];
+    snprintf(serviceID, sizeof(serviceID), "org.outershell.image.%s", request.id);
+    snprintf(servicePath, sizeof(servicePath), "/var/lib/outershell/services/%s.outerservice", serviceID);
+    snprintf(registrationPath, sizeof(registrationPath), "/etc/outershell/apps.d/%s.sh", serviceID);
+    snprintf(socketPath, sizeof(socketPath), "/run/user/0/%s", serviceID);
+    snprintf(appDirectory, sizeof(appDirectory), "/var/lib/outershell/apps/%s", serviceID);
+    snprintf(logPath, sizeof(logPath), "%s/backend.log", appDirectory);
+    snprintf(wrapperPath, sizeof(wrapperPath), "/opt/outershell/image-apps/%s/start", serviceID);
+
+    char hostServicePath[PATH_MAX];
+    char hostRegistrationPath[PATH_MAX];
+    char hostAppDirectory[PATH_MAX];
+    char hostLogPath[PATH_MAX];
+    char hostWrapperPath[PATH_MAX];
+    char hostWorkingDirectory[PATH_MAX];
+    bool ok = imagePath(request.root, servicePath, hostServicePath, sizeof(hostServicePath)) &&
+        imagePath(request.root, registrationPath, hostRegistrationPath, sizeof(hostRegistrationPath)) &&
+        imagePath(request.root, appDirectory, hostAppDirectory, sizeof(hostAppDirectory)) &&
+        imagePath(request.root, logPath, hostLogPath, sizeof(hostLogPath)) &&
+        imagePath(request.root, wrapperPath, hostWrapperPath, sizeof(hostWrapperPath)) &&
+        imagePath(request.root,
+                  request.workingDirectory,
+                  hostWorkingDirectory,
+                  sizeof(hostWorkingDirectory)) &&
+        makeDirectories(hostAppDirectory, 0755) &&
+        makeDirectories(hostWorkingDirectory, 0755);
+    if (ok) {
+        FILE *log = fopen(hostLogPath, "a");
+        ok = log && fclose(log) == 0 && chmod(hostLogPath, 0644) == 0;
+    }
+    if (ok && request.tcpPort) {
+        ok = writeTcpImageAppWrapper(argc, argv, request, socketPath, hostWrapperPath);
+    }
+    if (ok) {
+        ok = writeImageAppService(argc,
+                                  argv,
+                                  request,
+                                  socketPath,
+                                  logPath,
+                                  wrapperPath,
+                                  hostServicePath);
+    }
+    if (ok) {
+        ok = writeImageAppRegistration(request,
+                                       serviceID,
+                                       servicePath,
+                                       socketPath,
+                                       logPath,
+                                       hostRegistrationPath);
+    }
+    if (!ok) {
+        fprintf(stderr, "Could not write the image app definition: %s\n", strerror(errno));
+        freeBuffer(errorMessage);
+        return 1;
+    }
+    printf("Added %s to the image.\n", request.displayName);
+    freeBuffer(errorMessage);
+    return 0;
+}
+
+struct ImageCommandRequest {
+    const char *id = "";
+    const char *displayName = "";
+    const char *workingDirectory = "/root";
+    const char *user = "root";
+    const char *iconPath = "";
+    const char *root = "/";
+    int commandIndex = 0;
+};
+
+void printImageAddCommandUsage(FILE *stream) {
+    fputs(
+        "Usage: outerctl image add-command --id ID --name NAME [options] -- EXECUTABLE [ARGUMENTS...]\n"
+        "Options:\n"
+        "  --working-directory PATH   Initial command directory (default: /root)\n"
+        "  --user USER                 Container user (default: root)\n"
+        "  --icon-path PATH            Absolute path to an icon inside the image\n",
+        stream
+    );
+}
+
+bool parseImageAddCommandRequest(int argc,
+                                 char *argv[],
+                                 ImageCommandRequest &request,
+                                 Buffer &errorMessage) {
+    const char *environmentRoot = getenv("OUTERCTL_IMAGE_ROOT");
+    if (environmentRoot && environmentRoot[0]) request.root = environmentRoot;
+    for (int index = 3; index < argc; index += 1) {
+        const char *argument = argv[index];
+        if (strcmp(argument, "--") == 0) {
+            request.commandIndex = index + 1;
+            break;
+        }
+        const char *value = nullptr;
+        if (parseImageOption(index, argc, argv, "--id", value)) {
+            request.id = value;
+        } else if (parseImageOption(index, argc, argv, "--name", value)) {
+            request.displayName = value;
+        } else if (parseImageOption(index, argc, argv, "--working-directory", value)) {
+            request.workingDirectory = value;
+        } else if (parseImageOption(index, argc, argv, "--user", value)) {
+            request.user = value;
+        } else if (parseImageOption(index, argc, argv, "--icon-path", value)) {
+            request.iconPath = value;
+        } else if (parseImageOption(index, argc, argv, "--root", value)) {
+            request.root = value;
+        } else {
+            assignCString(errorMessage, "Unknown image add-command argument: ");
+            appendCString(errorMessage, argument);
+            return false;
+        }
+    }
+    if (!isImageAppIdentifier(request.id)) {
+        assignCString(errorMessage, "--id must contain 1-48 letters, digits, periods, underscores, or hyphens.");
+        return false;
+    }
+    if (!request.displayName[0] || !isSingleLine(request.displayName)) {
+        assignCString(errorMessage, "--name must be a non-empty single line.");
+        return false;
+    }
+    if (!request.workingDirectory[0] || request.workingDirectory[0] != '/' ||
+        !isSingleLine(request.workingDirectory)) {
+        assignCString(errorMessage, "--working-directory must be an absolute path.");
+        return false;
+    }
+    if (!request.user[0] || !isSingleLine(request.user)) {
+        assignCString(errorMessage, "--user must be a non-empty single line.");
+        return false;
+    }
+    if (request.iconPath[0] &&
+        (request.iconPath[0] != '/' || !isSingleLine(request.iconPath))) {
+        assignCString(errorMessage, "--icon-path must be an absolute single-line path.");
+        return false;
+    }
+    if (!request.root[0] || request.root[0] != '/') {
+        assignCString(errorMessage, "--root must be an absolute path.");
+        return false;
+    }
+    if (request.commandIndex == 0 || request.commandIndex >= argc ||
+        argv[request.commandIndex][0] != '/') {
+        assignCString(errorMessage, "Specify an absolute executable path after --.");
+        return false;
+    }
+    for (int index = request.commandIndex; index < argc; index += 1) {
+        if (!isSingleLine(argv[index])) {
+            assignCString(errorMessage, "Command arguments must not contain newlines.");
+            return false;
+        }
+    }
+    return true;
+}
+
+bool writeImageCommand(int argc,
+                       char *argv[],
+                       const ImageCommandRequest &request,
+                       const char *destination) {
+    if (!makeParentDirectories(destination, 0755)) return false;
+    FILE *file = fopen(destination, "w");
+    if (!file) return false;
+    bool ok = fprintf(file,
+                      "[Command]\nFormat=1\nID=%s\nName=%s\nWorkingDirectory=%s\nUser=%s\nIconPath=%s\nExecutable=%s\n",
+                      request.id,
+                      request.displayName,
+                      request.workingDirectory,
+                      request.user,
+                      request.iconPath,
+                      argv[request.commandIndex]) >= 0;
+    for (int index = request.commandIndex + 1; ok && index < argc; index += 1) {
+        ok = fprintf(file, "Argument=%s\n", argv[index]) >= 0;
+    }
+    return ok && finishImageFile(file, destination, 0644);
+}
+
+int handleImageAddCommand(int argc, char *argv[]) {
+    ImageCommandRequest request;
+    Buffer errorMessage;
+    if (!parseImageAddCommandRequest(argc, argv, request, errorMessage)) {
+        fprintf(stderr, "%s\n", errorMessage.data ? errorMessage.data : "Invalid image command definition.");
+        printImageAddCommandUsage(stderr);
+        freeBuffer(errorMessage);
+        return 1;
+    }
+    char commandPath[PATH_MAX];
+    char hostCommandPath[PATH_MAX];
+    char hostWorkingDirectory[PATH_MAX];
+    char hostIconPath[PATH_MAX];
+    snprintf(commandPath, sizeof(commandPath), "/etc/outershell/commands.d/%s.outercommand", request.id);
+    if (request.iconPath[0]) {
+        struct stat iconStatus = {};
+        if (!imagePath(request.root,
+                       request.iconPath,
+                       hostIconPath,
+                       sizeof(hostIconPath)) ||
+            stat(hostIconPath, &iconStatus) != 0 ||
+            !S_ISREG(iconStatus.st_mode) ||
+            iconStatus.st_size <= 0 || iconStatus.st_size > 512 * 1024) {
+            fprintf(stderr,
+                    "--icon-path must identify an image file no larger than 512 KB.\n");
+            freeBuffer(errorMessage);
+            return 1;
+        }
+    }
+    bool ok = imagePath(request.root, commandPath, hostCommandPath, sizeof(hostCommandPath)) &&
+        imagePath(request.root,
+                  request.workingDirectory,
+                  hostWorkingDirectory,
+                  sizeof(hostWorkingDirectory)) &&
+        makeDirectories(hostWorkingDirectory, 0755) &&
+        writeImageCommand(argc, argv, request, hostCommandPath);
+    if (!ok) {
+        fprintf(stderr, "Could not write the image command definition: %s\n", strerror(errno));
+        freeBuffer(errorMessage);
+        return 1;
+    }
+    printf("Added %s command to the image.\n", request.displayName);
+    freeBuffer(errorMessage);
+    return 0;
+}
+
+struct ImageCommandDefinition {
+    char id[49] = "";
+    char displayName[256] = "";
+    char workingDirectory[PATH_MAX] = "";
+    char user[128] = "";
+    char iconPath[PATH_MAX] = "";
+    char executable[PATH_MAX] = "";
+    Buffer arguments;
+};
+
+bool copyImageCommandValue(char *destination, size_t capacity, const char *value) {
+    const size_t length = strlen(value);
+    if (length >= capacity) return false;
+    memcpy(destination, value, length + 1);
+    return true;
+}
+
+bool parseImageCommandFile(const char *path, ImageCommandDefinition &definition) {
+    FILE *file = fopen(path, "r");
+    if (!file) return false;
+    char *line = nullptr;
+    size_t lineCapacity = 0;
+    bool hasHeader = false;
+    bool hasFormat = false;
+    bool ok = true;
+    while (ok && getline(&line, &lineCapacity, file) >= 0) {
+        line[strcspn(line, "\r\n")] = '\0';
+        if (!hasHeader) {
+            hasHeader = strcmp(line, "[Command]") == 0;
+            if (!hasHeader) ok = false;
+            continue;
+        }
+        char *separator = strchr(line, '=');
+        if (!separator) continue;
+        *separator = '\0';
+        const char *value = separator + 1;
+        if (strcmp(line, "Format") == 0) hasFormat = strcmp(value, "1") == 0;
+        else if (strcmp(line, "ID") == 0) {
+            ok = copyImageCommandValue(definition.id, sizeof(definition.id), value);
+        } else if (strcmp(line, "Name") == 0) {
+            ok = copyImageCommandValue(definition.displayName,
+                                       sizeof(definition.displayName),
+                                       value);
+        } else if (strcmp(line, "WorkingDirectory") == 0) {
+            ok = copyImageCommandValue(definition.workingDirectory,
+                                       sizeof(definition.workingDirectory),
+                                       value);
+        } else if (strcmp(line, "User") == 0) {
+            ok = copyImageCommandValue(definition.user, sizeof(definition.user), value);
+        } else if (strcmp(line, "IconPath") == 0) {
+            ok = copyImageCommandValue(definition.iconPath,
+                                       sizeof(definition.iconPath),
+                                       value);
+        } else if (strcmp(line, "Executable") == 0) {
+            ok = copyImageCommandValue(definition.executable,
+                                       sizeof(definition.executable),
+                                       value);
+        } else if (strcmp(line, "Argument") == 0) {
+            ok = appendCString(definition.arguments, value) &&
+                appendZeroBytes(definition.arguments, 1);
+        }
+    }
+    free(line);
+    fclose(file);
+    return ok && hasFormat && isImageAppIdentifier(definition.id) &&
+        definition.displayName[0] && definition.workingDirectory[0] == '/' &&
+        definition.user[0] && definition.executable[0] == '/';
+}
+
+void printEncodedImageCommandField(const char *value) {
+    static const char hex[] = "0123456789ABCDEF";
+    for (const unsigned char *cursor = reinterpret_cast<const unsigned char *>(value);
+         *cursor;
+         cursor += 1) {
+        const unsigned char character = *cursor;
+        if ((character >= 'a' && character <= 'z') ||
+            (character >= 'A' && character <= 'Z') ||
+            (character >= '0' && character <= '9') ||
+            character == '-' || character == '_' || character == '.' || character == '/' ||
+            character == ':' || character == ' ') {
+            fputc(character, stdout);
+        } else {
+            fputc('%', stdout);
+            fputc(hex[character >> 4], stdout);
+            fputc(hex[character & 15], stdout);
+        }
+    }
+}
+
+int handleImageListCommands(int argc, char *argv[]) {
+    const char *root = "/";
+    const char *environmentRoot = getenv("OUTERCTL_IMAGE_ROOT");
+    if (environmentRoot && environmentRoot[0]) root = environmentRoot;
+    for (int index = 3; index < argc; index += 1) {
+        const char *value = nullptr;
+        if (parseImageOption(index, argc, argv, "--root", value)) {
+            root = value;
+        } else {
+            fprintf(stderr, "Unknown image list-commands argument: %s\n", argv[index]);
+            return 1;
+        }
+    }
+    char pattern[PATH_MAX];
+    if (!imagePath(root,
+                   "/etc/outershell/commands.d/*.outercommand",
+                   pattern,
+                   sizeof(pattern))) {
+        fprintf(stderr, "Command definition path is too long.\n");
+        return 1;
+    }
+    glob_t matches = {};
+    const int globStatus = glob(pattern, 0, nullptr, &matches);
+    if (globStatus == GLOB_NOMATCH) {
+        globfree(&matches);
+        return 0;
+    }
+    if (globStatus != 0) {
+        globfree(&matches);
+        fprintf(stderr, "Could not list image command definitions.\n");
+        return 1;
+    }
+    for (size_t index = 0; index < matches.gl_pathc; index += 1) {
+        ImageCommandDefinition definition;
+        if (!parseImageCommandFile(matches.gl_pathv[index], definition)) {
+            freeBuffer(definition.arguments);
+            continue;
+        }
+        const char *fields[] = {
+            definition.id,
+            definition.displayName,
+            definition.workingDirectory,
+            definition.user,
+            definition.iconPath,
+            definition.executable
+        };
+        fputs("1", stdout);
+        for (const char *field : fields) {
+            fputc('\t', stdout);
+            printEncodedImageCommandField(field);
+        }
+        size_t argumentOffset = 0;
+        while (argumentOffset < definition.arguments.size) {
+            const char *argument = definition.arguments.data + argumentOffset;
+            fputc('\t', stdout);
+            printEncodedImageCommandField(argument);
+            argumentOffset += strlen(argument) + 1;
+        }
+        fputc('\n', stdout);
+        freeBuffer(definition.arguments);
+    }
+    globfree(&matches);
+    return 0;
+}
+
 } // namespace
 
 int main(int argc, char *argv[]) {
+    if (argc >= 3 && strcmp(argv[1], "image") == 0 && strcmp(argv[2], "add-app") == 0) {
+        return handleImageAddApp(argc, argv);
+    }
+    if (argc >= 3 && strcmp(argv[1], "image") == 0 && strcmp(argv[2], "add-command") == 0) {
+        return handleImageAddCommand(argc, argv);
+    }
+    if (argc >= 3 && strcmp(argv[1], "image") == 0 && strcmp(argv[2], "list-commands") == 0) {
+        return handleImageListCommands(argc, argv);
+    }
     int apiExitStatus = 1;
     Buffer apiError;
     CommandRequest request;

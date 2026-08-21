@@ -78,6 +78,24 @@ case "$response" in
         ;;
 esac
 
+set +e
+response="$(OUTERSHELLD_API_SOCKET="$api_socket" "$build_dir/outerctl" \
+    bundled-app install \
+    --backend org.outershell.Top \
+    --scope system \
+    --stage-root "$build_dir/missing" 2>&1)"
+status=$?
+set -e
+
+[ "$status" -ne 0 ]
+case "$response" in
+    *"Root-supported apps are not available with this service manager"*) ;;
+    *)
+        printf 'unexpected internal root-install response: %s\n' "$response" >&2
+        exit 1
+        ;;
+esac
+
 if [ "$(uname -s)" = "Linux" ]; then
     case "$(uname -m)" in
         aarch64|arm64) architecture=aarch64 ;;

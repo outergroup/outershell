@@ -126,7 +126,6 @@ enum {
     OFContentMessageSetAcceptedPasteboardPasteTypes = 2022,
     OFContentMessagePasteboardDropHitTestResponse = 2023,
     OFContentMessageSetPasteboardDropBehaviorHitTest = 2024,
-    OFContentMessageReleaseDroppedFileAccess = 2026,
     OFContentMessageFilePromiseWriteResponse = 2027,
     OFContentMessageSetTitle = 2030,
     OFContentMessageSetIcon = 2031,

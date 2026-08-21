@@ -955,7 +955,6 @@ enum ContentToBrowserMessage {
                                  pasteboardTypes: [String],
                                  items: [OuterframeContentPasteboardItem])
     case beginDraggingPasteboardItems(items: [OuterframeContentDraggingItem], operationMask: UInt32)
-    case releaseDroppedFileAccess(accessID: UUID)
     case filePromiseWriteResponse(requestID: UUID,
                                   promiseID: UUID,
                                   success: Bool,
@@ -963,8 +962,9 @@ enum ContentToBrowserMessage {
                                   deleteWhenDone: Bool,
                                   errorMessage: String?)
     case openNewWindow(url: String, displayString: String?, preferredSize: CGSize?)
-    case navigate(url: String)
+    case navigate(url: String, displayString: String?)
     case openNewTab(url: String, displayString: String?)
+    case openURLExternally(url: String)
     case editCommandValidationResponse(requestID: UUID, enabledCommands: OuterframeEditCommandSet)
     case setPasteboardDropBehaviorUniform([String])
     case setAcceptedPasteboardPasteTypes([String])
@@ -1072,11 +1072,6 @@ enum ContentToBrowserMessage {
             try appendDraggingItems(items, to: &payload)
             return makeContentToBrowserFrame(type: .beginDraggingPasteboardItems, payload: try payload.finalize())
 
-        case .releaseDroppedFileAccess(let accessID):
-            var payload = Data(capacity: 16)
-            payload.append(uuid: accessID)
-            return makeContentToBrowserFrame(type: .releaseDroppedFileAccess, payload: payload)
-
         case .filePromiseWriteResponse(let requestID, let promiseID, let success, let localPath, let deleteWhenDone, let errorMessage):
             var payload = OffsetPayloadBuilder()
             payload.append(uuid: requestID)
@@ -1101,10 +1096,16 @@ enum ContentToBrowserMessage {
             payload.append(float64: preferredSize.map { Float64($0.height) } ?? 0)
             return makeContentToBrowserFrame(type: .openNewWindow, payload: try payload.finalize())
 
-        case .navigate(let url):
+        case .navigate(let url, let displayString):
             var payload = OffsetPayloadBuilder()
             try payload.append(stringReference: url)
-            return makeContentToBrowserFrame(type: .navigate, payload: try payload.finalize())
+            guard let displayString else {
+                return makeContentToBrowserFrame(type: .navigate,
+                                                 payload: try payload.finalize())
+            }
+            try payload.append(stringReference: displayString)
+            return makeContentToBrowserFrame(type: .navigateWithDisplayString,
+                                             payload: try payload.finalize())
 
         case .openNewTab(let url, let displayString):
             var payload = OffsetPayloadBuilder()
@@ -1114,6 +1115,11 @@ enum ContentToBrowserMessage {
             payload.append(uint8: flags)
             try payload.append(stringReference: displayString ?? "")
             return makeContentToBrowserFrame(type: .openNewTab, payload: try payload.finalize())
+
+        case .openURLExternally(let url):
+            var payload = OffsetPayloadBuilder()
+            try payload.append(stringReference: url)
+            return makeContentToBrowserFrame(type: .openURLExternally, payload: try payload.finalize())
 
         case .editCommandValidationResponse(let requestID, let enabledCommands):
             var payload = Data(capacity: 20)
@@ -1345,12 +1351,6 @@ enum ContentToBrowserMessage {
             let items = try readDraggingItems(cursor: &cursor)
             return .beginDraggingPasteboardItems(items: items, operationMask: operationMask)
 
-        case .releaseDroppedFileAccess:
-            guard let accessID = cursor.readUUID() else {
-                throw OuterframeContentSocketMessageError.truncatedPayload
-            }
-            return .releaseDroppedFileAccess(accessID: accessID)
-
         case .filePromiseWriteResponse:
             guard let requestID = cursor.readUUID(),
                   let promiseID = cursor.readUUID(),
@@ -1475,7 +1475,14 @@ enum ContentToBrowserMessage {
             guard let url = cursor.readStringReference() else {
                 throw OuterframeContentSocketMessageError.truncatedPayload
             }
-            return .navigate(url: url)
+            return .navigate(url: url, displayString: nil)
+
+        case .navigateWithDisplayString:
+            guard let url = cursor.readStringReference(),
+                  let displayString = cursor.readStringReference() else {
+                throw OuterframeContentSocketMessageError.truncatedPayload
+            }
+            return .navigate(url: url, displayString: displayString)
 
         case .openNewTab:
             guard let url = cursor.readStringReference(),
@@ -1485,6 +1492,12 @@ enum ContentToBrowserMessage {
             }
             let displayString = flags & (1 << 0) != 0 ? displayStringReference : nil
             return .openNewTab(url: url, displayString: displayString)
+
+        case .openURLExternally:
+            guard let url = cursor.readStringReference() else {
+                throw OuterframeContentSocketMessageError.truncatedPayload
+            }
+            return .openURLExternally(url: url)
 
         case .setTitle:
             guard let flags = cursor.readUInt8(),
@@ -1773,13 +1786,14 @@ private enum ContentToBrowserMessageKind: UInt16 {
     case setAcceptedPasteboardPasteTypes = 2022
     case pasteboardDropHitTestResponse = 2023
     case setPasteboardDropBehaviorHitTest = 2024
-    case releaseDroppedFileAccess = 2026
     case filePromiseWriteResponse = 2027
     case navigate = 2028
     case openNewTab = 2029
     case setTitle = 2030
     case setIcon = 2031
     case hostSpecificMessage = 2032
+    case navigateWithDisplayString = 2033
+    case openURLExternally = 2034
 
     // Assign new indices in contiguous blocks to make the switch statement more efficient
 }

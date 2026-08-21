@@ -172,7 +172,6 @@ stage_home_screen_macos() {
     local app_bundle="${app_root}/Outer Shell.app"
     mkdir -p "${root}/tools" "${app_root}"
     ditto "${MACOS_BUILD_ROOT}/Outer Shell.app" "${app_bundle}"
-    rm -rf "${app_bundle}/Contents/Resources/bundled-apps"
     rm -rf "${app_bundle}/Contents/Resources/bundles"
     mkdir -p "${app_bundle}/Contents/Resources/bundles"
     ditto "${REPO_ROOT}/Resources/NativeAppTemplate" "${app_root}/native-app-template"

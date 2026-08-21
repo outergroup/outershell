@@ -288,15 +288,22 @@ final class SingleLineTextInputController<DelegateClass: SingleLineTextInputCont
         }
     }
 
-    func setCursorPosition(_ position: Int, modifySelection: Bool) {
+    func setCursorPosition(_ position: Int,
+                           modifySelection: Bool,
+                           notifyDelegate: Bool = true) {
         guard isFocused else { return }
         clearMarkedTextState()
         let clamped = clamp(position)
         if modifySelection {
-            extendSelection(to: clamped)
+            if selectionAnchor == nil {
+                selectionAnchor = cursorPosition
+            }
+            cursorPosition = clamped
         } else {
             cursorPosition = clamped
             selectionAnchor = nil
+        }
+        if notifyDelegate {
             notifyStateChanged()
         }
     }
@@ -710,14 +717,17 @@ final class SingleLineTextInputController<DelegateClass: SingleLineTextInputCont
         }
 
         let fragments = visualLineFragments(maxWidth: visualLineWidth)
-        return fragments.first { fragment in
+        if let containing = fragments.first(where: { fragment in
             if fragment.lowerBound == fragment.upperBound {
                 return clamped == fragment.lowerBound
             }
             return clamped >= fragment.lowerBound && clamped < fragment.upperBound
+        }) {
+            return containing
         }
-            ?? fragments.last
-            ?? 0..<0
+        return fragments.first(where: {
+            $0.lowerBound != $0.upperBound && clamped == $0.upperBound
+        }) ?? fragments.last ?? 0..<0
     }
 
     private func visualLineOffset(from position: Int, delta: Int) -> Int? {
@@ -744,6 +754,11 @@ final class SingleLineTextInputController<DelegateClass: SingleLineTextInputCont
             return clamped >= fragment.lowerBound && clamped < fragment.upperBound
         }) {
             return exact
+        }
+        if let ending = fragments.firstIndex(where: {
+            $0.lowerBound != $0.upperBound && clamped == $0.upperBound
+        }) {
+            return ending
         }
         if clamped >= fragments.last?.upperBound ?? 0 {
             return max(fragments.count - 1, 0)

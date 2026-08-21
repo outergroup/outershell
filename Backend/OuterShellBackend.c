@@ -1924,6 +1924,10 @@ static uint16_t ui_route_for_http_request(const char *method, const char *target
         if (strcmp(target, "/api/control") == 0) return OUTERSHELLD_UI_ROUTE_CONTROL;
         if (strcmp(target, "/api/create") == 0) return OUTERSHELLD_UI_ROUTE_CREATE;
         if (strcmp(target, "/api/icon-observation") == 0) return OUTERSHELLD_UI_ROUTE_ICON_OBSERVATION;
+        if (strcmp(target, "/api/safe-spaces") == 0) return OUTERSHELLD_UI_ROUTE_SAFE_SPACES;
+        if (strcmp(target, "/api/safe-space-icon-observation") == 0) {
+            return OUTERSHELLD_UI_ROUTE_SAFE_SPACE_ICON_OBSERVATION;
+        }
         return OUTERSHELLD_UI_ROUTE_NONE;
     }
     if (strcasecmp(method, "GET") == 0 || strcasecmp(method, "HEAD") == 0) {

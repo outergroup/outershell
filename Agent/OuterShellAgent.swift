@@ -17,6 +17,17 @@ private func OuterShelldRequestShutdown()
 private typealias MenuBarVisibilityCallback = @convention(c) (Int32) -> Void
 private typealias MenuBarVisibilityGetter = @convention(c) () -> Int32
 private typealias BackendEventChangedCallback = @convention(c) () -> Void
+private typealias SafeSpaceRequestCallback = @convention(c) (
+    UnsafePointer<UInt8>?,
+    Int,
+    UnsafeMutablePointer<Int>?,
+    UnsafeMutablePointer<Int32>?
+) -> UnsafeMutablePointer<UInt8>?
+private typealias SafeSpaceIconObservationCallback = @convention(c) (
+    UnsafePointer<CChar>?,
+    UnsafePointer<UInt8>?,
+    Int
+) -> Int32
 
 @_silgen_name("OuterShelldSetMenuBarVisibilityCallbacks")
 private func OuterShelldSetMenuBarVisibilityCallbacks(_ callback: MenuBarVisibilityCallback?,
@@ -25,8 +36,20 @@ private func OuterShelldSetMenuBarVisibilityCallbacks(_ callback: MenuBarVisibil
 @_silgen_name("OuterShelldSetBackendEventChangedCallback")
 private func OuterShelldSetBackendEventChangedCallback(_ callback: BackendEventChangedCallback?)
 
+@_silgen_name("OuterShelldSetSafeSpaceRequestCallback")
+private func OuterShelldSetSafeSpaceRequestCallback(_ callback: SafeSpaceRequestCallback?)
+
+@_silgen_name("OuterShelldSetSafeSpaceIconObservationCallback")
+private func OuterShelldSetSafeSpaceIconObservationCallback(
+    _ callback: SafeSpaceIconObservationCallback?
+)
+
 @_silgen_name("OuterShelldMarkBackendEventChanged")
 private func OuterShelldMarkBackendEventChanged()
+
+func notifyOuterShellSafeSpacesChanged() {
+    OuterShelldMarkBackendEventChanged()
+}
 
 private struct HostedFrontend: Equatable {
     let serviceID: String
@@ -378,6 +401,75 @@ private let menuBarVisibilityGetter: MenuBarVisibilityGetter = {
 private let backendEventChangedCallback: BackendEventChangedCallback = {
     Task { @MainActor in
         activeOuterShellAgentDelegate?.backendEventChanged()
+    }
+}
+
+private final class SafeSpaceCallbackResult: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: (status: Int, data: Data)?
+
+    func store(_ value: (status: Int, data: Data)) {
+        lock.lock()
+        self.value = value
+        lock.unlock()
+    }
+
+    func load() -> (status: Int, data: Data)? {
+        lock.lock()
+        defer {
+            lock.unlock()
+        }
+        return value
+    }
+}
+
+private let safeSpaceRequestCallback: SafeSpaceRequestCallback = {
+    body, bodyLength, responseLength, responseStatus in
+    let request = body.map {
+        Data(bytes: $0, count: max(bodyLength, 0))
+    } ?? Data()
+    let semaphore = DispatchSemaphore(value: 0)
+    let result = SafeSpaceCallbackResult()
+    Task.detached(priority: .userInitiated) {
+        result.store(await SafeSpaceManager.shared.handle(request))
+        semaphore.signal()
+    }
+    semaphore.wait()
+    guard let value = result.load() else {
+        responseLength?.pointee = 0
+        responseStatus?.pointee = 500
+        return nil
+    }
+    responseLength?.pointee = value.data.count
+    responseStatus?.pointee = Int32(value.status)
+    guard !value.data.isEmpty,
+          let allocation = malloc(value.data.count) else {
+        return nil
+    }
+    value.data.copyBytes(to: allocation.assumingMemoryBound(to: UInt8.self),
+                         count: value.data.count)
+    return allocation.assumingMemoryBound(to: UInt8.self)
+}
+
+private let safeSpaceIconObservationCallback: SafeSpaceIconObservationCallback = {
+    token, body, bodyLength in
+    guard let token,
+          let body,
+          bodyLength > 0 else {
+        return 400
+    }
+    let icon = Data(bytes: body, count: bodyLength)
+    do {
+        try SafeSpaceManager.shared.storeDiscoveredIcon(
+            token: String(cString: token),
+            data: icon
+        )
+        return 200
+    } catch SafeSpaceManagerError.safeSpaceAppNotFound {
+        return 404
+    } catch {
+        NSLog("Container icon discovery failed: %@", error.localizedDescription)
+        return 400
     }
 }
 
@@ -792,6 +884,8 @@ private final class OuterShellAgentDelegate: NSObject, NSApplicationDelegate, NS
         activeOuterShellAgentDelegate = self
         OuterShelldSetMenuBarVisibilityCallbacks(menuBarVisibilityCallback, menuBarVisibilityGetter)
         OuterShelldSetBackendEventChangedCallback(backendEventChangedCallback)
+        OuterShelldSetSafeSpaceRequestCallback(safeSpaceRequestCallback)
+        OuterShelldSetSafeSpaceIconObservationCallback(safeSpaceIconObservationCallback)
         NSApplication.shared.setActivationPolicy(.accessory)
         startBackend()
         configureStatusItem()
@@ -814,6 +908,8 @@ private final class OuterShellAgentDelegate: NSObject, NSApplicationDelegate, NS
         activeOuterShellAgentDelegate = nil
         OuterShelldSetMenuBarVisibilityCallbacks(nil, nil)
         OuterShelldSetBackendEventChangedCallback(nil)
+        OuterShelldSetSafeSpaceRequestCallback(nil)
+        OuterShelldSetSafeSpaceIconObservationCallback(nil)
         DistributedNotificationCenter.default().removeObserver(self)
         OuterShellBackendRequestShutdown()
         OuterShelldRequestShutdown()

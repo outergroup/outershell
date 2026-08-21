@@ -11,6 +11,7 @@ typedef void (*OuterServiceEventCallback)(void *context, const char *service_id)
 typedef struct {
     const char *services_directory;
     const char *launcher_path;
+    const char *api_socket_path;
     OuterServiceEventCallback event_callback;
     void *event_context;
 } OuterServiceManagerOptions;

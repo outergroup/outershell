@@ -90,4 +90,19 @@ outerctl backend upsert \
   --outershell-owns true
 ```
 
+When authoring a container image, `outerctl image add-app` writes the service
+file and startup registration without contacting a running `outershelld`:
+
+```dockerfile
+RUN outerctl image add-app \
+    --id example \
+    --name "Example" \
+    --socket-argument=--socket \
+    -- /opt/example/bin/server
+```
+
+Use `--tcp-port PORT` instead of `--socket-argument` for a loopback TCP server.
+That form writes a small `bash` and `socat` adapter which publishes the app on a
+Unix socket when the container starts.
+
 The internal manager is intentionally not used on a working launchd/systemd host. The same registry remains compatible across all three managers.

@@ -463,7 +463,13 @@ static bool append_outerloop_http_unix_allowlist_entry(const char *socket_path,
 static bool append_outerloop_http_unix_allowlist_entry_for_current_scope(const char *socket_path,
                                                                          char *error,
                                                                          size_t error_size) {
-    return append_outerloop_http_unix_allowlist_entry(socket_path, geteuid() == 0, error, error_size);
+    bool system_scope = geteuid() == 0;
+    if (system_scope) {
+        char runtime_dir[PATH_MAX];
+        current_user_runtime_directory(runtime_dir, sizeof(runtime_dir));
+        if (path_has_directory_prefix(socket_path, runtime_dir)) system_scope = false;
+    }
+    return append_outerloop_http_unix_allowlist_entry(socket_path, system_scope, error, error_size);
 }
 
 
@@ -1259,9 +1265,22 @@ static bool is_home_screen_service_id(const char *service_id) {
 typedef void (*OuterShelldMenuBarVisibilityCallback)(int enabled);
 typedef int (*OuterShelldMenuBarVisibilityGetter)(void);
 typedef void (*OuterShelldBackendEventChangedCallback)(void);
+typedef unsigned char *(*OuterShelldSafeSpaceRequestCallback)(
+    const unsigned char *body,
+    size_t body_length,
+    size_t *response_length,
+    int *response_status
+);
+typedef int (*OuterShelldSafeSpaceIconObservationCallback)(
+    const char *token,
+    const unsigned char *body,
+    size_t body_length
+);
 static OuterShelldMenuBarVisibilityCallback g_menu_bar_visibility_callback = NULL;
 static OuterShelldMenuBarVisibilityGetter g_menu_bar_visibility_getter = NULL;
 static OuterShelldBackendEventChangedCallback g_backend_event_changed_callback = NULL;
+static OuterShelldSafeSpaceRequestCallback g_safe_space_request_callback = NULL;
+static OuterShelldSafeSpaceIconObservationCallback g_safe_space_icon_observation_callback = NULL;
 
 void OuterShelldSetMenuBarVisibilityCallbacks(OuterShelldMenuBarVisibilityCallback callback,
                                               OuterShelldMenuBarVisibilityGetter getter) {
@@ -1271,6 +1290,16 @@ void OuterShelldSetMenuBarVisibilityCallbacks(OuterShelldMenuBarVisibilityCallba
 
 void OuterShelldSetBackendEventChangedCallback(OuterShelldBackendEventChangedCallback callback) {
     g_backend_event_changed_callback = callback;
+}
+
+void OuterShelldSetSafeSpaceRequestCallback(OuterShelldSafeSpaceRequestCallback callback) {
+    g_safe_space_request_callback = callback;
+}
+
+void OuterShelldSetSafeSpaceIconObservationCallback(
+    OuterShelldSafeSpaceIconObservationCallback callback
+) {
+    g_safe_space_icon_observation_callback = callback;
 }
 
 void OuterShelldMarkBackendEventChanged(void) {
@@ -2737,6 +2766,7 @@ typedef struct {
     char *host;
     char *path;
     char *socket_path;
+    char *external_socket_path;
     char *icon_path;
     char *list;
 } RegistryFrontendRecord;
@@ -3102,6 +3132,7 @@ static void registry_store_free(RegistryStore *store) {
         free(store->frontends[i].host);
         free(store->frontends[i].path);
         free(store->frontends[i].socket_path);
+        free(store->frontends[i].external_socket_path);
         free(store->frontends[i].icon_path);
         free(store->frontends[i].list);
     }
@@ -3307,7 +3338,9 @@ static bool registry_store_upsert_frontend_endpoint(RegistryStore *store,
         !registry_assign_string(&record->display_name, display_name) ||
         !registry_assign_string(&record->host, endpoint_kind == OUTERSHELLD_API_FRONTEND_ENDPOINT_TCP ? (host && host[0] ? host : "127.0.0.1") : "") ||
         !registry_assign_string(&record->path, normalized_path) ||
-        !registry_assign_string(&record->socket_path, socket_path)) {
+        !registry_assign_string(&record->socket_path, socket_path) ||
+        (!record->external_socket_path &&
+         !registry_assign_string(&record->external_socket_path, ""))) {
         return false;
     }
     record->endpoint_kind = endpoint_kind;
@@ -3509,6 +3542,7 @@ static void registry_store_remove_frontend_at(RegistryStore *store, size_t index
     free(record->host);
     free(record->path);
     free(record->socket_path);
+    free(record->external_socket_path);
     free(record->icon_path);
     free(record->list);
     memmove(record, record + 1, (store->frontend_count - index - 1) * sizeof(*record));
@@ -3800,7 +3834,7 @@ static bool registry_store_load_orwa_file(RegistryStore *store, const char *path
     for (uint64_t row = 0; ok && row < descriptors[ORWA_TABLE_FRONTENDS].row_count; row++) {
         const unsigned char *row_bytes = bytes + descriptors[ORWA_TABLE_FRONTENDS].offset + row * descriptors[ORWA_TABLE_FRONTENDS].row_size;
         char *url = NULL, *service_id = NULL, *display_name = NULL, *icon_path = NULL, *list = NULL, *socket_path = NULL, *frontend_id = NULL;
-        char *host = NULL, *path = NULL;
+        char *host = NULL, *path = NULL, *external_socket_path = NULL;
         uint16_t endpoint_kind = OUTERSHELLD_API_FRONTEND_ENDPOINT_NONE;
         uint16_t endpoint_scheme = OUTERSHELLD_API_FRONTEND_SCHEME_HTTP;
         uint16_t endpoint_flags = 0;
@@ -3821,16 +3855,19 @@ static bool registry_store_load_orwa_file(RegistryStore *store, const char *path
                     port = read_uint16_le(row_bytes + 64);
                     socket_path = registry_strdup("");
                 } else if (endpoint_kind == OUTERSHELLD_API_FRONTEND_ENDPOINT_UNIX) {
-                    ok = registry_binary_read_string_ref32(bytes, file_size, variable_offset, row_bytes, 56, &socket_path, error, error_size);
+                    ok = registry_binary_read_string_ref32(bytes, file_size, variable_offset, row_bytes, 56, &socket_path, error, error_size) &&
+                         registry_binary_read_string_ref32(bytes, file_size, variable_offset, row_bytes, 64, &external_socket_path, error, error_size);
                     host = registry_strdup("");
                 } else if (endpoint_kind == OUTERSHELLD_API_FRONTEND_ENDPOINT_NONE) {
                     host = registry_strdup("");
                     socket_path = registry_strdup("");
+                    external_socket_path = registry_strdup("");
                 } else {
                     snprintf(error, error_size, "Registry binary frontend endpoint kind is unsupported.");
                     ok = false;
                 }
-                if (ok && (!host || !socket_path)) {
+                if (ok && (!host || !socket_path ||
+                           (endpoint_kind == OUTERSHELLD_API_FRONTEND_ENDPOINT_UNIX && !external_socket_path))) {
                     snprintf(error, error_size, "Out of memory.");
                     ok = false;
                 }
@@ -3850,6 +3887,12 @@ static bool registry_store_load_orwa_file(RegistryStore *store, const char *path
                                                              icon_path,
                                                              list,
                                                              false);
+                if (!ok) snprintf(error, error_size, "Out of memory.");
+            }
+            if (ok && endpoint_kind == OUTERSHELLD_API_FRONTEND_ENDPOINT_UNIX) {
+                RegistryFrontendRecord *record = registry_store_find_frontend(store, frontend_id);
+                ok = record && registry_assign_string(&record->external_socket_path,
+                                                      external_socket_path ? external_socket_path : "");
                 if (!ok) snprintf(error, error_size, "Out of memory.");
             }
         } else {
@@ -3906,6 +3949,7 @@ static bool registry_store_load_orwa_file(RegistryStore *store, const char *path
         free(frontend_id);
         free(host);
         free(path);
+        free(external_socket_path);
     }
 
     if (ok && table_count != ORWA_LEGACY_THREE_TABLE_COUNT) {
@@ -4035,6 +4079,7 @@ static bool registry_store_write_orwa_file(RegistryStore *store, const char *pat
         RegistryFrontendRecord *record = &store->frontends[i];
         unsigned char reserved2[2] = {0};
         unsigned char reserved14[14] = {0};
+        unsigned char reserved8[8] = {0};
         unsigned char reserved16[16] = {0};
         ok = registry_binary_append_string_ref32(&pool, &variable_region, &rows, record->frontend_id) &&
              registry_binary_append_string_ref32(&pool, &variable_region, &rows, record->service_id) &&
@@ -4047,8 +4092,9 @@ static bool registry_store_write_orwa_file(RegistryStore *store, const char *pat
              sb_append_n(&rows, (const char *)reserved2, sizeof(reserved2)) &&
              registry_binary_append_string_ref32(&pool, &variable_region, &rows, record->path);
         if (ok && record->endpoint_kind == OUTERSHELLD_API_FRONTEND_ENDPOINT_UNIX) {
-            ok = registry_binary_append_string_ref32(&pool, &variable_region, &rows, record->socket_path);
-            if (ok) ok = sb_append_n(&rows, (const char *)reserved16, sizeof(reserved16));
+            ok = registry_binary_append_string_ref32(&pool, &variable_region, &rows, record->socket_path) &&
+                 registry_binary_append_string_ref32(&pool, &variable_region, &rows, record->external_socket_path) &&
+                 sb_append_n(&rows, (const char *)reserved8, sizeof(reserved8));
         } else if (ok && record->endpoint_kind == OUTERSHELLD_API_FRONTEND_ENDPOINT_TCP) {
             ok = registry_binary_append_string_ref32(&pool, &variable_region, &rows, record->host) &&
                  binary_append_u16(&rows, record->port > 0 ? (uint16_t)record->port : 0) &&
@@ -5752,7 +5798,10 @@ static bool append_registered_backend_payloads(const RegistryStore *database,
             }
         }
         if (bundled_app) flags |= BACKEND_FLAG_IS_BUNDLED;
-        if (bundled_app && bundled_app->supports_root) flags |= BACKEND_FLAG_SUPPORTS_ROOT;
+        if (bundled_app && bundled_app->supports_root &&
+            (!g_internal_service_manager || direct_root_session_uses_system_scope())) {
+            flags |= BACKEND_FLAG_SUPPORTS_ROOT;
+        }
         if (bundled_app && bundled_app->root_only) flags |= BACKEND_FLAG_ROOT_ONLY;
 #ifndef __APPLE__
         if (bundled_app && bundled_app->supports_root) {
@@ -5804,7 +5853,9 @@ static bool append_bundled_backend_placeholder_payload(BinaryPayloadList *payloa
                                     "available",
                                     BACKEND_FLAG_CAN_CONTROL |
                                         BACKEND_FLAG_IS_BUNDLED |
-                                        (app->supports_root ? BACKEND_FLAG_SUPPORTS_ROOT : 0) |
+                                        (app->supports_root &&
+                                         (!g_internal_service_manager || direct_root_session_uses_system_scope())
+                                             ? BACKEND_FLAG_SUPPORTS_ROOT : 0) |
                                         (app->root_only ? BACKEND_FLAG_ROOT_ONLY : 0),
                                     app->icon_symbol_name ? app->icon_symbol_name : "",
                                     "",
@@ -5858,6 +5909,11 @@ static void send_backends_response(int fd) {
     for (size_t i = 0; ok && i < sizeof(kBundledApps) / sizeof(kBundledApps[0]); i++) {
         if (!bundled_app_is_available_on_platform(&kBundledApps[i])) continue;
         if (bundled_installed[i]) continue;
+        if (g_internal_service_manager &&
+            !direct_root_session_uses_system_scope() &&
+            kBundledApps[i].root_only) {
+            continue;
+        }
         ok = ok && append_bundled_backend_placeholder_payload(&payloads, &kBundledApps[i]);
     }
     if (have_user_database) registry_store_free(&user_database);
@@ -6108,6 +6164,11 @@ static void send_action_response(int fd, int status, bool ok_value, const char *
     send_action_response_ex(fd, status, ok_value, message, false);
 }
 
+static void send_safe_space_icon_observation_response(int fd,
+                                                      const char *query,
+                                                      const char *body,
+                                                      size_t body_length);
+
 static void send_icon_observation_response(int fd,
                                            const char *query,
                                            const char *body,
@@ -6119,6 +6180,10 @@ static void send_icon_observation_response(int fd,
     }
     IconObservationCapability *capability = icon_observation_capability_for_token(token);
     if (!capability) {
+        if (g_safe_space_icon_observation_callback) {
+            send_safe_space_icon_observation_response(fd, query, body, body_length);
+            return;
+        }
         send_action_response(fd, 403, false, "Invalid icon observation token.");
         return;
     }
@@ -6206,6 +6271,37 @@ static void send_icon_observation_response(int fd,
 
     mark_backend_event_changed();
     send_action_response(fd, 200, true, "Discovered icon saved.");
+}
+
+static void send_safe_space_icon_observation_response(int fd,
+                                                      const char *query,
+                                                      const char *body,
+                                                      size_t body_length) {
+    char token[64] = "";
+    if (!query_value(query, "token", token, sizeof(token))) {
+        send_action_response(fd, 400, false, "Missing icon observation token.");
+        return;
+    }
+    if (!g_safe_space_icon_observation_callback) {
+        send_action_response(fd, 503, false, "Container icon discovery is unavailable.");
+        return;
+    }
+    if (!body || body_length == 0 || body_length > 48u * 1024u) {
+        send_action_response(fd, 400, false, "Icon must be a non-empty PNG no larger than 48 KiB.");
+        return;
+    }
+    int status = g_safe_space_icon_observation_callback(
+        token,
+        (const unsigned char *)body,
+        body_length
+    );
+    if (status == 200) {
+        send_action_response(fd, 200, true, "Discovered icon saved.");
+    } else if (status == 404) {
+        send_action_response(fd, 404, false, "The container app no longer exists.");
+    } else {
+        send_action_response(fd, status, false, "Could not save the discovered icon.");
+    }
 }
 
 static bool install_bundled_app(const BundledAppDefinition *app,
@@ -6481,6 +6577,12 @@ static void send_control_response(int fd, const char *query, const char *body) {
         const char *scope = direct_root_session_uses_system_scope()
             ? "system"
             : ((strcmp(operation, "runRoot") == 0 || strcmp(operation, "installRoot") == 0) ? "system" : "user");
+        if (g_internal_service_manager &&
+            !direct_root_session_uses_system_scope() &&
+            strcmp(scope, "system") == 0) {
+            send_action_response(fd, 400, false, "Root-supported apps are not available with this service manager.");
+            return;
+        }
         if (strcmp(scope, "system") == 0 && !app->supports_root) {
             send_action_response(fd, 400, false, "This app does not support running as root.");
             return;
@@ -6525,6 +6627,10 @@ static void send_control_response(int fd, const char *query, const char *body) {
         const BundledAppDefinition *app = bundled_app_for_service_id(service_id);
         if (!app || !app->supports_root) {
             send_action_response(fd, 404, false, "This app does not support root support.");
+            return;
+        }
+        if (g_internal_service_manager && !direct_root_session_uses_system_scope()) {
+            send_action_response(fd, 400, false, "Root-supported apps are not available with this service manager.");
             return;
         }
         if (direct_root_session_uses_system_scope()) {
@@ -9213,7 +9319,7 @@ static bool outerctl_print_registry_list(const RegistryStore *database,
             if (ok && !sb_append(out, "\n")) ok = false;
         }
     } else if (strcmp(resource, "app") == 0) {
-        const char *headers[] = {"frontend_id", "service_id", "display_name", "endpoint_kind", "scheme", "host", "port", "socket_path", "path", "url", "icon_path", "list"};
+        const char *headers[] = {"frontend_id", "service_id", "display_name", "endpoint_kind", "scheme", "host", "port", "socket_path", "external_socket_path", "path", "url", "icon_path", "list"};
         ok = outerctl_print_headers(out, headers, sizeof(headers) / sizeof(headers[0]));
         for (size_t i = 0; ok && i < database->frontend_count; i++) {
             const RegistryFrontendRecord *record = &database->frontends[i];
@@ -9236,6 +9342,7 @@ static bool outerctl_print_registry_list(const RegistryStore *database,
                 record->host,
                 port_buffer,
                 record->socket_path,
+                record->external_socket_path,
                 record->path,
                 record->url,
                 record->icon_path,
@@ -9374,6 +9481,67 @@ static bool parse_opener_capabilities_option(const char *raw, uint32_t *out) {
     return true;
 }
 
+static bool install_managed_outerservice(const char *service_id,
+                                         const char *source_path,
+                                         char *managed_path,
+                                         size_t managed_path_size,
+                                         char *error,
+                                         size_t error_size) {
+    if (!g_internal_service_manager || !g_outer_service_manager) {
+        snprintf(error, error_size, "Portable services require the internal service manager.");
+        return false;
+    }
+    if (!service_id || !service_id[0] || !source_path || !source_path[0]) {
+        snprintf(error, error_size, "A portable service requires an identifier and service file.");
+        return false;
+    }
+    int length = snprintf(managed_path,
+                          managed_path_size,
+                          "%s/%s.outerservice",
+                          g_outer_services_directory,
+                          service_id);
+    if (length < 0 || (size_t)length >= managed_path_size) {
+        snprintf(error, error_size, "The managed portable service path is too long.");
+        return false;
+    }
+    if (strcmp(source_path, managed_path) != 0 &&
+        !copy_file(source_path, managed_path, 0600, error, error_size)) {
+        return false;
+    }
+    chmod(managed_path, 0600);
+    return outer_service_manager_load_service(g_outer_service_manager,
+                                              service_id,
+                                              error,
+                                              error_size);
+}
+
+static bool remove_managed_outerservice(const char *service_id,
+                                        char *error,
+                                        size_t error_size) {
+    if (!g_internal_service_manager || !g_outer_service_manager) return true;
+    if (!outer_service_manager_unload_service(g_outer_service_manager,
+                                              service_id,
+                                              error,
+                                              error_size)) {
+        return false;
+    }
+    char managed_path[PATH_MAX];
+    int length = snprintf(managed_path,
+                          sizeof(managed_path),
+                          "%s/%s.outerservice",
+                          g_outer_services_directory,
+                          service_id);
+    if (length < 0 || (size_t)length >= sizeof(managed_path)) {
+        snprintf(error, error_size, "The managed portable service path is too long.");
+        return false;
+    }
+    if (unlink(managed_path) != 0 && errno != ENOENT) {
+        snprintf(error, error_size, "Failed to remove %s: %s", managed_path, strerror(errno));
+        return false;
+    }
+    return true;
+}
+
 static int outershelld_handle_outerctl(int argc, char **argv, StringBuilder *stdout_buffer, StringBuilder *stderr_buffer) {
     if (argc < 3) {
         sb_append(stderr_buffer, "Usage: outerctl <resource> <action> [options]\n");
@@ -9396,6 +9564,7 @@ static int outershelld_handle_outerctl(int argc, char **argv, StringBuilder *std
     const char *icon_path = NULL;
     const char *frontend_list = NULL;
     const char *socket_path = NULL;
+    const char *external_socket_path = NULL;
     const char *content_type = NULL;
     const char *conforms_to = NULL;
     const char *extensions = NULL;
@@ -9446,6 +9615,8 @@ static int outershelld_handle_outerctl(int argc, char **argv, StringBuilder *std
             REQUIRE_VALUE("--list", frontend_list);
         } else if (strcmp(arg, "--socket-path") == 0) {
             REQUIRE_VALUE("--socket-path", socket_path);
+        } else if (strcmp(arg, "--external-socket-path") == 0) {
+            REQUIRE_VALUE("--external-socket-path", external_socket_path);
         } else if (strcmp(arg, "--content-type") == 0 || strcmp(arg, "--type") == 0) {
             REQUIRE_VALUE("--content-type", content_type);
         } else if (strcmp(arg, "--conforms-to") == 0) {
@@ -9518,7 +9689,9 @@ static int outershelld_handle_outerctl(int argc, char **argv, StringBuilder *std
 
     bool ok = true;
     bool changed = false;
+    bool installed_outerservice = false;
     char allowlist_socket_path[PATH_MAX] = "";
+    char managed_service_file[PATH_MAX] = "";
 
     if (is_list) {
         char normalized_content_type[160] = "";
@@ -9541,15 +9714,28 @@ static int outershelld_handle_outerctl(int argc, char **argv, StringBuilder *std
 
     if (ok && strcmp(resource, "backend") == 0) {
         if (strcmp(action, "upsert") == 0) {
-            if (icon_path && icon_path[0]) {
+            if (service_file && service_file[0]) {
+                ok = install_managed_outerservice(backend,
+                                                  service_file,
+                                                  managed_service_file,
+                                                  sizeof(managed_service_file),
+                                                  error,
+                                                  sizeof(error));
+                if (ok) {
+                    service_file = managed_service_file;
+                    installed_outerservice = true;
+                }
+            }
+            if (ok && icon_path && icon_path[0]) {
                 snprintf(error, sizeof(error), "Backend icons are no longer supported. Put icons on app entries instead.");
                 ok = false;
-            } else if (((systemd_unit && systemd_unit[0]) ? 1 : 0) +
-                       ((plist_path && plist_path[0]) ? 1 : 0) +
-                       ((service_file && service_file[0]) ? 1 : 0) > 1) {
+            } else if (ok &&
+                       (((systemd_unit && systemd_unit[0]) ? 1 : 0) +
+                        ((plist_path && plist_path[0]) ? 1 : 0) +
+                        ((service_file && service_file[0]) ? 1 : 0) > 1)) {
                 snprintf(error, sizeof(error), "Specify only one of --unit, --plist, or --service-file.");
                 ok = false;
-            } else {
+            } else if (ok) {
                 ok = registry_store_upsert_backend(&database,
                                                    backend,
                                                    (display_name && display_name[0]) ? display_name : backend,
@@ -9560,9 +9746,13 @@ static int outershelld_handle_outerctl(int argc, char **argv, StringBuilder *std
             }
             changed = ok;
         } else if (strcmp(action, "remove") == 0) {
-            if (!registry_store_find_backend(&database, backend)) {
+            const RegistryBackendRecord *record = registry_store_find_backend_const(&database, backend);
+            if (!record) {
                 snprintf(error, sizeof(error), "Backend not registered.");
                 ok = false;
+            }
+            if (ok && is_outerservice_path(record->unit_path)) {
+                ok = remove_managed_outerservice(backend, error, sizeof(error));
             }
             if (ok) {
                 ok = registry_store_remove_backend_and_owned_records(&database, backend);
@@ -9695,6 +9885,18 @@ static int outershelld_handle_outerctl(int argc, char **argv, StringBuilder *std
             if (ok && has_socket) {
                 snprintf(allowlist_socket_path, sizeof(allowlist_socket_path), "%s", socket_path);
             }
+            if (ok && external_socket_path) {
+                if (external_socket_path[0] && external_socket_path[0] != '/') {
+                    snprintf(error, sizeof(error), "Invalid external socket path.");
+                    ok = false;
+                } else {
+                    RegistryFrontendRecord *record = registry_store_find_frontend(&database,
+                                                                                  stable_frontend_id);
+                    ok = record && registry_assign_string(&record->external_socket_path,
+                                                          external_socket_path);
+                    if (!ok && !error[0]) snprintf(error, sizeof(error), "Out of memory.");
+                }
+            }
             if (ok) {
                 const char *layout_key = stable_frontend_id;
                 ok = registry_store_upsert_layout(&database,
@@ -9824,6 +10026,10 @@ static int outershelld_handle_outerctl(int argc, char **argv, StringBuilder *std
     bool close_ok = registry_store_close(&database, ok, error, sizeof(error));
     ok = ok && close_ok;
     if (!ok) {
+        if (installed_outerservice) {
+            char cleanup_error[1024] = "";
+            (void)remove_managed_outerservice(backend, cleanup_error, sizeof(cleanup_error));
+        }
         sb_append(stderr_buffer, error[0] ? error : "Registry operation failed.");
         sb_append(stderr_buffer, "\n");
         return 1;
@@ -10743,15 +10949,21 @@ static bool install_bundled_app(const BundledAppDefinition *app,
                                 bool *needs_password,
                                 char *message,
                                 size_t message_size) {
-#ifdef __APPLE__
-    return install_bundled_app_macos(app, scope, requested_stage_root, sudo_password, needs_password, message, message_size);
-#else
     if (needs_password) *needs_password = false;
     if (!app) {
         snprintf(message, message_size, "Unknown app.");
         return false;
     }
     bool install_as_root = direct_root_session_uses_system_scope() || (scope && strcmp(scope, "system") == 0);
+    if (g_internal_service_manager &&
+        !direct_root_session_uses_system_scope() &&
+        install_as_root) {
+        snprintf(message, message_size, "Root-supported apps are not available with this service manager.");
+        return false;
+    }
+#ifdef __APPLE__
+    return install_bundled_app_macos(app, scope, requested_stage_root, sudo_password, needs_password, message, message_size);
+#else
     if (install_as_root && !app->supports_root) {
         snprintf(message, message_size, "%s does not support root installation.", app->display_name);
         return false;
@@ -13450,6 +13662,39 @@ static void process_ui_route_request(uint16_t route, const char *query, const ch
     case OUTERSHELLD_UI_ROUTE_ICON_OBSERVATION:
         send_icon_observation_response(-1, query, body, body_length);
         break;
+    case OUTERSHELLD_UI_ROUTE_SAFE_SPACES: {
+        if (!g_safe_space_request_callback) {
+            send_text_response(-1, 503, "Containers are unavailable on this platform.\n");
+            break;
+        }
+        size_t result_length = 0;
+        int result_status = 500;
+        unsigned char *result = g_safe_space_request_callback(
+            (const unsigned char *)body,
+            body_length,
+            &result_length,
+            &result_status
+        );
+        if (!result && result_length > 0) {
+            send_text_response(-1, 500, "The container provider returned an invalid response.\n");
+            break;
+        }
+        free(response->body.data);
+        memset(&response->body, 0, sizeof(response->body));
+        response->status = result_status;
+        response->content_kind = UI_API_CONTENT_BINARY;
+        if (result_length > 0 &&
+            !sb_append_n(&response->body, (const char *)result, result_length)) {
+            free(result);
+            send_text_response(-1, 500, "out of memory\n");
+            break;
+        }
+        free(result);
+        break;
+    }
+    case OUTERSHELLD_UI_ROUTE_SAFE_SPACE_ICON_OBSERVATION:
+        send_safe_space_icon_observation_response(-1, query, body, body_length);
+        break;
     default:
         send_text_response(-1, 400, "unsupported UI API route\n");
         break;
@@ -13733,7 +13978,7 @@ static bool api_registry_list_row_size(uint16_t response_type, uint32_t *row_siz
         *row_size = 36;
         return true;
     case OUTERSHELLD_API_APP_LIST_RESPONSE:
-        *row_size = 80;
+        *row_size = 88;
         return true;
     case OUTERSHELLD_API_LOG_LIST_RESPONSE:
         *row_size = 16;
@@ -13912,7 +14157,7 @@ static bool api_app_list_response_append_row(ApiListResponseBuilder *response,
         registry_store_find_layout_const(database, record && record->frontend_id && record->frontend_id[0] ? record->frontend_id : (record ? record->url : ""));
     if (!layout && record) layout = registry_store_find_layout_const(database, record->url);
     size_t row_offset = 0;
-    return api_list_response_append_row(response, 80, &row_offset) &&
+    return api_list_response_append_row(response, 88, &row_offset) &&
            binary_write_u16_at(&response->rows, row_offset, record ? record->endpoint_kind : 0) &&
            binary_write_u16_at(&response->rows, row_offset + 2, record ? record->endpoint_scheme : 0) &&
            binary_write_u16_at(&response->rows, row_offset + 4, record ? record->endpoint_flags : 0) &&
@@ -13922,10 +14167,11 @@ static bool api_app_list_response_append_row(ApiListResponseBuilder *response,
            api_list_response_append_string_ref_at(response, &response->rows, row_offset + 24, record ? record->display_name : "") &&
            api_list_response_append_string_ref_at(response, &response->rows, row_offset + 32, record ? record->host : "") &&
            api_list_response_append_string_ref_at(response, &response->rows, row_offset + 40, record ? record->socket_path : "") &&
-           api_list_response_append_string_ref_at(response, &response->rows, row_offset + 48, record ? record->path : "") &&
-           api_list_response_append_string_ref_at(response, &response->rows, row_offset + 56, record ? record->url : "") &&
-           api_list_response_append_string_ref_at(response, &response->rows, row_offset + 64, record ? record->icon_path : "") &&
-           api_list_response_append_string_ref_at(response, &response->rows, row_offset + 72, layout ? layout->list : (record ? record->list : "")) &&
+           api_list_response_append_string_ref_at(response, &response->rows, row_offset + 48, record ? record->external_socket_path : "") &&
+           api_list_response_append_string_ref_at(response, &response->rows, row_offset + 56, record ? record->path : "") &&
+           api_list_response_append_string_ref_at(response, &response->rows, row_offset + 64, record ? record->url : "") &&
+           api_list_response_append_string_ref_at(response, &response->rows, row_offset + 72, record ? record->icon_path : "") &&
+           api_list_response_append_string_ref_at(response, &response->rows, row_offset + 80, layout ? layout->list : (record ? record->list : "")) &&
            api_list_response_finish_row(response);
 }
 
@@ -14118,9 +14364,14 @@ static bool api_append_file_openers_from_database(const RegistryStore *database,
         if (require_socket_access && !unix_socket_path_accessible_to_current_user(socket_path)) {
             continue;
         }
+        const char *response_socket_path = socket_path;
         const char *endpoint_base = frontend->endpoint_kind == OUTERSHELLD_API_FRONTEND_ENDPOINT_UNIX
             ? socket_path
             : (frontend->url ? frontend->url : "");
+        if (frontend->external_socket_path && frontend->external_socket_path[0]) {
+            response_socket_path = frontend->external_socket_path;
+            endpoint_base = frontend->external_socket_path;
+        }
         StringBuilder url = {0};
         ok = append_file_opener_url(&url,
                                     endpoint_base,
@@ -14129,7 +14380,7 @@ static bool api_append_file_openers_from_database(const RegistryStore *database,
              api_append_string_ref32(rows, variable, record->extension) &&
              api_append_string_ref32(rows, variable, frontend->service_id) &&
              api_append_string_ref32(rows, variable, frontend->display_name) &&
-             api_append_string_ref32(rows, variable, socket_path) &&
+             api_append_string_ref32(rows, variable, response_socket_path) &&
              api_append_string_ref32(rows, variable, url.data ? url.data : "") &&
              binary_append_u32(rows, normalize_opener_capabilities(record->capabilities));
         free(url.data);
@@ -14406,6 +14657,7 @@ static bool process_api_command_request(ReactorClient *client, const unsigned ch
     char *icon_path = NULL;
     char *frontend_list = NULL;
     char *socket_path = NULL;
+    char *external_socket_path = NULL;
     char *content_type = NULL;
     char *conforms_to = NULL;
     char *extensions = NULL;
@@ -14476,6 +14728,9 @@ static bool process_api_command_request(ReactorClient *client, const unsigned ch
              READ_REF(50, socket_path) &&
              READ_REF(58, icon_path) &&
              READ_REF(66, frontend_list);
+        if (ok && message_length >= 82) {
+            ok = READ_REF(74, external_socket_path);
+        }
         endpoint_kind = ok ? read_uint16_le(message + 2) : OUTERSHELLD_API_FRONTEND_ENDPOINT_NONE;
         endpoint_scheme = ok ? read_uint16_le(message + 4) : OUTERSHELLD_API_FRONTEND_SCHEME_HTTP;
         endpoint_flags = ok ? read_uint16_le(message + 6) : 0;
@@ -14501,6 +14756,11 @@ static bool process_api_command_request(ReactorClient *client, const unsigned ch
             ok = api_command_append_option(argv, &argc, 64, "--socket-path", socket_path);
         } else if (ok && endpoint_kind != OUTERSHELLD_API_FRONTEND_ENDPOINT_NONE) {
             ok = false;
+        }
+        if (ok && external_socket_path && external_socket_path[0]) {
+            ok = api_command_append_option(argv, &argc, 64,
+                                           "--external-socket-path",
+                                           external_socket_path);
         }
         break;
     case OUTERSHELLD_API_APP_REMOVE_REQUEST:
@@ -14632,6 +14892,7 @@ static bool process_api_command_request(ReactorClient *client, const unsigned ch
     free(icon_path);
     free(frontend_list);
     free(socket_path);
+    free(external_socket_path);
     free(content_type);
     free(conforms_to);
     free(extensions);
@@ -15269,6 +15530,7 @@ int OuterShelldMain(int argc, char **argv) {
         OuterServiceManagerOptions options = {
             .services_directory = g_outer_services_directory,
             .launcher_path = executable,
+            .api_socket_path = api_socket_path,
             .event_callback = outer_service_event,
             .event_context = NULL
         };

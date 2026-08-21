@@ -85,6 +85,7 @@ typedef struct {
 struct OuterServiceManager {
     char *services_directory;
     char *launcher_path;
+    char *api_socket_path;
     OuterServiceEventCallback event_callback;
     void *event_context;
     OuterService *services;
@@ -573,11 +574,22 @@ static void notify_service(OuterServiceManager *manager, OuterService *service) 
     if (manager->event_callback) manager->event_callback(manager->event_context, service->id);
 }
 
-static char **build_environment(const OuterService *service, size_t socket_count) {
+static bool service_environment_defines(const OuterService *service, const char *name) {
+    size_t name_length = strlen(name);
+    for (size_t index = 0; index < service->environment_count; index++) {
+        const char *entry = service->environment[index];
+        if (strncmp(entry, name, name_length) == 0 && entry[name_length] == '=') return true;
+    }
+    return false;
+}
+
+static char **build_environment(const OuterServiceManager *manager,
+                                const OuterService *service,
+                                size_t socket_count) {
     size_t inherited_count = 0;
     if (service->inherit_environment) while (environ[inherited_count]) inherited_count++;
     size_t capacity = inherited_count + service->pass_environment_count +
-                      service->environment_count + 6;
+                      service->environment_count + 7;
     char **result = calloc(capacity, sizeof(char *));
     if (!result) return NULL;
     size_t count = 0;
@@ -596,6 +608,14 @@ static char **build_environment(const OuterService *service, size_t socket_count
             size_t length = strlen(service->pass_environment[index]) + strlen(value) + 2;
             result[count] = malloc(length);
             if (result[count]) snprintf(result[count++], length, "%s=%s", service->pass_environment[index], value);
+        }
+    }
+    if (manager->api_socket_path && manager->api_socket_path[0] &&
+        !service_environment_defines(service, "OUTERSHELLD_API_SOCKET")) {
+        size_t length = strlen("OUTERSHELLD_API_SOCKET=") + strlen(manager->api_socket_path) + 1;
+        result[count] = malloc(length);
+        if (result[count]) {
+            snprintf(result[count++], length, "OUTERSHELLD_API_SOCKET=%s", manager->api_socket_path);
         }
     }
     for (size_t index = 0; index < service->environment_count; index++) {
@@ -640,7 +660,7 @@ static bool spawn_service(OuterServiceManager *manager,
     argv[2] = service->executable;
     for (size_t index = 0; index < service->argument_count; index++) argv[3 + index] = service->arguments[index];
 
-    char **environment = build_environment(service, service->socket_count);
+    char **environment = build_environment(manager, service, service->socket_count);
     if (!environment) {
         free(argv);
         goto allocation_error;
@@ -965,11 +985,12 @@ OuterServiceManager *outer_service_manager_create(const OuterServiceManagerOptio
     if (!manager) return NULL;
     manager->services_directory = duplicate_string(options->services_directory);
     manager->launcher_path = duplicate_string(options->launcher_path);
+    manager->api_socket_path = duplicate_string(options->api_socket_path);
     manager->event_callback = options->event_callback;
     manager->event_context = options->event_context;
     manager->wake_pipe[0] = manager->wake_pipe[1] = -1;
     pthread_mutex_init(&manager->mutex, NULL);
-    if (!manager->services_directory || !manager->launcher_path ||
+    if (!manager->services_directory || !manager->launcher_path || !manager->api_socket_path ||
         pipe(manager->wake_pipe) != 0) {
         snprintf(error, error_size, "initialize internal service manager: %s", strerror(errno));
         outer_service_manager_destroy(manager);
@@ -1012,6 +1033,7 @@ void outer_service_manager_destroy(OuterServiceManager *manager) {
     pthread_mutex_destroy(&manager->mutex);
     free(manager->services_directory);
     free(manager->launcher_path);
+    free(manager->api_socket_path);
     free(manager);
 }
 

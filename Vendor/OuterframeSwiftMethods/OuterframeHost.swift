@@ -358,8 +358,15 @@ final class OuterframeHost: SocketToBrowserDelegate {
     }
 
     func navigate(to url: URL) {
+        navigate(to: url, displayString: nil)
+    }
+
+    func navigate(to url: URL, displayString: String?) {
         Task {
-            try? await socket.send(ContentToBrowserMessage.navigate(url: url.absoluteString).encode())
+            try? await socket.send(ContentToBrowserMessage.navigate(
+                url: url.absoluteString,
+                displayString: displayString
+            ).encode())
         }
     }
 
@@ -368,6 +375,14 @@ final class OuterframeHost: SocketToBrowserDelegate {
             try? await socket.send(ContentToBrowserMessage.openNewTab(
                 url: url.absoluteString,
                 displayString: displayString
+            ).encode())
+        }
+    }
+
+    func openURLExternally(_ url: URL) {
+        Task {
+            try? await socket.send(ContentToBrowserMessage.openURLExternally(
+                url: url.absoluteString
             ).encode())
         }
     }
@@ -777,12 +792,6 @@ final class OuterframeHost: SocketToBrowserDelegate {
                                     operationMask: operationMask,
                                     previewPNGData: previewPNGData,
                                     previewSize: previewSize)
-    }
-
-    func releaseDroppedFileAccess(_ accessID: UUID) {
-        Task {
-            try? await socket.send(ContentToBrowserMessage.releaseDroppedFileAccess(accessID: accessID).encode())
-        }
     }
 
     func sendFilePromiseWriteResponse(requestID: UUID,
