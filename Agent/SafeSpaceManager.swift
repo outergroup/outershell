@@ -60,12 +60,19 @@ private struct SafeSpaceRecipe: Codable {
     var environment: [SafeSpaceEnvironmentVariable]?
     var realizedMounts: [SafeSpaceMount]?
     var realizedEnvironment: [SafeSpaceEnvironmentVariable]?
+    var publishedPorts: [SafeSpacePublishedPort]?
+    var realizedPublishedPorts: [SafeSpacePublishedPort]?
     var persistentData: [SafeSpacePersistentData]?
 }
 
 private struct SafeSpaceEnvironmentVariable: Codable, Equatable {
     var name: String
     var value: String
+}
+
+private struct SafeSpacePublishedPort: Codable, Equatable {
+    var hostPort: Int
+    var containerPort: Int
 }
 
 private struct SafeSpaceRecipeUser: Codable, Equatable {
@@ -144,6 +151,7 @@ private struct SafeSpaceCachedApp: Codable {
     let iconObservationToken: String?
     var listName: String
     var isRunning: Bool?
+    let publishedPort: Int?
 }
 
 private struct SafeSpaceAppSnapshot {
@@ -156,6 +164,22 @@ private struct SafeSpaceAppSnapshot {
     let iconPath: String
     let listName: String
     let isRunning: Bool
+    let publishedPort: Int?
+}
+
+struct SafeSpaceMenuBarApp: Equatable, Sendable {
+    let workspaceID: UUID
+    let serviceID: String
+    let displayName: String
+    let socketPath: String
+    let url: String
+    let publishedPort: Int?
+}
+
+struct SafeSpaceMenuBarContainer: Equatable, Sendable {
+    let id: UUID
+    let name: String
+    let apps: [SafeSpaceMenuBarApp]
 }
 
 private struct SafeSpaceCommandSnapshot {
@@ -301,11 +325,24 @@ final class SafeSpaceManager: @unchecked Sendable {
             }
             requestID = request["requestID"] as? String ?? UUID().uuidString
             let extra = try await perform(operation: operation, request: request)
+            if operationChangesMenuBarState(operation) {
+                notifyOuterShellSafeSpacesChanged()
+            }
             return (200, try await response(requestID: requestID, extra: extra))
         } catch {
             let fallbackRequestID = (try? JSONSerialization.jsonObject(with: data))
                 .flatMap { $0 as? [String: Any] }?["requestID"] as? String ?? UUID().uuidString
             return (200, errorResponse(requestID: fallbackRequestID, error: error))
+        }
+    }
+
+    private func operationChangesMenuBarState(_ operation: String) -> Bool {
+        switch operation {
+        case "create", "duplicate", "changeRuntime", "rename", "start", "stop", "delete",
+             "startApp", "stopApp", "restartApp", "rebuildRecipe":
+            return true
+        default:
+            return false
         }
     }
 
@@ -345,6 +382,77 @@ final class SafeSpaceManager: @unchecked Sendable {
             throw SafeSpaceManagerError.safeSpaceAppNotFound
         }
         try saveCachedApps()
+    }
+
+    func menuBarContainers() async -> [SafeSpaceMenuBarContainer] {
+        let currentRecords = lock.withSafeSpaceLock { records }
+            .sorted { $0.createdAt < $1.createdAt }
+        var containers: [SafeSpaceMenuBarContainer] = []
+        for record in currentRecords {
+            guard (try? runtimeState(record)) == "running" else { continue }
+            let snapshots: [SafeSpaceAppSnapshot]
+            do {
+                snapshots = try await appSnapshots(for: record)
+            } catch {
+                NSLog("Could not list menu bar apps for container %@: %@",
+                      record.name,
+                      error.localizedDescription)
+                snapshots = []
+            }
+            let apps = snapshots
+                .filter(\.isRunning)
+                .map {
+                    SafeSpaceMenuBarApp(workspaceID: record.id,
+                                        serviceID: $0.serviceID,
+                                        displayName: $0.displayName,
+                                        socketPath: $0.socketPath,
+                                        url: $0.url,
+                                        publishedPort: $0.publishedPort)
+                }
+                .sorted {
+                    $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending
+                }
+            containers.append(SafeSpaceMenuBarContainer(id: record.id,
+                                                        name: record.name,
+                                                        apps: apps))
+            ensureAppEventMonitor(for: record)
+        }
+        return containers
+    }
+
+    func menuBarURL(for app: SafeSpaceMenuBarApp) async throws -> URL {
+        guard let record = lock.withSafeSpaceLock({
+            records.first(where: { $0.id == app.workspaceID })
+        }) else {
+            throw SafeSpaceManagerError.safeSpaceNotFound
+        }
+        let path = appPathAndQuery(app.url, socketPath: app.socketPath)
+        var components = URLComponents()
+        components.scheme = "outerloop"
+        components.host = "open-hosted-app"
+        components.queryItems = [
+            URLQueryItem(name: "server", value: "localhost"),
+            URLQueryItem(name: "backend", value: app.serviceID),
+            URLQueryItem(name: "appURL", value: path),
+            URLQueryItem(name: "name", value: app.displayName)
+        ]
+        if let publishedPort = app.publishedPort {
+            components.queryItems?.append(
+                URLQueryItem(name: "port", value: String(publishedPort))
+            )
+        } else {
+            let publishedPath = try await publishSocket(in: record,
+                                                        socketPath: app.socketPath)
+            components.queryItems?.append(
+                URLQueryItem(name: "socketPath", value: publishedPath)
+            )
+        }
+        guard let url = components.url else {
+            throw SafeSpaceManagerError.commandFailed(
+                "The container app returned an invalid address."
+            )
+        }
+        return url
     }
 
     private func perform(operation: String,
@@ -904,6 +1012,7 @@ final class SafeSpaceManager: @unchecked Sendable {
         duplicatedRecipe.realizedDockerfileContents = nil
         duplicatedRecipe.realizedMounts = nil
         duplicatedRecipe.realizedEnvironment = nil
+        duplicatedRecipe.realizedPublishedPorts = nil
         duplicatedRecipe.hasUntrackedChanges = false
         try saveRecipe(duplicatedRecipe, for: duplicate)
         lock.withSafeSpaceLock {
@@ -1174,6 +1283,11 @@ final class SafeSpaceManager: @unchecked Sendable {
                 "--env", "\(variable.name)=\(variable.value)"
             ])
         }
+        for port in recipe.publishedPorts ?? [] {
+            arguments.append(contentsOf: [
+                "--publish", "127.0.0.1:\(port.hostPort):\(port.containerPort)/tcp"
+            ])
+        }
         arguments.append(imageReference)
         let result = try runContainer(arguments)
         try requireSuccess(result, action: "create the container")
@@ -1230,6 +1344,11 @@ final class SafeSpaceManager: @unchecked Sendable {
         }
         for variable in recipe.environment ?? [] {
             arguments.append(contentsOf: ["--env", "\(variable.name)=\(variable.value)"])
+        }
+        for port in recipe.publishedPorts ?? [] {
+            arguments.append(contentsOf: [
+                "--publish", "127.0.0.1:\(port.hostPort):\(port.containerPort)/tcp"
+            ])
         }
         arguments.append(imageReference)
         try requireSuccess(try runDocker(arguments), action: "create the Docker container")
@@ -1704,6 +1823,7 @@ final class SafeSpaceManager: @unchecked Sendable {
         try validateDockerfile(contents)
         let mounts = try configurationMounts(request["mounts"])
         let environment = try configurationEnvironment(request["environment"])
+        let publishedPorts = try configurationPublishedPorts(request["publishedPorts"])
         var value = try recipe(for: selected)
         if value.realizedMounts == nil {
             value.realizedMounts = value.mounts ?? []
@@ -1711,12 +1831,16 @@ final class SafeSpaceManager: @unchecked Sendable {
         if value.realizedEnvironment == nil {
             value.realizedEnvironment = value.environment ?? []
         }
+        if value.realizedPublishedPorts == nil {
+            value.realizedPublishedPorts = value.publishedPorts ?? []
+        }
 
         try contents.write(to: try dockerfileURL(selected.id),
                            atomically: true,
                            encoding: .utf8)
         value.mounts = mounts
         value.environment = environment
+        value.publishedPorts = publishedPorts
         try saveRecipe(value, for: selected)
         return ["recipeCommandOutput": "", "recipeCommandApplied": false]
     }
@@ -1798,6 +1922,28 @@ final class SafeSpaceManager: @unchecked Sendable {
         return name.unicodeScalars.dropFirst().allSatisfy {
             CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "_"))
                 .contains($0)
+        }
+    }
+
+    private func configurationPublishedPorts(
+        _ value: Any?
+    ) throws -> [SafeSpacePublishedPort] {
+        guard let dictionaries = value as? [[String: Any]] else {
+            throw SafeSpaceManagerError.invalidRequest
+        }
+        var hostPorts = Set<Int>()
+        return try dictionaries.map { dictionary in
+            guard let hostPort = dictionary["hostPort"] as? Int,
+                  let containerPort = dictionary["containerPort"] as? Int,
+                  (1...65535).contains(hostPort),
+                  (1...65535).contains(containerPort),
+                  hostPorts.insert(hostPort).inserted else {
+                throw SafeSpaceManagerError.commandFailed(
+                    "Published ports need a unique host port and values from 1 through 65535."
+                )
+            }
+            return SafeSpacePublishedPort(hostPort: hostPort,
+                                          containerPort: containerPort)
         }
     }
 
@@ -2356,9 +2502,41 @@ final class SafeSpaceManager: @unchecked Sendable {
             "/bin/sh", "-c", command
         ])
         try requireSuccess(result, action: "list container apps")
+        let declaredPorts = try declaredAppTCPPorts(for: record)
+        let publishedPorts = Dictionary(uniqueKeysWithValues: (try recipe(for: record).publishedPorts ?? []).map {
+            ($0.containerPort, $0.hostPort)
+        })
         return try parseAppSnapshots(result.stdout,
                                      runtimeDirectory: runtimeDirectory,
-                                     runningServiceIDs: runningServiceIDs)
+                                     runningServiceIDs: runningServiceIDs,
+                                     declaredPorts: declaredPorts,
+                                     publishedPorts: publishedPorts)
+    }
+
+    private func declaredAppTCPPorts(for record: SafeSpaceRecord) throws -> [String: Int] {
+        let command = """
+        for path in /opt/outershell/image-apps/*/start; do
+            [ -f "${path}" ] || continue
+            service=${path%/start}
+            service=${service##*/}
+            port=$(/usr/bin/awk -F= '$1 == "port" && $2 ~ /^[0-9]+$/ { print $2; exit }' "${path}")
+            [ -n "${port}" ] && /usr/bin/printf '%s\t%s\n' "${service}" "${port}"
+        done
+        """
+        let result = try runRuntime(record, [
+            "exec", "--user", "root", containerName(record.id),
+            "/bin/sh", "-c", command
+        ])
+        try requireSuccess(result, action: "inspect container app ports")
+        return Dictionary(uniqueKeysWithValues: result.stdout
+            .split(separator: "\n")
+            .compactMap { line -> (String, Int)? in
+                let fields = line.split(separator: "\t", omittingEmptySubsequences: false)
+                guard fields.count == 2, let port = Int(fields[1]), (1...65_535).contains(port) else {
+                    return nil
+                }
+                return (String(fields[0]), port)
+            })
     }
 
     private func runningServiceIDs(for record: SafeSpaceRecord) async throws -> Set<String> {
@@ -2402,6 +2580,10 @@ final class SafeSpaceManager: @unchecked Sendable {
         var result: [SafeSpaceAppSnapshot] = []
         result.reserveCapacity(snapshots.count)
         for snapshot in snapshots {
+            if snapshot.publishedPort != nil {
+                result.append(snapshot)
+                continue
+            }
             do {
                 let publishedPath = try await publishSocket(
                     in: record,
@@ -2423,7 +2605,8 @@ final class SafeSpaceManager: @unchecked Sendable {
                     url: externalURL,
                     iconPath: snapshot.iconPath,
                     listName: snapshot.listName,
-                    isRunning: snapshot.isRunning
+                    isRunning: snapshot.isRunning,
+                    publishedPort: snapshot.publishedPort
                 ))
             } catch {
                 NSLog("Could not publish app endpoint %@ in container %@: %@",
@@ -2554,7 +2737,9 @@ final class SafeSpaceManager: @unchecked Sendable {
 
     private func parseAppSnapshots(_ output: String,
                                    runtimeDirectory: String,
-                                   runningServiceIDs: Set<String>) throws -> [SafeSpaceAppSnapshot] {
+                                   runningServiceIDs: Set<String>,
+                                   declaredPorts: [String: Int],
+                                   publishedPorts: [Int: Int]) throws -> [SafeSpaceAppSnapshot] {
         let lines = output.components(separatedBy: .newlines)
         let appLines = lines.filter { !$0.isEmpty }
         guard let headerLine = appLines.first else {
@@ -2579,6 +2764,7 @@ final class SafeSpaceManager: @unchecked Sendable {
                 return nil
             }
             let serviceID = field("service_id")
+            let publishedPort = declaredPorts[serviceID].flatMap { publishedPorts[$0] }
             return SafeSpaceAppSnapshot(
                 frontendID: field("frontend_id"),
                 serviceID: serviceID,
@@ -2588,7 +2774,8 @@ final class SafeSpaceManager: @unchecked Sendable {
                 url: field("url"),
                 iconPath: field("icon_path"),
                 listName: field("list"),
-                isRunning: runningServiceIDs.contains(serviceID)
+                isRunning: runningServiceIDs.contains(serviceID),
+                publishedPort: publishedPort
             )
         }
     }
@@ -2610,7 +2797,8 @@ final class SafeSpaceManager: @unchecked Sendable {
                                    iconObservationToken: old[$0.frontendID]?.iconObservationToken
                                        ?? UUID().uuidString,
                                    listName: old[$0.frontendID]?.listName ?? $0.listName,
-                                   isRunning: $0.isRunning)
+                                   isRunning: $0.isRunning,
+                                   publishedPort: $0.publishedPort)
             }
         }
     }
@@ -2719,7 +2907,8 @@ final class SafeSpaceManager: @unchecked Sendable {
             "iconPath": app.iconPath,
             "iconObservationToken": app.iconObservationToken ?? "",
             "listName": app.listName,
-            "isRunning": running && (app.isRunning ?? false)
+            "isRunning": running && (app.isRunning ?? false),
+            "publishedPort": app.publishedPort ?? 0
         ]
         if let iconData = app.iconData {
             value["iconData"] = iconData.base64EncodedString()
@@ -2916,6 +3105,8 @@ final class SafeSpaceManager: @unchecked Sendable {
                         environment: [],
                         realizedMounts: nil,
                         realizedEnvironment: nil,
+                        publishedPorts: [],
+                        realizedPublishedPorts: nil,
                         persistentData: [])
     }
 
@@ -2972,6 +3163,9 @@ final class SafeSpaceManager: @unchecked Sendable {
         if result.persistentData == nil {
             result.persistentData = []
         }
+        if result.publishedPorts == nil {
+            result.publishedPorts = []
+        }
         var changedStepIDs = Set<UUID>()
         result.steps = value.steps.map { step in
             guard let catalogItemID = step.catalogItemID,
@@ -3006,6 +3200,7 @@ final class SafeSpaceManager: @unchecked Sendable {
         value.realizedDockerfileContents = try dockerfileContents(for: record)
         value.realizedMounts = value.mounts ?? []
         value.realizedEnvironment = value.environment ?? []
+        value.realizedPublishedPorts = value.publishedPorts ?? []
         value.hasUntrackedChanges = false
         try saveRecipe(value, for: record)
     }
@@ -3021,7 +3216,8 @@ final class SafeSpaceManager: @unchecked Sendable {
         let needsRebuild = value.version != currentSafeSpaceRecipeVersion ||
             value.realizedDockerfileContents != dockerfile ||
             value.realizedMounts.map { $0 != (value.mounts ?? []) } == true ||
-            value.realizedEnvironment.map { $0 != (value.environment ?? []) } == true
+            value.realizedEnvironment.map { $0 != (value.environment ?? []) } == true ||
+            value.realizedPublishedPorts.map { $0 != (value.publishedPorts ?? []) } == true
         return [
             "baseImage": value.baseImage,
             "installsOuterShellSupport": value.installsOuterShellSupport ?? false,
@@ -3113,6 +3309,9 @@ final class SafeSpaceManager: @unchecked Sendable {
             "workingDirectory": value.users?.first?.workingDirectory ?? "/",
             "environment": (value.environment ?? []).map {
                 ["name": $0.name, "value": $0.value]
+            },
+            "publishedPorts": (value.publishedPorts ?? []).map {
+                ["hostPort": $0.hostPort, "containerPort": $0.containerPort]
             }
         ]
     }

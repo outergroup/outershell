@@ -872,9 +872,11 @@ private final class OuterShellAgentDelegate: NSObject, NSApplicationDelegate, NS
     private var statusItem: NSStatusItem?
     private let menu = NSMenu()
     private var services: [ManagedBackend] = []
+    private var runningContainers: [SafeSpaceMenuBarContainer] = []
     private var lastError: String?
     private var refreshTimer: Timer?
     private var followUpRefreshTask: Task<Void, Never>?
+    private var containerRefreshTask: Task<Void, Never>?
     private var pendingLifecycleActions: [String: PendingLifecycleAction] = [:]
     private var serviceExitMonitors: [String: (pid: pid_t, source: DispatchSourceProcess)] = [:]
     private var brokerThread: Thread?
@@ -894,7 +896,7 @@ private final class OuterShellAgentDelegate: NSObject, NSApplicationDelegate, NS
                                                             name: MenuBarVisibilityPreference.changedNotification,
                                                             object: nil)
         refresh()
-        refreshTimer = Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { [weak self] _ in
+        refreshTimer = Timer.scheduledTimer(withTimeInterval: 300, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in
                 self?.refresh()
             }
@@ -904,6 +906,7 @@ private final class OuterShellAgentDelegate: NSObject, NSApplicationDelegate, NS
     func applicationWillTerminate(_ notification: Notification) {
         refreshTimer?.invalidate()
         followUpRefreshTask?.cancel()
+        containerRefreshTask?.cancel()
         cancelAllServiceExitMonitors()
         activeOuterShellAgentDelegate = nil
         OuterShelldSetMenuBarVisibilityCallbacks(nil, nil)
@@ -1003,6 +1006,7 @@ private final class OuterShellAgentDelegate: NSObject, NSApplicationDelegate, NS
         } catch {
             lastError = error.localizedDescription
         }
+        refreshContainers()
         guard previousServices != services ||
                 previousError != lastError else {
             return
@@ -1011,8 +1015,24 @@ private final class OuterShellAgentDelegate: NSObject, NSApplicationDelegate, NS
         rebuildMenu()
     }
 
+    private func refreshContainers() {
+        containerRefreshTask?.cancel()
+        containerRefreshTask = Task.detached(priority: .userInitiated) { [weak self] in
+            let containers = await SafeSpaceManager.shared.menuBarContainers()
+            guard !Task.isCancelled else { return }
+            await MainActor.run { [weak self] in
+                guard let self, self.runningContainers != containers else { return }
+                self.runningContainers = containers
+                self.updateStatusItem()
+                self.rebuildMenu()
+            }
+        }
+    }
+
     private func updateStatusItem() {
-        let running = services.filter(\.state.isRunning).count
+        let privilegedAppCount = services.filter(\.state.isRunning).count
+        let containerAppCount = runningContainers.reduce(0) { $0 + $1.apps.count }
+        let running = privilegedAppCount + containerAppCount
         let shouldShow = MenuBarVisibilityPreference.isEnabled && running > 0
         if shouldShow {
             ensureStatusItem()
@@ -1022,7 +1042,9 @@ private final class OuterShellAgentDelegate: NSObject, NSApplicationDelegate, NS
         }
         guard let button = statusItem?.button else { return }
         button.title = " \(running)"
-        button.toolTip = lastError ?? "\(running) running backend\(running == 1 ? "" : "s")"
+        button.toolTip = lastError ??
+            "\(privilegedAppCount) privileged app\(privilegedAppCount == 1 ? "" : "s") and " +
+            "\(containerAppCount) container app\(containerAppCount == 1 ? "" : "s") running"
     }
 
     private func ensureStatusItem() {
@@ -1046,30 +1068,49 @@ private final class OuterShellAgentDelegate: NSObject, NSApplicationDelegate, NS
             menu.addItem(item)
             menu.addItem(.separator())
         }
-        let duplicateDisplayNameKeys = duplicateMenuDisplayNameKeys(for: services)
-        for (index, service) in services.enumerated() {
-            let displayName = menuDisplayName(for: service,
-                                              showsScope: duplicateDisplayNameKeys.contains(menuDisplayNameKey(for: service)))
-            append(service, displayName: displayName, isLast: index == services.index(before: services.endIndex))
+        if !services.isEmpty {
+            let heading = NSMenuItem(title: "PRIVILEGED APPS", action: nil, keyEquivalent: "")
+            heading.isEnabled = false
+            heading.view = SectionHeadingMenuItemView(title: "PRIVILEGED APPS")
+            menu.addItem(heading)
+            let duplicateDisplayNameKeys = duplicateMenuDisplayNameKeys(for: services)
+            for service in services {
+                let displayName = menuDisplayName(
+                    for: service,
+                    showsScope: duplicateDisplayNameKeys.contains(menuDisplayNameKey(for: service))
+                )
+                append(service, displayName: displayName)
+            }
+        }
+        if !runningContainers.isEmpty {
+            if !services.isEmpty {
+                menu.addItem(.separator())
+            }
+            for (index, container) in runningContainers.enumerated() {
+                append(container)
+                if index < runningContainers.count - 1 {
+                    menu.addItem(.separator())
+                }
+            }
         }
         if !menu.items.isEmpty {
             menu.addItem(.separator())
         }
-        let quit = NSMenuItem(title: "Stop showing this in menu bar",
-                              action: #selector(quit(_:)),
-                              keyEquivalent: "")
-        quit.target = self
-        menu.addItem(quit)
-        quit.image = menuImage(systemSymbolName: "eye.slash")
         let manage = NSMenuItem(title: "Manage in Outer Shell",
                                 action: #selector(openOuterShell(_:)),
                                 keyEquivalent: "")
         manage.target = self
         manage.image = menuImage(systemSymbolName: "arrow.up.forward")
         menu.addItem(manage)
+        let quit = NSMenuItem(title: "Stop showing this in menu bar",
+                              action: #selector(quit(_:)),
+                              keyEquivalent: "")
+        quit.target = self
+        menu.addItem(quit)
+        quit.image = menuImage(systemSymbolName: "eye.slash")
     }
 
-    private func append(_ service: ManagedBackend, displayName: String, isLast: Bool) {
+    private func append(_ service: ManagedBackend, displayName: String) {
         let heading = NSMenuItem(title: displayName, action: nil, keyEquivalent: "")
         heading.isEnabled = false
         heading.view = SectionHeadingMenuItemView(title: displayName)
@@ -1098,8 +1139,49 @@ private final class OuterShellAgentDelegate: NSObject, NSApplicationDelegate, NS
             menu.addItem(copy)
         }
 
-        if !isLast {
-            menu.addItem(.separator())
+    }
+
+    private func append(_ container: SafeSpaceMenuBarContainer) {
+        let title = container.name.uppercased()
+        let heading = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+        heading.isEnabled = false
+        heading.view = SectionHeadingMenuItemView(title: title)
+        menu.addItem(heading)
+        if container.apps.isEmpty {
+            let empty = NSMenuItem(title: "No apps running", action: nil, keyEquivalent: "")
+            empty.isEnabled = false
+            menu.addItem(empty)
+        } else {
+            for app in container.apps {
+                append(app)
+            }
+        }
+    }
+
+    private func append(_ app: SafeSpaceMenuBarApp) {
+        let displayName = app.displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let title = displayName.isEmpty ? app.serviceID : displayName
+        let heading = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+        heading.isEnabled = false
+        heading.view = SectionHeadingMenuItemView(title: title)
+        menu.addItem(heading)
+
+        let open = NSMenuItem(title: "Open",
+                              action: #selector(openContainerAppMenuItemClicked(_:)),
+                              keyEquivalent: "")
+        open.target = self
+        open.representedObject = app
+        open.image = menuImage(systemSymbolName: "arrow.up.forward")
+        menu.addItem(open)
+
+        if copyableURL(for: app) != nil {
+            let copy = NSMenuItem(title: "Copy URL",
+                                  action: #selector(copyContainerAppURLMenuItemClicked(_:)),
+                                  keyEquivalent: "")
+            copy.target = self
+            copy.representedObject = app
+            copy.image = menuImage(systemSymbolName: "doc.on.doc")
+            menu.addItem(copy)
         }
     }
 
@@ -1169,6 +1251,35 @@ private final class OuterShellAgentDelegate: NSObject, NSApplicationDelegate, NS
         NSPasteboard.general.setString(url.absoluteString, forType: .string)
     }
 
+    @objc private func openContainerAppMenuItemClicked(_ sender: NSMenuItem) {
+        guard let app = sender.representedObject as? SafeSpaceMenuBarApp else { return }
+        Task.detached(priority: .userInitiated) { [weak self] in
+            do {
+                let url = try await SafeSpaceManager.shared.menuBarURL(for: app)
+                await MainActor.run { [weak self] in
+                    self?.openInOuterLoop(url)
+                }
+            } catch {
+                await MainActor.run { [weak self] in
+                    NSLog("Could not open container app %@: %@",
+                          app.displayName,
+                          error.localizedDescription)
+                    self?.lastError = error.localizedDescription
+                    self?.rebuildMenu()
+                }
+            }
+        }
+    }
+
+    @objc private func copyContainerAppURLMenuItemClicked(_ sender: NSMenuItem) {
+        guard let app = sender.representedObject as? SafeSpaceMenuBarApp,
+              let url = copyableURL(for: app) else {
+            return
+        }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(url.absoluteString, forType: .string)
+    }
+
     @objc private func menuBarVisibilityPreferenceChanged(_ notification: Notification) {
         updateStatusItem()
     }
@@ -1192,6 +1303,22 @@ private final class OuterShellAgentDelegate: NSObject, NSApplicationDelegate, NS
         components.host = "127.0.0.1"
         components.port = frontend.port
         let pathAndQuery = pathAndQuery(fromFrontendURL: frontend.url)
+        if let questionIndex = pathAndQuery.firstIndex(of: "?") {
+            components.path = String(pathAndQuery[..<questionIndex])
+            components.query = String(pathAndQuery[pathAndQuery.index(after: questionIndex)...])
+        } else {
+            components.path = pathAndQuery
+        }
+        return components.url
+    }
+
+    private func copyableURL(for app: SafeSpaceMenuBarApp) -> URL? {
+        guard let publishedPort = app.publishedPort else { return nil }
+        var components = URLComponents()
+        components.scheme = "http"
+        components.host = "127.0.0.1"
+        components.port = publishedPort
+        let pathAndQuery = pathAndQuery(fromFrontendURL: app.url)
         if let questionIndex = pathAndQuery.firstIndex(of: "?") {
             components.path = String(pathAndQuery[..<questionIndex])
             components.query = String(pathAndQuery[pathAndQuery.index(after: questionIndex)...])

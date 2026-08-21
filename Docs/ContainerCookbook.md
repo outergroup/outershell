@@ -286,6 +286,29 @@ RUN outerctl image add-app \
 The TCP adapter requires `bash`, `curl`, and `socat`; the installation fragment
 above includes them.
 
+## Publish a TCP port to this server
+
+`outerctl image add-app --tcp-port` keeps an application available to Outer
+Loop through its normal Unix-socket route. It does not publish that port from
+the container to the server.
+
+To also use the application in an ordinary browser, open **Edit container**, go
+to **Ports**, and add one mapping per line:
+
+```text
+4000:4000
+```
+
+The first number is the port on the server and the second is the port inside
+the container. Outer Shell binds the server port to `127.0.0.1`, so it is only
+reachable from that server by default. The application inside the container
+must listen on `0.0.0.0`, rather than `127.0.0.1`, for the runtime to forward
+connections to it.
+
+You may also include `EXPOSE 4000` in the Dockerfile to document the
+application's container port. `EXPOSE` is OCI image metadata; it does not
+create the server-to-container mapping by itself.
+
 ## Publish another app
 
 For another application that can listen on a Unix socket:

@@ -464,6 +464,7 @@ private struct LocalWorkspaceAppRecord: Decodable, Equatable {
     let iconObservationToken: String
     let listName: String
     let isRunning: Bool
+    let publishedPort: Int
 }
 
 private struct LocalWorkspaceCommandRecord: Decodable, Equatable {
@@ -601,6 +602,11 @@ private struct LocalWorkspaceRecord: Decodable, Equatable {
             let value: String
         }
 
+        struct PublishedPort: Decodable, Equatable {
+            let hostPort: Int
+            let containerPort: Int
+        }
+
         let baseImage: String
         let installsOuterShellSupport: Bool
         let outerShellSupportSnippet: String
@@ -620,6 +626,7 @@ private struct LocalWorkspaceRecord: Decodable, Equatable {
         let hasUntrackedChanges: Bool
         let workingDirectory: String
         let environment: [EnvironmentVariable]
+        let publishedPorts: [PublishedPort]
     }
 
     let id: UUID
@@ -743,6 +750,7 @@ private struct LocalWorkspaceHostRequest: Encodable {
     let dockerfile: String?
     let mounts: [ContainerConfigurationMountRequest]?
     let environment: [ContainerConfigurationEnvironmentRequest]?
+    let publishedPorts: [ContainerConfigurationPublishedPortRequest]?
 }
 
 private struct ContainerConfigurationMountRequest: Encodable {
@@ -756,6 +764,11 @@ private struct ContainerConfigurationMountRequest: Encodable {
 private struct ContainerConfigurationEnvironmentRequest: Encodable {
     let name: String
     let value: String
+}
+
+private struct ContainerConfigurationPublishedPortRequest: Encodable {
+    let hostPort: Int
+    let containerPort: Int
 }
 
 private struct SafeSpaceSocketAPIRequest: Encodable {
@@ -795,6 +808,7 @@ private enum ContainerConfigurationTab {
     case dockerfile
     case mounts
     case environment
+    case ports
     case runtime
 }
 
@@ -1346,6 +1360,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private var containerConfigurationSavedDockerfile = ""
     private var containerConfigurationEnvironment = ""
     private var containerConfigurationSavedEnvironment = ""
+    private var containerConfigurationPorts = ""
+    private var containerConfigurationSavedPorts = ""
     private var containerConfigurationMounts: [ContainerConfigurationMountDraft] = []
     private var containerConfigurationSavedMounts: [ContainerConfigurationMountDraft] = []
     private var containerConfigurationRequiresRebuild = false
@@ -1359,6 +1375,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private var pendingContainerConfigurationPreviousRequiresRebuild: Bool?
     private var pendingContainerConfigurationRuntimeSave: (
         environment: String,
+        ports: String,
         mounts: [ContainerConfigurationMountDraft]
     )?
     private var containerConfigurationTextScroll: CGFloat = 0
@@ -1598,9 +1615,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private var containerConfigurationDockerfileTabFrame = CGRect.zero
     private var containerConfigurationMountsTabFrame = CGRect.zero
     private var containerConfigurationEnvironmentTabFrame = CGRect.zero
+    private var containerConfigurationPortsTabFrame = CGRect.zero
     private var containerConfigurationRuntimeTabFrame = CGRect.zero
     private var containerConfigurationChangeRuntimeFrame = CGRect.zero
-    private var containerConfigurationDuplicateRuntimeFrame = CGRect.zero
     private var containerConfigurationEditorToolbarFrame = CGRect.zero
     private var containerConfigurationCookbookFrame = CGRect.zero
     private var containerConfigurationCopyPathFrame = CGRect.zero
@@ -9232,14 +9249,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             navigate(nil)
             return
         }
-        requestPublishedWorkspaceSocket(socketPath: socketPath) { [weak self] path, error in
-            if let error, !error.isEmpty {
-                self?.backendError = error
-                self?.updateLayout()
-                return
-            }
-            navigate(path)
-        }
+        navigate(nil)
     }
 
     private func requestPublishedWorkspaceSocket(socketPath: String,
@@ -9302,6 +9312,24 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             ? "Opening \(displayName)…"
             : "Starting container \(workspace.name) and opening \(displayName)…"
         updateLayout()
+        if app.publishedPort > 0 {
+            let path = pathAndQuery(fromFrontendURL: app.url,
+                                    socketPath: app.socketPath)
+            guard let url = URL(string: "http://127.0.0.1:\(app.publishedPort)\(path)") else {
+                isPerformingAction = false
+                backendError = "The app returned an invalid published port address."
+                updateLayout()
+                return
+            }
+            isPerformingAction = false
+            backendError = ""
+            updateLayout()
+            navigateToWorkspaceApp(workspaceAppNavigationURL(url, app: app),
+                                   displayName: endpointDisplayName,
+                                   opensInNewTab: opensInNewTab,
+                                   opensInNewWindow: opensInNewWindow)
+            return
+        }
         requestPublishedWorkspaceSocket(socketPath: app.socketPath,
                                         workspaceID: workspace.id,
                                         completion: { [weak self] publishedSocketPath, publicationError in
@@ -9325,18 +9353,28 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             self.backendError = ""
             self.updateLayout()
             let navigationURL = self.workspaceAppNavigationURL(url, app: app)
-            if opensInNewWindow {
-                self.outerframeHost.openNewWindow(with: navigationURL,
-                                                  displayString: endpointDisplayName,
-                                                  preferredSize: nil)
-            } else if opensInNewTab {
-                self.outerframeHost.openNewTab(with: navigationURL,
-                                               displayString: endpointDisplayName)
-            } else {
-                self.outerframeHost.navigate(to: navigationURL,
-                                             displayString: endpointDisplayName)
-            }
+            self.navigateToWorkspaceApp(navigationURL,
+                                        displayName: endpointDisplayName,
+                                        opensInNewTab: opensInNewTab,
+                                        opensInNewWindow: opensInNewWindow)
         })
+    }
+
+    private func navigateToWorkspaceApp(_ url: URL,
+                                        displayName: String,
+                                        opensInNewTab: Bool,
+                                        opensInNewWindow: Bool) {
+        if opensInNewWindow {
+            outerframeHost.openNewWindow(with: url,
+                                         displayString: displayName,
+                                         preferredSize: nil)
+        } else if opensInNewTab {
+            outerframeHost.openNewTab(with: url,
+                                      displayString: displayName)
+        } else {
+            outerframeHost.navigate(to: url,
+                                    displayString: displayName)
+        }
     }
 
     private func workspaceAppNavigationURL(_ targetURL: URL,
@@ -10384,6 +10422,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                     containerConfigurationDockerfile = workspaceRenameInputController.text
                 case .environment:
                     containerConfigurationEnvironment = workspaceRenameInputController.text
+                    scheduleContainerConfigurationEnvironmentSave()
+                case .ports:
+                    containerConfigurationPorts = workspaceRenameInputController.text
                     scheduleContainerConfigurationEnvironmentSave()
                 case .mounts, .runtime:
                     break
@@ -12529,9 +12570,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                         containerConfigurationDockerfileTabFrame.contains(point) ||
                         containerConfigurationMountsTabFrame.contains(point) ||
                         containerConfigurationEnvironmentTabFrame.contains(point) ||
+                        containerConfigurationPortsTabFrame.contains(point) ||
                         containerConfigurationRuntimeTabFrame.contains(point) ||
                         containerConfigurationChangeRuntimeFrame.contains(point) ||
-                        containerConfigurationDuplicateRuntimeFrame.contains(point) ||
                         containerConfigurationCookbookFrame.contains(point) ||
                         containerConfigurationCopyPathFrame.contains(point) ||
                         containerConfigurationAddMountFrame.contains(point) ||
@@ -12903,7 +12944,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         }
         if isContainerConfigurationEditorVisible,
            workspaceRenameFieldFrame.contains(point),
-           containerConfigurationTab != .mounts {
+           containerConfigurationTab == .dockerfile ||
+            containerConfigurationTab == .environment ||
+            containerConfigurationTab == .ports {
             let visibleFrame = containerConfigurationTextVisibleFrame
             let text = workspaceRenameInputController.isFocused
                 ? workspaceRenameInputController.text
@@ -13204,6 +13247,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 armButtonClick(frame: containerConfigurationEnvironmentTabFrame) { [weak self] in
                     self?.selectContainerConfigurationTab(.environment)
                 }
+            } else if containerConfigurationPortsTabFrame.contains(point) {
+                armButtonClick(frame: containerConfigurationPortsTabFrame) { [weak self] in
+                    self?.selectContainerConfigurationTab(.ports)
+                }
             } else if containerConfigurationRuntimeTabFrame.contains(point) {
                 armButtonClick(frame: containerConfigurationRuntimeTabFrame) { [weak self] in
                     self?.selectContainerConfigurationTab(.runtime)
@@ -13222,20 +13269,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                     self.sendWorkspaceRequest(
                         operation: "changeRuntime",
                         workspaceID: workspace.id
-                    )
-                }
-            } else if containerConfigurationDuplicateRuntimeFrame.contains(point),
-                      let workspace = pendingDockerfileWorkspace,
-                      let destination = availableSafeSpaceProviders.first(where: {
-                          $0.id != workspace.runtime?.providerID && $0.canCreate
-                      }) {
-                armButtonClick(frame: containerConfigurationDuplicateRuntimeFrame) { [weak self] in
-                    guard let self else { return }
-                    self.selectedSafeSpaceProviderID = destination.id
-                    self.sendWorkspaceRequest(
-                        operation: "duplicate",
-                        workspaceID: workspace.id,
-                        name: "\(workspace.name) (\(destination.name))"
                     )
                 }
             } else if containerConfigurationCookbookFrame.contains(point) {
@@ -15204,7 +15237,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                       recipeScriptPath: String? = nil,
                                       dockerfile: String? = nil,
                                       mounts: [ContainerConfigurationMountRequest]? = nil,
-                                      environment: [ContainerConfigurationEnvironmentRequest]? = nil) {
+                                      environment: [ContainerConfigurationEnvironmentRequest]? = nil,
+                                      publishedPorts: [ContainerConfigurationPublishedPortRequest]? = nil) {
         if operation == "list" {
             guard !isRefreshingWorkspaces else { return }
         } else if operation != "create" {
@@ -15242,7 +15276,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                                 recipeScriptPath: recipeScriptPath,
                                                 dockerfile: dockerfile,
                                                 mounts: mounts,
-                                                environment: environment)
+                                                environment: environment,
+                                                publishedPorts: publishedPorts)
         guard let payload = try? JSONEncoder().encode(request) else {
             if operation == "rebuildRecipe" || operation == "changeRuntime" {
                 containerConfigurationRebuildWorkspaceID = nil
@@ -15459,11 +15494,13 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             if response.error?.isEmpty != false,
                let savedConfiguration = pendingContainerConfigurationRuntimeSave {
                 containerConfigurationSavedEnvironment = savedConfiguration.environment
+                containerConfigurationSavedPorts = savedConfiguration.ports
                 containerConfigurationSavedMounts = savedConfiguration.mounts
                 containerConfigurationRequiresRebuild = true
             }
             pendingContainerConfigurationRuntimeSave = nil
             if containerConfigurationEnvironment != containerConfigurationSavedEnvironment ||
+                containerConfigurationPorts != containerConfigurationSavedPorts ||
                 containerConfigurationMounts != containerConfigurationSavedMounts {
                 scheduleContainerConfigurationEnvironmentSave(after: 0.2)
             }
@@ -15853,6 +15890,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             "\($0.name)=\($0.value)"
         }.joined(separator: "\n")
         containerConfigurationSavedEnvironment = containerConfigurationEnvironment
+        containerConfigurationPorts = recipe.publishedPorts.map {
+            "\($0.hostPort):\($0.containerPort)"
+        }.joined(separator: "\n")
+        containerConfigurationSavedPorts = containerConfigurationPorts
         containerConfigurationMounts = workspace.visibleMounts.map {
             ContainerConfigurationMountDraft(
                 id: $0.id,
@@ -15902,6 +15943,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         containerConfigurationSavedDockerfile = ""
         containerConfigurationEnvironment = ""
         containerConfigurationSavedEnvironment = ""
+        containerConfigurationPorts = ""
+        containerConfigurationSavedPorts = ""
         containerConfigurationMounts = []
         containerConfigurationSavedMounts = []
         containerConfigurationRequiresRebuild = false
@@ -15937,6 +15980,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             case .environment:
                 containerConfigurationEnvironment = workspaceRenameInputController.text
                 scheduleContainerConfigurationEnvironmentSave(after: 0)
+            case .ports:
+                containerConfigurationPorts = workspaceRenameInputController.text
+                scheduleContainerConfigurationEnvironmentSave(after: 0)
             case .mounts, .runtime:
                 break
             }
@@ -15953,6 +15999,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         case .environment:
             workspaceRenameName = containerConfigurationEnvironment
             focusWorkspaceRenameField()
+        case .ports:
+            workspaceRenameName = containerConfigurationPorts
+            focusWorkspaceRenameField()
         case .mounts, .runtime:
             blurWorkspaceRenameField()
         }
@@ -15961,6 +16010,25 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
     private var hasUnsavedContainerConfigurationDockerfile: Bool {
         containerConfigurationDockerfile != containerConfigurationSavedDockerfile
+    }
+
+    private var currentContainerConfigurationText: String {
+        switch containerConfigurationTab {
+        case .dockerfile:
+            return containerConfigurationDockerfile
+        case .environment:
+            return containerConfigurationEnvironment
+        case .ports:
+            return containerConfigurationPorts
+        case .mounts, .runtime:
+            return ""
+        }
+    }
+
+    private var isContainerConfigurationTextTab: Bool {
+        containerConfigurationTab == .dockerfile ||
+            containerConfigurationTab == .environment ||
+            containerConfigurationTab == .ports
     }
 
     @discardableResult
@@ -16045,9 +16113,15 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
            workspaceRenameInputController.isFocused {
             containerConfigurationEnvironment = workspaceRenameInputController.text
         }
+        if containerConfigurationTab == .ports,
+           workspaceRenameInputController.isFocused {
+            containerConfigurationPorts = workspaceRenameInputController.text
+        }
         let environment: [ContainerConfigurationEnvironmentRequest]
+        let publishedPorts: [ContainerConfigurationPublishedPortRequest]
         do {
             environment = try parsedContainerConfigurationEnvironment()
+            publishedPorts = try parsedContainerConfigurationPublishedPorts()
         } catch {
             if reportErrors {
                 workspacePanelMessage = error.localizedDescription
@@ -16056,6 +16130,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             return
         }
         guard containerConfigurationEnvironment != containerConfigurationSavedEnvironment ||
+                containerConfigurationPorts != containerConfigurationSavedPorts ||
                 containerConfigurationMounts != containerConfigurationSavedMounts else {
             return
         }
@@ -16070,13 +16145,15 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         }
         pendingContainerConfigurationRuntimeSave = (
             environment: containerConfigurationEnvironment,
+            ports: containerConfigurationPorts,
             mounts: containerConfigurationMounts
         )
         sendWorkspaceRequest(operation: "updateContainerConfiguration",
                              workspaceID: workspace.id,
                              dockerfile: containerConfigurationSavedDockerfile,
                              mounts: mounts,
-                             environment: environment)
+                             environment: environment,
+                             publishedPorts: publishedPorts)
     }
 
     private func rebuildContainerConfiguration() {
@@ -16112,10 +16189,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         containerConfigurationBuildErrorViewportLayer = nil
         containerConfigurationBuildErrorCopyConfirmationID = nil
         setDockerfileSelection(fragmentID: nil, range: nil)
-        if containerConfigurationTab != .mounts {
-            workspaceRenameName = containerConfigurationTab == .dockerfile
-                ? containerConfigurationDockerfile
-                : containerConfigurationEnvironment
+        if isContainerConfigurationTextTab {
+            workspaceRenameName = currentContainerConfigurationText
             focusWorkspaceRenameField()
         }
         updateLayout()
@@ -16138,10 +16213,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private func dismissContainerConfigurationRebuildPrompt() {
         isConfirmingContainerConfigurationRebuild = false
         containerConfigurationRebuildAfterDockerfileSave = false
-        if containerConfigurationTab != .mounts {
-            workspaceRenameName = containerConfigurationTab == .dockerfile
-                ? containerConfigurationDockerfile
-                : containerConfigurationEnvironment
+        if isContainerConfigurationTextTab {
+            workspaceRenameName = currentContainerConfigurationText
             focusWorkspaceRenameField()
         }
         updateLayout()
@@ -16192,10 +16265,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private func dismissContainerConfigurationDismissalPrompt() {
         guard isConfirmingContainerConfigurationDismissal else { return }
         isConfirmingContainerConfigurationDismissal = false
-        if containerConfigurationTab != .mounts {
-            workspaceRenameName = containerConfigurationTab == .dockerfile
-                ? containerConfigurationDockerfile
-                : containerConfigurationEnvironment
+        if isContainerConfigurationTextTab {
+            workspaceRenameName = currentContainerConfigurationText
             focusWorkspaceRenameField()
         }
         updateLayout()
@@ -16252,6 +16323,33 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             }
             values.append(ContainerConfigurationEnvironmentRequest(name: name,
                                                                     value: value))
+        }
+        return values
+    }
+
+    private func parsedContainerConfigurationPublishedPorts() throws
+        -> [ContainerConfigurationPublishedPortRequest] {
+        var values: [ContainerConfigurationPublishedPortRequest] = []
+        var hostPorts = Set<Int>()
+        for (index, rawLine) in containerConfigurationPorts
+            .components(separatedBy: .newlines).enumerated() {
+            let line = rawLine.trimmingCharacters(in: .whitespaces)
+            if line.isEmpty { continue }
+            let parts = line.split(separator: ":", omittingEmptySubsequences: false)
+            guard parts.count == 2,
+                  let hostPort = Int(parts[0].trimmingCharacters(in: .whitespaces)),
+                  let containerPort = Int(parts[1].trimmingCharacters(in: .whitespaces)),
+                  (1...65535).contains(hostPort),
+                  (1...65535).contains(containerPort),
+                  hostPorts.insert(hostPort).inserted else {
+                throw ContainerConfigurationInputError(
+                    message: "Published port line \(index + 1) needs a unique HOST:CONTAINER mapping, such as 4000:4000."
+                )
+            }
+            values.append(ContainerConfigurationPublishedPortRequest(
+                hostPort: hostPort,
+                containerPort: containerPort
+            ))
         }
         return values
     }
@@ -16521,6 +16619,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 containerConfigurationDockerfile = workspaceRenameInputController.text
             case .environment:
                 containerConfigurationEnvironment = workspaceRenameInputController.text
+            case .ports:
+                containerConfigurationPorts = workspaceRenameInputController.text
             case .mounts, .runtime:
                 break
             }
@@ -16545,6 +16645,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             focusWorkspaceRenameField()
         case .environment:
             workspaceRenameName = containerConfigurationEnvironment
+            focusWorkspaceRenameField()
+        case .ports:
+            workspaceRenameName = containerConfigurationPorts
             focusWorkspaceRenameField()
         case .mounts, .runtime:
             workspaceRenameName = ""
@@ -17013,9 +17116,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         containerConfigurationDismissWithoutSavingFrame = .zero
         containerConfigurationDismissCancelFrame = .zero
         containerConfigurationRenameFrame = .zero
+        containerConfigurationPortsTabFrame = .zero
         containerConfigurationRuntimeTabFrame = .zero
         containerConfigurationChangeRuntimeFrame = .zero
-        containerConfigurationDuplicateRuntimeFrame = .zero
         workspaceRenameConfirmFrame = .zero
         workspaceRenameCancelFrame = .zero
 
@@ -17058,6 +17161,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             (.dockerfile, "Dockerfile"),
             (.mounts, "Folder Mounts"),
             (.environment, "Environment"),
+            (.ports, "Ports"),
             (.runtime, "Runtime")
         ]
         var tabX: CGFloat = 24
@@ -17082,6 +17186,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 containerConfigurationMountsTabFrame = rootFrame
             case .environment:
                 containerConfigurationEnvironmentTabFrame = rootFrame
+            case .ports:
+                containerConfigurationPortsTabFrame = rootFrame
             case .runtime:
                 containerConfigurationRuntimeTabFrame = rootFrame
             }
@@ -17134,6 +17240,11 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 in: contentFrame,
                 placeholder: "EXAMPLE=value"
             )
+        case .ports:
+            renderContainerConfigurationTextEditor(
+                in: contentFrame,
+                placeholder: "4000:4000"
+            )
         case .runtime:
             renderContainerConfigurationRuntime(workspace, in: contentFrame)
         }
@@ -17154,6 +17265,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             title: "Rebuild",
             emphasized: containerConfigurationRequiresRebuild ||
                 containerConfigurationEnvironment != containerConfigurationSavedEnvironment ||
+                containerConfigurationPorts != containerConfigurationSavedPorts ||
                 containerConfigurationMounts != containerConfigurationSavedMounts
         )
         rebuild.frame = localRebuildFrame
@@ -17257,9 +17369,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
         let text: String
         if isRenamingContainerConfiguration {
-            text = containerConfigurationTab == .dockerfile
-                ? containerConfigurationDockerfile
-                : containerConfigurationEnvironment
+            text = currentContainerConfigurationText
         } else {
             text = workspaceRenameInputController.isFocused
                 ? workspaceRenameInputController.text
@@ -18037,7 +18147,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             let unavailable = makeTextLayer(size: 11,
                                             weight: .regular,
                                             color: .secondaryLabelColor)
-            unavailable.string = "Install and start another supported runtime to convert or duplicate this container."
+            unavailable.string = "Install and start another supported runtime to convert this container."
             unavailable.frame = CGRect(x: contentFrame.minX,
                                        y: contentFrame.maxY - 132,
                                        width: contentFrame.width,
@@ -18063,22 +18173,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             dy: workspacePanelFrame.minY
         )
 
-        let button = makeButtonLayer(
-            title: "Duplicate using \(destination.name)",
-            emphasized: false
-        )
-        let width = min(max(CGFloat(destination.name.count * 8 + 130), 190),
-                        contentFrame.width)
-        let localFrame = CGRect(x: contentFrame.minX,
-                                y: contentFrame.maxY - 188,
-                                width: width,
-                                height: 32)
-        button.frame = localFrame
-        workspacePanelLayer.addSublayer(button)
-        containerConfigurationDuplicateRuntimeFrame = localFrame.offsetBy(
-            dx: workspacePanelFrame.minX,
-            dy: workspacePanelFrame.minY
-        )
     }
 
     private func renderContainerConfigurationMounts(in contentFrame: CGRect) {
