@@ -4853,6 +4853,60 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                  at: point)
     }
 
+    private func copyWorkspaceShellCommand(_ workspace: LocalWorkspaceRecord,
+                                           at point: CGPoint) {
+        let command = workspace.shellCommand.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !command.isEmpty else {
+            workspacePanelMessage = "The shell command for \(workspace.name) is not available yet."
+            updateLayout()
+            return
+        }
+        copyCommandForCurrentServer(command) { [weak self] resolvedCommand in
+            guard let self else { return }
+            self.copyTextToPasteboard(resolvedCommand)
+            self.workspacePanelMessage = ""
+            self.showCommandCopiedConfirmation(at: point)
+        }
+    }
+
+    private func copyWorkspaceCommand(_ command: LocalWorkspaceCommandRecord,
+                                      in workspace: LocalWorkspaceRecord,
+                                      at point: CGPoint) {
+        let containerCommand = command.containerCommand.trimmingCharacters(
+            in: .whitespacesAndNewlines
+        )
+        guard !containerCommand.isEmpty else {
+            workspacePanelMessage = "The \(command.displayName) command for \(workspace.name) is not available yet."
+            updateLayout()
+            return
+        }
+        copyCommandForCurrentServer(containerCommand) { [weak self] resolvedCommand in
+            guard let self else { return }
+            self.copyTextToPasteboard(resolvedCommand)
+            self.workspacePanelMessage = ""
+            self.showCommandCopiedConfirmation(at: point)
+        }
+    }
+
+    private func showWorkspaceOverviewCommandMenu(
+        for operation: String,
+        in workspace: LocalWorkspaceRecord,
+        at point: CGPoint
+    ) -> Bool {
+        if operation == "copyShell" {
+            showWorkspaceShellCommandMenu(workspace, at: point)
+            return true
+        }
+        guard operation.hasPrefix("copyCommand:"),
+              let command = workspace.commandLaunchers.first(where: {
+                  $0.id == String(operation.dropFirst("copyCommand:".count))
+              }) else {
+            return false
+        }
+        showWorkspaceCommandMenu(command, in: workspace, at: point)
+        return true
+    }
+
     private func showContainerCommandMenu(workspace: LocalWorkspaceRecord,
                                           command: LocalWorkspaceCommandRecord?,
                                           containerCommand: String,
@@ -5062,12 +5116,12 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         } else if operation == "editContainer" {
             navigateToRecipeSafeSpace(workspace.id, pushHistory: true)
         } else if operation == "copyShell" {
-            showWorkspaceShellCommandMenu(workspace, at: point)
+            copyWorkspaceShellCommand(workspace, at: point)
         } else if operation.hasPrefix("copyCommand:"),
                   let command = workspace.commandLaunchers.first(where: {
                       $0.id == String(operation.dropFirst("copyCommand:".count))
                   }) {
-            showWorkspaceCommandMenu(command, in: workspace, at: point)
+            copyWorkspaceCommand(command, in: workspace, at: point)
         } else if operation.hasPrefix("unmountFolder:") {
             let identifier = String(operation.dropFirst("unmountFolder:".count))
             guard let mountID = UUID(uuidString: identifier) else { return }
@@ -13102,6 +13156,15 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 at: appsPoint,
                 contentSpace: appsTextContentSpace(for: contentPoint),
                 rootPoint: point
+            ) {
+                return
+            }
+            if let action = workspaceOverviewActionFrames.first(where: {
+                $0.frame.contains(appsPoint)
+            }), showWorkspaceOverviewCommandMenu(
+                for: action.operation,
+                in: action.workspace,
+                at: point
             ) {
                 return
             }
