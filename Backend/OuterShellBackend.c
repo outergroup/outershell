@@ -128,9 +128,10 @@ static int connect_unix_stream(const char *socket_path, char *error, size_t erro
 
 #define DEFAULT_PORT 7354
 #define READ_BUFFER_SIZE 65536
-#define MAX_HTTP_REQUEST_SIZE (8u * 1024u * 1024u)
+#define MAX_HTTP_REQUEST_SIZE (16u * 1024u * 1024u)
 #define MAX_REACTOR_CLIENTS 128
 #define CLIENT_IDLE_TIMEOUT_MS 10000
+#define TRANSFER_IDLE_TIMEOUT_MS 120000
 
 static const char *kBundleUrlPath = "/bundles/OuterShell";
 static const char *kBundleFilePathMacosArm = "bundles/OuterShell.bundle.macos-arm.aar";
@@ -145,6 +146,7 @@ static char g_bundled_apps_base_url[2048] = "";
 static char g_home_screen_public_base_url[2048] = "";
 static char g_listen_socket_path[PATH_MAX] = "";
 static char g_http_proxy_api_socket_path[PATH_MAX] = "";
+static char g_container_transfers_directory[PATH_MAX] = "";
 static bool g_systemd_socket_activation = false;
 static bool g_launchd_socket_activation = false;
 static bool g_stay_alive_when_socket_idle = false;
@@ -163,6 +165,11 @@ typedef struct {
     int64_t last_activity_ms;
     bool waiting_for_api_response;
     int api_response_fd;
+    bool streaming_container_upload;
+    int container_upload_fd;
+    uint64_t container_upload_offset;
+    uint64_t container_upload_received;
+    uint64_t container_upload_length;
 } ReactorClient;
 
 static const char *bundle_arm_path(void) {
@@ -272,8 +279,10 @@ void OuterShellBackendRequestShutdown(void) {
 static const char *http_status_text(int status) {
     switch (status) {
     case 200: return "OK";
+    case 204: return "No Content";
     case 400: return "Bad Request";
     case 401: return "Unauthorized";
+    case 409: return "Conflict";
     case 404: return "Not Found";
     case 500: return "Internal Server Error";
     default: return "Error";
@@ -302,6 +311,24 @@ static void send_response(int fd, int status, const char *status_text, const cha
 
 static void send_text_response(int fd, int status, const char *message) {
     send_response(fd, status, http_status_text(status), "text/plain; charset=utf-8", message, strlen(message));
+}
+
+static void send_container_upload_response(int fd, int status, uint64_t offset) {
+    char header[512];
+    int header_len = snprintf(header, sizeof(header),
+                              "HTTP/1.1 %d %s\r\n"
+                              "Content-Length: 0\r\n"
+                              "Connection: close\r\n"
+                              "Cache-Control: no-store\r\n"
+                              "Upload-Offset: %llu\r\n"
+                              "Upload-Protocol: outershell-resumable-v1\r\n"
+                              "\r\n",
+                              status,
+                              http_status_text(status),
+                              (unsigned long long)offset);
+    if (header_len > 0 && (size_t)header_len < sizeof(header)) {
+        queue_all(fd, header, (size_t)header_len);
+    }
 }
 
 static void send_cached_response_header(int fd,
@@ -1872,6 +1899,212 @@ static bool parsed_content_length(const char *request,
     return true;
 }
 
+static bool parsed_uint64_header(const char *request,
+                                 size_t header_length,
+                                 const char *name,
+                                 uint64_t *value) {
+    char header[READ_BUFFER_SIZE];
+    if (header_length >= sizeof(header)) return false;
+    memcpy(header, request, header_length);
+    header[header_length] = '\0';
+
+    char needle[128];
+    int needle_length = snprintf(needle, sizeof(needle), "\r\n%s:", name);
+    if (needle_length <= 0 || (size_t)needle_length >= sizeof(needle)) return false;
+    char *line = strcasestr(header, needle);
+    if (!line) return false;
+    char *text = line + needle_length;
+    while (*text == ' ' || *text == '\t') text++;
+    errno = 0;
+    char *end = NULL;
+    unsigned long long parsed = strtoull(text, &end, 10);
+    if (errno != 0 || end == text) return false;
+    while (*end == ' ' || *end == '\t') end++;
+    if (*end != '\r' && *end != '\n' && *end != '\0') return false;
+    *value = (uint64_t)parsed;
+    return true;
+}
+
+static bool header_value_contains(const char *request,
+                                  size_t header_length,
+                                  const char *name,
+                                  const char *value) {
+    char header[READ_BUFFER_SIZE];
+    if (header_length >= sizeof(header)) return false;
+    memcpy(header, request, header_length);
+    header[header_length] = '\0';
+
+    char needle[128];
+    int needle_length = snprintf(needle, sizeof(needle), "\r\n%s:", name);
+    if (needle_length <= 0 || (size_t)needle_length >= sizeof(needle)) return false;
+    char *line = strcasestr(header, needle);
+    if (!line) return false;
+    char *line_end = strstr(line + needle_length, "\r\n");
+    if (!line_end) line_end = header + header_length;
+    char saved = *line_end;
+    *line_end = '\0';
+    bool contains = strcasestr(line + needle_length, value) != NULL;
+    *line_end = saved;
+    return contains;
+}
+
+static const char *container_transfer_id_from_target(const char *target) {
+    static const char prefix[] = "/api/container-transfers/";
+    if (!target || strncmp(target, prefix, sizeof(prefix) - 1) != 0) return NULL;
+    const char *identifier = target + sizeof(prefix) - 1;
+    if (strlen(identifier) != 36) return NULL;
+    for (size_t i = 0; i < 36; i++) {
+        if (i == 8 || i == 13 || i == 18 || i == 23) {
+            if (identifier[i] != '-') return NULL;
+        } else if (!isxdigit((unsigned char)identifier[i])) {
+            return NULL;
+        }
+    }
+    return identifier;
+}
+
+static int open_container_upload(const char *transfer_id, int flags, struct stat *status) {
+    if (!g_container_transfers_directory[0] || !transfer_id) return -1;
+    int root_fd = open(g_container_transfers_directory, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (root_fd < 0) return -1;
+    int transfer_fd = openat(root_fd, transfer_id, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    close(root_fd);
+    if (transfer_fd < 0) return -1;
+    int upload_fd = openat(transfer_fd,
+                           "upload.outershell-container",
+                           flags | O_CLOEXEC | O_NOFOLLOW);
+    close(transfer_fd);
+    if (upload_fd < 0) return -1;
+    if (fstat(upload_fd, status) != 0 || !S_ISREG(status->st_mode)) {
+        close(upload_fd);
+        return -1;
+    }
+    return upload_fd;
+}
+
+static bool write_container_upload_bytes(ReactorClient *client,
+                                         const char *bytes,
+                                         size_t length) {
+    size_t offset = 0;
+    while (offset < length) {
+        ssize_t wrote = write(client->container_upload_fd, bytes + offset, length - offset);
+        if (wrote > 0) {
+            offset += (size_t)wrote;
+            client->container_upload_received += (uint64_t)wrote;
+            continue;
+        }
+        if (wrote < 0 && errno == EINTR) continue;
+        return false;
+    }
+    return true;
+}
+
+typedef enum {
+    CONTAINER_UPLOAD_NOT_HANDLED = 0,
+    CONTAINER_UPLOAD_STREAMING = 1,
+    CONTAINER_UPLOAD_FINISHED = 2
+} ContainerUploadDispatch;
+
+static ContainerUploadDispatch begin_container_upload_if_ready(ReactorClient *client,
+                                                                bool *should_close) {
+    const char *separator = strstr(client->request, "\r\n\r\n");
+    if (!separator) return CONTAINER_UPLOAD_NOT_HANDLED;
+    size_t header_length = (size_t)(separator + 4 - client->request);
+    char method[16] = "";
+    char target[1024] = "";
+    char version[16] = "";
+    if (sscanf(client->request, "%15s %1023s %15s", method, target, version) != 3 ||
+        strcasecmp(method, "PATCH") != 0) {
+        return CONTAINER_UPLOAD_NOT_HANDLED;
+    }
+    const char *transfer_id = container_transfer_id_from_target(target);
+    if (!transfer_id) return CONTAINER_UPLOAD_NOT_HANDLED;
+
+    uint64_t upload_offset = 0;
+    uint64_t content_length = 0;
+    if (!parsed_uint64_header(client->request, header_length, "Upload-Offset", &upload_offset) ||
+        !parsed_uint64_header(client->request, header_length, "Content-Length", &content_length)) {
+        send_text_response(client->fd, 400, "Upload-Offset and Content-Length are required.\n");
+        *should_close = true;
+        return CONTAINER_UPLOAD_FINISHED;
+    }
+
+    struct stat status;
+    int upload_fd = open_container_upload(transfer_id, O_WRONLY, &status);
+    if (upload_fd < 0) {
+        send_text_response(client->fd, 404, "The container transfer does not exist.\n");
+        *should_close = true;
+        return CONTAINER_UPLOAD_FINISHED;
+    }
+    if (flock(upload_fd, LOCK_EX | LOCK_NB) != 0) {
+        close(upload_fd);
+        send_text_response(client->fd, 409, "Another request is writing this container transfer.\n");
+        *should_close = true;
+        return CONTAINER_UPLOAD_FINISHED;
+    }
+    uint64_t current_offset = (uint64_t)status.st_size;
+    if (current_offset != upload_offset) {
+        send_container_upload_response(client->fd, 409, current_offset);
+        close(upload_fd);
+        *should_close = true;
+        return CONTAINER_UPLOAD_FINISHED;
+    }
+    if (lseek(upload_fd, 0, SEEK_END) < 0) {
+        close(upload_fd);
+        send_text_response(client->fd, 500, "Could not seek the container transfer.\n");
+        *should_close = true;
+        return CONTAINER_UPLOAD_FINISHED;
+    }
+
+    client->streaming_container_upload = true;
+    client->container_upload_fd = upload_fd;
+    client->container_upload_offset = upload_offset;
+    client->container_upload_received = 0;
+    client->container_upload_length = content_length;
+    if (header_value_contains(client->request,
+                              header_length,
+                              "Expect",
+                              "100-continue")) {
+        static const char continue_response[] = "HTTP/1.1 100 Continue\r\n\r\n";
+        queue_all(client->fd, continue_response, sizeof(continue_response) - 1);
+    }
+    size_t available_body = client->length > header_length ? client->length - header_length : 0;
+    if ((uint64_t)available_body > content_length) {
+        send_text_response(client->fd, 400, "The container upload body is larger than Content-Length.\n");
+        *should_close = true;
+        return CONTAINER_UPLOAD_FINISHED;
+    }
+    if (available_body > 0 &&
+        !write_container_upload_bytes(client, client->request + header_length, available_body)) {
+        send_text_response(client->fd, 500, "Could not write the container transfer.\n");
+        *should_close = true;
+        return CONTAINER_UPLOAD_FINISHED;
+    }
+    client->length = 0;
+    client->request[0] = '\0';
+    if (client->container_upload_received == client->container_upload_length) {
+        uint64_t next_offset = client->container_upload_offset + client->container_upload_received;
+        send_container_upload_response(client->fd, 204, next_offset);
+        *should_close = true;
+        return CONTAINER_UPLOAD_FINISHED;
+    }
+    return CONTAINER_UPLOAD_STREAMING;
+}
+
+static bool send_container_upload_offset(int fd, const char *target) {
+    const char *transfer_id = container_transfer_id_from_target(target);
+    if (!transfer_id) return false;
+    struct stat status;
+    int upload_fd = open_container_upload(transfer_id, O_RDONLY, &status);
+    if (upload_fd < 0) {
+        send_text_response(fd, 404, "The container transfer does not exist.\n");
+        return true;
+    }
+    close(upload_fd);
+    send_container_upload_response(fd, 200, (uint64_t)status.st_size);
+    return true;
+}
+
 static bool request_is_complete(const char *request, size_t length, size_t *complete_length) {
     *complete_length = 0;
     const char *body_separator = NULL;
@@ -1909,8 +2142,8 @@ static bool api_request_is_complete(const char *request, size_t length, size_t *
     *complete_length = 0;
     if (length < 4) return false;
     uint32_t message_length = read_uint32_le((const unsigned char *)request);
-    if (message_length > READ_BUFFER_SIZE - 4) {
-        *complete_length = READ_BUFFER_SIZE + 1;
+    if (message_length > OUTERSHELL_API_MAX_FRAME_SIZE) {
+        *complete_length = OUTERSHELL_API_MAX_FRAME_SIZE + 5u;
         return true;
     }
     if (length < 4u + message_length) return false;
@@ -2083,6 +2316,10 @@ static bool process_http_client_request(ReactorClient *client, char *request, si
     if (query) {
         *query = '\0';
         query++;
+    }
+
+    if (strcasecmp(method, "HEAD") == 0 && send_container_upload_offset(fd, target)) {
+        return false;
     }
 
     uint16_t ui_route = ui_route_for_http_request(method, target);
@@ -2299,6 +2536,9 @@ static void close_reactor_client(ReactorClient *clients, size_t *client_count, s
     if (clients[index].api_response_fd >= 0) {
         close(clients[index].api_response_fd);
     }
+    if (clients[index].container_upload_fd >= 0) {
+        close(clients[index].container_upload_fd);
+    }
     free(clients[index].request);
     clients[index].request = NULL;
     if (index + 1 < *client_count) {
@@ -2326,6 +2566,7 @@ static void add_reactor_client(ReactorClient *clients, size_t *client_count, int
     }
     client->fd = client_fd;
     client->api_response_fd = -1;
+    client->container_upload_fd = -1;
     client->is_api = is_api;
 #ifndef __APPLE__
     struct ucred credentials;
@@ -2354,7 +2595,40 @@ static bool read_reactor_client_from_fd(ReactorClient *client,
     *should_close = false;
 
     for (;;) {
-        size_t maximum_size = parse_api_frame ? READ_BUFFER_SIZE : MAX_HTTP_REQUEST_SIZE;
+        if (!parse_api_frame && client->streaming_container_upload) {
+            char buffer[READ_BUFFER_SIZE];
+            uint64_t remaining = client->container_upload_length - client->container_upload_received;
+            size_t wanted = remaining < sizeof(buffer) ? (size_t)remaining : sizeof(buffer);
+            ssize_t got = read(fd, buffer, wanted);
+            if (got > 0) {
+                if (!write_container_upload_bytes(client, buffer, (size_t)got)) {
+                    send_text_response(client->fd, 500, "Could not write the container transfer.\n");
+                    *should_close = true;
+                    return false;
+                }
+                client->last_activity_ms = monotonic_milliseconds();
+                if (client->container_upload_received == client->container_upload_length) {
+                    uint64_t next_offset = client->container_upload_offset +
+                        client->container_upload_received;
+                    send_container_upload_response(client->fd, 204, next_offset);
+                    *should_close = true;
+                    return false;
+                }
+                continue;
+            }
+            if (got == 0) {
+                *should_close = true;
+                return false;
+            }
+            if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) return false;
+            *should_close = true;
+            return false;
+        }
+
+        size_t maximum_size = parse_api_frame
+            ? OUTERSHELL_API_MAX_FRAME_SIZE + 4u
+            : MAX_HTTP_REQUEST_SIZE;
         if (client->length >= client->request_capacity - 1) {
             size_t maximum_capacity = maximum_size + 1;
             if (client->request_capacity >= maximum_capacity) {
@@ -2380,6 +2654,11 @@ static bool read_reactor_client_from_fd(ReactorClient *client,
             client->length += (size_t)got;
             client->request[client->length] = '\0';
             client->last_activity_ms = monotonic_milliseconds();
+            if (!parse_api_frame) {
+                ContainerUploadDispatch upload = begin_container_upload_if_ready(client, should_close);
+                if (upload == CONTAINER_UPLOAD_FINISHED) return false;
+                if (upload == CONTAINER_UPLOAD_STREAMING) continue;
+            }
             bool complete = parse_api_frame
                 ? api_request_is_complete(client->request, client->length, complete_length)
                 : request_is_complete(client->request, client->length, complete_length);
@@ -2479,7 +2758,8 @@ static void run_http_reactor(int listener) {
                                                                     &complete_length,
                                                                     &should_close);
                         if (complete) {
-                            if (complete_length <= READ_BUFFER_SIZE && complete_length >= 4) {
+                            if (complete_length <= OUTERSHELL_API_MAX_FRAME_SIZE + 4u &&
+                                complete_length >= 4) {
                                 (void)send_ui_api_response_message_as_http(clients[index].fd,
                                                                            clients[index].request + 4,
                                                                            complete_length - 4);
@@ -2526,7 +2806,10 @@ static void run_http_reactor(int listener) {
         for (size_t i = client_count; i > 0; i--) {
             size_t index = i - 1;
             if (clients[index].waiting_for_api_response) continue;
-            if (now - clients[index].last_activity_ms > CLIENT_IDLE_TIMEOUT_MS) {
+            int64_t idle_timeout = clients[index].streaming_container_upload
+                ? TRANSFER_IDLE_TIMEOUT_MS
+                : CLIENT_IDLE_TIMEOUT_MS;
+            if (now - clients[index].last_activity_ms > idle_timeout) {
                 close_reactor_client(clients, &client_count, index);
             }
         }
@@ -2542,7 +2825,7 @@ static void run_http_reactor(int listener) {
 }
 
 static void outer_shell_backend_usage(const char *program) {
-    fprintf(stderr, "Usage: %s [--port PORT | --socket-path PATH] [--api-socket-path PATH] [--launchd-socket-name NAME] [--bundles-dir DIR] [--web-root DIR] [--native-app-template-dir DIR] [--stay-alive]\n", program);
+    fprintf(stderr, "Usage: %s [--port PORT | --socket-path PATH] [--api-socket-path PATH] [--container-transfers-dir DIR] [--launchd-socket-name NAME] [--bundles-dir DIR] [--web-root DIR] [--native-app-template-dir DIR] [--stay-alive]\n", program);
 }
 
 static void initialize_runtime_paths(char *api_socket_path, size_t api_socket_path_size) {
@@ -2578,6 +2861,10 @@ int OuterShellBackendMain(int argc, char **argv) {
             use_port = false;
         } else if (strcmp(argv[i], "--api-socket-path") == 0 && i + 1 < argc) {
             expand_tilde_path(argv[++i], api_socket_path, sizeof(api_socket_path));
+        } else if (strcmp(argv[i], "--container-transfers-dir") == 0 && i + 1 < argc) {
+            expand_tilde_path(argv[++i],
+                              g_container_transfers_directory,
+                              sizeof(g_container_transfers_directory));
         } else if (strcmp(argv[i], "--launchd-socket-name") == 0 && i + 1 < argc) {
             snprintf(launchd_socket_name, sizeof(launchd_socket_name), "%s", argv[++i]);
         } else if (strcmp(argv[i], "--bundles-dir") == 0 && i + 1 < argc) {
@@ -2609,6 +2896,14 @@ int OuterShellBackendMain(int argc, char **argv) {
         return 2;
     }
     snprintf(g_http_proxy_api_socket_path, sizeof(g_http_proxy_api_socket_path), "%s", api_socket_path);
+    if (!g_container_transfers_directory[0]) {
+        const char *configured_transfers = getenv("OUTER_SHELL_CONTAINER_TRANSFERS_DIR");
+        if (configured_transfers && configured_transfers[0]) {
+            expand_tilde_path(configured_transfers,
+                              g_container_transfers_directory,
+                              sizeof(g_container_transfers_directory));
+        }
+    }
 
     snprintf(g_bundle_file_path_macos_arm, sizeof(g_bundle_file_path_macos_arm),
              "%s/OuterShell.bundle.macos-arm.aar", bundles_dir);

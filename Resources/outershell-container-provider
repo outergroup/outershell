@@ -1,0 +1,1809 @@
+#!/usr/bin/env python3
+
+import base64
+import fcntl
+import hashlib
+import json
+import os
+import pathlib
+import selectors
+import shlex
+import shutil
+import signal
+import socket
+import struct
+import subprocess
+import sys
+import tempfile
+import tarfile
+import threading
+import time
+import urllib.parse
+import uuid
+
+
+PROVIDER_ID = "docker"
+DEFAULT_BASE_IMAGE = "outershell/container-base:17"
+FRAME_MAGIC = 0x3142524F
+FRAME_VERSION = 1
+FRAME_HELLO = 1
+FRAME_OPEN = 2
+FRAME_OPEN_OK = 3
+FRAME_OPEN_ERROR = 4
+FRAME_DATA = 5
+FRAME_EOF = 6
+FRAME_CLOSE = 7
+FRAME_PING = 8
+FRAME_PONG = 9
+FRAME_SOCKET_STATE = 10
+FRAME_HEADER = struct.Struct("<IHHII")
+TRANSFER_MAGIC = b"OSCT"
+TRANSFER_VERSION = 1
+TRANSFER_READ = 1
+TRANSFER_APPEND = 2
+TRANSFER_REQUEST_HEADER = struct.Struct("<4sHH16sQQII")
+TRANSFER_RESPONSE_HEADER = struct.Struct("<4sHHQQIIII")
+TRANSFER_MAX_CHUNK_SIZE = 16_000_000
+
+
+def outer_shell_home():
+    return pathlib.Path(os.environ.get(
+        "OUTERSHELL_HOME",
+        pathlib.Path.home() / ".local" / "state" / "outershell",
+    ))
+
+
+def provider_root():
+    return outer_shell_home() / "containers"
+
+
+def records_path():
+    return provider_root() / "records.json"
+
+
+def container_directory(container_id):
+    return provider_root() / container_id
+
+
+def recipe_directory(container_id):
+    return container_directory(container_id) / "Recipe"
+
+
+def dockerfile_path(container_id):
+    return recipe_directory(container_id) / "Dockerfile"
+
+
+def runtime_directory(container_id):
+    return container_directory(container_id) / "Runtime"
+
+
+def persistent_data_directory(container_id, item_id):
+    root = container_directory(container_id) / "Persistent Data"
+    canonical = root / str(item_id).lower()
+    legacy = root / str(item_id)
+    if legacy != canonical and legacy.exists() and not canonical.exists():
+        legacy.rename(canonical)
+    return canonical
+
+
+def transfer_directory():
+    value = provider_root() / "Transfers"
+    value.mkdir(parents=True, exist_ok=True, mode=0o700)
+    return value
+
+
+def provider_resources():
+    configured = os.environ.get("OUTER_SHELL_CONTAINER_PROVIDER_RESOURCES")
+    if configured:
+        return pathlib.Path(configured)
+    return pathlib.Path(__file__).resolve().parent / "container-bootstrap"
+
+
+def docker_path():
+    return shutil.which("docker")
+
+
+def rootless_docker_socket():
+    runtime = pathlib.Path(os.environ.get(
+        "XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"
+    ))
+    return runtime / "docker.sock"
+
+
+def docker_host():
+    configured = os.environ.get("OUTER_SHELL_DOCKER_HOST")
+    if configured:
+        return configured
+    return "unix://" + str(rootless_docker_socket())
+
+
+def docker_environment():
+    environment = os.environ.copy()
+    environment["DOCKER_HOST"] = docker_host()
+    return environment
+
+
+def rootless_docker_available():
+    return docker_path() is not None and rootless_docker_socket().is_socket()
+
+
+def docker_cli_prefix():
+    return ["docker", "--host", docker_host()]
+
+
+def provider_dictionary():
+    available = rootless_docker_available()
+    if available:
+        detail = (
+            "A broadly compatible OCI runtime running without host-root privileges."
+        )
+    elif docker_path() is None:
+        detail = "Docker is not installed or is not available in PATH."
+    else:
+        detail = (
+            "Rootless Docker is not running for this server user. "
+            "Outer Shell does not use the host-root Docker daemon."
+        )
+    return {
+        "id": PROVIDER_ID,
+        "name": "Docker",
+        "detail": detail,
+        "defaultBaseImage": DEFAULT_BASE_IMAGE,
+        "isolationName": "",
+        "isAvailable": available,
+        "capabilities": capabilities(),
+    }
+
+
+def capabilities():
+    return {
+        "supportsApps": True,
+        "supportsShell": True,
+        "supportsLiveMounts": True,
+        "supportsMounts": True,
+        "supportsRecipes": True,
+    }
+
+
+class Records:
+    def __enter__(self):
+        provider_root().mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.lock_file = open(provider_root() / "records.lock", "a+")
+        fcntl.flock(self.lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            self.values = json.loads(records_path().read_text())
+        except (FileNotFoundError, json.JSONDecodeError):
+            self.values = []
+        return self
+
+    def save(self):
+        temporary = records_path().with_suffix(".tmp")
+        temporary.write_text(json.dumps(self.values, indent=2) + "\n")
+        os.chmod(temporary, 0o600)
+        temporary.replace(records_path())
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        fcntl.flock(self.lock_file.fileno(), fcntl.LOCK_UN)
+        self.lock_file.close()
+
+
+def canonical_container_id(container_id):
+    try:
+        return str(uuid.UUID(str(container_id)))
+    except (ValueError, TypeError, AttributeError):
+        raise ValueError("The container identifier is invalid.")
+
+
+def find_record(values, container_id):
+    container_id = canonical_container_id(container_id)
+    for value in values:
+        if canonical_container_id(value["id"]) == container_id:
+            return value
+    raise ValueError("The selected container no longer exists.")
+
+
+def container_name(container_id):
+    return "outershell-container-" + container_id.lower()
+
+
+def image_name(container_id):
+    return "outershell/container-" + container_id.lower() + ":recipe"
+
+
+def run(arguments, *, input_text=None, check=False, timeout=None, environment=None):
+    result = subprocess.run(
+        arguments,
+        input=input_text,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=timeout,
+        env=environment,
+    )
+    if check and result.returncode != 0:
+        message = (result.stderr or result.stdout).strip()
+        raise RuntimeError(message or f"{arguments[0]} exited with status {result.returncode}.")
+    return result
+
+
+def docker(arguments, **kwargs):
+    executable = docker_path()
+    if not executable:
+        raise RuntimeError("Docker is not installed or is not available in PATH.")
+    socket_path = rootless_docker_socket()
+    if not socket_path.is_socket():
+        raise RuntimeError(
+            "Rootless Docker is not running for this server user. "
+            f"Expected its socket at {socket_path}."
+        )
+    return run(
+        [executable] + arguments,
+        environment=docker_environment(),
+        **kwargs,
+    )
+
+
+def docker_state(container_id):
+    result = docker([
+        "container", "inspect", "--format", "{{.State.Status}}",
+        container_name(container_id),
+    ])
+    if result.returncode != 0:
+        return "absent"
+    return "running" if result.stdout.strip() == "running" else "stopped"
+
+
+def default_dockerfile():
+    return """# syntax=docker/dockerfile:1
+FROM outershell/container-base:17
+USER root
+WORKDIR /root
+"""
+
+
+def default_recipe():
+    return {
+        "baseImage": DEFAULT_BASE_IMAGE,
+        "mounts": [],
+        "persistentData": [],
+        "environment": [],
+        "publishedPorts": [],
+        "realizedDockerfile": None,
+        "realizedMounts": None,
+        "realizedEnvironment": None,
+        "realizedPublishedPorts": None,
+    }
+
+
+def load_recipe(container_id):
+    path = recipe_directory(container_id) / "recipe.json"
+    try:
+        value = json.loads(path.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        value = default_recipe()
+    for key, default in default_recipe().items():
+        value.setdefault(key, default)
+    return value
+
+
+def save_recipe(container_id, value):
+    directory = recipe_directory(container_id)
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    temporary = directory / "recipe.tmp"
+    temporary.write_text(json.dumps(value, indent=2) + "\n")
+    os.chmod(temporary, 0o600)
+    temporary.replace(directory / "recipe.json")
+
+
+def normalize_imported_builtin_base(container_id, recipe):
+    path = dockerfile_path(container_id)
+    contents = path.read_text()
+    lines = contents.splitlines(keepends=True)
+    imported_base = None
+    for index, line in enumerate(lines):
+        fields = line.strip().split()
+        if not fields or fields[0].upper() != "FROM":
+            continue
+        imported_base = next(
+            (field for field in fields[1:] if not field.startswith("--")),
+            None,
+        )
+        if imported_base and imported_base.startswith("outershell/container-base:"):
+            start = line.find(imported_base)
+            lines[index] = (
+                line[:start] + DEFAULT_BASE_IMAGE + line[start + len(imported_base):]
+            )
+            path.write_text("".join(lines))
+            recipe["baseImage"] = DEFAULT_BASE_IMAGE
+        break
+    return recipe
+
+
+def write_initial_definition(container_id, base_image=None):
+    directory = recipe_directory(container_id)
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    contents = default_dockerfile()
+    if base_image and base_image != DEFAULT_BASE_IMAGE:
+        contents = contents.replace(DEFAULT_BASE_IMAGE, base_image, 1)
+    dockerfile_path(container_id).write_text(contents)
+    save_recipe(container_id, default_recipe() | {"baseImage": base_image or DEFAULT_BASE_IMAGE})
+
+
+def update_record(container_id, **changes):
+    with Records() as records:
+        record = find_record(records.values, container_id)
+        record.update(changes)
+        records.save()
+
+
+def spawn_worker(action, container_id):
+    log_path = container_directory(container_id) / "provider.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    log = open(log_path, "ab", buffering=0)
+    subprocess.Popen(
+        [str(pathlib.Path(__file__).resolve()), "job", action, container_id],
+        stdin=subprocess.DEVNULL,
+        stdout=log,
+        stderr=log,
+        start_new_session=True,
+        close_fds=True,
+        env=os.environ.copy(),
+    )
+    log.close()
+
+
+def base_image_context(directory):
+    bootstrap = provider_resources()
+    if not bootstrap.is_dir():
+        raise RuntimeError("Outer Shell's container bootstrap resources are missing.")
+    shutil.copytree(bootstrap, directory / ".outershell" / "bootstrap")
+    install_script = directory / ".outershell" / "install.sh"
+    install_script.write_text("""#!/bin/sh
+set -eu
+architecture=$(uname -m)
+case "$architecture" in
+    aarch64|arm64) architecture=aarch64 ;;
+    x86_64|amd64) architecture=x86_64 ;;
+    *) echo "Unsupported container architecture: $architecture" >&2; exit 1 ;;
+esac
+libc=glibc
+for loader in /lib/ld-musl-*.so.1 /lib/libc.musl-*.so.1; do
+    if [ -e "$loader" ]; then libc=musl; break; fi
+done
+source_directory="/tmp/outershell-bootstrap/bin/$libc/$architecture"
+test -x "$source_directory/outershelld"
+test -x "$source_directory/outerctl"
+test -x "$source_directory/outer-socket-bridge"
+install -d -m 0755 /usr/local/bin /etc/outershell/apps.d /var/lib/outershell/services /var/lib/outershell/apps /run/user/0
+install -m 0755 "$source_directory/outershelld" /usr/local/bin/outershelld
+install -m 0755 "$source_directory/outerctl" /usr/local/bin/outerctl
+install -m 0755 "$source_directory/outer-socket-bridge" /usr/local/bin/outer-socket-bridge
+install -m 0755 /tmp/outershell-bootstrap/outershell-container-init /usr/local/bin/outershell-container-init
+""")
+    os.chmod(install_script, 0o755)
+    init_script = directory / ".outershell" / "bootstrap" / "outershell-container-init"
+    init_script.write_text("""#!/bin/sh
+set -eu
+export HOME=/root USER=root LOGNAME=root XDG_RUNTIME_DIR=/run/user/0
+export OUTER_SHELL_SERVICE_MANAGER=internal
+mkdir -p /run/user/0 /var/lib/outershell/services /var/lib/outershell/apps
+chmod 0700 /run/user/0
+rm -f /run/user/0/outershelld-api
+/usr/local/bin/outershelld \
+    --api-socket-path /run/user/0/outershelld-api \
+    --service-manager internal \
+    --services-dir /var/lib/outershell/services &
+daemon_pid=$!
+trap 'kill "$daemon_pid" 2>/dev/null || true; wait "$daemon_pid" 2>/dev/null || true' EXIT INT TERM
+attempt=0
+while [ ! -S /run/user/0/outershelld-api ]; do
+    attempt=$((attempt + 1))
+    if [ "$attempt" -ge 200 ]; then
+        echo "Outer Shell's container daemon did not start." >&2
+        exit 1
+    fi
+    sleep 0.05
+done
+for registration in /etc/outershell/apps.d/*.sh; do
+    [ -f "$registration" ] || continue
+    /bin/sh "$registration" || true
+done
+wait "$daemon_pid"
+""")
+    os.chmod(init_script, 0o755)
+    (directory / "Dockerfile").write_text("""# syntax=docker/dockerfile:1
+FROM debian:bookworm
+USER root
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libpng16-16 \
+    && rm -rf /var/lib/apt/lists/*
+COPY --chmod=0755 .outershell/install.sh /tmp/outershell-install.sh
+COPY --chmod=0755 .outershell/bootstrap/ /tmp/outershell-bootstrap/
+RUN /tmp/outershell-install.sh && rm -rf /tmp/outershell-install.sh /tmp/outershell-bootstrap
+ENV HOME=/root USER=root LOGNAME=root XDG_RUNTIME_DIR=/run/user/0
+USER root
+WORKDIR /root
+CMD ["/usr/local/bin/outershell-container-init"]
+""")
+
+
+def ensure_base_image(log_path):
+    inspect = docker(["image", "inspect", DEFAULT_BASE_IMAGE])
+    if inspect.returncode == 0:
+        return
+    with tempfile.TemporaryDirectory(prefix="outershell-base-") as temporary:
+        context = pathlib.Path(temporary)
+        base_image_context(context)
+        build_image(context, DEFAULT_BASE_IMAGE, log_path, base_build=True)
+
+
+def set_build_progress(container_id, phase, detail, log="", instruction=None,
+                       current_step=None, total_steps=None):
+    progress = {
+        "phase": phase,
+        "detail": detail,
+        "instruction": instruction,
+        "currentStep": current_step,
+        "totalSteps": total_steps,
+        "sourceStartLine": None,
+        "sourceEndLine": None,
+        "log": log[-1024 * 1024:],
+    }
+    update_record(container_id, buildProgress=progress)
+
+
+def build_image(context, tag, log_path, *, container_id=None, base_build=False):
+    command = [docker_path(), "build", "--progress", "plain", "--tag", tag, str(context)]
+    with open(log_path, "w", buffering=1) as log_file:
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            env=docker_environment(),
+        )
+        captured = []
+        for line in process.stdout:
+            log_file.write(line)
+            captured.append(line)
+            if sum(map(len, captured)) > 1024 * 1024:
+                captured = captured[len(captured) // 3:]
+            if container_id:
+                set_build_progress(
+                    container_id,
+                    "building",
+                    "Building the container image…",
+                    "".join(captured),
+                    line.strip() or None,
+                )
+        status = process.wait()
+    if status != 0:
+        raise RuntimeError(pathlib.Path(log_path).read_text()[-1024 * 1024:])
+
+
+def build_context(container_id):
+    source = recipe_directory(container_id)
+    context = runtime_directory(container_id) / "BuildContext"
+    if context.exists():
+        shutil.rmtree(context)
+    shutil.copytree(source, context)
+    return context
+
+
+def remove_runtime_container(container_id):
+    stop_relays(container_id)
+    docker(["rm", "--force", container_name(container_id)])
+
+
+def create_runtime_container(container_id):
+    recipe = load_recipe(container_id)
+    arguments = [
+        "create", "--name", container_name(container_id),
+        "--init",
+        "--label", "org.outershell.container-id=" + container_id,
+    ]
+    with Records() as records:
+        record = find_record(records.values, container_id)
+        cpus = record.get("cpus", 4)
+        memory = record.get("memoryInGB", 8)
+    if cpus:
+        arguments += ["--cpus", str(cpus)]
+    if memory:
+        arguments += ["--memory", f"{memory}g"]
+    project = recipe_directory(container_id)
+    arguments += ["--mount", f"type=bind,src={project},dst=/var/lib/outershell/project"]
+    for mount in recipe.get("mounts", []):
+        host = pathlib.Path(mount["hostPath"]).expanduser().resolve()
+        option = f"type=bind,src={host},dst={mount['guestPath']}"
+        if mount.get("isReadOnly"):
+            option += ",readonly"
+        arguments += ["--mount", option]
+    for item in recipe.get("persistentData", []):
+        if not item.get("isDeclared", True):
+            continue
+        host = persistent_data_directory(container_id, item["id"])
+        host.mkdir(parents=True, exist_ok=True, mode=0o700)
+        arguments += ["--mount", f"type=bind,src={host},dst={item['guestPath']}"]
+    for variable in recipe.get("environment", []):
+        arguments += ["--env", f"{variable['name']}={variable['value']}"]
+    for port in recipe.get("publishedPorts", []):
+        arguments += ["--publish", f"{port['hostPort']}:{port['containerPort']}"]
+    arguments.append(image_name(container_id))
+    docker(arguments, check=True)
+
+
+def mark_realized(container_id):
+    recipe = load_recipe(container_id)
+    recipe["realizedDockerfile"] = dockerfile_path(container_id).read_text()
+    recipe["realizedMounts"] = recipe.get("mounts", [])
+    recipe["realizedEnvironment"] = recipe.get("environment", [])
+    recipe["realizedPublishedPorts"] = recipe.get("publishedPorts", [])
+    save_recipe(container_id, recipe)
+
+
+def rebuild(container_id):
+    log_path = runtime_directory(container_id) / "build.log"
+    runtime_directory(container_id).mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        update_record(container_id, transientState="creating", lastError="")
+        set_build_progress(container_id, "preparing", "Preparing the container build…")
+        ensure_base_image(log_path)
+        context = build_context(container_id)
+        build_image(context, image_name(container_id), log_path, container_id=container_id)
+        set_build_progress(container_id, "replacing", "Replacing the container…",
+                           log_path.read_text())
+        remove_runtime_container(container_id)
+        create_runtime_container(container_id)
+        docker(["start", container_name(container_id)], check=True)
+        mark_realized(container_id)
+        update_record(container_id, transientState=None, buildProgress=None, lastError="")
+    except Exception as error:
+        message = str(error)
+        update_record(
+            container_id,
+            transientState=None,
+            buildProgress={
+                "phase": "failed",
+                "detail": "The container build failed.",
+                "instruction": None,
+                "currentStep": None,
+                "totalSteps": None,
+                "sourceStartLine": None,
+                "sourceEndLine": None,
+                "log": message,
+            },
+            lastError=message,
+        )
+
+
+def start_container(container_id):
+    state = docker_state(container_id)
+    if state == "running":
+        return
+    if state == "absent":
+        rebuild(container_id)
+        return
+    docker(["start", container_name(container_id)], check=True)
+
+
+def operation_create(request):
+    container_id = str(uuid.uuid4())
+    name = request.get("name", "Container").strip() or "Container"
+    base_image = request.get("baseImage") or DEFAULT_BASE_IMAGE
+    now = time.time()
+    record = {
+        "id": container_id,
+        "name": name,
+        "createdAt": now,
+        "cpus": request.get("cpus") or 4,
+        "memoryInGB": request.get("memoryInGB") or 8,
+        "transientState": "creating",
+        "lastError": "",
+        "cachedApps": [],
+        "buildProgress": {
+            "phase": "preparing",
+            "detail": "Preparing the container…",
+            "instruction": None,
+            "currentStep": None,
+            "totalSteps": None,
+            "sourceStartLine": None,
+            "sourceEndLine": None,
+            "log": "",
+        },
+    }
+    container_directory(container_id).mkdir(parents=True, exist_ok=True, mode=0o700)
+    write_initial_definition(container_id, base_image)
+    with Records() as records:
+        records.values.append(record)
+        records.save()
+    spawn_worker("rebuild", container_id)
+
+
+def operation_rename(request):
+    with Records() as records:
+        record = find_record(records.values, request["workspaceID"])
+        record["name"] = request.get("name", "").strip() or record["name"]
+        records.save()
+
+
+def operation_delete(request):
+    container_id = canonical_container_id(request["workspaceID"])
+    remove_runtime_container(container_id)
+    docker(["image", "rm", "--force", image_name(container_id)])
+    with Records() as records:
+        records.values = [
+            value for value in records.values
+            if canonical_container_id(value["id"]) != container_id
+        ]
+        records.save()
+    shutil.rmtree(container_directory(container_id), ignore_errors=True)
+
+
+def operation_update_dockerfile(request):
+    container_id = request["workspaceID"]
+    contents = request.get("dockerfile")
+    if not isinstance(contents, str) or not contents.strip():
+        raise ValueError("The Dockerfile cannot be empty.")
+    dockerfile_path(container_id).write_text(contents)
+    for line in contents.splitlines():
+        fields = line.strip().split()
+        if not fields or fields[0].upper() != "FROM":
+            continue
+        image = next((field for field in fields[1:] if not field.startswith("--")), "")
+        if image:
+            recipe = load_recipe(container_id)
+            recipe["baseImage"] = image
+            save_recipe(container_id, recipe)
+        break
+
+
+def operation_update_configuration(request):
+    container_id = request["workspaceID"]
+    recipe = load_recipe(container_id)
+    recipe["mounts"] = request.get("mounts") or []
+    recipe["environment"] = request.get("environment") or []
+    recipe["publishedPorts"] = request.get("publishedPorts") or []
+    save_recipe(container_id, recipe)
+
+
+def operation_rebuild(request):
+    container_id = request["workspaceID"]
+    update_record(container_id, transientState="creating", lastError="")
+    set_build_progress(container_id, "preparing", "Preparing the container build…")
+    spawn_worker("rebuild", container_id)
+
+
+def operation_start(request):
+    container_id = request["workspaceID"]
+    state = docker_state(container_id)
+    if state == "absent":
+        operation_rebuild(request)
+    else:
+        docker(["start", container_name(container_id)], check=True)
+
+
+def operation_stop(request):
+    container_id = request["workspaceID"]
+    docker(["stop", container_name(container_id)], check=True)
+    stop_relays(container_id)
+
+
+def safe_transfer_file_name(name):
+    stem = "".join(character if character.isalnum() or character in "-_" else "-"
+                   for character in name)
+    return (stem or "Container") + ".outershell-container"
+
+
+def safe_import_directory_name(value, fallback):
+    name = "".join(
+        character if character.isalnum() or character in "-_ ." else "-"
+        for character in str(value)
+    ).strip(" .")
+    return name or fallback
+
+
+def import_mount_directory_names(mounts):
+    values = {}
+    used = set()
+    for mount in mounts:
+        source_name = pathlib.Path(mount.get("hostPath", "")).name
+        base = safe_import_directory_name(
+            mount.get("name") or source_name,
+            "Mounted Folder",
+        )
+        candidate = base
+        suffix = 2
+        while candidate.casefold() in used:
+            candidate = f"{base} {suffix}"
+            suffix += 1
+        used.add(candidate.casefold())
+        values[mount["id"]] = candidate
+    return values
+
+
+def operation_prepare_share(request):
+    container_id = request["workspaceID"]
+    with Records() as records:
+        record = dict(find_record(records.values, container_id))
+    recipe = load_recipe(container_id)
+    include_persistent = bool(request.get("includePersistentData", False))
+    include_mounts = bool(request.get("includeMountedFolders", False))
+    transfer_id = str(uuid.uuid4())
+    root = transfer_directory() / transfer_id
+    root.mkdir(parents=True, mode=0o700)
+    archive = root / "container.outershell-container"
+    included_mounts = []
+    persistent_data = [
+        item for item in recipe.get("persistentData", [])
+        if item.get("isDeclared", True)
+    ]
+    shared_recipe = dict(recipe)
+    shared_recipe["persistentData"] = persistent_data
+    shared_recipe_directory = root / "Recipe"
+    shutil.copytree(recipe_directory(container_id), shared_recipe_directory)
+    (shared_recipe_directory / "recipe.json").write_text(
+        json.dumps(shared_recipe, indent=2, sort_keys=True) + "\n"
+    )
+    with tarfile.open(archive, "w:gz", compresslevel=1) as output:
+        output.add(shared_recipe_directory, arcname="Recipe", recursive=True)
+        if include_persistent:
+            for item in persistent_data:
+                source = persistent_data_directory(container_id, item["id"])
+                if source.exists():
+                    output.add(
+                        source,
+                        arcname="Persistent Data/" + item["id"].lower(),
+                        recursive=True,
+                    )
+        if include_mounts:
+            for mount in recipe.get("mounts", []):
+                source = pathlib.Path(mount.get("hostPath", ""))
+                if not source.exists():
+                    continue
+                output.add(source,
+                           arcname="Mounted Folders/" + mount["id"],
+                           recursive=True)
+                included_mounts.append(mount)
+        included_ids = {value["id"] for value in included_mounts}
+        manifest = {
+            "version": 1,
+            "name": record["name"],
+            "cpus": record.get("cpus", 4),
+            "memoryInGB": record.get("memoryInGB", 8),
+            "sourceRuntimeProviderID": PROVIDER_ID,
+            "includesPersistentData": include_persistent,
+            "includedMounts": included_mounts,
+            "omittedMounts": [value for value in recipe.get("mounts", [])
+                              if value["id"] not in included_ids],
+        }
+        encoded = json.dumps(manifest, indent=2, sort_keys=True).encode()
+        info = tarfile.TarInfo("manifest.json")
+        info.size = len(encoded)
+        info.mode = 0o600
+        import io
+        output.addfile(info, io.BytesIO(encoded))
+    os.chmod(archive, 0o600)
+    return {
+        "transferID": transfer_id,
+        "fileName": safe_transfer_file_name(record["name"]),
+        "byteCount": archive.stat().st_size,
+        "includedMountCount": len(included_mounts),
+        "omittedMountCount": len(manifest["omittedMounts"]),
+    }
+
+
+def operation_begin_import(request):
+    del request
+    transfer_id = str(uuid.uuid4())
+    root = transfer_directory() / transfer_id
+    root.mkdir(parents=True, mode=0o700)
+    (root / "upload.outershell-container").write_bytes(b"")
+    return {"transferID": transfer_id}
+
+
+def operation_cancel_import(request):
+    transfer_id = str(uuid.UUID(request["transferID"]))
+    shutil.rmtree(transfer_directory() / transfer_id, ignore_errors=True)
+
+
+def transfer_response(*, next_offset=0, total_length=0, data=b"", error=""):
+    error_data = str(error).encode()
+    header_size = TRANSFER_RESPONSE_HEADER.size
+    data_offset = header_size if data else 0
+    error_offset = header_size + len(data) if error_data else 0
+    status = 1 if error_data else 0
+    return TRANSFER_RESPONSE_HEADER.pack(
+        TRANSFER_MAGIC,
+        TRANSFER_VERSION,
+        status,
+        next_offset,
+        total_length,
+        data_offset,
+        len(data),
+        error_offset,
+        len(error_data),
+    ) + data + error_data
+
+
+def handle_transfer_request(value):
+    try:
+        if len(value) < TRANSFER_REQUEST_HEADER.size:
+            raise ValueError("The container transfer request is incomplete.")
+        (magic, version, operation, transfer_bytes, offset, length,
+         data_offset, data_length) = TRANSFER_REQUEST_HEADER.unpack_from(value)
+        if magic != TRANSFER_MAGIC or version != TRANSFER_VERSION:
+            raise ValueError("The container transfer request has an unsupported format.")
+        transfer_id = str(uuid.UUID(bytes=transfer_bytes))
+        if operation == TRANSFER_READ:
+            requested_length = min(max(length, 1), TRANSFER_MAX_CHUNK_SIZE)
+            archive = transfer_directory() / transfer_id / "container.outershell-container"
+            size = archive.stat().st_size
+            with archive.open("rb") as stream:
+                stream.seek(offset)
+                data = stream.read(requested_length)
+            next_offset = offset + len(data)
+            if next_offset >= size:
+                shutil.rmtree(archive.parent, ignore_errors=True)
+            return transfer_response(next_offset=next_offset,
+                                     total_length=size,
+                                     data=data)
+        if operation == TRANSFER_APPEND:
+            if (data_offset < TRANSFER_REQUEST_HEADER.size or
+                    data_offset > len(value) or
+                    data_length > len(value) - data_offset or
+                    data_length > TRANSFER_MAX_CHUNK_SIZE or
+                    length != data_length):
+                raise ValueError("The container transfer data reference is invalid.")
+            archive = transfer_directory() / transfer_id / "upload.outershell-container"
+            current_size = archive.stat().st_size
+            data = value[data_offset:data_offset + data_length]
+            next_offset = offset + len(data)
+            if current_size == next_offset:
+                with archive.open("rb") as stream:
+                    stream.seek(offset)
+                    if stream.read(len(data)) != data:
+                        raise ValueError(
+                            "The repeated container transfer chunk does not match."
+                        )
+                return transfer_response(next_offset=next_offset,
+                                         total_length=next_offset)
+            if current_size != offset:
+                raise ValueError(
+                    f"The container transfer expected offset {current_size}, not {offset}."
+                )
+            with archive.open("ab") as stream:
+                stream.write(data)
+            return transfer_response(next_offset=next_offset,
+                                     total_length=next_offset)
+        raise ValueError("This binary container transfer operation is unsupported.")
+    except Exception as error:
+        return transfer_response(error=error)
+
+
+def operation_finish_import(request):
+    transfer_id = str(uuid.UUID(request["transferID"]))
+    root = transfer_directory() / transfer_id
+    archive = root / "upload.outershell-container"
+    extracted = root / "Extracted"
+    if not extracted.exists():
+        extracted.mkdir(mode=0o700)
+        extracted_root = extracted.resolve()
+        with tarfile.open(archive, "r|gz") as source:
+            for member in source:
+                if member.issym() or member.islnk():
+                    raise ValueError(
+                        "The shared container contains symbolic or hard links, "
+                        "which cannot be imported safely."
+                    )
+                destination = (extracted / member.name).resolve()
+                if extracted_root not in [destination, *destination.parents]:
+                    raise ValueError("The shared container contains unsafe paths.")
+                source.extract(member, extracted)
+    manifest = json.loads((extracted / "manifest.json").read_text())
+    if manifest.get("version") != 1:
+        raise ValueError("This shared container uses an unsupported format.")
+    included_mounts = manifest.get("includedMounts", [])
+    mount_directory_names = import_mount_directory_names(included_mounts)
+    name = (request.get("name") or manifest["name"]).strip() or manifest["name"]
+    mount_destination_root = str(request.get("mountDestinationRoot") or "").strip()
+    if included_mounts and not mount_destination_root:
+        suggested_root = (
+            pathlib.Path.home()
+            / "Outer Shell Containers"
+            / safe_import_directory_name(name, "Imported Container")
+        )
+        return {
+            "needsMountDestination": True,
+            "importName": name,
+            "suggestedMountRoot": str(suggested_root),
+            "importMounts": [
+                {
+                    "id": mount["id"],
+                    "name": mount.get("name", "Mounted Folder"),
+                    "sourceHostPath": mount.get("hostPath", ""),
+                    "guestPath": mount.get("guestPath", ""),
+                    "isReadOnly": bool(mount.get("isReadOnly", False)),
+                    "directoryName": mount_directory_names[mount["id"]],
+                }
+                for mount in included_mounts
+            ],
+        }
+    destination_root = None
+    if included_mounts:
+        destination_root = pathlib.Path(mount_destination_root).expanduser()
+        if not destination_root.is_absolute() or destination_root == pathlib.Path("/"):
+            raise ValueError("Choose an absolute destination folder on this server.")
+        if destination_root.exists() and not destination_root.is_dir():
+            raise ValueError("The mounted-folder destination is not a folder.")
+        destinations = [
+            destination_root / mount_directory_names[mount["id"]]
+            for mount in included_mounts
+        ]
+        existing = next((value for value in destinations if value.exists()), None)
+        if existing is not None:
+            raise ValueError(
+                f"The destination already contains {existing.name}. "
+                "Choose another folder so imported data is not overwritten."
+            )
+    for mount in included_mounts:
+        source = (
+            extracted
+            / "Mounted Folders"
+            / str(uuid.UUID(mount["id"]))
+        )
+        if not source.exists():
+            raise ValueError(
+                "The shared container is missing the included folder "
+                + str(mount.get("name", "Mounted Folder"))
+                + "."
+            )
+    container_id = str(uuid.uuid4())
+    record = {
+        "id": container_id,
+        "name": name,
+        "createdAt": time.time(),
+        "cpus": manifest.get("cpus", 4),
+        "memoryInGB": manifest.get("memoryInGB", 8),
+        "transientState": "creating",
+        "lastError": "",
+        "cachedApps": [],
+    }
+    target = container_directory(container_id)
+    target.mkdir(parents=True, mode=0o700)
+    shutil.move(extracted / "Recipe", recipe_directory(container_id))
+    recipe = normalize_imported_builtin_base(
+        container_id,
+        load_recipe(container_id),
+    )
+    imported_mounts = []
+    for mount in included_mounts:
+        source = (
+            extracted
+            / "Mounted Folders"
+            / str(uuid.UUID(mount["id"]))
+        )
+        if not source.exists():
+            raise ValueError(
+                "The shared container is missing the included folder "
+                + str(mount.get("name", "Mounted Folder"))
+                + "."
+            )
+        destination = destination_root / mount_directory_names[mount["id"]]
+        destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        shutil.move(source, destination)
+        imported = dict(mount)
+        imported["hostPath"] = str(destination)
+        imported_mounts.append(imported)
+    recipe["mounts"] = imported_mounts
+    for key in ["realizedMounts", "realizedDockerfile", "realizedDockerfileContents",
+                "realizedEnvironment", "realizedPublishedPorts"]:
+        recipe.pop(key, None)
+    recipe["hasUntrackedChanges"] = False
+    save_recipe(container_id, recipe)
+    persistent = extracted / "Persistent Data"
+    if persistent.exists():
+        shutil.move(persistent, target / "Persistent Data")
+    with Records() as records:
+        records.values.append(record)
+        records.save()
+    spawn_worker("rebuild", container_id)
+    shutil.rmtree(root, ignore_errors=True)
+    return {
+        "importedWorkspaceID": container_id,
+        "omittedMountCount": len(manifest.get("omittedMounts", [])),
+    }
+
+
+def container_environment(user="root"):
+    uid = "0" if user == "root" else "1000"
+    home = "/root" if user == "root" else f"/home/{user}"
+    return [
+        "/usr/bin/env", "-i", f"HOME={home}", f"USER={user}", f"LOGNAME={user}",
+        f"XDG_RUNTIME_DIR=/run/user/{uid}",
+        "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "OUTERSHELLD_API_SOCKET=" + f"/run/user/{uid}/outershelld-api",
+    ]
+
+
+def container_exec(container_id, command, *, user="root", check=False):
+    return docker([
+        "exec", "--user", user, container_name(container_id),
+    ] + container_environment(user) + command, check=check)
+
+
+def percent_decode_fields(line):
+    return [urllib.parse.unquote(field) for field in line.rstrip("\n").split("\t")]
+
+
+def command_snapshots(container_id):
+    result = container_exec(
+        container_id,
+        ["/usr/local/bin/outerctl", "image", "list-commands"],
+    )
+    if result.returncode != 0:
+        return []
+    values = []
+    for line in result.stdout.splitlines():
+        fields = percent_decode_fields(line)
+        if len(fields) < 7 or fields[0] != "1":
+            continue
+        command_id, name, working, user, icon, executable, *arguments = fields[1:]
+        invocation = "cd " + shlex.quote(working) + " && exec " + " ".join(
+            shlex.quote(value) for value in [executable] + arguments
+        )
+        host_command = docker_cli_prefix() + [
+            "exec", "-it", "--user", user, container_name(container_id),
+            "/bin/sh", "-lc", invocation,
+        ]
+        value = {
+            "id": command_id,
+            "displayName": name,
+            "shellCommand": " ".join(shlex.quote(part) for part in host_command),
+            "containerCommand": " ".join(shlex.quote(part) for part in host_command),
+            "internalCommand": invocation,
+            "iconPath": icon,
+        }
+        icon_data = copy_icon(container_id, icon, f"command-{command_id}")
+        if icon_data:
+            value["iconData"] = icon_data
+        values.append(value)
+    return values
+
+
+def declared_app_tcp_ports(container_id):
+    command = r'''for path in /opt/outershell/image-apps/*/start; do
+    [ -f "${path}" ] || continue
+    service=${path%/start}
+    service=${service##*/}
+    port=$(/usr/bin/awk -F= '$1 == "port" && $2 ~ /^[0-9]+$/ { print $2; exit }' "${path}")
+    [ -n "${port}" ] && /usr/bin/printf '%s\t%s\n' "${service}" "${port}"
+done'''
+    result = container_exec(container_id, ["/bin/sh", "-c", command])
+    if result.returncode != 0:
+        return {}
+    ports = {}
+    for line in result.stdout.splitlines():
+        fields = line.split("\t")
+        if len(fields) != 2:
+            continue
+        try:
+            port = int(fields[1])
+        except ValueError:
+            continue
+        if 1 <= port <= 65535:
+            ports[fields[0]] = port
+    return ports
+
+
+def app_snapshots(container_id, recipe):
+    result = container_exec(container_id, ["/usr/local/bin/outerctl", "app", "list"])
+    if result.returncode != 0:
+        return None
+    try:
+        running_service_ids = container_running_service_ids(container_id)
+    except (OSError, RuntimeError):
+        running_service_ids = None
+    declared_ports = declared_app_tcp_ports(container_id)
+    published_ports = {
+        int(value["containerPort"]): int(value["hostPort"])
+        for value in recipe.get("publishedPorts", [])
+        if value.get("containerPort") and value.get("hostPort")
+    }
+    lines = [line for line in result.stdout.splitlines() if line]
+    if not lines:
+        return []
+    headers = lines[0].split("\t")
+    apps = []
+    for line in lines[1:]:
+        fields = line.split("\t")
+        row = dict(zip(headers, fields))
+        service_id = row.get("service_id", "")
+        socket_path = row.get("socket_path", "")
+        if not service_id or not socket_path:
+            continue
+        is_running = service_id in running_service_ids if running_service_ids is not None else False
+        if not is_running and socket_path.startswith("/"):
+            is_running = container_exec(
+                container_id,
+                ["/usr/bin/test", "-S", socket_path],
+            ).returncode == 0
+        app = {
+            "frontendID": row.get("frontend_id", ""),
+            "serviceID": service_id,
+            "displayName": row.get("display_name", service_id),
+            "socketPath": socket_path,
+            "url": row.get("url", ""),
+            "iconPath": row.get("icon_path", ""),
+            "iconObservationToken": "",
+            "listName": row.get("list", ""),
+            "isRunning": is_running,
+            "publishedPort": published_ports.get(declared_ports.get(service_id), 0),
+        }
+        icon_data = copy_icon(container_id, app["iconPath"], "app-" + service_id)
+        if icon_data:
+            app["iconData"] = icon_data
+        apps.append(app)
+    return apps
+
+
+def copy_icon(container_id, source, cache_name):
+    if not source.startswith("/"):
+        return None
+    cache = runtime_directory(container_id) / "Icons"
+    cache.mkdir(parents=True, exist_ok=True, mode=0o700)
+    destination = cache / hashlib.sha256(cache_name.encode()).hexdigest()
+    result = docker(["cp", f"{container_name(container_id)}:{source}", str(destination)])
+    if result.returncode != 0:
+        return None
+    try:
+        data = destination.read_bytes()
+    except OSError:
+        return None
+    if not data or len(data) > 512 * 1024:
+        return None
+    return base64.b64encode(data).decode()
+
+
+def operation_control_app(request):
+    operation = request["operation"]
+    verb = {"startApp": "start", "stopApp": "stop", "restartApp": "restart"}[operation]
+    service_id = request.get("serviceID", "")
+    form = urllib.parse.urlencode({
+        "serviceID": service_id,
+        "operation": verb,
+        "scope": "user",
+    }).encode()
+    status, body = container_ui_api_request(request["workspaceID"], 3, b"", form)
+    if len(body) < 12:
+        raise RuntimeError("The container app control response was invalid.")
+    succeeded = struct.unpack_from("<I", body, 0)[0] & 1
+    message_text = referenced_bytes(body, 4).decode(errors="replace")
+    if status < 200 or status >= 300 or not succeeded:
+        raise RuntimeError(message_text or f"Could not {verb} the container app.")
+
+
+def container_running_service_ids(container_id):
+    status, body = container_ui_api_request(container_id, 1)
+    if status != 200 or len(body) < 12:
+        return set()
+    count = struct.unpack_from("<I", body, 8)[0]
+    if count > 100_000 or 12 + count * 8 > len(body):
+        return set()
+    result = set()
+    for index in range(count):
+        try:
+            backend = referenced_bytes(body, 12 + index * 8)
+            if len(backend) < 48:
+                continue
+            service_id = referenced_bytes(backend, 0).decode(errors="replace")
+            state = referenced_bytes(backend, 40).decode(errors="replace")
+            if state == "running":
+                result.add(service_id)
+        except RuntimeError:
+            continue
+    return result
+
+
+def container_ui_api_request(container_id, route, query=b"", body=b""):
+    message = bytearray(24)
+    struct.pack_into("<HHI", message, 0, 26, route, 0)
+    struct.pack_into("<II", message, 8, len(message), len(query))
+    message.extend(query)
+    struct.pack_into("<II", message, 16, len(message), len(body))
+    message.extend(body)
+    control_path = ensure_relay(container_id, "/run/user/0/outershelld-api")
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+        connection.settimeout(15)
+        connection.connect(control_path)
+        connection.sendall(struct.pack("<I", len(message)) + message)
+        response_length = struct.unpack("<I", receive_exact(connection, 4))[0]
+        if response_length < 24 or response_length > 16 * 1024 * 1024:
+            raise RuntimeError("The container service manager returned an invalid response.")
+        response = receive_exact(connection, response_length)
+    if struct.unpack_from("<H", response, 0)[0] != 107:
+        raise RuntimeError("The container service manager returned an unsupported response.")
+    return struct.unpack_from("<I", response, 2)[0], referenced_bytes(response, 16)
+
+
+def receive_exact(connection, length):
+    chunks = []
+    remaining = length
+    while remaining:
+        value = connection.recv(remaining)
+        if not value:
+            raise RuntimeError("The container service manager closed its response early.")
+        chunks.append(value)
+        remaining -= len(value)
+    return b"".join(chunks)
+
+
+def referenced_bytes(value, offset):
+    if offset < 0 or offset + 8 > len(value):
+        raise RuntimeError("The container response contained an invalid reference.")
+    value_offset, value_length = struct.unpack_from("<II", value, offset)
+    if value_offset > len(value) or value_length > len(value) - value_offset:
+        raise RuntimeError("The container response contained an invalid reference.")
+    return value[value_offset:value_offset + value_length]
+
+
+def operation_app_logs(request):
+    container_id = request["workspaceID"]
+    service_id = request.get("serviceID", "")
+    path = f"/var/lib/outershell/apps/{service_id}/backend.log"
+    result = container_exec(container_id, ["/usr/bin/tail", "-c", "1048576", path])
+    contents = result.stdout if result.returncode == 0 else ""
+    return {
+        "appLog": {
+            "path": path,
+            "contents": contents,
+            "isTruncated": len(contents.encode()) >= 1024 * 1024,
+            "fileSize": len(contents.encode()),
+            "modified": time.time(),
+            "error": "" if result.returncode == 0 else (result.stderr or result.stdout).strip(),
+        }
+    }
+
+
+def authorize_host_socket(path):
+    configuration = pathlib.Path(os.environ.get(
+        "XDG_CONFIG_HOME", pathlib.Path.home() / ".config"
+    )) / "outerloop"
+    configuration.mkdir(parents=True, exist_ok=True, mode=0o700)
+    allowlist = configuration / "http-unix.allow"
+    lines = []
+    try:
+        lines = allowlist.read_text().splitlines()
+    except FileNotFoundError:
+        pass
+    if str(path) not in lines:
+        with open(allowlist, "a") as output:
+            output.write(str(path) + "\n")
+    os.chmod(allowlist, 0o600)
+
+
+def authorize_container_socket(container_id, socket_path):
+    name = pathlib.PurePosixPath(socket_path).name
+    command = (
+        "mkdir -p /root/.config/outerloop && "
+        "touch /root/.config/outerloop/http-unix.allow && "
+        f"grep -Fxq {shlex.quote('%t/' + name)} /root/.config/outerloop/http-unix.allow || "
+        f"printf '%s\\n' {shlex.quote('%t/' + name)} >> /root/.config/outerloop/http-unix.allow; "
+        "chmod 0600 /root/.config/outerloop/http-unix.allow"
+    )
+    container_exec(container_id, ["/bin/sh", "-c", command], check=True)
+
+
+def ensure_container_socket_bridge(container_id):
+    platform = container_exec(container_id, [
+        "/bin/sh", "-c", """
+architecture=$(/bin/uname -m)
+case "$architecture" in
+    aarch64|arm64) architecture=aarch64 ;;
+    x86_64|amd64) architecture=x86_64 ;;
+    *) exit 1 ;;
+esac
+libc=glibc
+for loader in /lib/ld-musl-*.so.1 /lib/libc.musl-*.so.1; do
+    if [ -e "$loader" ]; then libc=musl; break; fi
+done
+/usr/bin/printf '%s/%s' "$libc" "$architecture"
+""",
+    ], check=True).stdout.strip()
+    if not platform or ".." in platform:
+        raise RuntimeError("Outer Shell could not identify the container platform.")
+    source = provider_resources() / "bin" / platform / "outer-socket-bridge"
+    if not source.is_file():
+        raise RuntimeError(
+            "Outer Shell does not include a socket bridge for this container platform."
+        )
+    temporary = "/tmp/outershell-outer-socket-bridge"
+    docker(["cp", str(source), f"{container_name(container_id)}:{temporary}"], check=True)
+    container_exec(container_id, [
+        "/bin/sh", "-c",
+        "install -d -m 0755 /usr/local/bin && "
+        f"install -m 0755 {temporary} /usr/local/bin/outer-socket-bridge && "
+        f"rm -f {temporary}",
+    ], check=True)
+
+
+def relay_path(container_id, inner_path):
+    runtime = pathlib.Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"))
+    digest = hashlib.sha256(inner_path.encode()).hexdigest()[:16]
+    return runtime / "outershell-relays" / container_id[:8] / (digest + ".sock")
+
+
+def stop_relays(container_id):
+    runtime = pathlib.Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"))
+    directory = runtime / "outershell-relays" / container_id[:8]
+    if not directory.exists():
+        return
+    for pid_path in directory.glob("*.pid"):
+        try:
+            os.kill(int(pid_path.read_text()), signal.SIGTERM)
+        except (FileNotFoundError, OSError, ValueError):
+            pass
+    shutil.rmtree(directory, ignore_errors=True)
+
+
+def ensure_relay(container_id, inner_path):
+    ensure_container_socket_bridge(container_id)
+    published = relay_path(container_id, inner_path)
+    pid_path = published.with_suffix(".pid")
+    if published.exists() and pid_path.exists():
+        try:
+            os.kill(int(pid_path.read_text()), 0)
+            authorize_host_socket(published)
+            return str(published)
+        except (OSError, ValueError):
+            pass
+    published.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    for path in (published, pid_path):
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+    authorize_container_socket(container_id, inner_path)
+    subprocess.Popen(
+        [str(pathlib.Path(__file__).resolve()), "relay", container_id, inner_path, str(published)],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=open(published.with_suffix(".log"), "ab", buffering=0),
+        start_new_session=True,
+        close_fds=True,
+        env=os.environ.copy(),
+    )
+    for _ in range(50):
+        if published.exists():
+            authorize_host_socket(published)
+            return str(published)
+        time.sleep(0.02)
+    raise RuntimeError("The container socket relay did not start.")
+
+
+def operation_publish_socket(request):
+    path = request.get("socketPath", "")
+    if not path.startswith("/run/user/"):
+        raise ValueError("The container returned an invalid socket path.")
+    return {"publishedSocketPath": ensure_relay(request["workspaceID"], path)}
+
+
+def outer_shell_support(container_id, state):
+    if state != "running":
+        return {
+            "status": "unknown",
+            "detail": "Outer Shell support will be verified when the container starts.",
+        }
+    result = container_exec(container_id, [
+        "/bin/sh", "-c",
+        "if [ ! -x /usr/local/bin/outerctl ] || [ ! -x /usr/local/bin/outershelld ]; then printf missing; elif [ -S /run/user/0/outershelld-api ]; then printf available; else printf inactive; fi",
+    ])
+    status = result.stdout.strip() if result.returncode == 0 else "missing"
+    details = {
+        "available": "Outer Shell support is available.",
+        "inactive": "Outer Shell support is installed but its daemon is not running.",
+        "missing": "Outer Shell support is not installed in this image.",
+    }
+    return {"status": status, "detail": details.get(status, details["missing"])}
+
+
+def recipe_dictionary(record, recipe):
+    container_id = record["id"]
+    dockerfile = dockerfile_path(container_id).read_text()
+    realized = recipe.get("realizedDockerfile")
+    needs_rebuild = (
+        realized != dockerfile
+        or recipe.get("realizedMounts") != recipe.get("mounts", [])
+        or recipe.get("realizedEnvironment") != recipe.get("environment", [])
+        or recipe.get("realizedPublishedPorts") != recipe.get("publishedPorts", [])
+    )
+    return {
+        "baseImage": recipe.get("baseImage", DEFAULT_BASE_IMAGE),
+        "installsOuterShellSupport": False,
+        "outerShellSupportSnippet": "",
+        "steps": [],
+        "fragments": [],
+        "catalog": [],
+        "launchers": [],
+        "users": [{
+            "id": "root", "name": "root", "homeDirectory": "/root",
+            "workingDirectory": "/", "isRoot": True,
+        }],
+        "scriptFiles": [],
+        "containerfile": dockerfile,
+        "dockerfileHostPath": str(dockerfile_path(container_id)),
+        "dockerfileGuestPath": "/var/lib/outershell/project/Dockerfile",
+        "buildEngineAvailable": docker_path() is not None,
+        "definitionDirectory": str(recipe_directory(container_id)),
+        "transferItems": [
+            {"name": "Container definition", "detail": "Dockerfile and its build context", "status": "Included"},
+            {"name": "Mounted folders", "detail": f"{len(recipe.get('mounts', []))} local folder mapping(s)", "status": "Reconnect at destination"},
+            {"name": "Environment", "detail": "Runtime environment values", "status": "Review at destination"},
+            {"name": "OCI image", "detail": image_name(container_id), "status": "Rebuild or push to a registry"},
+        ],
+        "needsRebuild": needs_rebuild,
+        "hasUntrackedChanges": False,
+        "workingDirectory": "/",
+        "environment": recipe.get("environment", []),
+        "publishedPorts": recipe.get("publishedPorts", []),
+    }
+
+
+def runtime_description(recipe):
+    base = recipe.get("baseImage", DEFAULT_BASE_IMAGE).lower()
+    if "debian" in base or "outershell/container-base" in base:
+        return "Debian GNU/Linux", "12 (bookworm)"
+    if "ubuntu" in base:
+        return "Ubuntu", base.rsplit(":", 1)[-1] if ":" in base else ""
+    if "alpine" in base:
+        return "Alpine Linux", base.rsplit(":", 1)[-1] if ":" in base else ""
+    return recipe.get("baseImage", "Linux"), ""
+
+
+def workspace_dictionary(record):
+    container_id = record["id"]
+    transient = record.get("transientState")
+    state = transient or docker_state(container_id)
+    recipe = load_recipe(container_id)
+    try:
+        support = outer_shell_support(container_id, state)
+    except Exception as error:
+        support = {
+            "status": "unknown",
+            "detail": f"Outer Shell support could not be inspected: {error}",
+        }
+    apps = record.get("cachedApps", [])
+    commands = []
+    if state == "running" and support["status"] == "available":
+        try:
+            discovered = app_snapshots(container_id, recipe)
+        except Exception:
+            discovered = None
+        if discovered is not None:
+            for app in discovered:
+                if app["isRunning"]:
+                    try:
+                        app["externalSocketPath"] = ensure_relay(container_id, app["socketPath"])
+                    except Exception:
+                        pass
+            apps = discovered
+            record["cachedApps"] = discovered
+        try:
+            commands = command_snapshots(container_id)
+        except Exception:
+            commands = []
+    if state != "running":
+        apps = [dict(app, isRunning=False, externalSocketPath=None) for app in apps]
+    operating_system, version = runtime_description(recipe)
+    mounts = [{
+        "id": "00000000-0000-4000-8000-000000000002",
+        "name": "Container project",
+        "hostPath": str(recipe_directory(container_id)),
+        "guestPath": "/var/lib/outershell/project",
+        "isReadOnly": False,
+        "isInfrastructure": True,
+        "isRecipeMount": True,
+    }]
+    mounts += [dict(value, isInfrastructure=False, isRecipeMount=False)
+               for value in recipe.get("mounts", [])]
+    persistent = []
+    for item in recipe.get("persistentData", []):
+        if not item.get("isDeclared", True):
+            continue
+        persistent.append({
+            "id": item["id"],
+            "hostPath": str(persistent_data_directory(container_id, item["id"])),
+            "guestPath": item["guestPath"],
+        })
+    value = {
+        "id": container_id,
+        "name": record["name"],
+        "state": state,
+        "cpus": record.get("cpus", 4),
+        "memoryInGB": record.get("memoryInGB", 8),
+        "runtimeKind": "docker",
+        "supportsLiveMounts": True,
+        "runtime": {
+            "providerID": PROVIDER_ID,
+            "providerName": "Docker",
+            "isolationKind": "container",
+            "isolationName": "",
+            "operatingSystemName": operating_system,
+            "operatingSystemVersion": version,
+            "architecture": os.uname().machine,
+        },
+        "capabilities": capabilities(),
+        "shellCommand": " ".join(shlex.quote(part) for part in (
+            docker_cli_prefix()
+            + ["exec", "-it", container_name(container_id), "/bin/bash"]
+        )),
+        "apps": apps,
+        "commands": commands,
+        "mounts": mounts,
+        "persistentData": persistent,
+        "recipe": recipe_dictionary(record, recipe),
+        "outerShellSupport": support,
+    }
+    if record.get("buildProgress"):
+        value["buildProgress"] = record["buildProgress"]
+    return value
+
+
+def unavailable_workspace_dictionary(record, error):
+    container_id = record["id"]
+    apps = [dict(app, isRunning=False, externalSocketPath=None)
+            for app in record.get("cachedApps", [])]
+    return {
+        "id": container_id,
+        "name": record.get("name", "Container"),
+        "state": record.get("transientState") or "absent",
+        "cpus": record.get("cpus", 4),
+        "memoryInGB": record.get("memoryInGB", 8),
+        "runtimeKind": "docker",
+        "supportsLiveMounts": True,
+        "runtime": {
+            "providerID": PROVIDER_ID,
+            "providerName": "Docker",
+            "isolationKind": "container",
+            "isolationName": "",
+            "operatingSystemName": "Linux",
+            "operatingSystemVersion": "",
+            "architecture": os.uname().machine,
+        },
+        "capabilities": capabilities(),
+        "shellCommand": " ".join(shlex.quote(part) for part in (
+            docker_cli_prefix()
+            + ["exec", "-it", container_name(container_id), "/bin/bash"]
+        )),
+        "apps": apps,
+        "commands": [],
+        "mounts": [],
+        "persistentData": [],
+        "recipe": None,
+        "outerShellSupport": {
+            "status": "unknown",
+            "detail": f"This container's saved definition could not be read: {error}",
+        },
+    }
+
+
+def list_workspaces():
+    with Records() as records:
+        values = []
+        changed = False
+        for record in sorted(records.values, key=lambda value: value.get("createdAt", 0)):
+            before = json.dumps(record.get("cachedApps", []), sort_keys=True)
+            try:
+                values.append(workspace_dictionary(record))
+            except Exception as error:
+                values.append(unavailable_workspace_dictionary(record, error))
+            after = json.dumps(record.get("cachedApps", []), sort_keys=True)
+            changed = changed or before != after
+        if changed:
+            records.save()
+        return values
+
+
+def response(request_id, extra=None, error=None):
+    value = {
+        "requestID": request_id,
+        "providers": [provider_dictionary()],
+        "workspaces": list_workspaces(),
+    }
+    if extra:
+        value.update(extra)
+    if error:
+        value["error"] = str(error)
+    return value
+
+
+def handle_request(request):
+    operation = request.get("operation")
+    request_id = request.get("requestID") or str(uuid.uuid4())
+    try:
+        if "workspaceID" in request:
+            request["workspaceID"] = canonical_container_id(request["workspaceID"])
+        extra = None
+        if operation == "list":
+            pass
+        elif operation == "create":
+            operation_create(request)
+        elif operation == "rename":
+            operation_rename(request)
+        elif operation == "start":
+            operation_start(request)
+        elif operation == "stop":
+            operation_stop(request)
+        elif operation == "delete":
+            operation_delete(request)
+        elif operation == "updateDockerfile":
+            operation_update_dockerfile(request)
+        elif operation == "updateContainerConfiguration":
+            operation_update_configuration(request)
+        elif operation == "rebuildRecipe":
+            operation_rebuild(request)
+        elif operation in ("startApp", "stopApp", "restartApp"):
+            operation_control_app(request)
+        elif operation == "appLogs":
+            extra = operation_app_logs(request)
+        elif operation == "publishSocket":
+            extra = operation_publish_socket(request)
+        elif operation == "changeRuntime":
+            if request.get("runtimeProviderID") != PROVIDER_ID:
+                raise ValueError("Only Docker is available on this server.")
+        elif operation == "prepareShare":
+            extra = operation_prepare_share(request)
+        elif operation == "beginImport":
+            extra = operation_begin_import(request)
+        elif operation == "cancelImport":
+            operation_cancel_import(request)
+        elif operation == "finishImport":
+            extra = operation_finish_import(request)
+        else:
+            raise ValueError("This container operation is not supported on this server.")
+        return response(request_id, extra=extra)
+    except Exception as error:
+        return response(request_id, error=error)
+
+
+def read_exact(stream, length):
+    chunks = []
+    remaining = length
+    while remaining:
+        value = stream.read(remaining)
+        if not value:
+            raise EOFError()
+        chunks.append(value)
+        remaining -= len(value)
+    return b"".join(chunks)
+
+
+def read_frame(stream):
+    header = read_exact(stream, FRAME_HEADER.size)
+    magic, version, frame_type, stream_id, length = FRAME_HEADER.unpack(header)
+    if magic != FRAME_MAGIC or version != FRAME_VERSION or length > 1024 * 1024:
+        raise RuntimeError("The container socket bridge returned an invalid frame.")
+    return frame_type, stream_id, read_exact(stream, length)
+
+
+def send_frame(stream, lock, frame_type, stream_id, payload=b""):
+    frame = FRAME_HEADER.pack(FRAME_MAGIC, FRAME_VERSION, frame_type, stream_id, len(payload)) + payload
+    with lock:
+        stream.write(frame)
+        stream.flush()
+
+
+def bridge_client(container_id, inner_path, client):
+    process = subprocess.Popen(
+        [docker_path(), "exec", "--interactive", "--user", "root", container_name(container_id)]
+        + container_environment("root")
+        + ["/usr/local/bin/outer-socket-bridge", "bridge", "--socket", inner_path],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=docker_environment(),
+    )
+    lock = threading.Lock()
+    try:
+        while True:
+            frame_type, _, _ = read_frame(process.stdout)
+            if frame_type in (FRAME_HELLO, FRAME_SOCKET_STATE):
+                if frame_type == FRAME_HELLO:
+                    break
+                continue
+        send_frame(process.stdin, lock, FRAME_OPEN, 1)
+        while True:
+            frame_type, stream_id, payload = read_frame(process.stdout)
+            if frame_type == FRAME_OPEN_OK and stream_id == 1:
+                break
+            if frame_type == FRAME_OPEN_ERROR:
+                raise RuntimeError(payload.decode(errors="replace"))
+
+        stopped = threading.Event()
+
+        def read_local():
+            try:
+                while not stopped.is_set():
+                    data = client.recv(64 * 1024)
+                    if not data:
+                        send_frame(process.stdin, lock, FRAME_EOF, 1)
+                        return
+                    send_frame(process.stdin, lock, FRAME_DATA, 1, data)
+            except OSError:
+                pass
+
+        local_thread = threading.Thread(target=read_local, daemon=True)
+        local_thread.start()
+        while True:
+            frame_type, stream_id, payload = read_frame(process.stdout)
+            if frame_type == FRAME_DATA and stream_id == 1:
+                client.sendall(payload)
+            elif frame_type == FRAME_EOF and stream_id == 1:
+                client.shutdown(socket.SHUT_WR)
+            elif frame_type == FRAME_CLOSE and stream_id == 1:
+                break
+            elif frame_type == FRAME_PING:
+                send_frame(process.stdin, lock, FRAME_PONG, stream_id, payload)
+        stopped.set()
+    except (EOFError, OSError, RuntimeError):
+        pass
+    finally:
+        try:
+            client.close()
+        except OSError:
+            pass
+        process.terminate()
+        try:
+            process.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            process.kill()
+
+
+def run_relay(container_id, inner_path, published_path):
+    path = pathlib.Path(published_path)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(str(path))
+    os.chmod(path, 0o600)
+    server.listen(64)
+    path.with_suffix(".pid").write_text(str(os.getpid()))
+    while True:
+        client, _ = server.accept()
+        threading.Thread(
+            target=bridge_client,
+            args=(container_id, inner_path, client),
+            daemon=True,
+        ).start()
+
+
+def main():
+    if len(sys.argv) < 2:
+        return 2
+    if sys.argv[1] == "request":
+        try:
+            raw_request = sys.stdin.buffer.read()
+            if raw_request.startswith(TRANSFER_MAGIC):
+                sys.stdout.buffer.write(handle_transfer_request(raw_request))
+                return 0
+            request = json.loads(raw_request)
+            value = handle_request(request)
+        except Exception as error:
+            value = response(str(uuid.uuid4()), error=error)
+        json.dump(value, sys.stdout, separators=(",", ":"))
+        return 0
+    if sys.argv[1] == "job" and len(sys.argv) == 4:
+        if sys.argv[2] == "rebuild":
+            rebuild(sys.argv[3])
+            return 0
+    if sys.argv[1] == "relay" and len(sys.argv) == 5:
+        run_relay(sys.argv[2], sys.argv[3], sys.argv[4])
+        return 0
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

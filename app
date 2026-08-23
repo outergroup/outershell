@@ -207,9 +207,17 @@ build_linux_target() {
     require_build_container_runtime
     local image="outer-shell-linux-toolchain-${TARGET_ARCH}"
     local network="${image}-internal"
+    local source_root
     local platform
     [[ "${TARGET_ARCH}" == aarch64 ]] && platform=linux/arm64 || platform=linux/amd64
     prepare_linux_source_archives
+    source_root="$(mktemp -d "${TMPDIR:-/tmp}/outershell-linux-source.XXXXXX")"
+    cp -R \
+        "${ROOT}/Backend" \
+        "${ROOT}/outershelld" \
+        "${ROOT}/Resources" \
+        "${ROOT}/Scripts" \
+        "${source_root}/"
     echo "==> Building Outer Shell for Linux/${TARGET_ARCH} with musl"
     if [[ "${BUILD_CONTAINER_RUNTIME}" == container ]]; then
         container build --progress plain --platform "${platform}" \
@@ -219,10 +227,10 @@ build_linux_target() {
         ensure_internal_container_network "${network}"
         container run --rm --platform "${platform}" \
             --network "${network}" \
-            --mount "type=bind,source=${ROOT}/Backend,target=/work/Backend,readonly" \
-            --mount "type=bind,source=${ROOT}/outershelld,target=/work/outershelld,readonly" \
-            --mount "type=bind,source=${ROOT}/Resources,target=/work/Resources,readonly" \
-            --mount "type=bind,source=${ROOT}/Scripts,target=/work/Scripts,readonly" \
+            --mount "type=bind,source=${source_root}/Backend,target=/work/Backend,readonly" \
+            --mount "type=bind,source=${source_root}/outershelld,target=/work/outershelld,readonly" \
+            --mount "type=bind,source=${source_root}/Resources,target=/work/Resources,readonly" \
+            --mount "type=bind,source=${source_root}/Scripts,target=/work/Scripts,readonly" \
             --mount "type=bind,source=${ROOT}/build,target=/work/build" \
             --workdir /work \
             "${image}" \
@@ -234,15 +242,16 @@ build_linux_target() {
             "${ROOT}/Container/OuterShellLinux"
         docker run --rm --platform "${platform}" \
             --network none \
-            --mount "type=bind,source=${ROOT}/Backend,target=/work/Backend,readonly" \
-            --mount "type=bind,source=${ROOT}/outershelld,target=/work/outershelld,readonly" \
-            --mount "type=bind,source=${ROOT}/Resources,target=/work/Resources,readonly" \
-            --mount "type=bind,source=${ROOT}/Scripts,target=/work/Scripts,readonly" \
+            --mount "type=bind,source=${source_root}/Backend,target=/work/Backend,readonly" \
+            --mount "type=bind,source=${source_root}/outershelld,target=/work/outershelld,readonly" \
+            --mount "type=bind,source=${source_root}/Resources,target=/work/Resources,readonly" \
+            --mount "type=bind,source=${source_root}/Scripts,target=/work/Scripts,readonly" \
             --mount "type=bind,source=${ROOT}/build,target=/work/build" \
             --workdir /work \
             "${image}" \
             bash -lc 'OUTER_SHELL_LINUX_LIBC=musl ./Scripts/build_linux_resources.sh'
     fi
+    rm -rf "${source_root}"
 }
 
 archive_frontend_symbols() {
@@ -299,7 +308,7 @@ cmd_deploy() {
             tar xzf - -C \"\$HOME/${remote_dir}\"
         "
     echo "==> Installing Outer Shell"
-    install_command="OUTERSHELL_INSTALL_ARCHIVE=\"\$HOME/${remote_dir}/${archive}\" sh \"\$HOME/${remote_dir}/install.sh\" install"
+    install_command="OUTERSHELL_INSTALL_ARCHIVE=\"\$HOME/${remote_dir}/${archive}\" OUTERSHELL_SKIP_SHARED_ROOT_REFRESH=1 sh \"\$HOME/${remote_dir}/install.sh\" install"
     if [[ -t 0 ]]; then
         run_ssh_interactive "${install_command}"
     else

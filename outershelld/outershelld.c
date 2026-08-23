@@ -1070,7 +1070,8 @@ typedef struct {
     bool is_api;
     uid_t peer_uid;
     bool has_peer_uid;
-    char request[READ_BUFFER_SIZE];
+    char *request;
+    size_t request_capacity;
     size_t length;
     int64_t last_activity_ms;
     bool waiting_for_api_response;
@@ -13616,13 +13617,79 @@ static bool api_request_is_complete(const char *request, size_t length, size_t *
     *complete_length = 0;
     if (length < 4) return false;
     uint32_t message_length = read_uint32_le((const unsigned char *)request);
-    if (message_length > READ_BUFFER_SIZE - 4) {
-        *complete_length = READ_BUFFER_SIZE + 1;
+    if (message_length > OUTERSHELL_API_MAX_FRAME_SIZE) {
+        *complete_length = OUTERSHELL_API_MAX_FRAME_SIZE + 5u;
         return true;
     }
     if (length < 4u + message_length) return false;
     *complete_length = 4u + message_length;
     return true;
+}
+
+static bool run_safe_space_provider(const char *body,
+                                    size_t body_length,
+                                    StringBuilder *output,
+                                    int *exit_status) {
+    const char *provider = getenv("OUTER_SHELL_CONTAINER_PROVIDER");
+    if (!provider || !provider[0] || access(provider, X_OK) != 0) return false;
+
+    int input_pipe[2] = {-1, -1};
+    int output_pipe[2] = {-1, -1};
+    if (pipe(input_pipe) != 0 || pipe(output_pipe) != 0) {
+        if (input_pipe[0] >= 0) close(input_pipe[0]);
+        if (input_pipe[1] >= 0) close(input_pipe[1]);
+        if (output_pipe[0] >= 0) close(output_pipe[0]);
+        if (output_pipe[1] >= 0) close(output_pipe[1]);
+        return false;
+    }
+
+    pid_t child = fork();
+    if (child < 0) {
+        close(input_pipe[0]);
+        close(input_pipe[1]);
+        close(output_pipe[0]);
+        close(output_pipe[1]);
+        return false;
+    }
+    if (child == 0) {
+        dup2(input_pipe[0], STDIN_FILENO);
+        dup2(output_pipe[1], STDOUT_FILENO);
+        close(input_pipe[0]);
+        close(input_pipe[1]);
+        close(output_pipe[0]);
+        close(output_pipe[1]);
+        execl(provider, provider, "request", (char *)NULL);
+        _exit(127);
+    }
+
+    close(input_pipe[0]);
+    close(output_pipe[1]);
+    bool ok = queue_all(input_pipe[1], body ? body : "", body_length);
+    close(input_pipe[1]);
+
+    char buffer[8192];
+    while (ok) {
+        ssize_t count = read(output_pipe[0], buffer, sizeof(buffer));
+        if (count < 0) {
+            if (errno == EINTR) continue;
+            ok = false;
+            break;
+        }
+        if (count == 0) break;
+        if (output->length + (size_t)count > 16u * 1024u * 1024u ||
+            !sb_append_n(output, buffer, (size_t)count)) {
+            ok = false;
+            break;
+        }
+    }
+    close(output_pipe[0]);
+
+    int status = 0;
+    while (waitpid(child, &status, 0) < 0 && errno == EINTR) {}
+    if (exit_status) {
+        *exit_status = WIFEXITED(status) ? WEXITSTATUS(status) : 128;
+    }
+    return ok;
 }
 
 static void process_ui_route_request(uint16_t route, const char *query, const char *body, size_t body_length, UiApiResponse *response) {
@@ -13664,7 +13731,20 @@ static void process_ui_route_request(uint16_t route, const char *query, const ch
         break;
     case OUTERSHELLD_UI_ROUTE_SAFE_SPACES: {
         if (!g_safe_space_request_callback) {
-            send_text_response(-1, 503, "Containers are unavailable on this platform.\n");
+            StringBuilder provider_output = {0};
+            int provider_status = -1;
+            if (!run_safe_space_provider(body,
+                                         body_length,
+                                         &provider_output,
+                                         &provider_status)) {
+                free(provider_output.data);
+                send_text_response(-1, 503, "Containers are unavailable on this platform.\n");
+                break;
+            }
+            free(response->body.data);
+            response->body = provider_output;
+            response->status = provider_status == 0 ? 200 : 500;
+            response->content_kind = UI_API_CONTENT_BINARY;
             break;
         }
         size_t result_length = 0;
@@ -15223,6 +15303,7 @@ static void close_reactor_client(ReactorClient *clients, size_t *client_count, s
     if (clients[index].api_response_fd >= 0) {
         close(clients[index].api_response_fd);
     }
+    free(clients[index].request);
     if (index + 1 < *client_count) {
         memmove(&clients[index],
                 &clients[index + 1],
@@ -15240,6 +15321,13 @@ static void add_reactor_client(ReactorClient *clients, size_t *client_count, int
     set_fd_nonblocking(client_fd, true);
     ReactorClient *client = &clients[(*client_count)++];
     memset(client, 0, sizeof(*client));
+    client->request = malloc(READ_BUFFER_SIZE);
+    if (!client->request) {
+        close(client_fd);
+        (*client_count)--;
+        return;
+    }
+    client->request_capacity = READ_BUFFER_SIZE;
     client->fd = client_fd;
     client->api_response_fd = -1;
     client->is_api = is_api;
@@ -15270,14 +15358,33 @@ static bool read_reactor_client_from_fd(ReactorClient *client,
     *should_close = false;
 
     for (;;) {
-        if (client->length >= sizeof(client->request) - 1) {
-            *complete_length = READ_BUFFER_SIZE + 1;
+        if (parse_api_frame && client->length >= 4) {
+            uint32_t message_length = read_uint32_le((const unsigned char *)client->request);
+            if (message_length > OUTERSHELL_API_MAX_FRAME_SIZE) {
+                *complete_length = OUTERSHELL_API_MAX_FRAME_SIZE + 5u;
+                return true;
+            }
+            size_t required_capacity = (size_t)message_length + 5u;
+            if (required_capacity > client->request_capacity) {
+                char *expanded = realloc(client->request, required_capacity);
+                if (!expanded) {
+                    *should_close = true;
+                    return false;
+                }
+                client->request = expanded;
+                client->request_capacity = required_capacity;
+            }
+        }
+        if (client->length >= client->request_capacity - 1) {
+            *complete_length = parse_api_frame
+                ? OUTERSHELL_API_MAX_FRAME_SIZE + 5u
+                : READ_BUFFER_SIZE + 1u;
             return true;
         }
 
         ssize_t got = read(fd,
                            client->request + client->length,
-                           sizeof(client->request) - client->length - 1);
+                           client->request_capacity - client->length - 1);
         if (got > 0) {
             client->length += (size_t)got;
             client->request[client->length] = '\0';
@@ -15423,7 +15530,7 @@ static void run_api_reactor(int api_listener) {
                 bool complete = read_reactor_client(&clients[index], &complete_length, &should_close);
                 if (complete) {
                     set_fd_nonblocking(clients[index].fd, false);
-                    if (complete_length > READ_BUFFER_SIZE) {
+                    if (complete_length > OUTERSHELL_API_MAX_FRAME_SIZE + 4u) {
                         close_reactor_client(clients, &client_count, index);
                     } else {
                         bool keep_open = process_api_client_request(&clients[index],
@@ -15450,7 +15557,10 @@ static void run_api_reactor(int api_listener) {
             }
         }
     }
-    for (size_t i = 0; i < client_count; i++) close(clients[i].fd);
+    for (size_t i = 0; i < client_count; i++) {
+        close(clients[i].fd);
+        free(clients[i].request);
+    }
     free(clients);
 }
 

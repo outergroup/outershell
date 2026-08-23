@@ -975,6 +975,19 @@ private final class OuterShellAgentDelegate: NSObject, NSApplicationDelegate, NS
             args.append("--api-socket-path")
             args.append(defaultApiSocketPath())
         }
+        if !containsOption(args, "--container-transfers-dir"),
+           let applicationSupport = FileManager.default.urls(
+               for: .applicationSupportDirectory,
+               in: .userDomainMask
+           ).first {
+            args.append("--container-transfers-dir")
+            args.append(
+                applicationSupport
+                    .appendingPathComponent("Outer Shell", isDirectory: true)
+                    .appendingPathComponent("Transfers", isDirectory: true)
+                    .path
+            )
+        }
         if !containsOption(args, "--bundles-dir") {
             args.append("--bundles-dir")
             args.append(defaultBundlesPath())

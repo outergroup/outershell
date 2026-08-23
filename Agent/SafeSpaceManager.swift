@@ -3,8 +3,15 @@ import Foundation
 import AppKit
 
 private let currentSafeSpaceRecipeVersion = 13
-private let rootContainerBaseImage = "outershell/container-base:10"
+private let rootContainerBaseImage = "outershell/container-base:12"
 private let bundledAppOCIImageVersion = "2"
+private let containerTransferMagic = Data([0x4f, 0x53, 0x43, 0x54])
+private let containerTransferVersion: UInt16 = 1
+private let containerTransferRead: UInt16 = 1
+private let containerTransferAppend: UInt16 = 2
+private let containerTransferRequestHeaderSize = 48
+private let containerTransferResponseHeaderSize = 40
+private let containerTransferMaximumChunkSize = 16_000_000
 
 private struct SafeSpaceRecord: Codable {
     var id: UUID
@@ -101,6 +108,17 @@ private struct SafeSpacePersistentData: Codable, Equatable {
     var id: UUID
     var guestPath: String
     var isDeclared: Bool
+}
+
+private struct SafeSpaceTransferManifest: Codable {
+    var version: Int
+    var name: String
+    var cpus: Int
+    var memoryInGB: Int
+    var sourceRuntimeProviderID: String
+    var includesPersistentData: Bool
+    var includedMounts: [SafeSpaceMount]
+    var omittedMounts: [SafeSpaceMount]
 }
 
 private struct SafeSpaceRecipeStep: Codable, Equatable {
@@ -317,6 +335,10 @@ final class SafeSpaceManager: @unchecked Sendable {
     }
 
     func handle(_ data: Data) async -> (status: Int, data: Data) {
+        if data.count >= containerTransferMagic.count,
+           data.prefix(containerTransferMagic.count) == containerTransferMagic {
+            return handleContainerTransfer(data)
+        }
         let requestID: String
         do {
             guard let request = try JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -336,10 +358,120 @@ final class SafeSpaceManager: @unchecked Sendable {
         }
     }
 
+    private func handleContainerTransfer(_ data: Data) -> (status: Int, data: Data) {
+        do {
+            guard data.count >= containerTransferRequestHeaderSize,
+                  data.safeSpaceUInt16(at: 4) == containerTransferVersion else {
+                throw SafeSpaceManagerError.invalidRequest
+            }
+            var transferBytes: uuid_t = (0, 0, 0, 0, 0, 0, 0, 0,
+                                          0, 0, 0, 0, 0, 0, 0, 0)
+            _ = withUnsafeMutableBytes(of: &transferBytes) { destination in
+                data.copyBytes(to: destination, from: 8..<24)
+            }
+            let transferID = UUID(uuid: transferBytes)
+            let operation = data.safeSpaceUInt16(at: 6)
+            let offset = data.safeSpaceUInt64(at: 24)
+            let length = data.safeSpaceUInt64(at: 32)
+            let dataOffset = Int(data.safeSpaceUInt32(at: 40))
+            let dataLength = Int(data.safeSpaceUInt32(at: 44))
+            switch operation {
+            case containerTransferRead:
+                let archive = try transferDirectory()
+                    .appendingPathComponent(transferID.uuidString.lowercased(), isDirectory: true)
+                    .appendingPathComponent("container.outershell-container")
+                let size = UInt64(try archive.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0)
+                guard offset <= size else {
+                    throw SafeSpaceManagerError.invalidRequest
+                }
+                let readLength = min(
+                    Int(min(length, UInt64(containerTransferMaximumChunkSize))),
+                    Int(size - offset)
+                )
+                let handle = try FileHandle(forReadingFrom: archive)
+                defer { try? handle.close() }
+                try handle.seek(toOffset: offset)
+                let payload = try handle.read(upToCount: readLength) ?? Data()
+                let nextOffset = offset + UInt64(payload.count)
+                if nextOffset >= size {
+                    try? FileManager.default.removeItem(at: archive.deletingLastPathComponent())
+                }
+                return (200, containerTransferResponse(nextOffset: nextOffset,
+                                                       totalLength: size,
+                                                       data: payload))
+            case containerTransferAppend:
+                guard dataLength <= containerTransferMaximumChunkSize,
+                      dataOffset >= containerTransferRequestHeaderSize,
+                      dataOffset <= data.count,
+                      dataLength <= data.count - dataOffset,
+                      UInt64(dataLength) == length else {
+                    throw SafeSpaceManagerError.invalidRequest
+                }
+                let archive = try transferDirectory()
+                    .appendingPathComponent(transferID.uuidString.lowercased(), isDirectory: true)
+                    .appendingPathComponent("upload.outershell-container")
+                let handle = try FileHandle(forWritingTo: archive)
+                defer { try? handle.close() }
+                let currentOffset = try handle.seekToEnd()
+                let payload = data.subdata(in: dataOffset..<(dataOffset + dataLength))
+                let nextOffset = offset + UInt64(dataLength)
+                if currentOffset == nextOffset {
+                    let reader = try FileHandle(forReadingFrom: archive)
+                    defer { try? reader.close() }
+                    try reader.seek(toOffset: offset)
+                    let existing = try reader.read(upToCount: dataLength) ?? Data()
+                    guard existing == payload else {
+                        throw SafeSpaceManagerError.commandFailed(
+                            "The repeated container transfer chunk does not match."
+                        )
+                    }
+                    return (200, containerTransferResponse(nextOffset: nextOffset,
+                                                           totalLength: nextOffset))
+                }
+                guard currentOffset == offset else {
+                    throw SafeSpaceManagerError.commandFailed(
+                        "The shared container transfer resumed at an unexpected offset."
+                    )
+                }
+                try handle.write(contentsOf: payload)
+                return (200, containerTransferResponse(nextOffset: nextOffset,
+                                                       totalLength: nextOffset))
+            default:
+                throw SafeSpaceManagerError.invalidRequest
+            }
+        } catch {
+            return (200, containerTransferResponse(error: error.localizedDescription))
+        }
+    }
+
+    private func containerTransferResponse(nextOffset: UInt64 = 0,
+                                           totalLength: UInt64 = 0,
+                                           data: Data = Data(),
+                                           error: String? = nil) -> Data {
+        var result = Data()
+        result.append(containerTransferMagic)
+        result.safeSpaceAppend(containerTransferVersion)
+        result.safeSpaceAppend(UInt16(error == nil ? 0 : 1))
+        result.safeSpaceAppend(nextOffset)
+        result.safeSpaceAppend(totalLength)
+        result.safeSpaceAppend(UInt32(0))
+        result.safeSpaceAppend(UInt32(0))
+        result.safeSpaceAppend(UInt32(0))
+        result.safeSpaceAppend(UInt32(0))
+        precondition(result.count == containerTransferResponseHeaderSize)
+        if !data.isEmpty {
+            result.safeSpaceAppendReference(data, at: 24)
+        }
+        if let error, let errorData = error.data(using: .utf8) {
+            result.safeSpaceAppendReference(errorData, at: 32)
+        }
+        return result
+    }
+
     private func operationChangesMenuBarState(_ operation: String) -> Bool {
         switch operation {
         case "create", "duplicate", "changeRuntime", "rename", "start", "stop", "delete",
-             "startApp", "stopApp", "restartApp", "rebuildRecipe":
+             "startApp", "stopApp", "restartApp", "rebuildRecipe", "finishImport":
             return true
         default:
             return false
@@ -515,6 +647,14 @@ final class SafeSpaceManager: @unchecked Sendable {
             }
             return ["publishedSocketPath": try await publishSocket(in: record,
                                                                    socketPath: socketPath)]
+        case "prepareShare":
+            return try prepareShare(request)
+        case "beginImport":
+            return try beginImport(request)
+        case "cancelImport":
+            try cancelImport(request)
+        case "finishImport":
+            return try finishImport(request)
         default:
             throw SafeSpaceManagerError.invalidRequest
         }
@@ -780,6 +920,8 @@ final class SafeSpaceManager: @unchecked Sendable {
             "id": command.id,
             "displayName": command.displayName,
             "shellCommand": hostArguments.map(shellCommandArgument).joined(separator: " "),
+            "containerCommand": hostArguments.map(shellCommandArgument).joined(separator: " "),
+            "internalCommand": invocation,
             "iconPath": command.iconPath
         ]
         if let iconData = commandIconData(command, for: record) {
@@ -1063,6 +1205,446 @@ final class SafeSpaceManager: @unchecked Sendable {
                 self.setTransientState("error", for: duplicate.id)
             }
         }
+    }
+
+    private func prepareShare(_ request: [String: Any]) throws -> [String: Any] {
+        let record = try record(from: request)
+        let includePersistentData = request["includePersistentData"] as? Bool ?? false
+        let includeMountedFolders = request["includeMountedFolders"] as? Bool ?? false
+        let transferID = UUID()
+        let transferRoot = try transferDirectory().appendingPathComponent(
+            transferID.uuidString.lowercased(), isDirectory: true
+        )
+        try FileManager.default.createDirectory(at: transferRoot,
+                                                withIntermediateDirectories: true,
+                                                attributes: [.posixPermissions: 0o700])
+        let recipe = try recipe(for: record)
+        let persistentData = (recipe.persistentData ?? []).filter(\.isDeclared)
+        let sharedRecipeDirectory = transferRoot.appendingPathComponent(
+            "Recipe", isDirectory: true
+        )
+        try FileManager.default.copyItem(
+            at: try recipeDirectory(record.id),
+            to: sharedRecipeDirectory
+        )
+        var sharedRecipe = recipe
+        sharedRecipe.persistentData = persistentData
+        let recipeEncoder = JSONEncoder()
+        recipeEncoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        try recipeEncoder.encode(sharedRecipe).write(
+            to: sharedRecipeDirectory.appendingPathComponent("recipe.json"),
+            options: .atomic
+        )
+        var archiveSources: [(source: URL, destination: String)] = [
+            (sharedRecipeDirectory, "Recipe")
+        ]
+        if includePersistentData {
+            for item in persistentData {
+                let source = try persistentDataDirectory(record, item: item)
+                if FileManager.default.fileExists(atPath: source.path) {
+                    archiveSources.append((
+                        source,
+                        "Persistent Data/\(item.id.uuidString.lowercased())"
+                    ))
+                }
+            }
+        }
+        let mounts = recipe.mounts ?? []
+        var includedMounts: [SafeSpaceMount] = []
+        if includeMountedFolders {
+            for mount in mounts {
+                let source = URL(fileURLWithPath: mount.hostPath, isDirectory: true)
+                guard FileManager.default.fileExists(atPath: source.path) else { continue }
+                archiveSources.append(
+                    (source, "Mounted Folders/\(mount.id.uuidString.lowercased())")
+                )
+                includedMounts.append(mount)
+            }
+        }
+        let manifest = SafeSpaceTransferManifest(
+            version: 1,
+            name: record.name,
+            cpus: record.cpus,
+            memoryInGB: record.memoryInGB,
+            sourceRuntimeProviderID: runtimeProvider(for: record).rawValue,
+            includesPersistentData: includePersistentData,
+            includedMounts: includedMounts,
+            omittedMounts: mounts.filter { mount in
+                !includedMounts.contains(where: { $0.id == mount.id })
+            }
+        )
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        let manifestURL = transferRoot.appendingPathComponent("manifest.json")
+        try encoder.encode(manifest).write(to: manifestURL, options: .atomic)
+        archiveSources.append((manifestURL, "manifest.json"))
+        let stagedArchive = validatedShareStagingURL(request["stagingPath"] as? String)
+        let archive = stagedArchive
+            ?? transferRoot.appendingPathComponent("container.outershell-container")
+        var arguments = [
+            "-czf", archive.path,
+            "--options", "gzip:compression-level=1"
+        ]
+        for item in archiveSources {
+            let sourcePath = item.source.standardizedFileURL.path
+            guard sourcePath.hasPrefix("/"), sourcePath.count > 1 else {
+                throw SafeSpaceManagerError.commandFailed(
+                    "The root of the server cannot be included in a shared container."
+                )
+            }
+            let relativeSourcePath = String(sourcePath.dropFirst())
+            var escapedSourcePath = NSRegularExpression.escapedPattern(for: relativeSourcePath)
+            escapedSourcePath = escapedSourcePath.replacingOccurrences(of: "#", with: "\\#")
+            let escapedDestination = item.destination.replacingOccurrences(of: "#", with: "\\#")
+            arguments.append(contentsOf: [
+                "-s", "#^\(escapedSourcePath)#\(escapedDestination)#"
+            ])
+        }
+        arguments.append(contentsOf: ["-C", "/"])
+        arguments.append(contentsOf: archiveSources.map {
+            String($0.source.standardizedFileURL.path.dropFirst())
+        })
+        let result = try runCommand(
+            executable: "/usr/bin/tar",
+            arguments: arguments
+        )
+        try? FileManager.default.removeItem(at: manifestURL)
+        try requireSuccess(result, action: "prepare the shared container")
+        let size = try archive.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
+        if stagedArchive != nil {
+            try? FileManager.default.removeItem(at: transferRoot)
+        }
+        return [
+            "transferID": transferID.uuidString.lowercased(),
+            "fileName": safeTransferFileName(record.name),
+            "byteCount": size,
+            "stagedDirectly": stagedArchive != nil,
+            "includedMountCount": includedMounts.count,
+            "omittedMountCount": manifest.omittedMounts.count
+        ]
+    }
+
+    private func validatedShareStagingURL(_ path: String?) -> URL? {
+        guard let path, !path.isEmpty else { return nil }
+        let destination = URL(fileURLWithPath: path).standardizedFileURL
+        guard destination.pathExtension == "outershell-container" else { return nil }
+        let parent = destination.deletingLastPathComponent().resolvingSymlinksInPath()
+        let temporaryRoot = FileManager.default.temporaryDirectory
+            .resolvingSymlinksInPath()
+            .standardizedFileURL
+        let parentPath = parent.standardizedFileURL.path
+        let temporaryPath = temporaryRoot.path.hasSuffix("/")
+            ? temporaryRoot.path
+            : temporaryRoot.path + "/"
+        guard parentPath.hasPrefix(temporaryPath),
+              FileManager.default.fileExists(atPath: parentPath) else {
+            return nil
+        }
+        return destination
+    }
+
+    private func beginImport(_ request: [String: Any]) throws -> [String: Any] {
+        _ = request
+        let transferID = UUID()
+        let root = try transferDirectory().appendingPathComponent(
+            transferID.uuidString.lowercased(), isDirectory: true
+        )
+        try FileManager.default.createDirectory(at: root,
+                                                withIntermediateDirectories: true,
+                                                attributes: [.posixPermissions: 0o700])
+        try Data().write(to: root.appendingPathComponent("upload.outershell-container"))
+        return ["transferID": transferID.uuidString.lowercased()]
+    }
+
+    private func cancelImport(_ request: [String: Any]) throws {
+        guard let transferText = request["transferID"] as? String,
+              let transferID = UUID(uuidString: transferText) else {
+            throw SafeSpaceManagerError.invalidRequest
+        }
+        let root = try transferDirectory().appendingPathComponent(
+            transferID.uuidString.lowercased(), isDirectory: true
+        )
+        try? FileManager.default.removeItem(at: root)
+    }
+
+    private func finishImport(_ request: [String: Any]) throws -> [String: Any] {
+        guard let transferText = request["transferID"] as? String,
+              let transferID = UUID(uuidString: transferText) else {
+            throw SafeSpaceManagerError.invalidRequest
+        }
+        let transferRoot = try transferDirectory().appendingPathComponent(
+            transferID.uuidString.lowercased(), isDirectory: true
+        )
+        let archive = transferRoot.appendingPathComponent("upload.outershell-container")
+        let extracted = transferRoot.appendingPathComponent("Extracted", isDirectory: true)
+        if !FileManager.default.fileExists(atPath: extracted.path) {
+            let listing = try runCommand(
+                executable: "/usr/bin/tar",
+                arguments: ["-tzf", archive.path]
+            )
+            try requireSuccess(listing, action: "inspect the shared container")
+            let entries = listing.stdout.components(separatedBy: .newlines).filter { !$0.isEmpty }
+            guard !entries.isEmpty,
+                  entries.allSatisfy({ entry in
+                      !entry.hasPrefix("/") &&
+                          !entry.split(separator: "/", omittingEmptySubsequences: false).contains("..")
+                  }) else {
+                throw SafeSpaceManagerError.commandFailed(
+                    "The shared container contains unsafe paths."
+                )
+            }
+            let verboseListing = try runCommand(
+                executable: "/usr/bin/tar",
+                arguments: ["-tvzf", archive.path]
+            )
+            try requireSuccess(verboseListing, action: "inspect the shared container")
+            let containsLinks = verboseListing.stdout.components(separatedBy: .newlines)
+                .filter { !$0.isEmpty }
+                .contains { line in
+                    guard let type = line.first else { return true }
+                    return type == "l" || type == "h"
+                }
+            guard !containsLinks else {
+                throw SafeSpaceManagerError.commandFailed(
+                    "The shared container contains symbolic or hard links, which cannot be imported safely."
+                )
+            }
+            try FileManager.default.createDirectory(
+                at: extracted,
+                withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700]
+            )
+            let extraction = try runCommand(
+                executable: "/usr/bin/tar",
+                arguments: ["-xzf", archive.path, "-C", extracted.path]
+            )
+            try requireSuccess(extraction, action: "open the shared container")
+        }
+        let manifestData = try Data(contentsOf: extracted.appendingPathComponent("manifest.json"))
+        let manifest = try JSONDecoder().decode(SafeSpaceTransferManifest.self, from: manifestData)
+        guard manifest.version == 1 else {
+            throw SafeSpaceManagerError.commandFailed("This shared container uses an unsupported format.")
+        }
+        let providerText = request["runtimeProviderID"] as? String
+            ?? availableDefaultRuntimeProvider().rawValue
+        guard let provider = SafeSpaceRuntimeProviderID(rawValue: providerText),
+              runtimeExecutableURL(for: provider) != nil else {
+            throw SafeSpaceManagerError.unsupportedProvider
+        }
+        let requestedName = (request["name"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let importedName = requestedName.flatMap { $0.isEmpty ? nil : $0 } ?? manifest.name
+        let mountDirectoryNames = importMountDirectoryNames(manifest.includedMounts)
+        let mountDestinationRoot = (request["mountDestinationRoot"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !manifest.includedMounts.isEmpty && mountDestinationRoot.isEmpty {
+            let suggestedRoot = FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent("Outer Shell Containers", isDirectory: true)
+                .appendingPathComponent(
+                    safeImportDirectoryName(importedName, fallback: "Imported Container"),
+                    isDirectory: true
+                )
+            return [
+                "needsMountDestination": true,
+                "importName": importedName,
+                "suggestedMountRoot": suggestedRoot.path,
+                "importMounts": manifest.includedMounts.map { mount in
+                    [
+                        "id": mount.id.uuidString.lowercased(),
+                        "name": mount.name,
+                        "sourceHostPath": mount.hostPath,
+                        "guestPath": mount.guestPath,
+                        "isReadOnly": mount.isReadOnly,
+                        "directoryName": mountDirectoryNames[mount.id] ?? "Mounted Folder"
+                    ] as [String: Any]
+                }
+            ]
+        }
+        let destinationRoot: URL?
+        if manifest.includedMounts.isEmpty {
+            destinationRoot = nil
+        } else {
+            let expandedPath = NSString(string: mountDestinationRoot).expandingTildeInPath
+            guard expandedPath.hasPrefix("/"), expandedPath != "/" else {
+                throw SafeSpaceManagerError.commandFailed(
+                    "Choose an absolute destination folder on this server."
+                )
+            }
+            let root = URL(fileURLWithPath: expandedPath, isDirectory: true)
+            var isDirectory: ObjCBool = false
+            if FileManager.default.fileExists(atPath: root.path, isDirectory: &isDirectory),
+               !isDirectory.boolValue {
+                throw SafeSpaceManagerError.commandFailed(
+                    "The mounted-folder destination is not a folder."
+                )
+            }
+            for mount in manifest.includedMounts {
+                let destination = root.appendingPathComponent(
+                    mountDirectoryNames[mount.id] ?? "Mounted Folder",
+                    isDirectory: true
+                )
+                if FileManager.default.fileExists(atPath: destination.path) {
+                    throw SafeSpaceManagerError.commandFailed(
+                        "The destination already contains \(destination.lastPathComponent). " +
+                            "Choose another folder so imported data is not overwritten."
+                    )
+                }
+            }
+            destinationRoot = root
+        }
+        for mount in manifest.includedMounts {
+            let source = extracted.appendingPathComponent("Mounted Folders", isDirectory: true)
+                .appendingPathComponent(mount.id.uuidString.lowercased(), isDirectory: true)
+            guard FileManager.default.fileExists(atPath: source.path) else {
+                throw SafeSpaceManagerError.commandFailed(
+                    "The shared container is missing the included folder \(mount.name)."
+                )
+            }
+        }
+        let record = SafeSpaceRecord(
+            id: UUID(), name: importedName, createdAt: Date(),
+            cpus: manifest.cpus, memoryInGB: manifest.memoryInGB,
+            runtimeProviderID: provider.rawValue
+        )
+        try createManagedDirectories(for: record)
+        let destinationRecipe = try recipeDirectory(record.id)
+        if FileManager.default.fileExists(atPath: destinationRecipe.path) {
+            try FileManager.default.removeItem(at: destinationRecipe)
+        }
+        try FileManager.default.moveItem(
+            at: extracted.appendingPathComponent("Recipe", isDirectory: true),
+            to: destinationRecipe
+        )
+        var importedRecipe = try recipe(for: record)
+        let importedDockerfileURL = try dockerfileURL(record.id)
+        var importedDockerfile = try String(
+            contentsOf: importedDockerfileURL,
+            encoding: .utf8
+        )
+        if let importedBaseImage = dockerfileBaseImage(in: importedDockerfile),
+           importedBaseImage.hasPrefix("outershell/container-base:"),
+           importedBaseImage != rootContainerBaseImage,
+           let range = importedDockerfile.range(of: importedBaseImage) {
+            importedDockerfile.replaceSubrange(range, with: rootContainerBaseImage)
+            try importedDockerfile.write(
+                to: importedDockerfileURL,
+                atomically: true,
+                encoding: .utf8
+            )
+            importedRecipe.baseImage = rootContainerBaseImage
+        }
+        var importedMounts: [SafeSpaceMount] = []
+        for mount in manifest.includedMounts {
+            let source = extracted.appendingPathComponent("Mounted Folders", isDirectory: true)
+                .appendingPathComponent(mount.id.uuidString.lowercased(), isDirectory: true)
+            guard FileManager.default.fileExists(atPath: source.path) else {
+                throw SafeSpaceManagerError.commandFailed(
+                    "The shared container is missing the included folder \(mount.name)."
+                )
+            }
+            guard let destinationRoot else {
+                throw SafeSpaceManagerError.commandFailed(
+                    "Choose where the included mounted folders should be copied."
+                )
+            }
+            try FileManager.default.createDirectory(
+                at: destinationRoot,
+                withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700]
+            )
+            let destination = destinationRoot.appendingPathComponent(
+                mountDirectoryNames[mount.id] ?? "Mounted Folder",
+                isDirectory: true
+            )
+            do {
+                try FileManager.default.moveItem(at: source, to: destination)
+            } catch {
+                try FileManager.default.copyItem(at: source, to: destination)
+                try FileManager.default.removeItem(at: source)
+            }
+            var imported = mount
+            imported.hostPath = destination.path
+            importedMounts.append(imported)
+        }
+        importedRecipe.mounts = importedMounts
+        importedRecipe.realizedMounts = nil
+        importedRecipe.realizedDockerfileContents = nil
+        importedRecipe.realizedEnvironment = nil
+        importedRecipe.realizedPublishedPorts = nil
+        importedRecipe.hasUntrackedChanges = false
+        try saveRecipe(importedRecipe, for: record)
+        let persistentSource = extracted.appendingPathComponent("Persistent Data", isDirectory: true)
+        let persistentDestination = try safeSpaceDirectory(record.id)
+            .appendingPathComponent("Persistent Data", isDirectory: true)
+        if FileManager.default.fileExists(atPath: persistentSource.path) {
+            if FileManager.default.fileExists(atPath: persistentDestination.path) {
+                try FileManager.default.removeItem(at: persistentDestination)
+            }
+            try FileManager.default.moveItem(at: persistentSource, to: persistentDestination)
+        }
+        lock.withSafeSpaceLock {
+            records.append(record)
+            transientStates[record.id] = "creating"
+        }
+        try saveRecords()
+        Task.detached(priority: .userInitiated) { [weak self] in
+            guard let self else { return }
+            do {
+                let imageReference = self.recipeImageReference(record.id)
+                _ = try self.runContainerBuild(record, imageReference: imageReference)
+                try self.createRuntimeContainer(record, imageReference: imageReference)
+                try self.markRecipeRealized(for: record)
+                self.setTransientState(nil, for: record.id)
+            } catch {
+                NSLog("Container import failed: %@", error.localizedDescription)
+                self.setTransientState("error", for: record.id)
+            }
+        }
+        try? FileManager.default.removeItem(at: transferRoot)
+        return [
+            "importedWorkspaceID": record.id.uuidString.lowercased(),
+            "omittedMountCount": manifest.omittedMounts.count
+        ]
+    }
+
+    private func availableDefaultRuntimeProvider() -> SafeSpaceRuntimeProviderID {
+        runtimeExecutableURL(for: .docker) != nil ? .docker : .appleContainer
+    }
+
+    private func safeTransferFileName(_ name: String) -> String {
+        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_"))
+        let stem = name.unicodeScalars.map { allowed.contains($0) ? String($0) : "-" }.joined()
+        return "\(stem.isEmpty ? "Container" : stem).outershell-container"
+    }
+
+    private func safeImportDirectoryName(_ value: String, fallback: String) -> String {
+        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_ ."))
+        let name = value.unicodeScalars
+            .map { allowed.contains($0) ? String($0) : "-" }
+            .joined()
+            .trimmingCharacters(in: CharacterSet(charactersIn: " ."))
+        return name.isEmpty ? fallback : name
+    }
+
+    private func importMountDirectoryNames(_ mounts: [SafeSpaceMount]) -> [UUID: String] {
+        var names: [UUID: String] = [:]
+        var usedNames = Set<String>()
+        for mount in mounts {
+            let sourceName = URL(fileURLWithPath: mount.hostPath).lastPathComponent
+            let baseName = safeImportDirectoryName(
+                mount.name.isEmpty ? sourceName : mount.name,
+                fallback: "Mounted Folder"
+            )
+            var name = baseName
+            var suffix = 2
+            while usedNames.contains(name.lowercased()) {
+                name = "\(baseName) \(suffix)"
+                suffix += 1
+            }
+            usedNames.insert(name.lowercased())
+            names[mount.id] = name
+        }
+        return names
     }
 
     private func beginRuntimeChange(_ request: [String: Any]) throws -> [String: Any] {
@@ -2337,6 +2919,7 @@ final class SafeSpaceManager: @unchecked Sendable {
         guard normalized.hasPrefix("/run/user/") else {
             throw SafeSpaceManagerError.invalidRequest
         }
+        try ensureContainerSocketBridge(record)
         let key = "\(record.id.uuidString.lowercased())\n\(normalized)"
         if let existing = lock.withSafeSpaceLock({ publishedForwards[key] }),
            !existing.isClosed,
@@ -2344,7 +2927,6 @@ final class SafeSpaceManager: @unchecked Sendable {
             return path
         }
         let socketUser = try socketOwner(in: record, socketPath: normalized) == 0 ? "root" : "workspace"
-        try ensureContainerSocketBridge(record)
         try ensureSafeSpaceSocketAllowed(record,
                                          socketPath: normalized,
                                          user: socketUser)
@@ -2372,7 +2954,13 @@ final class SafeSpaceManager: @unchecked Sendable {
     private func ensureContainerSocketBridge(_ record: SafeSpaceRecord) throws {
         let installed = try runRuntime(record, [
             "exec", "--user", "root", containerName(record.id),
-            "/bin/test", "-x", "/usr/local/bin/outer-socket-bridge"
+            "/bin/sh", "-c",
+            """
+            if [ ! -x /usr/local/bin/outer-socket-bridge ]; then exit 1; fi
+            /usr/local/bin/outer-socket-bridge >/dev/null 2>&1
+            status=$?
+            [ "$status" -ne 126 ] && [ "$status" -ne 127 ]
+            """
         ])
         guard installed.status != 0 else { return }
 
@@ -4845,6 +5433,15 @@ final class SafeSpaceManager: @unchecked Sendable {
                                                 withIntermediateDirectories: true,
                                                 attributes: [.posixPermissions: 0o700])
         return base
+    }
+
+    private func transferDirectory() throws -> URL {
+        let directory = try applicationDirectory()
+            .appendingPathComponent("Transfers", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory,
+                                                withIntermediateDirectories: true,
+                                                attributes: [.posixPermissions: 0o700])
+        return directory
     }
 
     private func safeSpaceDirectory(_ id: UUID) throws -> URL {

@@ -84,6 +84,18 @@ macOS package), streams it over the configured SSH command, and runs the normal
 Outer Shell installer with the locally built archive. Run `./app help` for
 frontend-only push, status, logs, SSH, uninstall, and clean commands.
 
+On Linux, Outer Shell uses Docker in rootless mode for containers. Install
+Docker's rootless prerequisites before deploying. On Debian and Ubuntu:
+
+```bash
+sudo apt-get install uidmap
+```
+
+The Outer Shell installer then creates and starts the signed-in user's rootless
+Docker service. It deliberately does not fall back to the system Docker daemon:
+container root maps to the signed-in server account instead of host root, while
+other container users retain distinct subordinate UID and GID mappings.
+
 Deploys rebuild the macOS frontend with fresh intermediates and verify that its
 dSYM contains function and source-line information with UUIDs matching the
 packaged bundle. The matching dSYM is retained by arm64 UUID under

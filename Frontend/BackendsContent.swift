@@ -471,6 +471,8 @@ private struct LocalWorkspaceCommandRecord: Decodable, Equatable {
     let id: String
     let displayName: String
     let shellCommand: String
+    let containerCommand: String
+    let internalCommand: String
     let iconPath: String
     let iconData: Data?
 }
@@ -795,7 +797,141 @@ private struct LocalWorkspaceHostResponse: Decodable {
     let recipeCommandOutput: String?
     let recipeCommandApplied: Bool?
     let selectedFolderPath: String?
+    let transferID: String?
+    let fileName: String?
+    let byteCount: Int?
+    let stagedDirectly: Bool?
+    let includedMountCount: Int?
+    let omittedMountCount: Int?
+    let importedWorkspaceID: String?
+    let needsMountDestination: Bool?
+    let importName: String?
+    let suggestedMountRoot: String?
+    let importMounts: [SharedContainerImportMount]?
     let error: String?
+}
+
+private struct SharedContainerImportMount: Decodable {
+    let id: UUID
+    let name: String
+    let sourceHostPath: String
+    let guestPath: String
+    let isReadOnly: Bool
+    let directoryName: String
+}
+
+private struct PendingSharedContainerImport {
+    let transferID: String
+    let runtimeProviderID: String
+    let name: String
+    let mounts: [SharedContainerImportMount]
+}
+
+private struct ContainerTransferBinaryResponse {
+    let nextOffset: UInt64
+    let totalLength: UInt64
+    let data: Data
+}
+
+private enum ContainerTransferBinaryCodec {
+    private static let magic = Data([0x4f, 0x53, 0x43, 0x54])
+    private static let version: UInt16 = 1
+    private static let requestHeaderSize = 48
+    private static let responseHeaderSize = 40
+    static let chunkSize = 4_000_000
+    static let requestTimeout: TimeInterval = 90
+    static let maximumRetryCount = 8
+
+    static func request(operation: UInt16,
+                        transferID: UUID,
+                        offset: UInt64,
+                        length: UInt64,
+                        data: Data = Data()) -> Data {
+        var result = Data()
+        result.append(magic)
+        result.appendLittleEndian(version)
+        result.appendLittleEndian(operation)
+        var uuid = transferID.uuid
+        withUnsafeBytes(of: &uuid) { result.append(contentsOf: $0) }
+        result.appendLittleEndian(offset)
+        result.appendLittleEndian(length)
+        result.appendLittleEndian(data.isEmpty ? UInt32(0) : UInt32(requestHeaderSize))
+        result.appendLittleEndian(UInt32(data.count))
+        result.append(data)
+        return result
+    }
+
+    static func response(from value: Data) throws -> ContainerTransferBinaryResponse {
+        guard value.count >= responseHeaderSize,
+              value.prefix(4) == magic,
+              value.littleEndianUInt16(at: 4) == version,
+              let status = value.littleEndianUInt16(at: 6),
+              let nextOffset = value.littleEndianUInt64(at: 8),
+              let totalLength = value.littleEndianUInt64(at: 16),
+              let dataOffset = value.littleEndianUInt32(at: 24),
+              let dataLength = value.littleEndianUInt32(at: 28),
+              let errorOffset = value.littleEndianUInt32(at: 32),
+              let errorLength = value.littleEndianUInt32(at: 36) else {
+            throw ContainerConfigurationInputError(
+                message: "The container service returned an invalid transfer response."
+            )
+        }
+        let payload = try value.referencedData(offset: dataOffset, length: dataLength)
+        let errorData = try value.referencedData(offset: errorOffset, length: errorLength)
+        if status != 0 {
+            let message = String(data: errorData, encoding: .utf8) ??
+                "The container transfer failed."
+            throw ContainerConfigurationInputError(message: message)
+        }
+        return ContainerTransferBinaryResponse(nextOffset: nextOffset,
+                                               totalLength: totalLength,
+                                               data: payload)
+    }
+}
+
+private enum ContainerResumableUpload {
+    static let segmentSize = 64 * 1024 * 1024
+    static let requestTimeout: TimeInterval = 600
+    static let maximumRetryCount = 8
+}
+
+private extension Data {
+    mutating func appendLittleEndian<T: FixedWidthInteger>(_ value: T) {
+        var encoded = value.littleEndian
+        Swift.withUnsafeBytes(of: &encoded) { append(contentsOf: $0) }
+    }
+
+    func littleEndianUInt16(at offset: Int) -> UInt16? {
+        littleEndianInteger(at: offset, as: UInt16.self)
+    }
+
+    func littleEndianUInt32(at offset: Int) -> UInt32? {
+        littleEndianInteger(at: offset, as: UInt32.self)
+    }
+
+    func littleEndianUInt64(at offset: Int) -> UInt64? {
+        littleEndianInteger(at: offset, as: UInt64.self)
+    }
+
+    private func littleEndianInteger<T: FixedWidthInteger>(at offset: Int,
+                                                            as type: T.Type) -> T? {
+        guard offset >= 0, offset <= count - MemoryLayout<T>.size else { return nil }
+        return self[offset..<(offset + MemoryLayout<T>.size)].enumerated().reduce(T.zero) {
+            $0 | (T($1.element) << T($1.offset * 8))
+        }
+    }
+
+    func referencedData(offset: UInt32, length: UInt32) throws -> Data {
+        if length == 0 { return Data() }
+        let start = Int(offset)
+        let count = Int(length)
+        guard start >= 0, start <= self.count, count <= self.count - start else {
+            throw ContainerConfigurationInputError(
+                message: "The container service returned an invalid data reference."
+            )
+        }
+        return subdata(in: start..<(start + count))
+    }
 }
 
 private enum BaseImageTemplate {
@@ -1342,6 +1478,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private var workspaceNamePromptDismissesPanel = false
     private var workspaceRenameName = ""
     private var isSynchronizingWorkspaceRenameInput = false
+    private var pendingSharedContainerImport: PendingSharedContainerImport?
     private var selectedRecipeSafeSpaceID: UUID?
     private var pendingRecipeCommandWorkspace: LocalWorkspaceRecord?
     private var pendingDockerfileWorkspace: LocalWorkspaceRecord?
@@ -1400,7 +1537,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             pendingRecipeBaseImageWorkspace != nil ||
             pendingRecipeEditStep != nil ||
             pendingRecipeScriptWorkspace != nil ||
-            pendingSafeSpaceAppWorkspace != nil
+            pendingSafeSpaceAppWorkspace != nil ||
+            pendingSharedContainerImport != nil
     }
 
     private var isRenamingContainerConfiguration: Bool {
@@ -1509,8 +1647,24 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private var pendingAppMenuActions: [UUID: (item: AppLauncherItem, operationByItemID: [String: String])] = [:]
     private var pendingWorkspaceOverviewMenuActions: [UUID: (
         workspace: LocalWorkspaceRecord,
-        operationByItemID: [String: String]
+        operationByItemID: [String: String],
+        anchor: CGPoint
     )] = [:]
+    private var pendingContainerCommandMenuActions: [UUID: (
+        workspace: LocalWorkspaceRecord,
+        command: LocalWorkspaceCommandRecord?,
+        commandByItemID: [String: String],
+        anchor: CGPoint
+    )] = [:]
+    private var pendingShareScopeMenuActions: [UUID: (
+        workspace: LocalWorkspaceRecord,
+        options: [String: (includePersistentData: Bool, includeMountedFolders: Bool)]
+    )] = [:]
+    private var pendingImportRuntimeMenuActions: [UUID: (url: URL, providerByItemID: [String: String])] = [:]
+    private var sharedContainerFile: (url: URL, name: String, byteCount: Int)?
+    private var sharedContainerDragFrame = CGRect.zero
+    private var sharedContainerCloseFrame = CGRect.zero
+    private var pendingSharedContainerDrag = false
     private var pendingSafeSpaceProviderMenuSelections: [UUID: [String: String]] = [:]
     private var pendingContainerPathMenuSelections: [UUID: [String: String]] = [:]
     private var pendingSafeSpaceAppMenuSelections: [UUID: (
@@ -1693,7 +1847,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             updateInputMode()
             updateEditingAndPasteboardState()
             outerframeHost.setPasteboardDropBehaviorHitTest(
-                acceptedTypes: Self.createFieldPasteboardTypes
+                acceptedTypes: Self.createFieldPasteboardTypes + [
+                    NSPasteboard.PasteboardType.fileURL.rawValue
+                ]
             )
             fetchBackends()
             fetchRecipes()
@@ -1821,7 +1977,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                                       operationMask: operationMask) ||
                            passwordFieldAcceptsTextDrop(at: point,
                                                         pasteboardTypes: pasteboardTypes,
-                                                        operationMask: operationMask)
+                                                        operationMask: operationMask) ||
+                           sharedContainerFileAcceptsDrop(pasteboardTypes: pasteboardTypes,
+                                                          operationMask: operationMask)
             outerframeHost.sendPasteboardDropHitTestResponse(requestID: requestID,
                                                              operationMask: accepted ? .copy : [])
 
@@ -4663,35 +4821,115 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         return workspace.state
     }
 
-    private func copyWorkspaceShellCommand(_ workspace: LocalWorkspaceRecord,
-                                           confirmationAnchor: CGPoint? = nil) {
-        let command = workspace.shellCommand.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !command.isEmpty else {
+    private func showWorkspaceShellCommandMenu(_ workspace: LocalWorkspaceRecord,
+                                               at point: CGPoint) {
+        let containerCommand = workspace.shellCommand.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !containerCommand.isEmpty else {
             workspacePanelMessage = "The shell command for \(workspace.name) is not available yet."
             updateLayout()
             return
         }
-        copyTextToPasteboard(command)
-        workspacePanelMessage = ""
-        if let confirmationAnchor {
-            showCommandCopiedConfirmation(at: confirmationAnchor)
-        } else {
-            updateLayout()
-        }
+        showContainerCommandMenu(workspace: workspace,
+                                 command: nil,
+                                 containerCommand: containerCommand,
+                                 internalCommand: nil,
+                                 at: point)
     }
 
-    private func copyWorkspaceCommand(_ command: LocalWorkspaceCommandRecord,
-                                      in workspace: LocalWorkspaceRecord,
-                                      confirmationAnchor: CGPoint) {
-        let value = command.shellCommand.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !value.isEmpty else {
+    private func showWorkspaceCommandMenu(_ command: LocalWorkspaceCommandRecord,
+                                          in workspace: LocalWorkspaceRecord,
+                                          at point: CGPoint) {
+        let containerCommand = command.containerCommand.trimmingCharacters(in: .whitespacesAndNewlines)
+        let internalCommand = command.internalCommand.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !containerCommand.isEmpty, !internalCommand.isEmpty else {
             workspacePanelMessage = "The \(command.displayName) command for \(workspace.name) is not available yet."
             updateLayout()
             return
         }
-        copyTextToPasteboard(value)
-        workspacePanelMessage = ""
-        showCommandCopiedConfirmation(at: confirmationAnchor)
+        showContainerCommandMenu(workspace: workspace,
+                                 command: command,
+                                 containerCommand: containerCommand,
+                                 internalCommand: internalCommand,
+                                 at: point)
+    }
+
+    private func showContainerCommandMenu(workspace: LocalWorkspaceRecord,
+                                          command: LocalWorkspaceCommandRecord?,
+                                          containerCommand: String,
+                                          internalCommand: String?,
+                                          at point: CGPoint) {
+        outerframeHost.requestOuterLoopSSHCommandArguments { [weak self] arguments in
+            guard let self else { return }
+            var commandByItemID: [String: String] = ["container": containerCommand]
+            var items: [OuterframeContextMenuItem] = []
+            if let arguments, !arguments.isEmpty {
+                let sshCommand = self.commandForSSHArguments(arguments, command: containerCommand)
+                commandByItemID["ssh"] = sshCommand
+                items.append(OuterframeContextMenuItem(
+                    id: "ssh",
+                    title: internalCommand == nil
+                        ? "SSH command, container command"
+                        : "SSH command, container command, and internal command",
+                    isEnabled: true,
+                    systemImageName: "network"
+                ))
+            }
+            items.append(OuterframeContextMenuItem(
+                id: "container",
+                title: internalCommand == nil
+                    ? "Container command"
+                    : "Container command and internal command",
+                isEnabled: true,
+                systemImageName: "shippingbox"
+            ))
+            if let internalCommand {
+                commandByItemID["internal"] = internalCommand
+                items.append(OuterframeContextMenuItem(
+                    id: "internal",
+                    title: "Internal command",
+                    isEnabled: true,
+                    systemImageName: "terminal"
+                ))
+            }
+            let menuID = UUID()
+            self.pendingContainerCommandMenuActions[menuID] = (
+                workspace,
+                command,
+                commandByItemID,
+                point
+            )
+            self.outerframeHost.showContextMenu(menuID: menuID, items: items, at: point)
+        }
+    }
+
+    private func copyCommandForCurrentServer(_ command: String,
+                                             completion: @escaping @MainActor (String) -> Void) {
+        outerframeHost.requestOuterLoopSSHCommandArguments { arguments in
+            guard let arguments, !arguments.isEmpty else {
+                completion(command)
+                return
+            }
+            completion(self.commandForSSHArguments(arguments, command: command))
+        }
+    }
+
+    private func commandForSSHArguments(_ sourceArguments: [String], command: String) -> String {
+        var arguments = sourceArguments
+        if !arguments.contains("-t") && !arguments.contains("-tt") {
+            arguments.insert("-t", at: 1)
+        }
+        arguments.append(command)
+        return arguments.map(Self.shellQuotedArgument).joined(separator: " ")
+    }
+
+    private static func shellQuotedArgument(_ argument: String) -> String {
+        let safeCharacters = CharacterSet.alphanumerics.union(
+            CharacterSet(charactersIn: "@%_+=:,./-")
+        )
+        if !argument.isEmpty && argument.unicodeScalars.allSatisfy(safeCharacters.contains) {
+            return argument
+        }
+        return "'\(argument.replacingOccurrences(of: "'", with: "'\\''"))'"
     }
 
     private func showCommandCopiedConfirmation(at anchor: CGPoint) {
@@ -4824,12 +5062,12 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         } else if operation == "editContainer" {
             navigateToRecipeSafeSpace(workspace.id, pushHistory: true)
         } else if operation == "copyShell" {
-            copyWorkspaceShellCommand(workspace, confirmationAnchor: point)
+            showWorkspaceShellCommandMenu(workspace, at: point)
         } else if operation.hasPrefix("copyCommand:"),
                   let command = workspace.commandLaunchers.first(where: {
                       $0.id == String(operation.dropFirst("copyCommand:".count))
                   }) {
-            copyWorkspaceCommand(command, in: workspace, confirmationAnchor: point)
+            showWorkspaceCommandMenu(command, in: workspace, at: point)
         } else if operation.hasPrefix("unmountFolder:") {
             let identifier = String(operation.dropFirst("unmountFolder:".count))
             guard let mountID = UUID(uuidString: identifier) else { return }
@@ -10009,6 +10247,37 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                                    previewFrameOrigin: dragPreview?.frameOrigin)
     }
 
+    private func beginDraggingSharedContainer() {
+        guard let file = sharedContainerFile else { return }
+        guard let urlData = file.url.absoluteString.data(using: .utf8) else { return }
+        let pasteboardItem = OuterContentPasteboardItem(representations: [
+            OuterContentPasteboardRepresentation(
+                typeIdentifier: NSPasteboard.PasteboardType.fileURL.rawValue,
+                data: urlData
+            )
+        ])
+        let dragPreview = sharedContainerDragPreview(for: file)
+        outerframeHost.beginDraggingPasteboardItem(
+            pasteboardItem,
+            operationMask: .copy,
+            previewPNGData: dragPreview?.pngData,
+            previewSize: dragPreview?.size,
+            previewFrameOrigin: dragPreview?.frameOrigin
+        )
+    }
+
+    private func dismissSharedContainerPanel() {
+        if let url = sharedContainerFile?.url {
+            try? FileManager.default.removeItem(at: url.deletingLastPathComponent())
+        }
+        sharedContainerFile = nil
+        sharedContainerDragFrame = .zero
+        sharedContainerCloseFrame = .zero
+        pendingSharedContainerDrag = false
+        isShowingWorkspacePanel = false
+        updateLayout()
+    }
+
     private func handleFilePromiseWriteRequest(requestID: UUID, promiseID: UUID) {
         guard let url = nativeFilePromiseURLs.removeValue(forKey: promiseID) else {
             outerframeHost.sendFilePromiseWriteFailure(requestID: requestID,
@@ -11899,7 +12168,36 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                Self.passwordFieldPasteboardTypes.contains { types.contains($0) }
     }
 
+    private func sharedContainerFileAcceptsDrop(pasteboardTypes: [String],
+                                                operationMask: UInt32) -> Bool {
+        let operations = NSDragOperation(rawValue: UInt(operationMask))
+        return mode == .apps &&
+            workspaceContextID == nil &&
+            operations.contains(.copy) &&
+            pasteboardTypes.contains(NSPasteboard.PasteboardType.fileURL.rawValue)
+    }
+
+    private func sharedContainerURL(in items: [OuterframeContentPasteboardItem]) -> URL? {
+        for item in items {
+            guard let representation = item.representations.first(where: {
+                $0.typeIdentifier == NSPasteboard.PasteboardType.fileURL.rawValue
+            }),
+                  let text = String(data: representation.data, encoding: .utf8),
+                  let url = URL(string: text),
+                  url.isFileURL,
+                  url.pathExtension == "outershell-container" else {
+                continue
+            }
+            return url
+        }
+        return nil
+    }
+
     private func handlePasteboardItemsForDrop(at point: CGPoint, items: [OuterframeContentPasteboardItem]) {
+        if let url = sharedContainerURL(in: items) {
+            showSharedContainerImportRuntimeMenu(for: url, at: point)
+            return
+        }
         if passwordFieldFrame.contains(point), pendingPasswordAction != nil {
             let index = characterIndexForPasswordField(xPosition: point.x)
             focusPasswordField(cursorPosition: index)
@@ -12335,6 +12633,11 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
     private func handleMouseDragged(to point: CGPoint, modifierFlags: NSEvent.ModifierFlags) {
         _ = modifierFlags
+        if pendingSharedContainerDrag {
+            pendingSharedContainerDrag = false
+            beginDraggingSharedContainer()
+            return
+        }
         if handleStatusMouseDragged(to: point) {
             return
         }
@@ -12483,6 +12786,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         pendingTextSelectionDrag = nil
         if finishedContainerTextSelection {
             updateLayout()
+        }
+        if pendingSharedContainerDrag {
+            pendingSharedContainerDrag = false
+            return
         }
         if pendingFilePicker != nil {
             _ = filePickerScrollbarController?.handleMouseUp(at: rootLayer.convert(point, to: filePickerListLayer))
@@ -13092,6 +13399,18 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         if handleStatusMouseDown(at: point, clickCount: clickCount) {
             return
         }
+        if sharedContainerFile != nil {
+            if sharedContainerCloseFrame.contains(point) {
+                armButtonClick(frame: sharedContainerCloseFrame) { [weak self] in
+                    self?.dismissSharedContainerPanel()
+                }
+            } else if sharedContainerDragFrame.contains(point) {
+                pendingSharedContainerDrag = true
+            } else if !workspacePanelFrame.contains(point) {
+                dismissSharedContainerPanel()
+            }
+            return
+        }
         if isContainerConfigurationEditorVisible,
            containerConfigurationBuildError == nil,
            !isRenamingContainerConfiguration,
@@ -13450,8 +13769,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                performAtPoint: { [weak self] releasePoint in
                     guard let self else { return }
                     if action.operation == "copyShell" {
-                        self.copyWorkspaceShellCommand(action.workspace,
-                                                       confirmationAnchor: releasePoint)
+                        self.showWorkspaceShellCommandMenu(action.workspace,
+                                                           at: releasePoint)
                     } else if action.operation == "rename" {
                         self.showWorkspaceRename(action.workspace)
                     } else {
@@ -15745,6 +16064,676 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         }
     }
 
+    private func performContainerTransferRequest(
+        operation: String,
+        values: [String: Any] = [:],
+        completion: @escaping @MainActor (Result<LocalWorkspaceHostResponse, Error>) -> Void
+    ) {
+        guard let safeSpacesEndpoint, let safeSpaceOperationSession else {
+            completion(.failure(NSError(
+                domain: "org.outershell.transfer",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "Outer Shell's container service is unavailable."]
+            )))
+            return
+        }
+        var requestValue = values
+        requestValue["requestID"] = UUID().uuidString.lowercased()
+        requestValue["operation"] = operation
+        let payload: Data
+        do {
+            payload = try JSONSerialization.data(withJSONObject: requestValue)
+        } catch {
+            completion(.failure(error))
+            return
+        }
+        var request = URLRequest(url: safeSpacesEndpoint)
+        request.httpMethod = "POST"
+        request.httpBody = payload
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        safeSpaceOperationSession.dataTask(with: request) { data, response, error in
+            Task { @MainActor in
+                if let error {
+                    completion(.failure(error))
+                    return
+                }
+                guard let data else {
+                    completion(.failure(NSError(
+                        domain: "org.outershell.transfer",
+                        code: 2,
+                        userInfo: [NSLocalizedDescriptionKey: "The container service returned no response."]
+                    )))
+                    return
+                }
+                let decoded = try? JSONDecoder().decode(LocalWorkspaceHostResponse.self, from: data)
+                if let message = decoded?.error, !message.isEmpty {
+                    completion(.failure(NSError(
+                        domain: "org.outershell.transfer",
+                        code: 3,
+                        userInfo: [NSLocalizedDescriptionKey: message]
+                    )))
+                    return
+                }
+                if let response = response as? HTTPURLResponse,
+                   !(200..<300).contains(response.statusCode) {
+                    let body = String(data: data, encoding: .utf8)?
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                    let detail = body.flatMap { $0.isEmpty ? nil : $0 }
+                        ?? "The container service returned HTTP \(response.statusCode)."
+                    completion(.failure(NSError(
+                        domain: "org.outershell.transfer",
+                        code: 2,
+                        userInfo: [NSLocalizedDescriptionKey: detail]
+                    )))
+                    return
+                }
+                do {
+                    let value = try decoded ?? JSONDecoder().decode(
+                        LocalWorkspaceHostResponse.self,
+                        from: data
+                    )
+                    completion(.success(value))
+                } catch {
+                    completion(.failure(error))
+                }
+            }
+        }.resume()
+    }
+
+    private func performContainerBinaryTransferRequest(
+        _ payload: Data,
+        completion: @escaping @MainActor (Result<ContainerTransferBinaryResponse, Error>) -> Void
+    ) {
+        guard let safeSpacesEndpoint, let safeSpaceOperationSession else {
+            completion(.failure(ContainerConfigurationInputError(
+                message: "Outer Shell's container service is unavailable."
+            )))
+            return
+        }
+        var request = URLRequest(url: safeSpacesEndpoint)
+        request.httpMethod = "POST"
+        request.httpBody = payload
+        request.timeoutInterval = ContainerTransferBinaryCodec.requestTimeout
+        request.setValue("application/vnd.outershell.container-transfer",
+                         forHTTPHeaderField: "Content-Type")
+        safeSpaceOperationSession.dataTask(with: request) { data, response, error in
+            Task { @MainActor in
+                if let error {
+                    completion(.failure(error))
+                    return
+                }
+                guard let data else {
+                    completion(.failure(ContainerConfigurationInputError(
+                        message: "The container service returned no transfer response."
+                    )))
+                    return
+                }
+                if let response = response as? HTTPURLResponse,
+                   !(200..<300).contains(response.statusCode) {
+                    let detail = String(data: data, encoding: .utf8)?
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                    let message: String
+                    if let detail, !detail.isEmpty {
+                        message = detail
+                    } else {
+                        message = "The container service returned HTTP \(response.statusCode)."
+                    }
+                    completion(.failure(ContainerConfigurationInputError(
+                        message: message
+                    )))
+                    return
+                }
+                do {
+                    completion(.success(try ContainerTransferBinaryCodec.response(from: data)))
+                } catch {
+                    completion(.failure(error))
+                }
+            }
+        }.resume()
+    }
+
+    private func showShareContainerOptions(for workspace: LocalWorkspaceRecord,
+                                           at point: CGPoint) {
+        let menuID = UUID()
+        var options: [String: (includePersistentData: Bool, includeMountedFolders: Bool)] = [
+            "project": (false, false),
+            "persistent": (true, false)
+        ]
+        var items = [
+            OuterframeContextMenuItem(
+                id: "project",
+                title: "Container project only (recommended)",
+                isEnabled: true,
+                systemImageName: "doc.zipper"
+            ),
+            OuterframeContextMenuItem(
+                id: "persistent",
+                title: "Include persistent data (may contain credentials)",
+                isEnabled: true,
+                systemImageName: "externaldrive"
+            )
+        ]
+        if !workspace.overviewMounts.isEmpty {
+            options["complete"] = (true, true)
+            items.append(OuterframeContextMenuItem(
+                id: "complete",
+                title: "Include persistent data and mounted folders…",
+                isEnabled: true,
+                systemImageName: "folder.badge.plus"
+            ))
+        }
+        pendingShareScopeMenuActions[menuID] = (workspace, options)
+        outerframeHost.showContextMenu(menuID: menuID, items: items, at: point)
+    }
+
+    private func prepareSharedContainer(_ workspace: LocalWorkspaceRecord,
+                                        includePersistentData: Bool,
+                                        includeMountedFolders: Bool) {
+        guard let stagingDirectory = outerframeHost.stagedFileDirectoryURL else {
+            workspacePanelMessage = "Outer Loop did not provide a place to stage the shared container."
+            updateLayout()
+            return
+        }
+        let fileName = safeSharedContainerFileName(workspace.name)
+        let directory = stagingDirectory.appendingPathComponent(
+            UUID().uuidString.lowercased(), isDirectory: true
+        )
+        let destination = directory.appendingPathComponent(fileName)
+        do {
+            try FileManager.default.createDirectory(
+                at: directory,
+                withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700]
+            )
+        } catch {
+            workspacePanelMessage = error.localizedDescription
+            updateLayout()
+            return
+        }
+        isPerformingWorkspaceOperation = true
+        workspacePanelMessage = "Preparing shared container…"
+        updateLayout()
+        performContainerTransferRequest(
+            operation: "prepareShare",
+            values: [
+                "workspaceID": workspace.id.uuidString.lowercased(),
+                "includePersistentData": includePersistentData,
+                "includeMountedFolders": includeMountedFolders,
+                "stagingPath": destination.path
+            ]
+        ) { [weak self] result in
+            guard let self else { return }
+            switch result {
+            case .failure(let error):
+                try? FileManager.default.removeItem(at: directory)
+                self.isPerformingWorkspaceOperation = false
+                self.workspacePanelMessage = error.localizedDescription
+                self.updateLayout()
+            case .success(let response):
+                guard let transferID = response.transferID,
+                      let responseFileName = response.fileName,
+                      let byteCount = response.byteCount else {
+                    try? FileManager.default.removeItem(at: directory)
+                    self.isPerformingWorkspaceOperation = false
+                    self.workspacePanelMessage = "Outer Shell did not return a usable shared container."
+                    self.updateLayout()
+                    return
+                }
+                if response.stagedDirectly == true {
+                    self.isPerformingWorkspaceOperation = false
+                    self.workspacePanelMessage = ""
+                    self.sharedContainerFile = (destination, responseFileName, byteCount)
+                    self.isShowingWorkspacePanel = true
+                    self.updateLayout()
+                    return
+                }
+                do {
+                    try Data().write(to: destination)
+                    self.downloadSharedContainer(
+                        transferID: transferID,
+                        destination: destination,
+                        fileName: responseFileName,
+                        byteCount: byteCount,
+                        offset: 0
+                    )
+                } catch {
+                    try? FileManager.default.removeItem(at: directory)
+                    self.isPerformingWorkspaceOperation = false
+                    self.workspacePanelMessage = error.localizedDescription
+                    self.updateLayout()
+                }
+            }
+        }
+    }
+
+    private func safeSharedContainerFileName(_ name: String) -> String {
+        let characters = name.map { character -> Character in
+            character.isLetter || character.isNumber || character == "-" || character == "_"
+                ? character
+                : "-"
+        }
+        let stem = String(characters)
+        return "\(stem.isEmpty ? "Container" : stem).outershell-container"
+    }
+
+    private func downloadSharedContainer(transferID: String,
+                                         destination: URL,
+                                         fileName: String,
+                                         byteCount: Int,
+                                         offset: Int) {
+        guard let transferUUID = UUID(uuidString: transferID) else {
+            finishSharedContainerImport(message: "The shared container transfer identifier is invalid.")
+            return
+        }
+        let request = ContainerTransferBinaryCodec.request(
+            operation: 1,
+            transferID: transferUUID,
+            offset: UInt64(offset),
+            length: UInt64(ContainerTransferBinaryCodec.chunkSize)
+        )
+        performContainerBinaryTransferRequest(request) { [weak self] result in
+            guard let self else { return }
+            switch result {
+            case .failure(let error):
+                self.isPerformingWorkspaceOperation = false
+                self.workspacePanelMessage = error.localizedDescription
+                self.updateLayout()
+            case .success(let response):
+                let data = response.data
+                let nextOffset = Int(response.nextOffset)
+                do {
+                    let handle = try FileHandle(forWritingTo: destination)
+                    defer { try? handle.close() }
+                    try handle.seekToEnd()
+                    try handle.write(contentsOf: data)
+                } catch {
+                    self.isPerformingWorkspaceOperation = false
+                    self.workspacePanelMessage = error.localizedDescription
+                    self.updateLayout()
+                    return
+                }
+                if response.nextOffset >= response.totalLength {
+                    self.isPerformingWorkspaceOperation = false
+                    self.workspacePanelMessage = ""
+                    self.sharedContainerFile = (destination, fileName, byteCount)
+                    self.isShowingWorkspacePanel = true
+                    self.updateLayout()
+                } else {
+                    let percent = byteCount > 0
+                        ? min(Int((Double(nextOffset) / Double(byteCount)) * 100), 99)
+                        : 0
+                    self.workspacePanelMessage = "Preparing shared container… \(percent)%"
+                    self.updateLayout()
+                    self.downloadSharedContainer(
+                        transferID: transferID,
+                        destination: destination,
+                        fileName: fileName,
+                        byteCount: byteCount,
+                        offset: nextOffset
+                    )
+                }
+            }
+        }
+    }
+
+    private func showSharedContainerImportRuntimeMenu(for url: URL, at point: CGPoint) {
+        let providers = availableSafeSpaceProviders.filter(\.canCreate)
+        guard !providers.isEmpty else {
+            workspacePanelMessage = "No container runtime is available on this server."
+            updateLayout()
+            return
+        }
+        let menuID = UUID()
+        pendingImportRuntimeMenuActions[menuID] = (
+            url,
+            Dictionary(uniqueKeysWithValues: providers.map { ($0.id, $0.id) })
+        )
+        let items = providers.map { provider in
+            OuterframeContextMenuItem(
+                id: provider.id,
+                title: "Import using \(provider.name)",
+                isEnabled: true,
+                systemImageName: provider.capabilities.supportsLiveMounts
+                    ? "server.rack"
+                    : "shippingbox"
+            )
+        }
+        outerframeHost.showContextMenu(menuID: menuID, items: items, at: point)
+    }
+
+    private func importSharedContainer(at url: URL, runtimeProviderID: String) {
+        isPerformingWorkspaceOperation = true
+        workspacePanelMessage = "Importing shared container…"
+        updateLayout()
+        performContainerTransferRequest(operation: "beginImport") { [weak self] result in
+            guard let self else { return }
+            switch result {
+            case .failure(let error):
+                self.finishSharedContainerImport(error: error)
+            case .success(let response):
+                guard let transferID = response.transferID else {
+                    self.finishSharedContainerImport(message: "The server could not begin the import.")
+                    return
+                }
+                do {
+                    let size = try url.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
+                    let handle = try FileHandle(forReadingFrom: url)
+                    self.resumeSharedContainerUpload(
+                        transferID: transferID,
+                        runtimeProviderID: runtimeProviderID,
+                        handle: handle,
+                        byteCount: size,
+                        retryCount: 0
+                    )
+                } catch {
+                    self.finishSharedContainerImport(error: error)
+                }
+            }
+        }
+    }
+
+    private func containerUploadEndpoint(transferID: String) -> URL? {
+        guard let safeSpacesEndpoint,
+              var components = URLComponents(
+                  url: safeSpacesEndpoint,
+                  resolvingAgainstBaseURL: true
+              ) else {
+            return nil
+        }
+        components.path = "/api/container-transfers/\(transferID.lowercased())"
+        components.query = nil
+        components.fragment = nil
+        return components.url
+    }
+
+    private func uploadOffset(from response: URLResponse?) -> Int? {
+        guard let response = response as? HTTPURLResponse,
+              let text = response.value(forHTTPHeaderField: "Upload-Offset"),
+              let value = UInt64(text),
+              value <= UInt64(Int.max) else {
+            return nil
+        }
+        return Int(value)
+    }
+
+    private func resumeSharedContainerUpload(transferID: String,
+                                             runtimeProviderID: String,
+                                             handle: FileHandle,
+                                             byteCount: Int,
+                                             retryCount: Int) {
+        guard let endpoint = containerUploadEndpoint(transferID: transferID),
+              let safeSpaceOperationSession else {
+            try? handle.close()
+            finishSharedContainerImport(
+                message: "Outer Shell's container transfer service is unavailable."
+            )
+            return
+        }
+        var request = URLRequest(url: endpoint)
+        request.httpMethod = "HEAD"
+        request.timeoutInterval = ContainerResumableUpload.requestTimeout
+        request.setValue("outershell-resumable-v1", forHTTPHeaderField: "Upload-Protocol")
+        safeSpaceOperationSession.dataTask(with: request) { [weak self] _, response, error in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                if let error {
+                    self.retrySharedContainerUpload(
+                        transferID: transferID,
+                        runtimeProviderID: runtimeProviderID,
+                        handle: handle,
+                        byteCount: byteCount,
+                        sentByteCount: 0,
+                        retryCount: retryCount,
+                        error: error
+                    )
+                    return
+                }
+                guard let httpResponse = response as? HTTPURLResponse,
+                      (200..<300).contains(httpResponse.statusCode),
+                      let offset = self.uploadOffset(from: response),
+                      offset <= byteCount else {
+                    try? handle.close()
+                    self.finishSharedContainerImport(
+                        message: "The destination returned an invalid container transfer offset."
+                    )
+                    return
+                }
+                self.uploadSharedContainerSegment(
+                    transferID: transferID,
+                    runtimeProviderID: runtimeProviderID,
+                    handle: handle,
+                    byteCount: byteCount,
+                    sentByteCount: offset,
+                    retryCount: retryCount
+                )
+            }
+        }.resume()
+    }
+
+    private func uploadSharedContainerSegment(transferID: String,
+                                              runtimeProviderID: String,
+                                              handle: FileHandle,
+                                              byteCount: Int,
+                                              sentByteCount: Int,
+                                              retryCount: Int) {
+        let data: Data
+        do {
+            try handle.seek(toOffset: UInt64(sentByteCount))
+            data = try handle.read(upToCount: ContainerResumableUpload.segmentSize) ?? Data()
+        } catch {
+            try? handle.close()
+            finishSharedContainerImport(error: error)
+            return
+        }
+        if data.isEmpty {
+            try? handle.close()
+            finishUploadedSharedContainer(
+                transferID: transferID,
+                runtimeProviderID: runtimeProviderID
+            )
+            return
+        }
+        guard let endpoint = containerUploadEndpoint(transferID: transferID),
+              let safeSpaceOperationSession else {
+            try? handle.close()
+            finishSharedContainerImport(
+                message: "Outer Shell's container transfer service is unavailable."
+            )
+            return
+        }
+        var request = URLRequest(url: endpoint)
+        request.httpMethod = "PATCH"
+        request.timeoutInterval = ContainerResumableUpload.requestTimeout
+        request.setValue("application/offset+octet-stream", forHTTPHeaderField: "Content-Type")
+        request.setValue("outershell-resumable-v1", forHTTPHeaderField: "Upload-Protocol")
+        request.setValue(String(sentByteCount), forHTTPHeaderField: "Upload-Offset")
+        request.setValue(String(data.count), forHTTPHeaderField: "Content-Length")
+        safeSpaceOperationSession.uploadTask(with: request, from: data) { [weak self] _, response, error in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                if let error {
+                    self.retrySharedContainerUpload(
+                        transferID: transferID,
+                        runtimeProviderID: runtimeProviderID,
+                        handle: handle,
+                        byteCount: byteCount,
+                        sentByteCount: sentByteCount,
+                        retryCount: retryCount,
+                        error: error
+                    )
+                    return
+                }
+                guard let httpResponse = response as? HTTPURLResponse else {
+                    try? handle.close()
+                    self.finishSharedContainerImport(
+                        message: "The destination returned no container transfer response."
+                    )
+                    return
+                }
+                if httpResponse.statusCode == 409 {
+                    self.resumeSharedContainerUpload(
+                        transferID: transferID,
+                        runtimeProviderID: runtimeProviderID,
+                        handle: handle,
+                        byteCount: byteCount,
+                        retryCount: retryCount
+                    )
+                    return
+                }
+                guard (200..<300).contains(httpResponse.statusCode),
+                      let total = self.uploadOffset(from: response),
+                      total > sentByteCount,
+                      total <= byteCount else {
+                    try? handle.close()
+                    self.finishSharedContainerImport(
+                        message: "The destination did not accept the container transfer segment."
+                    )
+                    return
+                }
+                let percent = byteCount > 0
+                    ? min(Int((Double(total) / Double(byteCount)) * 100), 99)
+                    : 0
+                self.workspacePanelMessage = "Importing shared container… \(percent)%"
+                self.updateLayout()
+                self.uploadSharedContainerSegment(
+                    transferID: transferID,
+                    runtimeProviderID: runtimeProviderID,
+                    handle: handle,
+                    byteCount: byteCount,
+                    sentByteCount: total,
+                    retryCount: 0
+                )
+            }
+        }.resume()
+    }
+
+    private func finishUploadedSharedContainer(transferID: String,
+                                               runtimeProviderID: String,
+                                               mountDestinationRoot: String? = nil) {
+        var values = [
+            "transferID": transferID,
+            "runtimeProviderID": runtimeProviderID
+        ]
+        if let mountDestinationRoot {
+            values["mountDestinationRoot"] = mountDestinationRoot
+        }
+        performContainerTransferRequest(
+            operation: "finishImport",
+            values: values
+        ) { [weak self] result in
+            guard let self else { return }
+            switch result {
+            case .failure(let error):
+                if self.pendingSharedContainerImport != nil {
+                    self.isPerformingWorkspaceOperation = false
+                    self.workspacePanelMessage = error.localizedDescription
+                    self.focusWorkspaceRenameField(selectAll: false)
+                    self.updateLayout()
+                } else {
+                    self.finishSharedContainerImport(error: error)
+                }
+            case .success(let response):
+                if response.needsMountDestination == true,
+                   let suggestedMountRoot = response.suggestedMountRoot,
+                   let mounts = response.importMounts,
+                   !mounts.isEmpty {
+                    self.pendingSharedContainerImport = PendingSharedContainerImport(
+                        transferID: transferID,
+                        runtimeProviderID: runtimeProviderID,
+                        name: response.importName ?? "Imported Container",
+                        mounts: mounts
+                    )
+                    self.isPerformingWorkspaceOperation = false
+                    self.workspaceNamePromptDismissesPanel = true
+                    self.workspaceRenameName = suggestedMountRoot
+                    self.workspacePanelMessage = ""
+                    self.isShowingWorkspacePanel = true
+                    self.focusWorkspaceRenameField(selectAll: false)
+                    self.updateLayout()
+                    return
+                }
+                self.pendingSharedContainerImport = nil
+                if let providers = response.providers {
+                    self.availableSafeSpaceProviders = providers
+                }
+                self.localWorkspaces = response.workspaces
+                let omitted = response.omittedMountCount ?? 0
+                let message = omitted > 0
+                    ? "Imported the container. \(omitted) folder mount(s) need to be reconnected."
+                    : "Imported the container. Its image is being built."
+                self.blurWorkspaceRenameField()
+                self.workspaceNamePromptDismissesPanel = false
+                self.workspaceRenameName = ""
+                self.isShowingWorkspacePanel = false
+                self.finishSharedContainerImport(message: message)
+                self.scheduleWorkspaceRefresh()
+            }
+        }
+    }
+
+    private func retrySharedContainerUpload(transferID: String,
+                                            runtimeProviderID: String,
+                                            handle: FileHandle,
+                                            byteCount: Int,
+                                            sentByteCount: Int,
+                                            retryCount: Int,
+                                            error: Error) {
+        guard retryCount < ContainerResumableUpload.maximumRetryCount,
+              canRetryContainerTransfer(after: error) else {
+            try? handle.close()
+            finishSharedContainerImport(error: error)
+            return
+        }
+        _ = recoverNetworkingIfNeeded(after: error)
+        let percent = byteCount > 0
+            ? min(Int((Double(sentByteCount) / Double(byteCount)) * 100), 99)
+            : 0
+        workspacePanelMessage = "Importing shared container… \(percent)% · Reconnecting…"
+        updateLayout()
+        let delay = min(pow(2.0, Double(retryCount)), 8.0)
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            self?.resumeSharedContainerUpload(
+                transferID: transferID,
+                runtimeProviderID: runtimeProviderID,
+                handle: handle,
+                byteCount: byteCount,
+                retryCount: retryCount + 1
+            )
+        }
+    }
+
+    private func canRetryContainerTransfer(after error: Error) -> Bool {
+        let value = error as NSError
+        if value.domain == NSURLErrorDomain {
+            switch value.code {
+            case NSURLErrorCannotConnectToHost,
+                 NSURLErrorNetworkConnectionLost,
+                 NSURLErrorNotConnectedToInternet,
+                 NSURLErrorCannotFindHost,
+                 NSURLErrorDNSLookupFailed,
+                 NSURLErrorTimedOut:
+                return true
+            default:
+                break
+            }
+        }
+        let message = error.localizedDescription.lowercased()
+        return message.contains("connection") ||
+            message.contains("timed out") ||
+            message.contains("failed to send request") ||
+            message.contains("temporarily unavailable")
+    }
+
+    private func finishSharedContainerImport(error: Error) {
+        finishSharedContainerImport(message: error.localizedDescription)
+    }
+
+    private func finishSharedContainerImport(message: String) {
+        isPerformingWorkspaceOperation = false
+        workspacePanelMessage = message
+        updateLayout()
+    }
+
     private func showSafeSpaceProviderMenu(at point: CGPoint) {
         let providers: [LocalSafeSpaceProviderRecord]
         if availableSafeSpaceProviders.isEmpty {
@@ -16680,6 +17669,21 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func dismissWorkspaceRename() {
+        if let pendingImport = pendingSharedContainerImport {
+            guard !isPerformingWorkspaceOperation else { return }
+            pendingSharedContainerImport = nil
+            blurWorkspaceRenameField()
+            workspaceNamePromptDismissesPanel = false
+            workspaceRenameName = ""
+            workspacePanelMessage = ""
+            isShowingWorkspacePanel = false
+            performContainerTransferRequest(
+                operation: "cancelImport",
+                values: ["transferID": pendingImport.transferID]
+            ) { _ in }
+            updateLayout()
+            return
+        }
         if isRenamingContainerConfiguration {
             blurWorkspaceRenameField()
             restoreContainerConfigurationInputAfterRename()
@@ -16730,7 +17734,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             in: .whitespacesAndNewlines
         )
         guard !name.isEmpty else {
-            if pendingWorkspaceRename != nil {
+            if pendingSharedContainerImport != nil {
+                workspacePanelMessage = "Choose a destination folder on this server."
+            } else if pendingWorkspaceRename != nil {
                 workspacePanelMessage = "Enter a name for the container."
             } else if pendingSafeSpaceAppWorkspace != nil {
                 workspacePanelMessage = "Enter a folder path inside the container."
@@ -16750,6 +17756,18 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 workspacePanelMessage = "Enter a name for the container."
             }
             updateLayout()
+            return
+        }
+        if let pendingImport = pendingSharedContainerImport {
+            isPerformingWorkspaceOperation = true
+            workspacePanelMessage = "Copying mounted folders…"
+            blurWorkspaceRenameField()
+            updateLayout()
+            finishUploadedSharedContainer(
+                transferID: pendingImport.transferID,
+                runtimeProviderID: pendingImport.runtimeProviderID,
+                mountDestinationRoot: name
+            )
             return
         }
         if isCreatingWorkspace && isEditingCreationBaseImage {
@@ -16858,6 +17876,93 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         }
     }
 
+    private func renderSharedContainerPanel(_ file: (url: URL, name: String, byteCount: Int),
+                                            width: CGFloat,
+                                            height: CGFloat) {
+        workspaceOverlayLayer.backgroundColor = resolvedCGColor(NSColor.black.withAlphaComponent(0.24))
+        let panelWidth = min(max(width - 64, 420), 560)
+        let panelHeight: CGFloat = 240
+        workspacePanelFrame = CGRect(
+            x: floor((width - panelWidth) / 2),
+            y: floor((height - panelHeight) / 2),
+            width: panelWidth,
+            height: panelHeight
+        )
+        workspacePanelLayer.frame = workspacePanelFrame
+        workspacePanelLayer.backgroundColor = resolvedCGColor(.windowBackgroundColor)
+        workspacePanelLayer.cornerRadius = 14
+        workspacePanelLayer.borderWidth = 0.5
+        workspacePanelLayer.borderColor = resolvedCGColor(.separatorColor)
+        workspacePanelLayer.shadowColor = resolvedCGColor(.black)
+        workspacePanelLayer.shadowOpacity = 0.18
+        workspacePanelLayer.shadowRadius = 18
+        workspacePanelLayer.shadowOffset = CGSize(width: 0, height: -4)
+        workspacePanelLayer.sublayers = nil
+
+        let title = makeTextLayer(size: 20, weight: .semibold, color: .labelColor)
+        title.string = "Share Container"
+        title.frame = CGRect(x: 24, y: panelHeight - 48, width: panelWidth - 76, height: 26)
+        workspacePanelLayer.addSublayer(title)
+
+        let close = makeSymbolButtonLayer(
+            symbolName: "xmark.circle.fill",
+            accessibilityTitle: "Close Share Container"
+        )
+        let closeFrame = CGRect(x: panelWidth - 42, y: panelHeight - 43, width: 24, height: 24)
+        close.frame = closeFrame
+        sharedContainerCloseFrame = closeFrame.offsetBy(
+            dx: workspacePanelFrame.minX,
+            dy: workspacePanelFrame.minY
+        )
+        workspacePanelLayer.addSublayer(close)
+
+        let explanation = makeTextLayer(size: 13, weight: .regular, color: .secondaryLabelColor)
+        explanation.string = "Drag this file into another Outer Shell window to create a portable copy."
+        explanation.frame = CGRect(x: 24, y: panelHeight - 76, width: panelWidth - 48, height: 20)
+        workspacePanelLayer.addSublayer(explanation)
+
+        let localFileFrame = CGRect(x: 24, y: 28, width: panelWidth - 48, height: 102)
+        let card = CALayer()
+        card.frame = localFileFrame
+        card.backgroundColor = resolvedCGColor(.controlBackgroundColor)
+        card.cornerRadius = 10
+        card.borderWidth = 1
+        card.borderColor = resolvedCGColor(.separatorColor)
+        workspacePanelLayer.addSublayer(card)
+
+        let icon = makeSymbolButtonLayer(
+            symbolName: "shippingbox.and.arrow.backward",
+            accessibilityTitle: "Shared container file"
+        )
+        icon.applyStyle(
+            tintCGColor: resolvedCGColor(.controlAccentColor),
+            backgroundCGColor: resolvedCGColor(.clear)
+        )
+        icon.frame = CGRect(x: 20, y: 28, width: 42, height: 42)
+        card.addSublayer(icon)
+
+        let name = makeTextLayer(size: 14, weight: .medium, color: .labelColor)
+        name.string = file.name
+        name.frame = CGRect(x: 76, y: 52, width: localFileFrame.width - 96, height: 22)
+        card.addSublayer(name)
+
+        let formatter = ByteCountFormatter()
+        formatter.countStyle = .file
+        let detail = makeTextLayer(size: 12, weight: .regular, color: .secondaryLabelColor)
+        detail.string = "\(formatter.string(fromByteCount: Int64(file.byteCount))) · Drag to share"
+        detail.frame = CGRect(x: 76, y: 28, width: localFileFrame.width - 96, height: 20)
+        card.addSublayer(detail)
+
+        sharedContainerDragFrame = localFileFrame.offsetBy(
+            dx: workspacePanelFrame.minX,
+            dy: workspacePanelFrame.minY
+        )
+        workspaceCloseFrame = .zero
+        workspaceCreateFrame = .zero
+        workspaceRowFrames.removeAll()
+        workspaceActionFrames.removeAll()
+    }
+
     private func renderWorkspacePanelIfNeeded(width: CGFloat, height: CGFloat) {
         workspaceOverlayLayer.isHidden = !isShowingWorkspacePanel
         guard isShowingWorkspacePanel else {
@@ -16879,6 +17984,13 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             workspaceDeletePanelFrame = .zero
             workspaceDeleteCancelFrame = .zero
             workspaceDeleteConfirmFrame = .zero
+            sharedContainerDragFrame = .zero
+            sharedContainerCloseFrame = .zero
+            return
+        }
+
+        if let sharedContainerFile {
+            renderSharedContainerPanel(sharedContainerFile, width: width, height: height)
             return
         }
 
@@ -16898,19 +18010,26 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             isWorkspaceNamePromptVisible
         let showsDeletePrompt = pendingWorkspaceDeletion != nil
         let panelWidth = showsStandaloneNamePrompt || showsDeletePrompt
-            ? (isDockerfileFragmentPrompt
+            ? (pendingSharedContainerImport != nil
+                ? min(max(width - 72, 460), 680)
+                : (isDockerfileFragmentPrompt
                 ? min(max(width - 72, 520), 760)
-                : min(max(width - 72, 320), 460))
+                : min(max(width - 72, 320), 460)))
             : min(max(width - 48, 420), 680)
         let desiredHeight = CGFloat(localWorkspaces.count) * 74 + 170
         let panelHeight = showsStandaloneNamePrompt || showsDeletePrompt
-            ? (isDockerfileFragmentPrompt
+            ? (pendingSharedContainerImport != nil
+                ? min(
+                    CGFloat(224 + min(pendingSharedContainerImport?.mounts.count ?? 0, 5) * 50),
+                    max(height - 72, 274)
+                )
+                : (isDockerfileFragmentPrompt
                 ? min(max(height - 72, 360), 600)
                 : CGFloat(showsDeletePrompt
                     ? 184
                     : (isBaseImageChoicePrompt
                         ? 310
-                        : (isCreatingWorkspace && !isEditingCreationBaseImage ? 224 : 174))))
+                        : (isCreatingWorkspace && !isEditingCreationBaseImage ? 224 : 174)))))
             : min(max(desiredHeight, 290), max(height - 48, 220))
         workspacePanelFrame = CGRect(x: floor((width - panelWidth) / 2),
                                      y: floor((height - panelHeight) / 2),
@@ -18470,7 +19589,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         let prompt: CALayer
         let promptWidth: CGFloat
         let promptHeight: CGFloat
-        let wrapsPromptDetail = isBaseImageChoicePrompt ||
+        let wrapsPromptDetail = pendingSharedContainerImport != nil ||
+            isBaseImageChoicePrompt ||
             (pendingDockerfileWorkspace != nil && !isRenamingContainerConfiguration)
         if workspaceNamePromptDismissesPanel {
             prompt = workspacePanelLayer
@@ -18525,7 +19645,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         }
 
         let title = makeTextLayer(size: 17, weight: .semibold, color: .labelColor)
-        if isCreatingWorkspace && isEditingCreationBaseImage {
+        if pendingSharedContainerImport != nil {
+            title.string = "Copy Mounted Folders"
+        } else if isCreatingWorkspace && isEditingCreationBaseImage {
             title.string = "Choose Base Image"
         } else if pendingSafeSpaceAppWorkspace != nil {
             title.string = "Add JupyterLab App"
@@ -18553,6 +19675,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         let detail = makeTextLayer(size: 11, weight: .regular, color: .secondaryLabelColor)
         if !workspacePanelMessage.isEmpty {
             detail.string = workspacePanelMessage
+        } else if let pendingImport = pendingSharedContainerImport {
+            let count = pendingImport.mounts.count
+            detail.string = "Choose where \(count) included folder\(count == 1 ? "" : "s") " +
+                "will be copied on this server. Paths inside the container will stay the same."
         } else if isCreatingWorkspace && isEditingCreationBaseImage {
             detail.string = "Start with Outer Shell's image, add visible support steps to another image, or use it unchanged."
         } else if let workspace = pendingSafeSpaceAppWorkspace {
@@ -18583,7 +19709,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             }
         }
         detail.foregroundColor = resolvedCGColor(
-            workspacePanelMessage.isEmpty ? .secondaryLabelColor : .systemRed
+            workspacePanelMessage.isEmpty || isPerformingWorkspaceOperation
+                ? .secondaryLabelColor
+                : .systemRed
         )
         detail.isWrapped = wrapsPromptDetail
         detail.frame = CGRect(x: 18,
@@ -18591,6 +19719,54 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                               width: promptWidth - 36,
                               height: wrapsPromptDetail ? 36 : 17)
         prompt.addSublayer(detail)
+
+        if let pendingImport = pendingSharedContainerImport {
+            let shownMounts = Array(pendingImport.mounts.prefix(5))
+            var rowY = promptHeight - 145
+            for mount in shownMounts {
+                let source = makeTextLayer(size: 10,
+                                           weight: .medium,
+                                           color: .labelColor)
+                source.string = mount.sourceHostPath
+                source.truncationMode = .middle
+                source.frame = CGRect(x: 24,
+                                      y: rowY + 22,
+                                      width: promptWidth - 48,
+                                      height: 15)
+                prompt.addSublayer(source)
+
+                let destination = makeTextLayer(size: 9,
+                                                weight: .regular,
+                                                color: .secondaryLabelColor)
+                let root = workspaceRenameInputController.text.isEmpty
+                    ? workspaceRenameName
+                    : workspaceRenameInputController.text
+                let serverPath = NSString(string: root)
+                    .appendingPathComponent(mount.directoryName)
+                destination.string = "→ \(serverPath)   ·   mounted at \(mount.guestPath)"
+                destination.truncationMode = .middle
+                destination.frame = CGRect(x: 24,
+                                           y: rowY + 4,
+                                           width: promptWidth - 48,
+                                           height: 14)
+                prompt.addSublayer(destination)
+                rowY -= 50
+            }
+            if pendingImport.mounts.count > shownMounts.count {
+                let more = makeTextLayer(size: 9,
+                                         weight: .regular,
+                                         color: .secondaryLabelColor)
+                more.string = "And \(pendingImport.mounts.count - shownMounts.count) more…"
+                more.frame = CGRect(x: 24, y: 105, width: promptWidth - 48, height: 14)
+                prompt.addSublayer(more)
+            }
+            let fieldLabel = makeTextLayer(size: 9,
+                                           weight: .semibold,
+                                           color: .secondaryLabelColor)
+            fieldLabel.string = "DESTINATION FOLDER ON SERVER"
+            fieldLabel.frame = CGRect(x: 18, y: 100, width: promptWidth - 36, height: 13)
+            prompt.addSublayer(fieldLabel)
+        }
 
         let showsCreationOptions = isCreatingWorkspace && !isEditingCreationBaseImage
         let localFieldFrame = CGRect(x: 18,
@@ -18874,14 +20050,16 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         if !isDockerfileFragmentPrompt {
             let value = makeTextLayer(size: 13, weight: .regular, color: .textColor)
             value.string = text.isEmpty
-                ? (pendingSafeSpaceAppWorkspace != nil
+                ? (pendingSharedContainerImport != nil
+                    ? "/path/on/this/server"
+                    : (pendingSafeSpaceAppWorkspace != nil
                     ? "/home/workspace/Workspace"
                     : (pendingRecipeBaseImageWorkspace != nil ||
                        (isCreatingWorkspace && isEditingCreationBaseImage)
                         ? "debian:bookworm"
                     : (pendingRecipeUserWorkspace != nil
                         ? "Linux username"
-                        : "Container name")))
+                        : "Container name"))))
                 : text
             value.foregroundColor = resolvedCGColor(
                 text.isEmpty ? .placeholderTextColor : .textColor
@@ -18903,7 +20081,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         }
 
         let confirm = makeButtonLayer(
-            title: isCreatingWorkspace && isEditingCreationBaseImage
+            title: pendingSharedContainerImport != nil
+                ? "Import"
+                : (isCreatingWorkspace && isEditingCreationBaseImage
                 ? "Done"
                 : (pendingSafeSpaceAppWorkspace != nil
                 ? "Add App"
@@ -18917,7 +20097,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                     ? (pendingDockerfileWorkspace != nil || pendingRecipeEditStep != nil
                         ? "Save"
                         : "Add")
-                    : (isCreatingWorkspace ? "Create" : "Rename")))))),
+                    : (isCreatingWorkspace ? "Create" : "Rename"))))))),
             emphasized: true
         )
         let localConfirmFrame = CGRect(x: promptWidth - 96, y: 18, width: 78, height: 30)
@@ -19242,6 +20422,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         let menuID = UUID()
         let operations = [
             "state": stateOperation,
+            "share": "share",
             "delete": "delete"
         ]
         var items: [OuterframeContextMenuItem] = []
@@ -19254,6 +20435,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                       systemImageName: stateOperation == "stop"
                                         ? "stop.fill"
                                         : "play.fill"),
+            OuterframeContextMenuItem(id: "share",
+                                      title: "Share Container…",
+                                      isEnabled: !isPerformingWorkspaceOperation,
+                                      systemImageName: "square.and.arrow.up"),
             OuterframeContextMenuItem(id: "delete-separator",
                                       title: "",
                                       kind: .separator,
@@ -19263,7 +20448,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                       isEnabled: !isPerformingWorkspaceOperation,
                                       systemImageName: "trash")
         ])
-        pendingWorkspaceOverviewMenuActions[menuID] = (workspace, operations)
+        pendingWorkspaceOverviewMenuActions[menuID] = (workspace, operations, point)
         outerframeHost.showContextMenu(menuID: menuID, items: items, at: point)
     }
 
@@ -19586,6 +20771,25 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func handleContextMenuSelection(menuID: UUID, itemID: String) {
+        if let selection = pendingContainerCommandMenuActions.removeValue(forKey: menuID),
+           let command = selection.commandByItemID[itemID] {
+            copyTextToPasteboard(command)
+            workspacePanelMessage = ""
+            showCommandCopiedConfirmation(at: selection.anchor)
+            return
+        }
+        if let selection = pendingShareScopeMenuActions.removeValue(forKey: menuID),
+           let option = selection.options[itemID] {
+            prepareSharedContainer(selection.workspace,
+                                   includePersistentData: option.includePersistentData,
+                                   includeMountedFolders: option.includeMountedFolders)
+            return
+        }
+        if let selection = pendingImportRuntimeMenuActions.removeValue(forKey: menuID),
+           let providerID = selection.providerByItemID[itemID] {
+            importSharedContainer(at: selection.url, runtimeProviderID: providerID)
+            return
+        }
         if let paths = pendingContainerPathMenuSelections.removeValue(forKey: menuID),
            let path = paths[itemID] {
             copyTextToPasteboard(path)
@@ -19625,6 +20829,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             switch operation {
             case "delete":
                 showWorkspaceDeletionConfirmation(action.workspace)
+            case "share":
+                showShareContainerOptions(for: action.workspace, at: action.anchor)
             case let value where value.hasPrefix("unmountFolder:"):
                 let identifier = String(value.dropFirst("unmountFolder:".count))
                 guard let mountID = UUID(uuidString: identifier) else {
@@ -20004,6 +21210,88 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             size: CGSize(width: width, height: height),
             frameOrigin: CGPoint(x: nativeProjectDragFrame.midX - width / 2,
                                  y: nativeProjectDragFrame.minY)
+        )
+    }
+
+    private func sharedContainerDragPreview(
+        for file: (url: URL, name: String, byteCount: Int)
+    ) -> NativeProjectDragPreview? {
+        let scale = max(NSScreen.main?.backingScaleFactor ?? 2, 1)
+        let iconSize: CGFloat = 72
+        let labelHeight: CGFloat = 24
+        let iconLabelGap: CGFloat = 8
+        let font = NSFont.systemFont(ofSize: 13, weight: .medium)
+        let measuredNameWidth = ceil((file.name as NSString).size(withAttributes: [.font: font]).width)
+        let labelWidth = min(max(measuredNameWidth + 18, 80), 320)
+        let width = max(iconSize, labelWidth)
+        let height = iconSize + iconLabelGap + labelHeight
+
+        guard let bitmap = NSBitmapImageRep(bitmapDataPlanes: nil,
+                                            pixelsWide: max(Int(ceil(width * scale)), 1),
+                                            pixelsHigh: max(Int(ceil(height * scale)), 1),
+                                            bitsPerSample: 8,
+                                            samplesPerPixel: 4,
+                                            hasAlpha: true,
+                                            isPlanar: false,
+                                            colorSpaceName: .deviceRGB,
+                                            bytesPerRow: 0,
+                                            bitsPerPixel: 0),
+              let context = NSGraphicsContext(bitmapImageRep: bitmap) else {
+            return nil
+        }
+
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = context
+        context.cgContext.scaleBy(x: scale, y: scale)
+        defer { NSGraphicsContext.restoreGraphicsState() }
+
+        withEffectiveAppearance {
+            NSColor.clear.setFill()
+            NSBezierPath(rect: NSRect(x: 0, y: 0, width: width, height: height)).fill()
+
+            let symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 58, weight: .regular)
+                .applying(NSImage.SymbolConfiguration(hierarchicalColor: .controlAccentColor))
+            if let icon = NSImage(systemSymbolName: "shippingbox.fill", accessibilityDescription: nil)?
+                .withSymbolConfiguration(symbolConfiguration) {
+                icon.draw(in: NSRect(x: (width - iconSize) / 2,
+                                     y: labelHeight + iconLabelGap,
+                                     width: iconSize,
+                                     height: iconSize),
+                          from: .zero,
+                          operation: .sourceOver,
+                          fraction: 1)
+            }
+
+            let labelFrame = NSRect(x: (width - labelWidth) / 2,
+                                    y: 0,
+                                    width: labelWidth,
+                                    height: labelHeight)
+            NSColor.controlAccentColor.setFill()
+            NSBezierPath(roundedRect: labelFrame.insetBy(dx: 0, dy: 2),
+                         xRadius: 6,
+                         yRadius: 6).fill()
+
+            let paragraph = NSMutableParagraphStyle()
+            paragraph.alignment = .center
+            paragraph.lineBreakMode = .byTruncatingTail
+            let attributes: [NSAttributedString.Key: Any] = [
+                .font: font,
+                .foregroundColor: NSColor.alternateSelectedControlTextColor,
+                .paragraphStyle: paragraph
+            ]
+            (file.name as NSString).draw(with: labelFrame.insetBy(dx: 9, dy: 4),
+                                         options: [.usesLineFragmentOrigin, .truncatesLastVisibleLine],
+                                         attributes: attributes)
+        }
+
+        guard let pngData = bitmap.representation(using: .png, properties: [:]) else {
+            return nil
+        }
+        return NativeProjectDragPreview(
+            pngData: pngData,
+            size: CGSize(width: width, height: height),
+            frameOrigin: CGPoint(x: sharedContainerDragFrame.midX - width / 2,
+                                 y: sharedContainerDragFrame.minY)
         )
     }
 

@@ -54,6 +54,14 @@ require_file "${REPO_ROOT}/OuterShell.icns"
 require_file "${REPO_ROOT}/Resources/OuterShellWeb/index.html"
 require_file "${REPO_ROOT}/Resources/OuterShellWeb/style.css"
 require_file "${REPO_ROOT}/Resources/OuterShellWeb/app.js"
+require_file "${REPO_ROOT}/Resources/outershell-container-provider"
+for libc in glibc musl; do
+    for arch in aarch64 x86_64; do
+        require_file "${RUN_ROOT}/container-bootstrap/bin/${libc}/${arch}/outershelld"
+        require_file "${RUN_ROOT}/container-bootstrap/bin/${libc}/${arch}/outerctl"
+        require_file "${RUN_ROOT}/container-bootstrap/bin/${libc}/${arch}/outer-socket-bridge"
+    done
+done
 for arch in aarch64 x86_64; do
     if wants_variant "linux-${arch}"; then
         require_file "${PACKAGE_ROOT}/RemoteLinuxBinaries/${arch}/outershelld"
@@ -137,6 +145,8 @@ stage_home_screen() {
     mkdir -p "${root}/tools" "${app_root}/bundles"
     install -m 0755 "${PACKAGE_ROOT}/RemoteLinuxBinaries/${arch}/outershelld" "${root}/tools/outershelld"
     install -m 0755 "${PACKAGE_ROOT}/RemoteLinuxBinaries/${arch}/outerctl" "${root}/tools/outerctl"
+    install -m 0755 "${REPO_ROOT}/Resources/outershell-container-provider" "${root}/tools/outershell-container-provider"
+    ditto "${RUN_ROOT}/container-bootstrap" "${root}/container-bootstrap"
     install -m 0755 "${PACKAGE_ROOT}/RemoteLinuxBinaries/${arch}/OuterShellBackend" "${app_root}/OuterShellBackend"
     install -m 0644 "${REPO_ROOT}/app-icon.png" "${app_root}/app-icon.png"
     install -m 0644 "${RUN_ROOT}/bundles/OuterShell.bundle.macos-arm.aar" "${app_root}/bundles/OuterShell.bundle.macos-arm.aar"
@@ -154,6 +164,8 @@ stage_home_screen_musl() {
     mkdir -p "${root}/tools" "${app_root}/bundles"
     install -m 0755 "${PACKAGE_ROOT}/RemoteLinuxBinariesMusl/${arch}/outershelld" "${root}/tools/outershelld"
     install -m 0755 "${PACKAGE_ROOT}/RemoteLinuxBinariesMusl/${arch}/outerctl" "${root}/tools/outerctl"
+    install -m 0755 "${REPO_ROOT}/Resources/outershell-container-provider" "${root}/tools/outershell-container-provider"
+    ditto "${RUN_ROOT}/container-bootstrap" "${root}/container-bootstrap"
     install -m 0755 "${PACKAGE_ROOT}/RemoteLinuxBinariesMusl/${arch}/OuterShellBackend" "${app_root}/OuterShellBackend"
     install -m 0644 "${REPO_ROOT}/app-icon.png" "${app_root}/app-icon.png"
     install -m 0644 "${RUN_ROOT}/bundles/OuterShell.bundle.macos-arm.aar" "${app_root}/bundles/OuterShell.bundle.macos-arm.aar"
@@ -393,6 +405,29 @@ if [ "$os_name" = "Darwin" ]; then
         return 0
     }
 
+    stop_unmanaged_outer_shell_copies() {
+        executable_path="$app_install_root/Outer Shell.app/Contents/MacOS/Outer Shell"
+        pkill -f -- "$executable_path" >/dev/null 2>&1 || true
+        attempts=20
+        while [ "$attempts" -gt 0 ]; do
+            if ! pgrep -f -- "$executable_path" >/dev/null 2>&1; then
+                return 0
+            fi
+            sleep 0.1
+            attempts=$((attempts - 1))
+        done
+        pkill -KILL -f -- "$executable_path" >/dev/null 2>&1 || true
+        attempts=40
+        while [ "$attempts" -gt 0 ]; do
+            if ! pgrep -f -- "$executable_path" >/dev/null 2>&1; then
+                return 0
+            fi
+            sleep 0.1
+            attempts=$((attempts - 1))
+        done
+        return 0
+    }
+
     bootstrap_outer_shell() {
         attempts=60
         last_error=""
@@ -515,6 +550,7 @@ EOF
     touch "$log_path"
 
     unload_outer_shell
+    stop_unmanaged_outer_shell_copies
     rm -f "$socket_path" "$api_socket_path"
 
     app_executable="$app_install_root/Outer Shell.app/Contents/MacOS/Outer Shell"
@@ -713,7 +749,43 @@ case "$service_manager" in
         exit 1
         ;;
 esac
+
+configure_rootless_docker() {
+    [ "$root_install" = false ] || return 0
+    [ "$(uname -s)" = Linux ] || return 0
+    rootless_socket="$runtime_dir/docker.sock"
+    [ ! -S "$rootless_socket" ] || return 0
+    if command -v systemctl >/dev/null 2>&1 &&
+       systemctl --user cat docker.service >/dev/null 2>&1; then
+        XDG_RUNTIME_DIR="$runtime_dir" \
+            DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=$runtime_dir/bus}" \
+            systemctl --user start docker.service >/dev/null 2>&1 || true
+        attempts=50
+        while [ "$attempts" -gt 0 ] && [ ! -S "$rootless_socket" ]; do
+            sleep 0.1
+            attempts=$((attempts - 1))
+        done
+        [ ! -S "$rootless_socket" ] || return 0
+    fi
+    rootless_setup_tool="$(command -v dockerd-rootless-setuptool.sh 2>/dev/null || true)"
+    if [ -z "$rootless_setup_tool" ]; then
+        printf '%s\n' \
+            'Rootless Docker is not installed. Containers will remain unavailable until it is configured for this user.' >&2
+        return 0
+    fi
+    printf 'Configuring rootless Docker for %s…\n' "$(id -un)"
+    if ! XDG_RUNTIME_DIR="$runtime_dir" \
+         DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=$runtime_dir/bus}" \
+         "$rootless_setup_tool" install --force; then
+        printf '%s\n' \
+            'Rootless Docker could not be started. Other Outer Shell features remain available.' >&2
+    fi
+}
+
+configure_rootless_docker
 services_dir="$daemon_root/services"
+container_provider_path="$daemon_root/outershell-container-provider"
+container_provider_resources="$daemon_root/container-bootstrap"
 outer_shell_service_file="$services_dir/org.outershell.OuterShell.outerservice"
 outershelld_pid_path="$daemon_root/outershelld.pid"
 printf 'Outer Shell selected service manager: %s\n' "$service_manager"
@@ -746,6 +818,8 @@ start_internal_service_manager() {
     rm -f "$api_socket_path"
     if command -v setsid >/dev/null 2>&1; then
         OUTERSHELL_HOME="$outershell_home" OUTER_SHELL_PUBLIC_BASE_URL="$public_base_url" \
+            OUTER_SHELL_CONTAINER_PROVIDER="$container_provider_path" \
+            OUTER_SHELL_CONTAINER_PROVIDER_RESOURCES="$container_provider_resources" \
             OUTER_SHELL_SERVICE_MANAGER=internal \
             nohup setsid "$outershelld_path" \
                 --service-manager internal \
@@ -754,6 +828,8 @@ start_internal_service_manager() {
                 --stay-alive >>"$broker_log_path" 2>&1 </dev/null &
     else
         OUTERSHELL_HOME="$outershell_home" OUTER_SHELL_PUBLIC_BASE_URL="$public_base_url" \
+            OUTER_SHELL_CONTAINER_PROVIDER="$container_provider_path" \
+            OUTER_SHELL_CONTAINER_PROVIDER_RESOURCES="$container_provider_resources" \
             OUTER_SHELL_SERVICE_MANAGER=internal \
             nohup "$outershelld_path" \
                 --service-manager internal \
@@ -776,6 +852,7 @@ current_user_uses_system_binaries() {
 
 refresh_root_binaries_match() {
     root_binaries_match=false
+    [ "${OUTERSHELL_SKIP_SHARED_ROOT_REFRESH:-0}" != 1 ] || return 0
     if current_user_uses_system_binaries &&
        [ -x "$system_outershelld_path" ] &&
        [ -x "$system_outerctl_path" ] &&
@@ -995,6 +1072,7 @@ EOF
 
 refresh_system_binaries_with_sudo() {
     [ "$root_install" = false ] || return 0
+    [ "${OUTERSHELL_SKIP_SHARED_ROOT_REFRESH:-0}" != 1 ] || return 0
     current_user_uses_system_binaries || return 0
     payload_outershelld="$1"
     payload_outerctl="$2"
@@ -1121,6 +1199,9 @@ else
 fi
 install -m 0755 "$payload/tools/outershelld" "$outershelld_path"
 install -m 0755 "$payload/tools/outerctl" "$payload_outerctl_path"
+install -m 0755 "$payload/tools/outershell-container-provider" "$container_provider_path"
+rm -rf "$container_provider_resources"
+cp -R "$payload/container-bootstrap" "$container_provider_resources"
 install -m 0755 "$app_payload/OuterShellBackend" "$install_root/OuterShellBackend"
 install -m 0644 "$app_payload/app-icon.png" "$install_root/app-icon.png"
 install -m 0644 "$app_payload/bundles/OuterShell.bundle.macos-arm.aar" "$install_root/bundles/OuterShell.bundle.macos-arm.aar"
@@ -1153,7 +1234,7 @@ printf '%s\n' "__OUTER_SHELL_VERSION__" > "$app_version_path"
 printf '%s\n' "__OUTER_SHELL_VERSION__" > "$daemon_version_path"
 touch "$log_path" "$broker_log_path"
 
-outer_shell_exec="$(systemd_quote_arg "$install_root/OuterShellBackend") --socket-path $(systemd_quote_arg "$socket_path") --api-socket-path $(systemd_quote_arg "$api_socket_path") --bundles-dir $(systemd_quote_arg "$install_root/bundles") --web-root $(systemd_quote_arg "$install_root/web") --bundled-apps-dir $(systemd_quote_arg "$install_root/bundled-apps") --app-base-url $(systemd_quote_arg "$app_base_url") --public-base-url $(systemd_quote_arg "$public_base_url") --native-app-template-dir $(systemd_quote_arg "$install_root/native-app-template")"
+outer_shell_exec="$(systemd_quote_arg "$install_root/OuterShellBackend") --socket-path $(systemd_quote_arg "$socket_path") --api-socket-path $(systemd_quote_arg "$api_socket_path") --container-transfers-dir $(systemd_quote_arg "$outershell_home/containers/Transfers") --bundles-dir $(systemd_quote_arg "$install_root/bundles") --web-root $(systemd_quote_arg "$install_root/web") --bundled-apps-dir $(systemd_quote_arg "$install_root/bundled-apps") --app-base-url $(systemd_quote_arg "$app_base_url") --public-base-url $(systemd_quote_arg "$public_base_url") --native-app-template-dir $(systemd_quote_arg "$install_root/native-app-template")"
 
 if [ "$service_manager" = systemd ]; then
 cat > "$unit_dir/org.outershell.OuterShell.service" <<EOF
@@ -1209,6 +1290,8 @@ Description=Outer Shell daemon
 [Service]
 Environment=OUTERSHELL_HOME=$outershell_home
 Environment=OUTER_SHELL_PUBLIC_BASE_URL=$public_base_url
+Environment=OUTER_SHELL_CONTAINER_PROVIDER=$container_provider_path
+Environment=OUTER_SHELL_CONTAINER_PROVIDER_RESOURCES=$container_provider_resources
 Environment=OUTER_SHELL_SERVICE_MANAGER=systemd
 ExecStart=$outershelld_path
 Restart=no
@@ -1229,6 +1312,8 @@ Argument=--socket-path
 Argument=$socket_path
 Argument=--api-socket-path
 Argument=$api_socket_path
+Argument=--container-transfers-dir
+Argument=$outershell_home/containers/Transfers
 Argument=--bundles-dir
 Argument=$install_root/bundles
 Argument=--web-root
