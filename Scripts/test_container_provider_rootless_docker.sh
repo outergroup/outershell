@@ -45,4 +45,25 @@ try:
     assert result.stdout == expected_host
 finally:
     listener.close()
+
+provider_globals = provider["handle_request"].__globals__
+provider_globals["canonical_container_id"] = lambda value: value
+provider_globals["operation_publish_socket"] = lambda request: {
+    "publishedSocketPath": "/tmp/published.sock",
+}
+
+def unexpected_workspace_list():
+    raise AssertionError("publishSocket must not enumerate containers")
+
+provider_globals["list_workspaces"] = unexpected_workspace_list
+published = provider["handle_request"]({
+    "requestID": "request-1",
+    "operation": "publishSocket",
+    "workspaceID": "container-1",
+    "socketPath": "/run/user/0/example",
+})
+assert published == {
+    "requestID": "request-1",
+    "publishedSocketPath": "/tmp/published.sock",
+}
 PY

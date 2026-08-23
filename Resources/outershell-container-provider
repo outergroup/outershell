@@ -1295,6 +1295,12 @@ def authorize_container_socket(container_id, socket_path):
 
 
 def ensure_container_socket_bridge(container_id):
+    installed = container_exec(container_id, [
+        "/bin/sh", "-c", "test -x /usr/local/bin/outer-socket-bridge",
+    ])
+    if installed.returncode == 0:
+        return
+
     platform = container_exec(container_id, [
         "/bin/sh", "-c", """
 architecture=$(/bin/uname -m)
@@ -1347,7 +1353,6 @@ def stop_relays(container_id):
 
 
 def ensure_relay(container_id, inner_path):
-    ensure_container_socket_bridge(container_id)
     published = relay_path(container_id, inner_path)
     pid_path = published.with_suffix(".pid")
     if published.exists() and pid_path.exists():
@@ -1357,6 +1362,8 @@ def ensure_relay(container_id, inner_path):
             return str(published)
         except (OSError, ValueError):
             pass
+
+    ensure_container_socket_bridge(container_id)
     published.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     for path in (published, pid_path):
         try:
@@ -1364,8 +1371,70 @@ def ensure_relay(container_id, inner_path):
         except FileNotFoundError:
             pass
     authorize_container_socket(container_id, inner_path)
+    start_relay(container_id, inner_path, published)
+    for _ in range(50):
+        if published.exists():
+            authorize_host_socket(published)
+            return str(published)
+        time.sleep(0.02)
+    raise RuntimeError("The container socket relay did not start.")
+
+
+def relay_unit_name(container_id, inner_path):
+    endpoint = hashlib.sha256(
+        container_id.encode() + b"\0" + inner_path.encode()
+    ).hexdigest()[:24]
+    return f"outershell-container-relay-{endpoint}.service"
+
+
+def start_relay(container_id, inner_path, published):
+    command = [
+        str(pathlib.Path(__file__).resolve()),
+        "relay",
+        container_id,
+        inner_path,
+        str(published),
+    ]
+    systemd_run = shutil.which("systemd-run")
+    systemctl = shutil.which("systemctl")
+    if sys.platform.startswith("linux") and systemd_run and systemctl:
+        unit = relay_unit_name(container_id, inner_path)
+        subprocess.run(
+            [systemctl, "--user", "stop", unit],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        arguments = [
+            systemd_run,
+            "--user",
+            "--quiet",
+            "--collect",
+            f"--unit={unit}",
+            f"--property=StandardOutput=append:{published.with_suffix('.log')}",
+            f"--property=StandardError=append:{published.with_suffix('.log')}",
+        ]
+        configured_host = docker_host()
+        if configured_host:
+            arguments.append(f"--setenv=OUTER_SHELL_DOCKER_HOST={configured_host}")
+        configured_resources = os.environ.get("OUTER_SHELL_CONTAINER_PROVIDER_RESOURCES")
+        if configured_resources:
+            arguments.append(
+                f"--setenv=OUTER_SHELL_CONTAINER_PROVIDER_RESOURCES={configured_resources}"
+            )
+        result = subprocess.run(
+            arguments + ["--"] + command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        if result.returncode != 0:
+            detail = result.stderr.strip() or result.stdout.strip()
+            raise RuntimeError(detail or "The container socket relay service did not start.")
+        return
+
     subprocess.Popen(
-        [str(pathlib.Path(__file__).resolve()), "relay", container_id, inner_path, str(published)],
+        command,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=open(published.with_suffix(".log"), "ab", buffering=0),
@@ -1373,12 +1442,6 @@ def ensure_relay(container_id, inner_path):
         close_fds=True,
         env=os.environ.copy(),
     )
-    for _ in range(50):
-        if published.exists():
-            authorize_host_socket(published)
-            return str(published)
-        time.sleep(0.02)
-    raise RuntimeError("The container socket relay did not start.")
 
 
 def operation_publish_socket(request):
@@ -1604,12 +1667,13 @@ def list_workspaces():
         return values
 
 
-def response(request_id, extra=None, error=None):
-    value = {
-        "requestID": request_id,
-        "providers": [provider_dictionary()],
-        "workspaces": list_workspaces(),
-    }
+def response(request_id, extra=None, error=None, include_state=True):
+    value = {"requestID": request_id}
+    if include_state:
+        value.update({
+            "providers": [provider_dictionary()],
+            "workspaces": list_workspaces(),
+        })
     if extra:
         value.update(extra)
     if error:
@@ -1620,6 +1684,7 @@ def response(request_id, extra=None, error=None):
 def handle_request(request):
     operation = request.get("operation")
     request_id = request.get("requestID") or str(uuid.uuid4())
+    include_state = operation != "publishSocket"
     try:
         if "workspaceID" in request:
             request["workspaceID"] = canonical_container_id(request["workspaceID"])
@@ -1661,9 +1726,9 @@ def handle_request(request):
             extra = operation_finish_import(request)
         else:
             raise ValueError("This container operation is not supported on this server.")
-        return response(request_id, extra=extra)
+        return response(request_id, extra=extra, include_state=include_state)
     except Exception as error:
-        return response(request_id, error=error)
+        return response(request_id, error=error, include_state=include_state)
 
 
 def read_exact(stream, length):
@@ -1693,91 +1758,233 @@ def send_frame(stream, lock, frame_type, stream_id, payload=b""):
         stream.flush()
 
 
-def bridge_client(container_id, inner_path, client):
-    process = subprocess.Popen(
-        [docker_path(), "exec", "--interactive", "--user", "root", container_name(container_id)]
-        + container_environment("root")
-        + ["/usr/local/bin/outer-socket-bridge", "bridge", "--socket", inner_path],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        env=docker_environment(),
-    )
-    lock = threading.Lock()
-    try:
-        while True:
-            frame_type, _, _ = read_frame(process.stdout)
-            if frame_type in (FRAME_HELLO, FRAME_SOCKET_STATE):
+class RelayStream:
+    def __init__(self, client):
+        self.client = client
+        self.ready = threading.Event()
+        self.opened = False
+        self.local_read_open = True
+        self.remote_read_open = True
+
+
+class ContainerSocketBridge:
+    def __init__(self, container_id, inner_path):
+        self.write_lock = threading.Lock()
+        self.state_lock = threading.Lock()
+        self.streams = {}
+        self.next_stream_id = 1
+        self.closed = False
+        self.process = subprocess.Popen(
+            [docker_path(), "exec", "--interactive", "--user", "root", container_name(container_id)]
+            + container_environment("root")
+            + ["/usr/local/bin/outer-socket-bridge", "bridge", "--socket", inner_path],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=None,
+            env=docker_environment(),
+        )
+        try:
+            while True:
+                frame_type, _, _ = read_frame(self.process.stdout)
                 if frame_type == FRAME_HELLO:
                     break
-                continue
-        send_frame(process.stdin, lock, FRAME_OPEN, 1)
-        while True:
-            frame_type, stream_id, payload = read_frame(process.stdout)
-            if frame_type == FRAME_OPEN_OK and stream_id == 1:
-                break
-            if frame_type == FRAME_OPEN_ERROR:
-                raise RuntimeError(payload.decode(errors="replace"))
+                if frame_type != FRAME_SOCKET_STATE:
+                    raise RuntimeError("The container socket bridge did not become ready.")
+        except Exception:
+            self.close()
+            raise
+        threading.Thread(target=self.read_remote, daemon=True).start()
 
-        stopped = threading.Event()
+    def is_alive(self):
+        with self.state_lock:
+            return not self.closed and self.process.poll() is None
 
-        def read_local():
-            try:
-                while not stopped.is_set():
-                    data = client.recv(64 * 1024)
-                    if not data:
-                        send_frame(process.stdin, lock, FRAME_EOF, 1)
-                        return
-                    send_frame(process.stdin, lock, FRAME_DATA, 1, data)
-            except OSError:
-                pass
+    def allocate_stream_id(self):
+        with self.state_lock:
+            if self.closed:
+                raise RuntimeError("The container socket bridge exited.")
+            while True:
+                stream_id = self.next_stream_id
+                self.next_stream_id = (self.next_stream_id + 1) & 0xffffffff
+                if self.next_stream_id == 0:
+                    self.next_stream_id = 1
+                if stream_id not in self.streams:
+                    return stream_id
 
-        local_thread = threading.Thread(target=read_local, daemon=True)
-        local_thread.start()
-        while True:
-            frame_type, stream_id, payload = read_frame(process.stdout)
-            if frame_type == FRAME_DATA and stream_id == 1:
-                client.sendall(payload)
-            elif frame_type == FRAME_EOF and stream_id == 1:
-                client.shutdown(socket.SHUT_WR)
-            elif frame_type == FRAME_CLOSE and stream_id == 1:
-                break
-            elif frame_type == FRAME_PING:
-                send_frame(process.stdin, lock, FRAME_PONG, stream_id, payload)
-        stopped.set()
-    except (EOFError, OSError, RuntimeError):
-        pass
-    finally:
+    def add_client(self, client):
+        stream_id = self.allocate_stream_id()
+        stream = RelayStream(client)
+        with self.state_lock:
+            if self.closed:
+                raise RuntimeError("The container socket bridge exited.")
+            self.streams[stream_id] = stream
         try:
-            client.close()
+            self.send(FRAME_OPEN, stream_id)
+        except (BrokenPipeError, OSError):
+            with self.state_lock:
+                self.streams.pop(stream_id, None)
+            stream.ready.set()
+            raise
+        threading.Thread(
+            target=self.read_local,
+            args=(stream_id, stream),
+            daemon=True,
+        ).start()
+
+    def send(self, frame_type, stream_id, payload=b""):
+        with self.state_lock:
+            if self.closed:
+                raise BrokenPipeError()
+        send_frame(
+            self.process.stdin,
+            self.write_lock,
+            frame_type,
+            stream_id,
+            payload,
+        )
+
+    def read_local(self, stream_id, stream):
+        if not stream.ready.wait(timeout=10) or not stream.opened:
+            self.close_stream(stream_id, notify_remote=True)
+            return
+        try:
+            while True:
+                data = stream.client.recv(64 * 1024)
+                if not data:
+                    with self.state_lock:
+                        if self.streams.get(stream_id) is not stream:
+                            return
+                        stream.local_read_open = False
+                        should_close = not stream.remote_read_open
+                    self.send(FRAME_EOF, stream_id)
+                    if should_close:
+                        self.close_stream(stream_id, notify_remote=True)
+                    return
+                self.send(FRAME_DATA, stream_id, data)
+        except (BrokenPipeError, OSError):
+            self.close_stream(stream_id, notify_remote=True)
+
+    def read_remote(self):
+        try:
+            while True:
+                frame_type, stream_id, payload = read_frame(self.process.stdout)
+                if frame_type == FRAME_PING:
+                    self.send(FRAME_PONG, stream_id, payload)
+                    continue
+                with self.state_lock:
+                    stream = self.streams.get(stream_id)
+                if stream is None:
+                    if frame_type not in (FRAME_CLOSE, FRAME_SOCKET_STATE, FRAME_PONG):
+                        self.send(FRAME_CLOSE, stream_id)
+                    continue
+                if frame_type == FRAME_OPEN_OK:
+                    stream.opened = True
+                    stream.ready.set()
+                elif frame_type == FRAME_OPEN_ERROR:
+                    stream.ready.set()
+                    self.close_stream(stream_id, notify_remote=False)
+                elif frame_type == FRAME_DATA:
+                    stream.client.sendall(payload)
+                elif frame_type == FRAME_EOF:
+                    with self.state_lock:
+                        if self.streams.get(stream_id) is not stream:
+                            continue
+                        stream.remote_read_open = False
+                        should_close = not stream.local_read_open
+                    try:
+                        stream.client.shutdown(socket.SHUT_WR)
+                    except OSError:
+                        pass
+                    if should_close:
+                        self.close_stream(stream_id, notify_remote=True)
+                elif frame_type == FRAME_CLOSE:
+                    self.close_stream(stream_id, notify_remote=False)
+        except (BrokenPipeError, EOFError, OSError, RuntimeError):
+            self.close()
+
+    def close_stream(self, stream_id, notify_remote):
+        with self.state_lock:
+            stream = self.streams.pop(stream_id, None)
+            bridge_open = not self.closed
+        if stream is None:
+            return
+        stream.ready.set()
+        if notify_remote and bridge_open:
+            try:
+                self.send(FRAME_CLOSE, stream_id)
+            except (BrokenPipeError, OSError):
+                pass
+        try:
+            stream.client.close()
         except OSError:
             pass
-        process.terminate()
+
+    def close(self):
+        with self.state_lock:
+            if self.closed:
+                return
+            self.closed = True
+            streams = list(self.streams.values())
+            self.streams.clear()
+        for stream in streams:
+            stream.ready.set()
+            try:
+                stream.client.close()
+            except OSError:
+                pass
         try:
-            process.wait(timeout=1)
-        except subprocess.TimeoutExpired:
-            process.kill()
+            self.process.stdin.close()
+        except (BrokenPipeError, OSError):
+            pass
+        if self.process.poll() is None:
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
 
 
 def run_relay(container_id, inner_path, published_path):
     path = pathlib.Path(published_path)
+    pid_path = path.with_suffix(".pid")
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     try:
         path.unlink()
     except FileNotFoundError:
         pass
-    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    server.bind(str(path))
-    os.chmod(path, 0o600)
-    server.listen(64)
-    path.with_suffix(".pid").write_text(str(os.getpid()))
-    while True:
-        client, _ = server.accept()
-        threading.Thread(
-            target=bridge_client,
-            args=(container_id, inner_path, client),
-            daemon=True,
-        ).start()
+    server = None
+    bridge = None
+    try:
+        bridge = ContainerSocketBridge(container_id, inner_path)
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server.bind(str(path))
+        os.chmod(path, 0o600)
+        server.listen(64)
+        pid_path.write_text(str(os.getpid()))
+        while True:
+            client, _ = server.accept()
+            if not bridge.is_alive():
+                bridge.close()
+                bridge = ContainerSocketBridge(container_id, inner_path)
+            try:
+                bridge.add_client(client)
+            except (BrokenPipeError, OSError, RuntimeError):
+                bridge.close()
+                bridge = ContainerSocketBridge(container_id, inner_path)
+                try:
+                    bridge.add_client(client)
+                except (BrokenPipeError, OSError, RuntimeError):
+                    client.close()
+    finally:
+        if bridge is not None:
+            bridge.close()
+        if server is not None:
+            server.close()
+        for stale_path in (path, pid_path):
+            try:
+                stale_path.unlink()
+            except FileNotFoundError:
+                pass
 
 
 def main():
