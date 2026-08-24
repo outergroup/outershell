@@ -176,6 +176,7 @@ cp -R "${SCRIPT_DIR}/Resources/OuterShellWeb" \
 bootstrap_resource="${BUILD_ROOT}/${CONFIGURATION}/Outer Shell.app/Contents/Resources/container-bootstrap"
 bootstrap_run_resource="${RUN_ROOT}/container-bootstrap"
 rm -rf "${bootstrap_resource}" "${bootstrap_run_resource}"
+"${SCRIPT_DIR}/Scripts/build_socket_bridge_helpers.sh"
 for libc in glibc musl; do
     if [[ "${libc}" == glibc ]]; then
         linux_root="${SCRIPT_DIR}/build/linux-package/RemoteLinuxBinaries"
@@ -189,9 +190,10 @@ for libc in glibc musl; do
                 exit 1
             fi
         done
-        socket_bridge="${SCRIPT_DIR}/../outerloop/OuterLoop/Resources/LinuxHelpers/outer-socket-bridge-linux-${architecture}-${libc}"
+        socket_bridge="${linux_root}/${architecture}/outer-socket-bridge"
         if [[ ! -x "${socket_bridge}" ]]; then
-            echo "Missing container socket bridge: ${socket_bridge}" >&2
+            echo "Missing Outer Shell container socket bridge: ${socket_bridge}" >&2
+            echo "Build the ${libc}/${architecture} Linux resources before building Outer Shell." >&2
             exit 1
         fi
         destination="${bootstrap_resource}/bin/${libc}/${architecture}"

@@ -5,6 +5,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 RESOURCES_DIR="${REPO_ROOT}/Resources"
+SOCKET_BRIDGE_SOURCE="${REPO_ROOT}/SocketBridge/outer-socket-bridge.c"
 
 case "$(uname -m)" in
     aarch64|arm64)
@@ -27,6 +28,21 @@ require_file() {
 }
 
 require_file "${RESOURCES_DIR}/outerctl.cpp"
+require_file "${SOCKET_BRIDGE_SOURCE}"
+
+build_socket_bridge() {
+    local output_dir="$1"
+    local output="${output_dir}/outer-socket-bridge"
+
+    mkdir -p "${output_dir}"
+    cc -std=gnu17 -O2 -Wall -Wextra \
+        -o "${output}" \
+        "${SOCKET_BRIDGE_SOURCE}"
+    if command -v strip >/dev/null 2>&1; then
+        strip --strip-unneeded "${output}" || true
+    fi
+    "${output}" --version
+}
 
 build_musl_static_resources() {
     local output_dir="${REPO_ROOT}/build/linux-package/RemoteLinuxBinariesMusl/${ARCH}"
@@ -101,6 +117,8 @@ build_musl_static_resources() {
         -Wl,--gc-sections \
         -o "${output_dir}/outerctl" \
         "${RESOURCES_DIR}/outerctl.cpp"
+
+    build_socket_bridge "${output_dir}"
 
     if command -v strip >/dev/null 2>&1; then
         strip --strip-unneeded "${output_dir}/outershelld" || true
@@ -399,6 +417,8 @@ c++ -std=c++17 -Os -ffunction-sections -fdata-sections -flto \
     -Wl,--gc-sections \
     -o "${OUTPUT_DIR}/outerctl" \
     "${RESOURCES_DIR}/outerctl.cpp"
+
+build_socket_bridge "${OUTPUT_DIR}"
 
 if command -v strip >/dev/null 2>&1; then
     strip --strip-unneeded "${OUTPUT_DIR}/outershelld" || true

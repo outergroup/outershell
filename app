@@ -216,6 +216,7 @@ build_linux_target() {
         "${ROOT}/Backend" \
         "${ROOT}/outershelld" \
         "${ROOT}/Resources" \
+        "${ROOT}/SocketBridge" \
         "${ROOT}/Scripts" \
         "${source_root}/"
     echo "==> Building Outer Shell for Linux/${TARGET_ARCH} with musl"
@@ -230,6 +231,7 @@ build_linux_target() {
             --mount "type=bind,source=${source_root}/Backend,target=/work/Backend,readonly" \
             --mount "type=bind,source=${source_root}/outershelld,target=/work/outershelld,readonly" \
             --mount "type=bind,source=${source_root}/Resources,target=/work/Resources,readonly" \
+            --mount "type=bind,source=${source_root}/SocketBridge,target=/work/SocketBridge,readonly" \
             --mount "type=bind,source=${source_root}/Scripts,target=/work/Scripts,readonly" \
             --mount "type=bind,source=${ROOT}/build,target=/work/build" \
             --workdir /work \
@@ -245,6 +247,7 @@ build_linux_target() {
             --mount "type=bind,source=${source_root}/Backend,target=/work/Backend,readonly" \
             --mount "type=bind,source=${source_root}/outershelld,target=/work/outershelld,readonly" \
             --mount "type=bind,source=${source_root}/Resources,target=/work/Resources,readonly" \
+            --mount "type=bind,source=${source_root}/SocketBridge,target=/work/SocketBridge,readonly" \
             --mount "type=bind,source=${source_root}/Scripts,target=/work/Scripts,readonly" \
             --mount "type=bind,source=${ROOT}/build,target=/work/build" \
             --workdir /work \
