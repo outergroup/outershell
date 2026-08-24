@@ -1879,7 +1879,7 @@ final class SafeSpaceManager: @unchecked Sendable {
             "--memory", "\(record.memoryInGB)G",
             "--init",
             "--label", "org.outershell.safe-space=\(record.id.uuidString)",
-            "--label", "dev.outergroup.outerloop.workspace=\(record.id.uuidString)",
+            "--label", "org.outershell.container-id=\(record.id.uuidString)",
             "--volume", "\(base.appendingPathComponent("Runtime/PiAgent").path):/var/lib/outershell/pi-agent",
             "--volume", "\(try recipeDirectory(record.id).path):/var/lib/outershell/project"
         ]
@@ -1949,7 +1949,7 @@ final class SafeSpaceManager: @unchecked Sendable {
             "--memory", "\(record.memoryInGB)g",
             "--init",
             "--label", "org.outershell.safe-space=\(record.id.uuidString)",
-            "--label", "dev.outergroup.outerloop.workspace=\(record.id.uuidString)",
+            "--label", "org.outershell.container-id=\(record.id.uuidString)",
             "--volume", "\(base.appendingPathComponent("Runtime/PiAgent").path):/var/lib/outershell/pi-agent",
             "--volume", "\(try recipeDirectory(record.id).path):/var/lib/outershell/project"
         ]
@@ -5829,7 +5829,7 @@ final class SafeSpaceManager: @unchecked Sendable {
     }
 
     private func containerName(_ id: UUID) -> String {
-        "outerloop-workspace-\(id.uuidString.lowercased())"
+        "outershell-container-\(id.uuidString.lowercased())"
     }
 
     private func runtimeIdentity(for record: SafeSpaceRecord) throws -> RuntimeIdentity {
@@ -6049,8 +6049,7 @@ final class SafeSpaceManager: @unchecked Sendable {
             && /bin/rm -rf /tmp/outershell-bootstrap \\
             && /bin/rm -rf /home/workspace /etc/sudoers.d/workspace \\
             && (/usr/sbin/userdel workspace 2>/dev/null || true) \\
-            && (/usr/sbin/groupdel workspace 2>/dev/null || true) \\
-            && /bin/rm -f /usr/local/bin/outerloop-workspace-init /usr/local/bin/outerloop-workspace-status /usr/local/bin/outerloop-workspace-control
+            && (/usr/sbin/groupdel workspace 2>/dev/null || true)
         ENV HOME=/root USER=root LOGNAME=root XDG_RUNTIME_DIR=/run/user/0 OUTERSHELL_HOME=/var/lib/outershell OUTERSHELLD_API_SOCKET=/run/user/0/outershelld-api
         USER root
         WORKDIR /root
