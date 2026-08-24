@@ -40,8 +40,8 @@ under `/outershell-rootfs`. For example, install Files and Plaintext with
 ordinary multi-stage copies:
 
 ```dockerfile
-COPY --from=ghcr.io/outergroup/outershell-app-files:2 /outershell-rootfs/ /
-COPY --from=ghcr.io/outergroup/outershell-app-plaintext:2 /outershell-rootfs/ /
+COPY --from=ghcr.io/outergroup/outershell-app-files:4 /outershell-rootfs/ /
+COPY --from=ghcr.io/outergroup/outershell-app-plaintext:4 /outershell-rootfs/ /
 ```
 
 This is standard Dockerfile syntax rather than an Outer Shell-only installer.

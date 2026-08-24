@@ -24,13 +24,25 @@
       <input id="search-input" type="search" hidden>
       <p id="app-summary" class="visually-hidden">Loading the apps registered with Outer Shell…</p>
       <section id="status-banner" class="status-banner" hidden></section>
-      <div id="app-sections" class="app-sections" aria-live="polite"></div>
-      <section id="empty-state" class="empty-state" hidden>
-        <div class="empty-glyph" aria-hidden="true">⌘</div>
-        <h2>No apps here yet</h2>
-        <p>Install a bundled app or turn a Bash command into one.</p>
-        <button class="primary-button" type="button" data-action="open-add">Add an app</button>
-      </section>
+      <div class="dashboard">
+        <section class="dashboard-panel privileged-panel" aria-labelledby="privileged-apps-heading">
+          <h2 id="privileged-apps-heading" class="section-heading">Privileged Apps</h2>
+          <div id="app-sections" class="app-sections" aria-live="polite"></div>
+          <section id="empty-state" class="empty-state" hidden>
+            <div class="empty-glyph" aria-hidden="true">⌘</div>
+            <h2>No apps here yet</h2>
+            <p>Install a bundled app or turn a Bash command into one.</p>
+            <button class="primary-button" type="button" data-action="open-add">Add an app</button>
+          </section>
+        </section>
+        <section class="dashboard-panel safe-spaces-panel" aria-labelledby="safe-spaces-heading">
+          <h2 id="safe-spaces-heading" class="section-heading">Safe Spaces</h2>
+          <div id="safe-spaces" class="safe-spaces" aria-live="polite"></div>
+          <section id="safe-spaces-empty" class="section-empty" hidden>
+            <p>No containers are available on this server.</p>
+          </section>
+        </section>
+      </div>
     </main>
   </div>
 

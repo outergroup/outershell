@@ -7,6 +7,8 @@
   const elements = {
     shell: document.querySelector("#app"),
     sections: document.querySelector("#app-sections"),
+    safeSpaces: document.querySelector("#safe-spaces"),
+    safeSpacesEmpty: document.querySelector("#safe-spaces-empty"),
     empty: document.querySelector("#empty-state"),
     summary: document.querySelector("#app-summary"),
     status: document.querySelector("#status-banner"),
@@ -20,7 +22,14 @@
 
   const state = {
     backends: [],
+    safeSpaces: [],
     loading: true,
+    safeSpacesLoading: true,
+    safeSpacesRefreshing: false,
+    backendError: "",
+    safeSpacesError: "",
+    safeSpaceBusy: new Set(),
+    safeSpacesTimer: null,
     busy: false,
     query: "",
     addTab: "catalog",
@@ -249,6 +258,14 @@
     return `<span class="list-icon${source ? " has-image" : ""}" aria-hidden="true">${content}</span>`;
   }
 
+  function safeSpaceAppIconHTML(app) {
+    const source = app.iconData ? `data:image/png;base64,${app.iconData}` : "";
+    const content = source
+      ? `<img src="${source}" alt="">`
+      : `<span>${escapeHTML(initials(app.displayName || app.serviceID).slice(0, 1))}</span>`;
+    return `<span class="safe-space-app-icon${source ? " has-image" : ""}" aria-hidden="true">${content}</span>`;
+  }
+
   function runningBadgesHTML(item) {
     const badges = [];
     if (item.user && endpointRunning(item.user)) badges.push(`<a class="running-badge-button" href="${escapeHTML(navigationURL(item.user.frontend))}" data-action="launch-endpoint" data-app-key="${escapeHTML(item.identity)}" data-app-scope="user" aria-label="Open ${escapeHTML(item.displayName)} as you" title="Open as you"><span class="running-badge user-running-badge" aria-hidden="true"></span></a>`);
@@ -348,6 +365,7 @@
     if (state.loading && !state.backends.length) {
       elements.sections.innerHTML = `<div class="loading-grid">${"<div class=\"skeleton\"></div>".repeat(6)}</div>`;
       elements.empty.hidden = true;
+      renderSafeSpaces();
       return;
     }
     const items = launcherItems();
@@ -366,6 +384,7 @@
         elements.empty.querySelector("p").textContent = "Install a bundled app or turn a Bash command into one.";
         elements.empty.querySelector("button").hidden = false;
       }
+      renderSafeSpaces();
       return;
     }
 
@@ -387,6 +406,97 @@
         <div class="launcher-grid">${iconItems.map(renderLauncherTile).join("")}${addTile}</div>
       </section>
       ${orderedLists.length ? `<section class="list-column" aria-label="App lists">${orderedLists.map(renderListGroup).join("")}</section>` : ""}`;
+    renderSafeSpaces();
+  }
+
+  function safeSpaceState(workspace) {
+    return String(workspace.state || "stopped").toLocaleLowerCase();
+  }
+
+  function safeSpaceIsRunning(workspace) {
+    return safeSpaceState(workspace) === "running";
+  }
+
+  function safeSpaceRuntimeDescription(workspace) {
+    const parts = [workspace.runtime?.providerName || workspace.runtime?.isolationName];
+    const system = [workspace.runtime?.operatingSystemName, workspace.runtime?.operatingSystemVersion]
+      .filter(Boolean).join(" ");
+    if (system) parts.push(system);
+    if (workspace.runtime?.architecture) parts.push(workspace.runtime.architecture);
+    return parts.filter(Boolean).join(" · ") || "Container";
+  }
+
+  function safeSpacePathAndQuery(app) {
+    return pathAndQuery({ url: app.url || "", socketPath: app.socketPath || "" });
+  }
+
+  function safeSpaceAppURL(app) {
+    const path = safeSpacePathAndQuery(app);
+    if (Number(app.publishedPort) > 0) return `http://127.0.0.1:${Number(app.publishedPort)}${path}`;
+    const socket = String(app.externalSocketPath || "").trim();
+    return socket ? `http+unix://${encodeURIComponent(socket)}${path}` : "#";
+  }
+
+  function safeSpaceAppNavigationURL(workspace, app) {
+    const target = safeSpaceAppURL(app);
+    if (target === "#" || window.outerLoopFriendlyNavigationSupported !== true) return target;
+    const name = app.displayName || app.serviceID || "App";
+    const user = String(app.socketPath || "").startsWith("/run/user/0/") ? "root" : "workspace";
+    const parameters = [
+      `url=${encodeURIComponent(target)}`,
+      `display=${encodeURIComponent(`${workspace.name || "Container"} / ${user} / ${name}`)}`
+    ].join("&");
+    return `outerloop://navigate?${parameters}`;
+  }
+
+  function safeSpaceAppIsReady(workspace, app) {
+    return safeSpaceIsRunning(workspace) && app.isRunning === true && safeSpaceAppURL(app) !== "#";
+  }
+
+  function renderSafeSpaces() {
+    if (state.safeSpacesLoading && !state.safeSpaces.length) {
+      elements.safeSpaces.innerHTML = `${"<div class=\"safe-space-skeleton\"></div>".repeat(2)}`;
+      elements.safeSpacesEmpty.hidden = true;
+      return;
+    }
+    elements.safeSpacesEmpty.hidden = state.safeSpaces.length > 0 || state.safeSpacesLoading;
+    elements.safeSpaces.innerHTML = state.safeSpaces.map(renderSafeSpace).join("");
+  }
+
+  function renderSafeSpace(workspace) {
+    const running = safeSpaceIsRunning(workspace);
+    const busy = state.safeSpaceBusy.has(workspace.id);
+    const apps = Array.isArray(workspace.apps) ? workspace.apps : [];
+    const appRows = apps.length
+      ? apps.map(app => renderSafeSpaceApp(workspace, app)).join("")
+      : `<p class="safe-space-no-apps">${running ? "No apps are installed in this container." : "Start this container to inspect its apps."}</p>`;
+    return `<article class="safe-space-card${running ? " is-running" : ""}" data-safe-space-id="${escapeHTML(workspace.id)}">
+      <header class="safe-space-header">
+        <span class="safe-space-state" aria-label="${running ? "Running" : "Stopped"}"></span>
+        <div class="safe-space-title-wrap">
+          <h3>${escapeHTML(workspace.name || "Container")}</h3>
+          <p>${escapeHTML(safeSpaceRuntimeDescription(workspace))}</p>
+        </div>
+        ${running ? "" : `<button class="safe-space-start secondary-button" type="button" data-action="start-safe-space" data-safe-space-id="${escapeHTML(workspace.id)}" ${busy ? "disabled" : ""}>${busy ? "Starting…" : "Start"}</button>`}
+      </header>
+      <div class="safe-space-apps">${appRows}</div>
+    </article>`;
+  }
+
+  function renderSafeSpaceApp(workspace, app) {
+    const ready = safeSpaceAppIsReady(workspace, app);
+    const key = `${workspace.id}\u001f${app.serviceID}`;
+    const busy = state.safeSpaceBusy.has(key);
+    const name = app.displayName || app.serviceID || "App";
+    return `<a class="safe-space-app${app.isRunning ? " is-running" : ""}${busy ? " is-busy" : ""}"
+      href="${escapeHTML(ready ? safeSpaceAppNavigationURL(workspace, app) : "#")}" data-action="launch-safe-space-app"
+      data-safe-space-id="${escapeHTML(workspace.id)}" data-service-id="${escapeHTML(app.serviceID)}"
+      aria-label="Open ${escapeHTML(name)} in ${escapeHTML(workspace.name || "container")}">
+      ${safeSpaceAppIconHTML(app)}
+      <span class="safe-space-app-name">${escapeHTML(name)}</span>
+      ${app.isRunning ? `<span class="safe-space-running-badge" aria-label="Running"></span>` : ""}
+      ${busy ? `<span class="safe-space-app-progress" aria-hidden="true"></span>` : ""}
+    </a>`;
   }
 
   function slug(value) {
@@ -427,6 +537,114 @@
     return { response, buffer };
   }
 
+  function makeRequestID() {
+    if (typeof globalThis.crypto?.randomUUID === "function") {
+      return globalThis.crypto.randomUUID();
+    }
+
+    const bytes = new Uint8Array(16);
+    if (typeof globalThis.crypto?.getRandomValues === "function") {
+      globalThis.crypto.getRandomValues(bytes);
+    } else {
+      for (let index = 0; index < bytes.length; index += 1) {
+        bytes[index] = Math.floor(Math.random() * 256);
+      }
+    }
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    const hex = Array.from(bytes, value => value.toString(16).padStart(2, "0"));
+    return `${hex[0]}${hex[1]}${hex[2]}${hex[3]}-${hex[4]}${hex[5]}-${hex[6]}${hex[7]}-${hex[8]}${hex[9]}-${hex[10]}${hex[11]}${hex[12]}${hex[13]}${hex[14]}${hex[15]}`;
+  }
+
+  async function safeSpaceRequest(operation, values = {}) {
+    const requestID = makeRequestID();
+    const response = await fetch("/api/safe-spaces", {
+      method: "POST",
+      cache: "no-store",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ requestID, operation, ...values })
+    });
+    const result = await response.json();
+    if (!response.ok || result.error) throw new Error(result.error || `Outer Shell returned HTTP ${response.status}.`);
+    return result;
+  }
+
+  async function refreshSafeSpaces({ quiet = false } = {}) {
+    if (state.safeSpacesRefreshing) return;
+    state.safeSpacesRefreshing = true;
+    if (!quiet) {
+      state.safeSpacesLoading = true;
+      renderSafeSpaces();
+    }
+    try {
+      const result = await safeSpaceRequest("list");
+      state.safeSpaces = Array.isArray(result.workspaces) ? result.workspaces : [];
+      state.safeSpacesError = "";
+    } catch (error) {
+      state.safeSpacesError = error.message || String(error);
+      if (!quiet) toast(state.safeSpacesError, true);
+    } finally {
+      state.safeSpacesRefreshing = false;
+      state.safeSpacesLoading = false;
+      updateStatus();
+      renderSafeSpaces();
+    }
+  }
+
+  function findSafeSpace(id) {
+    return state.safeSpaces.find(workspace => workspace.id === id);
+  }
+
+  async function waitForSafeSpaceApp(workspaceID, serviceID) {
+    for (let attempt = 0; attempt < 40; attempt += 1) {
+      await refreshSafeSpaces({ quiet: true });
+      const workspace = findSafeSpace(workspaceID);
+      const app = workspace?.apps?.find(candidate => candidate.serviceID === serviceID);
+      if (workspace && app && safeSpaceAppIsReady(workspace, app)) return { workspace, app };
+      await delay(250);
+    }
+    throw new Error("The app started, but its address is not ready yet.");
+  }
+
+  async function startSafeSpace(workspaceID) {
+    state.safeSpaceBusy.add(workspaceID);
+    renderSafeSpaces();
+    try {
+      const result = await safeSpaceRequest("start", { workspaceID });
+      state.safeSpaces = Array.isArray(result.workspaces) ? result.workspaces : state.safeSpaces;
+    } finally {
+      state.safeSpaceBusy.delete(workspaceID);
+      renderSafeSpaces();
+    }
+  }
+
+  async function launchSafeSpaceApp(workspaceID, serviceID) {
+    let workspace = findSafeSpace(workspaceID);
+    let app = workspace?.apps?.find(candidate => candidate.serviceID === serviceID);
+    if (!workspace || !app) throw new Error("The selected container app no longer exists.");
+    if (safeSpaceAppIsReady(workspace, app)) {
+      window.location.assign(safeSpaceAppNavigationURL(workspace, app));
+      return;
+    }
+    const key = `${workspaceID}\u001f${serviceID}`;
+    state.safeSpaceBusy.add(key);
+    renderSafeSpaces();
+    try {
+      if (!safeSpaceIsRunning(workspace)) {
+        const result = await safeSpaceRequest("start", { workspaceID });
+        state.safeSpaces = Array.isArray(result.workspaces) ? result.workspaces : state.safeSpaces;
+        workspace = findSafeSpace(workspaceID) || workspace;
+        app = workspace.apps?.find(candidate => candidate.serviceID === serviceID) || app;
+      }
+      if (app.isRunning !== true) await safeSpaceRequest("startApp", { workspaceID, serviceID });
+      const ready = await waitForSafeSpaceApp(workspaceID, serviceID);
+      window.location.assign(safeSpaceAppNavigationURL(ready.workspace, ready.app));
+    } finally {
+      state.safeSpaceBusy.delete(key);
+      renderSafeSpaces();
+    }
+  }
+
   async function refreshBackends({ quiet = false } = {}) {
     if (!quiet) {
       state.loading = true;
@@ -436,9 +654,11 @@
       const { buffer } = await requestBuffer("/api/backends");
       const result = decodeBackends(buffer);
       state.backends = result.backends;
-      showStatus(result.error);
+      state.backendError = result.error;
+      updateStatus();
     } catch (error) {
-      showStatus(error.message || String(error));
+      state.backendError = error.message || String(error);
+      updateStatus();
       if (!quiet) toast(error.message || String(error), true);
     } finally {
       state.loading = false;
@@ -449,6 +669,10 @@
   function showStatus(message = "") {
     elements.status.textContent = message;
     elements.status.hidden = !message;
+  }
+
+  function updateStatus() {
+    showStatus([state.backendError, state.safeSpacesError].filter(Boolean).join("\n"));
   }
 
   function toast(message, isError = false) {
@@ -1259,6 +1483,20 @@
     }
     if (action === "close-dialog") { closeDialog(); return; }
     if (action === "open-add") { openAddDialog(); return; }
+    if (action === "start-safe-space") {
+      try { await startSafeSpace(actionElement.dataset.safeSpaceId); }
+      catch (error) { toast(error.message || String(error), true); }
+      return;
+    }
+    if (action === "launch-safe-space-app") {
+      const workspace = findSafeSpace(actionElement.dataset.safeSpaceId);
+      const app = workspace?.apps?.find(candidate => candidate.serviceID === actionElement.dataset.serviceId);
+      if (workspace && app && safeSpaceAppIsReady(workspace, app)) return;
+      event.preventDefault();
+      try { await launchSafeSpaceApp(actionElement.dataset.safeSpaceId, actionElement.dataset.serviceId); }
+      catch (error) { toast(error.message || String(error), true); }
+      return;
+    }
     if (action === "add-tab") { openAddDialog(actionElement.dataset.tab); return; }
     if (action === "about-outer-shell") { openOuterShellAbout(actionElement.dataset.backendKey); return; }
     if (action === "check-outer-shell-update") { await checkOuterShellUpdate(actionElement.dataset.backendKey, actionElement); return; }
@@ -1321,7 +1559,15 @@
     cancelAppDrag();
     state.stopped = true;
     state.eventAbort?.abort();
+    window.clearInterval(state.safeSpacesTimer);
   });
 
-  refreshBackends().then(watchEvents);
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) refreshSafeSpaces({ quiet: true });
+  });
+  state.safeSpacesTimer = window.setInterval(() => {
+    if (!document.hidden && !state.safeSpaceBusy.size) refreshSafeSpaces({ quiet: true });
+  }, 2000);
+
+  Promise.all([refreshBackends(), refreshSafeSpaces()]).then(watchEvents);
 })();

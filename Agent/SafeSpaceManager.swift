@@ -4,7 +4,7 @@ import AppKit
 
 private let currentSafeSpaceRecipeVersion = 13
 private let rootContainerBaseImage = "outershell/container-base:12"
-private let bundledAppOCIImageVersion = "2"
+private let bundledAppOCIImageVersion = "4"
 private let containerTransferMagic = Data([0x4f, 0x53, 0x43, 0x54])
 private let containerTransferVersion: UInt16 = 1
 private let containerTransferRead: UInt16 = 1
@@ -163,6 +163,7 @@ private struct SafeSpaceCachedApp: Codable {
     let serviceID: String
     let displayName: String
     let socketPath: String
+    let externalSocketPath: String?
     let url: String
     let iconPath: String
     var iconData: Data?
@@ -3379,6 +3380,7 @@ final class SafeSpaceManager: @unchecked Sendable {
                                    serviceID: $0.serviceID,
                                    displayName: $0.displayName,
                                    socketPath: $0.socketPath,
+                                   externalSocketPath: $0.externalSocketPath,
                                    url: $0.url,
                                    iconPath: $0.iconPath,
                                    iconData: old[$0.frontendID]?.iconData,
@@ -3491,6 +3493,7 @@ final class SafeSpaceManager: @unchecked Sendable {
             "serviceID": app.serviceID,
             "displayName": app.displayName,
             "socketPath": app.socketPath,
+            "externalSocketPath": app.externalSocketPath ?? "",
             "url": app.url,
             "iconPath": app.iconPath,
             "iconObservationToken": app.iconObservationToken ?? "",
