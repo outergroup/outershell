@@ -286,6 +286,7 @@ final class SafeSpaceManager: @unchecked Sendable {
     private var appIconFetchesInProgress: Set<String> = []
     private var appEventMonitors: [UUID: SafeSpaceAppEventMonitor] = [:]
     private var cachedCommandIcons: [UUID: [String: SafeSpaceCachedCommandIcon]] = [:]
+    private var cachedTerminalShells: [UUID: String] = [:]
 
     private struct RuntimeIdentity {
         let user: String
@@ -834,7 +835,7 @@ final class SafeSpaceManager: @unchecked Sendable {
                 "runtime": try runtimeDictionary(for: record),
                 "capabilities": capabilityDictionary(for: record),
                 "outerShellSupport": outerShellSupport,
-                "shellCommand": try shellCommand(for: record),
+                "shellCommand": try shellCommand(for: record, state: state),
                 "apps": apps,
                 "commands": commands,
                 "mounts": mounts,
@@ -865,12 +866,54 @@ final class SafeSpaceManager: @unchecked Sendable {
         ]
     }
 
-    private func shellCommand(for record: SafeSpaceRecord) throws -> String {
-        let shell = usesBuiltInOuterShellImage(try recipe(for: record).baseImage)
-            ? "/bin/bash"
-            : "/bin/sh"
+    private func shellCommand(for record: SafeSpaceRecord, state: String) throws -> String {
+        let cachedShell = lock.withSafeSpaceLock { cachedTerminalShells[record.id] }
+        let shell: String
+        if let cachedShell {
+            shell = cachedShell
+        } else if state == "running" {
+            shell = resolvedTerminalShell(for: record)
+            lock.withSafeSpaceLock {
+                cachedTerminalShells[record.id] = shell
+            }
+        } else {
+            shell = "/bin/sh"
+        }
         let executable = runtimeProvider(for: record) == .docker ? "docker" : "container"
-        return "\(executable) exec -it \(containerName(record.id)) \(shell)"
+        return interactiveRuntimeCommand([
+            executable, "exec", "-it",
+            "--env", "TERM",
+            "--env", "COLORTERM",
+            "--env", "COLORFGBG",
+            containerName(record.id), shell
+        ])
+    }
+
+    private func resolvedTerminalShell(for record: SafeSpaceRecord) -> String {
+        let script = #"""
+        uid=$(id -u 2>/dev/null || /usr/bin/id -u)
+        shell=$(awk -F: -v uid="$uid" '$3 == uid { print $7; exit }' /etc/passwd 2>/dev/null || true)
+        case "$shell" in
+            ""|*/false|*/nologin) ;;
+            *) if [ -x "$shell" ]; then printf '%s\n' "$shell"; exit 0; fi ;;
+        esac
+        for shell in /bin/bash /usr/bin/bash /bin/zsh /usr/bin/zsh /bin/ash /usr/bin/ash /bin/sh /usr/bin/sh; do
+            if [ -x "$shell" ]; then printf '%s\n' "$shell"; exit 0; fi
+        done
+        printf '%s\n' /bin/sh
+        """#
+        guard let result = try? runRuntime(record, [
+            "exec", containerName(record.id), "/bin/sh", "-c", script
+        ]), result.status == 0 else {
+            return "/bin/sh"
+        }
+        let candidate = result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard candidate.hasPrefix("/"),
+              candidate.count <= 512,
+              !candidate.contains(where: { $0.isWhitespace }) else {
+            return "/bin/sh"
+        }
+        return candidate
     }
 
     private func commandSnapshots(for record: SafeSpaceRecord) throws
@@ -914,14 +957,19 @@ final class SafeSpaceManager: @unchecked Sendable {
             ? "docker"
             : "container"
         let hostArguments = [
-            runtimeExecutable, "exec", "-it", "--user", command.user,
+            runtimeExecutable, "exec", "-it",
+            "--env", "TERM",
+            "--env", "COLORTERM",
+            "--env", "COLORFGBG",
+            "--user", command.user,
             containerName(record.id), "/bin/sh", "-lc", invocation
         ]
+        let containerCommand = interactiveRuntimeCommand(hostArguments)
         var value: [String: Any] = [
             "id": command.id,
             "displayName": command.displayName,
-            "shellCommand": hostArguments.map(shellCommandArgument).joined(separator: " "),
-            "containerCommand": hostArguments.map(shellCommandArgument).joined(separator: " "),
+            "shellCommand": containerCommand,
+            "containerCommand": containerCommand,
             "internalCommand": invocation,
             "iconPath": command.iconPath
         ]
@@ -929,6 +977,14 @@ final class SafeSpaceManager: @unchecked Sendable {
             value["iconData"] = iconData.base64EncodedString()
         }
         return value
+    }
+
+    private func interactiveRuntimeCommand(_ arguments: [String]) -> String {
+        let environment = "TERM=${TERM:-xterm-256color} "
+            + "COLORTERM=${COLORTERM:-truecolor} "
+            + "COLORFGBG=${COLORFGBG:-}"
+        return environment + " "
+            + arguments.map(shellCommandArgument).joined(separator: " ")
     }
 
     private func commandIconData(_ command: SafeSpaceCommandSnapshot,
@@ -1800,6 +1856,9 @@ final class SafeSpaceManager: @unchecked Sendable {
 
     private func createRuntimeContainer(_ record: SafeSpaceRecord,
                                         imageReference: String) throws {
+        _ = lock.withSafeSpaceLock {
+            cachedTerminalShells.removeValue(forKey: record.id)
+        }
         switch runtimeProvider(for: record) {
         case .appleContainer:
             try createAppleContainer(record, imageReference: imageReference)
@@ -2074,6 +2133,7 @@ final class SafeSpaceManager: @unchecked Sendable {
             records.removeAll { $0.id == record.id }
             cachedApps.removeValue(forKey: record.id)
             cachedCommandIcons.removeValue(forKey: record.id)
+            cachedTerminalShells.removeValue(forKey: record.id)
             transientStates.removeValue(forKey: record.id)
         }
         try saveRecords()

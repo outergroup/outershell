@@ -131,6 +131,15 @@ def docker_cli_prefix():
     return ["docker", "--host", docker_host()]
 
 
+def interactive_command(arguments):
+    environment = (
+        "TERM=${TERM:-xterm-256color} "
+        "COLORTERM=${COLORTERM:-truecolor} "
+        "COLORFGBG=${COLORFGBG:-}"
+    )
+    return environment + " " + " ".join(shlex.quote(part) for part in arguments)
+
+
 def provider_dictionary():
     available = rootless_docker_available()
     if available:
@@ -546,7 +555,12 @@ def rebuild(container_id):
     log_path = runtime_directory(container_id) / "build.log"
     runtime_directory(container_id).mkdir(parents=True, exist_ok=True, mode=0o700)
     try:
-        update_record(container_id, transientState="creating", lastError="")
+        update_record(
+            container_id,
+            transientState="creating",
+            lastError="",
+            terminalShell=None,
+        )
         set_build_progress(container_id, "preparing", "Preparing the container build…")
         ensure_base_image(log_path)
         context = build_context(container_id)
@@ -669,7 +683,12 @@ def operation_update_configuration(request):
 
 def operation_rebuild(request):
     container_id = request["workspaceID"]
-    update_record(container_id, transientState="creating", lastError="")
+    update_record(
+        container_id,
+        transientState="creating",
+        lastError="",
+        terminalShell=None,
+    )
     set_build_progress(container_id, "preparing", "Preparing the container build…")
     spawn_worker("rebuild", container_id)
 
@@ -1053,14 +1072,19 @@ def command_snapshots(container_id):
             shlex.quote(value) for value in [executable] + arguments
         )
         host_command = docker_cli_prefix() + [
-            "exec", "-it", "--user", user, container_name(container_id),
+            "exec", "-it",
+            "--env", "TERM",
+            "--env", "COLORTERM",
+            "--env", "COLORFGBG",
+            "--user", user, container_name(container_id),
             "/bin/sh", "-lc", invocation,
         ]
+        container_command = interactive_command(host_command)
         value = {
             "id": command_id,
             "displayName": name,
-            "shellCommand": " ".join(shlex.quote(part) for part in host_command),
-            "containerCommand": " ".join(shlex.quote(part) for part in host_command),
+            "shellCommand": container_command,
+            "containerCommand": container_command,
             "internalCommand": invocation,
             "iconPath": icon,
         }
@@ -1069,6 +1093,33 @@ def command_snapshots(container_id):
             value["iconData"] = icon_data
         values.append(value)
     return values
+
+
+def terminal_shell(container_id, state, record):
+    cached = record.get("terminalShell")
+    if isinstance(cached, str) and cached.startswith("/"):
+        return cached
+    if state != "running":
+        return "/bin/sh"
+    script = r'''uid=$(id -u 2>/dev/null || /usr/bin/id -u)
+shell=$(awk -F: -v uid="$uid" '$3 == uid { print $7; exit }' /etc/passwd 2>/dev/null || true)
+case "$shell" in
+    ""|*/false|*/nologin) ;;
+    *) if [ -x "$shell" ]; then printf '%s\n' "$shell"; exit 0; fi ;;
+esac
+for shell in /bin/bash /usr/bin/bash /bin/zsh /usr/bin/zsh /bin/ash /usr/bin/ash /bin/sh /usr/bin/sh; do
+    if [ -x "$shell" ]; then printf '%s\n' "$shell"; exit 0; fi
+done
+printf '%s\n' /bin/sh'''
+    result = docker([
+        "exec", container_name(container_id), "/bin/sh", "-c", script,
+    ])
+    candidate = result.stdout.strip() if result.returncode == 0 else ""
+    if (not candidate.startswith("/") or len(candidate) > 512
+            or any(character.isspace() for character in candidate)):
+        candidate = "/bin/sh"
+    record["terminalShell"] = candidate
+    return candidate
 
 
 def declared_app_tcp_ports(container_id):
@@ -1596,10 +1647,15 @@ def workspace_dictionary(record):
             "architecture": os.uname().machine,
         },
         "capabilities": capabilities(),
-        "shellCommand": " ".join(shlex.quote(part) for part in (
+        "shellCommand": interactive_command(
             docker_cli_prefix()
-            + ["exec", "-it", container_name(container_id), "/bin/bash"]
-        )),
+            + ["exec", "-it",
+               "--env", "TERM",
+               "--env", "COLORTERM",
+               "--env", "COLORFGBG",
+               container_name(container_id),
+               terminal_shell(container_id, state, record)]
+        ),
         "apps": apps,
         "commands": commands,
         "mounts": mounts,
@@ -1634,10 +1690,15 @@ def unavailable_workspace_dictionary(record, error):
             "architecture": os.uname().machine,
         },
         "capabilities": capabilities(),
-        "shellCommand": " ".join(shlex.quote(part) for part in (
+        "shellCommand": interactive_command(
             docker_cli_prefix()
-            + ["exec", "-it", container_name(container_id), "/bin/bash"]
-        )),
+            + ["exec", "-it",
+               "--env", "TERM",
+               "--env", "COLORTERM",
+               "--env", "COLORFGBG",
+               container_name(container_id),
+               record.get("terminalShell") or "/bin/sh"]
+        ),
         "apps": apps,
         "commands": [],
         "mounts": [],
@@ -1655,12 +1716,18 @@ def list_workspaces():
         values = []
         changed = False
         for record in sorted(records.values, key=lambda value: value.get("createdAt", 0)):
-            before = json.dumps(record.get("cachedApps", []), sort_keys=True)
+            before = (
+                json.dumps(record.get("cachedApps", []), sort_keys=True),
+                record.get("terminalShell"),
+            )
             try:
                 values.append(workspace_dictionary(record))
             except Exception as error:
                 values.append(unavailable_workspace_dictionary(record, error))
-            after = json.dumps(record.get("cachedApps", []), sort_keys=True)
+            after = (
+                json.dumps(record.get("cachedApps", []), sort_keys=True),
+                record.get("terminalShell"),
+            )
             changed = changed or before != after
         if changed:
             records.save()
