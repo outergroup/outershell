@@ -423,7 +423,10 @@
       .filter(Boolean).join(" ");
     if (system) parts.push(system);
     if (workspace.runtime?.architecture) parts.push(workspace.runtime.architecture);
-    return parts.filter(Boolean).join(" · ") || "Container";
+    const description = parts.filter(Boolean).join(" · ") || "Container";
+    return workspace.ownsContainer === false || workspace.managementKind === "attached"
+      ? `Attached · ${description}`
+      : description;
   }
 
   function safeSpacePathAndQuery(app) {

@@ -2379,11 +2379,17 @@ enum {
     ORWA_TABLE_LOG_FILES = 3,
     ORWA_TABLE_CONTENT_TYPES = 4,
     ORWA_TABLE_FILE_OPENERS = 5,
-    ORWA_TABLE_COUNT = 6,
+    ORWA_TABLE_RESOURCES = 6,
+    ORWA_TABLE_CONTAINERS = 7,
+    ORWA_TABLE_COUNT = 8,
+    ORWA_LEGACY_SEVEN_TABLE_COUNT = 7,
+    ORWA_LEGACY_SIX_TABLE_COUNT = 6,
     ORWA_LEGACY_FOUR_TABLE_COUNT = 4,
     ORWA_LEGACY_THREE_TABLE_COUNT = 3,
     ORWA_TABLE_DESCRIPTOR_SIZE = 20,
     ORWA_HEADER_SIZE = 8 + ORWA_TABLE_COUNT * ORWA_TABLE_DESCRIPTOR_SIZE,
+    ORWA_LEGACY_SEVEN_TABLE_HEADER_SIZE = 8 + ORWA_LEGACY_SEVEN_TABLE_COUNT * ORWA_TABLE_DESCRIPTOR_SIZE,
+    ORWA_LEGACY_SIX_TABLE_HEADER_SIZE = 8 + ORWA_LEGACY_SIX_TABLE_COUNT * ORWA_TABLE_DESCRIPTOR_SIZE,
     ORWA_LEGACY_FOUR_TABLE_HEADER_SIZE = 8 + ORWA_LEGACY_FOUR_TABLE_COUNT * ORWA_TABLE_DESCRIPTOR_SIZE,
     ORWA_LEGACY_THREE_TABLE_HEADER_SIZE = 8 + ORWA_LEGACY_THREE_TABLE_COUNT * ORWA_TABLE_DESCRIPTOR_SIZE,
     ORWA_BACKENDS_ROW_SIZE = 68,
@@ -2396,7 +2402,9 @@ enum {
     ORWA_LOG_FILES_ROW_SIZE = 32,
     ORWA_LEGACY_CONTENT_TYPES_ROW_SIZE = 112,
     ORWA_CONTENT_TYPES_ROW_SIZE = 96,
-    ORWA_FILE_OPENERS_ROW_SIZE = 56
+    ORWA_FILE_OPENERS_ROW_SIZE = 56,
+    ORWA_RESOURCES_ROW_SIZE = 32,
+    ORWA_CONTAINERS_ROW_SIZE = 104
 };
 
 typedef struct {
@@ -2515,6 +2523,17 @@ static bool registry_binary_append_string_ref(RegistryBinaryStringPool *pool,
     uint64_t length = 0;
     return registry_binary_string_ref(pool, variable_region, text, &offset, &length) &&
            binary_append_string_ref(rows, offset, length);
+}
+
+static bool registry_binary_append_data_ref(RegistryBinaryStringPool *pool,
+                                            StringBuilder *variable_region,
+                                            StringBuilder *rows,
+                                            const unsigned char *data,
+                                            size_t data_length) {
+    if (data_length == 0) return binary_append_string_ref(rows, 0, 0);
+    uint64_t absolute_offset = pool->variable_base_offset + (uint64_t)variable_region->length;
+    return binary_append_string_ref(rows, absolute_offset, (uint64_t)data_length) &&
+           sb_append_n(variable_region, (const char *)data, data_length);
 }
 
 static bool registry_binary_append_string_ref32(RegistryBinaryStringPool *pool,
@@ -2800,6 +2819,24 @@ typedef struct {
 } RegistryFileOpenerRecord;
 
 typedef struct {
+    char *key;
+    unsigned char *data;
+    size_t data_length;
+} RegistryResourceRecord;
+
+typedef struct {
+    char *identifier;
+    char *display_name;
+    char *provider_id;
+    char *runtime_name;
+    char *project_resource_key;
+    uint64_t created_at_milliseconds;
+    uint32_t cpus;
+    uint32_t memory_in_gb;
+    bool owns_container;
+} RegistryContainerRecord;
+
+typedef struct {
     RegistryBackendRecord *backends;
     size_t backend_count;
     size_t backend_capacity;
@@ -2818,6 +2855,12 @@ typedef struct {
     RegistryFileOpenerRecord *openers;
     size_t opener_count;
     size_t opener_capacity;
+    RegistryResourceRecord *resources;
+    size_t resource_count;
+    size_t resource_capacity;
+    RegistryContainerRecord *containers;
+    size_t container_count;
+    size_t container_capacity;
     char binary_path[PATH_MAX];
     int lock_fd;
     bool needs_rewrite;
@@ -3163,6 +3206,19 @@ static void registry_store_free(RegistryStore *store) {
         free(store->openers[i].url_template);
     }
     free(store->openers);
+    for (size_t i = 0; i < store->resource_count; i++) {
+        free(store->resources[i].key);
+        free(store->resources[i].data);
+    }
+    free(store->resources);
+    for (size_t i = 0; i < store->container_count; i++) {
+        free(store->containers[i].identifier);
+        free(store->containers[i].display_name);
+        free(store->containers[i].provider_id);
+        free(store->containers[i].runtime_name);
+        free(store->containers[i].project_resource_key);
+    }
+    free(store->containers);
     if (store->lock_fd >= 0) {
         flock(store->lock_fd, LOCK_UN);
         close(store->lock_fd);
@@ -3275,6 +3331,109 @@ static RegistryFileOpenerRecord *registry_store_find_opener(RegistryStore *store
         }
     }
     return NULL;
+}
+
+static RegistryResourceRecord *registry_store_find_resource(RegistryStore *store, const char *key) {
+    for (size_t i = 0; i < store->resource_count; i++) {
+        if (strcmp(store->resources[i].key, key ? key : "") == 0) return &store->resources[i];
+    }
+    return NULL;
+}
+
+static bool registry_store_upsert_resource(RegistryStore *store,
+                                           const char *key,
+                                           const unsigned char *data,
+                                           size_t data_length) {
+    RegistryResourceRecord *record = registry_store_find_resource(store, key);
+    if (!record) {
+        REGISTRY_ENSURE_CAPACITY(store, resource, RegistryResourceRecord);
+        record = &store->resources[store->resource_count++];
+        memset(record, 0, sizeof(*record));
+        if (!registry_assign_string(&record->key, key)) return false;
+    }
+    unsigned char *copy = NULL;
+    if (data_length > 0) {
+        copy = malloc(data_length);
+        if (!copy) return false;
+        memcpy(copy, data, data_length);
+    }
+    free(record->data);
+    record->data = copy;
+    record->data_length = data_length;
+    return true;
+}
+
+static bool registry_store_remove_resource(RegistryStore *store, const char *key) {
+    for (size_t index = 0; index < store->resource_count; index++) {
+        RegistryResourceRecord *record = &store->resources[index];
+        if (strcmp(record->key, key ? key : "") != 0) continue;
+        free(record->key);
+        free(record->data);
+        memmove(record,
+                record + 1,
+                (store->resource_count - index - 1) * sizeof(*record));
+        store->resource_count--;
+        return true;
+    }
+    return false;
+}
+
+static RegistryContainerRecord *registry_store_find_container(RegistryStore *store,
+                                                               const char *identifier) {
+    for (size_t index = 0; index < store->container_count; index++) {
+        if (strcmp(store->containers[index].identifier, identifier ? identifier : "") == 0) {
+            return &store->containers[index];
+        }
+    }
+    return NULL;
+}
+
+static bool registry_store_upsert_container(RegistryStore *store,
+                                            const char *identifier,
+                                            const char *display_name,
+                                            const char *provider_id,
+                                            const char *runtime_name,
+                                            const char *project_resource_key,
+                                            uint64_t created_at_milliseconds,
+                                            uint32_t cpus,
+                                            uint32_t memory_in_gb,
+                                            bool owns_container) {
+    RegistryContainerRecord *record = registry_store_find_container(store, identifier);
+    if (!record) {
+        REGISTRY_ENSURE_CAPACITY(store, container, RegistryContainerRecord);
+        record = &store->containers[store->container_count++];
+        memset(record, 0, sizeof(*record));
+        if (!registry_assign_string(&record->identifier, identifier)) return false;
+    }
+    if (!registry_assign_string(&record->display_name, display_name) ||
+        !registry_assign_string(&record->provider_id, provider_id) ||
+        !registry_assign_string(&record->runtime_name, runtime_name) ||
+        !registry_assign_string(&record->project_resource_key, project_resource_key)) {
+        return false;
+    }
+    record->created_at_milliseconds = created_at_milliseconds;
+    record->cpus = cpus;
+    record->memory_in_gb = memory_in_gb;
+    record->owns_container = owns_container;
+    return true;
+}
+
+static bool registry_store_remove_container(RegistryStore *store, const char *identifier) {
+    for (size_t index = 0; index < store->container_count; index++) {
+        RegistryContainerRecord *record = &store->containers[index];
+        if (strcmp(record->identifier, identifier ? identifier : "") != 0) continue;
+        free(record->identifier);
+        free(record->display_name);
+        free(record->provider_id);
+        free(record->runtime_name);
+        free(record->project_resource_key);
+        memmove(record,
+                record + 1,
+                (store->container_count - index - 1) * sizeof(*record));
+        store->container_count--;
+        return true;
+    }
+    return false;
 }
 
 static bool registry_store_upsert_backend(RegistryStore *store,
@@ -3662,6 +3821,39 @@ static bool registry_store_read_string(const unsigned char *bytes,
                                        error_size);
 }
 
+static bool registry_store_read_data(const unsigned char *bytes,
+                                     size_t file_size,
+                                     uint64_t variable_offset,
+                                     const unsigned char *row_bytes,
+                                     size_t offset,
+                                     unsigned char **out,
+                                     size_t *out_length,
+                                     char *error,
+                                     size_t error_size) {
+    if (!out || !out_length) return false;
+    *out = NULL;
+    *out_length = 0;
+    uint64_t data_offset = read_uint64_le(row_bytes + offset);
+    uint64_t data_length = read_uint64_le(row_bytes + offset + 8);
+    if (data_offset == 0 && data_length == 0) return true;
+    if (data_offset < variable_offset ||
+        data_offset > (uint64_t)file_size ||
+        data_length > (uint64_t)file_size - data_offset ||
+        data_length > SIZE_MAX) {
+        snprintf(error, error_size, "Registry binary data reference is out of bounds.");
+        return false;
+    }
+    unsigned char *copy = malloc((size_t)data_length);
+    if (!copy) {
+        snprintf(error, error_size, "Out of memory.");
+        return false;
+    }
+    memcpy(copy, bytes + data_offset, (size_t)data_length);
+    *out = copy;
+    *out_length = (size_t)data_length;
+    return true;
+}
+
 static bool registry_store_read_string_list(const unsigned char *bytes,
                                             size_t file_size,
                                             uint64_t variable_offset,
@@ -3743,6 +3935,8 @@ static bool registry_store_load_orwa_file(RegistryStore *store, const char *path
     if (ok) {
         uint64_t first_table_offset = read_uint64_le(bytes + 8);
         table_count = first_table_offset == ORWA_HEADER_SIZE ? ORWA_TABLE_COUNT :
+                      first_table_offset == ORWA_LEGACY_SEVEN_TABLE_HEADER_SIZE ? ORWA_LEGACY_SEVEN_TABLE_COUNT :
+                      first_table_offset == ORWA_LEGACY_SIX_TABLE_HEADER_SIZE ? ORWA_LEGACY_SIX_TABLE_COUNT :
                       first_table_offset == ORWA_LEGACY_FOUR_TABLE_HEADER_SIZE ? ORWA_LEGACY_FOUR_TABLE_COUNT :
                       first_table_offset == ORWA_LEGACY_THREE_TABLE_HEADER_SIZE ? ORWA_LEGACY_THREE_TABLE_COUNT :
                       0;
@@ -3761,6 +3955,8 @@ static bool registry_store_load_orwa_file(RegistryStore *store, const char *path
                                      i == ORWA_TABLE_FRONTEND_LAYOUTS && table_count != ORWA_LEGACY_THREE_TABLE_COUNT ? ORWA_FRONTEND_LAYOUTS_ROW_SIZE :
                                      i == ORWA_TABLE_CONTENT_TYPES ? descriptors[i].row_size :
                                      i == ORWA_TABLE_FILE_OPENERS ? ORWA_FILE_OPENERS_ROW_SIZE :
+                                     i == ORWA_TABLE_RESOURCES ? ORWA_RESOURCES_ROW_SIZE :
+                                     i == ORWA_TABLE_CONTAINERS ? ORWA_CONTAINERS_ROW_SIZE :
                                      ORWA_LOG_FILES_ROW_SIZE;
         bool row_size_supported = descriptors[i].row_size == expected_row_size;
         bool bounds_valid = descriptors[i].offset <= (uint64_t)file_size &&
@@ -3982,7 +4178,7 @@ static bool registry_store_load_orwa_file(RegistryStore *store, const char *path
         free(service_id);
     }
 
-    if (ok && table_count == ORWA_TABLE_COUNT && content_types_table_supported) {
+    if (ok && table_count >= ORWA_LEGACY_SIX_TABLE_COUNT && content_types_table_supported) {
         for (uint64_t row = 0; ok && row < descriptors[ORWA_TABLE_CONTENT_TYPES].row_count; row++) {
             const unsigned char *row_bytes = bytes + descriptors[ORWA_TABLE_CONTENT_TYPES].offset + row * descriptors[ORWA_TABLE_CONTENT_TYPES].row_size;
             char *service_id = NULL, *identifier = NULL, *display_name = NULL;
@@ -4021,7 +4217,7 @@ static bool registry_store_load_orwa_file(RegistryStore *store, const char *path
         }
     }
 
-    if (ok && table_count == ORWA_TABLE_COUNT && file_openers_table_supported) {
+    if (ok && table_count >= ORWA_LEGACY_SIX_TABLE_COUNT && file_openers_table_supported) {
         for (uint64_t row = 0; ok && row < descriptors[ORWA_TABLE_FILE_OPENERS].row_count; row++) {
             const unsigned char *row_bytes = bytes + descriptors[ORWA_TABLE_FILE_OPENERS].offset + row * descriptors[ORWA_TABLE_FILE_OPENERS].row_size;
             char *extension = NULL, *frontend_id = NULL, *url_template = NULL;
@@ -4043,6 +4239,79 @@ static bool registry_store_load_orwa_file(RegistryStore *store, const char *path
         }
     }
 
+    if (ok && table_count >= ORWA_LEGACY_SEVEN_TABLE_COUNT) {
+        for (uint64_t row = 0; ok && row < descriptors[ORWA_TABLE_RESOURCES].row_count; row++) {
+            const unsigned char *row_bytes = bytes + descriptors[ORWA_TABLE_RESOURCES].offset +
+                row * ORWA_RESOURCES_ROW_SIZE;
+            char *key = NULL;
+            unsigned char *data = NULL;
+            size_t data_length = 0;
+            ok = registry_store_read_string(bytes,
+                                            file_size,
+                                            variable_offset,
+                                            row_bytes,
+                                            0,
+                                            &key,
+                                            error,
+                                            error_size) &&
+                 registry_store_read_data(bytes,
+                                          file_size,
+                                          variable_offset,
+                                          row_bytes,
+                                          16,
+                                          &data,
+                                          &data_length,
+                                          error,
+                                          error_size);
+            if (ok) {
+                ok = registry_store_upsert_resource(store, key, data, data_length);
+                if (!ok) snprintf(error, error_size, "Out of memory.");
+            }
+            free(key);
+            free(data);
+        }
+    }
+
+    if (ok && table_count == ORWA_TABLE_COUNT) {
+        for (uint64_t row = 0; ok && row < descriptors[ORWA_TABLE_CONTAINERS].row_count; row++) {
+            const unsigned char *row_bytes = bytes + descriptors[ORWA_TABLE_CONTAINERS].offset +
+                row * ORWA_CONTAINERS_ROW_SIZE;
+            char *identifier = NULL;
+            char *display_name = NULL;
+            char *provider_id = NULL;
+            char *runtime_name = NULL;
+            char *project_resource_key = NULL;
+            ok = registry_store_read_string(bytes, file_size, variable_offset, row_bytes, 0,
+                                            &identifier, error, error_size) &&
+                 registry_store_read_string(bytes, file_size, variable_offset, row_bytes, 16,
+                                            &display_name, error, error_size) &&
+                 registry_store_read_string(bytes, file_size, variable_offset, row_bytes, 32,
+                                            &provider_id, error, error_size) &&
+                 registry_store_read_string(bytes, file_size, variable_offset, row_bytes, 48,
+                                            &runtime_name, error, error_size) &&
+                 registry_store_read_string(bytes, file_size, variable_offset, row_bytes, 64,
+                                            &project_resource_key, error, error_size);
+            if (ok) {
+                ok = registry_store_upsert_container(store,
+                                                     identifier,
+                                                     display_name,
+                                                     provider_id,
+                                                     runtime_name,
+                                                     project_resource_key,
+                                                     read_uint64_le(row_bytes + 80),
+                                                     read_uint32_le(row_bytes + 88),
+                                                     read_uint32_le(row_bytes + 92),
+                                                     (read_uint32_le(row_bytes + 96) & 1u) != 0);
+                if (!ok) snprintf(error, error_size, "Out of memory.");
+            }
+            free(identifier);
+            free(display_name);
+            free(provider_id);
+            free(runtime_name);
+            free(project_resource_key);
+        }
+    }
+
     free(file_data);
     return ok;
 }
@@ -4055,6 +4324,8 @@ static bool registry_store_write_orwa_file(RegistryStore *store, const char *pat
         {.row_count = store->log_count, .row_size = ORWA_LOG_FILES_ROW_SIZE},
         {.row_count = store->content_type_count, .row_size = ORWA_CONTENT_TYPES_ROW_SIZE},
         {.row_count = store->opener_count, .row_size = ORWA_FILE_OPENERS_ROW_SIZE},
+        {.row_count = store->resource_count, .row_size = ORWA_RESOURCES_ROW_SIZE},
+        {.row_count = store->container_count, .row_size = ORWA_CONTAINERS_ROW_SIZE},
     };
     uint64_t offset = ORWA_HEADER_SIZE;
     for (size_t i = 0; i < ORWA_TABLE_COUNT; i++) {
@@ -4127,6 +4398,30 @@ static bool registry_store_write_orwa_file(RegistryStore *store, const char *pat
              registry_binary_append_string_ref(&pool, &variable_region, &rows, store->openers[i].url_template) &&
              binary_append_u32(&rows, (uint32_t)store->openers[i].rank) &&
              binary_append_u32(&rows, normalize_opener_capabilities(store->openers[i].capabilities));
+    }
+    for (size_t i = 0; ok && i < store->resource_count; i++) {
+        ok = registry_binary_append_string_ref(&pool,
+                                               &variable_region,
+                                               &rows,
+                                               store->resources[i].key) &&
+             registry_binary_append_data_ref(&pool,
+                                             &variable_region,
+                                             &rows,
+                                             store->resources[i].data,
+                                             store->resources[i].data_length);
+    }
+    for (size_t i = 0; ok && i < store->container_count; i++) {
+        RegistryContainerRecord *record = &store->containers[i];
+        ok = registry_binary_append_string_ref(&pool, &variable_region, &rows, record->identifier) &&
+             registry_binary_append_string_ref(&pool, &variable_region, &rows, record->display_name) &&
+             registry_binary_append_string_ref(&pool, &variable_region, &rows, record->provider_id) &&
+             registry_binary_append_string_ref(&pool, &variable_region, &rows, record->runtime_name) &&
+             registry_binary_append_string_ref(&pool, &variable_region, &rows, record->project_resource_key) &&
+             binary_append_u64(&rows, record->created_at_milliseconds) &&
+             binary_append_u32(&rows, record->cpus) &&
+             binary_append_u32(&rows, record->memory_in_gb) &&
+             binary_append_u32(&rows, record->owns_container ? 1u : 0u) &&
+             binary_append_u32(&rows, 0u);
     }
     if (ok && rows.length != variable_region_offset - ORWA_HEADER_SIZE) {
         snprintf(error, error_size, "Registry binary row length mismatch.");
@@ -4219,6 +4514,166 @@ static bool registry_store_open_system_readonly(RegistryStore *store, char *erro
 
 static bool registry_store_open_user_readwrite(RegistryStore *store, char *error, size_t error_size) {
     return registry_store_open_at(store, g_registry_database_path, true, error, error_size);
+}
+
+int OuterShellRegistryCopyResource(const char *key,
+                                   unsigned char **data,
+                                   size_t *data_length,
+                                   char *error,
+                                   size_t error_size) {
+    if (!key || !key[0] || !data || !data_length) {
+        if (error && error_size) snprintf(error, error_size, "Invalid registry resource request.");
+        return 0;
+    }
+    *data = NULL;
+    *data_length = 0;
+    RegistryStore store;
+    if (!registry_store_open_user_readonly(&store, error, error_size)) return 0;
+    RegistryResourceRecord *resource = registry_store_find_resource(&store, key);
+    if (resource && resource->data_length > 0) {
+        *data = malloc(resource->data_length);
+        if (!*data) {
+            if (error && error_size) snprintf(error, error_size, "Out of memory.");
+            registry_store_free(&store);
+            return 0;
+        }
+        memcpy(*data, resource->data, resource->data_length);
+        *data_length = resource->data_length;
+    }
+    registry_store_free(&store);
+    return 1;
+}
+
+int OuterShellRegistrySetResource(const char *key,
+                                  const unsigned char *data,
+                                  size_t data_length,
+                                  char *error,
+                                  size_t error_size) {
+    if (!key || !key[0] || (!data && data_length > 0)) {
+        if (error && error_size) snprintf(error, error_size, "Invalid registry resource request.");
+        return 0;
+    }
+    RegistryStore store;
+    if (!registry_store_open_user_readwrite(&store, error, error_size)) return 0;
+    bool ok = registry_store_upsert_resource(&store, key, data, data_length);
+    if (!ok && error && error_size) snprintf(error, error_size, "Out of memory.");
+    return registry_store_close(&store, ok, error, error_size) ? 1 : 0;
+}
+
+int OuterShellRegistryRemoveResource(const char *key,
+                                     char *error,
+                                     size_t error_size) {
+    if (!key || !key[0]) {
+        if (error && error_size) snprintf(error, error_size, "Invalid registry resource request.");
+        return 0;
+    }
+    RegistryStore store;
+    if (!registry_store_open_user_readwrite(&store, error, error_size)) return 0;
+    (void)registry_store_remove_resource(&store, key);
+    return registry_store_close(&store, true, error, error_size) ? 1 : 0;
+}
+
+void OuterShellRegistryFreeResource(unsigned char *data) {
+    free(data);
+}
+
+void OuterShellRegistryFreeContainers(OuterShellRegistryContainer *records, size_t count) {
+    if (!records) return;
+    for (size_t index = 0; index < count; index++) {
+        free(records[index].identifier);
+        free(records[index].display_name);
+        free(records[index].provider_id);
+        free(records[index].runtime_name);
+        free(records[index].project_resource_key);
+    }
+    free(records);
+}
+
+int OuterShellRegistryCopyContainers(OuterShellRegistryContainer **records,
+                                     size_t *count,
+                                     char *error,
+                                     size_t error_size) {
+    if (!records || !count) {
+        if (error && error_size) snprintf(error, error_size, "Invalid container registry request.");
+        return 0;
+    }
+    *records = NULL;
+    *count = 0;
+    RegistryStore store;
+    if (!registry_store_open_user_readonly(&store, error, error_size)) return 0;
+    OuterShellRegistryContainer *copy = NULL;
+    if (store.container_count > 0) {
+        copy = calloc(store.container_count, sizeof(*copy));
+        if (!copy) {
+            if (error && error_size) snprintf(error, error_size, "Out of memory.");
+            registry_store_free(&store);
+            return 0;
+        }
+    }
+    bool ok = true;
+    for (size_t index = 0; ok && index < store.container_count; index++) {
+        RegistryContainerRecord *source = &store.containers[index];
+        copy[index].identifier = registry_strdup(source->identifier);
+        copy[index].display_name = registry_strdup(source->display_name);
+        copy[index].provider_id = registry_strdup(source->provider_id);
+        copy[index].runtime_name = registry_strdup(source->runtime_name);
+        copy[index].project_resource_key = registry_strdup(source->project_resource_key);
+        copy[index].created_at_milliseconds = source->created_at_milliseconds;
+        copy[index].cpus = source->cpus;
+        copy[index].memory_in_gb = source->memory_in_gb;
+        copy[index].flags = source->owns_container ? OUTERSHELL_REGISTRY_CONTAINER_FLAG_OWNED : 0u;
+        ok = copy[index].identifier && copy[index].display_name && copy[index].provider_id &&
+             copy[index].runtime_name && copy[index].project_resource_key;
+    }
+    size_t copied_count = store.container_count;
+    registry_store_free(&store);
+    if (!ok) {
+        OuterShellRegistryFreeContainers(copy, copied_count);
+        if (error && error_size) snprintf(error, error_size, "Out of memory.");
+        return 0;
+    }
+    *records = copy;
+    *count = copied_count;
+    return 1;
+}
+
+int OuterShellRegistryUpsertContainer(const OuterShellRegistryContainer *record,
+                                      char *error,
+                                      size_t error_size) {
+    if (!record || !record->identifier || !record->identifier[0] ||
+        !record->display_name || !record->display_name[0] ||
+        !record->provider_id || !record->provider_id[0] ||
+        !record->runtime_name || !record->runtime_name[0]) {
+        if (error && error_size) snprintf(error, error_size, "Invalid container registry record.");
+        return 0;
+    }
+    RegistryStore store;
+    if (!registry_store_open_user_readwrite(&store, error, error_size)) return 0;
+    bool ok = registry_store_upsert_container(&store,
+                                              record->identifier,
+                                              record->display_name,
+                                              record->provider_id,
+                                              record->runtime_name,
+                                              record->project_resource_key ? record->project_resource_key : "",
+                                              record->created_at_milliseconds,
+                                              record->cpus,
+                                              record->memory_in_gb,
+                                              (record->flags & OUTERSHELL_REGISTRY_CONTAINER_FLAG_OWNED) != 0);
+    if (!ok && error && error_size) snprintf(error, error_size, "Out of memory.");
+    return registry_store_close(&store, ok, error, error_size) ? 1 : 0;
+}
+
+int OuterShellRegistryRemoveContainer(const char *identifier,
+                                      char *error,
+                                      size_t error_size) {
+    if (!identifier || !identifier[0]) {
+        if (error && error_size) snprintf(error, error_size, "Invalid container identifier.");
+        return 0;
+    }
+    RegistryStore store;
+    if (!registry_store_open_user_readwrite(&store, error, error_size)) return 0;
+    (void)registry_store_remove_container(&store, identifier);
+    return registry_store_close(&store, true, error, error_size) ? 1 : 0;
 }
 
 typedef struct IconObservationCapability {
@@ -9300,7 +9755,40 @@ static bool outerctl_print_registry_list(const RegistryStore *database,
                                          char *error,
                                          size_t error_size) {
     bool ok = true;
-    if (strcmp(resource, "backend") == 0) {
+    if (strcmp(resource, "container") == 0) {
+        const char *headers[] = {
+            "container_id", "display_name", "provider", "runtime_name", "project_key",
+            "created_at_milliseconds", "cpus", "memory_gb", "owns_container"
+        };
+        ok = outerctl_print_headers(out, headers, sizeof(headers) / sizeof(headers[0]));
+        for (size_t i = 0; ok && i < database->container_count; i++) {
+            const RegistryContainerRecord *record = &database->containers[i];
+            if (backend_filter && backend_filter[0] && strcmp(record->identifier, backend_filter) != 0) continue;
+            char created_buffer[32];
+            char cpus_buffer[16];
+            char memory_buffer[16];
+            snprintf(created_buffer, sizeof(created_buffer), "%llu",
+                     (unsigned long long)record->created_at_milliseconds);
+            snprintf(cpus_buffer, sizeof(cpus_buffer), "%u", record->cpus);
+            snprintf(memory_buffer, sizeof(memory_buffer), "%u", record->memory_in_gb);
+            const char *fields[] = {
+                record->identifier,
+                record->display_name,
+                record->provider_id,
+                record->runtime_name,
+                record->project_resource_key,
+                created_buffer,
+                cpus_buffer,
+                memory_buffer,
+                record->owns_container ? "1" : "0"
+            };
+            for (size_t column = 0; ok && column < sizeof(fields) / sizeof(fields[0]); column++) {
+                if (column > 0 && !sb_append(out, "\t")) ok = false;
+                if (ok && !outerctl_tsv_field(out, fields[column])) ok = false;
+            }
+            if (ok && !sb_append(out, "\n")) ok = false;
+        }
+    } else if (strcmp(resource, "backend") == 0) {
         const char *headers[] = {"service_id", "display_name", "unit_name", "unit_path", "owns_unit"};
         ok = outerctl_print_headers(out, headers, sizeof(headers) / sizeof(headers[0]));
         for (size_t i = 0; ok && i < database->backend_count; i++) {
@@ -9571,6 +10059,14 @@ static int outershelld_handle_outerctl(int argc, char **argv, StringBuilder *std
     const char *extensions = NULL;
     const char *mime_types = NULL;
     const char *url_template = NULL;
+    const char *resource_key = NULL;
+    const char *container_identifier = NULL;
+    const char *provider_id = NULL;
+    const char *runtime_name = NULL;
+    const char *project_resource_key = NULL;
+    uint64_t created_at_milliseconds = 0;
+    uint32_t container_cpus = 2;
+    uint32_t container_memory_in_gb = 2;
     int port = 0;
     int rank = 0;
     uint32_t opener_capabilities = OUTERSHELLD_API_OPENER_CAPABILITY_DEFAULT;
@@ -9628,6 +10124,46 @@ static int outershelld_handle_outerctl(int argc, char **argv, StringBuilder *std
             REQUIRE_VALUE("--mime-types", mime_types);
         } else if (strcmp(arg, "--url-template") == 0) {
             REQUIRE_VALUE("--url-template", url_template);
+        } else if (strcmp(arg, "--key") == 0) {
+            REQUIRE_VALUE("--key", resource_key);
+        } else if (strcmp(arg, "--container") == 0) {
+            REQUIRE_VALUE("--container", container_identifier);
+        } else if (strcmp(arg, "--provider") == 0) {
+            REQUIRE_VALUE("--provider", provider_id);
+        } else if (strcmp(arg, "--runtime-name") == 0) {
+            REQUIRE_VALUE("--runtime-name", runtime_name);
+        } else if (strcmp(arg, "--project-key") == 0) {
+            REQUIRE_VALUE("--project-key", project_resource_key);
+        } else if (strcmp(arg, "--cpus") == 0) {
+            const char *raw = NULL;
+            REQUIRE_VALUE("--cpus", raw);
+            char *end = NULL;
+            unsigned long value = strtoul(raw, &end, 10);
+            if (!end || *end != '\0' || value == 0 || value > UINT32_MAX) {
+                sb_append(stderr_buffer, "Invalid --cpus value.\n");
+                return 1;
+            }
+            container_cpus = (uint32_t)value;
+        } else if (strcmp(arg, "--memory-gb") == 0) {
+            const char *raw = NULL;
+            REQUIRE_VALUE("--memory-gb", raw);
+            char *end = NULL;
+            unsigned long value = strtoul(raw, &end, 10);
+            if (!end || *end != '\0' || value == 0 || value > UINT32_MAX) {
+                sb_append(stderr_buffer, "Invalid --memory-gb value.\n");
+                return 1;
+            }
+            container_memory_in_gb = (uint32_t)value;
+        } else if (strcmp(arg, "--created-at-milliseconds") == 0) {
+            const char *raw = NULL;
+            REQUIRE_VALUE("--created-at-milliseconds", raw);
+            char *end = NULL;
+            unsigned long long value = strtoull(raw, &end, 10);
+            if (!end || *end != '\0') {
+                sb_append(stderr_buffer, "Invalid --created-at-milliseconds value.\n");
+                return 1;
+            }
+            created_at_milliseconds = (uint64_t)value;
         } else if (strcmp(arg, "--capabilities") == 0) {
             const char *raw_capabilities = NULL;
             REQUIRE_VALUE("--capabilities", raw_capabilities);
@@ -9667,6 +10203,140 @@ static int outershelld_handle_outerctl(int argc, char **argv, StringBuilder *std
             return 1;
         }
 #undef REQUIRE_VALUE
+    }
+
+    if (strcmp(resource, "container") == 0) {
+        char container_error[2048] = "";
+        if (strcmp(action, "list") == 0) {
+            RegistryStore database;
+            if (!registry_store_open_user_readonly(&database, container_error, sizeof(container_error))) {
+                sb_append(stderr_buffer, container_error[0] ? container_error : "Failed to open registry.");
+                sb_append(stderr_buffer, "\n");
+                return 1;
+            }
+            bool ok = outerctl_print_registry_list(&database,
+                                                   "container",
+                                                   container_identifier,
+                                                   NULL,
+                                                   stdout_buffer,
+                                                   container_error,
+                                                   sizeof(container_error));
+            registry_store_free(&database);
+            if (!ok) {
+                sb_append(stderr_buffer, container_error[0] ? container_error : "Failed to list containers.");
+                sb_append(stderr_buffer, "\n");
+                return 1;
+            }
+            return 0;
+        }
+        if (!container_identifier || !container_identifier[0]) {
+            sb_append(stderr_buffer, "Missing container identifier.\n");
+            return 1;
+        }
+        if (strcmp(action, "upsert") == 0) {
+            if (!display_name || !display_name[0] || !provider_id || !provider_id[0] ||
+                !runtime_name || !runtime_name[0]) {
+                sb_append(stderr_buffer, "Container upsert requires --name, --provider, and --runtime-name.\n");
+                return 1;
+            }
+            OuterShellRegistryContainer record = {
+                .identifier = (char *)container_identifier,
+                .display_name = (char *)display_name,
+                .provider_id = (char *)provider_id,
+                .runtime_name = (char *)runtime_name,
+                .project_resource_key = (char *)(project_resource_key ? project_resource_key : ""),
+                .created_at_milliseconds = created_at_milliseconds,
+                .cpus = container_cpus,
+                .memory_in_gb = container_memory_in_gb,
+                .flags = owns_plist ? OUTERSHELL_REGISTRY_CONTAINER_FLAG_OWNED : 0u
+            };
+            if (!OuterShellRegistryUpsertContainer(&record, container_error, sizeof(container_error))) {
+                sb_append(stderr_buffer, container_error[0] ? container_error : "Failed to register container.");
+                sb_append(stderr_buffer, "\n");
+                return 1;
+            }
+            mark_backend_event_changed();
+            return 0;
+        }
+        if (strcmp(action, "remove") == 0) {
+            if (!OuterShellRegistryRemoveContainer(container_identifier,
+                                                   container_error,
+                                                   sizeof(container_error))) {
+                sb_append(stderr_buffer, container_error[0] ? container_error : "Failed to unregister container.");
+                sb_append(stderr_buffer, "\n");
+                return 1;
+            }
+            mark_backend_event_changed();
+            return 0;
+        }
+        sb_append(stderr_buffer, "Unknown container action.\n");
+        return 1;
+    }
+
+    if (strcmp(resource, "resource") == 0) {
+        if (!resource_key || !resource_key[0]) {
+            sb_append(stderr_buffer, "Missing resource key.\n");
+            return 1;
+        }
+        char resource_error[2048] = "";
+        if (strcmp(action, "get") == 0) {
+            unsigned char *data = NULL;
+            size_t data_length = 0;
+            if (!OuterShellRegistryCopyResource(resource_key,
+                                                &data,
+                                                &data_length,
+                                                resource_error,
+                                                sizeof(resource_error))) {
+                sb_append(stderr_buffer, resource_error[0] ? resource_error : "Failed to read registry resource.");
+                sb_append(stderr_buffer, "\n");
+                return 1;
+            }
+            bool appended = sb_append_n(stdout_buffer, (const char *)data, data_length);
+            OuterShellRegistryFreeResource(data);
+            if (!appended) {
+                sb_append(stderr_buffer, "Out of memory.\n");
+                return 1;
+            }
+            return 0;
+        }
+        if (strcmp(action, "set") == 0) {
+            StringBuilder input = {0};
+            unsigned char buffer[65536];
+            ssize_t count = 0;
+            while ((count = read(STDIN_FILENO, buffer, sizeof(buffer))) > 0) {
+                if (!sb_append_n(&input, (const char *)buffer, (size_t)count)) {
+                    free(input.data);
+                    sb_append(stderr_buffer, "Out of memory.\n");
+                    return 1;
+                }
+            }
+            if (count < 0 || !OuterShellRegistrySetResource(resource_key,
+                                                            (const unsigned char *)input.data,
+                                                            input.length,
+                                                            resource_error,
+                                                            sizeof(resource_error))) {
+                free(input.data);
+                sb_append(stderr_buffer, resource_error[0] ? resource_error : "Failed to write registry resource.");
+                sb_append(stderr_buffer, "\n");
+                return 1;
+            }
+            free(input.data);
+            mark_backend_event_changed();
+            return 0;
+        }
+        if (strcmp(action, "remove") == 0) {
+            if (!OuterShellRegistryRemoveResource(resource_key,
+                                                  resource_error,
+                                                  sizeof(resource_error))) {
+                sb_append(stderr_buffer, resource_error[0] ? resource_error : "Failed to remove registry resource.");
+                sb_append(stderr_buffer, "\n");
+                return 1;
+            }
+            mark_backend_event_changed();
+            return 0;
+        }
+        sb_append(stderr_buffer, "Unknown resource action.\n");
+        return 1;
     }
 
     bool is_list = strcmp(action, "list") == 0;
@@ -13626,6 +14296,47 @@ static bool api_request_is_complete(const char *request, size_t length, size_t *
     return true;
 }
 
+static bool process_provider_api_connection(int listener_fd) {
+    int client_fd = accept(listener_fd, NULL, NULL);
+    if (client_fd < 0) return errno == EINTR;
+
+    StringBuilder request = {0};
+    bool ok = true;
+    size_t complete_length = 0;
+    while (ok && complete_length == 0) {
+        char buffer[8192];
+        ssize_t count = read(client_fd, buffer, sizeof(buffer));
+        if (count < 0) {
+            if (errno == EINTR) continue;
+            ok = false;
+            break;
+        }
+        if (count == 0 ||
+            request.length + (size_t)count > OUTERSHELL_API_MAX_FRAME_SIZE + 4u ||
+            !sb_append_n(&request, buffer, (size_t)count)) {
+            ok = false;
+            break;
+        }
+        if (api_request_is_complete(request.data, request.length, &complete_length) &&
+            complete_length != request.length) {
+            ok = false;
+        }
+    }
+
+    if (ok && complete_length == request.length) {
+        ReactorClient client = {
+            .fd = client_fd,
+            .is_api = true,
+            .peer_uid = geteuid(),
+            .has_peer_uid = true,
+        };
+        (void)process_api_client_request(&client, request.data, request.length);
+    }
+    free(request.data);
+    close(client_fd);
+    return ok;
+}
+
 static bool run_safe_space_provider(const char *body,
                                     size_t body_length,
                                     StringBuilder *output,
@@ -13635,6 +14346,8 @@ static bool run_safe_space_provider(const char *body,
 
     int input_pipe[2] = {-1, -1};
     int output_pipe[2] = {-1, -1};
+    int provider_api_listener = -1;
+    char provider_api_socket_path[sizeof(((struct sockaddr_un *)0)->sun_path)] = "";
     if (pipe(input_pipe) != 0 || pipe(output_pipe) != 0) {
         if (input_pipe[0] >= 0) close(input_pipe[0]);
         if (input_pipe[1] >= 0) close(input_pipe[1]);
@@ -13643,8 +14356,51 @@ static bool run_safe_space_provider(const char *body,
         return false;
     }
 
+    provider_api_listener = socket(AF_UNIX, SOCK_STREAM, 0);
+    struct sockaddr_un provider_api_address = {0};
+    provider_api_address.sun_family = AF_UNIX;
+    const char *runtime_directory = getenv("XDG_RUNTIME_DIR");
+    if (!runtime_directory || !runtime_directory[0]) runtime_directory = "/tmp";
+    int provider_path_length = snprintf(provider_api_socket_path,
+                                        sizeof(provider_api_socket_path),
+                                        "%s/outershelld-provider-%ld.sock",
+                                        runtime_directory,
+                                        (long)getpid());
+    if (provider_api_listener < 0 ||
+        provider_path_length <= 0 ||
+        (size_t)provider_path_length >= sizeof(provider_api_socket_path)) {
+        if (provider_api_listener >= 0) close(provider_api_listener);
+        close(input_pipe[0]);
+        close(input_pipe[1]);
+        close(output_pipe[0]);
+        close(output_pipe[1]);
+        return false;
+    }
+    snprintf(provider_api_address.sun_path,
+             sizeof(provider_api_address.sun_path),
+             "%s",
+             provider_api_socket_path);
+    unlink(provider_api_socket_path);
+    mode_t previous_umask = umask(0077);
+    bool provider_api_ready = bind(provider_api_listener,
+                                   (struct sockaddr *)&provider_api_address,
+                                   sizeof(provider_api_address)) == 0 &&
+                              listen(provider_api_listener, 8) == 0;
+    umask(previous_umask);
+    if (!provider_api_ready) {
+        close(provider_api_listener);
+        unlink(provider_api_socket_path);
+        close(input_pipe[0]);
+        close(input_pipe[1]);
+        close(output_pipe[0]);
+        close(output_pipe[1]);
+        return false;
+    }
+
     pid_t child = fork();
     if (child < 0) {
+        close(provider_api_listener);
+        unlink(provider_api_socket_path);
         close(input_pipe[0]);
         close(input_pipe[1]);
         close(output_pipe[0]);
@@ -13658,6 +14414,8 @@ static bool run_safe_space_provider(const char *body,
         close(input_pipe[1]);
         close(output_pipe[0]);
         close(output_pipe[1]);
+        close(provider_api_listener);
+        setenv("OUTERSHELLD_API_SOCKET", provider_api_socket_path, 1);
         execl(provider, provider, "request", (char *)NULL);
         _exit(127);
     }
@@ -13667,22 +14425,40 @@ static bool run_safe_space_provider(const char *body,
     bool ok = queue_all(input_pipe[1], body ? body : "", body_length);
     close(input_pipe[1]);
 
-    char buffer[8192];
-    while (ok) {
-        ssize_t count = read(output_pipe[0], buffer, sizeof(buffer));
-        if (count < 0) {
+    bool output_open = true;
+    while (ok && output_open) {
+        struct pollfd descriptors[2] = {
+            {.fd = output_pipe[0], .events = POLLIN},
+            {.fd = provider_api_listener, .events = POLLIN},
+        };
+        int ready = poll(descriptors, 2, -1);
+        if (ready < 0) {
             if (errno == EINTR) continue;
             ok = false;
             break;
         }
-        if (count == 0) break;
-        if (output->length + (size_t)count > 16u * 1024u * 1024u ||
-            !sb_append_n(output, buffer, (size_t)count)) {
+        if (descriptors[1].revents & POLLIN) {
+            ok = process_provider_api_connection(provider_api_listener);
+        }
+        if (descriptors[0].revents & (POLLIN | POLLHUP)) {
+            char buffer[8192];
+            ssize_t count = read(output_pipe[0], buffer, sizeof(buffer));
+            if (count < 0) {
+                if (errno != EINTR) ok = false;
+            } else if (count == 0) {
+                output_open = false;
+            } else if (output->length + (size_t)count > 16u * 1024u * 1024u ||
+                       !sb_append_n(output, buffer, (size_t)count)) {
+                ok = false;
+            }
+        }
+        if (descriptors[0].revents & (POLLERR | POLLNVAL)) {
             ok = false;
-            break;
         }
     }
     close(output_pipe[0]);
+    close(provider_api_listener);
+    unlink(provider_api_socket_path);
 
     int status = 0;
     while (waitpid(child, &status, 0) < 0 && errno == EINTR) {}
@@ -14743,11 +15519,18 @@ static bool process_api_command_request(ReactorClient *client, const unsigned ch
     char *extensions = NULL;
     char *mime_types = NULL;
     char *url_template = NULL;
+    char *container_identifier = NULL;
+    char *provider_id = NULL;
+    char *runtime_name = NULL;
+    char *project_resource_key = NULL;
     char *argv[64];
     int argc = 0;
     char port_buffer[32];
     char rank_buffer[32];
     char capabilities_buffer[16];
+    char cpus_buffer[32];
+    char memory_in_gb_buffer[32];
+    char created_at_milliseconds_buffer[32];
     uint16_t flags = 0;
     uint16_t endpoint_kind = OUTERSHELLD_API_FRONTEND_ENDPOINT_NONE;
     uint16_t endpoint_scheme = OUTERSHELLD_API_FRONTEND_SCHEME_HTTP;
@@ -14946,6 +15729,46 @@ static bool process_api_command_request(ReactorClient *client, const unsigned ch
              api_command_append_option(argv, &argc, 64, "--frontend-id", frontend_id) &&
              api_command_append_option(argv, &argc, 64, "--content-type", content_type);
         break;
+    case OUTERSHELLD_API_CONTAINER_UPSERT_REQUEST:
+        ok = ok && message_length >= 60 &&
+             INIT_COMMAND("container", "upsert") &&
+             READ_REF(20, container_identifier) &&
+             READ_REF(28, display_name) &&
+             READ_REF(36, provider_id) &&
+             READ_REF(44, runtime_name) &&
+             READ_REF(52, project_resource_key);
+        flags = ok ? read_uint16_le(message + 2) : 0;
+        if (ok) {
+            snprintf(cpus_buffer, sizeof(cpus_buffer), "%u", read_uint32_le(message + 4));
+            snprintf(memory_in_gb_buffer, sizeof(memory_in_gb_buffer), "%u", read_uint32_le(message + 8));
+            snprintf(created_at_milliseconds_buffer,
+                     sizeof(created_at_milliseconds_buffer),
+                     "%llu",
+                     (unsigned long long)read_uint64_le(message + 12));
+        }
+        ok = ok &&
+             api_command_append_option(argv, &argc, 64, "--container", container_identifier) &&
+             api_command_append_option(argv, &argc, 64, "--name", display_name) &&
+             api_command_append_option(argv, &argc, 64, "--provider", provider_id) &&
+             api_command_append_option(argv, &argc, 64, "--runtime-name", runtime_name) &&
+             api_command_append_option(argv, &argc, 64, "--project-key", project_resource_key) &&
+             api_command_append_option(argv, &argc, 64, "--cpus", cpus_buffer) &&
+             api_command_append_option(argv, &argc, 64, "--memory-gb", memory_in_gb_buffer) &&
+             api_command_append_option(argv, &argc, 64,
+                                       "--created-at-milliseconds",
+                                       created_at_milliseconds_buffer);
+        if (ok && (flags & OUTERSHELL_REGISTRY_CONTAINER_FLAG_OWNED)) {
+            ok = api_command_append_option(argv, &argc, 64, "--outershell-owns", "true");
+        }
+        break;
+    case OUTERSHELLD_API_CONTAINER_REMOVE_REQUEST:
+    case OUTERSHELLD_API_CONTAINER_LIST_REQUEST:
+        ok = ok && message_length >= 10 &&
+             INIT_COMMAND("container",
+                          message_type == OUTERSHELLD_API_CONTAINER_REMOVE_REQUEST ? "remove" : "list") &&
+             READ_REF(2, container_identifier) &&
+             api_command_append_option(argv, &argc, 64, "--container", container_identifier);
+        break;
     default:
         ok = false;
         break;
@@ -14978,6 +15801,10 @@ static bool process_api_command_request(ReactorClient *client, const unsigned ch
     free(extensions);
     free(mime_types);
     free(url_template);
+    free(container_identifier);
+    free(provider_id);
+    free(runtime_name);
+    free(project_resource_key);
     free(stdout_buffer.data);
     free(stderr_buffer.data);
     return false;
@@ -15080,6 +15907,67 @@ static bool process_api_bundled_app_control_request(ReactorClient *client,
     return false;
 }
 
+static bool process_api_resource_request(ReactorClient *client,
+                                         const unsigned char *message,
+                                         size_t message_length) {
+    StringBuilder stdout_buffer = {0};
+    StringBuilder stderr_buffer = {0};
+    uint16_t message_type = read_uint16_le(message);
+    char *key = NULL;
+    const unsigned char *payload = NULL;
+    size_t payload_length = 0;
+    bool decoded = message_length >= 10 &&
+        api_read_string_ref(message, message_length, 2, &key);
+    if (decoded && message_type == OUTERSHELLD_API_RESOURCE_SET_REQUEST) {
+        decoded = message_length >= 18 &&
+            api_read_data_ref(message, message_length, 10, &payload, &payload_length);
+    }
+
+    int status = 1;
+    char error[2048] = "";
+    if (!decoded || !key || !key[0]) {
+        sb_append(&stderr_buffer, "Invalid resource request.\n");
+    } else if (message_type == OUTERSHELLD_API_RESOURCE_GET_REQUEST) {
+        unsigned char *data = NULL;
+        size_t data_length = 0;
+        if (OuterShellRegistryCopyResource(key, &data, &data_length, error, sizeof(error))) {
+            if (sb_append_n(&stdout_buffer, (const char *)data, data_length)) {
+                status = 0;
+            } else {
+                sb_append(&stderr_buffer, "Out of memory.\n");
+            }
+            OuterShellRegistryFreeResource(data);
+        } else {
+            sb_append(&stderr_buffer, error[0] ? error : "Failed to read registry resource.");
+            sb_append(&stderr_buffer, "\n");
+        }
+    } else if (message_type == OUTERSHELLD_API_RESOURCE_SET_REQUEST) {
+        if (OuterShellRegistrySetResource(key, payload, payload_length, error, sizeof(error))) {
+            mark_backend_event_changed();
+            status = 0;
+        } else {
+            sb_append(&stderr_buffer, error[0] ? error : "Failed to write registry resource.");
+            sb_append(&stderr_buffer, "\n");
+        }
+    } else if (message_type == OUTERSHELLD_API_RESOURCE_REMOVE_REQUEST) {
+        if (OuterShellRegistryRemoveResource(key, error, sizeof(error))) {
+            mark_backend_event_changed();
+            status = 0;
+        } else {
+            sb_append(&stderr_buffer, error[0] ? error : "Failed to remove registry resource.");
+            sb_append(&stderr_buffer, "\n");
+        }
+    } else {
+        sb_append(&stderr_buffer, "Unsupported resource request.\n");
+    }
+
+    api_send_command_response(client->fd, status, &stdout_buffer, &stderr_buffer);
+    free(key);
+    free(stdout_buffer.data);
+    free(stderr_buffer.data);
+    return false;
+}
+
 static bool api_message_is_command_request(uint16_t message_type) {
     switch (message_type) {
     case OUTERSHELLD_API_BACKEND_UPSERT_REQUEST:
@@ -15092,6 +15980,9 @@ static bool api_message_is_command_request(uint16_t message_type) {
     case OUTERSHELLD_API_CONTENT_TYPE_REMOVE_REQUEST:
     case OUTERSHELLD_API_OPENER_UPSERT_REQUEST:
     case OUTERSHELLD_API_OPENER_REMOVE_REQUEST:
+    case OUTERSHELLD_API_CONTAINER_UPSERT_REQUEST:
+    case OUTERSHELLD_API_CONTAINER_REMOVE_REQUEST:
+    case OUTERSHELLD_API_CONTAINER_LIST_REQUEST:
         return true;
     default:
         return false;
@@ -15111,6 +16002,11 @@ static bool process_api_client_request(ReactorClient *client, char *request, siz
     }
     if (message_type == OUTERSHELLD_API_BUNDLED_APP_CONTROL_REQUEST) {
         return process_api_bundled_app_control_request(client, message, message_length);
+    }
+    if (message_type == OUTERSHELLD_API_RESOURCE_GET_REQUEST ||
+        message_type == OUTERSHELLD_API_RESOURCE_SET_REQUEST ||
+        message_type == OUTERSHELLD_API_RESOURCE_REMOVE_REQUEST) {
+        return process_api_resource_request(client, message, message_length);
     }
     if (message_type == OUTERSHELLD_API_FILE_OPENERS_QUERY) {
         return process_api_file_openers_request(client, message, message_length);

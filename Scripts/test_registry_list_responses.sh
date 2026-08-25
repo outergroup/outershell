@@ -113,8 +113,8 @@ awk -F '\t' '
 ' "$build_dir/backend.tsv"
 
 awk -F '\t' '
-    NR == 2 && $1 == "test.app.1" && $3 == "App 1" && $12 == "List 1" { first = 1 }
-    NR == 4 && $1 == "test.app.3" && $3 == "App 3" && $12 == "List 3" { last = 1 }
+    NR == 2 && $1 == "test.app.1" && $3 == "App 1" && $13 == "List 1" { first = 1 }
+    NR == 4 && $1 == "test.app.3" && $3 == "App 3" && $13 == "List 3" { last = 1 }
     END { exit !(first && last) }
 ' "$build_dir/app.tsv"
 
@@ -152,5 +152,34 @@ if [ "$invalid_status" -eq 0 ] || [ "$invalid_response" != "Invalid content type
         "$invalid_status" "$invalid_response" >&2
     exit 1
 fi
+
+printf '\000\001ORWV\377' >"$build_dir/resource-input.bin"
+outerctl resource set --key test/binary <"$build_dir/resource-input.bin"
+outerctl resource get --key test/binary >"$build_dir/resource-output.bin"
+cmp "$build_dir/resource-input.bin" "$build_dir/resource-output.bin"
+outerctl resource remove --key test/binary
+outerctl resource get --key test/binary >"$build_dir/resource-removed.bin"
+[ ! -s "$build_dir/resource-removed.bin" ]
+
+container_id="54a0a9ae-71f2-4dfa-a69e-3b875ca20a0f"
+outerctl container upsert \
+    --container "$container_id" \
+    --name Science \
+    --provider docker \
+    --runtime-name science-runtime \
+    --project-key containers/science/recipe \
+    --created-at-milliseconds 1787616000000 \
+    --cpus 6 \
+    --memory-gb 12 \
+    --outershell-owns false
+outerctl container list >"$build_dir/container.tsv"
+awk -F '\t' -v id="$container_id" '
+    NR == 2 && $1 == id && $2 == "Science" && $3 == "docker" &&
+        $4 == "science-runtime" && $5 == "containers/science/recipe" &&
+        $7 == "6" && $8 == "12" && $9 == "0" { found = 1 }
+    END { exit !found }
+' "$build_dir/container.tsv"
+outerctl container remove --container "$container_id"
+[ "$(outerctl container list | wc -l | tr -d ' ')" -eq 1 ]
 
 printf 'multi-row registry list response round-trip test passed\n'

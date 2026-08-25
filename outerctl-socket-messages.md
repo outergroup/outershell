@@ -37,7 +37,7 @@ Every message begins with:
 bytes 0..1: UInt16 messageType
 ```
 
-Request message types are allocated contiguously from `10` through `27`.
+Request message types are allocated contiguously from `10` through `33`.
 Dedicated responses are allocated contiguously from `100` through `107`.
 
 Strings are encoded as offset-based references into the same message:
@@ -50,6 +50,15 @@ bytes 4..7: UInt32 UTF-8 byte length
 
 Offsets are relative to byte 0 of the message, not the frame. Empty optional
 strings are encoded as a zero-length `StringRef32`.
+
+Opaque data uses the same layout as `StringRef32`, but the referenced bytes
+have no text encoding:
+
+```text
+DataRef32:
+bytes 0..3: UInt32 offset to raw bytes
+bytes 4..7: UInt32 byte length
+```
 
 Lists of strings use a compact offset to a list payload in the variable region:
 
@@ -675,6 +684,109 @@ bytes 24..31:  StringRef32 socket path
 bytes 32..39:  StringRef32 resolved URL
 bytes 40..43:  UInt32 capability flags
 ```
+
+## Container Commands
+
+Container rows register runtimes that Outer Shell should expose. The ownership
+flag follows the same convention as a backend's `owns_unit`: it distinguishes
+a runtime that Outer Shell may rebuild and delete from one managed by another
+tool.
+
+### `outerctl container upsert`
+
+```bash
+outerctl container upsert \
+  --container 54a0a9ae-71f2-4dfa-a69e-3b875ca20a0f \
+  --name Science \
+  --provider docker \
+  --runtime-name science \
+  --outershell-owns false
+```
+
+Socket message: `containerUpsertRequest` (`messageType = 31`).
+
+```text
+bytes 2..3:    UInt16 flags; bit 0 = owns runtime
+bytes 4..7:    UInt32 CPU ceiling
+bytes 8..11:   UInt32 memory ceiling in GiB
+bytes 12..19:  UInt64 creation time in Unix milliseconds
+bytes 20..27:  StringRef32 stable container identifier
+bytes 28..35:  StringRef32 display name
+bytes 36..43:  StringRef32 provider identifier
+bytes 44..51:  StringRef32 provider runtime name
+bytes 52..59:  StringRef32 optional project resource key
+```
+
+### `outerctl container remove`
+
+```bash
+outerctl container remove --container 54a0a9ae-71f2-4dfa-a69e-3b875ca20a0f
+```
+
+Socket message: `containerRemoveRequest` (`messageType = 32`). Removing an
+attached row only unregisters it. Runtime deletion is an Outer Shell provider
+operation and is permitted only for owned rows.
+
+```text
+bytes 2..9: StringRef32 stable container identifier
+```
+
+### `outerctl container list`
+
+```bash
+outerctl container list
+```
+
+Socket message: `containerListRequest` (`messageType = 33`). `outerctl` prints
+the dedicated binary response as TSV.
+
+## Private Resource Commands
+
+Private resources are opaque binary values stored in the `resources` table of
+`registry.orwa`. They are intended for cooperating Outer Shell components, not
+as a text interchange format.
+
+### `outerctl resource get`
+
+```bash
+outerctl resource get --key containers/records >records.orwv
+```
+
+Socket message: `resourceGetRequest` (`messageType = 28`).
+
+```text
+bytes 2..9: StringRef32 resource key
+```
+
+The command response carries the resource bytes verbatim in its stdout field.
+A missing key produces an empty stdout field.
+
+### `outerctl resource set`
+
+```bash
+outerctl resource set --key containers/records <records.orwv
+```
+
+Socket message: `resourceSetRequest` (`messageType = 29`).
+
+```text
+bytes 2..9:    StringRef32 resource key
+bytes 10..17:  DataRef32 resource payload
+```
+
+### `outerctl resource remove`
+
+```bash
+outerctl resource remove --key containers/records
+```
+
+Socket message: `resourceRemoveRequest` (`messageType = 30`).
+
+```text
+bytes 2..9: StringRef32 resource key
+```
+
+All three commands return `commandResponse` (`messageType = 100`).
 
 ## When To Use `outerctl` Versus Messages
 

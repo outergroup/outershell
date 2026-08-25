@@ -44,6 +44,13 @@ TRANSFER_APPEND = 2
 TRANSFER_REQUEST_HEADER = struct.Struct("<4sHH16sQQII")
 TRANSFER_RESPONSE_HEADER = struct.Struct("<4sHHQQIIII")
 TRANSFER_MAX_CHUNK_SIZE = 16_000_000
+OFFSET_ARCHIVE_MAGIC = b"ORWV"
+OFFSET_ARCHIVE_VERSION = 1
+OFFSET_ARCHIVE_HEADER = struct.Struct("<4sIQ")
+OFFSET_ARCHIVE_NODE = struct.Struct("<B7xQQ")
+OFFSET_ARCHIVE_RESOURCE_RECORDS = "containers/records"
+OFFSET_ARCHIVE_RESOURCE_PROVIDER_STATE = "containers/docker-provider-state"
+CONTAINER_RUNTIME_NAMES = {}
 
 
 def outer_shell_home():
@@ -57,8 +64,222 @@ def provider_root():
     return outer_shell_home() / "containers"
 
 
-def records_path():
-    return provider_root() / "records.json"
+def outerctl_path():
+    configured = os.environ.get("OUTERSHELL_OUTERCTL")
+    if configured:
+        return configured
+    installed = outer_shell_home() / "bin" / "outerctl"
+    if installed.is_file():
+        return str(installed)
+    return shutil.which("outerctl") or "/usr/local/bin/outerctl"
+
+
+def offset_archive_encode(value):
+    output = bytearray(OFFSET_ARCHIVE_HEADER.pack(
+        OFFSET_ARCHIVE_MAGIC,
+        OFFSET_ARCHIVE_VERSION,
+        0,
+    ))
+
+    def append_node(node_type, payload, count=0):
+        offset = len(output)
+        output.extend(OFFSET_ARCHIVE_NODE.pack(node_type, payload, count))
+        return offset
+
+    def append_value(item):
+        if isinstance(item, dict):
+            entries = []
+            for key in sorted(item):
+                if item[key] is None:
+                    continue
+                entries.append((append_value(str(key)), append_value(item[key])))
+            payload = len(output)
+            for key_offset, value_offset in entries:
+                output.extend(struct.pack("<QQ", key_offset, value_offset))
+            return append_node(8, payload, len(entries))
+        if isinstance(item, (list, tuple)):
+            offsets = [append_value(value) for value in item if value is not None]
+            payload = len(output)
+            for offset in offsets:
+                output.extend(struct.pack("<Q", offset))
+            return append_node(7, payload, len(offsets))
+        if isinstance(item, str):
+            encoded = item.encode("utf-8")
+            payload = len(output)
+            output.extend(encoded)
+            return append_node(5, payload, len(encoded))
+        if isinstance(item, bytes):
+            payload = len(output)
+            output.extend(item)
+            return append_node(6, payload, len(item))
+        if isinstance(item, bool):
+            return append_node(2, 1 if item else 0)
+        if isinstance(item, int):
+            return append_node(3, item & 0xffffffffffffffff)
+        if isinstance(item, float):
+            return append_node(4, struct.unpack("<Q", struct.pack("<d", item))[0])
+        raise ValueError("The binary catalog contains an unsupported value.")
+
+    root = append_value(value)
+    struct.pack_into("<Q", output, 8, root)
+    return bytes(output)
+
+
+def offset_archive_decode(data):
+    if len(data) < OFFSET_ARCHIVE_HEADER.size:
+        raise ValueError("The binary catalog resource is invalid.")
+    magic, version, root = OFFSET_ARCHIVE_HEADER.unpack_from(data)
+    if magic != OFFSET_ARCHIVE_MAGIC or version != OFFSET_ARCHIVE_VERSION:
+        raise ValueError("The binary catalog resource is invalid.")
+
+    def checked_range(offset, length):
+        if offset < 0 or length < 0 or offset > len(data) - length:
+            raise ValueError("The binary catalog resource is invalid.")
+        return data[offset:offset + length]
+
+    def decode_value(offset, depth=0):
+        if depth >= 128:
+            raise ValueError("The binary catalog resource is invalid.")
+        checked_range(offset, OFFSET_ARCHIVE_NODE.size)
+        node_type, payload, count = OFFSET_ARCHIVE_NODE.unpack_from(data, offset)
+        if node_type == 2:
+            return bool(payload)
+        if node_type == 3:
+            return struct.unpack("<q", struct.pack("<Q", payload))[0]
+        if node_type == 4:
+            return struct.unpack("<d", struct.pack("<Q", payload))[0]
+        if node_type == 5:
+            return checked_range(payload, count).decode("utf-8")
+        if node_type == 6:
+            return bytes(checked_range(payload, count))
+        if node_type == 7:
+            checked_range(payload, count * 8)
+            return [
+                decode_value(struct.unpack_from("<Q", data, payload + index * 8)[0], depth + 1)
+                for index in range(count)
+            ]
+        if node_type == 8:
+            checked_range(payload, count * 16)
+            value = {}
+            for index in range(count):
+                entry = payload + index * 16
+                key_offset, value_offset = struct.unpack_from("<QQ", data, entry)
+                key = decode_value(key_offset, depth + 1)
+                if not isinstance(key, str):
+                    raise ValueError("The binary catalog resource is invalid.")
+                value[key] = decode_value(value_offset, depth + 1)
+            return value
+        if node_type == 9:
+            return struct.unpack("<d", struct.pack("<Q", payload))[0]
+        raise ValueError("The binary catalog resource is invalid.")
+
+    return decode_value(root)
+
+
+def registry_resource_get(key):
+    result = subprocess.run(
+        [outerctl_path(), "resource", "get", "--key", key],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.decode(errors="replace").strip())
+    return result.stdout or None
+
+
+def registry_resource_set(key, value):
+    result = subprocess.run(
+        [outerctl_path(), "resource", "set", "--key", key],
+        input=offset_archive_encode(value),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.decode(errors="replace").strip())
+
+
+def registry_resource_remove(key):
+    result = subprocess.run(
+        [outerctl_path(), "resource", "remove", "--key", key],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.decode(errors="replace").strip())
+
+
+def registry_container_list():
+    result = subprocess.run(
+        [outerctl_path(), "container", "list"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip())
+    values = []
+    lines = [line for line in result.stdout.splitlines() if line]
+    for line in lines[1:]:
+        fields = percent_decode_fields(line)
+        if len(fields) != 9:
+            continue
+        (
+            identifier, name, provider, runtime_name, project_key,
+            created_at, cpus, memory_in_gb, owns_container,
+        ) = fields
+        try:
+            identifier = canonical_container_id(identifier)
+            created_at_seconds = int(created_at) / 1000
+            cpu_count = int(cpus)
+            memory_count = int(memory_in_gb)
+        except (ValueError, TypeError):
+            continue
+        values.append({
+            "id": identifier,
+            "name": name or "Container",
+            "createdAt": created_at_seconds,
+            "cpus": cpu_count,
+            "memoryInGB": memory_count,
+            "runtimeProviderID": provider,
+            "runtimeName": runtime_name,
+            "projectResourceKey": project_key,
+            "ownsContainer": owns_container in ("1", "true", "yes"),
+        })
+    return values
+
+
+def registry_container_upsert(record):
+    arguments = [
+        outerctl_path(), "container", "upsert",
+        "--container", canonical_container_id(record["id"]),
+        "--name", record.get("name", "Container"),
+        "--provider", record.get("runtimeProviderID") or PROVIDER_ID,
+        "--runtime-name", record.get("runtimeName") or container_name(record["id"]),
+        "--project-key", record.get("projectResourceKey", ""),
+        "--created-at-milliseconds", str(round(record.get("createdAt", time.time()) * 1000)),
+        "--cpus", str(record.get("cpus", 0)),
+        "--memory-gb", str(record.get("memoryInGB", 0)),
+        "--outershell-owns", "true" if record.get("ownsContainer", False) else "false",
+    ]
+    result = subprocess.run(arguments, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip())
+
+
+def registry_container_remove(container_id):
+    result = subprocess.run(
+        [outerctl_path(), "container", "remove", "--container",
+         canonical_container_id(container_id)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip())
+
+
+def recipe_resource_key(container_id):
+    return "containers/" + canonical_container_id(container_id) + "/recipe"
 
 
 def container_directory(container_id):
@@ -179,17 +400,88 @@ class Records:
         provider_root().mkdir(parents=True, exist_ok=True, mode=0o700)
         self.lock_file = open(provider_root() / "records.lock", "a+")
         fcntl.flock(self.lock_file.fileno(), fcntl.LOCK_EX)
-        try:
-            self.values = json.loads(records_path().read_text())
-        except (FileNotFoundError, json.JSONDecodeError):
-            self.values = []
+        self.values = [
+            value for value in registry_container_list()
+            if value.get("runtimeProviderID") == PROVIDER_ID
+        ]
+        if not self.values:
+            encoded = registry_resource_get(OFFSET_ARCHIVE_RESOURCE_RECORDS)
+            legacy = offset_archive_decode(encoded) if encoded else []
+            for value in legacy:
+                identifier = canonical_container_id(value["id"])
+                value["id"] = identifier
+                value["runtimeProviderID"] = PROVIDER_ID
+                value["runtimeName"] = "outershell-container-" + identifier.lower()
+                value["projectResourceKey"] = recipe_resource_key(identifier)
+                value["ownsContainer"] = True
+                registry_container_upsert(value)
+            if legacy:
+                transient_keys = (
+                    "transientState", "lastError", "cachedApps", "buildProgress",
+                    "terminalShell",
+                )
+                registry_resource_set(OFFSET_ARCHIVE_RESOURCE_PROVIDER_STATE, {
+                    value["id"]: {
+                        key: value[key]
+                        for key in transient_keys
+                        if key in value and value[key] is not None
+                    }
+                    for value in legacy
+                })
+                registry_resource_remove(OFFSET_ARCHIVE_RESOURCE_RECORDS)
+                self.values = [
+                    value for value in registry_container_list()
+                    if value.get("runtimeProviderID") == PROVIDER_ID
+                ]
+        encoded = registry_resource_get(OFFSET_ARCHIVE_RESOURCE_PROVIDER_STATE)
+        provider_state = offset_archive_decode(encoded) if encoded else {}
+        if not isinstance(provider_state, dict):
+            provider_state = {}
+        for value in self.values:
+            state = provider_state.get(value["id"], {})
+            if isinstance(state, dict):
+                value.update(state)
+            CONTAINER_RUNTIME_NAMES[value["id"]] = value.get("runtimeName", "")
+        self.registered_values = {
+            value["id"]: self.registration_tuple(value)
+            for value in self.values
+        }
         return self
 
+    @staticmethod
+    def registration_tuple(value):
+        return (
+            value.get("name", "Container"),
+            value.get("runtimeProviderID", PROVIDER_ID),
+            value.get("runtimeName", ""),
+            value.get("projectResourceKey", ""),
+            value.get("createdAt", 0),
+            value.get("cpus", 0),
+            value.get("memoryInGB", 0),
+            bool(value.get("ownsContainer", False)),
+        )
+
     def save(self):
-        temporary = records_path().with_suffix(".tmp")
-        temporary.write_text(json.dumps(self.values, indent=2) + "\n")
-        os.chmod(temporary, 0o600)
-        temporary.replace(records_path())
+        for value in self.values:
+            identifier = canonical_container_id(value["id"])
+            if self.registered_values.get(identifier) != self.registration_tuple(value):
+                registry_container_upsert(value)
+                self.registered_values[identifier] = self.registration_tuple(value)
+            CONTAINER_RUNTIME_NAMES[identifier] = value.get("runtimeName", "")
+        provider_state = {}
+        transient_keys = (
+            "transientState", "lastError", "cachedApps", "buildProgress",
+            "terminalShell",
+        )
+        for value in self.values:
+            state = {
+                key: value[key]
+                for key in transient_keys
+                if key in value and value[key] is not None
+            }
+            if state:
+                provider_state[value["id"]] = state
+        registry_resource_set(OFFSET_ARCHIVE_RESOURCE_PROVIDER_STATE, provider_state)
 
     def __exit__(self, exc_type, exc_value, traceback):
         fcntl.flock(self.lock_file.fileno(), fcntl.LOCK_UN)
@@ -211,8 +503,22 @@ def find_record(values, container_id):
     raise ValueError("The selected container no longer exists.")
 
 
+def record_owns_container(record):
+    return bool(record.get("ownsContainer", False))
+
+
+def require_managed_container(record):
+    if not record_owns_container(record):
+        raise ValueError(
+            "This container is managed outside Outer Shell. "
+            "Its Dockerfile and runtime cannot be changed here."
+        )
+
+
 def container_name(container_id):
-    return "outershell-container-" + container_id.lower()
+    container_id = canonical_container_id(container_id)
+    return (CONTAINER_RUNTIME_NAMES.get(container_id)
+            or "outershell-container-" + container_id.lower())
 
 
 def image_name(container_id):
@@ -285,11 +591,8 @@ def default_recipe():
 
 
 def load_recipe(container_id):
-    path = recipe_directory(container_id) / "recipe.json"
-    try:
-        value = json.loads(path.read_text())
-    except (FileNotFoundError, json.JSONDecodeError):
-        value = default_recipe()
+    encoded = registry_resource_get(recipe_resource_key(container_id))
+    value = offset_archive_decode(encoded) if encoded else default_recipe()
     for key, default in default_recipe().items():
         value.setdefault(key, default)
     return value
@@ -298,10 +601,7 @@ def load_recipe(container_id):
 def save_recipe(container_id, value):
     directory = recipe_directory(container_id)
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-    temporary = directory / "recipe.tmp"
-    temporary.write_text(json.dumps(value, indent=2) + "\n")
-    os.chmod(temporary, 0o600)
-    temporary.replace(directory / "recipe.json")
+    registry_resource_set(recipe_resource_key(container_id), value)
 
 
 def normalize_imported_builtin_base(container_id, recipe):
@@ -612,6 +912,10 @@ def operation_create(request):
         "createdAt": now,
         "cpus": request.get("cpus") or 4,
         "memoryInGB": request.get("memoryInGB") or 8,
+        "runtimeProviderID": PROVIDER_ID,
+        "runtimeName": "outershell-container-" + container_id.lower(),
+        "projectResourceKey": recipe_resource_key(container_id),
+        "ownsContainer": True,
         "transientState": "creating",
         "lastError": "",
         "cachedApps": [],
@@ -643,19 +947,24 @@ def operation_rename(request):
 
 def operation_delete(request):
     container_id = canonical_container_id(request["workspaceID"])
-    remove_runtime_container(container_id)
-    docker(["image", "rm", "--force", image_name(container_id)])
     with Records() as records:
-        records.values = [
-            value for value in records.values
-            if canonical_container_id(value["id"]) != container_id
-        ]
+        record = find_record(records.values, container_id)
+        owns_container = record_owns_container(record)
+    if owns_container:
+        remove_runtime_container(container_id)
+        docker(["image", "rm", "--force", image_name(container_id)])
+        registry_resource_remove(recipe_resource_key(container_id))
+        shutil.rmtree(container_directory(container_id), ignore_errors=True)
+    registry_container_remove(container_id)
+    CONTAINER_RUNTIME_NAMES.pop(container_id, None)
+    with Records() as records:
         records.save()
-    shutil.rmtree(container_directory(container_id), ignore_errors=True)
 
 
 def operation_update_dockerfile(request):
     container_id = request["workspaceID"]
+    with Records() as records:
+        require_managed_container(find_record(records.values, container_id))
     contents = request.get("dockerfile")
     if not isinstance(contents, str) or not contents.strip():
         raise ValueError("The Dockerfile cannot be empty.")
@@ -674,6 +983,8 @@ def operation_update_dockerfile(request):
 
 def operation_update_configuration(request):
     container_id = request["workspaceID"]
+    with Records() as records:
+        require_managed_container(find_record(records.values, container_id))
     recipe = load_recipe(container_id)
     recipe["mounts"] = request.get("mounts") or []
     recipe["environment"] = request.get("environment") or []
@@ -683,6 +994,8 @@ def operation_update_configuration(request):
 
 def operation_rebuild(request):
     container_id = request["workspaceID"]
+    with Records() as records:
+        require_managed_container(find_record(records.values, container_id))
     update_record(
         container_id,
         transientState="creating",
@@ -697,6 +1010,13 @@ def operation_start(request):
     container_id = request["workspaceID"]
     state = docker_state(container_id)
     if state == "absent":
+        with Records() as records:
+            record = find_record(records.values, container_id)
+            if not record_owns_container(record):
+                raise ValueError(
+                    "The attached container is not currently available. "
+                    "Outer Shell will reconnect when its runtime reappears."
+                )
         operation_rebuild(request)
     else:
         docker(["start", container_name(container_id)], check=True)
@@ -744,6 +1064,8 @@ def import_mount_directory_names(mounts):
 def operation_prepare_share(request):
     container_id = request["workspaceID"]
     with Records() as records:
+        require_managed_container(find_record(records.values, container_id))
+    with Records() as records:
         record = dict(find_record(records.values, container_id))
     recipe = load_recipe(container_id)
     include_persistent = bool(request.get("includePersistentData", False))
@@ -761,8 +1083,12 @@ def operation_prepare_share(request):
     shared_recipe["persistentData"] = persistent_data
     shared_recipe_directory = root / "Recipe"
     shutil.copytree(recipe_directory(container_id), shared_recipe_directory)
-    (shared_recipe_directory / "recipe.json").write_text(
-        json.dumps(shared_recipe, indent=2, sort_keys=True) + "\n"
+    for name in ["recipe.orwv"]:
+        stale_recipe = shared_recipe_directory / name
+        if stale_recipe.exists():
+            stale_recipe.unlink()
+    (shared_recipe_directory / "recipe.orwv").write_bytes(
+        offset_archive_encode(shared_recipe)
     )
     with tarfile.open(archive, "w:gz", compresslevel=1) as output:
         output.add(shared_recipe_directory, arcname="Recipe", recursive=True)
@@ -796,8 +1122,8 @@ def operation_prepare_share(request):
             "omittedMounts": [value for value in recipe.get("mounts", [])
                               if value["id"] not in included_ids],
         }
-        encoded = json.dumps(manifest, indent=2, sort_keys=True).encode()
-        info = tarfile.TarInfo("manifest.json")
+        encoded = offset_archive_encode(manifest)
+        info = tarfile.TarInfo("manifest.orwv")
         info.size = len(encoded)
         info.mode = 0o600
         import io
@@ -919,7 +1245,7 @@ def operation_finish_import(request):
                 if extracted_root not in [destination, *destination.parents]:
                     raise ValueError("The shared container contains unsafe paths.")
                 source.extract(member, extracted)
-    manifest = json.loads((extracted / "manifest.json").read_text())
+    manifest = offset_archive_decode((extracted / "manifest.orwv").read_bytes())
     if manifest.get("version") != 1:
         raise ValueError("This shared container uses an unsupported format.")
     included_mounts = manifest.get("includedMounts", [])
@@ -984,6 +1310,10 @@ def operation_finish_import(request):
         "createdAt": time.time(),
         "cpus": manifest.get("cpus", 4),
         "memoryInGB": manifest.get("memoryInGB", 8),
+        "runtimeProviderID": PROVIDER_ID,
+        "runtimeName": "outershell-container-" + container_id.lower(),
+        "projectResourceKey": recipe_resource_key(container_id),
+        "ownsContainer": True,
         "transientState": "creating",
         "lastError": "",
         "cachedApps": [],
@@ -991,9 +1321,13 @@ def operation_finish_import(request):
     target = container_directory(container_id)
     target.mkdir(parents=True, mode=0o700)
     shutil.move(extracted / "Recipe", recipe_directory(container_id))
+    transferred_recipe_path = recipe_directory(container_id) / "recipe.orwv"
+    recipe = offset_archive_decode(transferred_recipe_path.read_bytes())
+    transferred_recipe_path.unlink()
+    save_recipe(container_id, recipe)
     recipe = normalize_imported_builtin_base(
         container_id,
-        load_recipe(container_id),
+        recipe,
     )
     imported_mounts = []
     for mount in included_mounts:
@@ -1147,6 +1481,24 @@ done'''
     return ports
 
 
+def runtime_published_ports(container_id):
+    result = docker(["port", container_name(container_id)])
+    if result.returncode != 0:
+        return {}
+    ports = {}
+    for line in result.stdout.splitlines():
+        source, separator, destination = line.partition(" -> ")
+        if not separator:
+            continue
+        try:
+            container_port = int(source.split("/", 1)[0])
+            host_port = int(destination.rsplit(":", 1)[-1])
+        except ValueError:
+            continue
+        ports[container_port] = host_port
+    return ports
+
+
 def app_snapshots(container_id, recipe):
     result = container_exec(container_id, ["/usr/local/bin/outerctl", "app", "list"])
     if result.returncode != 0:
@@ -1156,11 +1508,12 @@ def app_snapshots(container_id, recipe):
     except (OSError, RuntimeError):
         running_service_ids = None
     declared_ports = declared_app_tcp_ports(container_id)
-    published_ports = {
+    published_ports = runtime_published_ports(container_id)
+    published_ports.update({
         int(value["containerPort"]): int(value["hostPort"])
         for value in recipe.get("publishedPorts", [])
         if value.get("containerPort") and value.get("hostPort")
-    }
+    })
     lines = [line for line in result.stdout.splitlines() if line]
     if not lines:
         return []
@@ -1574,11 +1927,22 @@ def runtime_description(recipe):
     return recipe.get("baseImage", "Linux"), ""
 
 
+def attached_runtime_description(container_id):
+    result = docker([
+        "container", "inspect", "--format", "{{.Config.Image}}",
+        container_name(container_id),
+    ])
+    if result.returncode != 0 or not result.stdout.strip():
+        return "Linux", ""
+    return runtime_description({"baseImage": result.stdout.strip()})
+
+
 def workspace_dictionary(record):
     container_id = record["id"]
+    owns_container = record_owns_container(record)
     transient = record.get("transientState")
     state = transient or docker_state(container_id)
-    recipe = load_recipe(container_id)
+    recipe = load_recipe(container_id) if owns_container else default_recipe()
     try:
         support = outer_shell_support(container_id, state)
     except Exception as error:
@@ -1608,18 +1972,23 @@ def workspace_dictionary(record):
             commands = []
     if state != "running":
         apps = [dict(app, isRunning=False, externalSocketPath=None) for app in apps]
-    operating_system, version = runtime_description(recipe)
-    mounts = [{
-        "id": "00000000-0000-4000-8000-000000000002",
-        "name": "Container project",
-        "hostPath": str(recipe_directory(container_id)),
-        "guestPath": "/var/lib/outershell/project",
-        "isReadOnly": False,
-        "isInfrastructure": True,
-        "isRecipeMount": True,
-    }]
-    mounts += [dict(value, isInfrastructure=False, isRecipeMount=False)
-               for value in recipe.get("mounts", [])]
+    if owns_container:
+        operating_system, version = runtime_description(recipe)
+    else:
+        operating_system, version = attached_runtime_description(container_id)
+    mounts = []
+    if owns_container:
+        mounts.append({
+            "id": "00000000-0000-4000-8000-000000000002",
+            "name": "Container project",
+            "hostPath": str(recipe_directory(container_id)),
+            "guestPath": "/var/lib/outershell/project",
+            "isReadOnly": False,
+            "isInfrastructure": True,
+            "isRecipeMount": True,
+        })
+        mounts += [dict(value, isInfrastructure=False, isRecipeMount=False)
+                   for value in recipe.get("mounts", [])]
     persistent = []
     for item in recipe.get("persistentData", []):
         if not item.get("isDeclared", True):
@@ -1636,7 +2005,10 @@ def workspace_dictionary(record):
         "cpus": record.get("cpus", 4),
         "memoryInGB": record.get("memoryInGB", 8),
         "runtimeKind": "docker",
-        "supportsLiveMounts": True,
+        "managementKind": "managed" if owns_container else "attached",
+        "ownsContainer": owns_container,
+        "runtimeName": container_name(container_id),
+        "supportsLiveMounts": owns_container,
         "runtime": {
             "providerID": PROVIDER_ID,
             "providerName": "Docker",
@@ -1646,7 +2018,13 @@ def workspace_dictionary(record):
             "operatingSystemVersion": version,
             "architecture": os.uname().machine,
         },
-        "capabilities": capabilities(),
+        "capabilities": {
+            "supportsApps": True,
+            "supportsShell": True,
+            "supportsLiveMounts": owns_container,
+            "supportsMounts": owns_container,
+            "supportsRecipes": owns_container,
+        },
         "shellCommand": interactive_command(
             docker_cli_prefix()
             + ["exec", "-it",
@@ -1660,7 +2038,7 @@ def workspace_dictionary(record):
         "commands": commands,
         "mounts": mounts,
         "persistentData": persistent,
-        "recipe": recipe_dictionary(record, recipe),
+        "recipe": recipe_dictionary(record, recipe) if owns_container else None,
         "outerShellSupport": support,
     }
     if record.get("buildProgress"):
@@ -1670,6 +2048,7 @@ def workspace_dictionary(record):
 
 def unavailable_workspace_dictionary(record, error):
     container_id = record["id"]
+    owns_container = record_owns_container(record)
     apps = [dict(app, isRunning=False, externalSocketPath=None)
             for app in record.get("cachedApps", [])]
     return {
@@ -1679,7 +2058,10 @@ def unavailable_workspace_dictionary(record, error):
         "cpus": record.get("cpus", 4),
         "memoryInGB": record.get("memoryInGB", 8),
         "runtimeKind": "docker",
-        "supportsLiveMounts": True,
+        "managementKind": "managed" if owns_container else "attached",
+        "ownsContainer": owns_container,
+        "runtimeName": container_name(container_id),
+        "supportsLiveMounts": owns_container,
         "runtime": {
             "providerID": PROVIDER_ID,
             "providerName": "Docker",
@@ -1689,7 +2071,13 @@ def unavailable_workspace_dictionary(record, error):
             "operatingSystemVersion": "",
             "architecture": os.uname().machine,
         },
-        "capabilities": capabilities(),
+        "capabilities": {
+            "supportsApps": True,
+            "supportsShell": True,
+            "supportsLiveMounts": owns_container,
+            "supportsMounts": owns_container,
+            "supportsRecipes": owns_container,
+        },
         "shellCommand": interactive_command(
             docker_cli_prefix()
             + ["exec", "-it",
@@ -1717,7 +2105,7 @@ def list_workspaces():
         changed = False
         for record in sorted(records.values, key=lambda value: value.get("createdAt", 0)):
             before = (
-                json.dumps(record.get("cachedApps", []), sort_keys=True),
+                offset_archive_encode(record.get("cachedApps", [])),
                 record.get("terminalShell"),
             )
             try:
@@ -1725,7 +2113,7 @@ def list_workspaces():
             except Exception as error:
                 values.append(unavailable_workspace_dictionary(record, error))
             after = (
-                json.dumps(record.get("cachedApps", []), sort_keys=True),
+                offset_archive_encode(record.get("cachedApps", [])),
                 record.get("terminalShell"),
             )
             changed = changed or before != after

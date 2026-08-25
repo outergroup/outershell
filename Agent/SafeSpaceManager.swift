@@ -1,6 +1,77 @@
 import Darwin
 import Foundation
 import AppKit
+import CoreFoundation
+
+@_silgen_name("OuterShellRegistryCopyResource")
+private func outerShellRegistryCopyResource(
+    _ key: UnsafePointer<CChar>,
+    _ data: UnsafeMutablePointer<UnsafeMutablePointer<UInt8>?>,
+    _ length: UnsafeMutablePointer<Int>,
+    _ error: UnsafeMutablePointer<CChar>,
+    _ errorSize: Int
+) -> Int32
+
+@_silgen_name("OuterShellRegistrySetResource")
+private func outerShellRegistrySetResource(
+    _ key: UnsafePointer<CChar>,
+    _ data: UnsafePointer<UInt8>?,
+    _ length: Int,
+    _ error: UnsafeMutablePointer<CChar>,
+    _ errorSize: Int
+) -> Int32
+
+@_silgen_name("OuterShellRegistryRemoveResource")
+private func outerShellRegistryRemoveResource(
+    _ key: UnsafePointer<CChar>,
+    _ error: UnsafeMutablePointer<CChar>,
+    _ errorSize: Int
+) -> Int32
+
+@_silgen_name("OuterShellRegistryFreeResource")
+private func outerShellRegistryFreeResource(_ data: UnsafeMutablePointer<UInt8>?)
+
+private struct OuterShellRegistryContainerRecord {
+    var identifier: UnsafeMutablePointer<CChar>?
+    var displayName: UnsafeMutablePointer<CChar>?
+    var providerID: UnsafeMutablePointer<CChar>?
+    var runtimeName: UnsafeMutablePointer<CChar>?
+    var projectResourceKey: UnsafeMutablePointer<CChar>?
+    var createdAtMilliseconds: UInt64
+    var cpus: UInt32
+    var memoryInGB: UInt32
+    var flags: UInt32
+}
+
+@_silgen_name("OuterShellRegistryCopyContainers")
+private func outerShellRegistryCopyContainers(
+    _ records: UnsafeMutablePointer<UnsafeMutablePointer<OuterShellRegistryContainerRecord>?>,
+    _ count: UnsafeMutablePointer<Int>,
+    _ error: UnsafeMutablePointer<CChar>,
+    _ errorSize: Int
+) -> Int32
+
+@_silgen_name("OuterShellRegistryUpsertContainer")
+private func outerShellRegistryUpsertContainer(
+    _ record: UnsafePointer<OuterShellRegistryContainerRecord>,
+    _ error: UnsafeMutablePointer<CChar>,
+    _ errorSize: Int
+) -> Int32
+
+@_silgen_name("OuterShellRegistryRemoveContainer")
+private func outerShellRegistryRemoveContainer(
+    _ identifier: UnsafePointer<CChar>,
+    _ error: UnsafeMutablePointer<CChar>,
+    _ errorSize: Int
+) -> Int32
+
+@_silgen_name("OuterShellRegistryFreeContainers")
+private func outerShellRegistryFreeContainers(
+    _ records: UnsafeMutablePointer<OuterShellRegistryContainerRecord>?,
+    _ count: Int
+)
+
+private let outerShellRegistryContainerOwnedFlag: UInt32 = 0x01
 
 private let currentSafeSpaceRecipeVersion = 13
 private let rootContainerBaseImage = "outershell/container-base:12"
@@ -20,6 +91,9 @@ private struct SafeSpaceRecord: Codable {
     var cpus: Int
     var memoryInGB: Int
     var runtimeProviderID: String?
+    var runtimeName: String? = nil
+    var projectResourceKey: String? = nil
+    var ownsContainer: Bool? = nil
 }
 
 private enum SafeSpaceRuntimeProviderID: String {
@@ -519,6 +593,12 @@ final class SafeSpaceManager: @unchecked Sendable {
     }
 
     func menuBarContainers() async -> [SafeSpaceMenuBarContainer] {
+        do {
+            try refreshRecords()
+        } catch {
+            NSLog("Could not refresh registered containers for the menu bar: %@",
+                  error.localizedDescription)
+        }
         let currentRecords = lock.withSafeSpaceLock { records }
             .sorted { $0.createdAt < $1.createdAt }
         var containers: [SafeSpaceMenuBarContainer] = []
@@ -597,8 +677,10 @@ final class SafeSpaceManager: @unchecked Sendable {
         case "create":
             try create(request)
         case "duplicate":
+            try requireManagedContainer(try record(from: request))
             try duplicate(request)
         case "changeRuntime":
+            try requireManagedContainer(try record(from: request))
             return try beginRuntimeChange(request)
         case "rename":
             try rename(request)
@@ -609,8 +691,10 @@ final class SafeSpaceManager: @unchecked Sendable {
         case "delete":
             try await delete(try record(from: request))
         case "mountFolder":
+            try requireManagedContainer(try record(from: request))
             try await mountFolder(request)
         case "unmountFolder":
+            try requireManagedContainer(try record(from: request))
             try await unmountFolder(request)
         case "chooseFolder":
             return ["selectedFolderPath": await chooseFolder() ?? ""]
@@ -621,26 +705,37 @@ final class SafeSpaceManager: @unchecked Sendable {
         case "appLogs":
             return ["appLog": try await appLog(request)]
         case "addRecipeStep":
+            try requireManagedContainer(try record(from: request))
             return try addRecipeStep(request)
         case "updateDockerfile":
+            try requireManagedContainer(try record(from: request))
             return try updateDockerfile(request)
         case "updateContainerConfiguration":
+            try requireManagedContainer(try record(from: request))
             return try updateContainerConfiguration(request)
         case "updateRecipeBaseImage":
+            try requireManagedContainer(try record(from: request))
             return try updateRecipeBaseImage(request)
         case "addRecipeUser":
+            try requireManagedContainer(try record(from: request))
             return try addRecipeUser(request)
         case "createRecipeScript":
+            try requireManagedContainer(try record(from: request))
             return try createRecipeScript(request)
         case "renameRecipeScript":
+            try requireManagedContainer(try record(from: request))
             return try renameRecipeScript(request)
         case "updateRecipeStep":
+            try requireManagedContainer(try record(from: request))
             return try updateRecipeStep(request)
         case "installRecipeCatalogItem":
+            try requireManagedContainer(try record(from: request))
             return try installRecipeCatalogItem(request)
         case "deleteRecipeStep":
+            try requireManagedContainer(try record(from: request))
             return try await deleteRecipeStep(request)
         case "rebuildRecipe":
+            try requireManagedContainer(try record(from: request))
             return try beginRebuildRecipe(request)
         case "publishSocket":
             let record = try record(from: request)
@@ -650,6 +745,7 @@ final class SafeSpaceManager: @unchecked Sendable {
             return ["publishedSocketPath": try await publishSocket(in: record,
                                                                    socketPath: socketPath)]
         case "prepareShare":
+            try requireManagedContainer(try record(from: request))
             return try prepareShare(request)
         case "beginImport":
             return try beginImport(request)
@@ -712,6 +808,7 @@ final class SafeSpaceManager: @unchecked Sendable {
     }
 
     private func safeSpaceDictionaries() async throws -> [[String: Any]] {
+        try refreshRecords()
         let currentRecords = lock.withSafeSpaceLock { records }
         var values: [[String: Any]] = []
         for record in currentRecords.sorted(by: {
@@ -728,11 +825,9 @@ final class SafeSpaceManager: @unchecked Sendable {
                     state = "unavailable"
                 }
             }
-            let recipe = try recipe(for: record)
             let outerShellSupport = outerShellSupportDictionary(
                 for: record,
-                state: state,
-                recipe: recipe
+                state: state
             )
             let supportsRunningApps = outerShellSupport["status"] as? String == "available"
             var snapshots: [SafeSpaceAppSnapshot]?
@@ -780,18 +875,22 @@ final class SafeSpaceManager: @unchecked Sendable {
             } else {
                 commands = []
             }
-            let base = try safeSpaceDirectory(record.id)
-            var mounts: [[String: Any]] = [[
-                "id": UUID(uuid: (0, 0, 0, 0, 0, 0, 0x40, 0, 0x80, 0, 0, 0, 0, 0, 0, 2)).uuidString,
-                "name": "Container project",
-                "hostPath": try recipeDirectory(record.id).path,
-                "guestPath": "/var/lib/outershell/project",
-                "isReadOnly": false,
-                "isInfrastructure": true,
-                "isRecipeMount": true
-            ]]
-            for user in recipe.users ?? [] {
-                if user.name == "workspace" {
+            let ownsContainer = recordOwnsContainer(record)
+            var mounts: [[String: Any]] = []
+            var persistentData: [[String: Any]] = []
+            if ownsContainer {
+                let recipe = try recipe(for: record)
+                let base = try safeSpaceDirectory(record.id)
+                mounts = [[
+                    "id": UUID(uuid: (0, 0, 0, 0, 0, 0, 0x40, 0, 0x80, 0, 0, 0, 0, 0, 0, 2)).uuidString,
+                    "name": "Container project",
+                    "hostPath": try recipeDirectory(record.id).path,
+                    "guestPath": "/var/lib/outershell/project",
+                    "isReadOnly": false,
+                    "isInfrastructure": true,
+                    "isRecipeMount": true
+                ]]
+                for user in recipe.users ?? [] where user.name == "workspace" {
                     mounts.append([
                         "id": UUID(uuid: (0, 0, 0, 0, 0, 0, 0x40, 0, 0x80, 0, 0, 0, 0, 0, 0, 1)).uuidString,
                         "name": "Workspace",
@@ -802,34 +901,39 @@ final class SafeSpaceManager: @unchecked Sendable {
                         "isRecipeMount": false
                     ])
                 }
-            }
-            mounts.append(contentsOf: (recipe.mounts ?? []).map {
-                [
-                    "id": $0.id.uuidString,
-                    "name": $0.name,
-                    "hostPath": $0.hostPath,
-                    "guestPath": $0.guestPath,
-                    "isReadOnly": $0.isReadOnly,
-                    "isInfrastructure": false,
-                    "isRecipeMount": false
-                ] as [String: Any]
-            })
-            let persistentData = try (recipe.persistentData ?? [])
-                .filter(\.isDeclared)
-                .sorted { $0.guestPath.localizedStandardCompare($1.guestPath) == .orderedAscending }
-                .map { item in
+                mounts.append(contentsOf: (recipe.mounts ?? []).map {
                     [
-                        "id": item.id.uuidString,
-                        "guestPath": item.guestPath,
-                        "hostPath": try persistentDataDirectory(record, item: item).path
+                        "id": $0.id.uuidString,
+                        "name": $0.name,
+                        "hostPath": $0.hostPath,
+                        "guestPath": $0.guestPath,
+                        "isReadOnly": $0.isReadOnly,
+                        "isInfrastructure": false,
+                        "isRecipeMount": false
                     ] as [String: Any]
-                }
+                })
+                persistentData = try (recipe.persistentData ?? [])
+                    .filter(\.isDeclared)
+                    .sorted {
+                        $0.guestPath.localizedStandardCompare($1.guestPath) == .orderedAscending
+                    }
+                    .map { item in
+                        [
+                            "id": item.id.uuidString,
+                            "guestPath": item.guestPath,
+                            "hostPath": try persistentDataDirectory(record, item: item).path
+                        ] as [String: Any]
+                    }
+            }
             var value: [String: Any] = [
                 "id": record.id.uuidString,
                 "name": record.name,
                 "state": state,
                 "cpus": record.cpus,
                 "memoryInGB": record.memoryInGB,
+                "managementKind": ownsContainer ? "managed" : "attached",
+                "ownsContainer": ownsContainer,
+                "runtimeName": registeredRuntimeName(for: record),
                 "runtimeKind": runtimeProvider(for: record).runtimeKind,
                 "supportsLiveMounts": runtimeProvider(for: record).supportsLiveMounts,
                 "runtime": try runtimeDictionary(for: record),
@@ -841,7 +945,9 @@ final class SafeSpaceManager: @unchecked Sendable {
                 "mounts": mounts,
                 "persistentData": persistentData
             ]
-            value["recipe"] = try recipeDictionary(for: record)
+            if ownsContainer {
+                value["recipe"] = try recipeDictionary(for: record)
+            }
             if let progress = lock.withSafeSpaceLock({ buildProgress[record.id] }) {
                 value["buildProgress"] = progress.dictionary
             }
@@ -853,7 +959,7 @@ final class SafeSpaceManager: @unchecked Sendable {
 
     private func runtimeDictionary(for record: SafeSpaceRecord) throws -> [String: Any] {
         let provider = runtimeProvider(for: record)
-        let baseImage = try recipe(for: record).baseImage
+        let baseImage = recordOwnsContainer(record) ? try recipe(for: record).baseImage : "Linux"
         let operatingSystem = operatingSystemDescription(for: baseImage)
         return [
             "providerID": provider.rawValue,
@@ -1071,19 +1177,22 @@ final class SafeSpaceManager: @unchecked Sendable {
 
     private func capabilityDictionary(for record: SafeSpaceRecord) -> [String: Any] {
         let provider = runtimeProvider(for: record)
+        let ownsContainer = recordOwnsContainer(record)
         return [
             "supportsApps": true,
             "supportsShell": true,
-            "supportsLiveMounts": provider.supportsLiveMounts,
-            "supportsMounts": true,
-            "supportsRecipes": true
+            "supportsLiveMounts": ownsContainer && provider.supportsLiveMounts,
+            "supportsMounts": ownsContainer,
+            "supportsRecipes": ownsContainer,
+            "canChangeRuntime": ownsContainer,
+            "canShare": ownsContainer,
+            "canDeleteRuntime": ownsContainer
         ]
     }
 
     private func outerShellSupportDictionary(
         for record: SafeSpaceRecord,
-        state: String,
-        recipe: SafeSpaceRecipe
+        state: String
     ) -> [String: Any] {
         guard state == "running" else {
             return [
@@ -1137,12 +1246,16 @@ final class SafeSpaceManager: @unchecked Sendable {
             try validatedBaseImage($0)
         }
         let requestedSupportInstall = request["installsOuterShellSupport"] as? Bool
-        let record = SafeSpaceRecord(id: UUID(),
+        let id = UUID()
+        let record = SafeSpaceRecord(id: id,
                                      name: name,
                                      createdAt: Date(),
                                      cpus: max(request["cpus"] as? Int ?? 4, 1),
                                      memoryInGB: max(request["memoryInGB"] as? Int ?? 8, 1),
-                                     runtimeProviderID: provider.rawValue)
+                                     runtimeProviderID: provider.rawValue,
+                                     runtimeName: managedContainerName(id),
+                                     projectResourceKey: recipeResourceKey(id),
+                                     ownsContainer: true)
         try createManagedDirectories(for: record)
         lock.withSafeSpaceLock {
             records.append(record)
@@ -1187,13 +1300,17 @@ final class SafeSpaceManager: @unchecked Sendable {
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let name = requestedName.flatMap { $0.isEmpty ? nil : $0 }
             ?? "\(source.name) (\(provider.displayName))"
+        let duplicateID = UUID()
         let duplicate = SafeSpaceRecord(
-            id: UUID(),
+            id: duplicateID,
             name: name,
             createdAt: Date(),
             cpus: source.cpus,
             memoryInGB: source.memoryInGB,
-            runtimeProviderID: provider.rawValue
+            runtimeProviderID: provider.rawValue,
+            runtimeName: managedContainerName(duplicateID),
+            projectResourceKey: recipeResourceKey(duplicateID),
+            ownsContainer: true
         )
         try createManagedDirectories(for: duplicate)
         let sourceRecipe = try recipeDirectory(source.id)
@@ -1284,12 +1401,16 @@ final class SafeSpaceManager: @unchecked Sendable {
             at: try recipeDirectory(record.id),
             to: sharedRecipeDirectory
         )
+        for name in ["recipe.orwv"] {
+            let staleRecipe = sharedRecipeDirectory.appendingPathComponent(name)
+            if FileManager.default.fileExists(atPath: staleRecipe.path) {
+                try FileManager.default.removeItem(at: staleRecipe)
+            }
+        }
         var sharedRecipe = recipe
         sharedRecipe.persistentData = persistentData
-        let recipeEncoder = JSONEncoder()
-        recipeEncoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        try recipeEncoder.encode(sharedRecipe).write(
-            to: sharedRecipeDirectory.appendingPathComponent("recipe.json"),
+        try OffsetArchive.encode(sharedRecipe).write(
+            to: sharedRecipeDirectory.appendingPathComponent("recipe.orwv"),
             options: .atomic
         )
         var archiveSources: [(source: URL, destination: String)] = [
@@ -1330,11 +1451,9 @@ final class SafeSpaceManager: @unchecked Sendable {
                 !includedMounts.contains(where: { $0.id == mount.id })
             }
         )
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        let manifestURL = transferRoot.appendingPathComponent("manifest.json")
-        try encoder.encode(manifest).write(to: manifestURL, options: .atomic)
-        archiveSources.append((manifestURL, "manifest.json"))
+        let manifestURL = transferRoot.appendingPathComponent("manifest.orwv")
+        try OffsetArchive.encode(manifest).write(to: manifestURL, options: .atomic)
+        archiveSources.append((manifestURL, "manifest.orwv"))
         let stagedArchive = validatedShareStagingURL(request["stagingPath"] as? String)
         let archive = stagedArchive
             ?? transferRoot.appendingPathComponent("container.outershell-container")
@@ -1477,8 +1596,11 @@ final class SafeSpaceManager: @unchecked Sendable {
             )
             try requireSuccess(extraction, action: "open the shared container")
         }
-        let manifestData = try Data(contentsOf: extracted.appendingPathComponent("manifest.json"))
-        let manifest = try JSONDecoder().decode(SafeSpaceTransferManifest.self, from: manifestData)
+        let manifestData = try Data(contentsOf: extracted.appendingPathComponent("manifest.orwv"))
+        let manifest = try OffsetArchive.decode(
+            SafeSpaceTransferManifest.self,
+            from: manifestData
+        )
         guard manifest.version == 1 else {
             throw SafeSpaceManagerError.commandFailed("This shared container uses an unsupported format.")
         }
@@ -1558,10 +1680,14 @@ final class SafeSpaceManager: @unchecked Sendable {
                 )
             }
         }
+        let importedID = UUID()
         let record = SafeSpaceRecord(
-            id: UUID(), name: importedName, createdAt: Date(),
+            id: importedID, name: importedName, createdAt: Date(),
             cpus: manifest.cpus, memoryInGB: manifest.memoryInGB,
-            runtimeProviderID: provider.rawValue
+            runtimeProviderID: provider.rawValue,
+            runtimeName: managedContainerName(importedID),
+            projectResourceKey: recipeResourceKey(importedID),
+            ownsContainer: true
         )
         try createManagedDirectories(for: record)
         let destinationRecipe = try recipeDirectory(record.id)
@@ -1572,7 +1698,13 @@ final class SafeSpaceManager: @unchecked Sendable {
             at: extracted.appendingPathComponent("Recipe", isDirectory: true),
             to: destinationRecipe
         )
-        var importedRecipe = try recipe(for: record)
+        let transferredRecipeURL = destinationRecipe.appendingPathComponent("recipe.orwv")
+        let transferredRecipeData = try Data(contentsOf: transferredRecipeURL)
+        try FileManager.default.removeItem(at: transferredRecipeURL)
+        var importedRecipe = try OffsetArchive.decode(
+            SafeSpaceRecipe.self,
+            from: transferredRecipeData
+        )
         let importedDockerfileURL = try dockerfileURL(record.id)
         var importedDockerfile = try String(
             contentsOf: importedDockerfileURL,
@@ -2102,6 +2234,11 @@ final class SafeSpaceManager: @unchecked Sendable {
 
     private func startNow(_ record: SafeSpaceRecord) async throws {
         if try runtimeState(record) == "absent" {
+            guard recordOwnsContainer(record) else {
+                throw SafeSpaceManagerError.commandFailed(
+                    "The attached container is not present in \(runtimeProvider(for: record).displayName). Outer Shell will reconnect when a container named \(registeredRuntimeName(for: record)) appears."
+                )
+            }
             let imageReference = recipeImageReference(record.id)
             _ = try runContainerBuild(record, imageReference: imageReference)
             try createRuntimeContainer(record, imageReference: imageReference)
@@ -2125,9 +2262,11 @@ final class SafeSpaceManager: @unchecked Sendable {
     private func delete(_ record: SafeSpaceRecord) async throws {
         cancelAppEventMonitor(for: record.id)
         closePublishedForwards(record.id)
-        let result = try removeRuntimeContainer(record, force: true)
-        if result.status != 0 && !runtimeObjectIsMissing(result) {
-            try requireSuccess(result, action: "delete the container")
+        if recordOwnsContainer(record) {
+            let result = try removeRuntimeContainer(record, force: true)
+            if result.status != 0 && !runtimeObjectIsMissing(result) {
+                try requireSuccess(result, action: "delete the container")
+            }
         }
         lock.withSafeSpaceLock {
             records.removeAll { $0.id == record.id }
@@ -2136,8 +2275,11 @@ final class SafeSpaceManager: @unchecked Sendable {
             cachedTerminalShells.removeValue(forKey: record.id)
             transientStates.removeValue(forKey: record.id)
         }
-        try saveRecords()
+        try removeRecordRegistration(record.id)
         try saveCachedApps()
+        if recordOwnsContainer(record) {
+            try RegistryResourceStore.remove(recipeResourceKey(record.id))
+        }
     }
 
     private func mountFolder(_ request: [String: Any]) async throws {
@@ -3618,52 +3760,57 @@ final class SafeSpaceManager: @unchecked Sendable {
     }
 
     private func loadRecords() throws -> [SafeSpaceRecord] {
-        let current = try catalogURL()
-        if FileManager.default.fileExists(atPath: current.path) {
-            return try decodeContainerRecords(Data(contentsOf: current))
-        }
-        let legacy = try legacyDirectory().appendingPathComponent("workspaces.json")
-        guard FileManager.default.fileExists(atPath: legacy.path) else {
-            return []
-        }
-        let imported = try decodeContainerRecords(Data(contentsOf: legacy))
-        let encoder = JSONEncoder()
-        try encoder.encode(imported).write(to: current, options: .atomic)
-        return imported
-    }
-
-    private func decodeContainerRecords(_ data: Data) throws -> [SafeSpaceRecord] {
-        guard let values = try JSONSerialization.jsonObject(with: data) as? [[String: Any]]
-        else {
+        var pointer: UnsafeMutablePointer<OuterShellRegistryContainerRecord>?
+        var count = 0
+        var error = [CChar](repeating: 0, count: 2048)
+        guard outerShellRegistryCopyContainers(&pointer, &count, &error, error.count) != 0 else {
             throw SafeSpaceManagerError.commandFailed(
-                "Outer Shell's container catalog is invalid."
+                String(cString: error)
             )
         }
-        let containers = values.filter {
-            if let providerID = $0["runtimeProviderID"] as? String {
-                return SafeSpaceRuntimeProviderID(rawValue: providerID) != nil
+        defer { outerShellRegistryFreeContainers(pointer, count) }
+        if count == 0,
+           let legacyData = try RegistryResourceStore.data(for: "containers/records") {
+            var migrated = try OffsetArchive.decode([SafeSpaceRecord].self, from: legacyData)
+            for index in migrated.indices {
+                migrated[index].runtimeName = managedContainerName(migrated[index].id)
+                migrated[index].projectResourceKey = recipeResourceKey(migrated[index].id)
+                migrated[index].ownsContainer = true
+                try saveRecord(migrated[index])
             }
-            return ($0["runtimeKind"] as? String ?? "appleContainer") == "appleContainer"
+            try RegistryResourceStore.remove("containers/records")
+            return migrated
         }
-        return try JSONDecoder().decode(
-            [SafeSpaceRecord].self,
-            from: JSONSerialization.data(withJSONObject: containers)
-        )
+        guard let pointer else { return [] }
+        return (0..<count).compactMap { index in
+            let value = pointer[index]
+            guard let identifier = value.identifier,
+                  let id = UUID(uuidString: String(cString: identifier)) else {
+                return nil
+            }
+            return SafeSpaceRecord(
+                id: id,
+                name: value.displayName.map { String(cString: $0) } ?? id.uuidString,
+                createdAt: Date(timeIntervalSince1970:
+                    TimeInterval(value.createdAtMilliseconds) / 1000),
+                cpus: max(Int(value.cpus), 1),
+                memoryInGB: max(Int(value.memoryInGB), 1),
+                runtimeProviderID: value.providerID.map { String(cString: $0) },
+                runtimeName: value.runtimeName.map { String(cString: $0) },
+                projectResourceKey: value.projectResourceKey.map { String(cString: $0) },
+                ownsContainer: value.flags & outerShellRegistryContainerOwnedFlag != 0
+            )
+        }
     }
 
     private func loadCachedApps() throws -> [UUID: [SafeSpaceCachedApp]] {
-        let current = try cachedAppsURL()
-        let source: URL
-        if FileManager.default.fileExists(atPath: current.path) {
-            source = current
-        } else {
-            source = try legacyDirectory().appendingPathComponent("workspace-apps.json")
-        }
-        guard FileManager.default.fileExists(atPath: source.path) else {
+        guard let data = try RegistryResourceStore.data(for: "containers/apps") else {
             return [:]
         }
-        let decoded = try JSONDecoder().decode([String: [SafeSpaceCachedApp]].self,
-                                               from: Data(contentsOf: source))
+        let decoded = try OffsetArchive.decode(
+            [String: [SafeSpaceCachedApp]].self,
+            from: data
+        )
         return Dictionary(uniqueKeysWithValues: decoded.compactMap { key, value in
             UUID(uuidString: key).map { ($0, value) }
         })
@@ -3671,7 +3818,70 @@ final class SafeSpaceManager: @unchecked Sendable {
 
     private func saveRecords() throws {
         let values = lock.withSafeSpaceLock { records }
-        try JSONEncoder().encode(values).write(to: catalogURL(), options: .atomic)
+        for value in values {
+            try saveRecord(value)
+        }
+    }
+
+    private func refreshRecords() throws {
+        let values = try loadRecords()
+        lock.withSafeSpaceLock {
+            records = values
+        }
+    }
+
+    private func removeRecordRegistration(_ id: UUID) throws {
+        var error = [CChar](repeating: 0, count: 2048)
+        let identifier = id.uuidString.lowercased()
+        let removed = identifier.withCString {
+            outerShellRegistryRemoveContainer($0, &error, error.count)
+        }
+        guard removed != 0 else {
+            throw SafeSpaceManagerError.commandFailed(String(cString: error))
+        }
+    }
+
+    private func saveRecord(_ value: SafeSpaceRecord) throws {
+        let identifier = value.id.uuidString.lowercased()
+        let providerID = value.runtimeProviderID ?? SafeSpaceRuntimeProviderID.appleContainer.rawValue
+        let runtimeName = registeredRuntimeName(for: value)
+        let projectResourceKey = value.projectResourceKey
+            ?? (recordOwnsContainer(value) ? recipeResourceKey(value.id) : "")
+        var error = [CChar](repeating: 0, count: 2048)
+        let saved = identifier.withCString { identifierPointer in
+            value.name.withCString { displayNamePointer in
+                providerID.withCString { providerPointer in
+                    runtimeName.withCString { runtimeNamePointer in
+                        projectResourceKey.withCString { projectKeyPointer in
+                            var record = OuterShellRegistryContainerRecord(
+                                identifier: UnsafeMutablePointer(mutating: identifierPointer),
+                                displayName: UnsafeMutablePointer(mutating: displayNamePointer),
+                                providerID: UnsafeMutablePointer(mutating: providerPointer),
+                                runtimeName: UnsafeMutablePointer(mutating: runtimeNamePointer),
+                                projectResourceKey: UnsafeMutablePointer(mutating: projectKeyPointer),
+                                createdAtMilliseconds: UInt64(max(
+                                    value.createdAt.timeIntervalSince1970 * 1000,
+                                    0
+                                )),
+                                cpus: UInt32(clamping: value.cpus),
+                                memoryInGB: UInt32(clamping: value.memoryInGB),
+                                flags: recordOwnsContainer(value)
+                                    ? outerShellRegistryContainerOwnedFlag
+                                    : 0
+                            )
+                            return outerShellRegistryUpsertContainer(
+                                &record,
+                                &error,
+                                error.count
+                            )
+                        }
+                    }
+                }
+            }
+        }
+        guard saved != 0 else {
+            throw SafeSpaceManagerError.commandFailed(String(cString: error))
+        }
     }
 
     private func saveCachedApps() throws {
@@ -3680,7 +3890,10 @@ final class SafeSpaceManager: @unchecked Sendable {
                 ($0.key.uuidString.lowercased(), $0.value)
             })
         }
-        try JSONEncoder().encode(values).write(to: cachedAppsURL(), options: .atomic)
+        try RegistryResourceStore.set(
+            OffsetArchive.encode(values),
+            for: "containers/apps"
+        )
     }
 
     private var legacyWorkspaceRecipeUser: SafeSpaceRecipeUser {
@@ -3693,10 +3906,8 @@ final class SafeSpaceManager: @unchecked Sendable {
     }
 
     private func recipe(for record: SafeSpaceRecord) throws -> SafeSpaceRecipe {
-        let url = try recipeURL(record.id)
-        if FileManager.default.fileExists(atPath: url.path) {
-            var value = try JSONDecoder().decode(SafeSpaceRecipe.self,
-                                                 from: Data(contentsOf: url))
+        if let data = try RegistryResourceStore.data(for: recipeResourceKey(record.id)) {
+            var value = try OffsetArchive.decode(SafeSpaceRecipe.self, from: data)
             let storedVersion = value.version
             var needsSave = false
             if value.version < currentSafeSpaceRecipeVersion {
@@ -3772,10 +3983,10 @@ final class SafeSpaceManager: @unchecked Sendable {
             in: directory,
             users: normalizedValue.users ?? []
         )
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        try encoder.encode(normalizedValue).write(to: try recipeURL(record.id),
-                                                  options: .atomic)
+        try RegistryResourceStore.set(
+            OffsetArchive.encode(normalizedValue),
+            for: recipeResourceKey(record.id)
+        )
         try writeRecipeBuildContext(normalizedValue, to: directory)
         let dockerfile = try dockerfileURL(record.id)
         if !FileManager.default.fileExists(atPath: dockerfile.path) {
@@ -5212,7 +5423,6 @@ final class SafeSpaceManager: @unchecked Sendable {
         )
         let dockerIgnore = """
         README.md
-        recipe.json
         """
         try dockerIgnore.write(
             to: directory.appendingPathComponent(".dockerignore"),
@@ -5441,8 +5651,8 @@ final class SafeSpaceManager: @unchecked Sendable {
         }
     }
 
-    private func recipeURL(_ id: UUID) throws -> URL {
-        try recipeDirectory(id).appendingPathComponent("recipe.json")
+    private func recipeResourceKey(_ id: UUID) -> String {
+        "containers/\(id.uuidString.lowercased())/recipe"
     }
 
     private func recipeImageReference(_ id: UUID) -> String {
@@ -5476,14 +5686,6 @@ final class SafeSpaceManager: @unchecked Sendable {
             withIntermediateDirectories: true,
             attributes: [.posixPermissions: 0o700]
         )
-    }
-
-    private func catalogURL() throws -> URL {
-        try applicationDirectory().appendingPathComponent("safe-spaces.json")
-    }
-
-    private func cachedAppsURL() throws -> URL {
-        try applicationDirectory().appendingPathComponent("safe-space-apps.json")
     }
 
     private func applicationDirectory() throws -> URL {
@@ -5828,8 +6030,32 @@ final class SafeSpaceManager: @unchecked Sendable {
         return destination
     }
 
-    private func containerName(_ id: UUID) -> String {
+    private func managedContainerName(_ id: UUID) -> String {
         "outershell-container-\(id.uuidString.lowercased())"
+    }
+
+    private func registeredRuntimeName(for record: SafeSpaceRecord) -> String {
+        let value = record.runtimeName?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return value.flatMap { $0.isEmpty ? nil : $0 } ?? managedContainerName(record.id)
+    }
+
+    private func containerName(_ id: UUID) -> String {
+        lock.withSafeSpaceLock {
+            records.first(where: { $0.id == id }).map(registeredRuntimeName)
+                ?? managedContainerName(id)
+        }
+    }
+
+    private func recordOwnsContainer(_ record: SafeSpaceRecord) -> Bool {
+        record.ownsContainer ?? true
+    }
+
+    private func requireManagedContainer(_ record: SafeSpaceRecord) throws {
+        guard recordOwnsContainer(record) else {
+            throw SafeSpaceManagerError.commandFailed(
+                "This container is managed externally. Outer Shell can operate it and expose its apps, but cannot change its image or project."
+            )
+        }
     }
 
     private func runtimeIdentity(for record: SafeSpaceRecord) throws -> RuntimeIdentity {
@@ -6564,6 +6790,282 @@ final class SafeSpaceManager: @unchecked Sendable {
             throw SafeSpaceManagerError.commandFailed(
                 message.isEmpty ? "Could not \(action)." : message
             )
+        }
+    }
+}
+
+private enum OffsetArchiveError: Error, LocalizedError {
+    case invalidFormat
+    case unsupportedValue
+
+    var errorDescription: String? {
+        switch self {
+        case .invalidFormat:
+            return "The binary catalog resource is invalid."
+        case .unsupportedValue:
+            return "The binary catalog contains an unsupported value."
+        }
+    }
+}
+
+private enum OffsetArchive {
+    private static let headerSize = 16
+    private static let nodeSize = 24
+
+    static func encode<Value: Encodable>(_ value: Value) throws -> Data {
+        let encoder = PropertyListEncoder()
+        encoder.outputFormat = .binary
+        let propertyListData = try encoder.encode(value)
+        let propertyList = try PropertyListSerialization.propertyList(
+            from: propertyListData,
+            options: [],
+            format: nil
+        )
+        var writer = Writer()
+        let rootOffset = try writer.append(propertyList)
+        writer.data.safeSpaceWrite(rootOffset, at: 8)
+        return writer.data
+    }
+
+    static func decode<Value: Decodable>(_ type: Value.Type, from data: Data) throws -> Value {
+        let propertyList = try Reader(data: data).root()
+        let propertyListData = try PropertyListSerialization.data(
+            fromPropertyList: propertyList,
+            format: .binary,
+            options: 0
+        )
+        return try PropertyListDecoder().decode(type, from: propertyListData)
+    }
+
+    private struct Writer {
+        var data: Data = {
+            var value = Data("ORWV".utf8)
+            value.safeSpaceAppend(UInt32(1))
+            value.safeSpaceAppend(UInt64(0))
+            return value
+        }()
+
+        mutating func append(_ value: Any) throws -> UInt64 {
+            if let dictionary = value as? [String: Any] {
+                var entries: [(UInt64, UInt64)] = []
+                for key in dictionary.keys.sorted() {
+                    guard let item = dictionary[key] else {
+                        throw OffsetArchiveError.invalidFormat
+                    }
+                    entries.append((try append(key), try append(item)))
+                }
+                let payloadOffset = UInt64(data.count)
+                for entry in entries {
+                    data.safeSpaceAppend(entry.0)
+                    data.safeSpaceAppend(entry.1)
+                }
+                return appendNode(type: 8, value: payloadOffset, count: UInt64(entries.count))
+            }
+            if let array = value as? [Any] {
+                let offsets = try array.map { try append($0) }
+                let payloadOffset = UInt64(data.count)
+                for offset in offsets {
+                    data.safeSpaceAppend(offset)
+                }
+                return appendNode(type: 7, value: payloadOffset, count: UInt64(offsets.count))
+            }
+            if let string = value as? String {
+                let bytes = Data(string.utf8)
+                let payloadOffset = UInt64(data.count)
+                data.append(bytes)
+                return appendNode(type: 5, value: payloadOffset, count: UInt64(bytes.count))
+            }
+            if let bytes = value as? Data {
+                let payloadOffset = UInt64(data.count)
+                data.append(bytes)
+                return appendNode(type: 6, value: payloadOffset, count: UInt64(bytes.count))
+            }
+            if let date = value as? Date {
+                return appendNode(type: 9,
+                                  value: date.timeIntervalSince1970.bitPattern,
+                                  count: 0)
+            }
+            if let number = value as? NSNumber {
+                if CFGetTypeID(number) == CFBooleanGetTypeID() {
+                    return appendNode(type: 2, value: number.boolValue ? 1 : 0, count: 0)
+                }
+                let encoding = String(cString: number.objCType)
+                if "csilqCSILQ".contains(encoding) {
+                    return appendNode(type: 3,
+                                      value: UInt64(bitPattern: number.int64Value),
+                                      count: 0)
+                }
+                return appendNode(type: 4, value: number.doubleValue.bitPattern, count: 0)
+            }
+            throw OffsetArchiveError.unsupportedValue
+        }
+
+        private mutating func appendNode(type: UInt8,
+                                         value: UInt64,
+                                         count: UInt64) -> UInt64 {
+            let offset = UInt64(data.count)
+            data.append(type)
+            data.append(contentsOf: [UInt8](repeating: 0, count: 7))
+            data.safeSpaceAppend(value)
+            data.safeSpaceAppend(count)
+            return offset
+        }
+    }
+
+    private struct Reader {
+        let data: Data
+
+        func root() throws -> Any {
+            guard data.count >= OffsetArchive.headerSize,
+                  data.prefix(4) == Data("ORWV".utf8),
+                  data.safeSpaceUInt32(at: 4) == 1 else {
+                throw OffsetArchiveError.invalidFormat
+            }
+            return try value(at: data.safeSpaceUInt64(at: 8), depth: 0)
+        }
+
+        private func value(at rawOffset: UInt64, depth: Int) throws -> Any {
+            guard depth < 128,
+                  rawOffset <= UInt64(Int.max) else {
+                throw OffsetArchiveError.invalidFormat
+            }
+            let offset = Int(rawOffset)
+            guard offset >= OffsetArchive.headerSize,
+                  offset <= data.count,
+                  OffsetArchive.nodeSize <= data.count - offset else {
+                throw OffsetArchiveError.invalidFormat
+            }
+            let type = data[data.index(data.startIndex, offsetBy: offset)]
+            let payload = data.safeSpaceUInt64(at: offset + 8)
+            let count = data.safeSpaceUInt64(at: offset + 16)
+            switch type {
+            case 2:
+                return payload != 0
+            case 3:
+                return NSNumber(value: Int64(bitPattern: payload))
+            case 4:
+                return NSNumber(value: Double(bitPattern: payload))
+            case 5:
+                let bytes = try referencedData(offset: payload, length: count)
+                guard let text = String(data: bytes, encoding: .utf8) else {
+                    throw OffsetArchiveError.invalidFormat
+                }
+                return text
+            case 6:
+                return try referencedData(offset: payload, length: count)
+            case 7:
+                guard count <= UInt64(Int.max),
+                      payload <= UInt64(Int.max) else {
+                    throw OffsetArchiveError.invalidFormat
+                }
+                let arrayOffset = Int(payload)
+                let arrayCount = Int(count)
+                guard arrayOffset <= data.count,
+                      arrayCount <= (data.count - arrayOffset) / 8 else {
+                    throw OffsetArchiveError.invalidFormat
+                }
+                return try (0..<arrayCount).map {
+                    try value(at: data.safeSpaceUInt64(at: arrayOffset + $0 * 8),
+                              depth: depth + 1)
+                }
+            case 8:
+                guard count <= UInt64(Int.max),
+                      payload <= UInt64(Int.max) else {
+                    throw OffsetArchiveError.invalidFormat
+                }
+                let dictionaryOffset = Int(payload)
+                let dictionaryCount = Int(count)
+                guard dictionaryOffset <= data.count,
+                      dictionaryCount <= (data.count - dictionaryOffset) / 16 else {
+                    throw OffsetArchiveError.invalidFormat
+                }
+                var dictionary: [String: Any] = [:]
+                for index in 0..<dictionaryCount {
+                    let entryOffset = dictionaryOffset + index * 16
+                    guard let key = try value(
+                        at: data.safeSpaceUInt64(at: entryOffset),
+                        depth: depth + 1
+                    ) as? String else {
+                        throw OffsetArchiveError.invalidFormat
+                    }
+                    dictionary[key] = try value(
+                        at: data.safeSpaceUInt64(at: entryOffset + 8),
+                        depth: depth + 1
+                    )
+                }
+                return dictionary
+            case 9:
+                return Date(timeIntervalSince1970: Double(bitPattern: payload))
+            default:
+                throw OffsetArchiveError.invalidFormat
+            }
+        }
+
+        private func referencedData(offset: UInt64, length: UInt64) throws -> Data {
+            guard offset <= UInt64(Int.max), length <= UInt64(Int.max) else {
+                throw OffsetArchiveError.invalidFormat
+            }
+            let start = Int(offset)
+            let count = Int(length)
+            guard start <= data.count, count <= data.count - start else {
+                throw OffsetArchiveError.invalidFormat
+            }
+            return data.subdata(in: start..<(start + count))
+        }
+    }
+}
+
+private enum RegistryResourceStore {
+    private static func message(from buffer: [CChar]) -> String {
+        String(decoding: buffer.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }, as: UTF8.self)
+    }
+
+    static func data(for key: String) throws -> Data? {
+        var pointer: UnsafeMutablePointer<UInt8>?
+        var length = 0
+        var error = [CChar](repeating: 0, count: 2048)
+        let succeeded = key.withCString { keyPointer in
+            outerShellRegistryCopyResource(
+                keyPointer,
+                &pointer,
+                &length,
+                &error,
+                error.count
+            )
+        }
+        guard succeeded != 0 else {
+            throw SafeSpaceManagerError.commandFailed(message(from: error))
+        }
+        guard let pointer else { return nil }
+        defer { outerShellRegistryFreeResource(pointer) }
+        return Data(bytes: pointer, count: length)
+    }
+
+    static func set(_ data: Data, for key: String) throws {
+        var error = [CChar](repeating: 0, count: 2048)
+        let succeeded = key.withCString { keyPointer in
+            data.withUnsafeBytes { bytes in
+                outerShellRegistrySetResource(
+                    keyPointer,
+                    bytes.bindMemory(to: UInt8.self).baseAddress,
+                    data.count,
+                    &error,
+                    error.count
+                )
+            }
+        }
+        guard succeeded != 0 else {
+            throw SafeSpaceManagerError.commandFailed(message(from: error))
+        }
+    }
+
+    static func remove(_ key: String) throws {
+        var error = [CChar](repeating: 0, count: 2048)
+        let succeeded = key.withCString { keyPointer in
+            outerShellRegistryRemoveResource(keyPointer, &error, error.count)
+        }
+        guard succeeded != 0 else {
+            throw SafeSpaceManagerError.commandFailed(message(from: error))
         }
     }
 }

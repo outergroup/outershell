@@ -120,6 +120,14 @@ bool appendLittleEndianUInt32(Buffer &buffer, uint32_t value) {
     return appendBuffer(buffer, bytes, sizeof(bytes));
 }
 
+bool appendLittleEndianUInt64(Buffer &buffer, uint64_t value) {
+    uint8_t bytes[8];
+    for (size_t index = 0; index < sizeof(bytes); index += 1) {
+        bytes[index] = static_cast<uint8_t>((value >> (index * 8)) & 0xffu);
+    }
+    return appendBuffer(buffer, bytes, sizeof(bytes));
+}
+
 bool writeBufferLittleEndianUInt32At(Buffer &buffer, size_t offset, uint32_t value) {
     if (offset + 4 > buffer.size) return false;
     writeLittleEndianUInt32(reinterpret_cast<uint8_t *>(buffer.data + offset), value);
@@ -354,6 +362,12 @@ enum : uint16_t {
     kMessageOpenerRemoveRequest = 23,
     kMessageOpenerListRequest = 24,
     kMessageBundledAppControlRequest = 27,
+    kMessageResourceGetRequest = 28,
+    kMessageResourceSetRequest = 29,
+    kMessageResourceRemoveRequest = 30,
+    kMessageContainerUpsertRequest = 31,
+    kMessageContainerRemoveRequest = 32,
+    kMessageContainerListRequest = 33,
     kMessageCommandResponse = 100,
     kMessageBackendListResponse = 101,
     kMessageAppListResponse = 102,
@@ -410,6 +424,16 @@ struct CommandRequest {
     const char *scope = "";
     const char *stageRoot = "";
     const char *sudoPassword = "";
+    const char *resourceKey = "";
+    const char *resourceData = "";
+    size_t resourceDataLength = 0;
+    const char *containerIdentifier = "";
+    const char *providerId = "";
+    const char *runtimeName = "";
+    const char *projectResourceKey = "";
+    uint64_t createdAtMilliseconds = 0;
+    uint32_t cpus = 2;
+    uint32_t memoryInGB = 2;
     bool usedDeprecatedIcons = false;
     bool readSudoPasswordFromStdin = false;
 };
@@ -603,6 +627,16 @@ bool mapCommand(const char *resource, const char *action, uint16_t &messageType)
         } else {
             return false;
         }
+    } else if (strcmp(resource, "resource") == 0) {
+        if (strcmp(action, "get") == 0) messageType = kMessageResourceGetRequest;
+        else if (strcmp(action, "set") == 0) messageType = kMessageResourceSetRequest;
+        else if (strcmp(action, "remove") == 0) messageType = kMessageResourceRemoveRequest;
+        else return false;
+    } else if (strcmp(resource, "container") == 0) {
+        if (strcmp(action, "upsert") == 0) messageType = kMessageContainerUpsertRequest;
+        else if (strcmp(action, "remove") == 0) messageType = kMessageContainerRemoveRequest;
+        else if (strcmp(action, "list") == 0) messageType = kMessageContainerListRequest;
+        else return false;
     } else {
         return false;
     }
@@ -735,6 +769,40 @@ bool parseCommandRequest(int argc, char *argv[], CommandRequest &request, Buffer
             REQUIRE_VALUE("--stage-root", request.stageRoot);
         } else if (strcmp(arg, "--sudo-password-stdin") == 0) {
             request.readSudoPasswordFromStdin = true;
+        } else if (strcmp(arg, "--key") == 0) {
+            REQUIRE_VALUE("--key", request.resourceKey);
+        } else if (strcmp(arg, "--container") == 0) {
+            REQUIRE_VALUE("--container", request.containerIdentifier);
+        } else if (strcmp(arg, "--provider") == 0) {
+            REQUIRE_VALUE("--provider", request.providerId);
+        } else if (strcmp(arg, "--runtime-name") == 0) {
+            REQUIRE_VALUE("--runtime-name", request.runtimeName);
+        } else if (strcmp(arg, "--project-key") == 0) {
+            REQUIRE_VALUE("--project-key", request.projectResourceKey);
+        } else if (strcmp(arg, "--cpus") == 0) {
+            const char *raw = nullptr;
+            REQUIRE_VALUE("--cpus", raw);
+            if (!parseUInt32(raw, 1024, request.cpus) || request.cpus == 0) {
+                assignCString(errorMessage, "Invalid --cpus value.");
+                return false;
+            }
+        } else if (strcmp(arg, "--memory-gb") == 0) {
+            const char *raw = nullptr;
+            REQUIRE_VALUE("--memory-gb", raw);
+            if (!parseUInt32(raw, 1048576, request.memoryInGB) || request.memoryInGB == 0) {
+                assignCString(errorMessage, "Invalid --memory-gb value.");
+                return false;
+            }
+        } else if (strcmp(arg, "--created-at-milliseconds") == 0) {
+            const char *raw = nullptr;
+            REQUIRE_VALUE("--created-at-milliseconds", raw);
+            char *end = nullptr;
+            unsigned long long value = strtoull(raw, &end, 10);
+            if (!end || *end != '\0') {
+                assignCString(errorMessage, "Invalid --created-at-milliseconds value.");
+                return false;
+            }
+            request.createdAtMilliseconds = static_cast<uint64_t>(value);
         } else {
             errorMessage.size = 0;
             if (errorMessage.data) errorMessage.data[0] = '\0';
@@ -754,6 +822,24 @@ bool parseCommandRequest(int argc, char *argv[], CommandRequest &request, Buffer
             assignCString(errorMessage, "Missing --stage-root for bundled-app install.");
             return false;
         }
+    }
+    if ((request.messageType == kMessageResourceGetRequest ||
+         request.messageType == kMessageResourceSetRequest ||
+         request.messageType == kMessageResourceRemoveRequest) &&
+        !request.resourceKey[0]) {
+        assignCString(errorMessage, "Missing resource key.");
+        return false;
+    }
+    if ((request.messageType == kMessageContainerUpsertRequest ||
+         request.messageType == kMessageContainerRemoveRequest) &&
+        !request.containerIdentifier[0]) {
+        assignCString(errorMessage, "Missing container identifier.");
+        return false;
+    }
+    if (request.messageType == kMessageContainerUpsertRequest &&
+        (!request.displayName[0] || !request.providerId[0] || !request.runtimeName[0])) {
+        assignCString(errorMessage, "Container upsert requires --name, --provider, and --runtime-name.");
+        return false;
     }
     return true;
 }
@@ -839,6 +925,45 @@ bool appendCommandRequestMessage(Buffer &message, const CommandRequest &request)
     case kMessageBundledAppControlRequest: {
         const char *values[] = {request.action, request.backend, request.scope, request.stageRoot, request.sudoPassword};
         ok = ok && appendStringRefs(message, values, 5);
+        break;
+    }
+    case kMessageResourceGetRequest:
+    case kMessageResourceRemoveRequest: {
+        const char *values[] = {request.resourceKey};
+        ok = ok && appendStringRefs(message, values, 1);
+        break;
+    }
+    case kMessageResourceSetRequest: {
+        const size_t refsOffset = message.size;
+        ok = ok &&
+            appendZeroBytes(message, 16) &&
+            appendOuterctlApiStringRef(message, refsOffset, request.resourceKey) &&
+            appendOuterctlApiStringRefBytes(message,
+                                            refsOffset + 8,
+                                            request.resourceData,
+                                            request.resourceDataLength);
+        break;
+    }
+    case kMessageContainerUpsertRequest: {
+        const char *values[] = {
+            request.containerIdentifier,
+            request.displayName,
+            request.providerId,
+            request.runtimeName,
+            request.projectResourceKey
+        };
+        ok = ok &&
+            appendLittleEndianUInt16(message, request.flags) &&
+            appendLittleEndianUInt32(message, request.cpus) &&
+            appendLittleEndianUInt32(message, request.memoryInGB) &&
+            appendLittleEndianUInt64(message, request.createdAtMilliseconds) &&
+            appendStringRefs(message, values, 5);
+        break;
+    }
+    case kMessageContainerRemoveRequest:
+    case kMessageContainerListRequest: {
+        const char *values[] = {request.containerIdentifier};
+        ok = ok && appendStringRefs(message, values, 1);
         break;
     }
     default:
@@ -1863,6 +1988,7 @@ int main(int argc, char *argv[]) {
               stderr);
     }
     char sudoPassword[1024] = "";
+    Buffer resourceInput;
     if (request.readSudoPasswordFromStdin) {
         if (!fgets(sudoPassword, sizeof(sudoPassword), stdin)) {
             fprintf(stderr, "Failed to read sudo password from stdin.\n");
@@ -1871,6 +1997,26 @@ int main(int argc, char *argv[]) {
         }
         sudoPassword[strcspn(sudoPassword, "\r\n")] = '\0';
         request.sudoPassword = sudoPassword;
+    }
+    if (request.messageType == kMessageResourceSetRequest) {
+        char bytes[65536];
+        size_t count = 0;
+        while ((count = fread(bytes, 1, sizeof(bytes), stdin)) > 0) {
+            if (!appendBuffer(resourceInput, bytes, count)) {
+                fprintf(stderr, "Failed to read resource data.\n");
+                freeBuffer(resourceInput);
+                freeBuffer(apiError);
+                return 1;
+            }
+        }
+        if (ferror(stdin)) {
+            fprintf(stderr, "Failed to read resource data.\n");
+            freeBuffer(resourceInput);
+            freeBuffer(apiError);
+            return 1;
+        }
+        request.resourceData = resourceInput.data ? resourceInput.data : "";
+        request.resourceDataLength = resourceInput.size;
     }
     Buffer endpointHost;
     Buffer endpointPath;
@@ -1886,11 +2032,13 @@ int main(int argc, char *argv[]) {
         freeBuffer(endpointHost);
         freeBuffer(endpointPath);
         freeBuffer(apiError);
+        freeBuffer(resourceInput);
         return apiExitStatus;
     }
     fprintf(stderr, "%s\n", apiError.data ? apiError.data : "Failed to call outershelld API.");
     freeBuffer(endpointHost);
     freeBuffer(endpointPath);
     freeBuffer(apiError);
+    freeBuffer(resourceInput);
     return 1;
 }

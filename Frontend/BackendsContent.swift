@@ -637,6 +637,9 @@ private struct LocalWorkspaceRecord: Decodable, Equatable {
     let cpus: Int
     let memoryInGB: Int
     let runtimeKind: String?
+    let managementKind: String?
+    let ownsContainer: Bool?
+    let runtimeName: String?
     let supportsLiveMounts: Bool?
     let runtime: Runtime?
     let capabilities: Capabilities?
@@ -684,7 +687,7 @@ private struct LocalWorkspaceRecord: Decodable, Equatable {
         ]
         .filter { !$0.isEmpty }
         .joined(separator: " ")
-        return [
+        let description = [
             runtime.providerName,
             runtime.isolationName,
             operatingSystem,
@@ -692,6 +695,11 @@ private struct LocalWorkspaceRecord: Decodable, Equatable {
         ]
         .filter { !$0.isEmpty }
         .joined(separator: " · ")
+        return isManagedContainer ? description : "Attached · \(description)"
+    }
+
+    var isManagedContainer: Bool {
+        ownsContainer ?? (managementKind != "attached")
     }
 
     var canMountFoldersLive: Bool {
@@ -19601,17 +19609,24 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         workspaceDeletePanelFrame = workspacePanelFrame
 
         let title = makeTextLayer(size: 17, weight: .semibold, color: .labelColor)
-        title.string = "Delete \(workspace.name)?"
+        title.string = workspace.isManagedContainer
+            ? "Delete \(workspace.name)?"
+            : "Remove \(workspace.name) from Outer Shell?"
         title.frame = CGRect(x: 20, y: panelHeight - 46, width: panelWidth - 40, height: 23)
         workspacePanelLayer.addSublayer(title)
 
         let detail = makeTextLayer(size: 12, weight: .regular, color: .secondaryLabelColor)
-        detail.string = "The container and its Outer Shell configuration will be permanently deleted. Mounted folders and their contents will remain on the server. This cannot be undone."
+        detail.string = workspace.isManagedContainer
+            ? "The container and its Outer Shell configuration will be permanently deleted. Mounted folders and their contents will remain on the server. This cannot be undone."
+            : "Outer Shell will forget this registration. The externally managed container and all of its data will remain unchanged."
         detail.isWrapped = true
         detail.frame = CGRect(x: 20, y: 65, width: panelWidth - 40, height: 47)
         workspacePanelLayer.addSublayer(detail)
 
-        let confirm = makeButtonLayer(title: "Delete", emphasized: true)
+        let confirm = makeButtonLayer(
+            title: workspace.isManagedContainer ? "Delete" : "Remove",
+            emphasized: true
+        )
         confirm.applyStyle(
             textCGColor: resolvedCGColor(.white),
             backgroundCGColor: resolvedCGColor(.systemRed),
@@ -20483,13 +20498,12 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         let stateOperation = displayedState == "running" ? "stop" : "start"
         let canChangeState = displayedState != "creating" && displayedState != "starting"
         let menuID = UUID()
-        let operations = [
+        var operations = [
             "state": stateOperation,
-            "share": "share",
             "delete": "delete"
         ]
         var items: [OuterframeContextMenuItem] = []
-        items.append(contentsOf: [
+        items.append(
             OuterframeContextMenuItem(id: "state",
                                       title: canChangeState
                                         ? (stateOperation == "stop" ? "Stop" : "Start")
@@ -20497,19 +20511,30 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                       isEnabled: canChangeState && !isPerformingWorkspaceOperation,
                                       systemImageName: stateOperation == "stop"
                                         ? "stop.fill"
-                                        : "play.fill"),
-            OuterframeContextMenuItem(id: "share",
-                                      title: "Share Container…",
-                                      isEnabled: !isPerformingWorkspaceOperation,
-                                      systemImageName: "square.and.arrow.up"),
+                                        : "play.fill")
+        )
+        if workspace.isManagedContainer {
+            operations["share"] = "share"
+            items.append(
+                OuterframeContextMenuItem(id: "share",
+                                          title: "Share Container…",
+                                          isEnabled: !isPerformingWorkspaceOperation,
+                                          systemImageName: "square.and.arrow.up")
+            )
+        }
+        items.append(contentsOf: [
             OuterframeContextMenuItem(id: "delete-separator",
                                       title: "",
                                       kind: .separator,
                                       isEnabled: false),
             OuterframeContextMenuItem(id: "delete",
-                                      title: "Delete Container…",
+                                      title: workspace.isManagedContainer
+                                        ? "Delete Container…"
+                                        : "Remove from Outer Shell…",
                                       isEnabled: !isPerformingWorkspaceOperation,
-                                      systemImageName: "trash")
+                                      systemImageName: workspace.isManagedContainer
+                                        ? "trash"
+                                        : "minus.circle")
         ])
         pendingWorkspaceOverviewMenuActions[menuID] = (workspace, operations, point)
         outerframeHost.showContextMenu(menuID: menuID, items: items, at: point)

@@ -1,45 +1,48 @@
-# OuterShell Registry Binary Format
+# Outer Shell Registry Binary Format
 
-This file format is the source of truth for the outershell registry.
+`registry.orwa` is the source of truth for Outer Shell's service registry and
+private durable resources. Catalogs and container recipes are stored here
+rather than in parallel JSON files.
 
-The backend `unit_path` field can contain either a launchd plist path or a portable `.outerservice` path. A `.outerservice` suffix selects `outershelld`'s internal manager; `unit_name` remains empty. This preserves the registry row layout. See [outerservice.md](outerservice.md).
+The backend `unit_path` field can contain either a launchd plist path or a
+portable `.outerservice` path. A `.outerservice` suffix selects `outershelld`'s
+internal manager; `unit_name` remains empty. See [outerservice.md](outerservice.md).
 
 All scalar values are little-endian. Strings are UTF-8 without a trailing NUL.
-Offsets are absolute offsets from byte 0 of the file. A string or data reference
-with `offset = 0` and `length = 0` means the value is absent or empty.
+Offsets are absolute offsets from byte 0 of the containing file. A reference
+with both offset and length equal to zero represents an absent or empty value.
 
 ## Shared References
 
 ```text
-StringRef64:
-bytes 0..7:   UInt64 little-endian offset to UTF-8 bytes, O
-bytes 8..15:  UInt64 little-endian UTF-8 byte length, L
+StringRef64 or DataRef64:
+bytes 0..7:   UInt64 absolute offset, O
+bytes 8..15:  UInt64 byte length, L
 
-DataRef64:
-bytes 0..7:   UInt64 little-endian offset to raw bytes, O
-bytes 8..15:  UInt64 little-endian data length, L
+StringRef32:
+bytes 0..3:   UInt32 absolute offset, O
+bytes 4..7:   UInt32 byte length, L
+
+StringListRef64:
+bytes 0..7:   UInt64 absolute offset to consecutive StringRef64 values
+bytes 8..15:  UInt64 item count
 ```
 
 Referenced ranges are valid only when `offset <= fileLength` and
-`length <= fileLength - offset`.
-
-All table rows share a single file-wide variable region. This means common
-values such as a backend `service_id` can point to the same bytes from multiple
-tables.
+`length <= fileLength - offset`. All rows share one file-wide variable region,
+allowing repeated strings to point to the same bytes.
 
 ## File Header
 
-The fixed header stores the location, row count, and row size for each table.
-Version 1 has exactly four table descriptors in fixed order.
+Version 1 currently has eight table descriptors in fixed order.
 
 ```text
 bytes 0..3:     Magic bytes `ORWA`
 bytes 4..7:     UInt32 format version, currently 1
-
-bytes 8..87:    Four TableDescriptor records
+bytes 8..167:   Eight TableDescriptor records
 ```
 
-`TableDescriptor` is 20 bytes:
+Each `TableDescriptor` is 20 bytes:
 
 ```text
 bytes 0..7:    UInt64 absolute offset to first row
@@ -47,17 +50,22 @@ bytes 8..15:   UInt64 row count
 bytes 16..19:  UInt32 row size
 ```
 
-The table descriptors are in this order:
+Descriptors are ordered as follows:
 
 ```text
 0 backends
 1 frontends
 2 frontend_layouts
 3 log_files
+4 content_types
+5 file_openers
+6 resources
+7 containers
 ```
 
-Tables are stored contiguously immediately after the header in descriptor order.
-The variable region starts immediately after the last table.
+Tables are contiguous immediately after the header. The variable region starts
+after the final table. Pre-release three-, four-, six-, and seven-table files
+are accepted and rewritten in the current layout on the next mutation.
 
 ## Tables
 
@@ -70,49 +78,40 @@ bytes 0..15:   StringRef64 service_id
 bytes 16..31:  StringRef64 display_name
 bytes 32..47:  StringRef64 unit_name
 bytes 48..63:  StringRef64 unit_path
-bytes 64..67:  UInt32 flags
-                bit 0 = owns_unit
+bytes 64..67:  UInt32 flags; bit 0 = owns_unit
 ```
 
 ### `frontends`
 
-Row size: 113 bytes.
+Row size: 80 bytes.
 
 ```text
-bytes 0..15:    StringRef64 url
-bytes 16..31:   StringRef64 service_id
-bytes 32..47:   StringRef64 display_name
-bytes 48..63:   StringRef64 icon_path
-bytes 64..79:   StringRef64 suggested_list
-byte 80:        UInt8 endpoint_kind
-                 0 = none
-                 1 = port
-                 2 = socket_path
-bytes 81..96:   EndpointPayload
-bytes 97..112:  StringRef64 frontend_id
-
-EndpointPayload when endpoint_kind = 1:
-bytes 81..84:    UInt32 port
-bytes 85..96:    zero-filled
-
-EndpointPayload when endpoint_kind = 2:
-bytes 81..96:    StringRef64 socket_path
+bytes 0..7:    StringRef32 frontend_id
+bytes 8..15:   StringRef32 service_id
+bytes 16..23:  StringRef32 display_name
+bytes 24..31:  StringRef32 icon_path
+bytes 32..39:  StringRef32 suggested_list
+bytes 40..41:  UInt16 endpoint_kind; 0 none, 1 TCP, 2 Unix
+bytes 42..43:  UInt16 endpoint_flags
+bytes 44..45:  UInt16 endpoint_scheme; 0 default, 1 HTTP, 2 HTTPS
+bytes 46..47:  reserved
+bytes 48..55:  StringRef32 URL path
+bytes 56..79:  endpoint payload
 ```
 
-The registry stores app metadata and endpoint hints, not runtime status. Outer
-Shell derives whether an app is running from the registered service manager
-unit.
+For a TCP endpoint the payload contains a host `StringRef32` at bytes 56..63
+and a `UInt16` port at bytes 64..65. For a Unix endpoint it contains socket and
+external-socket `StringRef32` values at bytes 56..63 and 64..71.
 
-`suggested_list` is announced by the backend. User placement is stored in
-`frontend_layouts`; when a layout row exists for a URL, it overrides
-`suggested_list`, including when the layout string is empty.
+The registry stores endpoint metadata, not runtime status. User placement in
+`frontend_layouts` overrides `suggested_list` when present.
 
 ### `frontend_layouts`
 
 Row size: 32 bytes.
 
 ```text
-bytes 0..15:   StringRef64 url
+bytes 0..15:   StringRef64 URL
 bytes 16..31:  StringRef64 list
 ```
 
@@ -125,22 +124,111 @@ bytes 0..15:   StringRef64 path
 bytes 16..31:  StringRef64 service_id
 ```
 
-## Locking And Atomic Writes
+### `content_types`
 
-Writers coordinate using a sidecar file:
+Row size: 96 bytes.
 
 ```text
-registry.orwa.lock
+bytes 0..15:   StringRef64 service_id
+bytes 16..31:  StringRef64 identifier
+bytes 32..47:  StringRef64 display_name
+bytes 48..63:  StringListRef64 conforms_to
+bytes 64..79:  StringListRef64 extensions
+bytes 80..95:  StringListRef64 MIME types
 ```
 
-Readers do not take a lock. They open `registry.orwa`, read the file they
-opened, and validate bounds while parsing. A writer replacing the path with
-`rename` does not affect readers that already opened the old file.
+### `file_openers`
 
-Writers take an exclusive lock, write a unique temp file, `fsync` it, rename it
-over `registry.orwa`, then `fsync` the containing directory.
+Row size: 56 bytes.
 
-The write path is:
+```text
+bytes 0..15:   StringRef64 extension or content type
+bytes 16..31:  StringRef64 frontend_id
+bytes 32..47:  StringRef64 URL template
+bytes 48..51:  UInt32 rank
+bytes 52..55:  UInt32 capability flags
+```
+
+### `resources`
+
+Row size: 32 bytes.
+
+```text
+bytes 0..15:   StringRef64 key
+bytes 16..31:  DataRef64 opaque payload
+```
+
+Resources let subsystems keep typed private state in the same atomic registry
+without coupling every field to the daemon's core schema. Container provider
+caches and recipes use keys under `containers/` and encode their payloads as
+typed offset archives.
+
+### `containers`
+
+Row size: 104 bytes.
+
+```text
+bytes 0..15:    StringRef64 stable identifier
+bytes 16..31:   StringRef64 display name
+bytes 32..47:   StringRef64 provider identifier
+bytes 48..63:   StringRef64 provider runtime name
+bytes 64..79:   StringRef64 optional project resource key
+bytes 80..87:   UInt64 creation time in Unix milliseconds
+bytes 88..91:   UInt32 CPU ceiling
+bytes 92..95:   UInt32 memory ceiling in GiB
+bytes 96..99:   UInt32 flags; bit 0 = owns_container
+bytes 100..103: reserved
+```
+
+The provider and runtime name locate the real container. An owned record lets
+Outer Shell create, rebuild, migrate, and delete that runtime. An attached
+record is observational: Outer Shell may start or stop it through its provider,
+discover its apps, and relay its sockets, but unregistering it never deletes
+the runtime or its data. This is the container equivalent of `owns_unit` on a
+backend row.
+
+## Typed Resource Archive
+
+The `ORWV` archive is an offset-based value tree used inside resource payloads
+and `.outershell-container` transfer manifests.
+
+```text
+bytes 0..3:    Magic bytes `ORWV`
+bytes 4..7:    UInt32 version, currently 1
+bytes 8..15:   UInt64 absolute offset to root node
+```
+
+Every node is 24 bytes:
+
+```text
+byte 0:        UInt8 value type
+bytes 1..7:    reserved
+bytes 8..15:   UInt64 scalar value or payload offset
+bytes 16..23:  UInt64 payload byte length or child count
+```
+
+Value types are:
+
+```text
+2 Boolean       scalar is 0 or 1
+3 signed integer, stored as two's-complement UInt64
+4 IEEE-754 binary64, stored in the scalar bits
+5 UTF-8 string  payload offset and byte length
+6 data          payload offset and byte length
+7 array         payload is consecutive UInt64 child-node offsets
+8 dictionary    payload is sorted pairs of UInt64 key/value node offsets
+9 date          IEEE-754 seconds since the Unix epoch in the scalar bits
+```
+
+Dictionary keys are strings and are sorted by their UTF-8 key value so the
+same logical value has stable bytes across implementations.
+
+## Locking And Atomic Writes
+
+Writers coordinate through `registry.orwa.lock`. Readers open and validate a
+snapshot without taking the writer lock. Writers take an exclusive lock, write
+a unique temporary file, `fsync` it, rename it over `registry.orwa`, then
+`fsync` the containing directory.
 
 ```text
 registry.orwa.tmp.XXXXXX -> registry.orwa

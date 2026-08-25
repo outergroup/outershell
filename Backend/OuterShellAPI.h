@@ -29,6 +29,12 @@ enum {
     OUTERSHELLD_API_FILE_OPENERS_QUERY = 25,
     OUTERSHELLD_API_UI_REQUEST = 26,
     OUTERSHELLD_API_BUNDLED_APP_CONTROL_REQUEST = 27,
+    OUTERSHELLD_API_RESOURCE_GET_REQUEST = 28,
+    OUTERSHELLD_API_RESOURCE_SET_REQUEST = 29,
+    OUTERSHELLD_API_RESOURCE_REMOVE_REQUEST = 30,
+    OUTERSHELLD_API_CONTAINER_UPSERT_REQUEST = 31,
+    OUTERSHELLD_API_CONTAINER_REMOVE_REQUEST = 32,
+    OUTERSHELLD_API_CONTAINER_LIST_REQUEST = 33,
     OUTERSHELLD_API_COMMAND_RESPONSE = 100,
     OUTERSHELLD_API_BACKEND_LIST_RESPONSE = 101,
     OUTERSHELLD_API_APP_LIST_RESPONSE = 102,
@@ -89,6 +95,34 @@ typedef struct {
     UiApiContentKind content_kind;
     StringBuilder body;
 } UiApiResponse;
+
+typedef struct {
+    char *identifier;
+    char *display_name;
+    char *provider_id;
+    char *runtime_name;
+    char *project_resource_key;
+    uint64_t created_at_milliseconds;
+    uint32_t cpus;
+    uint32_t memory_in_gb;
+    uint32_t flags;
+} OuterShellRegistryContainer;
+
+enum {
+    OUTERSHELL_REGISTRY_CONTAINER_FLAG_OWNED = 0x01
+};
+
+int OuterShellRegistryCopyContainers(OuterShellRegistryContainer **records,
+                                     size_t *count,
+                                     char *error,
+                                     size_t error_size);
+int OuterShellRegistryUpsertContainer(const OuterShellRegistryContainer *record,
+                                      char *error,
+                                      size_t error_size);
+int OuterShellRegistryRemoveContainer(const char *identifier,
+                                      char *error,
+                                      size_t error_size);
+void OuterShellRegistryFreeContainers(OuterShellRegistryContainer *records, size_t count);
 
 bool api_read_string_ref(const unsigned char *message, size_t message_length, size_t ref_offset, char **out);
 bool api_read_data_ref(const unsigned char *message, size_t message_length, size_t ref_offset, const unsigned char **out, size_t *out_length);
