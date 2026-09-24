@@ -3237,8 +3237,8 @@ final class SafeSpaceManager: @unchecked Sendable {
             throw SafeSpaceManagerError.invalidRequest
         }
         let directory = user == "root"
-            ? "/root/.config/outerloop"
-            : "/home/workspace/.config/outerloop"
+            ? "/root/.config/outerssh"
+            : "/home/workspace/.config/outerssh"
         let entry = "%t/\(name)"
         let directoryMode = "0700"
         let command = """
@@ -5466,7 +5466,7 @@ final class SafeSpaceManager: @unchecked Sendable {
         test -x "${source_directory}/outerctl"
         test -x "${source_directory}/outer-socket-bridge"
         /bin/mkdir -p /usr/local/bin /run/user/0 /var/lib/outershell/services \
-            /var/lib/outershell/apps /etc/outershell/apps.d /root/.config/outerloop \
+            /var/lib/outershell/apps /etc/outershell/apps.d /root/.config/outerssh \
             /root/.local/share/jupyter /root/.cache
         /bin/cp "${source_directory}/outershelld" /usr/local/bin/outershelld
         /bin/cp "${source_directory}/outerctl" /usr/local/bin/outerctl
@@ -5477,7 +5477,7 @@ final class SafeSpaceManager: @unchecked Sendable {
         /bin/chmod 0755 /usr/local/bin/outershelld /usr/local/bin/outerctl \
             /usr/local/bin/outer-socket-bridge \
             /usr/local/bin/outershell-container-init
-        /bin/chmod 0700 /run/user/0 /root/.config/outerloop
+        /bin/chmod 0700 /run/user/0 /root/.config/outerssh
         """
     }
 
@@ -5486,13 +5486,13 @@ final class SafeSpaceManager: @unchecked Sendable {
         #!/bin/sh
         set -eu
         umask 022
-        /bin/mkdir -p /run/user/0 /root/.config/outerloop /var/lib/outershell/services \
+        /bin/mkdir -p /run/user/0 /root/.config/outerssh /var/lib/outershell/services \
             /var/lib/outershell/apps /etc/outershell/apps.d /root/.local/share/jupyter \
             /root/.cache
-        /bin/chmod 0700 /run/user/0 /root/.config/outerloop
+        /bin/chmod 0700 /run/user/0 /root/.config/outerssh
         /usr/bin/printf '%s\n' '%t/outershelld-api' \
-            >/root/.config/outerloop/http-unix.allow
-        /bin/chmod 0600 /root/.config/outerloop/http-unix.allow
+            >/root/.config/outerssh/http-unix.allow
+        /bin/chmod 0600 /root/.config/outerssh/http-unix.allow
         export HOME=/root USER=root LOGNAME=root XDG_RUNTIME_DIR=/run/user/0
         export OUTERSHELL_HOME=/var/lib/outershell
         export OUTERSHELLD_API_SOCKET=/run/user/0/outershelld-api
@@ -5750,7 +5750,7 @@ final class SafeSpaceManager: @unchecked Sendable {
         let directory = URL(fileURLWithPath: String(cString: home), isDirectory: true)
             .appendingPathComponent("Library", isDirectory: true)
             .appendingPathComponent("Application Support", isDirectory: true)
-            .appendingPathComponent("dev.outergroup.OuterLoop", isDirectory: true)
+            .appendingPathComponent("org.outerssh", isDirectory: true)
         try FileManager.default.createDirectory(
             at: directory,
             withIntermediateDirectories: true,

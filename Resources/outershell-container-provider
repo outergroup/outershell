@@ -1672,7 +1672,7 @@ def operation_app_logs(request):
 def authorize_host_socket(path):
     configuration = pathlib.Path(os.environ.get(
         "XDG_CONFIG_HOME", pathlib.Path.home() / ".config"
-    )) / "outerloop"
+    )) / "outerssh"
     configuration.mkdir(parents=True, exist_ok=True, mode=0o700)
     allowlist = configuration / "http-unix.allow"
     lines = []
@@ -1689,11 +1689,11 @@ def authorize_host_socket(path):
 def authorize_container_socket(container_id, socket_path):
     name = pathlib.PurePosixPath(socket_path).name
     command = (
-        "mkdir -p /root/.config/outerloop && "
-        "touch /root/.config/outerloop/http-unix.allow && "
-        f"grep -Fxq {shlex.quote('%t/' + name)} /root/.config/outerloop/http-unix.allow || "
-        f"printf '%s\\n' {shlex.quote('%t/' + name)} >> /root/.config/outerloop/http-unix.allow; "
-        "chmod 0600 /root/.config/outerloop/http-unix.allow"
+        "mkdir -p /root/.config/outerssh && "
+        "touch /root/.config/outerssh/http-unix.allow && "
+        f"grep -Fxq {shlex.quote('%t/' + name)} /root/.config/outerssh/http-unix.allow || "
+        f"printf '%s\\n' {shlex.quote('%t/' + name)} >> /root/.config/outerssh/http-unix.allow; "
+        "chmod 0600 /root/.config/outerssh/http-unix.allow"
     )
     container_exec(container_id, ["/bin/sh", "-c", command], check=True)
 

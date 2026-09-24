@@ -305,30 +305,30 @@ static void system_runtime_directory(char *out, size_t out_size) {
 }
 
 
-static void outerloop_http_unix_allowlist_path(bool system_scope, char *out, size_t out_size) {
+static void outerssh_http_unix_allowlist_path(bool system_scope, char *out, size_t out_size) {
     if (!out || out_size == 0) return;
 #ifdef __APPLE__
     if (system_scope) {
-        snprintf(out, out_size, "/Library/Application Support/dev.outergroup.OuterLoop/http-unix.allow");
+        snprintf(out, out_size, "/Library/Application Support/org.outerssh/http-unix.allow");
     } else {
-        snprintf(out, out_size, "%s/Library/Application Support/dev.outergroup.OuterLoop/http-unix.allow", home_directory());
+        snprintf(out, out_size, "%s/Library/Application Support/org.outerssh/http-unix.allow", home_directory());
     }
 #else
     if (system_scope) {
-        snprintf(out, out_size, "/etc/outerloop/http-unix.allow");
+        snprintf(out, out_size, "/etc/outerssh/http-unix.allow");
     } else {
         const char *config_home = getenv("XDG_CONFIG_HOME");
         if (config_home && config_home[0]) {
-            snprintf(out, out_size, "%s/outerloop/http-unix.allow", config_home);
+            snprintf(out, out_size, "%s/outerssh/http-unix.allow", config_home);
         } else {
-            snprintf(out, out_size, "%s/.config/outerloop/http-unix.allow", home_directory());
+            snprintf(out, out_size, "%s/.config/outerssh/http-unix.allow", home_directory());
         }
     }
 #endif
 }
 
 
-static void outerloop_http_unix_allowlist_entry(const char *socket_path,
+static void outerssh_http_unix_allowlist_entry(const char *socket_path,
                                                 bool system_scope,
                                                 char *out,
                                                 size_t out_size) {
@@ -370,15 +370,15 @@ static bool text_contains_exact_line(const char *text, const char *line) {
 }
 
 
-static bool append_outerloop_http_unix_allowlist_entry(const char *socket_path,
+static bool append_outerssh_http_unix_allowlist_entry(const char *socket_path,
                                                        bool system_scope,
                                                        char *error,
                                                        size_t error_size) {
     if (!socket_path || !socket_path[0]) return true;
     char allowlist_path[PATH_MAX];
     char entry[PATH_MAX + 16];
-    outerloop_http_unix_allowlist_path(system_scope, allowlist_path, sizeof(allowlist_path));
-    outerloop_http_unix_allowlist_entry(socket_path, system_scope, entry, sizeof(entry));
+    outerssh_http_unix_allowlist_path(system_scope, allowlist_path, sizeof(allowlist_path));
+    outerssh_http_unix_allowlist_entry(socket_path, system_scope, entry, sizeof(entry));
     if (!entry[0]) return true;
 
     char directory[PATH_MAX];
@@ -460,7 +460,7 @@ static bool append_outerloop_http_unix_allowlist_entry(const char *socket_path,
 }
 
 
-static bool append_outerloop_http_unix_allowlist_entry_for_current_scope(const char *socket_path,
+static bool append_outerssh_http_unix_allowlist_entry_for_current_scope(const char *socket_path,
                                                                          char *error,
                                                                          size_t error_size) {
     bool system_scope = geteuid() == 0;
@@ -469,7 +469,7 @@ static bool append_outerloop_http_unix_allowlist_entry_for_current_scope(const c
         current_user_runtime_directory(runtime_dir, sizeof(runtime_dir));
         if (path_has_directory_prefix(socket_path, runtime_dir)) system_scope = false;
     }
-    return append_outerloop_http_unix_allowlist_entry(socket_path, system_scope, error, error_size);
+    return append_outerssh_http_unix_allowlist_entry(socket_path, system_scope, error, error_size);
 }
 
 
@@ -9337,7 +9337,7 @@ static bool register_created_backend(const char *service_id,
     }
     ok = registry_store_close(&database, ok, error, error_size) && ok;
     if (ok && frontend_socket_path && frontend_socket_path[0]) {
-        ok = append_outerloop_http_unix_allowlist_entry(frontend_socket_path,
+        ok = append_outerssh_http_unix_allowlist_entry(frontend_socket_path,
                                                         direct_root_session_uses_system_scope(),
                                                         error,
                                                         error_size);
@@ -10706,7 +10706,7 @@ static int outershelld_handle_outerctl(int argc, char **argv, StringBuilder *std
         return 1;
     }
     if (allowlist_socket_path[0] &&
-        !append_outerloop_http_unix_allowlist_entry_for_current_scope(allowlist_socket_path, error, sizeof(error))) {
+        !append_outerssh_http_unix_allowlist_entry_for_current_scope(allowlist_socket_path, error, sizeof(error))) {
         sb_append(stderr_buffer, error[0] ? error : "Failed to update Outer Loop Unix socket allowlist.");
         sb_append(stderr_buffer, "\n");
         return 1;
@@ -10780,7 +10780,7 @@ static bool upsert_outerservice_backend_registry(const char *service_id,
     }
     ok = registry_store_close(&database, ok, error, error_size) && ok;
     if (ok && socket_path && socket_path[0]) {
-        ok = append_outerloop_http_unix_allowlist_entry(socket_path,
+        ok = append_outerssh_http_unix_allowlist_entry(socket_path,
                                                         scope && strcmp(scope, "system") == 0,
                                                         error,
                                                         error_size);
@@ -10821,7 +10821,7 @@ static bool upsert_systemd_backend_registry(const char *service_id,
     }
     ok = registry_store_close(&database, ok, error, error_size) && ok;
     if (ok && socket_path && socket_path[0]) {
-        ok = append_outerloop_http_unix_allowlist_entry(socket_path,
+        ok = append_outerssh_http_unix_allowlist_entry(socket_path,
                                                         scope && strcmp(scope, "system") == 0,
                                                         error,
                                                         error_size);
@@ -10865,7 +10865,7 @@ static bool upsert_launchd_backend_registry_at(const char *database_path,
     ok = registry_store_close(&database, ok, error, error_size) && ok;
     if (ok && socket_path && socket_path[0]) {
         bool system_scope = database_path && strcmp(database_path, g_system_registry_database_path) == 0;
-        ok = append_outerloop_http_unix_allowlist_entry(socket_path, system_scope, error, error_size);
+        ok = append_outerssh_http_unix_allowlist_entry(socket_path, system_scope, error, error_size);
     }
     return ok;
 }
@@ -10972,7 +10972,7 @@ static void repair_user_bundled_app_registry_records(void) {
 
         char allowlist_error[512] = "";
         if (socket_path[0] &&
-            !append_outerloop_http_unix_allowlist_entry(socket_path, false, allowlist_error, sizeof(allowlist_error))) {
+            !append_outerssh_http_unix_allowlist_entry(socket_path, false, allowlist_error, sizeof(allowlist_error))) {
             log_event("Failed to update allowlist while repairing bundled app %s: %s",
                       app->service_id,
                       allowlist_error[0] ? allowlist_error : "unknown error");

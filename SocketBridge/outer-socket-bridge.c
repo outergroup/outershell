@@ -25,12 +25,12 @@
 #define OSB_ALLOWLIST_MAX_LINE 4096u
 
 #ifdef __APPLE__
-#define OSB_USER_ALLOWLIST_SUFFIX "/Library/Application Support/dev.outergroup.OuterLoop/http-unix.allow"
-#define OSB_SYSTEM_ALLOWLIST "/Library/Application Support/dev.outergroup.OuterLoop/http-unix.allow"
+#define OSB_USER_ALLOWLIST_SUFFIX "/Library/Application Support/org.outerssh/http-unix.allow"
+#define OSB_SYSTEM_ALLOWLIST "/Library/Application Support/org.outerssh/http-unix.allow"
 #define OSB_SYSTEM_RUNTIME_DIR "/var/run"
 #else
-#define OSB_USER_ALLOWLIST_SUFFIX "/.config/outerloop/http-unix.allow"
-#define OSB_SYSTEM_ALLOWLIST "/etc/outerloop/http-unix.allow"
+#define OSB_USER_ALLOWLIST_SUFFIX "/.config/outerssh/http-unix.allow"
+#define OSB_SYSTEM_ALLOWLIST "/etc/outerssh/http-unix.allow"
 #define OSB_SYSTEM_RUNTIME_DIR "/run"
 #endif
 
@@ -185,7 +185,7 @@ static int user_allowlist_path(char *out, size_t out_len) {
 #ifndef __APPLE__
     const char *xdg = getenv("XDG_CONFIG_HOME");
     if (xdg && xdg[0]) {
-        return copy_format(out, out_len, "%s/outerloop/http-unix.allow", xdg);
+        return copy_format(out, out_len, "%s/outerssh/http-unix.allow", xdg);
     }
 #endif
     char home[PATH_MAX];

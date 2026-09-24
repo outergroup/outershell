@@ -286,15 +286,15 @@ allowlist_path_for_scope() {
     scope="$1"
     if [ "$os_name" = "Darwin" ]; then
         if [ "$scope" = "system" ]; then
-            printf '%s\n' "/Library/Application Support/dev.outergroup.OuterLoop/http-unix.allow"
+            printf '%s\n' "/Library/Application Support/org.outerssh/http-unix.allow"
         else
-            printf '%s\n' "$HOME/Library/Application Support/dev.outergroup.OuterLoop/http-unix.allow"
+            printf '%s\n' "$HOME/Library/Application Support/org.outerssh/http-unix.allow"
         fi
     else
         if [ "$scope" = "system" ]; then
-            printf '%s\n' "/etc/outerloop/http-unix.allow"
+            printf '%s\n' "/etc/outerssh/http-unix.allow"
         else
-            printf '%s\n' "${XDG_CONFIG_HOME:-$HOME/.config}/outerloop/http-unix.allow"
+            printf '%s\n' "${XDG_CONFIG_HOME:-$HOME/.config}/outerssh/http-unix.allow"
         fi
     fi
 }
@@ -318,7 +318,7 @@ allowlist_entry_for_socket_path() {
     esac
 }
 
-append_outerloop_http_unix_allowlist_entry() {
+append_outerssh_http_unix_allowlist_entry() {
     scope="$1"
     socket="$2"
     [ -n "$socket" ] || return 0
@@ -625,7 +625,7 @@ EOF
     OUTERSHELL_HOME="$outershell_home" "$outerctl_path" backend upsert --backend "$service_id" --name "$display_name" --launchd-plist "$plist_path" --outershell-owns true
     OUTERSHELL_HOME="$outershell_home" "$outerctl_path" app remove --backend "$service_id" --frontend-id "$service_id:main"
     OUTERSHELL_HOME="$outershell_home" "$outerctl_path" app upsert --backend "$service_id" --socket-path "$socket_path" --name "$display_name" --url "/" --icon-path "$icon_path"
-    append_outerloop_http_unix_allowlist_entry user "$socket_path"
+    append_outerssh_http_unix_allowlist_entry user "$socket_path"
     OUTERSHELL_HOME="$outershell_home" "$outerctl_path" log remove --backend "$service_id" --path "$log_path"
     OUTERSHELL_HOME="$outershell_home" "$outerctl_path" log add --backend "$service_id" --path "$log_path"
     if [ "$command" = "update" ]; then
@@ -1380,9 +1380,9 @@ fi
 run_outerctl app remove --backend org.outershell.OuterShell --frontend-id org.outershell.OuterShell:main
 run_outerctl app upsert --backend org.outershell.OuterShell --socket-path "$socket_path" --name "Outer Shell" --url "/" --icon-path "$install_root/app-icon.png"
 if [ "$root_install" = true ]; then
-    append_outerloop_http_unix_allowlist_entry system "$socket_path"
+    append_outerssh_http_unix_allowlist_entry system "$socket_path"
 else
-    append_outerloop_http_unix_allowlist_entry user "$socket_path"
+    append_outerssh_http_unix_allowlist_entry user "$socket_path"
 fi
 run_outerctl log remove --backend org.outershell.OuterShell --path "$log_path"
 run_outerctl log add --backend org.outershell.OuterShell --path "$log_path"
