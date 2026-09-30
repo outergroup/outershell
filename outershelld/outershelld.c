@@ -13,6 +13,9 @@
 #include <pthread.h>
 #include <pwd.h>
 #include <signal.h>
+#include <spawn.h>
+
+extern char **environ;
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdarg.h>
@@ -1076,6 +1079,10 @@ typedef struct {
     int64_t last_activity_ms;
     bool waiting_for_api_response;
     int api_response_fd;
+    pid_t provider_pid;
+    int provider_output_fd;
+    bool provider_output_closed;
+    StringBuilder provider_output;
     bool waiting_for_events;
     bool event_response_is_api;
     int64_t event_deadline_ms;
@@ -14778,6 +14785,87 @@ static void process_ui_route_request(uint16_t route, const char *query, const ch
     if (response->status == 0) response->status = 500;
 }
 
+// The provider calls back into the registry through the normal API socket. Keep
+// discovery outside the reactor, and collect its response without blocking it.
+static bool start_provider_request(ReactorClient *client, const char *body, size_t length) {
+    const char *provider = getenv("OUTER_SHELL_CONTAINER_PROVIDER");
+    if (!provider || !provider[0] || access(provider, X_OK) != 0) return false;
+    FILE *input = tmpfile();
+    if (!input) return false;
+    if (fwrite(body, 1, length, input) != length || fflush(input) != 0 || fseek(input, 0, SEEK_SET) != 0) {
+        fclose(input);
+        return false;
+    }
+    int output[2];
+    if (pipe(output) != 0) { fclose(input); return false; }
+    fcntl(output[0], F_SETFD, FD_CLOEXEC);
+    fcntl(output[1], F_SETFD, FD_CLOEXEC);
+    size_t environment_count = 0;
+    while (environ[environment_count]) environment_count++;
+    char **environment = calloc(environment_count + 2, sizeof(char *));
+    char api_environment[PATH_MAX + 32];
+    snprintf(api_environment, sizeof(api_environment), "OUTERSHELLD_API_SOCKET=%s", g_api_socket_path);
+    size_t copied = 0;
+    if (environment) {
+        for (size_t i = 0; i < environment_count; i++) {
+            if (strncmp(environ[i], "OUTERSHELLD_API_SOCKET=", sizeof("OUTERSHELLD_API_SOCKET=") - 1) != 0) environment[copied++] = environ[i];
+        }
+        environment[copied] = api_environment;
+    }
+    posix_spawn_file_actions_t actions;
+    int error = environment ? posix_spawn_file_actions_init(&actions) : ENOMEM;
+    bool initialized = error == 0;
+    if (!error) error = posix_spawn_file_actions_adddup2(&actions, fileno(input), STDIN_FILENO);
+    if (!error) error = posix_spawn_file_actions_adddup2(&actions, output[1], STDOUT_FILENO);
+    if (!error) error = posix_spawn_file_actions_addclose(&actions, fileno(input));
+    if (!error) error = posix_spawn_file_actions_addclose(&actions, output[0]);
+    if (!error) error = posix_spawn_file_actions_addclose(&actions, output[1]);
+    pid_t child = -1;
+    char *arguments[] = {(char *)provider, "request", NULL};
+    if (!error) error = posix_spawn(&child, provider, &actions, NULL, arguments, environment);
+    if (initialized) posix_spawn_file_actions_destroy(&actions);
+    free(environment);
+    fclose(input);
+    close(output[1]);
+    if (error) { close(output[0]); return false; }
+    set_fd_nonblocking(output[0], true);
+    client->provider_pid = child;
+    client->provider_output_fd = output[0];
+    return true;
+}
+
+static bool collect_provider_response(ReactorClient *client) {
+    if (!client->provider_output_closed) {
+        char buffer[8192];
+        // Bound each turn so a large response cannot monopolize the reactor.
+        for (int i = 0; i < 32; i++) {
+            ssize_t count = read(client->provider_output_fd, buffer, sizeof(buffer));
+            if (count > 0) {
+                if (client->provider_output.length + (size_t)count > 16u * 1024u * 1024u ||
+                    !sb_append_n(&client->provider_output, buffer, (size_t)count)) return true;
+            } else if (count == 0) {
+                close(client->provider_output_fd);
+                client->provider_output_fd = -1;
+                client->provider_output_closed = true;
+                break;
+            } else if (errno == EINTR) continue;
+            else if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+            else return true;
+        }
+    }
+    if (!client->provider_output_closed) return false;
+    int status = 0;
+    pid_t result = waitpid(client->provider_pid, &status, WNOHANG);
+    if (result == 0 || (result < 0 && errno == EINTR)) return false;
+    client->provider_pid = 0;
+    UiApiResponse response = {0};
+    response.status = result > 0 && WIFEXITED(status) && WEXITSTATUS(status) == 0 ? 200 : 500;
+    response.content_kind = UI_API_CONTENT_BINARY;
+    response.body = client->provider_output;
+    api_send_ui_response(client->fd, &response);
+    return true;
+}
+
 static bool process_api_ui_request(ReactorClient *client, const unsigned char *message, size_t message_length) {
     char *query = NULL;
     const unsigned char *body = NULL;
@@ -14801,6 +14889,12 @@ static bool process_api_ui_request(ReactorClient *client, const unsigned char *m
             free(query);
             return true;
         }
+    } else if (route == OUTERSHELLD_UI_ROUTE_SAFE_SPACES && !g_safe_space_request_callback) {
+        if (start_provider_request(client, (const char *)body, body_length)) {
+            free(query);
+            return true;
+        }
+        ui_api_set_text_response(&response, 503, "Could not start the container provider.\n");
     } else {
         process_ui_route_request(route, query ? query : "", (const char *)body, body_length, &response);
     }
@@ -16413,6 +16507,12 @@ static bool socket_activation_enabled(void) {
 
 static void close_reactor_client(ReactorClient *clients, size_t *client_count, size_t index) {
     if (index >= *client_count) return;
+    if (clients[index].provider_pid > 0) {
+        kill(clients[index].provider_pid, SIGKILL);
+        while (waitpid(clients[index].provider_pid, NULL, 0) < 0 && errno == EINTR) {}
+    }
+    if (clients[index].provider_output_fd >= 0) close(clients[index].provider_output_fd);
+    free(clients[index].provider_output.data);
     close(clients[index].fd);
     if (clients[index].api_response_fd >= 0) {
         close(clients[index].api_response_fd);
@@ -16444,6 +16544,7 @@ static void add_reactor_client(ReactorClient *clients, size_t *client_count, int
     client->request_capacity = READ_BUFFER_SIZE;
     client->fd = client_fd;
     client->api_response_fd = -1;
+    client->provider_output_fd = -1;
     client->is_api = is_api;
 #ifndef __APPLE__
     struct ucred credentials;
@@ -16604,14 +16705,21 @@ static void run_api_reactor(int api_listener) {
     set_fd_nonblocking(api_listener, true);
     while (!g_shutdown_requested && !outer_service_manager_exit_requested(g_outer_service_manager)) {
         flush_ready_event_clients(clients, &client_count);
+        for (size_t i = client_count; i > 0; i--) {
+            if (clients[i - 1].provider_pid > 0 && clients[i - 1].provider_output_closed &&
+                collect_provider_response(&clients[i - 1])) close_reactor_client(clients, &client_count, i - 1);
+        }
         struct pollfd poll_fds[MAX_REACTOR_CLIENTS + 1];
         size_t polled_client_count = client_count;
         poll_fds[0] = (struct pollfd){.fd = api_listener, .events = POLLIN, .revents = 0};
         for (size_t i = 0; i < polled_client_count; i++) {
-            poll_fds[i + 1] = (struct pollfd){.fd = clients[i].fd, .events = POLLIN, .revents = 0};
+            poll_fds[i + 1] = (struct pollfd){.fd = clients[i].provider_pid > 0 ? clients[i].provider_output_fd : clients[i].fd, .events = POLLIN, .revents = 0};
         }
 
         int timeout_ms = socket_activation_enabled() && !g_stay_alive_when_socket_idle && polled_client_count == 0 ? 60000 : 1000;
+        for (size_t i = 0; i < client_count; i++) {
+            if (clients[i].provider_pid > 0 && clients[i].provider_output_closed) timeout_ms = 10;
+        }
         int poll_result = poll(poll_fds, (nfds_t)(polled_client_count + 1), timeout_ms);
         if (poll_result == 0) {
             if (socket_activation_enabled() && !g_stay_alive_when_socket_idle && client_count == 0) break;
@@ -16632,6 +16740,10 @@ static void run_api_reactor(int api_listener) {
             size_t index = i - 1;
             short revents = poll_fds[index + 1].revents;
             if (revents == 0) continue;
+            if (clients[index].provider_pid > 0) {
+                if (collect_provider_response(&clients[index])) close_reactor_client(clients, &client_count, index);
+                continue;
+            }
             if (clients[index].waiting_for_events) {
                 if (revents & (POLLIN | POLLERR | POLLHUP | POLLNVAL)) {
                     close_reactor_client(clients, &client_count, index);
@@ -16665,16 +16777,13 @@ static void run_api_reactor(int api_listener) {
         int64_t now = monotonic_milliseconds();
         for (size_t i = client_count; i > 0; i--) {
             size_t index = i - 1;
-            if (clients[index].waiting_for_events) continue;
+            if (clients[index].waiting_for_events || clients[index].provider_pid > 0) continue;
             if (now - clients[index].last_activity_ms > CLIENT_IDLE_TIMEOUT_MS) {
                 close_reactor_client(clients, &client_count, index);
             }
         }
     }
-    for (size_t i = 0; i < client_count; i++) {
-        close(clients[i].fd);
-        free(clients[i].request);
-    }
+    while (client_count > 0) close_reactor_client(clients, &client_count, client_count - 1);
     free(clients);
 }
 

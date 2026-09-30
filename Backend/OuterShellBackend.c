@@ -2259,7 +2259,7 @@ static bool proxy_ui_request_to_api(ReactorClient *client,
     free(request.data);
     free(owned_body.data);
 
-    if (route == OUTERSHELLD_UI_ROUTE_EVENTS) {
+    if (route == OUTERSHELLD_UI_ROUTE_EVENTS || route == OUTERSHELLD_UI_ROUTE_SAFE_SPACES) {
         set_fd_nonblocking(api_fd, true);
         client->waiting_for_api_response = true;
         client->api_response_fd = api_fd;
