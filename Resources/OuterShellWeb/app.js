@@ -6,16 +6,9 @@
   const decoder = new TextDecoder();
   const elements = {
     shell: document.querySelector("#app"),
-    edit: document.querySelector("#edit-button"),
-    urlsPage: document.querySelector("#urls-page"),
-    directory: document.querySelector("#url-directory"),
-    sections: document.querySelector("#app-sections"),
-    empty: document.querySelector("#empty-state"),
-    summary: document.querySelector("#app-summary"),
     status: document.querySelector("#status-banner"),
-    search: document.querySelector("#search-input"),
+    overview: document.querySelector("#server-overview"),
     add: document.querySelector("#add-button"),
-    refresh: document.querySelector("#refresh-button"),
     dialogLayer: document.querySelector("#dialog-layer"),
     dialogTemplate: document.querySelector("#dialog-template"),
     toasts: document.querySelector("#toast-region")
@@ -23,16 +16,7 @@
 
   const state = {
     backends: [],
-    bookmarks: null,
-    bookmarkOrder: [],
-    folderPositions: {},
     endpointNames: {},
-    folderWidths: {},
-    folderResize: null,
-    bookmarkStorageFailed: false,
-    bookmarksMarkup: "",
-    containerFolders: {},
-    directoryMarkup: "",
     safeSpaces: [],
     providers: [],
     containerDownloadURL: null,
@@ -45,7 +29,6 @@
     safeSpacesTimer: null,
     busy: false,
     query: "",
-    editing: false,
     addTab: "catalog",
     backendsVersion: 0n,
     logVersion: 0n,
@@ -59,7 +42,11 @@
     suppressLaunchUntil: 0,
     pageScrollY: null,
     pressFeedback: null,
-    appDrag: null
+    groupOrder: [],
+    groupPins: {},
+    endpointOrder: {},
+    endpointDrag: null,
+    groupDrag: null,
   };
 
   class PayloadReader {
@@ -288,9 +275,6 @@
   }
 
 
-  function editButtonHTML(item) {
-    return `<button class="bookmark-menu" type="button" data-action="edit-bookmark" data-app-key="${escapeHTML(item.identity)}" aria-label="Edit ${escapeHTML(item.displayName)}" aria-haspopup="dialog" ${state.editing ? "" : "hidden"}>•••</button>`;
-  }
 
   function normalizedPath(value) {
     const trimmed = String(value || "").trim();
@@ -368,9 +352,9 @@
     }).sort((left, right) => left.displayName.localeCompare(right.displayName, undefined, { sensitivity: "base" }));
   }
 
-  const bookmarkStorageKey = "outer-shell.home-bookmarks.v1";
 
   function hostBookmarkKey(item) {
+    if (item.custom) return item.identity;
     if (item.workspace) return containerBookmarkKey(item.workspace, item.app);
     return JSON.stringify(["host", item.backend.serviceScope, item.backend.serviceID, item.frontend.id || navigationURL(item.frontend)]);
   }
@@ -387,75 +371,37 @@
     return JSON.stringify(["container", workspace.id, app.serviceID, containerFrontendKey(app)]);
   }
 
-  function loadBookmarks() {
+  function loadCardPreferences() {
+    try {
+      const pins = JSON.parse(localStorage.getItem("outer-shell.group-pins.v1") || "{}");
+      if (!pins || Array.isArray(pins) || typeof pins !== "object" || Object.values(pins).some(keys => !Array.isArray(keys) || keys.some(key => typeof key !== "string"))) throw new Error("Invalid shortcuts");
+      state.groupPins = pins;
+    } catch (error) { toast("Could not load saved shortcuts.", true); }
+
+    try {
+      const layout = JSON.parse(localStorage.getItem("outer-shell.endpoint-layout.v1") || "null");
+      if (layout) {
+        for (const value of [layout.pins, layout.order]) {
+          if (!value || typeof value !== "object" || Array.isArray(value) || Object.values(value).some(keys => !Array.isArray(keys) || keys.some(key => typeof key !== "string"))) throw new Error("Invalid endpoint layout");
+        }
+        state.groupPins = layout.pins;
+        state.endpointOrder = layout.order;
+      }
+    } catch (error) { toast("Could not load endpoint ordering.", true); }
+    try {
+      const order = JSON.parse(localStorage.getItem("outer-shell.group-order.v1") || "[]");
+      if (Array.isArray(order)) state.groupOrder = order.filter(key => typeof key === "string");
+    } catch (error) { toast("Could not load the saved group order.", true); }
+
     try {
       const names = JSON.parse(localStorage.getItem("outer-shell.endpoint-names.v1") || "{}");
       if (names && typeof names === "object" && !Array.isArray(names)) state.endpointNames = Object.fromEntries(Object.entries(names).filter(([, name]) => typeof name === "string" && name.trim()));
     } catch (error) { toast("Could not read endpoint names.", true); }
-    try {
-      const widths = JSON.parse(localStorage.getItem("outer-shell.folder-widths.v1") || "{}");
-      if (widths && typeof widths === "object" && !Array.isArray(widths)) {
-        state.folderWidths = Object.fromEntries(Object.entries(widths).filter(([, width]) => Number.isFinite(width) && width >= 160));
-      }
-    } catch (error) { toast("Could not read folder widths.", true); }
-    try {
-      const positions = JSON.parse(localStorage.getItem("outer-shell.folder-positions.v1") || "{}");
-      if (positions && typeof positions === "object" && !Array.isArray(positions)) state.folderPositions = positions;
-    } catch (error) { toast("Could not read folder positions.", true); }
-    try {
-      const order = JSON.parse(window.localStorage.getItem("outer-shell.bookmark-order.v1") || "[]");
-      if (!Array.isArray(order) || order.some(key => typeof key !== "string")) throw new Error("Invalid bookmark order");
-      state.bookmarkOrder = [...new Set(order)];
-    } catch (error) { toast("Could not read bookmark order.", true); }
-    try {
-      const folders = JSON.parse(window.localStorage.getItem("outer-shell.container-folders.v1") || "{}");
-      if (folders && typeof folders === "object" && !Array.isArray(folders)) state.containerFolders = folders;
-      const saved = window.localStorage.getItem(bookmarkStorageKey);
-      if (saved !== null) {
-        const values = JSON.parse(saved);
-        if (!Array.isArray(values) || values.some(value => typeof value !== "string")) throw new Error("Invalid bookmark data");
-        state.bookmarks = new Set(values);
-      }
-    } catch (error) {
-      state.bookmarkStorageFailed = true;
-      toast("Could not read saved Bookmarks. Your saved choices have not been changed.", true);
-    }
-  }
-
-  function initializeBookmarks() {
-    if (state.bookmarks !== null) return;
-    const keys = launcherItems().map(hostBookmarkKey);
-    state.bookmarks = new Set(keys);
-    if (state.bookmarkStorageFailed) return;
-    try { window.localStorage.setItem(bookmarkStorageKey, JSON.stringify(keys)); }
-    catch (error) { state.bookmarkStorageFailed = true; toast("Bookmarks cannot be saved in this browser.", true); }
-  }
-
-  function isBookmarked(key) {
-    return state.bookmarks?.has(key) || false;
-  }
-
-  function setBookmark(key, included) {
-    if (state.bookmarkStorageFailed || state.bookmarks === null) {
-      toast("Bookmarks are unavailable. Enable browser storage and reload to try again.", true);
-      return false;
-    }
-    const next = new Set(state.bookmarks);
-    if (included) next.add(key);
-    else next.delete(key);
-    try { window.localStorage.setItem(bookmarkStorageKey, JSON.stringify([...next])); }
-    catch (error) { toast("Could not save this bookmark. Bookmarks have not changed.", true); return false; }
-    state.bookmarks = next;
-    return true;
-  }
-
-  function bookmarkMenuHTML(key) {
-    return `<button class="context-menu-item" type="button" data-action="toggle-bookmark" data-bookmark-key="${escapeHTML(key)}" role="menuitem">${contextMenuGlyph(isBookmarked(key) ? "−" : "☆")}<span>${isBookmarked(key) ? "Remove bookmark" : "Add bookmark"}</span></button>`;
   }
 
   function updatePage() {
     document.title = "Outer Shell";
-    renderDirectory();
+    renderServerOverview();
   }
 
   function addressKind(frontend) {
@@ -493,169 +439,161 @@
     return [...host, ...containers];
   }
 
-  function directoryRowHTML(entry) {
-    const launchAttributes = entry.item
+  function overviewLaunchAttributes(entry) {
+    return entry.item
       ? `data-action="launch" data-app-key="${escapeHTML(entry.item.identity)}"`
       : `data-action="launch-safe-space-app" data-safe-space-id="${escapeHTML(entry.workspace.id)}" data-service-id="${escapeHTML(entry.app.serviceID)}" data-frontend-key="${escapeHTML(containerFrontendKey(entry.app))}"`;
+  }
+
+  function overviewEndpoint(entry) {
     const target = entry.item ? navigationURL(entry.item.frontend) : safeSpaceAppNavigationURL(entry.workspace, entry.app);
-    const saved = isBookmarked(entry.key);
-    const route = entry.workspace && safeSpaceAppURL(entry.app) !== "#" ? safeSpaceAppURL(entry.app) : "";
-    const displayAddress = entry.socket || entry.address || "Address pending";
-    const path = entry.socket ? pathAndQuery(entry.item?.frontend || entry.app) : "";
-    const busy = entry.workspace && state.safeSpaceBusy.has(`${entry.workspace.id}\u001f${entry.app.serviceID}`);
-    const menuAttributes = entry.workspace
-      ? `data-action="edit-container-bookmark" data-safe-space-id="${escapeHTML(entry.workspace.id)}" data-service-id="${escapeHTML(entry.app.serviceID)}" data-frontend-key="${escapeHTML(containerFrontendKey(entry.app))}"`
-      : `data-action="edit-bookmark" data-app-key="${escapeHTML(entry.item.identity)}"`;
-    return `<article class="directory-row" aria-busy="${Boolean(busy)}">
-      <a class="directory-name" href="${escapeHTML(target)}" ${launchAttributes} title="Open ${escapeHTML(entry.name)}"><span class="address-status${entry.running ? " is-running" : ""}" aria-label="${entry.running ? "Running" : "Not running"}"></span>${escapeHTML(entry.name)}</a>
-      <div class="directory-address">
-        <a class="address-link" href="${escapeHTML(target)}" ${launchAttributes} aria-label="Open endpoint for ${escapeHTML(entry.name)}" title="${escapeHTML(entry.address)}"><code>${escapeHTML(displayAddress)}${path && path !== "/" ? `<span class="address-path"> ${escapeHTML(path)}</span>` : ""}</code></a>
-        ${route ? `<details class="connection-details"><summary>↳ host</summary><a class="address-link" href="${escapeHTML(target)}" ${launchAttributes} title="Open host connection URL"><code>${escapeHTML(route)}</code></a></details>` : ""}
-      </div>
-      <div class="directory-actions"><button class="bookmark-toggle${saved ? " is-saved" : ""}" type="button" data-action="toggle-bookmark" data-bookmark-key="${escapeHTML(entry.key)}" aria-pressed="${saved}" aria-label="${saved ? "Remove" : "Add"} ${escapeHTML(entry.name)} ${saved ? "from" : "to"} Bookmarks" title="${saved ? "Remove bookmark" : "Add bookmark"}">${saved ? "★" : "☆"}</button><button class="endpoint-menu" type="button" ${menuAttributes} aria-label="Actions for ${escapeHTML(entry.name)}" aria-haspopup="dialog">•••</button></div>
-    </article>`;
+    const isThisPage = entry.serviceID === "org.outershell.OuterShell" && entry.item?.backend.serviceScope !== "system" && !entry.workspace;
+    const icon = listIconHTML(entry.item || { app: entry.app, displayName: entry.name });
+    const menu = entry.item
+      ? `data-action="edit-bookmark" data-app-key="${escapeHTML(entry.item.identity)}"`
+      : `data-action="edit-container-bookmark" data-safe-space-id="${escapeHTML(entry.workspace.id)}" data-service-id="${escapeHTML(entry.app.serviceID)}" data-frontend-key="${escapeHTML(containerFrontendKey(entry.app))}"`;
+    return `<div class="overview-row" data-endpoint-key="${escapeHTML(entry.key)}"><a href="${escapeHTML(target)}" ${overviewLaunchAttributes(entry)} ${entry.item ? "" : `data-app-key="${escapeHTML(entry.key)}"`}><span class="address-status${entry.running ? " is-running" : ""}" aria-label="${entry.running ? "Running" : "Not running"}"></span>${icon}<span>${escapeHTML(entry.name)}${isThisPage ? ' <small class="this-page-label">This page</small>' : ""}</span></a><button class="endpoint-menu" type="button" ${menu} aria-label="Actions for ${escapeHTML(entry.name)}" aria-haspopup="dialog">•••</button></div>`;
   }
 
-  function matchesSearch(entry, query) {
-    const folder = entry.item?.frontend.list || state.containerFolders[entry.key] || "";
-    return `${entry.name} ${entry.address} ${entry.socket} ${entry.kind} ${entry.groupName} ${entry.serviceID} ${entry.item?.bookmarkContext || ""} ${folder}`.toLocaleLowerCase().includes(query);
+  function endpointGroupID(entry) {
+    return entry.workspace ? `container:${entry.workspace.id}` : entry.item.backend.serviceScope === "system" ? "root" : "user";
   }
 
-  function renderDirectory() {
-    const all = registeredAddresses();
-    const query = state.query.trim().toLocaleLowerCase();
-    const filtered = all.filter(entry => matchesSearch(entry, query));
-    const groups = [{ id: "host", name: "This server" }, ...state.safeSpaces.map(workspace => ({ id: workspace.id, name: workspace.name || "Container", workspace }))];
-    let markup = groups.map(group => {
-      const entries = filtered.filter(entry => entry.groupID === group.id);
-      if (!entries.length && query && !`${group.name} ${group.workspace ? safeSpaceRuntimeDescription(group.workspace) : ""}`.toLocaleLowerCase().includes(query)) return "";
-      const categories = ["Ports", "Root sockets", "User sockets", "Custom sockets", "Other endpoints"].map(kind => {
-        const rows = entries.filter(entry => entry.kind === kind);
-        return rows.length ? `<section class="address-category"><h4>${kind}<span>${rows.length}</span></h4>${rows.map(directoryRowHTML).join("")}</section>` : "";
-      }).join("");
-      const note = group.workspace ? `Container · ${safeSpaceState(group.workspace)}${group.workspace.recipe?.needsRebuild ? " · rebuild needed" : ""}` : "Host";
-      const loading = group.workspace ? state.safeSpacesLoading : state.loading;
+  function groupPinKeys(id, entries) {
+    return state.groupPins[id] ?? ["org.outershell.Files", "org.outershell.Top"].map(serviceID => entries.find(entry => entry.serviceID === serviceID)?.key).filter(Boolean);
+  }
+
+  function pinMenuHTML(key, allowReorder = false) {
+    const entries = registeredAddresses();
+    const entry = entries.find(entry => entry.key === key);
+    if (!entry) return "";
+    const id = endpointGroupID(entry);
+    const keys = groupPinKeys(id, entries.filter(entry => endpointGroupID(entry) === id));
+    const index = keys.indexOf(key);
+    const button = (action, label) => `<button class="context-menu-item" type="button" data-action="${action}" data-endpoint-key="${escapeHTML(key)}" role="menuitem">${contextMenuGlyph(action === "toggle-group-pin" ? "◇" : action === "move-pin-earlier" ? "↑" : "↓")}<span>${label}</span></button>`;
+    return button("toggle-group-pin", index < 0 ? "Pin to top" : "Unpin from top") + (allowReorder && index > 0 ? button("move-pin-earlier", "Move shortcut earlier") : "") + (allowReorder && index >= 0 && index < keys.length - 1 ? button("move-pin-later", "Move shortcut later") : "");
+  }
+
+  function changeGroupPin(key, action) {
+    const entries = registeredAddresses();
+    const entry = entries.find(entry => entry.key === key);
+    if (!entry) return;
+    const id = endpointGroupID(entry);
+    const keys = [...groupPinKeys(id, entries.filter(entry => endpointGroupID(entry) === id))];
+    const index = keys.indexOf(key);
+    if (action === "toggle-group-pin") {
+      if (index < 0) keys.push(key); else keys.splice(index, 1);
+    } else {
+      const to = index + (action === "move-pin-earlier" ? -1 : 1);
+      if (index < 0 || to < 0 || to >= keys.length) return;
+      keys.splice(index, 1); keys.splice(to, 0, key);
+    }
+    const pins = { ...state.groupPins, [id]: keys };
+    if (!saveEndpointLayout(pins, state.endpointOrder)) return;
+    closeDialog();
+    render();
+  }
+
+  function saveEndpointLayout(pins, order) {
+    try { localStorage.setItem("outer-shell.endpoint-layout.v1", JSON.stringify({ pins, order })); }
+    catch (error) { toast("Could not save endpoint layout.", true); return false; }
+    state.groupPins = pins;
+    state.endpointOrder = order;
+    return true;
+  }
+
+  function moveCardEndpoint(groupID, key, area, beforeKey) {
+    const entries = registeredAddresses().filter(entry => endpointGroupID(entry) === groupID);
+    if (!entries.some(entry => entry.key === key)) return;
+    const oldPins = groupPinKeys(groupID, entries);
+    const pins = oldPins.filter(value => value !== key);
+    const ranks = new Map((state.endpointOrder[groupID] || []).map((value, index) => [value, index]));
+    const list = entries.filter(entry => entry.key !== key && !oldPins.includes(entry.key)).sort((a, b) => (ranks.get(a.key) ?? Infinity) - (ranks.get(b.key) ?? Infinity)).map(entry => entry.key);
+    const destination = area === "pins" ? pins : list;
+    const index = destination.indexOf(beforeKey);
+    destination.splice(index < 0 ? destination.length : index, 0, key);
+    saveEndpointLayout({ ...state.groupPins, [groupID]: pins }, { ...state.endpointOrder, [groupID]: list });
+  }
+
+  function overviewShortcut(entry) {
+    const item = entry.item || findItem(entry.key);
+    const icon = listIconHTML(item);
+    const target = entry.item ? navigationURL(entry.item.frontend) : safeSpaceAppNavigationURL(entry.workspace, entry.app);
+    const identity = entry.item?.identity || entry.key;
+    return `<div class="overview-shortcut-wrap" data-endpoint-key="${escapeHTML(entry.key)}"><a class="overview-shortcut" href="${escapeHTML(target)}" ${overviewLaunchAttributes(entry)} ${entry.item ? "" : `data-app-key="${escapeHTML(identity)}"`}>${icon}<span class="shortcut-title"><span class="address-status${entry.running ? " is-running" : ""}" aria-label="${entry.running ? "Running" : "Not running"}"></span>${escapeHTML(entry.name)}</span></a></div>`;
+  }
+
+  function renderOverview(entries) {
+    if (state.groupDrag || state.endpointDrag) return;
+    const sessionUsername = window.outerLoop?.sessionContext?.username;
+    const userName = typeof sessionUsername === "string" ? sessionUsername.trim() : "";
+    const groups = [
+      { id: "user", name: userName || "Your user", note: "User", entries: entries.filter(entry => entry.item && entry.item.backend.serviceScope !== "system") },
+      { id: "root", name: "root", note: "Administrator", entries: entries.filter(entry => entry.item && entry.item.backend.serviceScope === "system") },
+      ...state.safeSpaces.map(workspace => ({ id: `container:${workspace.id}`, name: workspace.name || "Container", note: `Container · ${safeSpaceState(workspace)}`, workspace, entries: entries.filter(entry => entry.workspace?.id === workspace.id) }))
+    ];
+    const ranks = new Map(state.groupOrder.map((id, index) => [id, index]));
+    groups.sort((a, b) => (ranks.get(a.id) ?? Infinity) - (ranks.get(b.id) ?? Infinity));
+    const markup = groups.map(group => {
       const workspace = group.workspace;
-      const busy = workspace && containerPreparing(workspace);
-      const controls = workspace ? `${!safeSpaceIsRunning(workspace) ? `<button class="directory-control" type="button" data-action="start-safe-space" data-safe-space-id="${escapeHTML(workspace.id)}" ${busy ? "disabled" : ""}>${busy ? "Starting…" : "Start"}</button>` : ""}<button class="endpoint-menu" type="button" data-action="edit-container" data-safe-space-id="${escapeHTML(workspace.id)}" aria-label="Actions for ${escapeHTML(group.name)}" aria-haspopup="dialog">•••</button>` : "";
-      return `<section class="directory-group"><header><div><h3>${escapeHTML(group.name)}</h3><p>${escapeHTML(note)}</p></div><div class="directory-group-actions"><span class="directory-total">${entries.length} ${entries.length === 1 ? "endpoint" : "endpoints"}</span>${controls}</div></header>${workspace?.buildProgress ? `<details class="container-build-progress" ${workspace.buildProgress.phase === "failed" ? "open" : ""}><summary>${escapeHTML(workspace.buildProgress.detail || workspace.buildProgress.phase)}</summary><pre>${escapeHTML(workspace.buildProgress.log || "")}</pre></details>` : ""}${categories || `<p class="directory-empty">${loading ? "Loading addresses…" : "No registered endpoints here yet."}</p>`}</section>`;
-    }).join("");
-    if (!markup) markup = `<p class="directory-empty">No registered endpoints match your search.</p>`;
-    if (state.directoryMarkup !== markup) {
-      elements.directory.innerHTML = markup;
-      state.directoryMarkup = markup;
+      const id = escapeHTML(workspace?.id || "");
+      const preparing = workspace && containerPreparing(workspace);
+      const pins = groupPinKeys(group.id, group.entries);
+      const order = state.endpointOrder[group.id] || [];
+      const ranks = new Map(order.map((key, index) => [key, index]));
+      const listed = group.entries.filter(entry => !pins.includes(entry.key)).sort((a, b) => (ranks.get(a.key) ?? Infinity) - (ranks.get(b.key) ?? Infinity));
+      const controls = workspace ? `<div class="overview-controls">${!safeSpaceIsRunning(workspace) ? `<button type="button" data-action="start-safe-space" data-safe-space-id="${id}" ${preparing ? "disabled" : ""}>${preparing ? "Starting…" : "Start"}</button>` : ""}<button type="button" data-action="edit-container" data-safe-space-id="${id}" aria-label="Manage ${escapeHTML(group.name)}">Manage…</button></div>` : "";
+      const addMore = workspace
+        ? `<button class="overview-add-more" type="button" data-action="configure-container" data-safe-space-id="${id}" ${preparing || !managedContainer(workspace) ? "disabled" : ""} ${!managedContainer(workspace) ? 'title="This container is managed externally"' : ""}>Add more to Dockerfile…</button>`
+        : `<button class="overview-add-more" type="button" data-action="open-add">Add more…</button>`;
+      return `<section class="overview-identity" data-group-id="${escapeHTML(group.id)}"><header class="overview-group-handle" tabindex="0" aria-label="Reorder ${escapeHTML(group.name)}. Hold and drag, or use arrow keys." title="Hold and drag to reorder" data-group-handle><div class="overview-group-heading"><h2>${escapeHTML(group.name)}</h2><p>${escapeHTML(group.note)}</p></div>${controls}</header><div class="overview-shortcuts" data-endpoint-area="pins">${pins.map(key => group.entries.find(entry => entry.key === key)).filter(Boolean).map(overviewShortcut).join("")}</div><div class="overview-list" data-endpoint-area="list">${listed.map(overviewEndpoint).join("") || `<p class="overview-empty">${state.loading || (workspace && state.safeSpacesLoading) ? "Loading…" : group.entries.length ? "" : "No registered endpoints."}</p>`}</div>${workspace?.buildProgress ? `<details class="container-build-progress"><summary>${escapeHTML(workspace.buildProgress.detail || workspace.buildProgress.phase)}</summary><pre>${escapeHTML(workspace.buildProgress.log || "")}</pre></details>` : ""}${addMore}</section>`;
+    }).join("") + `<button class="overview-add-container" type="button" data-action="create-container"><span aria-hidden="true">+</span>Add container…</button>`;
+    if (state.overviewMarkup !== markup) {
+      elements.overview.innerHTML = markup;
+      state.overviewMarkup = markup;
     }
   }
 
-  function allBookmarkItems() {
+  function saveGroupOrder(order) {
+    try { localStorage.setItem("outer-shell.group-order.v1", JSON.stringify(order)); }
+    catch (error) { toast("Could not save the group order.", true); return false; }
+    state.groupOrder = order;
+    return true;
+  }
+
+  function finishGroupDrag(commit) {
+    const drag = state.groupDrag;
+    if (!drag) return;
+    state.groupDrag = null;
+    window.clearTimeout(drag.armTimer);
+    drag.handle.classList.remove("is-armed");
+    if (drag.pointerId !== undefined && drag.handle.hasPointerCapture(drag.pointerId)) drag.handle.releasePointerCapture(drag.pointerId);
+    if (commit && drag.moved && drag.target) {
+      const order = [...elements.overview.querySelectorAll("[data-group-id]")].map(card => card.dataset.groupId);
+      const from = order.indexOf(drag.id), to = order.indexOf(drag.target);
+      if (from !== -1 && to !== -1) { order.splice(from, 1); order.splice(to, 0, drag.id); saveGroupOrder(order); }
+    }
+    elements.overview.querySelectorAll(".is-group-dragging, .group-drop-before, .group-drop-after").forEach(card => card.classList.remove("is-group-dragging", "group-drop-before", "group-drop-after"));
+    renderOverview(registeredAddresses());
+  }
+
+  function renderServerOverview() {
+    renderOverview(registeredAddresses());
+  }
+
+  function allEndpointItems() {
     const containers = state.safeSpaces.flatMap(workspace => (workspace.apps || []).map(app => ({
       identity: containerBookmarkKey(workspace, app), workspace, app,
       displayName: state.endpointNames[containerBookmarkKey(workspace, app)] || app.displayName || app.serviceID,
       subtitle: workspace.name || "Container",
       backend: { serviceID: app.serviceID },
-      frontend: { list: state.containerFolders[containerBookmarkKey(workspace, app)] || "" }
+      frontend: {}
     })));
-    const ranks = new Map(state.bookmarkOrder.map((key, index) => [key, index]));
-    return [...launcherItems(true), ...containers].sort((a, b) => {
-      const rank = (ranks.get(hostBookmarkKey(a)) ?? Infinity) - (ranks.get(hostBookmarkKey(b)) ?? Infinity);
-      return rank || a.displayName.localeCompare(b.displayName, undefined, { sensitivity: "base" });
-    });
+    return [...launcherItems(true), ...containers].sort((a, b) => a.displayName.localeCompare(b.displayName, undefined, { sensitivity: "base" }));
   }
 
   function render() {
     renderSafeSpaces();
-  }
-
-  function renderBookmarks() {
-    if (state.appDrag || state.folderResize) return;
-    elements.shell.setAttribute("aria-busy", state.loading ? "true" : "false");
-    if (state.loading && !state.backends.length) {
-      state.bookmarksMarkup = "";
-      elements.sections.innerHTML = `<div class="loading-grid">${"<div class=\"skeleton\"></div>".repeat(6)}</div>`;
-      elements.empty.hidden = true;
-      return;
-    }
-    const items = allBookmarkItems().filter(item => isBookmarked(hostBookmarkKey(item)));
-    const query = state.query.trim().toLocaleLowerCase();
-    const matchingKeys = new Set(registeredAddresses().filter(entry => matchesSearch(entry, query)).map(entry => entry.key));
-    const visible = query ? items.filter(item => matchingKeys.has(hostBookmarkKey(item))) : items;
-    const bookmarkCount = items.length;
-    elements.summary.textContent = bookmarkCount === 1 ? "1 bookmark." : `${bookmarkCount} bookmarks.`;
-    elements.empty.hidden = visible.length > 0 || state.loading || state.safeSpacesLoading;
-    if (!visible.length) {
-      elements.sections.innerHTML = "";
-      state.bookmarksMarkup = "";
-      if (query) {
-        elements.empty.querySelector("h2").textContent = "No matching bookmarks";
-        elements.empty.querySelector("p").textContent = "Try a different name or identifier.";
-        elements.empty.querySelector("button").hidden = true;
-      } else {
-        elements.empty.querySelector("h2").textContent = "Your bookmarks";
-        elements.empty.querySelector("p").textContent = "Bookmark an endpoint to get started.";
-        elements.empty.querySelector("button").hidden = true;
-      }
-      if (query) return;
-    }
-
-    const iconItems = visible.filter(item => !item.frontend.list?.trim());
-    const listSections = new Map();
-    visible.filter(item => item.frontend.list?.trim()).forEach(item => {
-      const name = item.frontend.list.trim();
-      if (!listSections.has(name)) listSections.set(name, []);
-      listSections.get(name).push(item);
-    });
-    const orderedLists = [...listSections.entries()].sort(([left], [right]) => left.localeCompare(right, undefined, { sensitivity: "base" }));
-    const addTile = query ? "" : `<article class="launcher-tile add-app-tile">
-      <button class="launcher-link" type="button" data-action="browse-urls" aria-label="Add bookmark"><span class="add-app-icon" aria-hidden="true"><span></span></span></button>
-      <span class="launcher-name">Add bookmark</span>
-    </article>`;
-    elements.sections.classList.toggle("single-column", orderedLists.length === 0);
-    const markup = `
-      <section class="launcher-column" data-drop-list="" aria-label="Shortcuts">
-        <div class="launcher-grid">${iconItems.map(renderLauncherTile).join("")}${addTile}</div>
-      </section>
-      ${orderedLists.length ? `<section class="list-column" aria-label="Folders">${orderedLists.map(renderListGroup).join("")}</section>` : ""}`;
-    if (state.bookmarksMarkup !== markup) {
-      elements.sections.innerHTML = markup;
-      state.bookmarksMarkup = markup;
-      layoutBookmarks();
-    }
-  }
-
-  function layoutBookmarks() {
-    const grid = elements.sections.closest(".dashboard");
-    if (!grid || !grid.clientWidth) return;
-    const columns = window.innerWidth <= 680 ? 3 : Math.max(3, Math.floor((grid.clientWidth + 12) / 102));
-    grid.style.gridTemplateColumns = `repeat(${columns}, minmax(0, 1fr))`;
-    const folders = [...elements.sections.querySelectorAll(".list-group")];
-    const tiles = [...elements.sections.querySelectorAll(".launcher-tile")];
-    const occupied = new Set();
-    const rowHeight = Math.ceil(Math.max(112, ...tiles.map(tile => tile.getBoundingClientRect().height)));
-    const rowGap = 20;
-    grid.style.gridAutoRows = `${rowHeight}px`;
-    const span = element => Math.max(1, Math.ceil((element.getBoundingClientRect().height + rowGap) / (rowHeight + rowGap)));
-    tiles.forEach(tile => { tile.style.gridRow = "span 1"; });
-    folders.forEach(folder => {
-      const position = (state.appDrag?.folder === folder.dataset.folder && state.appDrag.folderPosition) || state.folderPositions[folder.dataset.folder] || "top-right";
-      const gap = parseFloat(getComputedStyle(grid).columnGap) || 0;
-      const columnWidth = (grid.clientWidth - gap * (columns - 1)) / columns;
-      const minimum = state.folderResize?.name === folder.dataset.folder ? state.folderResize.width : state.folderWidths[folder.dataset.folder];
-      const width = Math.min(columns, minimum ? Math.max(1, Math.ceil((minimum + gap) / (columnWidth + gap))) : 3);
-      folder.querySelectorAll("[data-folder-resize]").forEach(handle => {
-        handle.setAttribute("aria-valuenow", String(Math.round(minimum || columnWidth * width + gap * (width - 1))));
-        handle.setAttribute("aria-valuetext", `${handle.getAttribute("aria-valuenow")} pixels minimum`);
-      });
-      const column = position === "top-left" ? 1 : position === "middle" ? Math.floor((columns - width) / 2) + 1 : columns - width + 1;
-      folder.style.gridColumn = `${column} / span ${width}`;
-      const height = span(folder);
-      let row = position === "middle" && columns > width && tiles.length > columns
-        ? Math.max(1, Math.floor(tiles.length / columns / 2) + 1) : 1;
-      const cells = start => Array.from({ length: height }, (_, y) =>
-        Array.from({ length: width }, (_, x) => `${start + y}:${column + x}`)).flat();
-      while (cells(row).some(cell => occupied.has(cell))) row++;
-      cells(row).forEach(cell => occupied.add(cell));
-      folder.style.gridRow = `${row} / span ${height}`;
-    });
   }
 
   function safeSpaceState(workspace) {
@@ -712,79 +650,11 @@
   }
 
   function renderSafeSpaces() {
-    renderDirectory();
-    renderBookmarks();
+    renderServerOverview();
   }
 
   function slug(value) {
     return String(value).toLocaleLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "apps";
-  }
-
-  function renderLauncherTile(item) {
-    if (item.workspace) return renderContainerBookmark(item);
-    const readyURL = navigationURL(item.frontend);
-    return `<article class="launcher-tile" data-drag-app-key="${escapeHTML(item.identity)}">
-      <a class="launcher-link bookmark-link" href="${escapeHTML(readyURL)}" data-action="launch" data-app-key="${escapeHTML(item.identity)}" aria-label="Open ${escapeHTML(item.displayName)}${item.bookmarkContext ? ` ${escapeHTML(item.bookmarkContext)}` : ""}" aria-keyshortcuts="Shift+F10"><span class="launcher-icon-row">${launcherIconHTML(item)}</span>
-      <h2 class="launcher-name">${escapeHTML(item.displayName)}${item.bookmarkContext ? `<span class="bookmark-context">${escapeHTML(item.bookmarkContext)}</span>` : ""}</h2></a>${editButtonHTML(item)}
-    </article>`;
-  }
-
-  function renderContainerBookmark(item, row = false) {
-    const { workspace, app } = item;
-    const attributes = `data-app-key="${escapeHTML(item.identity)}" data-safe-space-id="${escapeHTML(workspace.id)}" data-service-id="${escapeHTML(app.serviceID)}" data-frontend-key="${escapeHTML(containerFrontendKey(app))}"`;
-    const name = `<span class="${row ? "container-bookmark-name" : "launcher-name"}">${escapeHTML(item.displayName)}<span class="bookmark-context">${escapeHTML(item.subtitle)}</span></span>`;
-    return `<article class="${row ? "list-row" : "launcher-tile"}" data-drag-app-key="${escapeHTML(item.identity)}">
-      <a class="${row ? "list-link" : "launcher-link bookmark-link"}" href="${escapeHTML(safeSpaceAppNavigationURL(workspace, app))}" data-action="launch-safe-space-app" ${attributes} aria-label="Open ${escapeHTML(item.displayName)} in ${escapeHTML(item.subtitle)}">${row ? listIconHTML(item) : `<span class="launcher-icon-row">${launcherIconHTML(item)}</span>`}${name}</a>
-      ${editButtonHTML(item)}
-    </article>`;
-  }
-
-  function renderListGroup([name, items]) {
-    return `<section class="list-group" data-folder="${escapeHTML(name)}" aria-label="${escapeHTML(name)}">
-      ${["left", "right"].map(edge => `<span class="folder-resize folder-resize-${edge}" data-folder-resize="${edge}" role="separator" tabindex="0" aria-orientation="vertical" aria-label="Resize ${escapeHTML(name)}" aria-valuemin="160"></span>`).join("")}
-      <header class="folder-heading" data-folder-handle="${escapeHTML(name)}" data-drop-list="${escapeHTML(name)}"><span>${escapeHTML(name)}</span><span class="folder-count">${items.length}</span></header>
-      <div class="list-widget" data-drop-list="${escapeHTML(name)}">${items.map(renderListRow).join("")}</div>
-    </section>`;
-  }
-
-  function saveFolderWidth(name, width) {
-    const widths = { ...state.folderWidths, [name]: Math.max(160, Math.round(width)) };
-    try { localStorage.setItem("outer-shell.folder-widths.v1", JSON.stringify(widths)); }
-    catch (error) { toast("Could not save folder width.", true); return false; }
-    state.folderWidths = widths;
-    return true;
-  }
-
-  function beginFolderResize(event) {
-    const handle = event.target.closest("[data-folder-resize]");
-    if (!handle || !event.isPrimary || event.button !== 0 || elements.dialogLayer.childElementCount) return;
-    event.preventDefault();
-    cancelAppDrag();
-    cancelLongPress();
-    const folder = handle.closest("[data-folder]");
-    const width = folder.getBoundingClientRect().width;
-    state.folderResize = { name: folder.dataset.folder, handle, pointerID: event.pointerId, startX: event.clientX, startWidth: width, width, direction: handle.dataset.folderResize === "left" ? -1 : 1 };
-    try { handle.setPointerCapture(event.pointerId); } catch (_) {}
-    document.body.classList.add("folder-resizing");
-  }
-
-  function moveFolderResize(event) {
-    const resize = state.folderResize;
-    if (!resize || resize.pointerID !== event.pointerId) return;
-    if (event.cancelable) event.preventDefault();
-    resize.width = Math.max(160, Math.round(resize.startWidth + (event.clientX - resize.startX) * resize.direction));
-    layoutBookmarks();
-  }
-
-  function endFolderResize(event, save) {
-    const resize = state.folderResize;
-    if (!resize || resize.pointerID !== event.pointerId) return;
-    if (save) { moveFolderResize(event); saveFolderWidth(resize.name, resize.width); }
-    state.folderResize = null;
-    document.body.classList.remove("folder-resizing");
-    state.suppressLaunchUntil = Date.now() + 300;
-    layoutBookmarks();
-    renderBookmarks();
   }
 
   function renameEndpointMenuHTML(item) {
@@ -793,7 +663,7 @@
 
   function openRenameEndpoint(item) {
     const key = hostBookmarkKey(item);
-    const dialog = openDialog(`${containerDialogHeader("Rename endpoint")}<form><div class="dialog-body"><label class="field">Name<input name="name" required value="${escapeHTML(item.displayName)}" autocomplete="off"></label><p class="field-note">Saved in this browser. Used in bookmarks and All endpoints.</p><p class="container-message" role="status"></p></div><footer class="dialog-footer"><button type="button" data-action="close-dialog">Cancel</button><button type="submit" class="primary-button">Rename</button></footer></form>`);
+    const dialog = openDialog(`${containerDialogHeader("Rename endpoint")}<form><div class="dialog-body"><label class="field">Name<input name="name" required value="${escapeHTML(item.displayName)}" autocomplete="off"></label><p class="field-note">Saved in this browser. Used in endpoint lists and pinned shortcuts.</p><p class="container-message" role="status"></p></div><footer class="dialog-footer"><button type="button" data-action="close-dialog">Cancel</button><button type="submit" class="primary-button">Rename</button></footer></form>`);
     const form = dialog.querySelector("form");
     form.elements.name.select();
     form.addEventListener("submit", event => {
@@ -808,54 +678,6 @@
       closeDialog();
       render();
     });
-  }
-
-  function openFolderMenu(name, point = null) {
-    showContextMenu(`<button class="context-menu-item" type="button" data-action="rename-folder" data-folder-name="${escapeHTML(name)}" role="menuitem">${contextMenuGlyph("✎")}<span>Rename folder…</span></button>`, point, `${name} actions`);
-  }
-
-  function openRenameFolder(name) {
-    const dialog = openDialog(`${containerDialogHeader("Rename folder")}<form><div class="dialog-body"><label class="field">Folder name<input name="folder" required value="${escapeHTML(name)}" autocomplete="off"></label><p class="container-message" role="status"></p></div><footer class="dialog-footer"><button type="button" data-action="close-dialog">Cancel</button><button type="submit" class="primary-button">Rename</button></footer></form>`);
-    const form = dialog.querySelector("form");
-    form.elements.folder.select();
-    form.addEventListener("submit", async event => {
-      event.preventDefault();
-      const next = form.elements.folder.value.trim();
-      const message = form.querySelector(".container-message");
-      if (!next) { message.textContent = "Enter a folder name."; return; }
-      if (next === name) { closeDialog(); return; }
-      const items = allBookmarkItems();
-      if (items.some(item => item.frontend.list?.trim() === next)) { message.textContent = "A folder with that name already exists."; return; }
-      const button = form.querySelector('[type="submit"]');
-      button.disabled = true;
-      form.elements.folder.disabled = true;
-      let failed = false;
-      for (const item of items.filter(item => item.frontend.list?.trim() === name)) {
-        if (!await setFrontendList(item, next)) { failed = true; break; }
-      }
-      const positions = { ...state.folderPositions, [next]: state.folderPositions[name] || "top-right" };
-      if (!failed) delete positions[name];
-      try { localStorage.setItem("outer-shell.folder-positions.v1", JSON.stringify(positions)); state.folderPositions = positions; }
-      catch (error) { toast("Could not save folder position.", true); }
-      if (Object.hasOwn(state.folderWidths, name)) {
-        const widths = { ...state.folderWidths, [next]: state.folderWidths[name] };
-        if (!failed) delete widths[name];
-        try { localStorage.setItem("outer-shell.folder-widths.v1", JSON.stringify(widths)); state.folderWidths = widths; }
-        catch (error) { toast("Could not save folder width.", true); }
-      }
-      render();
-      if (!failed) closeDialog();
-      else { message.textContent = "Some bookmarks could not be moved. Both folders have been kept; move the remaining bookmarks when the connection is restored."; button.disabled = false; form.elements.folder.disabled = false; }
-    });
-  }
-
-  function renderListRow(item) {
-    if (item.workspace) return renderContainerBookmark(item, true);
-    const readyURL = navigationURL(item.frontend);
-    return `<article class="list-row" data-drag-app-key="${escapeHTML(item.identity)}">
-      <a class="list-link" href="${escapeHTML(readyURL)}" data-action="launch" data-app-key="${escapeHTML(item.identity)}" aria-label="Open ${escapeHTML(item.displayName)}${item.bookmarkContext ? ` ${escapeHTML(item.bookmarkContext)}` : ""}" aria-keyshortcuts="Shift+F10">${listIconHTML(item)}<h3 class="list-name">${escapeHTML(item.displayName)}${item.bookmarkContext ? `<span class="bookmark-context">${escapeHTML(item.bookmarkContext)}</span>` : ""}</h3></a>
-      ${editButtonHTML(item)}
-    </article>`;
   }
 
   async function requestBuffer(url, options = {}, acceptErrors = false) {
@@ -995,7 +817,6 @@
       if (state.refreshAbort.backendError !== controller) return;
       const result = decodeBackends(buffer);
       state.backends = result.backends;
-      if (!result.error) initializeBookmarks();
       clearRefreshFailure("backendError");
       state.backendError = result.error;
       updateStatus();
@@ -1063,7 +884,7 @@
   }
 
   function findItem(identity) {
-    return allBookmarkItems().find(item => item.identity === identity);
+    return allEndpointItems().find(item => item.identity === identity);
   }
 
   function itemIdentityFromTarget(target) {
@@ -1085,12 +906,11 @@
   function beginLongPress(event) {
     if (event.pointerType !== "touch" || !event.isPrimary || elements.dialogLayer.childElementCount) return;
     const identity = itemIdentityFromTarget(event.target);
-    if (event.target.closest("[data-folder-resize]")) return;
-    const folder = event.target.closest("[data-folder]")?.dataset.folder;
-    if (!identity && folder === undefined) return;
+    if (!identity) return;
     cancelLongPress();
     const press = {
       identity,
+      context: menuContext(event.target),
       pointerID: event.pointerId,
       x: event.clientX,
       y: event.clientY,
@@ -1099,12 +919,11 @@
     press.timer = window.setTimeout(() => {
       if (state.longPress !== press) return;
       state.longPress = null;
-      cancelAppDrag();
       clearPressFeedback();
       state.suppressLaunchUntil = Date.now() + 900;
+      finishEndpointDrag(false);
       navigator.vibrate?.(8);
-      if (identity) openAppMenu(identity);
-      else openFolderMenu(folder);
+      if (identity) openAppMenu(identity, { x: press.x, y: press.y }, press.context);
       clearTextSelection();
       window.requestAnimationFrame(clearTextSelection);
     }, 520);
@@ -1135,293 +954,6 @@
   function clearPressFeedback() {
     state.pressFeedback?.target.classList.remove("pressed");
     state.pressFeedback = null;
-  }
-
-  function beginAppDrag(event) {
-    if (!event.isPrimary || event.button !== 0 || event.ctrlKey || elements.dialogLayer.childElementCount || !(event.target instanceof Element)) return;
-    const source = event.target.closest(".launcher-link[data-app-key], .list-link[data-app-key], [data-folder-handle]");
-    if (!source || source.closest(".context-menu")) return;
-    if (event.target.closest("button")) return;
-    const folder = source.dataset.folderHandle;
-    const item = folder === undefined ? findItem(source.dataset.appKey) : { identity: folder, displayName: folder, frontend: {} };
-    if (!item) return;
-    cancelAppDrag();
-    const drag = {
-      identity: item.identity,
-      folder,
-      item,
-      source,
-      sourceContainer: source.closest("[data-drag-app-key], [data-folder]"),
-      pointerID: event.pointerId,
-      pointerType: event.pointerType,
-      startX: event.clientX,
-      startY: event.clientY,
-      x: event.clientX,
-      y: event.clientY,
-      currentList: String(item.frontend.list || "").trim(),
-      currentDropList: null,
-      dropTarget: null,
-      preview: null,
-      isDragging: false,
-      touchArmed: event.pointerType !== "touch" || state.editing,
-      armTimer: 0,
-      scrollVelocity: 0,
-      scrollFrame: 0
-    };
-    if (event.pointerType === "touch" && !state.editing) {
-      drag.armTimer = window.setTimeout(() => {
-        if (state.appDrag === drag) drag.touchArmed = true;
-      }, 260);
-    }
-    state.appDrag = drag;
-  }
-
-  function startAppDrag(drag, event) {
-    if (drag.isDragging) return;
-    drag.isDragging = true;
-    window.clearTimeout(drag.armTimer);
-    drag.armTimer = 0;
-    cancelLongPress();
-    clearPressFeedback();
-    clearTextSelection();
-    state.suppressLaunchUntil = Date.now() + 900;
-    drag.source.setAttribute("aria-grabbed", "true");
-    drag.sourceContainer?.classList.add("app-drag-source");
-    document.body.classList.add("app-dragging");
-    const preview = document.createElement("div");
-    preview.className = "app-drag-preview";
-    preview.setAttribute("aria-hidden", "true");
-    preview.innerHTML = `${drag.folder !== undefined ? "▤" : drag.item.workspace ? safeSpaceAppIconHTML(drag.item.app) : launcherIconHTML(drag.item)}<span>${escapeHTML(drag.item.displayName)}</span>`;
-    document.body.append(preview);
-    drag.preview = preview;
-    try { drag.source.setPointerCapture(event.pointerId); } catch (_) {}
-    updateAppDrag(drag, event.clientX, event.clientY);
-  }
-
-  function dropTargetAt(x, y) {
-    const node = document.elementFromPoint(x, y);
-    const target = node instanceof Element ? node.closest("[data-drop-list]") : null;
-    if (!target) return null;
-    const bookmark = node.closest("[data-drag-app-key]");
-    const bounds = bookmark?.getBoundingClientRect();
-    const after = bounds ? (bookmark.classList.contains("list-row") ? y > bounds.top + bounds.height / 2 : x > bounds.left + bounds.width / 2) : true;
-    return { element: bookmark || target, list: target.dataset.dropList || "", identity: bookmark?.dataset.dragAppKey, after };
-  }
-
-  function updateAppDropTarget(drag) {
-    if (drag.folder !== undefined) {
-      const bounds = elements.sections.closest(".dashboard").getBoundingClientRect();
-      const fraction = (drag.x - bounds.left) / bounds.width;
-      drag.folderPosition = fraction < 1 / 3 ? "top-left" : fraction > 2 / 3 ? "top-right" : "middle";
-      layoutBookmarks();
-      return;
-    }
-    const target = dropTargetAt(drag.x, drag.y);
-    drag.dropTarget?.classList.remove("app-drop-target");
-    drag.dropTarget?.removeAttribute("data-drop-position");
-    drag.dropTarget = null;
-    drag.currentDropList = target?.list ?? null;
-    drag.targetIdentity = target?.identity || null;
-    drag.dropAfter = target?.after ?? true;
-    if (!target || target.identity === drag.identity) return;
-    drag.dropTarget = target.element;
-    if (target.identity) target.element.dataset.dropPosition = target.after ? "after" : "before";
-    else target.element.classList.add("app-drop-target");
-  }
-
-  function stepAppDragScroll() {
-    const drag = state.appDrag;
-    if (!drag?.isDragging || !drag.scrollVelocity) return;
-    window.scrollBy(0, drag.scrollVelocity);
-    updateAppDropTarget(drag);
-    drag.scrollFrame = window.requestAnimationFrame(stepAppDragScroll);
-  }
-
-  function updateAppDragScroll(drag) {
-    const edge = Math.min(84, Math.max(54, window.innerHeight * 0.12));
-    let velocity = 0;
-    if (drag.y < edge) velocity = -Math.max(2, (edge - drag.y) * 0.12);
-    else if (drag.y > window.innerHeight - edge) velocity = Math.max(2, (drag.y - (window.innerHeight - edge)) * 0.12);
-    drag.scrollVelocity = Math.max(-13, Math.min(13, velocity));
-    if (drag.scrollVelocity && !drag.scrollFrame) drag.scrollFrame = window.requestAnimationFrame(stepAppDragScroll);
-    if (!drag.scrollVelocity && drag.scrollFrame) {
-      window.cancelAnimationFrame(drag.scrollFrame);
-      drag.scrollFrame = 0;
-    }
-  }
-
-  function updateAppDrag(drag, x, y) {
-    drag.x = x;
-    drag.y = y;
-    if (drag.preview) {
-      drag.preview.style.left = `${x}px`;
-      drag.preview.style.top = `${y}px`;
-    }
-    updateAppDropTarget(drag);
-    updateAppDragScroll(drag);
-  }
-
-  function moveAppDrag(event) {
-    const drag = state.appDrag;
-    if (!drag || event.pointerId !== drag.pointerID) return;
-    const distance = Math.hypot(event.clientX - drag.startX, event.clientY - drag.startY);
-    if (!drag.isDragging) {
-      if (drag.pointerType === "touch" && !drag.touchArmed) {
-        if (distance > 10) cancelAppDrag();
-        return;
-      }
-      if (distance < 4) return;
-      startAppDrag(drag, event);
-    }
-    if (event.cancelable) event.preventDefault();
-    updateAppDrag(drag, event.clientX, event.clientY);
-  }
-
-  function cancelAppDrag() {
-    const drag = state.appDrag;
-    if (!drag) return;
-    window.clearTimeout(drag.armTimer);
-    if (drag.scrollFrame) window.cancelAnimationFrame(drag.scrollFrame);
-    drag.dropTarget?.classList.remove("app-drop-target");
-    drag.dropTarget?.removeAttribute("data-drop-position");
-    drag.sourceContainer?.classList.remove("app-drag-source");
-    drag.source.removeAttribute("aria-grabbed");
-    drag.preview?.remove();
-    document.body.classList.remove("app-dragging");
-    state.appDrag = null;
-    if (drag.folder !== undefined) layoutBookmarks();
-  }
-
-  async function setFrontendList(item, listName) {
-    if (item.workspace) {
-      const folders = { ...state.containerFolders, [item.identity]: listName };
-      try { window.localStorage.setItem("outer-shell.container-folders.v1", JSON.stringify(folders)); }
-      catch (error) { toast("Could not save the bookmark folder.", true); return false; }
-      state.containerFolders = folders;
-      render();
-      return true;
-    }
-    const serviceID = item.backend.serviceID;
-    const frontendID = item.frontend.id;
-    const frontendURL = item.frontend.url;
-    state.backends.forEach(backend => {
-      if (backend.serviceID !== serviceID) return;
-      backend.frontends.forEach(frontend => {
-        const matches = frontendID ? frontend.id === frontendID : frontend.url === frontendURL;
-        if (matches) frontend.list = listName;
-      });
-    });
-    render();
-    try {
-      const result = await control(item.backend, "setFrontendList", {
-        frontendID,
-        frontendURL,
-        list: listName
-      });
-      if (!result.ok) throw new Error(result.message || "Could not update the app list.");
-      return true;
-    } catch (error) {
-      await refreshBackends({ quiet: true });
-      toast(error.message || String(error), true);
-      return false;
-    }
-  }
-
-  function openBookmarkFolderDialog(item) {
-    const folders = [...new Set(allBookmarkItems().map(value => value.frontend.list?.trim()).filter(Boolean))]
-      .sort((a, b) => a.localeCompare(b, undefined, { sensitivity: "base" }));
-    const current = item.frontend.list?.trim() || "";
-    const dialog = openDialog(`${containerDialogHeader("Move bookmark to folder")}
-      <form class="bookmark-folder-form"><div class="dialog-body">
-        <p>${escapeHTML(item.displayName)}</p>
-        <label class="field">Existing folder<select name="existing"><option value="">Choose a folder…</option><option value="top">No folder</option>${folders.map((name, index) => `<option value="${index}" ${name === current ? "selected" : ""}>${escapeHTML(name)}</option>`).join("")}</select></label>
-        <label class="field">Folder name<input name="folder" value="${escapeHTML(current)}" placeholder="Enter a new folder name" autocomplete="off"></label>
-        <p class="field-note">Choose an existing folder or type a new name. Leave the name empty to move the bookmark out of its folder.</p>
-        <p class="container-message" role="status"></p>
-      </div><footer class="dialog-footer"><button type="button" data-action="close-dialog">Cancel</button><button class="primary-button" type="submit">Move</button></footer></form>`);
-    const form = dialog.querySelector("form");
-    const input = form.elements.folder;
-    const select = form.elements.existing;
-    select.addEventListener("change", () => {
-      if (select.value !== "") input.value = select.value === "top" ? "" : folders[Number(select.value)];
-    });
-    input.addEventListener("input", () => {
-      const index = folders.indexOf(input.value.trim());
-      select.value = !input.value.trim() ? "top" : index >= 0 ? String(index) : "";
-    });
-    form.addEventListener("submit", async event => {
-      event.preventDefault();
-      const name = input.value.trim();
-      const button = form.querySelector('[type="submit"]');
-      const message = form.querySelector(".container-message");
-      button.disabled = true;
-      input.disabled = true;
-      select.disabled = true;
-      message.textContent = "Moving…";
-      const moved = await setFrontendList(item, name);
-      if (moved) {
-        render();
-        if (dialog.isConnected) closeDialog();
-      } else {
-        message.textContent = "Could not move the bookmark. Your chosen folder is still here; you can try again.";
-        button.disabled = false;
-        input.disabled = false;
-        select.disabled = false;
-      }
-    });
-  }
-
-  function reorderBookmark(item, target, after = false, listName = item.frontend.list?.trim() || "") {
-    const key = hostBookmarkKey(item);
-    if (target && hostBookmarkKey(target) === key) return true;
-    const items = allBookmarkItems().filter(value => isBookmarked(hostBookmarkKey(value)));
-    const order = [...new Set([...items.map(hostBookmarkKey), ...state.bookmarkOrder])].filter(value => value !== key);
-    let index;
-    if (target) index = order.indexOf(hostBookmarkKey(target)) + (after ? 1 : 0);
-    else {
-      const siblings = items.filter(value => hostBookmarkKey(value) !== key && (value.frontend.list?.trim() || "") === listName);
-      const last = siblings.at(-1);
-      index = last ? order.indexOf(hostBookmarkKey(last)) + 1 : order.length;
-    }
-    order.splice(Math.max(0, index), 0, key);
-    try { window.localStorage.setItem("outer-shell.bookmark-order.v1", JSON.stringify(order)); }
-    catch (error) { toast("Could not save bookmark order.", true); return false; }
-    state.bookmarkOrder = order;
-    return true;
-  }
-
-  function reorderMenuHTML(item) {
-    if (!isBookmarked(hostBookmarkKey(item))) return "";
-    const siblings = allBookmarkItems().filter(value => isBookmarked(hostBookmarkKey(value)) && (value.frontend.list?.trim() || "") === (item.frontend.list?.trim() || ""));
-    const index = siblings.findIndex(value => value.identity === item.identity);
-    return [[-1, "Move earlier", "↑"], [1, "Move later", "↓"]].map(([direction, label, icon]) => `<button class="context-menu-item" type="button" data-action="reorder-bookmark" data-app-key="${escapeHTML(item.identity)}" data-direction="${direction}" role="menuitem" ${index + direction < 0 || index + direction >= siblings.length ? "disabled" : ""}>${contextMenuGlyph(icon)}<span>${label}</span></button>`).join("");
-  }
-
-  function finishAppDrag(event) {
-    const drag = state.appDrag;
-    if (!drag || event.pointerId !== drag.pointerID) return;
-    const wasDragging = drag.isDragging;
-    if (wasDragging) {
-      updateAppDropTarget(drag);
-      if (event.cancelable) event.preventDefault();
-      state.suppressLaunchUntil = Date.now() + 900;
-    }
-    if (drag.folder !== undefined) {
-      if (wasDragging) {
-        const positions = { ...state.folderPositions, [drag.folder]: drag.folderPosition };
-        try { localStorage.setItem("outer-shell.folder-positions.v1", JSON.stringify(positions)); state.folderPositions = positions; }
-        catch (error) { toast("Could not save folder position.", true); }
-      }
-      cancelAppDrag();
-      return;
-    }
-    const listName = drag.currentDropList;
-    const target = drag.targetIdentity ? findItem(drag.targetIdentity) : null;
-    cancelAppDrag();
-    if (wasDragging && listName !== null && reorderBookmark(drag.item, target, drag.dropAfter, listName)) {
-      if (listName !== drag.currentList) setFrontendList(drag.item, listName);
-      else render();
-    }
   }
 
   async function launch(identity, scope = "primary") {
@@ -1494,13 +1026,13 @@
   }
 
   function positionContextMenu(dialog, point) {
-    if (!point || window.matchMedia("(max-width: 680px), (min-width: 681px) and (max-width: 950px) and (orientation: landscape)").matches) return;
+    if (!point) return;
     dialog.dataset.anchored = "true";
     dialog.style.visibility = "hidden";
     const bounds = dialog.getBoundingClientRect();
     const inset = 9;
-    const left = Math.min(Math.max(point.x, inset), window.innerWidth - bounds.width - inset);
-    const top = Math.min(Math.max(point.y, inset), window.innerHeight - bounds.height - inset);
+    const left = Math.max(inset, Math.min(point.x, window.innerWidth - bounds.width - inset));
+    const top = Math.max(inset, Math.min(point.y, window.innerHeight - bounds.height - inset));
     dialog.style.left = `${left}px`;
     dialog.style.top = `${top}px`;
     dialog.style.visibility = "visible";
@@ -1667,30 +1199,45 @@
   }
 
   function showContextMenu(contents, point = null, label = "Actions") {
+    clearTextSelection();
     const dialog = openDialog(`<h2 id="dialog-title" class="context-menu-title">${escapeHTML(label)}</h2><div class="context-menu-scroll" role="menu">${contents}</div>`, "context-menu");
     dialog.setAttribute("aria-label", label);
     positionContextMenu(dialog, point);
     return dialog;
   }
 
-  function openAppMenu(identity, point = null) {
+  function menuContext(target) {
+    if (target.closest(".overview-shortcut")) return "shortcut";
+    return "endpoint";
+  }
+
+  function openAppMenu(identity, point = null, context = "endpoint") {
     const item = findItem(identity);
     if (!item) return;
-    if (item.workspace) { openContainerMenu(item.workspace.id, item.app.serviceID, containerFrontendKey(item.app)); return; }
+    if (item.workspace) { openContainerMenu(item.workspace.id, item.app.serviceID, containerFrontendKey(item.app), point, context); return; }
     const backend = item.backend;
     const sections = [endpointContextMenuHTML(item, "primary", backend.serviceScope === "system" ? "Root" : "User")];
     const management = [
-      bookmarkMenuHTML(hostBookmarkKey(item)),
+      pinMenuHTML(hostBookmarkKey(item), context === "shortcut"),
       renameEndpointMenuHTML(item),
-      reorderMenuHTML(item),
-      `<button class="context-menu-item" type="button" data-action="copy-url" data-app-key="${escapeHTML(item.identity)}" role="menuitem">${contextMenuGlyph("⧉")}<span>Copy URL</span></button>`,
-      `<button class="context-menu-item" type="button" data-action="move-bookmark" data-app-key="${escapeHTML(item.identity)}" role="menuitem">${contextMenuGlyph("▤")}<span>Move bookmark to folder…</span></button>`
+      `<button class="context-menu-item" type="button" data-action="copy-url" data-app-key="${escapeHTML(item.identity)}" role="menuitem">${contextMenuGlyph("⧉")}<span>Copy URL</span></button>`
     ];
     if (backend.supportsRoot && backend.serviceScope !== "system" && !backend.rootOnly) {
       management.push(`<button class="context-menu-item" type="button" data-action="control" data-operation="${backend.hasRootSupport ? "removeRootSupport" : "addRootSupport"}" data-backend-key="${escapeHTML(backendKey(backend))}" role="menuitem">${contextMenuGlyph("◇")}<span>${backend.hasRootSupport ? "Remove root support" : "Add root shortcut"}</span></button>`);
     }
-    if (backend.canUninstall) {
-      management.push(`<button class="context-menu-item danger" type="button" data-action="uninstall" data-backend-key="${escapeHTML(backendKey(backend))}" role="menuitem">${contextMenuGlyph("−")}<span>Uninstall</span></button>`);
+    const isOuterShell = backend.serviceID === "org.outershell.OuterShell" && backend.serviceScope !== "system";
+    if (isOuterShell) {
+      const key = escapeHTML(backendKey(backend));
+      management.push(
+        `<button class="context-menu-item" type="button" data-action="about-outer-shell" data-backend-key="${key}" role="menuitem">${contextMenuGlyph("ⓘ")}<span>About Outer Shell</span></button>`,
+        `<button class="context-menu-item" type="button" data-action="check-outer-shell-update" data-backend-key="${key}" role="menuitem">${contextMenuGlyph("↻")}<span>Check for Updates</span></button>`
+      );
+      if (backend.menuBarVisibilityAvailable) {
+        management.push(`<button class="context-menu-item menu-toggle" type="button" data-action="toggle-menu-bar" data-backend-key="${key}" data-enabled="${backend.menuBarVisibilityEnabled ? "true" : "false"}" role="menuitemcheckbox" aria-checked="${backend.menuBarVisibilityEnabled ? "true" : "false"}">${contextMenuGlyph(backend.menuBarVisibilityEnabled ? "✓" : "")}<span>Show in macOS menu bar when backends are running</span></button>`);
+      }
+    }
+    if (isOuterShell || backend.canUninstall) {
+      management.push(`<button class="context-menu-item danger" type="button" data-action="${isOuterShell ? "uninstall-outer-shell" : "uninstall"}" data-backend-key="${escapeHTML(backendKey(backend))}" role="menuitem">${contextMenuGlyph("−")}<span>Uninstall</span></button>`);
     }
     if (management.length) sections.push(`<section class="context-menu-section context-menu-management">${management.join("")}</section>`);
     showContextMenu(`<div class="context-menu-app-heading">${launcherIconHTML(item)}<strong>${escapeHTML(item.displayName)}</strong></div>${sections.filter(Boolean).join("")}`, point, `${item.displayName} actions`);
@@ -1955,7 +1502,7 @@
     });
   }
 
-  function openContainerMenu(id, serviceID, frontendKey) {
+  function openContainerMenu(id, serviceID, frontendKey, point = null, context = "endpoint") {
     const workspace = findSafeSpace(id);
     if (!workspace) return;
     const app = serviceID ? findSafeSpaceApp(workspace, serviceID, frontendKey) : null;
@@ -1966,40 +1513,14 @@
     const operation = app ? (running ? "stopApp" : "startApp") : (running ? "stop" : "start");
     const attributes = `data-safe-space-id="${escapeHTML(id)}" data-service-id="${escapeHTML(serviceID || "")}" data-frontend-key="${escapeHTML(frontendKey || "")}"`;
     const url = app ? safeSpaceAppNavigationURL(workspace, app) : "";
-    showContextMenu(`<div class="context-menu-app-heading"><strong>${escapeHTML(name)}</strong></div>
+    showContextMenu(`<div class="context-menu-app-heading">${app ? launcherIconHTML(findItem(containerBookmarkKey(workspace, app))) : ""}<strong>${escapeHTML(name)}</strong></div>
       <section class="context-menu-section">
-        ${!app && managedContainer(workspace) ? `<button class="context-menu-item" type="button" data-action="configure-container" data-safe-space-id="${escapeHTML(id)}" role="menuitem" ${preparing ? "disabled" : ""}>Edit container…</button><button class="context-menu-item" type="button" data-action="share-container" data-safe-space-id="${escapeHTML(id)}" role="menuitem" ${preparing ? "disabled" : ""}>Share Container…</button>` : ""}
-        ${app ? bookmarkMenuHTML(containerBookmarkKey(workspace, app)) + renameEndpointMenuHTML(findItem(containerBookmarkKey(workspace, app))) : ""}
-        ${app ? reorderMenuHTML(findItem(containerBookmarkKey(workspace, app))) : ""}
-        ${app ? `<button class="context-menu-item" type="button" data-action="move-bookmark" data-app-key="${escapeHTML(containerBookmarkKey(workspace, app))}" role="menuitem">Move bookmark to folder…</button>` : ""}
-        ${app ? `<a class="context-menu-item" href="${escapeHTML(url)}" data-action="launch-safe-space-app" ${attributes} role="menuitem">Open</a>` : `<p class="container-details">${escapeHTML(safeSpaceRuntimeDescription(workspace))}</p>`}
-        <button class="context-menu-item" type="button" data-action="container-control" data-operation="${operation}" ${attributes} role="menuitem" ${preparing ? "disabled" : ""}>${preparing ? "Preparing…" : running ? "Stop" : "Start"}</button>
-        ${app && url !== "#" ? `<button class="context-menu-item" type="button" data-action="copy-container-url" ${attributes} role="menuitem">Copy URL</button>` : ""}
-      </section>`, null, `${name} actions`);
-  }
-
-  function openHomeMenu(anchor) {
-    const outerShell = state.backends.find(backend => backend.serviceID === "org.outershell.OuterShell" && backend.serviceScope !== "system")
-      || state.backends.find(backend => backend.serviceID === "org.outershell.OuterShell");
-    const actions = [
-      `<button class="context-menu-item plain" type="button" data-action="create-container" role="menuitem">New container…</button>`
-    ];
-    if (!state.editing) actions.unshift(`<button class="context-menu-item plain" type="button" data-action="toggle-edit" role="menuitem">Edit</button>`);
-    if (outerShell) {
-      const key = escapeHTML(backendKey(outerShell));
-      actions.push(
-        `<button class="context-menu-item plain" type="button" data-action="about-outer-shell" data-backend-key="${key}" role="menuitem">About Outer Shell</button>`,
-        `<button class="context-menu-item plain" type="button" data-action="logs" data-backend-key="${key}" role="menuitem">View Logs for Outer Shell</button>`
-      );
-      if (outerShell.menuBarVisibilityAvailable) {
-        actions.push(`<button class="context-menu-item menu-toggle" type="button" data-action="toggle-menu-bar" data-backend-key="${key}" data-enabled="${outerShell.menuBarVisibilityEnabled ? "true" : "false"}" role="menuitemcheckbox" aria-checked="${outerShell.menuBarVisibilityEnabled ? "true" : "false"}">${contextMenuGlyph(outerShell.menuBarVisibilityEnabled ? "✓" : "")}<span>Show in macOS menu bar when backends are running</span></button>`);
-      }
-      actions.push(`<button class="context-menu-item plain" type="button" data-action="check-outer-shell-update" data-backend-key="${key}" role="menuitem">Check for Updates</button>`);
-      actions.push(`<button class="context-menu-item plain" type="button" data-action="uninstall-outer-shell" data-backend-key="${key}" role="menuitem">Uninstall Outer Shell</button>`);
-    }
-    const bounds = anchor.getBoundingClientRect();
-    const point = { x: Math.max(9, bounds.right - 280), y: bounds.bottom + 5 };
-    showContextMenu(`<section class="context-menu-section">${actions.join("")}</section>`, point, "Outer Shell");
+        ${!app && managedContainer(workspace) ? `<button class="context-menu-item" type="button" data-action="configure-container" data-safe-space-id="${escapeHTML(id)}" role="menuitem" ${preparing ? "disabled" : ""}>${contextMenuGlyph("✎")}<span>Edit container…</span></button><button class="context-menu-item" type="button" data-action="share-container" data-safe-space-id="${escapeHTML(id)}" role="menuitem" ${preparing ? "disabled" : ""}>${contextMenuGlyph("↗")}<span>Share Container…</span></button>` : ""}
+        ${app ? pinMenuHTML(containerBookmarkKey(workspace, app), context === "shortcut") + renameEndpointMenuHTML(findItem(containerBookmarkKey(workspace, app))) : ""}
+        ${app ? `<a class="context-menu-item" href="${escapeHTML(url)}" data-action="launch-safe-space-app" ${attributes} role="menuitem">${contextMenuGlyph("↗")}<span>Open</span></a>` : `<p class="container-details">${escapeHTML(safeSpaceRuntimeDescription(workspace))}</p>`}
+        <button class="context-menu-item" type="button" data-action="container-control" data-operation="${operation}" ${attributes} role="menuitem" ${preparing ? "disabled" : ""}>${contextMenuGlyph(running ? "■" : "▶")}<span>${preparing ? "Preparing…" : running ? "Stop" : "Start"}</span></button>
+        ${app && url !== "#" ? `<button class="context-menu-item" type="button" data-action="copy-container-url" ${attributes} role="menuitem">${contextMenuGlyph("⧉")}<span>Copy URL</span></button>` : ""}
+      </section>`, point, `${name} actions`);
   }
 
   function openOuterShellAbout(key) {
@@ -2223,139 +1744,213 @@
     }
   }
 
-  loadBookmarks();
+  loadCardPreferences();
   updatePage();
-  let layoutFrame = 0;
-  const scheduleBookmarkLayout = () => {
-    cancelAnimationFrame(layoutFrame);
-    layoutFrame = requestAnimationFrame(layoutBookmarks);
-  };
-  let bookmarkLayoutWidth = "";
-  const scheduleBookmarkWidthChange = () => {
-    const grid = elements.sections.closest(".dashboard");
-    const width = `${grid.clientWidth}:${window.innerWidth <= 680}`;
-    if (width === bookmarkLayoutWidth) return;
-    bookmarkLayoutWidth = width;
-    scheduleBookmarkLayout();
-  };
-  new ResizeObserver(scheduleBookmarkWidthChange).observe(elements.sections.closest(".dashboard"));
-  window.addEventListener("resize", scheduleBookmarkWidthChange);
-  elements.sections.addEventListener("load", scheduleBookmarkLayout, true);
   window.addEventListener("hashchange", updatePage);
-  elements.search.addEventListener("input", event => {
-    state.query = event.target.value;
-    render();
+  function beginEndpointDrag(event, touch) {
+    if (state.endpointDrag || state.groupDrag || elements.dialogLayer.childElementCount || event.target.closest("button")) return;
+    const source = event.target.closest(".overview-row[data-endpoint-key], .overview-shortcut-wrap[data-endpoint-key]");
+    if (!source) return;
+    const card = source.closest("[data-group-id]");
+    const drag = { source, card, key: source.dataset.endpointKey, groupID: card.dataset.groupId, x: (touch || event).clientX, y: (touch || event).clientY, pointerId: touch ? undefined : event.pointerId, touchId: touch?.identifier, armed: !touch, moved: false, target: null };
+    state.endpointDrag = drag;
+    if (touch) drag.timer = window.setTimeout(() => {
+      if (state.endpointDrag === drag) { drag.armed = true; source.classList.add("endpoint-armed"); }
+    }, 260);
+
+  }
+
+  function moveEndpointDrag(x, y, event) {
+    const drag = state.endpointDrag;
+    if (!drag) return;
+    const distance = Math.hypot(x - drag.x, y - drag.y);
+    if (!drag.armed) { if (distance > 10) finishEndpointDrag(false); return; }
+    event.preventDefault();
+    if (!drag.moved && distance < 6) return;
+    if (!drag.moved && drag.pointerId !== undefined) drag.source.setPointerCapture(drag.pointerId);
+    drag.moved = true;
+    cancelLongPress();
+    clearTextSelection();
+    state.suppressLaunchUntil = Date.now() + 900;
+    drag.card.classList.add("endpoint-drag-active");
+    drag.source.classList.add("endpoint-drag-source");
+    drag.card.querySelectorAll(".endpoint-drop-before, .endpoint-drop-area").forEach(node => node.classList.remove("endpoint-drop-before", "endpoint-drop-area"));
+    const hit = document.elementFromPoint(x, y);
+    const area = hit?.closest("[data-endpoint-area]");
+    drag.target = null;
+    if (area?.closest("[data-group-id]") === drag.card) {
+      const siblings = [...area.querySelectorAll(":scope > [data-endpoint-key]")].filter(node => node !== drag.source);
+      const before = siblings.find(node => {
+        const bounds = node.getBoundingClientRect();
+        return area.dataset.endpointArea === "list" ? y < bounds.top + bounds.height / 2 : y < bounds.top || (y <= bounds.bottom && x < bounds.left + bounds.width / 2);
+      });
+      drag.target = { area: area.dataset.endpointArea, beforeKey: before?.dataset.endpointKey };
+      if (before) before.classList.add("endpoint-drop-before"); else area.classList.add("endpoint-drop-area");
+    }
+    if (y < 60) window.scrollBy(0, -16);
+    else if (y > window.innerHeight - 60) window.scrollBy(0, 16);
+  }
+
+  function finishEndpointDrag(commit) {
+    const drag = state.endpointDrag;
+    if (!drag) return;
+    state.endpointDrag = null;
+    window.clearTimeout(drag.timer);
+    if (drag.pointerId !== undefined && drag.source.hasPointerCapture(drag.pointerId)) drag.source.releasePointerCapture(drag.pointerId);
+    if (drag.moved) state.suppressLaunchUntil = Date.now() + 900;
+    if (commit && drag.moved && drag.target) moveCardEndpoint(drag.groupID, drag.key, drag.target.area, drag.target.beforeKey);
+    drag.card.classList.remove("endpoint-drag-active");
+    drag.card.querySelectorAll(".endpoint-armed, .endpoint-drag-source, .endpoint-drop-before, .endpoint-drop-area").forEach(node => node.classList.remove("endpoint-armed", "endpoint-drag-source", "endpoint-drop-before", "endpoint-drop-area"));
+    renderOverview(registeredAddresses());
+  }
+
+  elements.overview.addEventListener("pointerdown", event => {
+    if (event.pointerType !== "touch" && event.isPrimary && event.button === 0) beginEndpointDrag(event);
+  });
+  elements.overview.addEventListener("pointermove", event => { if (state.endpointDrag?.pointerId === event.pointerId) moveEndpointDrag(event.clientX, event.clientY, event); }, { passive: false });
+  elements.overview.addEventListener("pointerup", event => { if (state.endpointDrag?.pointerId === event.pointerId) finishEndpointDrag(true); });
+  elements.overview.addEventListener("pointercancel", event => { if (state.endpointDrag?.pointerId === event.pointerId) finishEndpointDrag(false); });
+  elements.overview.addEventListener("lostpointercapture", event => { if (state.endpointDrag?.pointerId === event.pointerId) finishEndpointDrag(false); });
+  elements.overview.addEventListener("touchstart", event => { if (event.touches.length === 1) beginEndpointDrag(event, event.touches[0]); else finishEndpointDrag(false); }, { passive: true });
+  elements.overview.addEventListener("touchmove", event => {
+    const drag = state.endpointDrag;
+    if (!drag || drag.touchId === undefined) return;
+    if (event.touches.length !== 1 || !event.cancelable) { finishEndpointDrag(false); return; }
+    const touch = [...event.touches].find(touch => touch.identifier === drag.touchId);
+    if (touch) moveEndpointDrag(touch.clientX, touch.clientY, event);
+  }, { passive: false });
+  elements.overview.addEventListener("touchend", event => { if ([...event.changedTouches].some(touch => touch.identifier === state.endpointDrag?.touchId)) finishEndpointDrag(true); });
+  elements.overview.addEventListener("touchcancel", () => finishEndpointDrag(false));
+
+  function beginGroupDrag(handle, x, y, pointerId, touchId) {
+    const card = handle.closest("[data-group-id]");
+    const drag = { handle, card, id: card.dataset.groupId, pointerId, touchId, x, y, moved: false, target: null, armed: touchId === undefined, armTimer: 0 };
+    state.groupDrag = drag;
+    if (!drag.armed) {
+      drag.armTimer = window.setTimeout(() => {
+        if (state.groupDrag !== drag) return;
+        drag.armed = true;
+        handle.classList.add("is-armed");
+      }, 260);
+    } else handle.setPointerCapture(pointerId);
+  }
+
+  function moveGroupDrag(x, y, event) {
+    const drag = state.groupDrag;
+    if (!drag) return;
+    const distance = Math.hypot(x - drag.x, y - drag.y);
+    if (!drag.armed) {
+      if (distance > 10) finishGroupDrag(false);
+      return;
+    }
+    event.preventDefault();
+    if (!drag.moved && distance < 6) return;
+    drag.moved = true;
+    drag.card.classList.add("is-group-dragging");
+    elements.overview.querySelectorAll(".group-drop-before, .group-drop-after").forEach(card => card.classList.remove("group-drop-before", "group-drop-after"));
+    const target = document.elementFromPoint(x, y)?.closest("[data-group-id]");
+    drag.target = target && target !== drag.card ? target.dataset.groupId : null;
+    if (drag.target) {
+      const cards = [...elements.overview.querySelectorAll("[data-group-id]")];
+      target.classList.add(cards.indexOf(drag.card) < cards.indexOf(target) ? "group-drop-after" : "group-drop-before");
+    }
+    if (y < 60) window.scrollBy(0, -16);
+    else if (y > window.innerHeight - 60) window.scrollBy(0, 16);
+  }
+
+  elements.overview.addEventListener("pointerdown", event => {
+    if (event.pointerType === "touch") return;
+    const handle = event.target.closest("[data-group-handle]");
+    if (!handle || event.target.closest("button, a, input, select, textarea") || event.button !== 0 || !event.isPrimary || state.groupDrag) return;
+    beginGroupDrag(handle, event.clientX, event.clientY, event.pointerId);
+    event.preventDefault();
+  });
+  elements.overview.addEventListener("pointermove", event => {
+    if (event.pointerId === state.groupDrag?.pointerId) moveGroupDrag(event.clientX, event.clientY, event);
+  }, { passive: false });
+  elements.overview.addEventListener("pointerup", event => { if (event.pointerId === state.groupDrag?.pointerId) finishGroupDrag(true); });
+  elements.overview.addEventListener("pointercancel", event => { if (event.pointerId === state.groupDrag?.pointerId) finishGroupDrag(false); });
+  elements.overview.addEventListener("lostpointercapture", event => { if (event.pointerId === state.groupDrag?.pointerId) finishGroupDrag(false); });
+  elements.overview.addEventListener("touchstart", event => {
+    if (event.touches.length !== 1) { finishGroupDrag(false); return; }
+    const handle = event.target.closest("[data-group-handle]");
+    if (!handle || event.target.closest("button, a, input, select, textarea") || state.groupDrag) return;
+    const touch = event.touches[0];
+    beginGroupDrag(handle, touch.clientX, touch.clientY, undefined, touch.identifier);
+  }, { passive: true });
+  elements.overview.addEventListener("touchmove", event => {
+    const drag = state.groupDrag;
+    if (!drag || drag.touchId === undefined) return;
+    if (event.touches.length !== 1 || !event.cancelable) { finishGroupDrag(false); return; }
+    const touch = [...event.touches].find(touch => touch.identifier === drag.touchId);
+    if (touch) moveGroupDrag(touch.clientX, touch.clientY, event);
+  }, { passive: false });
+  elements.overview.addEventListener("touchend", event => {
+    if ([...event.changedTouches].some(touch => touch.identifier === state.groupDrag?.touchId)) finishGroupDrag(true);
+  });
+  elements.overview.addEventListener("touchcancel", () => { if (state.groupDrag?.touchId !== undefined) finishGroupDrag(false); });
+  elements.overview.addEventListener("keydown", event => {
+    if (event.key === "Escape") { finishGroupDrag(false); return; }
+    const handle = event.target.closest("[data-group-handle]");
+    if (!handle || event.target !== handle || !["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(event.key)) return;
+    event.preventDefault();
+    const id = handle.closest("[data-group-id]").dataset.groupId;
+    const order = [...elements.overview.querySelectorAll("[data-group-id]")].map(card => card.dataset.groupId);
+    const from = order.indexOf(id), to = from + (["ArrowLeft", "ArrowUp"].includes(event.key) ? -1 : 1);
+    if (to < 0 || to >= order.length) return;
+    order.splice(from, 1); order.splice(to, 0, id);
+    if (saveGroupOrder(order)) {
+      renderOverview(registeredAddresses());
+      [...elements.overview.querySelectorAll("[data-group-id]")].find(card => card.dataset.groupId === id)?.querySelector("[data-group-handle]").focus();
+    }
   });
   elements.add.addEventListener("click", () => openAddDialog());
-  elements.refresh.addEventListener("click", event => openHomeMenu(event.currentTarget));
   document.body.addEventListener("contextmenu", event => {
     const identity = itemIdentityFromTarget(event.target);
-    const folder = event.target.closest("[data-folder]")?.dataset.folder;
-    if (!identity && folder === undefined) return;
+    if (!identity) return;
     event.preventDefault();
     cancelLongPress();
-    cancelAppDrag();
+    finishEndpointDrag(false);
     clearPressFeedback();
     if (Date.now() < state.suppressLaunchUntil && elements.dialogLayer.childElementCount) return;
-    if (identity) openAppMenu(identity, { x: event.clientX, y: event.clientY });
-    else openFolderMenu(folder, { x: event.clientX, y: event.clientY });
-  });
-  document.body.addEventListener("pointerdown", beginFolderResize);
-  document.body.addEventListener("pointermove", moveFolderResize, { passive: false });
-  document.body.addEventListener("pointerup", event => endFolderResize(event, true));
-  document.body.addEventListener("pointercancel", event => endFolderResize(event, false));
-  document.body.addEventListener("lostpointercapture", event => endFolderResize(event, false));
-  elements.sections.addEventListener("keydown", event => {
-    const handle = event.target.closest("[data-folder-resize]");
-    if (!handle || !["ArrowLeft", "ArrowRight"].includes(event.key)) return;
-    event.preventDefault();
-    const folder = handle.closest("[data-folder]");
-    const width = state.folderWidths[folder.dataset.folder] || folder.getBoundingClientRect().width;
-    const direction = handle.dataset.folderResize === "left" ? -1 : 1;
-    saveFolderWidth(folder.dataset.folder, width + (event.key === "ArrowRight" ? 32 : -32) * direction);
-    layoutBookmarks();
+    if (identity) openAppMenu(identity, { x: event.clientX, y: event.clientY }, menuContext(event.target));
   });
   document.body.addEventListener("pointerdown", beginLongPress);
   document.body.addEventListener("pointerdown", beginPressFeedback);
-  document.body.addEventListener("pointerdown", beginAppDrag);
   document.body.addEventListener("dragstart", event => {
-    if (event.target.closest("[data-drag-app-key]")) event.preventDefault();
+    if (event.target.closest("[data-drag-app-key], [data-endpoint-key]")) event.preventDefault();
   });
   document.body.addEventListener("pointermove", moveLongPress);
   document.body.addEventListener("pointermove", movePressFeedback);
-  document.body.addEventListener("pointermove", moveAppDrag, { passive: false });
-  document.body.addEventListener("touchmove", event => {
-    if (state.appDrag?.touchArmed || state.appDrag?.isDragging) event.preventDefault();
-  }, { passive: false });
-  document.body.addEventListener("pointerup", event => { finishAppDrag(event); cancelLongPress(); clearPressFeedback(); });
-  document.body.addEventListener("pointercancel", () => { cancelAppDrag(); cancelLongPress(); clearPressFeedback(); });
-  document.body.addEventListener("lostpointercapture", () => { cancelAppDrag(); cancelLongPress(); clearPressFeedback(); });
+  document.body.addEventListener("pointerup", event => { cancelLongPress(); clearPressFeedback(); });
+  document.body.addEventListener("pointercancel", () => { cancelLongPress(); clearPressFeedback(); });
+  document.body.addEventListener("lostpointercapture", () => { cancelLongPress(); clearPressFeedback(); });
   document.body.addEventListener("selectstart", event => {
-    if (itemIdentityFromTarget(event.target) || Date.now() < state.suppressLaunchUntil) event.preventDefault();
+    if (event.target.closest?.(".context-menu, .overview-shortcut, .overview-row > a") || itemIdentityFromTarget(event.target) || Date.now() < state.suppressLaunchUntil) event.preventDefault();
   });
   document.body.addEventListener("click", async event => {
     const actionElement = event.target.closest("[data-action]");
     if (!actionElement) return;
     if (actionElement.classList.contains("dialog-backdrop") && event.target !== actionElement) return;
     const action = actionElement.dataset.action;
-    if (Date.now() < state.suppressLaunchUntil && actionElement.closest(".app-sections")) {
+    if (["toggle-group-pin", "move-pin-earlier", "move-pin-later"].includes(action)) { changeGroupPin(actionElement.dataset.endpointKey, action); return; }
+    if (Date.now() < state.suppressLaunchUntil && actionElement.closest(".app-sections, .directory-row, .overview-identity")) {
       event.preventDefault();
       return;
     }
     if (action === "rename-endpoint") { const item = findItem(actionElement.dataset.appKey); if (item) openRenameEndpoint(item); return; }
-    if (action === "rename-folder") { openRenameFolder(actionElement.dataset.folderName); return; }
     if (action === "create-container") { openCreateContainer(); return; }
     if (action === "configure-container") { openContainerConfiguration(actionElement.dataset.safeSpaceId); return; }
     if (action === "share-container") { openShareContainer(actionElement.dataset.safeSpaceId); return; }
-    if (action === "toggle-edit") {
-      state.editing = !state.editing;
-      elements.shell.classList.toggle("is-editing", state.editing);
-      elements.edit.hidden = !state.editing;
-      if (actionElement.closest(".context-menu")) closeDialog();
-      render();
-      return;
-    }
-    if (action === "browse-urls") {
-      window.location.hash = "bookmarks";
-      updatePage();
-      elements.urlsPage.scrollIntoView({ block: "start" });
-      return;
-    }
-    if (action === "toggle-bookmark") {
-      const key = actionElement.dataset.bookmarkKey;
-      const added = !isBookmarked(key);
-      if (setBookmark(key, added)) {
-        if (actionElement.closest(".context-menu")) closeDialog();
-        render();
-        toast(added ? "Bookmark added." : "Bookmark removed. The endpoint is still registered.");
-        const button = [...elements.directory.querySelectorAll("[data-bookmark-key]")].find(value => value.dataset.bookmarkKey === key);
-        button?.focus({ preventScroll: true });
-      }
-      return;
-    }
-    if (action === "edit-bookmark") { openAppMenu(actionElement.dataset.appKey); return; }
+    if (action === "edit-bookmark") { const bounds = actionElement.getBoundingClientRect(); openAppMenu(actionElement.dataset.appKey, { x: bounds.left, y: bounds.bottom + 4 }, menuContext(actionElement)); return; }
     if (action === "copy-url") {
       const item = findItem(actionElement.dataset.appKey);
       if (item) { closeDialog(); await copyText(navigationURL(item.frontend)); }
       return;
     }
-    if (action === "reorder-bookmark") {
-      const item = findItem(actionElement.dataset.appKey);
-      if (!item) return;
-      const direction = Number(actionElement.dataset.direction);
-      const siblings = allBookmarkItems().filter(value => isBookmarked(hostBookmarkKey(value)) && (value.frontend.list?.trim() || "") === (item.frontend.list?.trim() || ""));
-      const target = siblings[siblings.findIndex(value => value.identity === item.identity) + direction];
-      if (target && reorderBookmark(item, target, direction > 0)) { closeDialog(); render(); }
-      return;
-    }
-    if (action === "move-bookmark") {
-      const item = findItem(actionElement.dataset.appKey);
-      if (!item) return;
-      openBookmarkFolderDialog(item);
-      return;
-    }
     if (action === "edit-container" || action === "edit-container-bookmark") {
-      openContainerMenu(actionElement.dataset.safeSpaceId, actionElement.dataset.serviceId, actionElement.dataset.frontendKey);
+      const bounds = actionElement.getBoundingClientRect();
+      openContainerMenu(actionElement.dataset.safeSpaceId, actionElement.dataset.serviceId, actionElement.dataset.frontendKey, { x: bounds.left, y: bounds.bottom + 4 }, menuContext(actionElement));
       return;
     }
     if (action === "copy-container-url") {
@@ -2438,21 +2033,22 @@
     fetchSelectedLog();
   });
   document.addEventListener("keydown", event => {
+    if (event.key === "Escape") { finishEndpointDrag(false); finishGroupDrag(false); }
     if (event.key === "Escape" && elements.dialogLayer.childElementCount) closeDialog();
     if (event.key === "ContextMenu" || (event.shiftKey && event.key === "F10")) {
       const identity = itemIdentityFromTarget(event.target);
       if (!identity) return;
       event.preventDefault();
       const bounds = event.target.getBoundingClientRect();
-      openAppMenu(identity, { x: bounds.left, y: bounds.bottom });
+      openAppMenu(identity, { x: bounds.left, y: bounds.bottom }, menuContext(event.target));
     }
   });
   window.addEventListener("beforeunload", suspendRefreshes);
-  window.addEventListener("pagehide", () => { cancelAppDrag(); suspendRefreshes(); });
+  window.addEventListener("pagehide", () => { finishEndpointDrag(false); finishGroupDrag(false); suspendRefreshes(); });
   window.addEventListener("pageshow", resumeRefreshes);
   window.addEventListener("online", () => { suspendRefreshes(); resumeRefreshes(); });
   document.addEventListener("visibilitychange", () => {
-    if (document.hidden) suspendRefreshes();
+    if (document.hidden) { finishEndpointDrag(false); finishGroupDrag(false); suspendRefreshes(); }
     else resumeRefreshes();
   });
   state.safeSpacesTimer = window.setInterval(() => {

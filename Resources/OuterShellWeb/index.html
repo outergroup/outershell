@@ -14,33 +14,10 @@
 <body>
   <div id="app" class="shell" aria-busy="true">
     <main>
-      <div class="page-tools">
-        <button id="refresh-button" class="home-menu-button" type="button" aria-label="Outer Shell menu" title="Outer Shell menu" aria-haspopup="dialog">
-          <span class="menu-gear" aria-hidden="true">⚙︎</span>
-        </button>
-        <button id="edit-button" class="ghost-button" type="button" data-action="toggle-edit" hidden>Done editing</button>
-        <label class="header-search"><span class="visually-hidden">Search bookmarks and endpoints</span><input id="search-input" type="search" placeholder="Search…" autocomplete="off"></label>
-      </div>
       <button id="add-button" type="button" hidden>Add</button>
-      <p id="app-summary" class="visually-hidden">Loading bookmarks…</p>
       <section id="status-banner" class="status-banner" hidden></section>
-      <section id="home-page" aria-label="Bookmarks and endpoints">
-      <div class="dashboard" aria-label="Bookmarks">
-        <div id="app-sections" class="app-sections"></div>
-      </div>
-      <section id="empty-state" class="empty-state" hidden>
-        <h2>Your bookmarks</h2>
-        <p>Bookmark an endpoint to get started.</p>
-        <button class="primary-button" type="button" data-action="browse-urls">Add bookmark</button>
-      </section>
-      <section id="urls-page" aria-labelledby="urls-heading">
-        <header class="directory-header">
-          <h2 id="urls-heading">All endpoints</h2>
-          <div class="directory-actions"><button class="secondary-button" type="button" data-action="create-container">New container…</button><button class="secondary-button" type="button" data-action="open-add">Register…</button></div>
-        </header>
-        <div id="url-directory"></div>
-        <p class="directory-note">● Running · ☆ Add bookmark · ★ Bookmarked · Tap an address to open. Bookmarks saved in this browser.</p>
-      </section>
+      <section id="home-page" aria-label="Server overview">
+      <div id="server-overview"></div>
       </section>
     </main>
   </div>
