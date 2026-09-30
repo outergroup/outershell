@@ -61,3 +61,9 @@ An older Outer Loop does not advertise the web feature and the web home screen
 navigates directly to the app. Native Outer Shell navigation requires an Outer
 Loop version that recognizes the custom URL; the custom URL is never sent to
 the destination app itself.
+
+### Linux container endpoints
+
+Container snapshots carry a persistent `iconObservationToken` per service/frontend/socket/URL identity. The web launcher requests observation for container endpoints just as it does for host endpoints. The daemon first resolves host capabilities, then delegates unknown tokens to the configured container provider. Before delegation it applies the same PNG size and dimension checks used for host icons.
+
+The provider's private stdin protocol accepts `OSCI`, followed by a 32-byte lowercase hexadecimal token and the PNG bytes, and returns a three-digit HTTP status. This is separate from the public HTTP API; Outer Loop continues to POST to `/api/icon-observation`. Discovered icons are stored in the container's cached app records and carried across discovery refreshes. Declared icon paths take precedence, and a changed endpoint identity gets a fresh capability.

@@ -1499,6 +1499,48 @@ def runtime_published_ports(container_id):
     return ports
 
 
+def app_icon_identity(app):
+    return tuple(app.get(key, "") for key in ("serviceID", "frontendID", "socketPath", "url"))
+
+
+def preserve_observed_icons(discovered, previous):
+    previous = {app_icon_identity(app): app for app in previous}
+    for app in discovered:
+        old = previous.get(app_icon_identity(app), {})
+        app["iconObservationToken"] = old.get("iconObservationToken") or uuid.uuid4().hex
+        if not app.get("iconPath") and old.get("observedIconData"):
+            app["observedIconData"] = old["observedIconData"]
+            app["iconData"] = old["observedIconData"]
+
+
+def store_observed_icon(payload):
+    if len(payload) <= 36 or len(payload) > 36 + 48 * 1024:
+        return 400
+    try:
+        token = payload[4:36].decode("ascii")
+        if len(token) != 32 or any(c not in "0123456789abcdef" for c in token):
+            return 403
+    except UnicodeDecodeError:
+        return 403
+    image = payload[36:]
+    if len(image) < 24 or image[:8] != b"\x89PNG\r\n\x1a\n":
+        return 400
+    width, height = struct.unpack(">II", image[16:24])
+    if not (0 < width <= 4096 and 0 < height <= 4096):
+        return 400
+    with Records() as records:
+        for record in records.values:
+            for app in record.get("cachedApps", []):
+                if app.get("iconObservationToken") != token:
+                    continue
+                if not app.get("iconPath"):
+                    app["observedIconData"] = base64.b64encode(image).decode("ascii")
+                    app["iconData"] = app["observedIconData"]
+                    records.save()
+                return 200
+    return 403
+
+
 def app_snapshots(container_id, recipe):
     result = container_exec(container_id, ["/usr/local/bin/outerctl", "app", "list"])
     if result.returncode != 0:
@@ -1958,6 +2000,7 @@ def workspace_dictionary(record):
         except Exception:
             discovered = None
         if discovered is not None:
+            preserve_observed_icons(discovered, apps)
             for app in discovered:
                 if app["isRunning"]:
                     try:
@@ -2448,6 +2491,13 @@ def main():
     if sys.argv[1] == "request":
         try:
             raw_request = sys.stdin.buffer.read()
+            if raw_request.startswith(b"OSCI"):
+                try:
+                    status = store_observed_icon(raw_request)
+                except Exception:
+                    status = 500
+                sys.stdout.write(str(status))
+                return 0
             if raw_request.startswith(TRANSFER_MAGIC):
                 sys.stdout.buffer.write(handle_transfer_request(raw_request))
                 return 0

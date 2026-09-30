@@ -6625,6 +6625,9 @@ static void send_safe_space_icon_observation_response(int fd,
                                                       const char *body,
                                                       size_t body_length);
 
+static bool run_safe_space_provider(const char *body, size_t body_length,
+                                    StringBuilder *output, int *exit_status);
+
 static void send_icon_observation_response(int fd,
                                            const char *query,
                                            const char *body,
@@ -6636,11 +6639,7 @@ static void send_icon_observation_response(int fd,
     }
     IconObservationCapability *capability = icon_observation_capability_for_token(token);
     if (!capability) {
-        if (g_safe_space_icon_observation_callback) {
-            send_safe_space_icon_observation_response(fd, query, body, body_length);
-            return;
-        }
-        send_action_response(fd, 403, false, "Invalid icon observation token.");
+        send_safe_space_icon_observation_response(fd, query, body, body_length);
         return;
     }
     if (!body || body_length == 0 || body_length > 48u * 1024u) {
@@ -6738,19 +6737,44 @@ static void send_safe_space_icon_observation_response(int fd,
         send_action_response(fd, 400, false, "Missing icon observation token.");
         return;
     }
-    if (!g_safe_space_icon_observation_callback) {
-        send_action_response(fd, 503, false, "Container icon discovery is unavailable.");
-        return;
-    }
     if (!body || body_length == 0 || body_length > 48u * 1024u) {
         send_action_response(fd, 400, false, "Icon must be a non-empty PNG no larger than 48 KiB.");
         return;
     }
-    int status = g_safe_space_icon_observation_callback(
-        token,
-        (const unsigned char *)body,
-        body_length
-    );
+    int status = 500;
+    if (g_safe_space_icon_observation_callback) {
+        status = g_safe_space_icon_observation_callback(token, (const unsigned char *)body, body_length);
+    } else {
+        if (strlen(token) != 32 || strspn(token, "0123456789abcdef") != 32) {
+            send_action_response(fd, 403, false, "Invalid icon observation token.");
+            return;
+        }
+        char path[] = "/tmp/outershell-observed-icon-XXXXXX";
+        int icon_fd = mkstemp(path);
+        size_t width = 0, height = 0;
+        char error[256] = "";
+        bool valid = icon_fd >= 0 && queue_all(icon_fd, body, body_length);
+        if (icon_fd >= 0 && close(icon_fd) != 0) valid = false;
+        valid = valid && outer_shell_png_dimensions(path, &width, &height, error, sizeof(error)) &&
+                width > 0 && height > 0 && width <= 4096 && height <= 4096;
+        unlink(path);
+        if (!valid) {
+            send_action_response(fd, 400, false, "The observed icon is not a valid PNG of a supported size.");
+            return;
+        }
+        StringBuilder request = {0}, output = {0};
+        int exit_status = -1;
+        if (sb_append_n(&request, "OSCI", 4) && sb_append_n(&request, token, 32) &&
+            sb_append_n(&request, body, body_length) &&
+            run_safe_space_provider(request.data, request.length, &output, &exit_status) &&
+            exit_status == 0 && output.length == 3) {
+            if (memcmp(output.data, "200", 3) == 0) status = 200;
+            else if (memcmp(output.data, "403", 3) == 0) status = 403;
+            else if (memcmp(output.data, "400", 3) == 0) status = 400;
+        }
+        free(request.data);
+        free(output.data);
+    }
     if (status == 200) {
         send_action_response(fd, 200, true, "Discovered icon saved.");
     } else if (status == 404) {
