@@ -2165,6 +2165,7 @@ static uint16_t ui_route_for_http_request(const char *method, const char *target
         return OUTERSHELLD_UI_ROUTE_NONE;
     }
     if (strcasecmp(method, "GET") == 0 || strcasecmp(method, "HEAD") == 0) {
+        if (strcmp(target, "/api/container-snapshot") == 0) return OUTERSHELLD_UI_ROUTE_CONTAINER_SNAPSHOT;
         if (strcmp(target, "/api/layout") == 0) return OUTERSHELLD_UI_ROUTE_LAYOUT_READ;
         if (strcmp(target, "/api/backends") == 0) return OUTERSHELLD_UI_ROUTE_BACKENDS;
         if (strcmp(target, "/api/logs") == 0) return OUTERSHELLD_UI_ROUTE_LOGS;
@@ -2259,29 +2260,12 @@ static bool proxy_ui_request_to_api(ReactorClient *client,
     free(request.data);
     free(owned_body.data);
 
-    if (route == OUTERSHELLD_UI_ROUTE_EVENTS || route == OUTERSHELLD_UI_ROUTE_SAFE_SPACES) {
-        set_fd_nonblocking(api_fd, true);
-        client->waiting_for_api_response = true;
-        client->api_response_fd = api_fd;
-        client->length = 0;
-        client->request[0] = '\0';
-        return true;
-    }
-
-    StringBuilder response = {0};
-    ok = api_read_frame_from_fd(api_fd, &response, error, sizeof(error));
-    close(api_fd);
-    if (!ok) {
-        free(response.data);
-        char message[768];
-        snprintf(message, sizeof(message), "outershelld API failed: %s\n", error);
-        send_text_response(client_fd, 500, message);
-        return false;
-    }
-
-    (void)send_ui_api_response_message_as_http(client_fd, response.data, response.length);
-    free(response.data);
-    return false;
+    set_fd_nonblocking(api_fd, true);
+    client->waiting_for_api_response = true;
+    client->api_response_fd = api_fd;
+    client->length = 0;
+    client->request[0] = '\0';
+    return true;
 }
 
 static bool process_http_client_request(ReactorClient *client, char *request, size_t n) {

@@ -1079,6 +1079,9 @@ typedef struct {
     int64_t last_activity_ms;
     bool waiting_for_api_response;
     int api_response_fd;
+    bool waiting_for_snapshot;
+    bool provider_snapshot;
+    uint64_t snapshot_generation;
     pid_t provider_pid;
     int provider_output_fd;
     bool provider_output_closed;
@@ -14785,6 +14788,14 @@ static void process_ui_route_request(uint16_t route, const char *query, const ch
     if (response->status == 0) response->status = 500;
 }
 
+// A shared in-memory snapshot serves all browsers. Discovery runs at most once
+// at a time, while readers keep using the last successful result.
+static StringBuilder g_container_snapshot = {0};
+static int64_t g_snapshot_requested_ms = 0;
+static int64_t g_snapshot_refresh_ms = 0;
+static uint64_t g_snapshot_generation = 0;
+static bool g_snapshot_refresh_failed = false;
+
 // The provider calls back into the registry through the normal API socket. Keep
 // discovery outside the reactor, and collect its response without blocking it.
 static bool start_provider_request(ReactorClient *client, const char *body, size_t length) {
@@ -14834,6 +14845,38 @@ static bool start_provider_request(ReactorClient *client, const char *body, size
     return true;
 }
 
+static bool container_snapshot_valid(const StringBuilder *body) {
+    const unsigned char *p = (const unsigned char *)body->data;
+    if (!p || !body->length) return false;
+    const unsigned char *end = p + body->length;
+    if (!layout_utf8_valid(p, end)) return false;
+    const unsigned char *check = p;
+    if (!layout_json_value(&check, end, 0)) return false;
+    layout_json_space(&check, end);
+    if (check != end) return false;
+    layout_json_space(&p, end);
+    if (p == end || *p++ != '{') return false;
+    bool workspaces = false;
+    for (;;) {
+        layout_json_space(&p, end);
+        if (p == end || *p == '}') break;
+        const unsigned char *key = p;
+        if (!layout_json_string(&p, end)) return false;
+        size_t key_length = (size_t)(p - key);
+        layout_json_space(&p, end);
+        if (p == end || *p++ != ':') return false;
+        layout_json_space(&p, end);
+        if (p == end) return false;
+        if (key_length == 12 && memcmp(key, "\"workspaces\"", 12) == 0) workspaces = *p == '[';
+        if (key_length == 7 && memcmp(key, "\"error\"", 7) == 0 && *p != 'n') return false;
+        if (!layout_json_value(&p, end, 1)) return false;
+        layout_json_space(&p, end);
+        if (p == end || *p != ',') break;
+        p++;
+    }
+    return workspaces;
+}
+
 static bool collect_provider_response(ReactorClient *client) {
     if (!client->provider_output_closed) {
         char buffer[8192];
@@ -14862,7 +14905,21 @@ static bool collect_provider_response(ReactorClient *client) {
     response.status = result > 0 && WIFEXITED(status) && WEXITSTATUS(status) == 0 ? 200 : 500;
     response.content_kind = UI_API_CONTENT_BINARY;
     response.body = client->provider_output;
-    api_send_ui_response(client->fd, &response);
+    if (client->provider_snapshot) {
+        if (client->snapshot_generation == g_snapshot_generation) {
+            g_snapshot_refresh_failed = response.status != 200 || !container_snapshot_valid(&response.body);
+            if (!g_snapshot_refresh_failed) {
+                free(g_container_snapshot.data);
+                g_container_snapshot = client->provider_output;
+                memset(&client->provider_output, 0, sizeof(client->provider_output));
+            }
+            g_snapshot_refresh_ms = monotonic_milliseconds();
+        }
+    } else {
+        g_snapshot_generation++;
+        g_snapshot_refresh_ms = 0;
+        api_send_ui_response(client->fd, &response);
+    }
     return true;
 }
 
@@ -14889,7 +14946,23 @@ static bool process_api_ui_request(ReactorClient *client, const unsigned char *m
             free(query);
             return true;
         }
+    } else if (route == OUTERSHELLD_UI_ROUTE_CONTAINER_SNAPSHOT) {
+        g_snapshot_requested_ms = monotonic_milliseconds();
+        if (g_safe_space_request_callback) {
+            const char *request = "{\"operation\":\"list\"}";
+            process_ui_route_request(OUTERSHELLD_UI_ROUTE_SAFE_SPACES, "", request, strlen(request), &response);
+        } else if (g_container_snapshot.data) {
+            response.status = 200;
+            response.content_kind = UI_API_CONTENT_BINARY;
+            sb_append_n(&response.body, g_container_snapshot.data, g_container_snapshot.length);
+        } else {
+            client->waiting_for_snapshot = true;
+            free(query);
+            return true;
+        }
     } else if (route == OUTERSHELLD_UI_ROUTE_SAFE_SPACES && !g_safe_space_request_callback) {
+        g_snapshot_generation++;
+        g_snapshot_refresh_ms = 0;
         if (start_provider_request(client, (const char *)body, body_length)) {
             free(query);
             return true;
@@ -16508,6 +16581,10 @@ static bool socket_activation_enabled(void) {
 static void close_reactor_client(ReactorClient *clients, size_t *client_count, size_t index) {
     if (index >= *client_count) return;
     if (clients[index].provider_pid > 0) {
+        if (clients[index].provider_snapshot) {
+            g_snapshot_refresh_failed = true;
+            g_snapshot_refresh_ms = monotonic_milliseconds();
+        }
         kill(clients[index].provider_pid, SIGKILL);
         while (waitpid(clients[index].provider_pid, NULL, 0) < 0 && errno == EINTR) {}
     }
@@ -16524,6 +16601,43 @@ static void close_reactor_client(ReactorClient *clients, size_t *client_count, s
                 (*client_count - index - 1) * sizeof(clients[0]));
     }
     (*client_count)--;
+}
+
+static void maintain_container_snapshot(ReactorClient *clients, size_t *count) {
+    if (g_safe_space_request_callback) return;
+    int64_t now = monotonic_milliseconds();
+    bool busy = false;
+    for (size_t i = 0; i < *count; i++) {
+        if (clients[i].provider_pid > 0) busy = true;
+    }
+    for (size_t i = *count; i > 0; i--) {
+        ReactorClient *client = &clients[i - 1];
+        if (!client->waiting_for_snapshot) continue;
+        if (!g_container_snapshot.data && !g_snapshot_refresh_failed) continue;
+        UiApiResponse response = {0};
+        response.status = g_container_snapshot.data ? 200 : 503;
+        response.content_kind = UI_API_CONTENT_BINARY;
+        const char *error = "{\"error\":\"Container discovery failed. Retrying…\"}";
+        response.body = g_container_snapshot.data ? g_container_snapshot : (StringBuilder){0};
+        if (!g_container_snapshot.data) sb_append(&response.body, error);
+        api_send_ui_response(client->fd, &response);
+        if (!g_container_snapshot.data) free(response.body.data);
+        close_reactor_client(clients, count, i - 1);
+    }
+    if (busy || *count >= MAX_REACTOR_CLIENTS ||
+        (g_snapshot_requested_ms && now - g_snapshot_requested_ms > 60000) ||
+        (g_snapshot_refresh_ms && now - g_snapshot_refresh_ms < 2000)) return;
+    const char *provider = getenv("OUTER_SHELL_CONTAINER_PROVIDER");
+    if (!provider || !provider[0]) { g_snapshot_refresh_failed = true; return; }
+    ReactorClient job = {.fd = -1, .api_response_fd = -1, .provider_output_fd = -1,
+                         .provider_snapshot = true, .snapshot_generation = g_snapshot_generation};
+    const char *request = "{\"operation\":\"list\",\"requestID\":\"snapshot\"}";
+    if (start_provider_request(&job, request, strlen(request))) {
+        clients[(*count)++] = job;
+    } else {
+        g_snapshot_refresh_failed = true;
+        g_snapshot_refresh_ms = now;
+    }
 }
 
 static void add_reactor_client(ReactorClient *clients, size_t *client_count, int client_fd, bool is_api) {
@@ -16702,13 +16816,16 @@ static void run_api_reactor(int api_listener) {
         return;
     }
     size_t client_count = 0;
+    g_snapshot_requested_ms = monotonic_milliseconds();
     set_fd_nonblocking(api_listener, true);
     while (!g_shutdown_requested && !outer_service_manager_exit_requested(g_outer_service_manager)) {
         flush_ready_event_clients(clients, &client_count);
+        maintain_container_snapshot(clients, &client_count);
         for (size_t i = client_count; i > 0; i--) {
             if (clients[i - 1].provider_pid > 0 && clients[i - 1].provider_output_closed &&
                 collect_provider_response(&clients[i - 1])) close_reactor_client(clients, &client_count, i - 1);
         }
+        maintain_container_snapshot(clients, &client_count);
         struct pollfd poll_fds[MAX_REACTOR_CLIENTS + 1];
         size_t polled_client_count = client_count;
         poll_fds[0] = (struct pollfd){.fd = api_listener, .events = POLLIN, .revents = 0};
@@ -16717,12 +16834,13 @@ static void run_api_reactor(int api_listener) {
         }
 
         int timeout_ms = socket_activation_enabled() && !g_stay_alive_when_socket_idle && polled_client_count == 0 ? 60000 : 1000;
+        if (monotonic_milliseconds() - g_snapshot_requested_ms <= 60000) timeout_ms = 1000;
         for (size_t i = 0; i < client_count; i++) {
             if (clients[i].provider_pid > 0 && clients[i].provider_output_closed) timeout_ms = 10;
         }
         int poll_result = poll(poll_fds, (nfds_t)(polled_client_count + 1), timeout_ms);
         if (poll_result == 0) {
-            if (socket_activation_enabled() && !g_stay_alive_when_socket_idle && client_count == 0) break;
+            if (socket_activation_enabled() && !g_stay_alive_when_socket_idle && client_count == 0 && timeout_ms == 60000) break;
             continue;
         }
         if (poll_result < 0) {
@@ -16744,7 +16862,7 @@ static void run_api_reactor(int api_listener) {
                 if (collect_provider_response(&clients[index])) close_reactor_client(clients, &client_count, index);
                 continue;
             }
-            if (clients[index].waiting_for_events) {
+            if (clients[index].waiting_for_events || clients[index].waiting_for_snapshot) {
                 if (revents & (POLLIN | POLLERR | POLLHUP | POLLNVAL)) {
                     close_reactor_client(clients, &client_count, index);
                 }
@@ -16777,7 +16895,7 @@ static void run_api_reactor(int api_listener) {
         int64_t now = monotonic_milliseconds();
         for (size_t i = client_count; i > 0; i--) {
             size_t index = i - 1;
-            if (clients[index].waiting_for_events || clients[index].provider_pid > 0) continue;
+            if (clients[index].waiting_for_events || clients[index].waiting_for_snapshot || clients[index].provider_pid > 0) continue;
             if (now - clients[index].last_activity_ms > CLIENT_IDLE_TIMEOUT_MS) {
                 close_reactor_client(clients, &client_count, index);
             }

@@ -776,7 +776,9 @@
 
   async function safeSpaceRequest(operation, values = {}, signal) {
     const requestID = makeRequestID();
-    const response = await fetch("/api/safe-spaces", {
+    const response = operation === "list"
+      ? await fetch("/api/container-snapshot", { cache: "no-store", signal })
+      : await fetch("/api/safe-spaces", {
       method: "POST",
       cache: "no-store",
       headers: { "Content-Type": "application/json" },
