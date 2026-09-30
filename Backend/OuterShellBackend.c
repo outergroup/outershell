@@ -2154,6 +2154,7 @@ static bool api_request_is_complete(const char *request, size_t length, size_t *
 static uint16_t ui_route_for_http_request(const char *method, const char *target) {
     if (!target || !target[0]) return OUTERSHELLD_UI_ROUTE_NONE;
     if (strcasecmp(method, "POST") == 0) {
+        if (strcmp(target, "/api/layout") == 0) return OUTERSHELLD_UI_ROUTE_LAYOUT_WRITE;
         if (strcmp(target, "/api/control") == 0) return OUTERSHELLD_UI_ROUTE_CONTROL;
         if (strcmp(target, "/api/create") == 0) return OUTERSHELLD_UI_ROUTE_CREATE;
         if (strcmp(target, "/api/icon-observation") == 0) return OUTERSHELLD_UI_ROUTE_ICON_OBSERVATION;
@@ -2164,6 +2165,7 @@ static uint16_t ui_route_for_http_request(const char *method, const char *target
         return OUTERSHELLD_UI_ROUTE_NONE;
     }
     if (strcasecmp(method, "GET") == 0 || strcasecmp(method, "HEAD") == 0) {
+        if (strcmp(target, "/api/layout") == 0) return OUTERSHELLD_UI_ROUTE_LAYOUT_READ;
         if (strcmp(target, "/api/backends") == 0) return OUTERSHELLD_UI_ROUTE_BACKENDS;
         if (strcmp(target, "/api/logs") == 0) return OUTERSHELLD_UI_ROUTE_LOGS;
         if (strcmp(target, "/api/recipes") == 0) return OUTERSHELLD_UI_ROUTE_RECIPES;

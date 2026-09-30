@@ -14492,6 +14492,196 @@ static bool run_safe_space_provider(const char *body,
     return ok;
 }
 
+#define LAYOUT_MAX_BYTES (256u * 1024u)
+
+/* Layout is separate from discovery-owned registry rows. Its revision is a
+ * compare-and-swap token shared by all clients of this user's daemon. */
+static bool layout_json_value(const unsigned char **cursor, const unsigned char *end, unsigned depth);
+
+static void layout_json_space(const unsigned char **cursor, const unsigned char *end) {
+    while (*cursor < end && (**cursor == ' ' || **cursor == '\n' || **cursor == '\r' || **cursor == '\t')) ++*cursor;
+}
+
+static bool layout_json_string(const unsigned char **cursor, const unsigned char *end) {
+    if (*cursor == end || *(*cursor)++ != '"') return false;
+    while (*cursor < end) {
+        unsigned char c = *(*cursor)++;
+        if (c == '"') return true;
+        if (c < 32) return false;
+        if (c == '\\') {
+            if (*cursor == end) return false;
+            c = *(*cursor)++;
+            if (c == 'u') {
+                for (unsigned i = 0; i < 4; i++) {
+                    if (*cursor == end || !isxdigit(*(*cursor)++)) return false;
+                }
+            } else if (c == 0 || !strchr("\"\\/bfnrt", c)) return false;
+        }
+    }
+    return false;
+}
+
+static bool layout_json_value(const unsigned char **cursor, const unsigned char *end, unsigned depth) {
+    layout_json_space(cursor, end);
+    if (*cursor == end || depth > 32) return false;
+    unsigned char c = **cursor;
+    if (c == '"') return layout_json_string(cursor, end);
+    if (c == '{' || c == '[') {
+        ++*cursor;
+        unsigned char close = c == '{' ? '}' : ']';
+        layout_json_space(cursor, end);
+        if (*cursor < end && **cursor == close) { ++*cursor; return true; }
+        while (*cursor < end) {
+            if (c == '{') {
+                if (!layout_json_string(cursor, end)) return false;
+                layout_json_space(cursor, end);
+                if (*cursor == end || *(*cursor)++ != ':') return false;
+            }
+            if (!layout_json_value(cursor, end, depth + 1)) return false;
+            layout_json_space(cursor, end);
+            if (*cursor == end) return false;
+            unsigned char separator = *(*cursor)++;
+            if (separator == close) return true;
+            if (separator != ',') return false;
+            layout_json_space(cursor, end);
+        }
+        return false;
+    }
+    const char *literal = c == 't' ? "true" : c == 'f' ? "false" : c == 'n' ? "null" : NULL;
+    if (literal) {
+        size_t length = strlen(literal);
+        if ((size_t)(end - *cursor) < length || memcmp(*cursor, literal, length)) return false;
+        *cursor += length;
+        return true;
+    }
+    const unsigned char *p = *cursor;
+    if (*p == '-') { if (++p == end) return false; }
+    if (*p == '0') ++p;
+    else {
+        if (*p < '1' || *p > '9') return false;
+        while (p < end && isdigit(*p)) ++p;
+    }
+    if (p < end && *p == '.') {
+        if (++p == end || !isdigit(*p)) return false;
+        while (p < end && isdigit(*p)) ++p;
+    }
+    if (p < end && (*p == 'e' || *p == 'E')) {
+        if (++p < end && (*p == '+' || *p == '-')) ++p;
+        if (p == end || !isdigit(*p)) return false;
+        while (p < end && isdigit(*p)) ++p;
+    }
+    *cursor = p;
+    return true;
+}
+
+static bool layout_utf8_valid(const unsigned char *p, const unsigned char *end) {
+    while (p < end) {
+        uint32_t value = *p++;
+        if (value < 0x80) continue;
+        unsigned continuation;
+        uint32_t minimum;
+        if (value >= 0xc2 && value <= 0xdf) { continuation = 1; minimum = 0x80; value &= 0x1f; }
+        else if (value >= 0xe0 && value <= 0xef) { continuation = 2; minimum = 0x800; value &= 0x0f; }
+        else if (value >= 0xf0 && value <= 0xf4) { continuation = 3; minimum = 0x10000; value &= 0x07; }
+        else return false;
+        for (unsigned i = 0; i < continuation; i++) {
+            if (p == end || (*p & 0xc0) != 0x80) return false;
+            value = (value << 6) | (*p++ & 0x3f);
+        }
+        if (value < minimum || value > 0x10ffff || (value >= 0xd800 && value <= 0xdfff)) return false;
+    }
+    return true;
+}
+
+static bool layout_document_valid(const char *data, size_t length) {
+    if (length < 18 || length > LAYOUT_MAX_BYTES || memcmp(data, "OSLAY001", 8)) return false;
+    const unsigned char *cursor = (const unsigned char *)data + 16;
+    const unsigned char *end = (const unsigned char *)data + length;
+    if (!layout_utf8_valid(cursor, end)) return false;
+    layout_json_space(&cursor, end);
+    if (cursor == end || *cursor != '{' || !layout_json_value(&cursor, end, 0)) return false;
+    layout_json_space(&cursor, end);
+    return cursor == end;
+}
+
+static void send_layout_response(bool write_layout, const char *body, size_t body_length) {
+    if (write_layout && !layout_document_valid(body, body_length)) {
+        send_text_response(-1, 400, "Invalid layout document or size.\n");
+        return;
+    }
+    char path[PATH_MAX], lock_path[PATH_MAX], temp_path[PATH_MAX] = "";
+    if (snprintf(path, sizeof(path), "%s.layout", g_registry_database_path) >= (int)sizeof(path) ||
+        snprintf(lock_path, sizeof(lock_path), "%s.lock", path) >= (int)sizeof(lock_path)) {
+        send_text_response(-1, 500, "Layout path is too long.\n");
+        return;
+    }
+    int lock_fd = open(lock_path, O_CREAT | O_RDWR | O_CLOEXEC, 0600);
+    if (lock_fd < 0 || flock(lock_fd, write_layout ? LOCK_EX : LOCK_SH) != 0) {
+        if (lock_fd >= 0) close(lock_fd);
+        send_text_response(-1, 500, "Could not lock layout storage.\n");
+        return;
+    }
+    StringBuilder data = {0};
+    int status = 500;
+    const char *error = "Could not read layout storage.\n";
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0 && errno == ENOENT) {
+        if (!sb_append_n(&data, "OSLAY001\0\0\0\0\0\0\0\0{}", 18)) goto done;
+    } else if (fd >= 0) {
+        struct stat st;
+        bool ok = fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_size >= 18 && st.st_size <= LAYOUT_MAX_BYTES;
+        if (ok) ok = sb_reserve(&data, (size_t)st.st_size);
+        while (ok && data.length < (size_t)st.st_size) {
+            ssize_t count = read(fd, data.data + data.length, (size_t)st.st_size - data.length);
+            if (count < 0 && errno == EINTR) continue;
+            if (count <= 0) { ok = false; break; }
+            data.length += (size_t)count;
+        }
+        close(fd);
+        if (!ok || !layout_document_valid(data.data, data.length)) goto done;
+    } else goto done;
+    if (write_layout) {
+        uint64_t revision = read_uint64_le((const unsigned char *)data.data + 8);
+        if (read_uint64_le((const unsigned char *)body + 8) != revision) {
+            status = 409;
+            error = "Layout changed in another client. Reload it before saving.\n";
+            goto done;
+        }
+        if (revision >= 9007199254740991ULL) { error = "Layout revision exhausted.\n"; goto done; }
+        free(data.data);
+        data = (StringBuilder){0};
+        if (!sb_append_n(&data, body, body_length)) goto done;
+        write_uint64_le((unsigned char *)data.data + 8, revision + 1);
+        error = "Could not save layout storage.\n";
+        if (snprintf(temp_path, sizeof(temp_path), "%s.tmp.XXXXXX", path) >= (int)sizeof(temp_path)) goto done;
+        fd = mkstemp(temp_path);
+        if (fd < 0) goto done;
+        bool ok = fchmod(fd, 0600) == 0 && queue_all(fd, data.data, data.length) && fsync(fd) == 0;
+        if (close(fd) != 0) ok = false;
+        if (!ok || rename(temp_path, path) != 0) goto done;
+        temp_path[0] = '\0';
+        char directory[PATH_MAX];
+        snprintf(directory, sizeof(directory), "%s", path);
+        char *slash = strrchr(directory, '/');
+        if (slash) {
+            *slash = '\0';
+            int directory_fd = open(directory[0] ? directory : "/", O_RDONLY | O_CLOEXEC);
+            if (directory_fd < 0) goto done;
+            ok = fsync(directory_fd) == 0;
+            close(directory_fd);
+            if (!ok) goto done;
+        }
+    }
+    status = 200;
+done:
+    if (temp_path[0]) unlink(temp_path);
+    if (status == 200) send_binary_response(-1, 200, &data);
+    else send_text_response(-1, status, error);
+    free(data.data);
+    flock(lock_fd, LOCK_UN);
+    close(lock_fd);
+}
+
 static void process_ui_route_request(uint16_t route, const char *query, const char *body, size_t body_length, UiApiResponse *response) {
     UiApiResponse *previous_capture = g_captured_ui_response;
     g_captured_ui_response = response;
@@ -14499,6 +14689,10 @@ static void process_ui_route_request(uint16_t route, const char *query, const ch
     response->content_kind = UI_API_CONTENT_TEXT;
 
     switch (route) {
+    case OUTERSHELLD_UI_ROUTE_LAYOUT_READ:
+    case OUTERSHELLD_UI_ROUTE_LAYOUT_WRITE:
+        send_layout_response(route == OUTERSHELLD_UI_ROUTE_LAYOUT_WRITE, body, body_length);
+        break;
     case OUTERSHELLD_UI_ROUTE_BACKENDS:
         send_backends_response(-1);
         break;

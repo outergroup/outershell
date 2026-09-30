@@ -17,6 +17,12 @@
   const state = {
     backends: [],
     endpointNames: {},
+    layoutReady: false,
+    layoutSaving: false,
+    layoutFetching: false,
+    layoutAbort: null,
+    layoutRevision: 0n,
+    layoutError: "",
     safeSpaces: [],
     providers: [],
     containerDownloadURL: null,
@@ -371,32 +377,99 @@
     return JSON.stringify(["container", workspace.id, app.serviceID, containerFrontendKey(app)]);
   }
 
-  function loadCardPreferences() {
-    try {
-      const pins = JSON.parse(localStorage.getItem("outer-shell.group-pins.v1") || "{}");
-      if (!pins || Array.isArray(pins) || typeof pins !== "object" || Object.values(pins).some(keys => !Array.isArray(keys) || keys.some(key => typeof key !== "string"))) throw new Error("Invalid shortcuts");
-      state.groupPins = pins;
-    } catch (error) { toast("Could not load saved shortcuts.", true); }
+  function validateLayout(value) {
+    const object = value => value && typeof value === "object" && !Array.isArray(value);
+    const strings = value => Array.isArray(value) && value.every(item => typeof item === "string");
+    if (!object(value) || (value.version !== undefined && value.version !== 1)) throw new Error("Unsupported server layout.");
+    const result = { version: 1, pins: value.pins ?? {}, order: value.order ?? {}, groups: value.groups ?? [], names: value.names ?? {} };
+    if (![result.pins, result.order].every(map => object(map) && Object.values(map).every(strings)) || !strings(result.groups) || !object(result.names) || !Object.values(result.names).every(name => typeof name === "string")) throw new Error("Invalid server layout.");
+    return result;
+  }
 
+  function currentLayout() {
+    return { version: 1, pins: state.groupPins, order: state.endpointOrder, groups: state.groupOrder, names: state.endpointNames };
+  }
+
+  function applyLayout(layout) {
+    state.groupPins = layout.pins;
+    state.endpointOrder = layout.order;
+    state.groupOrder = layout.groups;
+    state.endpointNames = layout.names;
+  }
+
+  function encodeLayout(layout, revision) {
+    const json = new TextEncoder().encode(JSON.stringify(validateLayout(layout)));
+    const bytes = new Uint8Array(16 + json.length);
+    bytes.set(new TextEncoder().encode("OSLAY001"));
+    new DataView(bytes.buffer).setBigUint64(8, revision, true);
+    bytes.set(json, 16);
+    return bytes;
+  }
+
+  function decodeLayout(buffer) {
+    const bytes = new Uint8Array(buffer);
+    if (bytes.length < 18 || decoder.decode(bytes.slice(0, 8)) !== "OSLAY001") throw new Error("Invalid layout response.");
+    return { revision: new DataView(buffer).getBigUint64(8, true), layout: validateLayout(JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes.slice(16)))) };
+  }
+
+  async function fetchLayout(signal) {
+    const { buffer } = await requestBuffer("/api/layout", { signal });
+    return decodeLayout(buffer);
+  }
+
+  async function writeLayout(layout, revision, signal) {
+    const { response, buffer } = await requestBuffer("/api/layout", { method: "POST", headers: { "Content-Type": "application/octet-stream" }, body: encodeLayout(layout, revision), signal }, true);
+    if (!response.ok) {
+      const error = new Error(response.status === 409 ? "Layout changed in another browser. The latest layout has been loaded; please try again." : "Could not save the layout on the server. Please try again.");
+      error.conflict = response.status === 409;
+      throw error;
+    }
+    return decodeLayout(buffer);
+  }
+
+  async function refreshLayout() {
+    if (state.layoutFetching || state.layoutSaving || state.groupDrag || state.endpointDrag || state.suspended || state.stopped) return;
+    state.layoutFetching = true;
+    const controller = new AbortController();
+    state.layoutAbort = controller;
     try {
-      const layout = JSON.parse(localStorage.getItem("outer-shell.endpoint-layout.v1") || "null");
-      if (layout) {
-        for (const value of [layout.pins, layout.order]) {
-          if (!value || typeof value !== "object" || Array.isArray(value) || Object.values(value).some(keys => !Array.isArray(keys) || keys.some(key => typeof key !== "string"))) throw new Error("Invalid endpoint layout");
-        }
-        state.groupPins = layout.pins;
-        state.endpointOrder = layout.order;
+      const result = await fetchLayout(controller.signal);
+      if (state.layoutAbort !== controller) return;
+      if (state.layoutAbort !== controller || state.layoutSaving || state.groupDrag || state.endpointDrag) return;
+      if (!state.layoutReady || result.revision > state.layoutRevision) {
+        applyLayout(result.layout);
+        state.layoutRevision = result.revision;
+        state.layoutReady = true;
+        render();
       }
-    } catch (error) { toast("Could not load endpoint ordering.", true); }
-    try {
-      const order = JSON.parse(localStorage.getItem("outer-shell.group-order.v1") || "[]");
-      if (Array.isArray(order)) state.groupOrder = order.filter(key => typeof key === "string");
-    } catch (error) { toast("Could not load the saved group order.", true); }
+      clearRefreshFailure("layoutError");
+      state.layoutError = "";
+      updateStatus();
+    } catch (error) { if (state.layoutAbort === controller) reportRefreshFailure("layoutError", error, true); }
+    finally { if (state.layoutAbort === controller) { state.layoutAbort = null; state.layoutFetching = false; } }
+  }
 
-    try {
-      const names = JSON.parse(localStorage.getItem("outer-shell.endpoint-names.v1") || "{}");
-      if (names && typeof names === "object" && !Array.isArray(names)) state.endpointNames = Object.fromEntries(Object.entries(names).filter(([, name]) => typeof name === "string" && name.trim()));
-    } catch (error) { toast("Could not read endpoint names.", true); }
+  function saveLayout(layout) {
+    if (!state.layoutReady || state.layoutSaving) { toast("Please wait for the layout to finish saving or loading.", true); return false; }
+    const previous = currentLayout();
+    const revision = state.layoutRevision;
+    state.layoutSaving = true;
+    applyLayout(layout);
+    void (async () => {
+      try {
+        const result = await writeLayout(layout, revision);
+        applyLayout(result.layout);
+        state.layoutRevision = result.revision;
+      } catch (error) {
+        applyLayout(previous);
+        if (error.conflict) {
+          try { const result = await fetchLayout(); applyLayout(result.layout); state.layoutRevision = result.revision; }
+          catch { state.layoutReady = false; }
+        }
+        toast(error.message, true);
+      } finally { state.layoutSaving = false; render(); }
+    })();
+    return true;
   }
 
   function updatePage() {
@@ -495,11 +568,7 @@
   }
 
   function saveEndpointLayout(pins, order) {
-    try { localStorage.setItem("outer-shell.endpoint-layout.v1", JSON.stringify({ pins, order })); }
-    catch (error) { toast("Could not save endpoint layout.", true); return false; }
-    state.groupPins = pins;
-    state.endpointOrder = order;
-    return true;
+    return saveLayout({ ...currentLayout(), pins, order });
   }
 
   function moveCardEndpoint(groupID, key, area, beforeKey) {
@@ -525,6 +594,7 @@
 
   function renderOverview(entries) {
     if (state.groupDrag || state.endpointDrag) return;
+    if (!state.layoutReady) { elements.overview.innerHTML = '<p class="overview-empty">Loading layout…</p>'; state.overviewMarkup = ""; return; }
     const sessionUsername = window.outerLoop?.sessionContext?.username;
     const userName = typeof sessionUsername === "string" ? sessionUsername.trim() : "";
     const groups = [
@@ -554,11 +624,8 @@
     }
   }
 
-  function saveGroupOrder(order) {
-    try { localStorage.setItem("outer-shell.group-order.v1", JSON.stringify(order)); }
-    catch (error) { toast("Could not save the group order.", true); return false; }
-    state.groupOrder = order;
-    return true;
+  function saveGroupOrder(groups) {
+    return saveLayout({ ...currentLayout(), groups });
   }
 
   function finishGroupDrag(commit) {
@@ -663,7 +730,7 @@
 
   function openRenameEndpoint(item) {
     const key = hostBookmarkKey(item);
-    const dialog = openDialog(`${containerDialogHeader("Rename endpoint")}<form><div class="dialog-body"><label class="field">Name<input name="name" required value="${escapeHTML(item.displayName)}" autocomplete="off"></label><p class="field-note">Saved in this browser. Used in endpoint lists and pinned shortcuts.</p><p class="container-message" role="status"></p></div><footer class="dialog-footer"><button type="button" data-action="close-dialog">Cancel</button><button type="submit" class="primary-button">Rename</button></footer></form>`);
+    const dialog = openDialog(`${containerDialogHeader("Rename endpoint")}<form><div class="dialog-body"><label class="field">Name<input name="name" required value="${escapeHTML(item.displayName)}" autocomplete="off"></label><p class="field-note">Saved on this server. Used in endpoint lists and pinned shortcuts.</p><p class="container-message" role="status"></p></div><footer class="dialog-footer"><button type="button" data-action="close-dialog">Cancel</button><button type="submit" class="primary-button">Rename</button></footer></form>`);
     const form = dialog.querySelector("form");
     form.elements.name.select();
     form.addEventListener("submit", event => {
@@ -672,9 +739,7 @@
       const message = form.querySelector(".container-message");
       if (!name) { message.textContent = "Enter a name."; return; }
       const names = { ...state.endpointNames, [key]: name };
-      try { localStorage.setItem("outer-shell.endpoint-names.v1", JSON.stringify(names)); }
-      catch (error) { message.textContent = "Could not save the name. Please try again."; return; }
-      state.endpointNames = names;
+      if (!saveLayout({ ...currentLayout(), names })) return;
       closeDialog();
       render();
     });
@@ -847,8 +912,11 @@
 
   function suspendRefreshes() {
     state.suspended = true;
+    state.layoutAbort?.abort();
+    state.layoutAbort = null;
+    state.layoutFetching = false;
     state.eventAbort?.abort();
-    for (const key of ["backendError", "safeSpacesError"]) {
+    for (const key of ["backendError", "safeSpacesError", "layoutError"]) {
       state.refreshAbort[key]?.abort();
       delete state.refreshAbort[key];
       clearRefreshFailure(key);
@@ -861,6 +929,7 @@
   function resumeRefreshes() {
     if (document.hidden || !state.suspended || state.stopped) return;
     state.suspended = false;
+    refreshLayout();
     refreshBackends({ quiet: true });
     refreshSafeSpaces({ quiet: true });
   }
@@ -871,7 +940,7 @@
   }
 
   function updateStatus() {
-    if (!state.stopped) showStatus([...new Set([state.backendError, state.safeSpacesError].filter(Boolean))].join("\n"));
+    if (!state.stopped) showStatus([...new Set([state.backendError, state.safeSpacesError, state.layoutError].filter(Boolean))].join("\n"));
   }
 
   function toast(message, isError = false) {
@@ -1744,11 +1813,10 @@
     }
   }
 
-  loadCardPreferences();
   updatePage();
   window.addEventListener("hashchange", updatePage);
   function beginEndpointDrag(event, touch) {
-    if (state.endpointDrag || state.groupDrag || elements.dialogLayer.childElementCount || event.target.closest("button")) return;
+    if (!state.layoutReady || state.layoutSaving || state.endpointDrag || state.groupDrag || elements.dialogLayer.childElementCount || event.target.closest("button")) return;
     const source = event.target.closest(".overview-row[data-endpoint-key], .overview-shortcut-wrap[data-endpoint-key]");
     if (!source) return;
     const card = source.closest("[data-group-id]");
@@ -1823,6 +1891,7 @@
   elements.overview.addEventListener("touchcancel", () => finishEndpointDrag(false));
 
   function beginGroupDrag(handle, x, y, pointerId, touchId) {
+    if (!state.layoutReady || state.layoutSaving) return;
     const card = handle.closest("[data-group-id]");
     const drag = { handle, card, id: card.dataset.groupId, pointerId, touchId, x, y, moved: false, target: null, armed: touchId === undefined, armTimer: 0 };
     state.groupDrag = drag;
@@ -2053,9 +2122,10 @@
   });
   state.safeSpacesTimer = window.setInterval(() => {
     if (document.hidden || state.suspended) return;
+    refreshLayout();
     if (!state.safeSpaceBusy.size) refreshSafeSpaces({ quiet: true });
     if (state.backendError || state.refreshErrorTimers.backendError) refreshBackends({ quiet: true });
   }, 2000);
 
-  Promise.all([refreshBackends(), refreshSafeSpaces()]).then(watchEvents);
+  Promise.all([refreshLayout(), refreshBackends(), refreshSafeSpaces()]).then(watchEvents);
 })();
