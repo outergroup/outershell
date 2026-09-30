@@ -29,3 +29,32 @@ Run `python3 Scripts/test_container_snapshot.py /path/to/outershelld` for isolat
 API coverage, or add `/path/to/OuterShellBackend` to test through HTTP. Tests cover
 shared cold discovery, immediate cached reads, background updates, retention on
 failure, and mutation/discovery races.
+
+## Browser notifications and assets
+
+The web page no longer polls layout or snapshots on a timer. It includes
+`sinceOverview` in the existing `/api/events` long-poll request. The response
+adds an overview-changed flag (bit 3) and a 64-bit overview token at offset 24.
+The token combines snapshot content with the layout file state, so unchanged
+discovery does not wake readers, and changes survive daemon restarts. Existing
+backend and log fields remain at their original offsets. A quiet watch times out
+after 25 seconds and reconnects without downloading overview data. Resume and
+reconnection recovery still reconcile state. Active overview watches keep the
+server snapshot refresh alive.
+
+The server still periodically checks container state. Docker events alone do
+not cover all endpoint registrations or process changes inside containers.
+This is one shared server-side check, not a data fetch per browser.
+
+Overview snapshots omit commands, recipes, mounts, and persistent-data details.
+The configuration sheet obtains the full provider response when opened.
+Host web requests use `/api/backends?web=1`: frontend flag bit 1 indicates that
+the icon reference contains a URL instead of inline PNG bytes. Native requests
+retain the inline representation. Container overview endpoints use `iconURL`.
+
+Icons are derived files in `web-icons` under the Outer Shell state directory.
+`/api/icon?key=…` accepts only hexadecimal content keys and returns PNG bytes
+with `Cache-Control: private, max-age=31536000, immutable`. Changed bytes get a
+new URL; browser HTTP caching is only for these assets, not user preferences.
+Old derived icon files are currently retained; automatic cache pruning is not
+implemented.

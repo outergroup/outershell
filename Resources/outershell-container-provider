@@ -1979,7 +1979,7 @@ def attached_runtime_description(container_id):
     return runtime_description({"baseImage": result.stdout.strip()})
 
 
-def workspace_dictionary(record):
+def workspace_dictionary(record, overview=False):
     container_id = record["id"]
     owns_container = record_owns_container(record)
     transient = record.get("transientState")
@@ -2009,10 +2009,11 @@ def workspace_dictionary(record):
                         pass
             apps = discovered
             record["cachedApps"] = discovered
-        try:
-            commands = command_snapshots(container_id)
-        except Exception:
-            commands = []
+        if not overview:
+            try:
+                commands = command_snapshots(container_id)
+            except Exception:
+                commands = []
     if state != "running":
         apps = [dict(app, isRunning=False, externalSocketPath=None) for app in apps]
     if owns_container:
@@ -2142,7 +2143,7 @@ def unavailable_workspace_dictionary(record, error):
     }
 
 
-def list_workspaces():
+def list_workspaces(overview=False):
     with Records() as records:
         values = []
         changed = False
@@ -2152,7 +2153,7 @@ def list_workspaces():
                 record.get("terminalShell"),
             )
             try:
-                values.append(workspace_dictionary(record))
+                values.append(workspace_dictionary(record, overview=overview))
             except Exception as error:
                 values.append(unavailable_workspace_dictionary(record, error))
             after = (
@@ -2165,12 +2166,12 @@ def list_workspaces():
         return values
 
 
-def response(request_id, extra=None, error=None, include_state=True):
+def response(request_id, extra=None, error=None, include_state=True, overview=False):
     value = {"requestID": request_id}
     if include_state:
         value.update({
             "providers": [provider_dictionary()],
-            "workspaces": list_workspaces(),
+            "workspaces": list_workspaces(overview=overview),
         })
     if extra:
         value.update(extra)
@@ -2224,7 +2225,26 @@ def handle_request(request):
             extra = operation_finish_import(request)
         else:
             raise ValueError("This container operation is not supported on this server.")
-        return response(request_id, extra=extra, include_state=include_state)
+        result = response(request_id, extra=extra, include_state=include_state, overview=bool(request.get("overview")))
+        if request.get("overview"):
+            icons = outer_shell_home() / "web-icons"
+            icons.mkdir(parents=True, exist_ok=True, mode=0o700)
+            for workspace in result.get("workspaces", []):
+                for field in ("commands", "recipe", "mounts", "persistentData"):
+                    workspace.pop(field, None)
+                for app in workspace.get("apps", []):
+                    encoded = app.pop("iconData", None)
+                    if encoded:
+                        data = base64.b64decode(encoded, validate=True)
+                        key = hashlib.sha256(data).hexdigest()
+                        destination = icons / (key + ".png")
+                        if not destination.exists():
+                            temporary = icons / (key + "." + str(os.getpid()) + ".tmp")
+                            temporary.write_bytes(data)
+                            temporary.chmod(0o600)
+                            temporary.replace(destination)
+                        app["iconURL"] = "/api/icon?key=" + key
+        return result
     except Exception as error:
         return response(request_id, error=error, include_state=include_state)
 

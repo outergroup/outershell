@@ -1066,6 +1066,7 @@ static int g_registry_write_lock_fd = -1;
 static char g_registry_write_lock_path[PATH_MAX] = "";
 static OuterServiceManager *g_outer_service_manager = NULL;
 static bool g_internal_service_manager = false;
+static uint64_t g_container_snapshot_version = 1;
 static char g_outer_services_directory[PATH_MAX] = "";
 
 typedef struct {
@@ -1091,6 +1092,8 @@ typedef struct {
     int64_t event_deadline_ms;
     uint64_t event_since_backends;
     uint64_t event_since_log;
+    bool event_watch_overview;
+    uint64_t event_since_overview;
     char event_log_service_id[PATH_MAX];
     char event_log_path[PATH_MAX];
     int event_log_index;
@@ -1820,7 +1823,7 @@ static void send_events_response(int fd,
                                  bool log_changed,
                                  bool timed_out,
                                  uint64_t backends_version,
-                                 uint64_t log_version);
+                                 uint64_t log_version, bool overview_changed, uint64_t overview_version);
 static bool ensure_root_helper_installed(const char *sudo_password, bool *needs_password, char *message, size_t message_size);
 static bool root_helper_outerctl(int argc,
                                  char **argv,
@@ -5952,6 +5955,54 @@ static const char *frontend_icon_data_path(const char *icon_path,
     return cached_path;
 }
 
+static bool g_web_icon_urls = false;
+
+static bool web_icon_url(const char *source, char *url, size_t capacity) {
+    if (!source || !source[0]) return false;
+    size_t length = 0;
+    char *data = read_text_file_alloc(source, &length);
+    if (!data || !length || length > 512 * 1024) { free(data); return false; }
+    uint64_t hash = 14695981039346656037ULL;
+    for (size_t i = 0; i < length; i++) { hash ^= (unsigned char)data[i]; hash *= 1099511628211ULL; }
+    char root[PATH_MAX], path[PATH_MAX], error[512];
+    default_user_outershell_root(root, sizeof(root));
+    snprintf(path, sizeof(path), "%s/web-icons/%016llx.png", root, (unsigned long long)hash);
+    bool ok = access(path, R_OK) == 0;
+    if (!ok && ensure_parent_directory(path, error, sizeof(error))) {
+        int fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+        if (fd >= 0) {
+            ok = queue_all(fd, data, length);
+            if (close(fd) != 0) ok = false;
+            if (!ok) unlink(path);
+        } else ok = errno == EEXIST;
+    }
+    free(data);
+    if (ok) snprintf(url, capacity, "/api/icon?key=%016llx", (unsigned long long)hash);
+    return ok;
+}
+
+static void send_web_icon_response(const char *query, UiApiResponse *response) {
+    char key[80] = "", root[PATH_MAX], path[PATH_MAX];
+    query_value(query, "key", key, sizeof(key));
+    size_t length = strlen(key);
+    if ((length != 16 && length != 64) || strspn(key, "0123456789abcdef") != length) {
+        ui_api_set_text_response(response, 404, "Icon not found.\n");
+        return;
+    }
+    default_user_outershell_root(root, sizeof(root));
+    snprintf(path, sizeof(path), "%s/web-icons/%s.png", root, key);
+    char *data = read_text_file_alloc(path, &length);
+    if (!data || length > 512 * 1024) {
+        free(data);
+        ui_api_set_text_response(response, 404, "Icon not found.\n");
+        return;
+    }
+    response->status = 200;
+    response->content_kind = UI_API_CONTENT_PNG;
+    sb_append_n(&response->body, data, length);
+    free(data);
+}
+
 static bool build_frontend_payload(const char *name,
                                    const char *frontend_id,
                                    const char *url,
@@ -5967,16 +6018,18 @@ static bool build_frontend_payload(const char *name,
                                                          list,
                                                          cached_icon_path,
                                                          sizeof(cached_icon_path));
+    char icon_url[128] = "";
+    bool icon_is_url = g_web_icon_urls && web_icon_url(icon_data_path, icon_url, sizeof(icon_url));
     if (!binary_append_zero(payload, 72)) return false;
     return binary_append_string_ref_at(payload, 0, name) &&
            binary_append_string_ref_at(payload, 8, url) &&
            binary_append_string_ref_at(payload, 16, socket_path) &&
            binary_append_string_ref_at(payload, 24, icon_path) &&
-           binary_append_file_ref_at(payload, 32, icon_data_path) &&
+           (icon_is_url ? binary_append_string_ref_at(payload, 32, icon_url) : binary_append_file_ref_at(payload, 32, icon_data_path)) &&
            binary_append_string_ref_at(payload, 40, list) &&
            binary_write_u32_at(payload, 48, (uint32_t)(port < 0 ? 0 : port)) &&
            binary_append_string_ref_at(payload, 52, frontend_id) &&
-           binary_write_u32_at(payload, 60, running ? FRONTEND_FLAG_RUNNING : 0) &&
+           binary_write_u32_at(payload, 60, (running ? FRONTEND_FLAG_RUNNING : 0) | (icon_is_url ? 2u : 0u)) &&
            binary_append_string_ref_at(payload, 64, icon_observation_token);
 }
 
@@ -6444,6 +6497,13 @@ static uint64_t registry_file_state_token(const char *registry_path) {
     return token;
 }
 
+static uint64_t current_overview_event_version(void) {
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s.layout", g_registry_database_path);
+    uint64_t version = mix_u64(g_container_snapshot_version, file_state_token(path));
+    return version ? version : 1;
+}
+
 static uint64_t current_backends_event_version(void) {
     pthread_mutex_lock(&g_backend_event_mutex);
     uint64_t version = g_backend_event_sequence;
@@ -6558,15 +6618,16 @@ static void send_events_response(int fd,
                                  bool log_changed,
                                  bool timed_out,
                                  uint64_t backends_version,
-                                 uint64_t log_version) {
+                                 uint64_t log_version, bool overview_changed, uint64_t overview_version) {
     StringBuilder builder = {0};
     uint32_t flags = (backends_changed ? 1u : 0u) |
                      (log_changed ? 2u : 0u) |
-                     (timed_out ? 4u : 0u);
-    bool ok = binary_append_zero(&builder, 24) &&
+                     (timed_out ? 4u : 0u) | (overview_changed ? 8u : 0u);
+    bool ok = binary_append_zero(&builder, 32) &&
               binary_write_u32_at(&builder, 0, flags) &&
               binary_write_u64_at(&builder, 8, backends_version) &&
-              binary_write_u64_at(&builder, 16, log_version);
+              binary_write_u64_at(&builder, 16, log_version) &&
+              binary_write_u64_at(&builder, 24, overview_version);
     if (!ok) {
         free(builder.data);
         send_text_response(fd, 500, "out of memory\n");
@@ -14703,8 +14764,16 @@ static void process_ui_route_request(uint16_t route, const char *query, const ch
     case OUTERSHELLD_UI_ROUTE_LAYOUT_WRITE:
         send_layout_response(route == OUTERSHELLD_UI_ROUTE_LAYOUT_WRITE, body, body_length);
         break;
-    case OUTERSHELLD_UI_ROUTE_BACKENDS:
+    case OUTERSHELLD_UI_ROUTE_WEB_ICON:
+        send_web_icon_response(query, response);
+        break;
+    case OUTERSHELLD_UI_ROUTE_BACKENDS: {
+        char web[8] = "";
+        query_value(query, "web", web, sizeof(web));
+        g_web_icon_urls = strcmp(web, "1") == 0;
         send_backends_response(-1);
+        g_web_icon_urls = false;
+    }
         break;
     case OUTERSHELLD_UI_ROUTE_LOGS:
         send_logs_response(-1, query);
@@ -14909,6 +14978,15 @@ static bool collect_provider_response(ReactorClient *client) {
         if (client->snapshot_generation == g_snapshot_generation) {
             g_snapshot_refresh_failed = response.status != 200 || !container_snapshot_valid(&response.body);
             if (!g_snapshot_refresh_failed) {
+                if (g_container_snapshot.length != client->provider_output.length ||
+                    !g_container_snapshot.data || memcmp(g_container_snapshot.data, client->provider_output.data, g_container_snapshot.length) != 0) {
+                    uint64_t token = 14695981039346656037ULL;
+                    for (size_t i = 0; i < client->provider_output.length; i++) {
+                        token ^= (unsigned char)client->provider_output.data[i];
+                        token *= 1099511628211ULL;
+                    }
+                    g_container_snapshot_version = token ? token : 1;
+                }
                 free(g_container_snapshot.data);
                 g_container_snapshot = client->provider_output;
                 memset(&client->provider_output, 0, sizeof(client->provider_output));
@@ -16410,6 +16488,12 @@ static bool process_api_client_request(ReactorClient *client, char *request, siz
 }
 
 static bool prepare_events_response_or_wait(ReactorClient *client, const char *query) {
+    char since_overview_raw[64] = "";
+    bool watch_overview = query_value(query, "sinceOverview", since_overview_raw, sizeof(since_overview_raw));
+    uint64_t since_overview = parse_u64_or_zero(since_overview_raw);
+    uint64_t overview_version = current_overview_event_version();
+    bool overview_changed = watch_overview && since_overview != overview_version;
+    if (watch_overview) g_snapshot_requested_ms = monotonic_milliseconds();
     char since_backends_raw[64] = "";
     char since_log_raw[64] = "";
     char service_id[PATH_MAX] = "";
@@ -16430,8 +16514,8 @@ static bool prepare_events_response_or_wait(ReactorClient *client, const char *q
     bool has_log_selection = log_path[0] || service_id[0];
     bool backends_changed = since_backends == 0 || backends_version != since_backends;
     bool log_changed = has_log_selection && (since_log == 0 || log_version != since_log);
-    if (backends_changed || log_changed) {
-        send_events_response(client->fd, backends_changed, log_changed, false, backends_version, log_version);
+    if (backends_changed || log_changed || overview_changed) {
+        send_events_response(client->fd, backends_changed, log_changed, false, backends_version, log_version, overview_changed, overview_version);
         return false;
     }
 
@@ -16439,6 +16523,8 @@ static bool prepare_events_response_or_wait(ReactorClient *client, const char *q
     client->event_deadline_ms = monotonic_milliseconds() + 25000;
     client->event_since_backends = since_backends;
     client->event_since_log = since_log;
+    client->event_watch_overview = watch_overview;
+    client->event_since_overview = since_overview;
     snprintf(client->event_log_service_id, sizeof(client->event_log_service_id), "%s", service_id);
     snprintf(client->event_log_path, sizeof(client->event_log_path), "%s", log_path);
     client->event_log_index = log_index;
@@ -16631,7 +16717,7 @@ static void maintain_container_snapshot(ReactorClient *clients, size_t *count) {
     if (!provider || !provider[0]) { g_snapshot_refresh_failed = true; return; }
     ReactorClient job = {.fd = -1, .api_response_fd = -1, .provider_output_fd = -1,
                          .provider_snapshot = true, .snapshot_generation = g_snapshot_generation};
-    const char *request = "{\"operation\":\"list\",\"requestID\":\"snapshot\"}";
+    const char *request = "{\"operation\":\"list\",\"requestID\":\"snapshot\",\"overview\":true}";
     if (start_provider_request(&job, request, strlen(request))) {
         clients[(*count)++] = job;
     } else {
@@ -16772,7 +16858,8 @@ static bool event_client_ready(ReactorClient *client, bool *timed_out,
     bool backends_changed = *backends_version != client->event_since_backends;
     bool has_log_selection = client->event_log_path[0] || client->event_log_service_id[0];
     bool log_changed = has_log_selection && *log_version != client->event_since_log;
-    return *timed_out || backends_changed || log_changed;
+    return *timed_out || backends_changed || log_changed ||
+        (client->event_watch_overview && client->event_since_overview != current_overview_event_version());
 }
 
 static void flush_ready_event_clients(ReactorClient *clients, size_t *client_count) {
@@ -16793,7 +16880,9 @@ static void flush_ready_event_clients(ReactorClient *clients, size_t *client_cou
                                  (client->event_log_path[0] || client->event_log_service_id[0]) && log_version != client->event_since_log,
                                  timed_out,
                                  backends_version,
-                                 log_version);
+                                 log_version,
+                                 client->event_watch_overview && client->event_since_overview != current_overview_event_version(),
+                                 current_overview_event_version());
             g_captured_ui_response = previous_capture;
             api_send_ui_response(client->fd, &response);
             ui_api_response_free(&response);
@@ -16803,7 +16892,9 @@ static void flush_ready_event_clients(ReactorClient *clients, size_t *client_cou
                                  (client->event_log_path[0] || client->event_log_service_id[0]) && log_version != client->event_since_log,
                                  timed_out,
                                  backends_version,
-                                 log_version);
+                                 log_version,
+                                 client->event_watch_overview && client->event_since_overview != current_overview_event_version(),
+                                 current_overview_event_version());
         }
         close_reactor_client(clients, client_count, index);
     }

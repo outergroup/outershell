@@ -2165,6 +2165,7 @@ static uint16_t ui_route_for_http_request(const char *method, const char *target
         return OUTERSHELLD_UI_ROUTE_NONE;
     }
     if (strcasecmp(method, "GET") == 0 || strcasecmp(method, "HEAD") == 0) {
+        if (strcmp(target, "/api/icon") == 0) return OUTERSHELLD_UI_ROUTE_WEB_ICON;
         if (strcmp(target, "/api/container-snapshot") == 0) return OUTERSHELLD_UI_ROUTE_CONTAINER_SNAPSHOT;
         if (strcmp(target, "/api/layout") == 0) return OUTERSHELLD_UI_ROUTE_LAYOUT_READ;
         if (strcmp(target, "/api/backends") == 0) return OUTERSHELLD_UI_ROUTE_BACKENDS;
@@ -2196,6 +2197,17 @@ static bool send_ui_api_response_message_as_http(int client_fd, const char *resp
         return false;
     }
 
+    if (status == 200 && content_kind == UI_API_CONTENT_PNG) {
+        char header[512];
+        int length = snprintf(header, sizeof(header),
+            "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: %zu\r\n"
+            "Cache-Control: private, max-age=31536000, immutable\r\n"
+            "X-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n", payload_length);
+        bool sent = length > 0 && (size_t)length < sizeof(header) &&
+            queue_all(client_fd, header, (size_t)length) && queue_all(client_fd, payload, payload_length);
+        free(api_error);
+        return sent;
+    }
     send_response(client_fd,
                   (int)status,
                   http_status_text((int)status),

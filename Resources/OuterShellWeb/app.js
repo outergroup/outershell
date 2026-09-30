@@ -32,7 +32,7 @@
     backendError: "",
     safeSpacesError: "",
     safeSpaceBusy: new Set(),
-    safeSpacesTimer: null,
+    overviewVersion: 0n,
     busy: false,
     query: "",
     addTab: "catalog",
@@ -160,7 +160,8 @@
       url: reader.stringRef(8),
       socketPath: reader.stringRef(16),
       iconPath: reader.stringRef(24),
-      iconData: reader.bytesRef(32),
+      iconData: flags & 2 ? new Uint8Array() : reader.bytesRef(32),
+      iconURL: flags & 2 ? reader.stringRef(32) : "",
       list: reader.stringRef(40),
       port: reader.u32(48),
       id: reader.bytes.length >= 60 ? reader.stringRef(52) : "",
@@ -214,7 +215,9 @@
       logChanged: Boolean(flags & 0x02),
       timedOut: Boolean(flags & 0x04),
       backendsVersion: reader.u64(8),
-      logVersion: reader.u64(16)
+      logVersion: reader.u64(16),
+      overviewChanged: Boolean(flags & 0x08),
+      overviewVersion: reader.u64(24)
     };
   }
 
@@ -245,37 +248,37 @@
   }
 
   function iconHTML(item, extraClass = "") {
-    const source = dataURL(item.frontend?.iconData);
+    const source = (item.frontend?.iconURL || dataURL(item.frontend?.iconData));
     const content = source
-      ? `<img src="${source}" alt="">`
+      ? `<img src="${escapeHTML(source)}" alt="">`
       : `<span>${escapeHTML(initials(item.displayName || item.backend.displayName))}</span>`;
     return `<span class="app-icon ${extraClass}" aria-hidden="true">${content}</span>`;
   }
 
   function launcherIconHTML(item) {
-    const source = item.app?.iconData
+    const source = item.app?.iconURL || (item.app?.iconData
       ? `data:image/png;base64,${escapeHTML(item.app.iconData)}`
-      : dataURL(item.frontend?.iconData);
+      : (item.frontend?.iconURL || dataURL(item.frontend?.iconData)));
     const content = source
-      ? `<img src="${source}" alt="">`
+      ? `<img src="${escapeHTML(source)}" alt="">`
       : `<span class="launcher-fallback" aria-hidden="true">${escapeHTML(initials(item.displayName).slice(0, 1))}</span>`;
     return `<span class="launcher-icon" aria-hidden="true">${content}</span>`;
   }
 
   function listIconHTML(item) {
-    const source = item.app?.iconData
+    const source = item.app?.iconURL || (item.app?.iconData
       ? `data:image/png;base64,${escapeHTML(item.app.iconData)}`
-      : dataURL(item.frontend?.iconData);
+      : (item.frontend?.iconURL || dataURL(item.frontend?.iconData)));
     const content = source
-      ? `<img src="${source}" alt="">`
+      ? `<img src="${escapeHTML(source)}" alt="">`
       : `<span>${escapeHTML(initials(item.displayName).slice(0, 1))}</span>`;
     return `<span class="list-icon${source ? " has-image" : ""}" aria-hidden="true">${content}</span>`;
   }
 
   function safeSpaceAppIconHTML(app) {
-    const source = app.iconData ? `data:image/png;base64,${app.iconData}` : "";
+    const source = app.iconURL || (app.iconData ? `data:image/png;base64,${app.iconData}` : "");
     const content = source
-      ? `<img src="${source}" alt="">`
+      ? `<img src="${escapeHTML(source)}" alt="">`
       : `<span>${escapeHTML(initials(app.displayName || app.serviceID).slice(0, 1))}</span>`;
     return `<span class="safe-space-app-icon${source ? " has-image" : ""}" aria-hidden="true">${content}</span>`;
   }
@@ -317,7 +320,7 @@
     else target = String(frontend.url || "").trim() || "#";
 
     const token = String(frontend.iconObservationToken || "");
-    if (window.outerLoopPageIconObservationSupported === true && !frontend.iconData?.length && token) {
+    if (window.outerLoopPageIconObservationSupported === true && !frontend.iconData?.length && !frontend.iconURL && token) {
       const callback = new URL("/api/icon-observation", window.location.href);
       callback.search = new URLSearchParams({ token }).toString();
       const observation = new URL("outerloop://observe-page-icon");
@@ -697,7 +700,7 @@
   function safeSpaceAppNavigationURL(workspace, app) {
     const target = safeSpaceAppURL(app);
     if (target === "#") return target;
-    if (window.outerLoopPageIconObservationSupported === true && !app.iconData && app.iconObservationToken) {
+    if (window.outerLoopPageIconObservationSupported === true && !app.iconData && !app.iconURL && app.iconObservationToken) {
       const callback = new URL("/api/icon-observation", window.location.href);
       callback.search = new URLSearchParams({ token: app.iconObservationToken }).toString();
       return `outerloop://observe-page-icon?${new URLSearchParams({ url: target, callback: callback.href })}`;
@@ -783,7 +786,7 @@
       cache: "no-store",
       headers: { "Content-Type": "application/json" },
       signal,
-      body: JSON.stringify({ requestID, operation, ...values })
+      body: JSON.stringify({ requestID, operation: operation === "listDetails" ? "list" : operation, ...values })
     });
     const result = await response.json();
     if (!response.ok || result.error) throw new Error(result.error || `Outer Shell returned HTTP ${response.status}.`);
@@ -880,7 +883,7 @@
       render();
     }
     try {
-      const { buffer } = await requestBuffer("/api/backends", { signal: controller.signal });
+      const { buffer } = await requestBuffer("/api/backends?web=1", { signal: controller.signal });
       if (state.refreshAbort.backendError !== controller) return;
       const result = decodeBackends(buffer);
       state.backends = result.backends;
@@ -1416,8 +1419,14 @@
     }
   }
 
-  function openContainerConfiguration(id) {
-    const workspace = findSafeSpace(id);
+  async function openContainerConfiguration(id) {
+    let workspace = findSafeSpace(id);
+    if (workspace && !workspace.recipe) {
+      try {
+        const result = await safeSpaceRequest("listDetails");
+        workspace = result.workspaces?.find(value => value.id === id);
+      } catch (error) { toast(error.message, true); return; }
+    }
     if (!workspace || !managedContainer(workspace)) return;
     const recipe = workspace.recipe;
     if (!recipe || typeof recipe.containerfile !== "string") { toast("The container configuration is not available yet.", true); return; }
@@ -1791,7 +1800,8 @@
       state.eventAbort = controller;
       const query = new URLSearchParams({
         sinceBackends: state.backendsVersion.toString(),
-        sinceLog: state.logVersion.toString()
+        sinceLog: state.logVersion.toString(),
+        sinceOverview: state.overviewVersion.toString()
       });
       const selection = state.logSelection;
       if (selection) {
@@ -1809,6 +1819,15 @@
         state.logVersion = event.logVersion;
         if (event.backendsChanged) await refreshBackends({ quiet: true });
         if (event.logChanged) await fetchSelectedLog();
+        if (event.overviewChanged || !state.layoutReady || state.safeSpacesError || state.layoutError || state.refreshErrorTimers.safeSpacesError || state.refreshErrorTimers.layoutError) {
+          if (state.layoutSaving || state.groupDrag || state.endpointDrag || state.safeSpacesRefreshing || state.layoutFetching) {
+            await delay(150);
+            continue;
+          }
+          await Promise.all([refreshLayout(), refreshSafeSpaces({ quiet: true })]);
+          state.overviewVersion = event.overviewVersion;
+        }
+        if (state.backendError || state.refreshErrorTimers.backendError) await refreshBackends({ quiet: true });
       } catch (error) {
         if (error.name !== "AbortError") await delay(1200);
       }
@@ -2122,12 +2141,5 @@
     if (document.hidden) { finishEndpointDrag(false); finishGroupDrag(false); suspendRefreshes(); }
     else resumeRefreshes();
   });
-  state.safeSpacesTimer = window.setInterval(() => {
-    if (document.hidden || state.suspended) return;
-    refreshLayout();
-    if (!state.safeSpaceBusy.size) refreshSafeSpaces({ quiet: true });
-    if (state.backendError || state.refreshErrorTimers.backendError) refreshBackends({ quiet: true });
-  }, 2000);
-
   Promise.all([refreshLayout(), refreshBackends(), refreshSafeSpaces()]).then(watchEvents);
 })();
