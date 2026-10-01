@@ -614,6 +614,63 @@
     return true;
   }
 
+  function containerCommands(workspace) {
+    const commands = (workspace.commands || []).map(command => ({
+      id: `command:${command.id}`, name: command.displayName || command.id,
+      text: command.containerCommand || command.shellCommand || "", internalText: command.internalCommand || "", iconURL: command.iconURL
+    }));
+    if (workspace.shellCommand) commands.unshift({ id: "terminal", name: "Terminal", text: workspace.shellCommand });
+    return commands.filter(command => command.text.trim());
+  }
+
+  function containerCommandsHTML(workspace) {
+    if (!workspace) return "";
+    const commands = containerCommands(workspace);
+    if (!commands.length) return "";
+    const disabled = !safeSpaceIsRunning(workspace) || containerPreparing(workspace);
+    return `<section class="container-commands" aria-label="Command line tools"><h3>Command line tools</h3>${commands.map(command => `<button type="button" class="container-command" data-action="show-container-command" data-safe-space-id="${escapeHTML(workspace.id)}" data-command-id="${escapeHTML(command.id)}" aria-label="Copy command for ${escapeHTML(command.name)}" aria-haspopup="dialog" ${disabled ? 'disabled title="Start the container to use this tool"' : ""}><span class="address-status" aria-hidden="true"></span><span class="container-command-icon" aria-hidden="true">${command.iconURL ? `<img src="${escapeHTML(command.iconURL)}" alt="">` : '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="2.5" y="4" width="19" height="16" rx="3"/><path d="m6.5 9 3 3-3 3m6 0h5"/></svg>'}</span><span>${escapeHTML(command.name)}</span><span class="container-command-copy" aria-hidden="true">⧉</span></button>`).join("")}</section>`;
+  }
+
+  function shellQuotedArgument(value) {
+    return /^[a-zA-Z0-9@%_+=:,./-]+$/.test(value) ? value : "'" + value.replace(/'/g, "'\\''") + "'";
+  }
+
+  function containerCommandVariants(command) {
+    const variants = [];
+    const source = window.outerLoop?.sessionContext?.sshCommandArguments;
+    const suffix = command.internalText ? " and internal command" : "";
+    if (Array.isArray(source) && source.length && source.every(value => typeof value === "string")) {
+      const args = [...source];
+      if (!args.includes("-t") && !args.includes("-tt")) args.splice(1, 0, "-t");
+      args.push(command.text);
+      variants.push({ name: command.internalText ? "SSH command, container command, and internal command" : "SSH command and container command", text: args.map(shellQuotedArgument).join(" "), hint: "Run in a terminal on your computer." });
+    }
+    variants.push({ name: `Container command${suffix}`, text: command.text, hint: "Run in a terminal on the server." });
+    if (command.internalText) variants.push({ name: "Internal command", text: command.internalText, hint: "Run in a terminal inside the container." });
+    return variants;
+  }
+
+  function openContainerCommand(workspaceID, commandID, point = null) {
+    const workspace = findSafeSpace(workspaceID);
+    if (!workspace || !safeSpaceIsRunning(workspace)) return;
+    const command = containerCommands(workspace).find(command => command.id === commandID);
+    if (!command) return;
+    const variants = containerCommandVariants(command);
+    const dialog = showContextMenu(variants.map((variant, index) => {
+      const label = variant.name.startsWith("SSH") ? "Copy SSH command"
+        : variant.name.startsWith("Internal") ? "Copy internal command" : "Copy container command";
+      return `<button type="button" class="context-menu-item" role="menuitem" data-copy-variant="${index}" title="${escapeHTML(variant.name)}">${contextMenuGlyph("⧉")}<span>${label}</span></button>`;
+    }).join(""), point, command.name);
+    dialog.querySelectorAll("[data-copy-variant]").forEach(button => {
+      button.addEventListener("click", () => {
+        const variant = variants[Number(button.dataset.copyVariant)];
+        if (!variant) return;
+        closeDialog();
+        copyText(variant.text);
+      });
+    });
+  }
+
   function renderOverview(entries) {
     if (state.groupDrag || state.endpointDrag) return;
     if (renderInitialLoading()) return;
@@ -638,7 +695,7 @@
       const addMore = workspace
         ? `<button class="overview-add-more" type="button" data-action="configure-container" data-safe-space-id="${id}" ${preparing || !managedContainer(workspace) ? "disabled" : ""} ${!managedContainer(workspace) ? 'title="This container is managed externally"' : ""}>Add more to Dockerfile…</button>`
         : `<button class="overview-add-more" type="button" data-action="open-add">Add more…</button>`;
-      return `<section class="overview-identity" data-group-id="${escapeHTML(group.id)}"><header class="overview-group-handle" tabindex="0" aria-label="Reorder ${escapeHTML(group.name)}. Hold and drag, or use arrow keys." title="Hold and drag to reorder" data-group-handle><div class="overview-group-heading"><h2>${escapeHTML(group.name)}</h2><p>${escapeHTML(group.note)}</p></div>${controls}</header><div class="overview-shortcuts" data-endpoint-area="pins">${pins.map(key => group.entries.find(entry => entry.key === key)).filter(Boolean).map(overviewShortcut).join("")}</div><div class="overview-list" data-endpoint-area="list">${listed.map(overviewEndpoint).join("") || `<p class="overview-empty">${state.loading || (workspace && state.safeSpacesLoading) ? "Loading…" : group.entries.length ? "" : "No registered endpoints."}</p>`}</div>${workspace?.buildProgress ? `<details class="container-build-progress"><summary>${escapeHTML(workspace.buildProgress.detail || workspace.buildProgress.phase)}</summary><pre>${escapeHTML(workspace.buildProgress.log || "")}</pre></details>` : ""}${addMore}</section>`;
+      return `<section class="overview-identity" data-group-id="${escapeHTML(group.id)}"><header class="overview-group-handle" tabindex="0" aria-label="Reorder ${escapeHTML(group.name)}. Hold and drag, or use arrow keys." title="Hold and drag to reorder" data-group-handle><div class="overview-group-heading"><h2>${escapeHTML(group.name)}</h2><p>${escapeHTML(group.note)}</p></div>${controls}</header><div class="overview-shortcuts" data-endpoint-area="pins">${pins.map(key => group.entries.find(entry => entry.key === key)).filter(Boolean).map(overviewShortcut).join("")}</div><div class="overview-list" data-endpoint-area="list">${listed.map(overviewEndpoint).join("") || `<p class="overview-empty">${state.loading || (workspace && state.safeSpacesLoading) ? "Loading…" : group.entries.length ? "" : "No registered endpoints."}</p>`}</div>${containerCommandsHTML(workspace)}${workspace?.buildProgress ? `<details class="container-build-progress"><summary>${escapeHTML(workspace.buildProgress.detail || workspace.buildProgress.phase)}</summary><pre>${escapeHTML(workspace.buildProgress.log || "")}</pre></details>` : ""}${addMore}</section>`;
     }).join("") + `<button class="overview-add-container" type="button" data-action="create-container"><span aria-hidden="true">+</span>Add container…</button>`;
     if (state.overviewMarkup !== markup) {
       elements.overview.innerHTML = markup;
@@ -2050,6 +2107,7 @@
       return;
     }
     if (action === "rename-endpoint") { const item = findItem(actionElement.dataset.appKey); if (item) openRenameEndpoint(item); return; }
+    if (action === "show-container-command") { const bounds = actionElement.getBoundingClientRect(); openContainerCommand(actionElement.dataset.safeSpaceId, actionElement.dataset.commandId, { x: bounds.left, y: bounds.bottom }); return; }
     if (action === "create-container") { openCreateContainer(); return; }
     if (action === "configure-container") { openContainerConfiguration(actionElement.dataset.safeSpaceId); return; }
     if (action === "share-container") { openShareContainer(actionElement.dataset.safeSpaceId); return; }

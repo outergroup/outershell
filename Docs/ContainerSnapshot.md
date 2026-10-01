@@ -46,7 +46,7 @@ The server still periodically checks container state. Docker events alone do
 not cover all endpoint registrations or process changes inside containers.
 This is one shared server-side check, not a data fetch per browser.
 
-Overview snapshots omit commands, recipes, mounts, and persistent-data details.
+Overview snapshots include terminal and registered command launchers, but omit recipes, mounts, and persistent-data details. Command icons use the same immutable asset URLs as endpoint icons.
 The configuration sheet obtains the full provider response when opened.
 Host web requests use `/api/backends?web=1`: frontend flag bit 1 indicates that
 the icon reference contains a URL instead of inline PNG bytes. Native requests

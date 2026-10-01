@@ -21,13 +21,16 @@ with tempfile.TemporaryDirectory(prefix='shell-icons-') as directory:
     provider = runpy.run_path(str(Path(__file__).resolve().parents[1]/'Resources/outershell-container-provider'))
     globals_ = provider['handle_request'].__globals__
     png = base64.b64decode('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aVZ0AAAAASUVORK5CYII=')
-    workspace = {'id':'test', 'apps':[{'iconData':base64.b64encode(png).decode()}], 'commands':['unused'], 'recipe':{'containerfile':'FROM alpine'}, 'mounts':[], 'persistentData':[]}
+    workspace = {'id':'test', 'apps':[{'iconData':base64.b64encode(png).decode()}], 'commands':[{'id':'codex', 'containerCommand':'docker exec -it test codex', 'iconData':base64.b64encode(png).decode()}], 'recipe':{'containerfile':'FROM alpine'}, 'mounts':[], 'persistentData':[]}
     globals_['outer_shell_home'] = lambda: root
     globals_['provider_dictionary'] = lambda: {}
     globals_['list_workspaces'] = lambda overview=False: [copy.deepcopy(workspace)]
     result = provider['handle_request']({'operation':'list', 'overview':True})
     overview = result['workspaces'][0]
-    assert 'commands' not in overview and 'recipe' not in overview
+    assert 'recipe' not in overview
+    assert overview['commands'][0]['containerCommand'] == 'docker exec -it test codex'
+    assert 'iconData' not in overview['commands'][0]
+    assert overview['commands'][0]['iconURL'] == overview['apps'][0]['iconURL']
     icon_url = overview['apps'][0]['iconURL']
     assert 'iconData' not in overview['apps'][0]
     assert icon_url == '/api/icon?key=' + hashlib.sha256(png).hexdigest()
