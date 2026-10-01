@@ -1332,26 +1332,96 @@ static void send_cached_file(int fd,
     free(data);
 }
 
-static void send_web_file(int fd,
-                          const char *filename,
-                          const char *content_type,
-                          const char *request,
-                          size_t header_length,
-                          bool send_body,
-                          bool vary_outerframe_accept) {
-    if (!g_web_root_directory[0]) {
-        send_text_response(fd, 404, "Outer Shell web frontend is not installed.\n");
-        return;
-    }
-    if (!filename || !filename[0] || strchr(filename, '/') || strstr(filename, "..")) {
-        send_text_response(fd, 404, "not found\n");
-        return;
-    }
-
+static bool read_web_asset(const char *filename, StringBuilder *body) {
     char path[PATH_MAX];
     append_path_component(path, sizeof(path), g_web_root_directory, filename);
-    send_cached_file(fd, path, content_type, request, header_length, send_body,
-                     vary_outerframe_accept);
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return false;
+    struct stat st;
+    bool ok = fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_size >= 0 && st.st_size <= 8 * 1024 * 1024;
+    char buffer[8192];
+    while (ok) {
+        ssize_t count = read(fd, buffer, sizeof(buffer));
+        if (count == 0) break;
+        if (count < 0 && errno == EINTR) continue;
+        if (count < 0 || body->length + (size_t)count > 8 * 1024 * 1024 ||
+            !sb_append_n(body, buffer, (size_t)count)) { ok = false; break; }
+    }
+    close(fd);
+    return ok;
+}
+
+static void web_asset_version(const StringBuilder *body, char *version, size_t capacity) {
+    char etag[96];
+    memory_response_etag(body->data, body->length, etag, sizeof(etag));
+    snprintf(version, capacity, "%.*s", (int)strlen(etag) - 4, etag + 3);
+}
+
+static void send_versioned_web_asset(int fd, const char *filename, const char *content_type,
+                                     const char *query, const char *request, size_t header_length,
+                                     bool send_body) {
+    StringBuilder body = {0};
+    char requested[96] = "", version[96], etag[96];
+    if (!read_web_asset(filename, &body)) {
+        free(body.data);
+        send_text_response(fd, 404, "Asset not found.\n");
+        return;
+    }
+    web_asset_version(&body, version, sizeof(version));
+    bool versioned = query_value(query, "v", requested, sizeof(requested));
+    if (versioned && strcmp(requested, version) != 0) {
+        free(body.data);
+        send_text_response(fd, 404, "Asset version is no longer available. Reload the page.\n");
+        return;
+    }
+    if (!versioned) {
+        send_cached_memory_response(fd, request, header_length, content_type, body.data, body.length,
+                                    NULL, send_body, false);
+    } else {
+        memory_response_etag(body.data, body.length, etag, sizeof(etag));
+        bool unchanged = cached_response_is_not_modified(request, header_length, etag, NULL);
+        char header[512];
+        int length = snprintf(header, sizeof(header),
+            "HTTP/1.1 %s\r\nContent-Type: %s\r\nContent-Length: %zu\r\n"
+            "Cache-Control: public, max-age=31536000, immutable\r\nETag: %s\r\nConnection: close\r\n\r\n",
+            unchanged ? "304 Not Modified" : "200 OK", content_type,
+            body.length, etag);
+        if (length > 0 && (size_t)length < sizeof(header)) queue_all(fd, header, (size_t)length);
+        if (!unchanged && send_body) queue_all(fd, body.data, body.length);
+    }
+    free(body.data);
+}
+
+static void send_web_index(int fd, const char *request, size_t header_length, bool send_body) {
+    StringBuilder html = {0}, script = {0}, style = {0}, rendered = {0};
+    bool ok = read_web_asset("index.html", &html) && read_web_asset("app.js", &script) && read_web_asset("style.css", &style);
+    char script_version[96], style_version[96];
+    if (ok) {
+        web_asset_version(&script, script_version, sizeof(script_version));
+        web_asset_version(&style, style_version, sizeof(style_version));
+        const char *cursor = html.data;
+        const char *end = html.data + html.length;
+        while (ok && cursor < end) {
+            const char *asset = NULL, *version = NULL;
+            if ((size_t)(end - cursor) >= 12 && memcmp(cursor, "/web/app.js\"", 12) == 0) {
+                asset = "/web/app.js"; version = script_version;
+            } else if ((size_t)(end - cursor) >= 15 && memcmp(cursor, "/web/style.css\"", 15) == 0) {
+                asset = "/web/style.css"; version = style_version;
+            }
+            if (asset) {
+                ok = sb_append(&rendered, asset) && sb_append(&rendered, "?v=") && sb_append(&rendered, version);
+                cursor += strlen(asset);
+            } else {
+                ok = sb_append_n(&rendered, cursor++, 1);
+            }
+        }
+    }
+    if (ok) {
+        // The HTML validator covers asset versions too, even when index.html itself is unchanged.
+        send_cached_memory_response(fd, request, header_length, "text/html; charset=utf-8",
+                                    rendered.data, rendered.length, NULL, send_body, true);
+    } else send_text_response(fd, 500, "Could not load the web frontend.\n");
+    free(html.data); free(script.data); free(style.data); free(rendered.data);
 }
 
 static void send_web_app_icon(int fd,
@@ -2336,15 +2406,14 @@ static bool process_http_client_request(ReactorClient *client, char *request, si
             send_outer_descriptor(fd, request, header_length,
                                   strcasecmp(method, "HEAD") != 0);
         } else {
-            send_web_file(fd, "index.html", "text/html; charset=utf-8",
-                          request, header_length, strcasecmp(method, "HEAD") != 0, true);
+            send_web_index(fd, request, header_length, strcasecmp(method, "HEAD") != 0);
         }
     } else if (strcmp(target, "/web/style.css") == 0) {
-        send_web_file(fd, "style.css", "text/css; charset=utf-8",
-                      request, header_length, strcasecmp(method, "HEAD") != 0, false);
+        send_versioned_web_asset(fd, "style.css", "text/css; charset=utf-8", query,
+                                 request, header_length, strcasecmp(method, "HEAD") != 0);
     } else if (strcmp(target, "/web/app.js") == 0) {
-        send_web_file(fd, "app.js", "text/javascript; charset=utf-8",
-                      request, header_length, strcasecmp(method, "HEAD") != 0, false);
+        send_versioned_web_asset(fd, "app.js", "text/javascript; charset=utf-8", query,
+                                 request, header_length, strcasecmp(method, "HEAD") != 0);
     } else if (strcmp(target, "/web/favicon.png") == 0) {
         send_web_app_icon(fd, request, header_length, strcasecmp(method, "HEAD") != 0);
     } else {

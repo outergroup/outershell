@@ -16,6 +16,11 @@
 
   const state = {
     backends: [],
+    backendsReady: false,
+    safeSpacesReady: false,
+    overviewReady: false,
+    showInitialLoading: false,
+    initialLoadingTimer: null,
     endpointNames: {},
     layoutReady: false,
     layoutSaving: false,
@@ -595,9 +600,23 @@
     return `<div class="overview-shortcut-wrap" data-endpoint-key="${escapeHTML(entry.key)}"><a class="overview-shortcut" href="${escapeHTML(target)}" ${overviewLaunchAttributes(entry)} ${entry.item ? "" : `data-app-key="${escapeHTML(identity)}"`}>${icon}<span class="shortcut-title"><span class="address-status${entry.running ? " is-running" : ""}" aria-label="${entry.running ? "Running" : "Not running"}"></span>${escapeHTML(entry.name)}</span></a></div>`;
   }
 
+  function renderInitialLoading() {
+    if (state.overviewReady) return false;
+    if (state.layoutReady && state.backendsReady && state.safeSpacesReady) {
+      state.overviewReady = true;
+      window.clearTimeout(state.initialLoadingTimer);
+      elements.shell.setAttribute("aria-busy", "false");
+      return false;
+    }
+    elements.overview.innerHTML = state.showInitialLoading
+      ? '<p class="overview-empty" role="status">Loading…</p>' : "";
+    state.overviewMarkup = "";
+    return true;
+  }
+
   function renderOverview(entries) {
     if (state.groupDrag || state.endpointDrag) return;
-    if (!state.layoutReady) { elements.overview.innerHTML = '<p class="overview-empty">Loading layout…</p>'; state.overviewMarkup = ""; return; }
+    if (renderInitialLoading()) return;
     const sessionUsername = window.outerLoop?.sessionContext?.username;
     const userName = typeof sessionUsername === "string" ? sessionUsername.trim() : "";
     const groups = [
@@ -807,6 +826,7 @@
       const result = await safeSpaceRequest("list", {}, controller.signal);
       if (state.refreshAbort.safeSpacesError !== controller) return;
       state.safeSpaces = Array.isArray(result.workspaces) ? result.workspaces : [];
+      state.safeSpacesReady = true;
       clearRefreshFailure("safeSpacesError");
       state.safeSpacesError = "";
     } catch (error) {
@@ -887,6 +907,7 @@
       if (state.refreshAbort.backendError !== controller) return;
       const result = decodeBackends(buffer);
       state.backends = result.backends;
+      state.backendsReady = true;
       clearRefreshFailure("backendError");
       state.backendError = result.error;
       updateStatus();
@@ -2141,5 +2162,9 @@
     if (document.hidden) { finishEndpointDrag(false); finishGroupDrag(false); suspendRefreshes(); }
     else resumeRefreshes();
   });
+  state.initialLoadingTimer = window.setTimeout(() => {
+    state.showInitialLoading = true;
+    render();
+  }, 400);
   Promise.all([refreshLayout(), refreshBackends(), refreshSafeSpaces()]).then(watchEvents);
 })();
