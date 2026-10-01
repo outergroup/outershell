@@ -99,8 +99,20 @@ other container users retain distinct subordinate UID and GID mappings.
 Deploys rebuild the macOS frontend with fresh intermediates and verify that its
 dSYM contains function and source-line information with UUIDs matching the
 packaged bundle. The matching dSYM is retained by arm64 UUID under
-`build/app-deploy/symbols/`, and `./app deploy` prints its exact path for use in
-Instruments.
+`build/app-deploy/symbols/`. Both `./app deploy` and `./app push-frontend` retain
+this dSYM and print its exact path and architecture UUIDs for use in Instruments.
+Both commands default to Release: Swift uses `-Osize` and whole-module
+optimization, with DWARF source information in the companion dSYM. To explicitly
+select this configuration, use `CONFIGURATION=Release ./app push-frontend`.
+Keep the dSYM for the build being profiled. Deployment also maintains a direct
+UUID index at `build/app-deploy/symbols/uuid-map` for both architectures. To enable
+automatic discovery on this Mac, add that absolute directory to
+`com.apple.DebugSymbols`'s `DBGFileMappedPaths` preference (an array of paths).
+Preserve any existing entries. If `DBGSpotlightPaths` is unset, set it to an empty
+array to keep normal Spotlight symbol discovery enabled. See
+[Apple symbol lookup configuration](https://lldb.llvm.org/use/symbols.html#file-mapped-uuid-directories).
+Restart Instruments after changing these preferences; an open recording can also
+be resolved immediately by supplying the printed dSYM path in View → Show Symbols.
 
 ## Registry And Installed Files
 

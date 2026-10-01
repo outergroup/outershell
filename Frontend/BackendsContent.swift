@@ -1,8 +1,101 @@
 import AppKit
 import CoreText
+import CryptoKit
+import Darwin
 import Foundation
 import ImageIO
 import QuartzCore
+
+private struct EndpointIconDiskCache: Sendable {
+    let directory: URL
+
+    private func fileURL(for url: URL, rendition: String) -> URL {
+        let digest = SHA256.hash(data: Data(url.absoluteString.utf8))
+        return directory.appendingPathComponent(rendition + digest.map { String(format: "%02x", $0) }.joined())
+    }
+
+    func data(for url: URL, rendition: String = "") -> Data? {
+        let file = fileURL(for: url, rendition: rendition)
+        do {
+            return try Data(contentsOf: file)
+        } catch CocoaError.fileReadNoSuchFile {
+            return nil
+        } catch {
+            print("Outer Shell: Cannot read cached icon: \(error)")
+            return nil
+        }
+    }
+
+    private static let rendition = "96px-v1-"
+
+    func image(for url: URL) -> CGImage? {
+        if let data = data(for: url, rendition: Self.rendition),
+           let source = CGImageSourceCreateWithData(data as CFData, nil),
+           let image = CGImageSourceCreateImageAtIndex(source, 0,
+                [kCGImageSourceShouldCacheImmediately: true] as CFDictionary) {
+            return image
+        }
+        guard let original = data(for: url) else { return nil }
+        return storeImage(original, for: url)
+    }
+
+    func storeImage(_ data: Data, for url: URL) -> CGImage? {
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+              let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+              let width = properties[kCGImagePropertyPixelWidth] as? Int,
+              let height = properties[kCGImagePropertyPixelHeight] as? Int else { return nil }
+        if max(width, height) <= 96 {
+            guard let image = CGImageSourceCreateImageAtIndex(source, 0,
+                [kCGImageSourceShouldCacheImmediately: true] as CFDictionary) else { return nil }
+            store(data, for: url, rendition: Self.rendition)
+            return image
+        }
+        guard let image = CGImageSourceCreateThumbnailAtIndex(source, 0, [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: 96,
+            kCGImageSourceShouldCacheImmediately: true
+        ] as CFDictionary) else { return nil }
+        let encoded = NSMutableData()
+        if let destination = CGImageDestinationCreateWithData(encoded, "public.png" as CFString, 1, nil) {
+            CGImageDestinationAddImage(destination, image, nil)
+            if CGImageDestinationFinalize(destination) {
+                store(encoded as Data, for: url, rendition: Self.rendition)
+            } else {
+                print("Outer Shell: Cannot encode resized icon.")
+            }
+        }
+        return image
+    }
+
+    func store(_ data: Data, for url: URL, rendition: String = "") {
+        do {
+            let manager = FileManager.default
+            try manager.createDirectory(at: directory, withIntermediateDirectories: true)
+            let target = fileURL(for: url, rendition: rendition)
+            let temporary = directory.appendingPathComponent("." + UUID().uuidString)
+            defer { try? manager.removeItem(at: temporary) }
+            try data.write(to: temporary)
+            guard rename(temporary.path, target.path) == 0 else {
+                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+            }
+            let files = try manager.contentsOfDirectory(at: directory,
+                includingPropertiesForKeys: [.fileSizeKey, .contentModificationDateKey], options: [.skipsHiddenFiles])
+            let entries = try files.map { file in
+                (file, try file.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey]))
+            }
+            var bytes = entries.reduce(0) { $0 + ($1.1.fileSize ?? 0) }
+            for (file, values) in entries.sorted(by: {
+                ($0.1.contentModificationDate ?? .distantPast) < ($1.1.contentModificationDate ?? .distantPast)
+            }) where bytes > 128 * 1024 * 1024 {
+                try manager.removeItem(at: file)
+                bytes -= values.fileSize ?? 0
+            }
+        } catch {
+            print("Outer Shell: Cannot store cached icon: \(error)")
+        }
+    }
+}
 
 @MainActor
 @objc public final class BackendsContent: NSObject, OuterframeContentLibrary {
@@ -101,6 +194,8 @@ private struct FrontendRecord {
         list?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     }
 
+    var iconURL: String? = nil
+
 }
 
 private func decodedIconCGImage(_ data: Data) -> CGImage? {
@@ -142,6 +237,8 @@ private struct ActionResponse: Decodable {
 
 private struct EventResponse {
     let backendsChanged: Bool
+    let overviewChanged: Bool
+    let overviewVersion: UInt64
     let logChanged: Bool
     let timedOut: Bool
     let backendsVersion: UInt64
@@ -309,9 +406,9 @@ private extension BackendRecord {
 
 private extension FrontendRecord {
     static func decodeBinary(_ reader: BinaryPayloadReader) throws -> FrontendRecord {
-        let iconData = try reader.dataRef(at: 32)
         let id = reader.data.count >= 60 ? try reader.stringRef(at: 52) : ""
         let flags = reader.data.count >= 64 ? try reader.uint32(at: 60) : 1
+        let iconData = (flags & 2) == 0 ? try reader.dataRef(at: 32) : Data()
         return FrontendRecord(id: id,
                               name: try reader.stringRef(at: 0),
                               url: try reader.stringRef(at: 8),
@@ -322,7 +419,8 @@ private extension FrontendRecord {
                               iconCGImage: decodedIconCGImage(iconData),
                               iconObservationToken: reader.data.count >= 72 ? try reader.stringRef(at: 64) : "",
                               list: emptyToNil(try reader.stringRef(at: 40)),
-                              isRunning: (flags & 0x01) != 0)
+                              isRunning: (flags & 0x01) != 0,
+                              iconURL: (flags & 2) != 0 ? try reader.stringRef(at: 32) : nil)
     }
 }
 
@@ -368,6 +466,8 @@ private extension EventResponse {
         let reader = BinaryPayloadReader(data: data)
         let flags = try reader.uint32(at: 0)
         return EventResponse(backendsChanged: (flags & 0x01) != 0,
+                             overviewChanged: (flags & 0x08) != 0,
+                             overviewVersion: try reader.uint64(at: 24),
                              logChanged: (flags & 0x02) != 0,
                              timedOut: (flags & 0x04) != 0,
                              backendsVersion: try reader.uint64(at: 8),
@@ -465,6 +565,8 @@ private struct LocalWorkspaceAppRecord: Decodable, Equatable {
     let listName: String
     let isRunning: Bool
     let publishedPort: Int
+    var iconURL: String? = nil
+
 }
 
 private struct LocalWorkspaceCommandRecord: Decodable, Equatable {
@@ -475,6 +577,8 @@ private struct LocalWorkspaceCommandRecord: Decodable, Equatable {
     let internalCommand: String
     let iconPath: String
     let iconData: Data?
+    var iconURL: String? = nil
+
 }
 
 private struct LocalWorkspaceRecord: Decodable, Equatable {
@@ -817,6 +921,22 @@ private struct LocalWorkspaceHostResponse: Decodable {
     let suggestedMountRoot: String?
     let importMounts: [SharedContainerImportMount]?
     let error: String?
+}
+
+private extension LocalWorkspaceHostResponse {
+    static func decode(_ data: Data, snapshotRequestID: UUID? = nil) throws -> LocalWorkspaceHostResponse {
+        let payload: Data
+        if let snapshotRequestID {
+            guard var object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                throw URLError(.cannotParseResponse)
+            }
+            object["requestID"] = snapshotRequestID.uuidString
+            payload = try JSONSerialization.data(withJSONObject: object)
+        } else {
+            payload = data
+        }
+        return try JSONDecoder().decode(LocalWorkspaceHostResponse.self, from: payload)
+    }
 }
 
 private struct SharedContainerImportMount: Decodable {
@@ -1307,6 +1427,30 @@ private struct PendingFilePicker {
 }
 
 @MainActor
+private struct OverviewLayout: Codable {
+    var version = 1
+    var pins: [String: [String]] = [:]
+    var order: [String: [String]] = [:]
+    var groups: [String] = []
+    var names: [String: String] = [:]
+
+    static func decode(_ data: Data) throws -> (OverviewLayout, UInt64) {
+        guard data.count >= 18, data.prefix(8) == Data("OSLAY001".utf8) else { throw URLError(.cannotParseResponse) }
+        let revision = data[8..<16].enumerated().reduce(UInt64(0)) { $0 | UInt64($1.element) << ($1.offset * 8) }
+        let layout = try JSONDecoder().decode(OverviewLayout.self, from: data.dropFirst(16))
+        guard layout.version == 1 else { throw URLError(.cannotParseResponse) }
+        return (layout, revision)
+    }
+
+    func encode(revision: UInt64) throws -> Data {
+        var data = Data("OSLAY001".utf8)
+        var littleEndianRevision = revision.littleEndian
+        withUnsafeBytes(of: &littleEndianRevision) { data.append(contentsOf: $0) }
+        data.append(try JSONEncoder().encode(self))
+        return data
+    }
+}
+
 private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLineTextInputControllerDelegate, ScrollbarControllerDelegate {
     private let outerframeHost: OuterframeHost
     private let appConnection: OuterframeAppConnection
@@ -1316,6 +1460,11 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private var currentSize = CGSize(width: 900, height: 620)
     private var layoutUpdateScheduled = false
     private var scheduledLayoutNeedsScrollClamping = false
+    private var iconSession: URLSession?
+    private var endpointIconDiskCache: EndpointIconDiskCache?
+    private var endpointIcons: [String: CGImage] = [:]
+    private var terminalSymbolImages: [URL: CGImage] = [:]
+    private var pendingIconURLs: Set<String> = []
     private var urlSession: URLSession?
     private var backendsEndpoint: URL?
     private var logsEndpoint: URL?
@@ -1333,6 +1482,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private var eventWatchRetryDelay: TimeInterval = 1
     private var backendsEventVersion: UInt64 = 0
     private var logEventVersion: UInt64 = 0
+    private var overviewEventVersion: UInt64 = 0
     private var didRegisterLayer = false
 
     private var backends: [BackendRecord] = []
@@ -1740,6 +1890,21 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private var workspaceOverviewRowFrames: [(frame: CGRect, workspace: LocalWorkspaceRecord)] = []
     private var workspaceOverviewActionFrames: [(frame: CGRect, workspace: LocalWorkspaceRecord, operation: String)] = []
     private var workspaceOverviewAppFrames: [(frame: CGRect, workspace: LocalWorkspaceRecord, app: LocalWorkspaceAppRecord)] = []
+    private var overviewMenuFrames: [(frame: CGRect, item: AppLauncherItem)] = []
+    private var overviewAddFrames: [CGRect] = []
+    private var overviewDropFrames: [(frame: CGRect, group: String, target: AppDropTarget)] = []
+    private var overviewGroupFrames: [(frame: CGRect, header: CGRect, id: String)] = []
+    private let overviewDragFeedbackLayer = CALayer()
+    private var overviewDragPreview: CALayer?
+    private var overviewDragPreviewKey: String?
+    private var overviewDragFrameScheduled = false
+    private var pendingOverviewGroupDrag: (id: String, start: CGPoint, current: CGPoint, active: Bool)?
+    private var overviewUsername = "Your user"
+    private var overviewLayout = OverviewLayout()
+    private var overviewLayoutRevision: UInt64 = 0
+    private var overviewLayoutReady = false
+    private var overviewLayoutSaving = false
+    private var overviewLayoutRequestPending = false
     private var workspaceOverviewCreateFrame = CGRect.zero
     private var safeSpaceDetailBackFrame = CGRect.zero
     private var safeSpaceDetailAddAppFrames: [CGRect] = []
@@ -1859,8 +2024,18 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                     NSPasteboard.PasteboardType.fileURL.rawValue
                 ]
             )
+            loadOverviewLayout()
+            outerframeHost.requestOuterLoopSSHCommandArguments { [weak self] arguments in
+                guard let self, let arguments else { return }
+                if let index = arguments.firstIndex(of: "-l"), arguments.indices.contains(index + 1) {
+                    self.overviewUsername = arguments[index + 1]
+                } else if let destination = arguments.last, let at = destination.firstIndex(of: "@") {
+                    self.overviewUsername = String(destination[..<at])
+                }
+                self.updateLayout()
+            }
             fetchBackends()
-            fetchRecipes()
+            if mode == .create { fetchRecipes() }
             startEventWatch()
             if workspaceContextID == nil {
                 sendWorkspaceRequest(operation: "list")
@@ -2027,7 +2202,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
     private func configureNetworking() {
         if let base = outerframeHost.pluginBaseURL() {
-            backendsEndpoint = URL(string: "/api/backends", relativeTo: base)?.absoluteURL
+            backendsEndpoint = URL(string: "/api/backends?web=1", relativeTo: base)?.absoluteURL
             logsEndpoint = URL(string: "/api/logs", relativeTo: base)?.absoluteURL
             controlEndpoint = URL(string: "/api/control", relativeTo: base)?.absoluteURL
             createEndpoint = URL(string: "/api/create", relativeTo: base)?.absoluteURL
@@ -2043,6 +2218,14 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         configuration.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
         outerframeHost.applyProxy(to: configuration)
         urlSession = URLSession(configuration: configuration)
+        endpointIconDiskCache = outerframeHost.stagedFileDirectoryURL.map {
+            EndpointIconDiskCache(directory: $0.appendingPathComponent("cache/OuterShellIcons", isDirectory: true))
+        }
+        let iconConfiguration = URLSessionConfiguration.ephemeral
+        iconConfiguration.urlCache = nil
+        iconConfiguration.timeoutIntervalForRequest = 20
+        outerframeHost.applyProxy(to: iconConfiguration)
+        iconSession = URLSession(configuration: iconConfiguration)
 
         let installConfiguration = URLSessionConfiguration.ephemeral
         installConfiguration.timeoutIntervalForRequest = 600
@@ -2233,6 +2416,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func applyMode(_ nextMode: BackendsViewMode) {
+        if nextMode == .create && recipes.isEmpty { fetchRecipes() }
         let previousMode = mode
         if mode == .create && nextMode != .create {
             blurCreateField()
@@ -2315,12 +2499,14 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         if resetVersions {
             backendsEventVersion = 0
             logEventVersion = 0
+            overviewEventVersion = 0
         }
         let generation = eventWatchGeneration
         var components = URLComponents(url: eventsEndpoint, resolvingAgainstBaseURL: false)
         var items = [
             URLQueryItem(name: "sinceBackends", value: String(backendsEventVersion)),
-            URLQueryItem(name: "sinceLog", value: String(logEventVersion))
+            URLQueryItem(name: "sinceLog", value: String(logEventVersion)),
+            URLQueryItem(name: "sinceOverview", value: String(overviewEventVersion))
         ]
         if selectedContainerLogContext == nil, let selectedLog {
             items.append(URLQueryItem(name: "serviceID", value: selectedLog.serviceID))
@@ -2344,7 +2530,15 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                     self.eventWatchRetryDelay = 1
                     self.backendsEventVersion = event.backendsVersion
                     self.logEventVersion = event.logVersion
+                    if event.overviewChanged || !self.overviewLayoutReady {
+                        self.overviewEventVersion = event.overviewVersion
+                        self.loadOverviewLayout()
+                        if !self.isRefreshingWorkspaces && self.workspaceContextID == nil {
+                            self.sendWorkspaceRequest(operation: "list")
+                        }
+                    }
                     if event.backendsChanged {
+                        self.loadOverviewLayout()
                         self.fetchBackends(quiet: true)
                     }
                     if event.logChanged, self.selectedLog != nil {
@@ -2396,6 +2590,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         rootLayer.addSublayer(toolbarLayer)
         rootLayer.addSublayer(contentLayer)
         rootLayer.addSublayer(iconTransitionLayer)
+        rootLayer.addSublayer(overviewDragFeedbackLayer)
         rootLayer.addSublayer(createLayer)
         rootLayer.addSublayer(installOverlayLayer)
         rootLayer.addSublayer(updateOverlayLayer)
@@ -2504,15 +2699,19 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 let width = max(currentSize.width, 1)
                 let height = max(currentSize.height, 1)
                 rootLayer.frame = CGRect(origin: .zero, size: CGSize(width: width, height: height))
-                toolbarLayer.frame = CGRect(x: 0, y: max(height - toolbarHeight, 0), width: width, height: toolbarHeight)
-                contentLayer.frame = CGRect(x: 0, y: 0, width: width, height: max(height - toolbarHeight, 0))
+                let visibleToolbarHeight: CGFloat = mode == .apps && backendError.isEmpty ? 0 : toolbarHeight
+                toolbarLayer.frame = CGRect(x: 0, y: max(height - visibleToolbarHeight, 0), width: width, height: visibleToolbarHeight)
+                toolbarLayer.isHidden = visibleToolbarHeight == 0
+                contentLayer.frame = CGRect(x: 0, y: 0, width: width, height: max(height - visibleToolbarHeight, 0))
                 iconTransitionLayer.frame = rootLayer.bounds
+                overviewDragFeedbackLayer.frame = rootLayer.bounds
+                overviewDragFeedbackLayer.isHidden = mode != .apps
                 createLayer.frame = rootLayer.bounds
                 workspaceOverlayLayer.frame = rootLayer.bounds
                 copyConfirmationLayer.frame = rootLayer.bounds
 
                 titleLayer.frame = .zero
-                outerShellActionFrame = (mode == .apps || mode == .create) && outerShellActionsBackend() != nil
+                outerShellActionFrame = mode == .create && outerShellActionsBackend() != nil
                     ? CGRect(x: max(width - horizontalInset - 28, horizontalInset),
                              y: 10,
                              width: 28,
@@ -2852,6 +3051,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         workspaceScrollContentLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
         appsOverlayLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
         appCardFrames.removeAll()
+        overviewMenuFrames.removeAll()
+        overviewAddFrames.removeAll()
+        overviewDropFrames.removeAll()
+        overviewGroupFrames.removeAll()
         appBadgeFrames.removeAll()
         appListDropFrames.removeAll()
         appUnlistedDropFrames.removeAll()
@@ -2886,155 +3089,16 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         var visibleIconKeys = Set<String>()
         var visibleTextKeys = Set<String>()
 
-        let items = appLauncherItems()
-        let unlistedItems = items.filter(isAppUnlisted)
-        let iconItems = unlistedItems.filter(isAppProminent)
-        let overflowItems = unlistedItems.filter { !isAppProminent($0) }
-        let listGroups = Dictionary(grouping: items.filter { !isAppUnlisted($0) },
-                                    by: { $0.frontend.listName })
-            .map { (name: $0.key, items: $0.value.sorted { $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending }) }
-            .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
-        let contentWidth = max(appsLayer.bounds.width - horizontalInset * 2, 1)
-        let left = horizontalInset
-        let sectionTop = max(appsLayer.bounds.height - 28, 0)
-        let showsWorkspaceOverview = workspaceContextID == nil &&
-            (workspaceOverviewAvailable || isRefreshingWorkspaces)
-        usesWorkspaceSplitLayout = showsWorkspaceOverview && contentWidth >= 900
-        let paneGap: CGFloat = 32
-        let privilegedWidth = usesWorkspaceSplitLayout
-            ? floor((contentWidth - paneGap) / 3)
-            : contentWidth
-        let privilegedArea = CGRect(x: left, y: 0, width: privilegedWidth, height: 0)
-        if usesWorkspaceSplitLayout {
-            let workspaceX = privilegedArea.maxX + paneGap
-            workspacePaneFrame = CGRect(
-                x: workspaceX,
-                y: 0,
-                width: max(left + contentWidth - workspaceX, 1),
-                height: appsLayer.bounds.height
-            )
-        } else {
-            workspacePaneFrame = .zero
-            workspaceScroll = 0
-        }
+        usesWorkspaceSplitLayout = false
+        workspacePaneFrame = .zero
+        workspaceScroll = 0
         updateAppsScrollLayerFrames()
-
-        let top: CGFloat
-        if usesWorkspaceSplitLayout {
-            privilegedAppsHeaderLayer.frame = CGRect(x: left,
-                                                      y: 15,
-                                                      width: privilegedWidth,
-                                                      height: 18)
-            safeSpacesHeaderLayer.frame = CGRect(
-                x: workspacePaneFrame.minX,
-                y: 15,
-                width: max(workspacePaneFrame.width - 44, 1),
-                height: 18
-            )
-            privilegedAppsHeaderLayer.isHidden = mode != .apps
-            safeSpacesHeaderLayer.isHidden = mode != .apps
-            top = max(appsLayer.bounds.height - 10, 0)
-        } else {
-            let topLevelApps = makeTextLayer(size: 13,
-                                             weight: .semibold,
-                                             color: .secondaryLabelColor)
-            topLevelApps.string = "PRIVILEGED APPS"
-            topLevelApps.frame = CGRect(x: left,
-                                        y: sectionTop - 22,
-                                        width: privilegedWidth,
-                                        height: 18)
-            addAppsSublayer(topLevelApps)
-            top = sectionTop - 34
-        }
-
-        let splitGap: CGFloat = 34
-        let usesSplitLayout = !usesWorkspaceSplitLayout &&
-            privilegedWidth >= 760 &&
-            !listGroups.isEmpty
-        let appArea: CGRect
-        let listArea: CGRect
-        let serverAppsBottom: CGFloat
-        if usesSplitLayout {
-            let columnWidth = floor((contentWidth - splitGap) / 2)
-            appArea = CGRect(x: left, y: 0, width: columnWidth, height: 0)
-            listArea = CGRect(x: left + columnWidth + splitGap, y: 0, width: columnWidth, height: 0)
-            let appBottom = renderAppIconGrid(items: iconItems,
-                                              area: appArea,
-                                              top: top,
-                                              includesAddTile: true,
-                                              visibleIconKeys: &visibleIconKeys,
-                                              visibleTextKeys: &visibleTextKeys)
-            let overflowBottom = renderAppOverflow(items: overflowItems,
-                                                   area: appArea,
-                                                   top: appBottom - 8,
-                                                   scope: .server,
-                                                   visibleIconKeys: &visibleIconKeys,
-                                                   visibleTextKeys: &visibleTextKeys)
-            let listBottom = renderAppListGroups(groups: listGroups,
-                                                 area: listArea,
-                                                 top: top,
-                                                 visibleIconKeys: &visibleIconKeys,
-                                                 visibleTextKeys: &visibleTextKeys)
-            serverAppsBottom = min(overflowBottom, listBottom)
-        } else {
-            let fullArea = privilegedArea
-            let appBottom = renderAppIconGrid(items: iconItems,
-                                              area: fullArea,
-                                              top: top,
-                                              includesAddTile: true,
-                                              visibleIconKeys: &visibleIconKeys,
-                                              visibleTextKeys: &visibleTextKeys)
-            let overflowBottom = renderAppOverflow(items: overflowItems,
-                                                   area: fullArea,
-                                                   top: appBottom - 8,
-                                                   scope: .server,
-                                                   visibleIconKeys: &visibleIconKeys,
-                                                   visibleTextKeys: &visibleTextKeys)
-            let listTop = listGroups.isEmpty ? overflowBottom : overflowBottom - 18
-            let listBottom = renderAppListGroups(groups: listGroups,
-                                                 area: fullArea,
-                                                 top: listTop,
-                                                 visibleIconKeys: &visibleIconKeys,
-                                                 visibleTextKeys: &visibleTextKeys)
-            serverAppsBottom = min(overflowBottom, listBottom)
-        }
-        if showsWorkspaceOverview {
-            if usesWorkspaceSplitLayout {
-                let existingIconKeys = visibleIconKeys
-                let existingTextKeys = visibleTextKeys
-                isRenderingWorkspacePane = true
-                workspaceContentBottom = renderWorkspaceOverview(
-                    area: CGRect(
-                        x: workspacePaneFrame.minX,
-                        y: 0,
-                        width: workspacePaneFrame.width,
-                        height: 0
-                    ),
-                    top: top,
-                    forceSingleColumn: true,
-                    showsHeading: false,
-                    visibleIconKeys: &visibleIconKeys,
-                    visibleTextKeys: &visibleTextKeys
-                )
-                isRenderingWorkspacePane = false
-                workspaceVisibleIconKeys = visibleIconKeys.subtracting(existingIconKeys)
-                workspaceVisibleTextKeys = visibleTextKeys.subtracting(existingTextKeys)
-                appsContentBottom = serverAppsBottom
-            } else {
-                workspaceContentBottom = 0
-                appsContentBottom = renderWorkspaceOverview(
-                    area: CGRect(x: left, y: 0, width: contentWidth, height: 0),
-                    top: serverAppsBottom - 28,
-                    forceSingleColumn: false,
-                    visibleIconKeys: &visibleIconKeys,
-                    visibleTextKeys: &visibleTextKeys
-                )
-            }
-        } else {
-            appsContentBottom = serverAppsBottom
-            workspaceContentBottom = 0
-        }
-        renderAppDragOverlayIfNeeded()
+        appsContentBottom = renderOverviewCards(
+            visibleIconKeys: &visibleIconKeys,
+            visibleTextKeys: &visibleTextKeys
+        )
+        workspaceContentBottom = 0
+        renderOverviewDragFrame()
         hideUnrenderedMatchedLayers(visibleIconKeys: visibleIconKeys, visibleTextKeys: visibleTextKeys)
         updateMatchedLayerVisibility()
         let didClampAppsScroll = clampAppsScrollUsingRenderedContent()
@@ -4456,6 +4520,456 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         return cursor - 5
     }
 
+    private func overviewGroupID(for item: AppLauncherItem) -> String {
+        if let context = item.containerContext { return "container:\(context.container.id.uuidString.lowercased())" }
+        return item.backend.serviceScope == "system" ? "root" : "user"
+    }
+
+    private func overviewTitle(for item: AppLauncherItem) -> String {
+        overviewLayout.names[overviewKey(for: item)] ?? item.displayName
+    }
+
+    private func renderOverviewCards(visibleIconKeys: inout Set<String>,
+                                     visibleTextKeys: inout Set<String>) -> CGFloat {
+        guard overviewLayoutReady, !backends.isEmpty || !isLoadingBackends,
+              workspaceContextID != nil || workspaceOverviewAvailable else { return appsLayer.bounds.height - 18 }
+        let width = max(appsLayer.bounds.width - horizontalInset * 2, 1)
+        let gap: CGFloat = 18
+        let columns = max(1, Int((width + gap) / 340))
+        let cardWidth = (width - CGFloat(columns - 1) * gap) / CGFloat(columns)
+        var tops = Array(repeating: appsLayer.bounds.height - 18, count: columns)
+        let hostItems = appLauncherItems().filter { $0.backend.isInstalled ?? true }
+        var groups: [(id: String, name: String, note: String, items: [AppLauncherItem], workspace: LocalWorkspaceRecord?)] = [
+            ("user", overviewUsername, "User", hostItems.filter { $0.backend.serviceScope != "system" }, nil),
+            ("root", "root", "Administrator", hostItems.filter { $0.backend.serviceScope == "system" }, nil)
+        ]
+        if workspaceContextID == nil {
+            groups += localWorkspaces.map {
+                ("container:\($0.id.uuidString.lowercased())", $0.name, "Container · \(displayedWorkspaceState(for: $0))", appLauncherItems(in: $0), $0)
+            }
+        }
+        groups.sort {
+            (overviewLayout.groups.firstIndex(of: $0.id) ?? Int.max) < (overviewLayout.groups.firstIndex(of: $1.id) ?? Int.max)
+        }
+        for (index, group) in groups.enumerated() {
+            let column = index % columns
+            let innerWidth = max(cardWidth - 32, 1)
+            let pinColumns = max(1, Int(innerWidth / 96))
+            let pins = overviewOrderedItems(group.items.filter(isAppProminent), group: group.id, pinned: true)
+            let listed = overviewOrderedItems(group.items.filter { !isAppProminent($0) }, group: group.id, pinned: false)
+            let pinHeight = pins.isEmpty ? 0 : CGFloat((pins.count + pinColumns - 1) / pinColumns) * 100 + 12
+            let commands = group.workspace?.commandLaunchers ?? []
+            let hasTerminal = !(group.workspace?.shellCommand.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
+            let commandCount = commands.count + (hasTerminal ? 1 : 0)
+            let commandsHeight: CGFloat = commandCount == 0 ? 0 : 38 + CGFloat(commandCount) * 38
+            let listHeight = max(CGFloat(listed.count) * 38, 28)
+            let cardHeight = 80 + pinHeight + listHeight + commandsHeight + 62
+            let frame = CGRect(x: horizontalInset + CGFloat(column) * (cardWidth + gap),
+                               y: tops[column] - cardHeight, width: cardWidth, height: cardHeight)
+            let card = CALayer()
+            card.frame = frame
+            card.cornerRadius = 14
+            card.cornerCurve = .continuous
+            card.backgroundColor = resolvedCGColor(.controlBackgroundColor)
+            card.borderWidth = 0.5
+            card.borderColor = resolvedCGColor(.separatorColor)
+            addAppsSublayer(card)
+            overviewGroupFrames.append((frame, CGRect(x: frame.minX, y: frame.maxY - 70, width: frame.width, height: 70), group.id))
+            let titleWidth = max(innerWidth - (group.workspace == nil ? 0 : 88), 1)
+            let heading = makeTextLayer(size: 18, weight: .semibold, color: .labelColor)
+            heading.string = group.name
+            heading.frame = CGRect(x: frame.minX + 16, y: frame.maxY - 41, width: titleWidth, height: 24)
+            addAppsSublayer(heading)
+            let note = makeTextLayer(size: 12, weight: .regular, color: .secondaryLabelColor)
+            note.string = group.note
+            note.frame = CGRect(x: frame.minX + 16, y: frame.maxY - 60, width: titleWidth, height: 18)
+            addAppsSublayer(note)
+            if let workspace = group.workspace {
+                workspaceOverviewRowFrames.append((frame, workspace))
+                let manage = CGRect(x: frame.maxX - 96, y: frame.maxY - 51, width: 80, height: 28)
+                renderOverviewButton("Manage…", frame: manage)
+                workspaceOverviewActionFrames.append((manage, workspace, "menu"))
+            }
+            var top = frame.maxY - 80
+            let pinTop = top
+            for (pinIndex, item) in pins.enumerated() {
+                let tileWidth = innerWidth / CGFloat(pinColumns)
+                let tile = CGRect(x: frame.minX + 16 + CGFloat(pinIndex % pinColumns) * tileWidth,
+                                  y: top - CGFloat(pinIndex / pinColumns + 1) * 100, width: tileWidth, height: 100)
+                renderOverviewEndpoint(item, frame: tile, pinned: true, separator: false,
+                                       visibleIconKeys: &visibleIconKeys, visibleTextKeys: &visibleTextKeys)
+            }
+            top -= pinHeight
+            overviewDropFrames.append((CGRect(x: frame.minX + 8, y: top, width: cardWidth - 16, height: max(pinTop - top, 20)), group.id, .pinned))
+            let listTop = top
+            for (row, item) in listed.enumerated() {
+                let rowFrame = CGRect(x: frame.minX + 16, y: top - 38, width: innerWidth, height: 38)
+                renderOverviewEndpoint(item, frame: rowFrame, pinned: false, separator: row > 0,
+                                       visibleIconKeys: &visibleIconKeys, visibleTextKeys: &visibleTextKeys)
+                top -= 38
+            }
+            if listed.isEmpty {
+                if pins.isEmpty {
+                    let empty = makeTextLayer(size: 12, weight: .regular, color: .secondaryLabelColor)
+                    empty.string = isLoadingBackends ? "Loading…" : "No registered endpoints."
+                    empty.frame = CGRect(x: frame.minX + 16, y: top - 22, width: innerWidth, height: 18)
+                    addAppsSublayer(empty)
+                }
+                top -= 28
+            }
+            overviewDropFrames.append((CGRect(x: frame.minX + 8, y: top, width: cardWidth - 16, height: listTop - top), group.id, .moreApps))
+            if let workspace = group.workspace, commandCount > 0 {
+                let label = makeTextLayer(size: 12, weight: .medium, color: .secondaryLabelColor)
+                label.string = "Command line tools"
+                label.frame = CGRect(x: frame.minX + 16, y: top - 32, width: innerWidth, height: 18)
+                addAppsSublayer(label)
+                top -= 38
+                if hasTerminal {
+                    renderContainerTerminalRow(workspace: workspace,
+                        frame: CGRect(x: frame.minX + 16, y: top - 38, width: innerWidth, height: 38),
+                        showsSeparator: false, visibleIconKeys: &visibleIconKeys, visibleTextKeys: &visibleTextKeys)
+                    top -= 38
+                }
+                for (commandIndex, command) in commands.enumerated() {
+                    renderContainerCommandRow(workspace: workspace, command: command,
+                        frame: CGRect(x: frame.minX + 16, y: top - 38, width: innerWidth, height: 38),
+                        showsSeparator: hasTerminal || commandIndex > 0,
+                        visibleIconKeys: &visibleIconKeys, visibleTextKeys: &visibleTextKeys)
+                    top -= 38
+                }
+            }
+            let add = CGRect(x: frame.minX + 16, y: frame.minY + 16,
+                             width: min(innerWidth, group.workspace == nil ? 106 : 204), height: 28)
+            renderOverviewButton(group.workspace == nil ? "Add more…" : "Add more to Dockerfile…", frame: add)
+            if let workspace = group.workspace {
+                workspaceOverviewActionFrames.append((add, workspace, "editContainer"))
+            } else {
+                overviewAddFrames.append(add)
+            }
+            tops[column] = frame.minY - gap
+        }
+        if workspaceContextID == nil && workspaceOverviewAvailable {
+            let column = groups.count % columns
+            let frame = CGRect(x: horizontalInset + CGFloat(column) * (cardWidth + gap), y: tops[column] - 90, width: cardWidth, height: 90)
+            workspaceOverviewCreateFrame = frame
+            renderAddContainerCard(frame: frame)
+            tops[column] = frame.minY - gap
+        }
+        return (tops.min() ?? 0) - 8
+    }
+
+    private func scheduleOverviewDragFrame() {
+        guard !overviewDragFrameScheduled else { return }
+        overviewDragFrameScheduled = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.overviewDragFrameScheduled = false
+            self.withEffectiveAppearance {
+                withoutImplicitAnimations { self.renderOverviewDragFrame() }
+            }
+        }
+    }
+
+    private func overviewGroupDrop(at point: CGPoint, source: String) -> (id: String, after: Bool, marker: CGRect)? {
+        let candidates = overviewGroupFrames.filter { $0.id != source }
+        guard let target = candidates.min(by: {
+            func distance(_ frame: CGRect) -> CGFloat {
+                let dx = max(frame.minX - point.x, 0, point.x - frame.maxX)
+                let dy = max(frame.minY - point.y, 0, point.y - frame.maxY)
+                return dx * dx + dy * dy
+            }
+            return distance($0.frame) < distance($1.frame)
+        }) else { return nil }
+        let multipleColumns = Set(overviewGroupFrames.map { $0.frame.minX }).count > 1
+        let after = multipleColumns ? point.x > target.frame.midX : point.y < target.frame.midY
+        let marker = multipleColumns
+            ? CGRect(x: (after ? target.frame.maxX : target.frame.minX) + (after ? 7 : -9), y: target.frame.minY, width: 2, height: target.frame.height)
+            : CGRect(x: target.frame.minX, y: (after ? target.frame.minY - 9 : target.frame.maxY + 7), width: target.frame.width, height: 2)
+        return (target.id, after, marker)
+    }
+
+    private func overviewEndpointDrop(at point: CGPoint, for item: AppLauncherItem)
+        -> (target: AppDropTarget, before: AppLauncherItem?, marker: CGRect, zone: CGRect)? {
+        guard let zone = overviewDropFrames.first(where: {
+            $0.group == overviewGroupID(for: item) && $0.frame.contains(point)
+        }) else { return nil }
+        let pinned = zone.target == .pinned
+        let candidates = appCardFrames.filter {
+            overviewGroupID(for: $0.item) == zone.group &&
+            isAppProminent($0.item) == pinned && $0.item.identityKey != item.identityKey
+        }
+        let next = candidates.first {
+            pinned
+                ? point.y > $0.frame.maxY || (point.y >= $0.frame.minY && point.x < $0.frame.midX)
+                : point.y > $0.frame.midY
+        }
+        let marker: CGRect
+        if let next {
+            marker = pinned
+                ? CGRect(x: next.frame.minX, y: next.frame.minY + 8, width: 2, height: next.frame.height - 16)
+                : CGRect(x: next.frame.minX, y: next.frame.maxY - 1, width: next.frame.width, height: 2)
+        } else if let last = candidates.last {
+            marker = pinned
+                ? CGRect(x: last.frame.maxX - 2, y: last.frame.minY + 8, width: 2, height: last.frame.height - 16)
+                : CGRect(x: last.frame.minX, y: last.frame.minY - 1, width: last.frame.width, height: 2)
+        } else {
+            marker = pinned
+                ? CGRect(x: zone.frame.minX + 8, y: zone.frame.minY + 4, width: 2, height: max(zone.frame.height - 8, 12))
+                : CGRect(x: zone.frame.minX + 8, y: zone.frame.maxY - 2, width: zone.frame.width - 16, height: 2)
+        }
+        return (zone.target, next?.item, marker, zone.frame)
+    }
+
+    private func renderOverviewDragFrame() {
+        overviewDragFeedbackLayer.sublayers = nil
+        overviewDragFeedbackLayer.removeAllAnimations()
+        overviewDragFeedbackLayer.frame = rootLayer.bounds
+        func outline(_ frame: CGRect, fill: Bool = false) {
+            let layer = CALayer()
+            layer.frame = overviewDragFeedbackLayer.convert(frame, from: appsScrollContentLayer)
+            layer.cornerRadius = fill ? 8 : 1
+            layer.backgroundColor = resolvedCGColor(NSColor.controlAccentColor.withAlphaComponent(fill ? 0.08 : 1))
+            overviewDragFeedbackLayer.addSublayer(layer)
+        }
+        let key: String
+        let point: CGPoint
+        let previewSize: CGSize
+        if let drag = pendingOverviewGroupDrag, drag.active,
+           let source = overviewGroupFrames.first(where: { $0.id == drag.id }) {
+            key = drag.id
+            point = drag.current
+            previewSize = CGSize(width: min(source.header.width, 280), height: 52)
+            outline(source.header, fill: true)
+            let contentPoint = appsScrollContentLayer.convert(point, from: rootLayer)
+            if let target = overviewGroupDrop(at: contentPoint, source: drag.id) { outline(target.marker) }
+            if overviewDragPreviewKey != key {
+                let preview = CALayer()
+                preview.backgroundColor = resolvedCGColor(.controlBackgroundColor)
+                preview.borderColor = resolvedCGColor(.controlAccentColor)
+                preview.borderWidth = 1
+                preview.cornerRadius = 10
+                preview.shadowOpacity = 0.18
+                preview.shadowRadius = 8
+                preview.shadowOffset = CGSize(width: 0, height: -3)
+                let text = makeTextLayer(size: 16, weight: .semibold, color: .labelColor)
+                text.string = drag.id == "user" ? overviewUsername : drag.id == "root" ? "root" : localWorkspaces.first { "container:\($0.id.uuidString.lowercased())" == drag.id }?.name ?? "Container"
+                text.frame = CGRect(x: 16, y: 14, width: previewSize.width - 32, height: 24)
+                preview.addSublayer(text)
+                overviewDragPreview = preview
+                overviewDragPreviewKey = key
+            }
+        } else if let drag = pendingAppDrag, drag.isDragging {
+            key = drag.item.identityKey
+            point = drag.currentPoint
+            previewSize = CGSize(width: 144, height: 88)
+            let contentPoint = appsScrollContentLayer.convert(point, from: rootLayer)
+            if let drop = overviewEndpointDrop(at: contentPoint, for: drag.item) {
+                outline(drop.zone, fill: true)
+                outline(drop.marker)
+            }
+            if overviewDragPreviewKey != key {
+                let preview = CALayer()
+                let icon = makeLauncherIconLayer(image: launcherIconImage(for: drag.item),
+                    symbolName: launcherIconSymbolName(for: drag.item), symbolColor: appIconTintColor(for: drag.item.backend),
+                    title: overviewTitle(for: drag.item), iconSize: 44)
+                icon.frame = CGRect(x: 50, y: 38, width: 44, height: 44)
+                preview.addSublayer(icon)
+                let text = makeTextLayer(size: 12, weight: .medium, color: .labelColor, alignment: .center)
+                text.string = overviewTitle(for: drag.item)
+                text.isWrapped = true
+                text.frame = CGRect(x: 2, y: 2, width: 140, height: 32)
+                preview.addSublayer(text)
+                overviewDragPreview = preview
+                overviewDragPreviewKey = key
+            }
+        } else {
+            overviewDragPreview?.removeFromSuperlayer()
+            overviewDragPreview = nil
+            overviewDragPreviewKey = nil
+            return
+        }
+        if let preview = overviewDragPreview {
+            overviewDragFeedbackLayer.addSublayer(preview)
+            let location = overviewDragFeedbackLayer.convert(point, from: rootLayer)
+            preview.removeAllAnimations()
+            preview.frame = CGRect(x: location.x - previewSize.width / 2, y: location.y - previewSize.height + 22,
+                                   width: previewSize.width, height: previewSize.height)
+        }
+    }
+
+    private func renderOverviewButton(_ title: String, frame: CGRect) {
+        let background = CALayer()
+        background.frame = frame
+        background.cornerRadius = 7
+        background.cornerCurve = .continuous
+        background.backgroundColor = resolvedCGColor(.controlColor)
+        background.borderWidth = 0.5
+        background.borderColor = resolvedCGColor(.separatorColor)
+        addAppsSublayer(background)
+        let text = makeTextLayer(size: 12, weight: .regular, color: .labelColor, alignment: .center)
+        text.string = title
+        text.frame = frame.insetBy(dx: 6, dy: 5)
+        addAppsSublayer(text)
+    }
+
+    private func renderOverviewEndpoint(_ item: AppLauncherItem, frame: CGRect, pinned: Bool,
+                                         separator: Bool, visibleIconKeys: inout Set<String>,
+                                         visibleTextKeys: inout Set<String>) {
+        appCardFrames.append((frame, item))
+        let title = overviewTitle(for: item)
+        let size: CGFloat = pinned ? 44 : 24
+        let iconFrame = CGRect(x: pinned ? frame.midX - size / 2 : frame.minX + 14,
+                               y: pinned ? frame.maxY - size - 8 : frame.midY - size / 2,
+                               width: size, height: size)
+        recordMatchedIcon(key: item.iconKey, frame: rootLayer.convert(iconFrame, from: activeAppsContentLayer),
+                          image: launcherIconImage(for: item), symbolName: launcherIconSymbolName(for: item),
+                          symbolColor: appIconTintColor(for: item.backend), title: title)
+        visibleIconKeys.insert(item.iconKey)
+        let isThisPage = item.backend.isBackendsSelf && item.backend.serviceScope == "user"
+        let textFrame = pinned
+            ? CGRect(x: frame.minX + 12, y: frame.minY + 8, width: frame.width - 24, height: 32)
+            : CGRect(x: iconFrame.maxX + 10, y: frame.midY - 9, width: max(frame.maxX - iconFrame.maxX - (isThisPage ? 98 : 42), 1), height: 18)
+        recordMatchedText(key: item.iconKey, frame: rootLayer.convert(textFrame, from: activeAppsContentLayer),
+                          title: title, fontSize: 13, weight: .regular,
+                          alignment: pinned ? .center : .left, isWrapped: pinned)
+        visibleTextKeys.insert(item.iconKey)
+        if endpointIsRunning(item.primaryEndpoint) {
+            let dot = CALayer()
+            dot.backgroundColor = resolvedCGColor(.systemGreen)
+            dot.cornerRadius = 2.5
+            let titleWidth = (title as NSString).size(withAttributes: [.font: NSFont.systemFont(ofSize: 13)]).width
+            let x = pinned ? max(frame.minX + 2, frame.midX - min(titleWidth, textFrame.width) / 2 - 11) : frame.minX
+            dot.frame = CGRect(x: x, y: pinned ? textFrame.maxY - 11 : frame.midY - 2.5, width: 5, height: 5)
+            addAppsSublayer(dot)
+        }
+        if !pinned {
+            let menuFrame = CGRect(x: frame.maxX - 26, y: frame.minY, width: 26, height: frame.height)
+            let menu = makeTextLayer(size: 16, weight: .medium, color: .secondaryLabelColor, alignment: .center)
+            menu.string = "⋯"
+            menu.frame = menuFrame.insetBy(dx: 0, dy: 8)
+            addAppsSublayer(menu)
+            overviewMenuFrames.append((menuFrame, item))
+            if isThisPage {
+                let note = makeTextLayer(size: 10, weight: .regular, color: .secondaryLabelColor, alignment: .right)
+                note.string = "This page"
+                note.frame = CGRect(x: menuFrame.minX - 58, y: frame.midY - 7, width: 54, height: 16)
+                addAppsSublayer(note)
+            }
+            if separator {
+                let line = CALayer()
+                line.backgroundColor = resolvedCGColor(.separatorColor)
+                line.frame = CGRect(x: frame.minX, y: frame.maxY, width: frame.width, height: 0.5)
+                addAppsSublayer(line)
+            }
+        }
+    }
+
+    private func overviewKey(for item: AppLauncherItem) -> String {
+        func json(_ values: [Any]) -> String {
+            guard let data = try? JSONSerialization.data(withJSONObject: values, options: [.fragmentsAllowed, .withoutEscapingSlashes]),
+                  let value = String(data: data, encoding: .utf8) else { return "" }
+            return value
+        }
+        if let context = item.containerContext {
+            let app = context.app
+            return json(["container", context.container.id.uuidString.lowercased(), app.serviceID,
+                         json([app.frontendID, app.socketPath, app.url, 0])])
+        }
+        return json(["host", item.backend.serviceScope, item.backend.serviceID,
+                     item.frontend.id.isEmpty ? (frontendNavigationURL(item.frontend)?.absoluteString ?? item.frontend.url) : item.frontend.id])
+    }
+
+    private func overviewOrderedItems(_ items: [AppLauncherItem], group: String, pinned: Bool) -> [AppLauncherItem] {
+        let order = (pinned ? overviewLayout.pins[group] : overviewLayout.order[group]) ?? []
+        return items.sorted {
+            let left = order.firstIndex(of: overviewKey(for: $0)) ?? Int.max
+            let right = order.firstIndex(of: overviewKey(for: $1)) ?? Int.max
+            return left == right ? overviewTitle(for: $0).localizedStandardCompare(overviewTitle(for: $1)) == .orderedAscending : left < right
+        }
+    }
+
+    private func loadOverviewLayout() {
+        guard !overviewLayoutRequestPending, !overviewLayoutSaving, let urlSession,
+              let base = outerframeHost.pluginBaseURL(),
+              let url = URL(string: "/api/layout", relativeTo: base)?.absoluteURL else { return }
+        overviewLayoutRequestPending = true
+        urlSession.dataTask(with: url) { [weak self] data, response, error in
+            Task { @MainActor in
+                guard let self else { return }
+                self.overviewLayoutRequestPending = false
+                do {
+                    if let error { throw error }
+                    guard (response as? HTTPURLResponse)?.statusCode == 200, let data else { throw URLError(.badServerResponse) }
+                    let (layout, revision) = try OverviewLayout.decode(data)
+                    guard !self.overviewLayoutSaving,
+                          !self.overviewLayoutReady || revision > self.overviewLayoutRevision else { return }
+                    self.overviewLayout = layout
+                    self.overviewLayoutRevision = revision
+                    self.overviewLayoutReady = true
+                    self.scheduleLayoutUpdate()
+                } catch {
+                    self.backendError = "Could not load the layout: \(error.localizedDescription)"
+                    self.scheduleLayoutUpdate()
+                }
+            }
+        }.resume()
+    }
+
+    private func saveOverviewLayout(_ layout: OverviewLayout) {
+        guard overviewLayoutReady, !overviewLayoutSaving, let urlSession,
+              let base = outerframeHost.pluginBaseURL(),
+              let url = URL(string: "/api/layout", relativeTo: base)?.absoluteURL else { return }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
+        do { request.httpBody = try layout.encode(revision: overviewLayoutRevision) }
+        catch {
+            backendError = "Could not save the layout: \(error.localizedDescription)"
+            updateLayout()
+            return
+        }
+        let previous = overviewLayout
+        overviewLayout = layout
+        overviewLayoutSaving = true
+        updateLayout()
+        urlSession.dataTask(with: request) { [weak self] data, response, error in
+            Task { @MainActor in
+                guard let self else { return }
+                self.overviewLayoutSaving = false
+                do {
+                    if let error { throw error }
+                    let status = (response as? HTTPURLResponse)?.statusCode
+                    guard status == 200, let data else { throw URLError(.badServerResponse) }
+                    let (saved, revision) = try OverviewLayout.decode(data)
+                    self.overviewLayout = saved
+                    self.overviewLayoutRevision = revision
+                } catch {
+                    self.overviewLayout = previous
+                    self.backendError = (response as? HTTPURLResponse)?.statusCode == 409
+                        ? "The layout changed in another window. Try again after it reloads."
+                        : "Could not save the layout: \(error.localizedDescription)"
+                    self.loadOverviewLayout()
+                }
+                self.updateLayout()
+            }
+        }.resume()
+    }
+
+    private func moveOverviewItem(_ item: AppLauncherItem, pinned: Bool, before: AppLauncherItem? = nil) {
+        let group = overviewGroupID(for: item)
+        let items = item.containerContext.map { appLauncherItems(in: $0.container) } ?? appLauncherItems().filter { overviewGroupID(for: $0) == group }
+        let key = overviewKey(for: item)
+        var pins = overviewOrderedItems(items.filter(isAppProminent), group: group, pinned: true).map(overviewKey).filter { $0 != key }
+        var list = overviewOrderedItems(items.filter { !isAppProminent($0) }, group: group, pinned: false).map(overviewKey).filter { $0 != key }
+        let beforeKey = before.map(overviewKey)
+        if pinned { pins.insert(key, at: beforeKey.flatMap { pins.firstIndex(of: $0) } ?? pins.count) }
+        else { list.insert(key, at: beforeKey.flatMap { list.firstIndex(of: $0) } ?? list.count) }
+        var layout = overviewLayout
+        layout.pins[group] = pins
+        layout.order[group] = list
+        saveOverviewLayout(layout)
+    }
+
     private func renderWorkspaceOverview(area: CGRect,
                                          top: CGFloat,
                                          forceSingleColumn: Bool,
@@ -5124,12 +5638,12 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         } else if operation == "editContainer" {
             navigateToRecipeSafeSpace(workspace.id, pushHistory: true)
         } else if operation == "copyShell" {
-            copyWorkspaceShellCommand(workspace, at: point)
+            showWorkspaceShellCommandMenu(workspace, at: point)
         } else if operation.hasPrefix("copyCommand:"),
                   let command = workspace.commandLaunchers.first(where: {
                       $0.id == String(operation.dropFirst("copyCommand:".count))
                   }) {
-            copyWorkspaceCommand(command, in: workspace, at: point)
+            showWorkspaceCommandMenu(command, in: workspace, at: point)
         } else if operation.hasPrefix("unmountFolder:") {
             let identifier = String(operation.dropFirst("unmountFolder:".count))
             guard let mountID = UUID(uuidString: identifier) else { return }
@@ -5149,20 +5663,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func isAppProminent(_ item: AppLauncherItem) -> Bool {
-        if item.frontend.listName == alwaysShownAppListName {
-            return true
+        if let keys = overviewLayout.pins[overviewGroupID(for: item)] {
+            return keys.contains(overviewKey(for: item))
         }
-        if item.frontend.listName == moreAppsListName {
-            return false
-        }
-        let serviceID = item.backend.serviceID.lowercased()
-        let name = item.displayName.lowercased()
-        switch item.scope {
-        case .server:
-            return serviceID == "org.outershell.top" || name == "top"
-        case .container:
-            return true
-        }
+        return ["org.outershell.files", "org.outershell.top"].contains(item.backend.serviceID.lowercased())
     }
 
     private func appOverflowHeight(itemCount: Int,
@@ -5580,7 +6084,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             workspace: workspace,
             keySuffix: "command:\(command.id)",
             title: command.displayName,
-            image: command.iconData.flatMap(decodedIconCGImage),
+            image: command.iconURL.flatMap { endpointIcons[$0] } ?? command.iconData.flatMap(decodedIconCGImage),
             symbolName: "apple.terminal",
             operation: "copyCommand:\(command.id)",
             frame: frame,
@@ -5602,8 +6106,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         visibleIconKeys: inout Set<String>,
         visibleTextKeys: inout Set<String>
     ) {
-        let iconSize: CGFloat = 26
-        let rowInset: CGFloat = 10
+        let iconSize: CGFloat = 24
+        let rowInset: CGFloat = 14
         let key = "container:\(workspace.id.uuidString):\(keySuffix)"
 
         if showsSeparator {
@@ -5635,21 +6139,27 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         visibleIconKeys.insert(key)
 
         let textFrame = CGRect(
-            x: iconFrame.maxX + 12,
-            y: frame.midY - 10,
-            width: max(frame.maxX - iconFrame.maxX - 28, 1),
-            height: 20
+            x: iconFrame.maxX + 10,
+            y: frame.midY - 9,
+            width: max(frame.maxX - iconFrame.maxX - 42, 1),
+            height: 18
         )
         recordMatchedText(
             key: key,
             frame: rootLayer.convert(textFrame, from: activeAppsContentLayer),
             title: title,
             fontSize: 13,
-            weight: .medium,
+            weight: .regular,
             alignment: .left,
             isWrapped: false
         )
         visibleTextKeys.insert(key)
+        let copy = CALayer()
+        copy.frame = CGRect(x: frame.maxX - 20, y: frame.midY - 7, width: 14, height: 14)
+        copy.contentsGravity = .resizeAspect
+        copy.contents = symbolCGImage(named: "doc.on.doc", pointSize: 14)
+        copy.opacity = 0.65
+        addAppsSublayer(copy)
         workspaceOverviewActionFrames.append((frame, workspace, operation))
     }
 
@@ -6477,6 +6987,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func appDropTarget(at appsPoint: CGPoint, for item: AppLauncherItem) -> AppDropTarget? {
+        if let frame = overviewDropFrames.first(where: {
+            $0.group == overviewGroupID(for: item) && $0.frame.contains(appsPoint)
+        }) { return frame.target }
         if let frame = appListDropFrames.first(where: {
             $0.scope == item.scope && $0.frame.contains(appsPoint)
         }) {
@@ -6493,9 +7006,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private func appItem(_ item: AppLauncherItem, isIn target: AppDropTarget) -> Bool {
         switch target {
         case .pinned:
-            return isAppUnlisted(item) && isAppProminent(item)
+            return isAppProminent(item)
         case .moreApps:
-            return isAppUnlisted(item) && !isAppProminent(item)
+            return !isAppProminent(item)
         case .list(let name):
             return item.frontend.listName == name
         }
@@ -6591,6 +7104,26 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func symbolAppIconCGImage(named symbolName: String, color: NSColor = .controlAccentColor) -> CGImage? {
+        var cacheURL: URL?
+        if symbolName == "apple.terminal", let rgb = resolvedColor(color).usingColorSpace(.sRGB) {
+            var components = URLComponents()
+            components.scheme = "outershell-symbol"
+            components.host = "local"
+            components.path = "/terminal-96-v1"
+            components.queryItems = [
+                URLQueryItem(name: "os", value: ProcessInfo.processInfo.operatingSystemVersionString),
+                URLQueryItem(name: "appearance", value: appearance?.name.rawValue ?? NSAppearance.currentDrawing().name.rawValue),
+                URLQueryItem(name: "color", value: "\(rgb.redComponent),\(rgb.greenComponent),\(rgb.blueComponent),\(rgb.alphaComponent)")
+            ]
+            cacheURL = components.url
+            if let cacheURL {
+                if let cached = terminalSymbolImages[cacheURL] { return cached }
+                if let cached = endpointIconDiskCache?.image(for: cacheURL) {
+                    terminalSymbolImages[cacheURL] = cached
+                    return cached
+                }
+            }
+        }
         let imageSize: CGFloat = 96
         let image = NSImage(size: NSSize(width: imageSize, height: imageSize))
         image.lockFocus()
@@ -6609,7 +7142,20 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             }
         }
         image.unlockFocus()
-        return cgImage(for: image)
+        guard let rendered = cgImage(for: image) else { return nil }
+        if let cacheURL {
+            let encoded = NSMutableData()
+            if let destination = CGImageDestinationCreateWithData(encoded, "public.png" as CFString, 1, nil) {
+                CGImageDestinationAddImage(destination, rendered, nil)
+                if CGImageDestinationFinalize(destination),
+                   let cached = endpointIconDiskCache?.storeImage(encoded as Data, for: cacheURL) {
+                    terminalSymbolImages[cacheURL] = cached
+                    return cached
+                }
+            }
+            terminalSymbolImages[cacheURL] = rendered
+        }
+        return rendered
     }
 
     private func iconCornerRadius(for iconSize: CGFloat) -> CGFloat {
@@ -8489,7 +9035,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             nodes.append(accessibilityNode(nextIdentifier: &nextIdentifier,
                                            role: .button,
                                            frame: frame,
-                                           label: "Open \(card.item.displayName)",
+                                           label: "Open \(overviewTitle(for: card.item))",
                                            value: status,
                                            hint: card.item.subtitle))
         }
@@ -8504,6 +9050,25 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                            value: "Running"))
         }
 
+        for target in overviewMenuFrames {
+            if let frame = accessibilityFrame(target.frame, from: appsScrollContentLayer, clippedBy: clipFrame) {
+                nodes.append(accessibilityNode(nextIdentifier: &nextIdentifier, role: .button, frame: frame, label: "Actions for \(overviewTitle(for: target.item))"))
+            }
+        }
+        for target in overviewAddFrames {
+            if let frame = accessibilityFrame(target, from: appsScrollContentLayer, clippedBy: clipFrame) {
+                nodes.append(accessibilityNode(nextIdentifier: &nextIdentifier, role: .button, frame: frame, label: "Add more…"))
+            }
+        }
+        for target in workspaceOverviewActionFrames {
+            if let frame = accessibilityFrame(target.frame, from: appsScrollContentLayer, clippedBy: clipFrame) {
+                let label = target.operation == "menu" ? "Manage \(target.workspace.name)" : target.operation == "editContainer" ? "Edit \(target.workspace.name)" : "Copy command"
+                nodes.append(accessibilityNode(nextIdentifier: &nextIdentifier, role: .button, frame: frame, label: label))
+            }
+        }
+        if let frame = accessibilityFrame(workspaceOverviewCreateFrame, from: appsScrollContentLayer, clippedBy: clipFrame) {
+            nodes.append(accessibilityNode(nextIdentifier: &nextIdentifier, role: .button, frame: frame, label: "Add container…"))
+        }
         if let frame = accessibilityFrame(addAppFrame, from: appsScrollContentLayer, clippedBy: clipFrame) {
             nodes.append(accessibilityNode(nextIdentifier: &nextIdentifier,
                                            role: .button,
@@ -9004,6 +9569,14 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                     self.lastBackendsResponseData = data
                     self.backendError = response.error
                     self.backends = response.backends
+                    self.fetchEndpointIcons()
+                    if self.overviewUsername == "Your user",
+                       let path = self.backends.first(where: { $0.serviceScope == "user" && $0.serviceUnitPath != nil })?.serviceUnitPath {
+                        let components = path.split(separator: "/")
+                        if components.count > 1 && ["home", "Users"].contains(String(components[0])) {
+                            self.overviewUsername = String(components[1])
+                        }
+                    }
                     if self.selectedContainerLogContext == nil,
                        let selectedServiceID = self.selectedServiceID,
                        !self.backends.contains(where: { $0.serviceID == selectedServiceID }) {
@@ -9449,7 +10022,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                       iconCGImage: frontend.iconCGImage,
                                       iconObservationToken: frontend.iconObservationToken,
                                       list: listName.isEmpty ? nil : listName,
-                                      isRunning: frontend.isRunning)
+                                      isRunning: frontend.isRunning,
+                                      iconURL: frontend.iconURL)
             }
             return BackendRecord(serviceID: backend.serviceID,
                                  displayName: backend.displayName,
@@ -9679,7 +10253,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
     private func workspaceAppNavigationURL(_ targetURL: URL,
                                            app: LocalWorkspaceAppRecord) -> URL {
-        if let iconData = app.iconData, !iconData.isEmpty {
+        if app.iconURL != nil || app.iconData?.isEmpty == false {
             return targetURL
         }
         guard !app.iconObservationToken.isEmpty else {
@@ -9871,7 +10445,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func plaintextEndpoint(for serviceScope: String) -> AppLauncherEndpoint? {
-        guard let item = appLauncherItems(from: backends).first(where: { $0.backend.serviceID == "org.outershell.Plaintext" }) else {
+        guard let item = appLauncherItems(from: backends).first(where: { $0.backend.serviceID == "org.outershell.Plaintext" && $0.backend.serviceScope == serviceScope }) else {
             return nil
         }
         if serviceScope == "system" {
@@ -9928,11 +10502,11 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
     private func performAppMenuAction(_ item: AppLauncherItem, operation: String) {
         if operation == "alwaysShow" {
-            setFrontendList(for: item, listName: alwaysShownAppListName)
+            moveOverviewItem(item, pinned: true)
             return
         }
         if operation == "moveToMoreApps" {
-            setFrontendList(for: item, listName: moreAppsListName)
+            moveOverviewItem(item, pinned: false)
             return
         }
         if let context = item.containerContext {
@@ -12695,6 +13269,14 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
     private func handleMouseDragged(to point: CGPoint, modifierFlags: NSEvent.ModifierFlags) {
         _ = modifierFlags
+        if var drag = pendingOverviewGroupDrag {
+            drag.current = point
+            if hypot(point.x - drag.start.x, point.y - drag.start.y) > 5 { drag.active = true }
+            pendingOverviewGroupDrag = drag
+            if drag.active { setCursorIfNeeded(.closedHand) }
+            scheduleOverviewDragFrame()
+            return
+        }
         if pendingSharedContainerDrag {
             pendingSharedContainerDrag = false
             beginDraggingSharedContainer()
@@ -12735,7 +13317,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             }
             self.pendingAppDrag = pendingAppDrag
             if pendingAppDrag.isDragging {
-                updateLayout()
+                scheduleOverviewDragFrame()
             }
             return
         }
@@ -12829,6 +13411,24 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func handleMouseUp(at point: CGPoint, modifierFlags: NSEvent.ModifierFlags) {
+        if let drag = pendingOverviewGroupDrag {
+            pendingOverviewGroupDrag = nil
+            let targetPoint = appsScrollContentLayer.convert(point, from: rootLayer)
+            if drag.active, let target = overviewGroupDrop(at: targetPoint, source: drag.id) {
+                var layout = overviewLayout
+                var groups = overviewGroupFrames.map(\.id).filter { $0 != drag.id }
+                if let destination = groups.firstIndex(of: target.id) {
+                    groups.insert(drag.id, at: destination + (target.after ? 1 : 0))
+                    if groups != overviewGroupFrames.map(\.id) {
+                        layout.groups = groups
+                        saveOverviewLayout(layout)
+                    }
+                }
+            }
+            setCursorIfNeeded(.arrow)
+            updateLayout()
+            return
+        }
         statusDragAnchorOffset = nil
         aboutDragAnchorOffset = nil
         logDragAnchorOffset = nil
@@ -12865,9 +13465,15 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             if pendingAppDrag.isDragging {
                 let contentPoint = contentLayer.convert(point, from: rootLayer)
                 let appsPoint = appsContentPoint(for: contentPoint)
-                if let target = appDropTarget(at: appsPoint, for: pendingAppDrag.item),
-                   !appItem(pendingAppDrag.item, isIn: target) {
-                    setFrontendList(for: pendingAppDrag.item, listName: target.listName)
+                if let drop = overviewEndpointDrop(at: appsPoint, for: pendingAppDrag.item) {
+                    moveOverviewItem(pendingAppDrag.item, pinned: drop.target == .pinned, before: drop.before)
+                } else if let target = appDropTarget(at: appsPoint, for: pendingAppDrag.item) {
+                    let before = appCardFrames.first {
+                        $0.item.identityKey != pendingAppDrag.item.identityKey &&
+                        overviewGroupID(for: $0.item) == overviewGroupID(for: pendingAppDrag.item) &&
+                        $0.frame.contains(appsPoint)
+                    }?.item
+                    moveOverviewItem(pendingAppDrag.item, pinned: target == .pinned, before: before)
                 } else {
                     updateLayout()
                 }
@@ -13059,6 +13665,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                             safeSpaceDetailCopyRecipeMessageFrame.contains(appsPoint) ||
                             safeSpaceDetailEditStepFrames.contains { $0.frame.contains(appsPoint) } ||
                             safeSpaceDetailStepFrames.contains { $0.frame.contains(appsPoint) } ||
+                            overviewAddFrames.contains { $0.contains(appsPoint) } ||
                             addAppFrame.contains(appsPoint) ||
                             outerShellActionFrame.contains(toolbarPoint)
         }
@@ -14153,6 +14760,17 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 }
                 return
             }
+            if let menu = overviewMenuFrames.first(where: { $0.frame.contains(appsPoint) }) {
+                armButtonClick(frame: rootFrame(menu.frame, from: appsScrollContentLayer),
+                               performAtPoint: { [weak self] point in
+                    self?.showAppActionsMenu(for: menu.item, at: point)
+                })
+                return
+            }
+            if let frame = overviewAddFrames.first(where: { $0.contains(appsPoint) }) {
+                armButtonClick(frame: rootFrame(frame, from: appsScrollContentLayer), action: .addApp)
+                return
+            }
             if workspaceOverviewCreateFrame.contains(appsPoint) {
                 armButtonClick(frame: rootFrame(workspaceOverviewCreateFrame,
                                                 from: workspaceOverviewContentLayer),
@@ -14171,6 +14789,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                                          workspace: action.workspace,
                                                          at: releasePoint)
                 })
+                return
+            }
+            if let group = overviewGroupFrames.first(where: { $0.header.contains(appsPoint) }) {
+                pendingOverviewGroupDrag = (group.id, point, point, false)
                 return
             }
             if let target = workspaceOverviewAppFrames.first(where: {
@@ -15096,7 +15718,40 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         appIconSymbolName(for: item.backend)
     }
 
+    private func fetchEndpointIcons() {
+        guard let iconSession, let base = outerframeHost.pluginBaseURL() else { return }
+        let paths = backends.flatMap { $0.frontends.compactMap(\.iconURL) } +
+            localWorkspaces.flatMap { $0.apps.compactMap(\.iconURL) + $0.commandLaunchers.compactMap(\.iconURL) }
+        for path in Set(paths) where endpointIcons[path] == nil && !pendingIconURLs.contains(path) {
+            guard let url = URL(string: path, relativeTo: base)?.absoluteURL else { continue }
+            let diskCache = endpointIconDiskCache
+            if let image = diskCache?.image(for: url) {
+                endpointIcons[path] = image
+                continue
+            }
+            pendingIconURLs.insert(path)
+            iconSession.dataTask(with: url) { [weak self] data, response, error in
+                let image: CGImage?
+                if error == nil, (response as? HTTPURLResponse)?.statusCode == 200, let data {
+                    image = diskCache.map { $0.storeImage(data, for: url) } ?? decodedIconCGImage(data)
+                } else {
+                    image = nil
+                }
+                Task { @MainActor in
+                    guard let self else { return }
+                    self.pendingIconURLs.remove(path)
+                    if let image {
+                        self.endpointIcons[path] = image
+                        self.scheduleLayoutUpdate()
+                    }
+                }
+            }.resume()
+        }
+    }
+
     private func launcherIconImage(for item: AppLauncherItem) -> CGImage? {
+        if let path = item.containerContext?.app.iconURL ?? item.frontend.iconURL,
+           let image = endpointIcons[path] { return image }
         if let image = item.iconCGImage {
             return image
         }
@@ -15301,63 +15956,19 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func appLauncherItems(from records: [BackendRecord]) -> [AppLauncherItem] {
-        let endpoints = records.flatMap { backend -> [AppLauncherEndpoint] in
-            guard !backend.isBackendsSelf else { return [] }
-            return backend.frontends.enumerated().compactMap { index, frontend in
-                return AppLauncherEndpoint(backend: backend, frontend: frontend, frontendIndex: index)
+        records.flatMap { backend in
+            backend.frontends.enumerated().map { index, frontend in
+                let endpoint = AppLauncherEndpoint(backend: backend, frontend: frontend, frontendIndex: index)
+                return AppLauncherItem(
+                    identityKey: frontendIdentityKey(backend: backend, frontend: frontend, frontendIndex: index),
+                    primaryEndpoint: endpoint,
+                    userEndpoint: backend.serviceScope == "system" ? nil : endpoint,
+                    rootEndpoint: backend.serviceScope == "system" ? endpoint : nil,
+                    scope: .server,
+                    containerContext: nil
+                )
             }
-        }
-
-        let grouped = Dictionary(grouping: endpoints) { endpoint in
-            appLauncherGroupingKey(backend: endpoint.backend, frontend: endpoint.frontend)
-        }
-        return grouped.map { key, endpoints in
-            let sorted = endpoints.sorted { lhs, rhs in
-                if lhs.backend.serviceScope == "system", rhs.backend.serviceScope != "system" { return false }
-                if lhs.backend.serviceScope != "system", rhs.backend.serviceScope == "system" { return true }
-                return frontendIdentityKey(backend: lhs.backend, frontend: lhs.frontend, frontendIndex: lhs.frontendIndex)
-                    .localizedStandardCompare(frontendIdentityKey(backend: rhs.backend, frontend: rhs.frontend, frontendIndex: rhs.frontendIndex)) == .orderedAscending
-            }
-            let userEndpoint = sorted.first { $0.backend.serviceScope != "system" }
-            let rootEndpoint = sorted.first { $0.backend.serviceScope == "system" }
-            let runningUserEndpoint = userEndpoint.flatMap { endpointIsRunning($0) ? $0 : nil }
-            let runningEndpoint = sorted.first { endpointIsRunning($0) }
-            let readyUserEndpoint = userEndpoint.flatMap { endpointIsReadyToOpen($0) ? $0 : nil }
-            let readyEndpoint = sorted.first { endpointIsReadyToOpen($0) }
-            let primaryEndpoint = runningUserEndpoint ?? runningEndpoint ?? readyUserEndpoint ?? readyEndpoint ?? userEndpoint ?? rootEndpoint ?? sorted[0]
-            return AppLauncherItem(identityKey: key,
-                                   primaryEndpoint: primaryEndpoint,
-                                   userEndpoint: userEndpoint,
-                                   rootEndpoint: rootEndpoint,
-                                   scope: .server,
-                                   containerContext: nil)
-        }
-        .sorted { $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending }
-    }
-
-    private func appLauncherGroupingKey(backend: BackendRecord, frontend: FrontendRecord) -> String {
-        let frontendName = frontend.name.trimmingCharacters(in: .whitespacesAndNewlines)
-        let displayName = frontendName.isEmpty ? backend.displayName.trimmingCharacters(in: .whitespacesAndNewlines) : frontendName
-        let endpointPath: String
-        if backend.isBundled ?? false {
-            endpointPath = pathAndQuery(fromFrontendURL: frontend.url, socketPath: frontend.socketPath)
-        } else if !frontend.id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            endpointPath = frontend.id
-        } else if !frontend.socketPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            endpointPath = pathAndQuery(fromFrontendURL: frontend.url, socketPath: frontend.socketPath)
-        } else if frontend.port > 0 {
-            endpointPath = pathAndQuery(fromFrontendURL: frontend.url, socketPath: nil)
-        } else if let parsed = URL(string: frontend.url), parsed.scheme != nil {
-            endpointPath = normalizedPathAndQuery((parsed.path.isEmpty ? "/" : parsed.path) + (parsed.query.map { "?\($0)" } ?? ""))
-        } else {
-            endpointPath = normalizedPathAndQuery(frontend.url)
-        }
-        return [
-            "app",
-            backend.serviceID,
-            displayName,
-            endpointPath
-        ].joined(separator: "\u{1f}")
+        }.sorted { $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending }
     }
 
     private func appLauncherSignature(for backends: [BackendRecord]) -> String {
@@ -15379,6 +15990,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 item.frontend.iconPath ?? "",
                 String(iconBytes),
                 item.frontend.iconObservationToken,
+                item.frontend.iconURL ?? "",
                 item.frontend.listName,
                 item.userEndpoint.map { frontendIdentityKey(backend: $0.backend, frontend: $0.frontend, frontendIndex: $0.frontendIndex) } ?? "",
                 item.userEndpoint?.backend.status ?? "",
@@ -15628,7 +16240,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                       dockerfile: String? = nil,
                                       mounts: [ContainerConfigurationMountRequest]? = nil,
                                       environment: [ContainerConfigurationEnvironmentRequest]? = nil,
-                                      publishedPorts: [ContainerConfigurationPublishedPortRequest]? = nil) {
+                                      publishedPorts: [ContainerConfigurationPublishedPortRequest]? = nil,
+                                      includeDetails: Bool = false) {
         if operation == "list" {
             guard !isRefreshingWorkspaces else { return }
         } else if operation != "create" {
@@ -15758,10 +16371,17 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             updateLayout()
             return
         }
-        var urlRequest = URLRequest(url: safeSpacesEndpoint)
-        urlRequest.httpMethod = "POST"
-        urlRequest.httpBody = payload
-        urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        let usesSnapshot = operation == "list" && !includeDetails &&
+            !isShowingWorkspacePanel && selectedRecipeSafeSpaceID == nil
+        let endpoint = usesSnapshot
+            ? safeSpacesEndpoint.deletingLastPathComponent().appendingPathComponent("container-snapshot")
+            : safeSpacesEndpoint
+        var urlRequest = URLRequest(url: endpoint)
+        if !usesSnapshot {
+            urlRequest.httpMethod = "POST"
+            urlRequest.httpBody = payload
+            urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        }
         operationSession.dataTask(with: urlRequest) { [weak self] data, response, error in
             Task { @MainActor [weak self] in
                 guard let self else { return }
@@ -15795,21 +16415,23 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                     } else {
                         self.workspacePanelMessage = message
                     }
-                    self.updateLayout()
+                    self.scheduleLayoutUpdate()
                     return
                 }
-                self.handleWorkspaceResponse(data)
+                self.handleWorkspaceResponse(data, requestID: requestID, fromSnapshot: usesSnapshot)
             }
         }.resume()
         if operation == "rebuildRecipe" || operation == "changeRuntime" {
             scheduleContainerBuildProgressRefresh()
         }
-        updateLayout()
+        if operation != "list" {
+            scheduleLayoutUpdate()
+        }
     }
 
-    private func handleWorkspaceResponse(_ payload: Data) {
-        guard let response = try? JSONDecoder().decode(LocalWorkspaceHostResponse.self,
-                                                       from: payload) else {
+    private func handleWorkspaceResponse(_ payload: Data, requestID: UUID? = nil, fromSnapshot: Bool = false) {
+        guard let response = try? LocalWorkspaceHostResponse.decode(payload,
+            snapshotRequestID: fromSnapshot ? requestID : nil) else {
             if pendingWorkspaceOperations.values.contains("rebuildRecipe") ||
                 pendingWorkspaceOperations.values.contains("changeRuntime") {
                 containerConfigurationRebuildWorkspaceID = nil
@@ -15817,18 +16439,21 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             isPerformingWorkspaceOperation = false
             isRefreshingWorkspaces = false
             workspacePanelMessage = "Outer Shell returned an invalid container response."
-            updateLayout()
+            scheduleLayoutUpdate()
             return
         }
-        let operation = pendingWorkspaceOperations.removeValue(forKey: response.requestID)
+        let effectiveRequestID = requestID ?? response.requestID
+        let operation = pendingWorkspaceOperations.removeValue(forKey: effectiveRequestID)
         let operationWorkspaceID = pendingWorkspaceOperationWorkspaceIDs.removeValue(
-            forKey: response.requestID
+            forKey: effectiveRequestID
         )
+        if operation == "list" { isRefreshingWorkspaces = false }
         let workspacesChanged = localWorkspaces != response.workspaces
         let previousOverviewAvailability = workspaceOverviewAvailable
         let previousPanelMessage = workspacePanelMessage
         if response.error == nil || !response.workspaces.isEmpty {
             localWorkspaces = response.workspaces
+            fetchEndpointIcons()
         }
         if let pendingID = pendingDockerfileWorkspace?.id,
            let updatedWorkspace = localWorkspaces.first(where: { $0.id == pendingID }) {
@@ -15842,7 +16467,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                   let workspace = localWorkspaces.first(where: {
                       $0.id == selectedRecipeSafeSpaceID
                   }) {
-            beginContainerConfigurationEditor(for: workspace)
+            if workspace.recipe != nil || fromSnapshot {
+                beginContainerConfigurationEditor(for: workspace)
+            }
         }
         if let providers = response.providers {
             availableSafeSpaceProviders = providers
@@ -15853,9 +16480,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             selectedContainerLogContext = ContainerAppLauncherContext(container: container, app: app)
         }
         workspaceOverviewAvailable = workspaceContextID == nil
-        if operation == "list" {
-            isRefreshingWorkspaces = false
-        } else if operation != "create" {
+        if operation != "list", operation != "create" {
             isPerformingWorkspaceOperation = false
         }
         var shouldDismissContainerConfiguration = false
@@ -15912,12 +16537,11 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             } else {
                 logError = "Outer Shell returned no container app logs."
             }
-            updateLayout()
-            scheduleWorkspaceRefresh()
+            scheduleLayoutUpdate()
             return
         }
         if operation == "create" {
-            pendingWorkspaceCreationNames.removeValue(forKey: response.requestID)
+            pendingWorkspaceCreationNames.removeValue(forKey: effectiveRequestID)
             addWorkspaceMessage = response.error ?? ""
         } else if operation == "chooseFolder" {
             if let error = response.error, !error.isEmpty {
@@ -16030,7 +16654,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             workspacesChanged ||
             previousOverviewAvailability != workspaceOverviewAvailable ||
             previousPanelMessage != workspacePanelMessage {
-            updateLayout()
+            scheduleLayoutUpdate()
         }
         if operation == "list", selectedContainerLogContext != nil {
             DispatchQueue.main.async { [weak self] in
@@ -16039,7 +16663,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         }
         updateContainerBuildMonitoring(operation: operation, responseError: response.error)
         scheduleContainerBuildProgressRefresh()
-        scheduleWorkspaceRefresh()
     }
 
     private func scheduleContainerBuildProgressRefresh() {
@@ -16926,7 +17549,11 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private func beginContainerConfigurationEditor(
         for workspace: LocalWorkspaceRecord
     ) {
-        guard let recipe = workspace.recipe else { return }
+        guard let recipe = workspace.recipe else {
+            selectedRecipeSafeSpaceID = workspace.id
+            sendWorkspaceRequest(operation: "list", includeDetails: true)
+            return
+        }
         workspaceNamePromptDismissesPanel = true
         isShowingWorkspacePanel = true
         isCreatingWorkspace = false
@@ -20514,6 +21141,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                         : "play.fill")
         )
         if workspace.isManagedContainer {
+            operations["editContainer"] = "editContainer"
+            items.append(OuterframeContextMenuItem(id: "editContainer", title: "Edit Container…", isEnabled: !isPerformingWorkspaceOperation, systemImageName: "square.and.pencil"))
             operations["share"] = "share"
             items.append(
                 OuterframeContextMenuItem(id: "share",
@@ -20598,6 +21227,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func showAppActionsMenu(for item: AppLauncherItem, at point: CGPoint) {
+        if item.backend.isBackendsSelf {
+            showBackendActionsMenu(for: item.backend, at: point)
+            return
+        }
         let menuID = UUID()
         if let context = item.containerContext {
             var operations = [
@@ -20645,21 +21278,20 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                                    title: "Show Logs",
                                                    isEnabled: true,
                                                    systemImageName: "doc.plaintext"))
-            if isAppUnlisted(item) {
-                items.append(OuterframeContextMenuItem(id: "visibility-separator",
-                                                       title: "",
-                                                       kind: .separator,
-                                                       isEnabled: false))
-                let isProminent = isAppProminent(item)
-                let visibilityItemID = isProminent ? "move-to-more-apps" : "always-show"
-                operations[visibilityItemID] = isProminent ? "moveToMoreApps" : "alwaysShow"
-                items.append(OuterframeContextMenuItem(
-                    id: visibilityItemID,
-                    title: isProminent ? "Move to “More Apps”" : "Always Show",
-                    isEnabled: true,
-                    systemImageName: isProminent ? "ellipsis" : "pin"
-                ))
-            }
+            items.append(OuterframeContextMenuItem(id: "visibility-separator",
+                                                   title: "",
+                                                   kind: .separator,
+                                                   isEnabled: false))
+            let isProminent = isAppProminent(item)
+            let visibilityItemID = isProminent ? "move-to-more-apps" : "always-show"
+            operations[visibilityItemID] = isProminent ? "moveToMoreApps" : "alwaysShow"
+            items.append(OuterframeContextMenuItem(
+                id: visibilityItemID,
+                title: isProminent ? "Unpin" : "Pin to Top",
+                isEnabled: true,
+                systemImageName: isProminent ? "ellipsis" : "pin"
+            ))
+
             pendingAppMenuActions[menuID] = (item, operations)
             outerframeHost.showContextMenu(menuID: menuID, items: items, at: point)
             return
@@ -20795,18 +21427,16 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
         appendScriptItems()
 
-        if isAppUnlisted(item) {
-            appendSeparatorIfNeeded()
-            let isProminent = isAppProminent(item)
-            let visibilityItemID = isProminent ? "move-to-more-apps" : "always-show"
-            operationByItemID[visibilityItemID] = isProminent ? "moveToMoreApps" : "alwaysShow"
-            items.append(OuterframeContextMenuItem(
-                id: visibilityItemID,
-                title: isProminent ? "Move to “More Apps”" : "Always Show",
-                isEnabled: true,
-                systemImageName: isProminent ? "ellipsis" : "pin"
-            ))
-        }
+        appendSeparatorIfNeeded()
+        let isProminent = isAppProminent(item)
+        let visibilityItemID = isProminent ? "move-to-more-apps" : "always-show"
+        operationByItemID[visibilityItemID] = isProminent ? "moveToMoreApps" : "alwaysShow"
+        items.append(OuterframeContextMenuItem(
+            id: visibilityItemID,
+            title: isProminent ? "Unpin" : "Pin to Top",
+            isEnabled: true,
+            systemImageName: isProminent ? "ellipsis" : "pin"
+        ))
 
         let management = backendManagementMenuItems(for: item.backend, includePlaceholderRunActions: false)
         var managementOperationByItemID = management.operationByItemID
@@ -20917,6 +21547,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             switch operation {
             case "delete":
                 showWorkspaceDeletionConfirmation(action.workspace)
+            case "editContainer":
+                navigateToRecipeSafeSpace(action.workspace.id, pushHistory: true)
             case "share":
                 showShareContainerOptions(for: action.workspace, at: action.anchor)
             case let value where value.hasPrefix("unmountFolder:"):
@@ -20985,7 +21617,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             socketPathOverride: socketPathOverride
         ) else { return nil }
         let token = endpoint.frontend.iconObservationToken
-        guard endpoint.frontend.iconCGImage == nil,
+        guard endpoint.frontend.iconCGImage == nil, endpoint.frontend.iconURL == nil,
               !token.isEmpty,
               let backendsEndpoint,
               var callbackComponents = URLComponents(url: backendsEndpoint, resolvingAgainstBaseURL: false) else {

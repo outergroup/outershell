@@ -197,7 +197,7 @@ cmd_build_frontend() {
         echo "error: Outer Shell frontend and macOS agent must be built on macOS" >&2
         exit 1
     }
-    echo "==> Building Outer Shell macOS and frontend resources"
+    echo "==> Building Outer Shell macOS and frontend resources (${BUILD_CONFIGURATION})"
     CLEAN_FRONTEND_BUILD="${clean_build}" \
     CONFIGURATION="${BUILD_CONFIGURATION}" \
         "${ROOT}/build_run.sh"
@@ -257,6 +257,17 @@ build_linux_target() {
     rm -rf "${source_root}"
 }
 
+index_frontend_symbols() {
+    local dsym="$1"
+    local uuid compact_uuid map_directory
+    while read -r uuid; do
+        compact_uuid="${uuid//-/}"
+        map_directory="${SYMBOLS_DIR}/uuid-map/${compact_uuid:0:4}/${compact_uuid:4:4}/${compact_uuid:8:4}/${compact_uuid:12:4}/${compact_uuid:16:4}"
+        mkdir -p "${map_directory}"
+        ln -sfn "${dsym}/Contents/Resources/DWARF/Outer Shell" "${map_directory}/${compact_uuid:20:12}"
+    done < <(dwarfdump --uuid "${dsym}" | awk '{ print $2 }')
+}
+
 archive_frontend_symbols() {
     local source_dsym="${ROOT}/build/macos/${BUILD_CONFIGURATION}/Outer Shell.bundle.dSYM"
     local arm64_uuid
@@ -271,6 +282,7 @@ archive_frontend_symbols() {
     destination_dsym="${SYMBOLS_DIR}/${arm64_uuid}/Outer Shell.bundle.dSYM"
     mkdir -p "$(dirname "${destination_dsym}")"
     ditto "${source_dsym}" "${destination_dsym}"
+    index_frontend_symbols "${destination_dsym}"
     FRONTEND_SYMBOLS_PATH="${destination_dsym}"
 }
 
@@ -325,6 +337,7 @@ cmd_deploy() {
 cmd_push_frontend() {
     probe_target
     cmd_build_frontend
+    archive_frontend_symbols
     local remote_dir
     if [[ "${TARGET_OS}" == Darwin ]]; then
         remote_dir="${HOME}/Library/Application Support/outershell/apps/org.outershell.OuterShell/Outer Shell.app/Contents/Resources/bundles"
@@ -342,7 +355,9 @@ cmd_push_frontend() {
             mkdir -p \"\$remote_dir\"
             tar xzf - -C \"\$remote_dir\"
         "
-    echo "Pushed Outer Shell frontend bundles. Reload Outer Shell in Outer Loop."
+    echo "Pushed Outer Shell frontend bundles (${BUILD_CONFIGURATION}). Reload Outer Shell in Outer Loop."
+    echo "Frontend profiling symbols: ${FRONTEND_SYMBOLS_PATH}"
+    dwarfdump --uuid "${FRONTEND_SYMBOLS_PATH}"
 }
 
 cmd_uninstall() {
