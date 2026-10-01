@@ -233,3 +233,14 @@ a unique temporary file, `fsync` it, rename it over `registry.orwa`, then
 ```text
 registry.orwa.tmp.XXXXXX -> registry.orwa
 ```
+
+## Retired UI metadata
+
+`suggested_list` and `frontend_layouts` are retained as stored metadata; current
+Outer Shell pinning, ordering, and display-name overrides use `/api/layout`.
+The former `setFrontendList` and container `setAppList` UI operations are retired.
+List names no longer determine icon resolution.
+
+When retiring a field from a fixed-size record, reserve its original byte range
+and document it as defunct. Do not shift subsequent fields or reuse the range.
+No registry field offsets or table descriptors changed in this cleanup.

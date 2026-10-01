@@ -699,42 +699,16 @@ final class SafeSpaceManager: @unchecked Sendable {
             try await unmountFolder(request)
         case "chooseFolder":
             return ["selectedFolderPath": await chooseFolder() ?? ""]
-        case "setAppList":
-            try setAppList(request)
         case "startApp", "stopApp", "restartApp":
             try await controlApp(request, operation: operation)
         case "appLogs":
             return ["appLog": try await appLog(request)]
-        case "addRecipeStep":
-            try requireManagedContainer(try record(from: request))
-            return try addRecipeStep(request)
         case "updateDockerfile":
             try requireManagedContainer(try record(from: request))
             return try updateDockerfile(request)
         case "updateContainerConfiguration":
             try requireManagedContainer(try record(from: request))
             return try updateContainerConfiguration(request)
-        case "updateRecipeBaseImage":
-            try requireManagedContainer(try record(from: request))
-            return try updateRecipeBaseImage(request)
-        case "addRecipeUser":
-            try requireManagedContainer(try record(from: request))
-            return try addRecipeUser(request)
-        case "createRecipeScript":
-            try requireManagedContainer(try record(from: request))
-            return try createRecipeScript(request)
-        case "renameRecipeScript":
-            try requireManagedContainer(try record(from: request))
-            return try renameRecipeScript(request)
-        case "updateRecipeStep":
-            try requireManagedContainer(try record(from: request))
-            return try updateRecipeStep(request)
-        case "installRecipeCatalogItem":
-            try requireManagedContainer(try record(from: request))
-            return try installRecipeCatalogItem(request)
-        case "deleteRecipeStep":
-            try requireManagedContainer(try record(from: request))
-            return try await deleteRecipeStep(request)
         case "rebuildRecipe":
             try requireManagedContainer(try record(from: request))
             return try beginRebuildRecipe(request)
@@ -2365,23 +2339,6 @@ final class SafeSpaceManager: @unchecked Sendable {
         try saveRecipe(value, for: selected)
     }
 
-    private func setAppList(_ request: [String: Any]) throws {
-        let selected = try record(from: request)
-        guard let frontendID = request["frontendID"] as? String,
-              let listName = request["listName"] as? String else {
-            throw SafeSpaceManagerError.invalidRequest
-        }
-        lock.withSafeSpaceLock {
-            guard var apps = cachedApps[selected.id],
-                  let index = apps.firstIndex(where: { $0.frontendID == frontendID }) else {
-                return
-            }
-            apps[index].listName = listName
-            cachedApps[selected.id] = apps
-        }
-        try saveCachedApps()
-    }
-
     private func controlApp(_ request: [String: Any], operation: String) async throws {
         let selected = try record(from: request)
         guard let serviceID = request["serviceID"] as? String else {
@@ -2590,29 +2547,6 @@ final class SafeSpaceManager: @unchecked Sendable {
         ]
     }
 
-    private func addRecipeStep(_ request: [String: Any]) throws -> [String: Any] {
-        let selected = try record(from: request)
-        guard let rawCommand = request["command"] as? String else {
-            throw SafeSpaceManagerError.invalidRequest
-        }
-        let command = rawCommand.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !command.isEmpty else {
-            throw SafeSpaceManagerError.invalidRequest
-        }
-        var value = try recipe(for: selected)
-        let step = SafeSpaceRecipeStep(id: UUID(),
-                                       command: "",
-                                       createdAt: Date(),
-                                       catalogItemID: nil,
-                                       displayName: "Dockerfile fragment",
-                                       dockerfileFragment: command,
-                                       isEditable: true)
-        value.steps.append(step)
-        try appendDockerfileInstructions(command, for: selected)
-        try saveRecipe(value, for: selected)
-        return ["recipeCommandOutput": "", "recipeCommandApplied": false]
-    }
-
     private func updateDockerfile(_ request: [String: Any]) throws -> [String: Any] {
         let selected = try record(from: request)
         guard let contents = request["command"] as? String else {
@@ -2760,27 +2694,6 @@ final class SafeSpaceManager: @unchecked Sendable {
         }
     }
 
-    private func updateRecipeBaseImage(_ request: [String: Any]) throws -> [String: Any] {
-        let selected = try record(from: request)
-        guard let rawBaseImage = request["baseImage"] as? String else {
-            throw SafeSpaceManagerError.invalidRequest
-        }
-        let baseImage = try validatedBaseImage(rawBaseImage)
-        guard let installsOuterShellSupport = request["installsOuterShellSupport"] as? Bool else {
-            throw SafeSpaceManagerError.invalidRequest
-        }
-        var value = try recipe(for: selected)
-        value.baseImage = baseImage
-        value.installsOuterShellSupport = usesBuiltInOuterShellImage(baseImage)
-            ? false
-            : installsOuterShellSupport
-        value.realizedStepIDs = []
-        value.realizedLauncherIDs = []
-        value.realizedEditableStepContents = [:]
-        try saveRecipe(value, for: selected)
-        return ["recipeCommandOutput": "", "recipeCommandApplied": false]
-    }
-
     private func validatedBaseImage(_ rawBaseImage: String) throws -> String {
         let baseImage = rawBaseImage.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !baseImage.isEmpty,
@@ -2795,253 +2708,6 @@ final class SafeSpaceManager: @unchecked Sendable {
             )
         }
         return baseImage
-    }
-
-    private func addRecipeUser(_ request: [String: Any]) throws -> [String: Any] {
-        let selected = try record(from: request)
-        guard let rawName = request["name"] as? String else {
-            throw SafeSpaceManagerError.invalidRequest
-        }
-        let name = rawName.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        let characters = Array(name)
-        guard !characters.isEmpty,
-              characters.count <= 32,
-              (characters.first?.isLowercase == true || characters.first == "_"),
-              characters.dropFirst().allSatisfy({
-                  $0.isLowercase || $0.isNumber || $0 == "_" || $0 == "-"
-              }),
-              name != "root" else {
-            throw SafeSpaceManagerError.commandFailed(
-                "Use a Linux username containing lowercase letters, numbers, hyphens, or underscores."
-            )
-        }
-        var value = try recipe(for: selected)
-        guard !(value.users ?? []).contains(where: { $0.name == name }) else {
-            throw SafeSpaceManagerError.commandFailed(
-                "The container recipe already includes the user \(name)."
-            )
-        }
-        let homeDirectory = "/home/\(name)"
-        value.users = (value.users ?? []) + [
-            SafeSpaceRecipeUser(
-                id: UUID(),
-                name: name,
-                homeDirectory: homeDirectory,
-                workingDirectory: homeDirectory
-            )
-        ]
-        try saveRecipe(value, for: selected)
-        return ["recipeCommandOutput": "", "recipeCommandApplied": false]
-    }
-
-    private func createRecipeScript(_ request: [String: Any]) throws -> [String: Any] {
-        let selected = try record(from: request)
-        let value = try recipe(for: selected)
-        let fileName = try validatedRecipeScriptName(request["name"] as? String)
-        let directory: URL
-        if let userIDText = request["recipeUserID"] as? String,
-           !userIDText.isEmpty {
-            guard let userID = UUID(uuidString: userIDText),
-                  let user = (value.users ?? []).first(where: { $0.id == userID }) else {
-                throw SafeSpaceManagerError.invalidRequest
-            }
-            directory = try userRecipeStepDirectory(for: selected, user: user)
-        } else {
-            directory = try rootRecipeStepDirectory(for: selected)
-        }
-        try FileManager.default.createDirectory(
-            at: directory,
-            withIntermediateDirectories: true,
-            attributes: [.posixPermissions: 0o700]
-        )
-        let destination = directory.appendingPathComponent(fileName)
-        guard !FileManager.default.fileExists(atPath: destination.path) else {
-            throw SafeSpaceManagerError.commandFailed(
-                "A setup script named \(fileName) already exists in this section."
-            )
-        }
-        try "#!/bin/sh\nset -eu\n\n".write(
-            to: destination,
-            atomically: true,
-            encoding: .utf8
-        )
-        try FileManager.default.setAttributes(
-            [.posixPermissions: 0o700],
-            ofItemAtPath: destination.path
-        )
-        return ["recipeCommandOutput": "", "recipeCommandApplied": false]
-    }
-
-    private func renameRecipeScript(_ request: [String: Any]) throws -> [String: Any] {
-        let selected = try record(from: request)
-        guard let relativePath = request["recipeScriptPath"] as? String else {
-            throw SafeSpaceManagerError.invalidRequest
-        }
-        let value = try recipe(for: selected)
-        guard let script = try editableRecipeSteps(
-            for: selected,
-            users: value.users ?? []
-        ).first(where: { $0.relativePath == relativePath }) else {
-            throw SafeSpaceManagerError.commandFailed(
-                "The setup script no longer exists."
-            )
-        }
-        let fileName = try validatedRecipeScriptName(request["name"] as? String)
-        guard fileName != script.fileName else {
-            return ["recipeCommandOutput": "", "recipeCommandApplied": false]
-        }
-        let directory: URL
-        if let user = script.user {
-            directory = try userRecipeStepDirectory(for: selected, user: user)
-        } else {
-            directory = try rootRecipeStepDirectory(for: selected)
-        }
-        let source = directory.appendingPathComponent(script.fileName)
-        let destination = directory.appendingPathComponent(fileName)
-        guard !FileManager.default.fileExists(atPath: destination.path) else {
-            throw SafeSpaceManagerError.commandFailed(
-                "A setup script named \(fileName) already exists in this section."
-            )
-        }
-        try FileManager.default.moveItem(at: source, to: destination)
-        return ["recipeCommandOutput": "", "recipeCommandApplied": false]
-    }
-
-    private func validatedRecipeScriptName(_ rawName: String?) throws -> String {
-        guard var fileName = rawName?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !fileName.isEmpty else {
-            throw SafeSpaceManagerError.invalidRequest
-        }
-        if !fileName.hasSuffix(".sh") {
-            fileName += ".sh"
-        }
-        guard fileName.count <= 128,
-              fileName != ".sh",
-              fileName.unicodeScalars.allSatisfy({
-                  CharacterSet.alphanumerics.contains($0) ||
-                      "._-".unicodeScalars.contains($0)
-              }) else {
-            throw SafeSpaceManagerError.commandFailed(
-                "Setup-script names may contain only letters, numbers, dots, hyphens, and underscores."
-            )
-        }
-        return fileName
-    }
-
-    private func updateRecipeStep(_ request: [String: Any]) throws -> [String: Any] {
-        let selected = try record(from: request)
-        guard let stepText = request["recipeStepID"] as? String,
-              let stepID = UUID(uuidString: stepText),
-              let rawFragment = request["command"] as? String else {
-            throw SafeSpaceManagerError.invalidRequest
-        }
-        let fragment = rawFragment.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !fragment.isEmpty else {
-            throw SafeSpaceManagerError.commandFailed(
-                "A Dockerfile fragment cannot be empty. Remove it instead."
-            )
-        }
-        var value = try recipe(for: selected)
-        guard let index = value.steps.firstIndex(where: { $0.id == stepID }),
-              value.steps[index].isEditable == true else {
-            throw SafeSpaceManagerError.commandFailed(
-                "This Dockerfile fragment is managed by Outer Shell."
-            )
-        }
-        value.steps[index].dockerfileFragment = fragment
-        value.realizedStepIDs.removeAll { $0 == stepID }
-        try saveRecipe(value, for: selected)
-        return ["recipeCommandOutput": "", "recipeCommandApplied": false]
-    }
-
-    private func installRecipeCatalogItem(_ request: [String: Any]) throws -> [String: Any] {
-        let selected = try record(from: request)
-        guard let catalogItemID = request["catalogItemID"] as? String,
-              let item = recipeCatalog().first(where: { $0.id == catalogItemID }) else {
-            throw SafeSpaceManagerError.invalidRequest
-        }
-        var value = try recipe(for: selected)
-        let dockerfile = try dockerfileContents(for: selected)
-        let fragment = item.dockerfileFragment?
-            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        guard fragment.isEmpty || !dockerfile.contains(fragment) else {
-            throw SafeSpaceManagerError.commandFailed(
-                "\(item.displayName) is already in this Dockerfile."
-            )
-        }
-        let wasUpToDate = value.realizedDockerfileContents ==
-            dockerfile
-        let step = SafeSpaceRecipeStep(id: UUID(),
-                                       command: item.command,
-                                       createdAt: Date(),
-                                       catalogItemID: item.id,
-                                       displayName: "Install \(item.displayName)",
-                                       dockerfileFragment: item.dockerfileFragment,
-                                       isEditable: item.isEditable)
-        if !value.steps.contains(where: { $0.catalogItemID == item.id }) {
-            value.steps.append(step)
-        }
-        var instructions = item.dockerfileFragment ?? ""
-        if !item.command.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            let stepIndex = value.steps.firstIndex(where: { $0.catalogItemID == item.id }) ?? 0
-            let fileName = recipeStepFileName(index: stepIndex, step: step)
-            instructions += "\n" + recipeStepInstructions(fileName: fileName)
-                .joined(separator: "\n")
-        }
-        try appendDockerfileInstructions(instructions, for: selected)
-        try saveRecipe(value, for: selected)
-
-        return try applyRecipeStepIfPossible(step, to: selected, recipe: &value,
-                                             wasUpToDate: wasUpToDate,
-                                             liveCommand: item.liveCommand)
-    }
-
-    private func applyRecipeStepIfPossible(_ step: SafeSpaceRecipeStep,
-                                           to selected: SafeSpaceRecord,
-                                           recipe value: inout SafeSpaceRecipe,
-                                           wasUpToDate: Bool,
-                                           liveCommand: String? = nil) throws -> [String: Any] {
-        var output = ""
-        var appliedDynamically = false
-        if let liveCommand, wasUpToDate, try runtimeState(selected) == "running" {
-            let result = try runRuntime(selected, [
-                "exec", "--user", "root", containerName(selected.id),
-                "/bin/sh", "-lc", "cd / && \(liveCommand)"
-            ])
-            if result.status == 0 {
-                value.realizedStepIDs = value.steps.map(\.id)
-                value.realizedDockerfileContents = try dockerfileContents(for: selected)
-                try saveRecipe(value, for: selected)
-                appliedDynamically = true
-                output = result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
-            } else {
-                output = [result.stderr, result.stdout]
-                    .joined(separator: "\n")
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-            }
-        }
-        return [
-            "recipeCommandOutput": output,
-            "recipeCommandApplied": appliedDynamically
-        ]
-    }
-
-    private func deleteRecipeStep(_ request: [String: Any]) async throws -> [String: Any] {
-        let selected = try record(from: request)
-        guard let text = request["recipeStepID"] as? String,
-              let stepID = UUID(uuidString: text) else {
-            throw SafeSpaceManagerError.invalidRequest
-        }
-        var value = try recipe(for: selected)
-        guard value.steps.contains(where: { $0.id == stepID }) else {
-            throw SafeSpaceManagerError.invalidRequest
-        }
-        value.steps.removeAll { $0.id == stepID }
-        try saveRecipe(value, for: selected)
-        if request["rebuild"] as? Bool == true {
-            return try await rebuild(selected, recipe: value)
-        }
-        return [:]
     }
 
     private func beginRebuildRecipe(_ request: [String: Any]) throws -> [String: Any] {

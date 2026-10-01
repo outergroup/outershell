@@ -1894,9 +1894,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private let filePickerRowHeight: CGFloat = 28
     private var workspacePanelFrame = CGRect.zero
     private var workspaceCloseFrame = CGRect.zero
-    private var workspaceCreateFrame = CGRect.zero
-    private var workspaceRowFrames: [(frame: CGRect, workspace: LocalWorkspaceRecord)] = []
-    private var workspaceActionFrames: [(frame: CGRect, workspace: LocalWorkspaceRecord, operation: String)] = []
     private var workspaceOverviewRowFrames: [(frame: CGRect, workspace: LocalWorkspaceRecord)] = []
     private var workspaceOverviewActionFrames: [(frame: CGRect, workspace: LocalWorkspaceRecord, operation: String)] = []
     private var workspaceOverviewAppFrames: [(frame: CGRect, workspace: LocalWorkspaceRecord, app: LocalWorkspaceAppRecord)] = []
@@ -3119,551 +3116,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         }
     }
 
-    private func renderSafeSpaceRecipeDetail(
-        _ workspace: LocalWorkspaceRecord,
-        visibleIconKeys: inout Set<String>,
-        visibleTextKeys: inout Set<String>
-    ) -> CGFloat {
-        let left = horizontalInset
-        let pageWidth = max(appsLayer.bounds.width - horizontalInset * 2, 1)
-        var cursor = max(appsLayer.bounds.height - 30, 0)
-
-        safeSpaceDetailBackFrame = CGRect(x: left, y: cursor - 28, width: 112, height: 28)
-        let backIcon = CALayer()
-        backIcon.frame = CGRect(x: left, y: cursor - 24, width: 18, height: 18)
-        backIcon.contentsGravity = .resizeAspect
-        backIcon.contents = symbolCGImage(named: "chevron.left", pointSize: 13)
-        addAppsSublayer(backIcon)
-        let backTitle = makeTextLayer(size: 12, weight: .medium, color: .controlAccentColor)
-        backTitle.string = "Back"
-        backTitle.frame = CGRect(x: left + 23, y: cursor - 24, width: 90, height: 18)
-        addAppsSublayer(backTitle)
-        cursor -= 52
-
-        let title = makeTextLayer(size: 24, weight: .semibold, color: .labelColor)
-        title.string = workspace.name
-        title.frame = CGRect(x: left, y: cursor - 32, width: pageWidth, height: 34)
-        addAppsSublayer(title)
-
-        let displayedState = displayedWorkspaceState(for: workspace)
-        let state = makeTextLayer(size: 11, weight: .regular, color: .secondaryLabelColor)
-        state.string = "\(displayedState.capitalized) · \(workspace.runtimeDescription)"
-        state.truncationMode = .end
-        state.frame = CGRect(x: left, y: cursor - 53, width: pageWidth, height: 17)
-        addAppsSublayer(state)
-        cursor -= 84
-
-        let contentArea = CGRect(x: left, y: 0, width: pageWidth, height: 0)
-        let dockerfileBottom = renderSafeSpaceDockerfileEditor(
-            workspace,
-            area: contentArea,
-            top: cursor
-        )
-
-        let mountedFoldersTop = dockerfileBottom - 32
-        let divider = CALayer()
-        divider.frame = CGRect(x: contentArea.minX,
-                               y: mountedFoldersTop + 16,
-                               width: contentArea.width,
-                               height: 0.5)
-        divider.backgroundColor = resolvedCGColor(.separatorColor)
-        addAppsSublayer(divider)
-        return renderSafeSpaceMountedFolders(
-            workspace,
-            area: contentArea,
-            top: mountedFoldersTop
-        ) - 24
-    }
-
-    private func renderSafeSpaceMountedFolders(
-        _ workspace: LocalWorkspaceRecord,
-        area: CGRect,
-        top: CGFloat
-    ) -> CGFloat {
-        let mounts = workspace.visibleMounts
-        let heading = makeTextLayer(size: 13,
-                                    weight: .semibold,
-                                    color: .secondaryLabelColor)
-        heading.string = "MOUNTED FOLDERS"
-        heading.frame = CGRect(x: area.minX,
-                               y: top - 19,
-                               width: area.width,
-                               height: 18)
-        addAppsSublayer(heading)
-        var cursor = top - 32
-
-        if mounts.isEmpty {
-            let empty = makeTextLayer(size: 12,
-                                      weight: .regular,
-                                      color: .secondaryLabelColor)
-            empty.string = "No folders are mounted in this container."
-            empty.frame = CGRect(x: area.minX,
-                                 y: cursor - 22,
-                                 width: area.width,
-                                 height: 18)
-            addAppsSublayer(empty)
-            cursor -= 36
-        } else {
-            for mount in mounts {
-                let rowFrame = CGRect(x: area.minX,
-                                      y: cursor - 58,
-                                      width: area.width,
-                                      height: 58)
-
-                let folderIcon = CALayer()
-                folderIcon.frame = CGRect(x: rowFrame.minX + 2,
-                                          y: rowFrame.minY + 20,
-                                          width: 19,
-                                          height: 19)
-                folderIcon.contentsGravity = .resizeAspect
-                folderIcon.contentsScale = 2
-                folderIcon.contents = symbolCGImage(
-                    named: mount.isReadOnly ? "folder" : "folder.fill",
-                    pointSize: 16
-                )
-                addAppsSublayer(folderIcon)
-
-                let trailingInset: CGFloat = mount.isInfrastructureMount ? 0 : 34
-                let mountName = makeTextLayer(size: 9,
-                                              weight: .semibold,
-                                              color: .secondaryLabelColor)
-                mountName.string = mount.isRecipeInfrastructureMount
-                    ? "\(mount.name.uppercased()) · INFRASTRUCTURE"
-                    : mount.name.uppercased()
-                mountName.frame = CGRect(
-                    x: rowFrame.minX + 31,
-                    y: rowFrame.minY + 43,
-                    width: max(rowFrame.width - 31 - trailingInset, 1),
-                    height: 13
-                )
-                addAppsSublayer(mountName)
-
-                let hostPathFrame = CGRect(
-                    x: rowFrame.minX + 31,
-                    y: rowFrame.minY + 23,
-                    width: max(rowFrame.width - 31 - trailingInset, 1),
-                    height: 17
-                )
-                renderSelectableMountedFolderPath(
-                    mount.hostPath,
-                    identifier: "mount:\(workspace.id):\(mount.id):host",
-                    font: NSFont.systemFont(ofSize: 12, weight: .semibold),
-                    color: .labelColor,
-                    localFrame: hostPathFrame,
-                    contentFrame: hostPathFrame,
-                    contentSpace: .apps,
-                    in: activeAppsContentLayer
-                )
-
-                let guestPathFrame = CGRect(
-                    x: rowFrame.minX + 31,
-                    y: rowFrame.minY + 6,
-                    width: max(rowFrame.width - 31 - trailingInset, 1),
-                    height: 15
-                )
-                renderSelectableMountedFolderPath(
-                    mount.guestPath,
-                    identifier: "mount:\(workspace.id):\(mount.id):guest",
-                    font: NSFont.systemFont(ofSize: 10, weight: .regular),
-                    color: .secondaryLabelColor,
-                    localFrame: guestPathFrame,
-                    contentFrame: guestPathFrame,
-                    contentSpace: .apps,
-                    in: activeAppsContentLayer
-                )
-
-                if !mount.isInfrastructureMount {
-                    let ejectFrame = CGRect(x: rowFrame.maxX - 26,
-                                            y: rowFrame.minY + 16,
-                                            width: 26,
-                                            height: 26)
-                    let eject = makeSymbolButtonLayer(
-                        symbolName: "eject",
-                        accessibilityTitle: "Unmount \(mount.name)"
-                    )
-                    eject.frame = ejectFrame
-                    addAppsSublayer(eject)
-                    workspaceOverviewActionFrames.append((
-                        ejectFrame,
-                        workspace,
-                        "unmountFolder:\(mount.id.uuidString)"
-                    ))
-                }
-
-                cursor -= 62
-            }
-        }
-
-        if workspace.canConfigureFolders {
-            let mountFrame = CGRect(x: area.minX,
-                                    y: cursor - 38,
-                                    width: min(area.width, 190),
-                                    height: 34)
-            let icon = CALayer()
-            icon.frame = CGRect(x: mountFrame.minX + 2,
-                                y: mountFrame.minY + 7,
-                                width: 19,
-                                height: 19)
-            icon.contentsGravity = .resizeAspect
-            icon.contentsScale = 2
-            icon.contents = symbolCGImage(named: "folder.badge.plus", pointSize: 16)
-            addAppsSublayer(icon)
-
-            let title = makeTextLayer(size: 12,
-                                      weight: .medium,
-                                      color: .controlAccentColor)
-            title.string = "Mount folder…"
-            title.frame = CGRect(x: mountFrame.minX + 31,
-                                 y: mountFrame.minY + 8,
-                                 width: max(mountFrame.width - 31, 1),
-                                 height: 17)
-            addAppsSublayer(title)
-            workspaceOverviewActionFrames.append((mountFrame, workspace, "mountFolder"))
-            cursor -= 42
-        }
-
-        return cursor - 8
-    }
-
-    private func renderSafeSpaceDockerfileEditor(
-        _ workspace: LocalWorkspaceRecord,
-        area: CGRect,
-        top: CGFloat
-    ) -> CGFloat {
-        var cursor = top
-        let heading = makeTextLayer(size: 13,
-                                    weight: .semibold,
-                                    color: .secondaryLabelColor)
-        heading.string = "DOCKERFILE"
-        heading.frame = CGRect(x: area.minX,
-                               y: cursor - 19,
-                               width: max(area.width - 278, 100),
-                               height: 18)
-        addAppsSublayer(heading)
-
-        guard let recipe = workspace.recipe else {
-            let unavailable = makeTextLayer(size: 12,
-                                            weight: .regular,
-                                            color: .secondaryLabelColor)
-            unavailable.string = "This container does not have a Dockerfile definition."
-            unavailable.isWrapped = true
-            unavailable.frame = CGRect(x: area.minX,
-                                       y: cursor - 66,
-                                       width: area.width,
-                                       height: 48)
-            addAppsSublayer(unavailable)
-            return cursor - 86
-        }
-
-        safeSpaceDetailCopyContainerfileFrame = CGRect(x: area.maxX - 64,
-                                                       y: cursor - 24,
-                                                       width: 64,
-                                                       height: 24)
-        let copy = makeButtonLayer(title: "Copy", emphasized: false)
-        copy.frame = safeSpaceDetailCopyContainerfileFrame
-        addAppsSublayer(copy)
-
-        safeSpaceDetailEditDockerfileFrame = CGRect(x: area.maxX - 136,
-                                                     y: cursor - 24,
-                                                     width: 64,
-                                                     height: 24)
-        let edit = makeButtonLayer(title: "Edit", emphasized: true)
-        edit.frame = safeSpaceDetailEditDockerfileFrame
-        addAppsSublayer(edit)
-
-        safeSpaceDetailOpenDockerfileFrame = CGRect(x: area.maxX - 248,
-                                                     y: cursor - 24,
-                                                     width: 104,
-                                                     height: 24)
-        let open = makeButtonLayer(title: "Open in Editor", emphasized: false)
-        open.frame = safeSpaceDetailOpenDockerfileFrame
-        addAppsSublayer(open)
-
-        cursor -= 30
-
-        if let support = workspace.outerShellSupport,
-           support.status == "missing" || support.status == "inactive" {
-            let showsCopyButton = support.status == "missing"
-            let buttonWidth: CGFloat = showsCopyButton ? 142 : 0
-            let warning = makeTextLayer(size: 11,
-                                        weight: .regular,
-                                        color: .systemOrange)
-            warning.string = support.detail
-            warning.isWrapped = true
-            warning.frame = CGRect(x: area.minX,
-                                   y: cursor - 39,
-                                   width: max(area.width - buttonWidth - 12, 1),
-                                   height: 36)
-            addAppsSublayer(warning)
-            if showsCopyButton {
-                safeSpaceDetailCopySupportSnippetFrame = CGRect(
-                    x: area.maxX - buttonWidth,
-                    y: cursor - 31,
-                    width: buttonWidth,
-                    height: 27
-                )
-                let copySupport = makeButtonLayer(
-                    title: "Copy Install Snippet",
-                    emphasized: false
-                )
-                copySupport.frame = safeSpaceDetailCopySupportSnippetFrame
-                addAppsSublayer(copySupport)
-            }
-            cursor -= 50
-        }
-
-        if !safeSpaceRecipeMessage.isEmpty {
-            let lowercasedMessage = safeSpaceRecipeMessage.lowercased()
-            let isError = lowercasedMessage.contains("error") ||
-                lowercasedMessage.contains("failed") ||
-                lowercasedMessage.contains("could not")
-            let copyButtonWidth: CGFloat = isError ? 82 : 0
-            let messageWidth = max(area.width - copyButtonWidth - (isError ? 10 : 0), 1)
-            let font = NSFont.systemFont(ofSize: 11, weight: .medium)
-            let measured = (safeSpaceRecipeMessage as NSString).boundingRect(
-                with: CGSize(width: messageWidth,
-                             height: CGFloat.greatestFiniteMagnitude),
-                options: [.usesLineFragmentOrigin, .usesFontLeading],
-                attributes: [.font: font]
-            )
-            let messageHeight = max(18, ceil(measured.height) + 2)
-            let message = makeTextLayer(
-                size: 11,
-                weight: .medium,
-                color: isError ? .systemRed : .secondaryLabelColor
-            )
-            message.string = safeSpaceRecipeMessage
-            message.isWrapped = true
-            message.frame = CGRect(x: area.minX,
-                                   y: cursor - messageHeight,
-                                   width: messageWidth,
-                                   height: messageHeight)
-            addAppsSublayer(message)
-            if isError {
-                safeSpaceDetailCopyRecipeMessageFrame = CGRect(
-                    x: area.maxX - copyButtonWidth,
-                    y: cursor - 25,
-                    width: copyButtonWidth,
-                    height: 24
-                )
-                let copyError = makeButtonLayer(title: "Copy Error", emphasized: false)
-                copyError.frame = safeSpaceDetailCopyRecipeMessageFrame
-                addAppsSublayer(copyError)
-            }
-            cursor -= max(messageHeight, isError ? 25 : 0) + 10
-        }
-
-        if !recipe.buildEngineAvailable {
-            let warning = makeTextLayer(size: 11,
-                                        weight: .regular,
-                                        color: .systemOrange)
-            warning.string = "The selected container runtime is not available on this server."
-            warning.isWrapped = true
-            warning.frame = CGRect(x: area.minX,
-                                   y: cursor - 48,
-                                   width: area.width,
-                                   height: 44)
-            addAppsSublayer(warning)
-            cursor -= 58
-        }
-
-        if recipe.needsRebuild {
-            let ready = makeTextLayer(size: 11,
-                                      weight: .regular,
-                                      color: .secondaryLabelColor)
-            ready.string = "Saved configuration differs from the running container"
-            ready.frame = CGRect(x: area.minX,
-                                 y: cursor - 20,
-                                 width: max(area.width - 130, 1),
-                                 height: 17)
-            addAppsSublayer(ready)
-            safeSpaceDetailRebuildFrame = CGRect(x: area.maxX - 120,
-                                                 y: cursor - 26,
-                                                 width: 120,
-                                                 height: 27)
-            let rebuild = makeButtonLayer(title: "Rebuild", emphasized: false)
-            rebuild.frame = safeSpaceDetailRebuildFrame
-            rebuild.opacity = isPerformingWorkspaceOperation ? 0.55 : 1
-            addAppsSublayer(rebuild)
-            cursor -= 38
-        }
-
-        if recipe.hasUntrackedChanges {
-            let warning = makeTextLayer(size: 11,
-                                        weight: .regular,
-                                        color: .systemOrange)
-            warning.string = "This container predates its Dockerfile. A rebuild replaces changes that are not represented in the file."
-            warning.isWrapped = true
-            warning.frame = CGRect(x: area.minX,
-                                   y: cursor - 43,
-                                   width: area.width,
-                                   height: 40)
-            addAppsSublayer(warning)
-            cursor -= 56
-        }
-
-        let paths = makeTextLayer(size: 9,
-                                  weight: .regular,
-                                  color: .tertiaryLabelColor)
-        paths.string = "Inside  \(recipe.dockerfileGuestPath)\nOutside  \(recipe.dockerfileHostPath)"
-        paths.isWrapped = true
-        paths.frame = CGRect(x: area.minX,
-                             y: cursor - 34,
-                             width: area.width,
-                             height: 30)
-        addAppsSublayer(paths)
-        cursor -= 44
-
-        let dockerfile = LocalWorkspaceRecord.Recipe.Fragment(
-            id: "dockerfile",
-            stepID: "",
-            displayName: "Dockerfile",
-            contents: recipe.containerfile,
-            isEditable: true,
-            isRemovable: false,
-            isApplied: !recipe.needsRebuild
-        )
-        cursor = renderDockerfileFragmentBlocks([dockerfile],
-                                                recipe: recipe,
-                                                area: area,
-                                                top: cursor)
-        cursor = renderInlineDockerfileAddApp(area: area, top: cursor)
-        return cursor - 8
-    }
-
-    private func renderSafeSpaceRecipeTools(
-        _ workspace: LocalWorkspaceRecord,
-        area: CGRect,
-        top: CGFloat
-    ) -> CGFloat {
-        guard let recipe = workspace.recipe else {
-            return top
-        }
-
-        var cursor = renderSafeSpaceRecipeUsers(recipe.users,
-                                                area: area,
-                                                top: top)
-        cursor = renderSafeSpaceRecipeCatalog(recipe.catalog,
-                                              area: area,
-                                              top: cursor)
-
-        let portabilityHeading = makeTextLayer(size: 10,
-                                               weight: .semibold,
-                                               color: .secondaryLabelColor)
-        portabilityHeading.string = "MOVING THIS CONTAINER"
-        portabilityHeading.frame = CGRect(x: area.minX,
-                                          y: cursor - 16,
-                                          width: area.width,
-                                          height: 14)
-        addAppsSublayer(portabilityHeading)
-        cursor -= 24
-        for item in recipe.transferItems {
-            let title = makeTextLayer(size: 11, weight: .medium, color: .labelColor)
-            title.string = item.name
-            title.frame = CGRect(x: area.minX, y: cursor - 17,
-                                 width: max(area.width - 120, 1), height: 16)
-            addAppsSublayer(title)
-            let status = makeTextLayer(size: 10, weight: .regular,
-                                       color: .secondaryLabelColor, alignment: .right)
-            status.string = item.status
-            status.frame = CGRect(x: area.maxX - 118, y: cursor - 17,
-                                  width: 118, height: 16)
-            addAppsSublayer(status)
-            let detail = makeTextLayer(size: 9, weight: .regular,
-                                       color: .secondaryLabelColor)
-            detail.string = item.detail
-            detail.truncationMode = .middle
-            detail.frame = CGRect(x: area.minX, y: cursor - 34,
-                                  width: area.width, height: 13)
-            addAppsSublayer(detail)
-            cursor -= 42
-        }
-        return cursor - 8
-    }
-
-    private func renderSafeSpaceRecipeUsers(
-        _ users: [LocalWorkspaceRecord.Recipe.User],
-        area: CGRect,
-        top: CGFloat
-    ) -> CGFloat {
-        var cursor = top
-        let heading = makeTextLayer(size: 10,
-                                    weight: .semibold,
-                                    color: .secondaryLabelColor)
-        heading.string = "CONTAINER USERS"
-        heading.frame = CGRect(x: area.minX,
-                               y: cursor - 14,
-                               width: area.width,
-                               height: 14)
-        addAppsSublayer(heading)
-        cursor -= 24
-
-        for user in users {
-            let rowHeight: CGFloat = 42
-            let icon = CALayer()
-            icon.frame = CGRect(x: area.minX,
-                                y: cursor - rowHeight + 12,
-                                width: 18,
-                                height: 18)
-            icon.contentsGravity = .resizeAspect
-            icon.contents = symbolCGImage(named: user.isRoot ? "lock.shield" : "person.crop.circle",
-                                          pointSize: 13)
-            addAppsSublayer(icon)
-
-            let name = makeTextLayer(size: 11, weight: .medium, color: .labelColor)
-            name.string = user.name
-            name.frame = CGRect(x: area.minX + 27,
-                                y: cursor - 20,
-                                width: max(area.width - 27, 1),
-                                height: 16)
-            addAppsSublayer(name)
-
-            let detail = makeTextLayer(size: 9,
-                                       weight: .regular,
-                                       color: .secondaryLabelColor)
-            detail.string = user.isRoot ? "Built in · /root" : user.workingDirectory
-            detail.truncationMode = .middle
-            detail.frame = CGRect(x: area.minX + 27,
-                                  y: cursor - 35,
-                                  width: max(area.width - 27, 1),
-                                  height: 13)
-            addAppsSublayer(detail)
-
-            let separator = CALayer()
-            separator.frame = CGRect(x: area.minX + 27,
-                                     y: cursor - rowHeight,
-                                     width: max(area.width - 27, 1),
-                                     height: 0.5)
-            separator.backgroundColor = resolvedCGColor(.separatorColor)
-            addAppsSublayer(separator)
-            cursor -= rowHeight
-        }
-
-        safeSpaceDetailAddUserFrame = CGRect(x: area.minX,
-                                             y: cursor - 34,
-                                             width: area.width,
-                                             height: 32)
-        let addIcon = CALayer()
-        addIcon.frame = CGRect(x: area.minX,
-                               y: cursor - 27,
-                               width: 18,
-                               height: 18)
-        addIcon.contentsGravity = .resizeAspect
-        addIcon.contents = symbolCGImage(named: "person.crop.circle.badge.plus", pointSize: 13)
-        addAppsSublayer(addIcon)
-
-        let addTitle = makeTextLayer(size: 11,
-                                     weight: .medium,
-                                     color: .controlAccentColor)
-        addTitle.string = "Add user…"
-        addTitle.frame = CGRect(x: area.minX + 27,
-                                y: cursor - 26,
-                                width: max(area.width - 27, 1),
-                                height: 17)
-        addAppsSublayer(addTitle)
-        return cursor - 50
-    }
-
     private func renderSafeSpaceDockerfileFragments(
         _ recipe: LocalWorkspaceRecord.Recipe,
         area: CGRect,
@@ -4430,106 +3882,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         return true
     }
 
-    private func renderSafeSpaceRecipeCatalog(
-        _ items: [LocalWorkspaceRecord.Recipe.CatalogItem],
-        area: CGRect,
-        top: CGFloat
-    ) -> CGFloat {
-        guard !items.isEmpty else { return top }
-        var cursor = top
-        let heading = makeTextLayer(size: 10,
-                                    weight: .semibold,
-                                    color: .secondaryLabelColor)
-        heading.string = "ADD SOFTWARE"
-        heading.frame = CGRect(x: area.minX, y: cursor - 14, width: area.width, height: 14)
-        addAppsSublayer(heading)
-        cursor -= 24
-
-        let groups = [("OUTER SHELL APPS", items)]
-        for (groupName, groupItems) in groups where !groupItems.isEmpty {
-            let group = makeTextLayer(size: 9,
-                                      weight: .medium,
-                                      color: .tertiaryLabelColor)
-            group.string = groupName
-            group.frame = CGRect(x: area.minX,
-                                 y: cursor - 13,
-                                 width: area.width,
-                                 height: 13)
-            addAppsSublayer(group)
-            cursor -= 18
-
-            for item in groupItems {
-                let rowHeight: CGFloat = 54
-                let rowFrame = CGRect(x: area.minX,
-                                      y: cursor - rowHeight,
-                                      width: area.width,
-                                      height: rowHeight)
-                let icon = CALayer()
-                icon.frame = CGRect(x: rowFrame.minX,
-                                    y: rowFrame.minY + 19,
-                                    width: 20,
-                                    height: 20)
-                icon.contentsGravity = .resizeAspect
-                icon.contents = symbolCGImage(named: "shippingbox", pointSize: 14)
-                addAppsSublayer(icon)
-
-                let buttonWidth: CGFloat = 58
-                let textX = rowFrame.minX + 29
-                let textWidth = max(rowFrame.width - 29 - buttonWidth - 10, 1)
-                let name = makeTextLayer(size: 11, weight: .medium, color: .labelColor)
-                name.string = item.displayName
-                name.truncationMode = .end
-                name.frame = CGRect(x: textX,
-                                    y: rowFrame.minY + 28,
-                                    width: textWidth,
-                                    height: 17)
-                addAppsSublayer(name)
-
-                let summary = makeTextLayer(size: 9,
-                                             weight: .regular,
-                                             color: .secondaryLabelColor)
-                summary.string = item.summary
-                summary.truncationMode = .end
-                summary.frame = CGRect(x: textX,
-                                       y: rowFrame.minY + 10,
-                                       width: textWidth,
-                                       height: 14)
-                addAppsSublayer(summary)
-
-                let buttonFrame = CGRect(x: rowFrame.maxX - buttonWidth,
-                                         y: rowFrame.minY + 15,
-                                         width: buttonWidth,
-                                         height: 26)
-                if item.isInstalled {
-                    let installed = makeTextLayer(size: 10,
-                                                  weight: .medium,
-                                                  color: .secondaryLabelColor,
-                                                  alignment: .right)
-                    installed.string = "Added"
-                    installed.frame = buttonFrame
-                    addAppsSublayer(installed)
-                } else {
-                    let add = makeButtonLayer(title: "Add", emphasized: false)
-                    add.frame = buttonFrame
-                    add.opacity = isPerformingWorkspaceOperation ? 0.55 : 1
-                    addAppsSublayer(add)
-                    safeSpaceDetailCatalogFrames.append((buttonFrame, item))
-                }
-
-                let separator = CALayer()
-                separator.frame = CGRect(x: textX,
-                                         y: rowFrame.minY,
-                                         width: max(rowFrame.maxX - textX, 1),
-                                         height: 0.5)
-                separator.backgroundColor = resolvedCGColor(.separatorColor)
-                addAppsSublayer(separator)
-                cursor -= rowHeight
-            }
-            cursor -= 9
-        }
-        return cursor - 5
-    }
-
     private func overviewGroupID(for item: AppLauncherItem) -> String {
         if let context = item.containerContext { return "container:\(context.container.id.uuidString.lowercased())" }
         return item.backend.serviceScope == "system" ? "root" : "user"
@@ -4980,315 +4332,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         saveOverviewLayout(layout)
     }
 
-    private func renderWorkspaceOverview(area: CGRect,
-                                         top: CGFloat,
-                                         forceSingleColumn: Bool,
-                                         showsHeading: Bool = true,
-                                         visibleIconKeys: inout Set<String>,
-                                         visibleTextKeys: inout Set<String>) -> CGFloat {
-        if showsHeading {
-            let title = makeTextLayer(size: 13,
-                                      weight: .semibold,
-                                      color: .secondaryLabelColor)
-            title.string = "SAFE SPACES"
-            title.frame = CGRect(x: area.minX,
-                                 y: top - 22,
-                                 width: max(area.width - 150, 100),
-                                 height: 18)
-            addAppsSublayer(title)
-        }
-
-        let isLoadingInitialWorkspaceState = isRefreshingWorkspaces &&
-            !workspaceOverviewAvailable
-
-        var cursor = showsHeading ? top - 42 : top
-        if isLoadingInitialWorkspaceState {
-            let loading = makeTextLayer(size: 12,
-                                        weight: .regular,
-                                        color: .secondaryLabelColor)
-            loading.string = "Loading containers…"
-            loading.frame = CGRect(x: area.minX,
-                                   y: cursor - 20,
-                                   width: area.width,
-                                   height: 18)
-            addAppsSublayer(loading)
-            cursor -= 32
-        }
-
-        let cardGap: CGFloat = 14
-        let cardCount = localWorkspaces.count + (workspaceOverviewAvailable ? 1 : 0)
-        let maximumColumnCount = min(cardCount, 3)
-        let columnCount: Int
-        if forceSingleColumn {
-            columnCount = 1
-        } else {
-            let availableColumnCount = max(
-                Int((area.width + cardGap) / (500 + cardGap)),
-                1
-            )
-            columnCount = max(min(availableColumnCount, maximumColumnCount), 1)
-        }
-        let cardWidth = floor(
-            (area.width - CGFloat(columnCount - 1) * cardGap) / CGFloat(columnCount)
-        )
-        var columnTops = Array(repeating: cursor, count: columnCount)
-
-        for workspace in localWorkspaces {
-            var columnIndex = 0
-            if columnTops.count > 1 {
-                for index in 1..<columnTops.count where columnTops[index] > columnTops[columnIndex] {
-                    columnIndex = index
-                }
-            }
-            let cardX = area.minX + CGFloat(columnIndex) * (cardWidth + cardGap)
-            let cardTop = columnTops[columnIndex]
-            let items = appLauncherItems(in: workspace)
-            let unlistedItems = items.filter(isAppUnlisted)
-            let iconItems = unlistedItems.filter(isAppProminent)
-            let overflowItems = unlistedItems.filter { !isAppProminent($0) }
-            let listGroups = Dictionary(grouping: items.filter {
-                !isAppUnlisted($0)
-            }, by: {
-                $0.frontend.listName
-            })
-            .map {
-                (
-                    name: $0.key,
-                    items: $0.value.sorted {
-                        $0.displayName.localizedCaseInsensitiveCompare($1.displayName)
-                            == .orderedAscending
-                    }
-                )
-            }
-            .sorted {
-                $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
-            }
-            let bodyWidth = max(cardWidth - 32, 1)
-            let splitGap: CGFloat = 24
-            let usesSplitLayout = bodyWidth >= 700 && !listGroups.isEmpty
-            let gridWidth = usesSplitLayout ? floor((bodyWidth - splitGap) / 2) : bodyWidth
-            let pinnedAppsHeight = flatAppRowsHeight(
-                itemCount: iconItems.count,
-                includesAddApp: false,
-                width: gridWidth
-            )
-            let terminalAppsHeight = 24 + flatAppRowsHeight(
-                itemCount: workspace.commandLaunchers.count + 1,
-                includesAddApp: false,
-                width: gridWidth
-            )
-            let gridHeight = pinnedAppsHeight + terminalAppsHeight
-            let scope = AppLauncherScope.container(workspace.id)
-            let overflowHeight = overflowItems.isEmpty
-                ? 0
-                : appOverflowHeight(
-                    itemCount: overflowItems.count,
-                    width: gridWidth,
-                    scope: scope
-                )
-            let listHeight = listGroups.reduce(CGFloat(0)) {
-                $0 + 48 + CGFloat(max($1.items.count, 1)) * 42
-            }
-            let appBodyHeight: CGFloat
-            if usesSplitLayout {
-                appBodyHeight = max(
-                    max(
-                        gridHeight + (overflowItems.isEmpty ? 0 : 6) + overflowHeight,
-                        listHeight
-                    ),
-                    44
-                )
-            } else {
-                appBodyHeight = gridHeight + (overflowItems.isEmpty ? 0 : 6) + overflowHeight
-                    + (listGroups.isEmpty ? 0 : 18 + listHeight)
-            }
-            let cardHeight = 64 + appBodyHeight
-            let cardFrame = CGRect(x: cardX,
-                                   y: cardTop - cardHeight,
-                                   width: cardWidth,
-                                   height: cardHeight)
-            workspaceOverviewRowFrames.append((cardFrame, workspace))
-
-            let card = CALayer()
-            card.frame = cardFrame
-            styleWorkspaceOverviewCard(card)
-            addAppsSublayer(card)
-
-            let displayedState = displayedWorkspaceState(for: workspace)
-            let stateColor: NSColor
-            switch displayedState {
-            case "running":
-                stateColor = .systemGreen
-            case "creating", "starting":
-                stateColor = .systemBlue
-            default:
-                stateColor = .tertiaryLabelColor
-            }
-            let stateDot = CALayer()
-            stateDot.frame = CGRect(x: 16, y: cardHeight - 31, width: 8, height: 8)
-            stateDot.cornerRadius = 4
-            stateDot.backgroundColor = resolvedCGColor(stateColor)
-            card.addSublayer(stateDot)
-
-            let name = makeTextLayer(size: 15, weight: .semibold, color: .labelColor)
-            name.string = workspace.name
-            name.frame = CGRect(x: 32,
-                                y: cardHeight - 38,
-                                width: max(cardFrame.width - 210, 80),
-                                height: 21)
-            card.addSublayer(name)
-
-            let runtime = makeTextLayer(size: 10,
-                                        weight: .regular,
-                                        color: .secondaryLabelColor)
-            runtime.string = [workspace.runtimeDescription, workspace.outerShellSupportIssue]
-                .compactMap { $0 }
-                .joined(separator: " · ")
-            runtime.truncationMode = .end
-            runtime.frame = CGRect(x: 32,
-                                   y: cardHeight - 56,
-                                   width: max(cardFrame.width - 210, 80),
-                                   height: 15)
-            card.addSublayer(runtime)
-
-            let actionsButton = makeSymbolButtonLayer(
-                symbolName: "ellipsis.circle",
-                accessibilityTitle: "Actions for \(workspace.name)"
-            )
-            let localActionsFrame = CGRect(x: cardFrame.width - 42,
-                                           y: cardHeight - 46,
-                                           width: 26,
-                                           height: 26)
-            actionsButton.frame = localActionsFrame
-            card.addSublayer(actionsButton)
-            workspaceOverviewActionFrames.append((
-                localActionsFrame.offsetBy(dx: cardFrame.minX, dy: cardFrame.minY),
-                workspace,
-                "menu"
-            ))
-
-            if workspace.recipe != nil {
-                let localEditFrame = CGRect(
-                    x: localActionsFrame.minX - 116,
-                    y: cardHeight - 47,
-                    width: 108,
-                    height: 28
-                )
-                let editButton = makeButtonLayer(title: "Edit container", emphasized: false)
-                editButton.frame = localEditFrame
-                card.addSublayer(editButton)
-                workspaceOverviewActionFrames.append((
-                    localEditFrame.offsetBy(dx: cardFrame.minX, dy: cardFrame.minY),
-                    workspace,
-                    "editContainer"
-                ))
-            }
-
-            let bodyTop = cardFrame.maxY - 64
-            let bodyArea = CGRect(x: cardFrame.minX + 16,
-                                  y: 0,
-                                  width: bodyWidth,
-                                  height: 0)
-            if usesSplitLayout {
-                let columnWidth = floor((bodyWidth - splitGap) / 2)
-                let iconArea = CGRect(x: bodyArea.minX,
-                                      y: 0,
-                                      width: columnWidth,
-                                      height: 0)
-                let listArea = CGRect(x: bodyArea.minX + columnWidth + splitGap,
-                                      y: 0,
-                                      width: columnWidth,
-                                      height: 0)
-                let iconBottom = renderContainerPinnedRows(
-                    items: iconItems,
-                    workspace: workspace,
-                    area: iconArea,
-                    top: bodyTop,
-                    visibleIconKeys: &visibleIconKeys,
-                    visibleTextKeys: &visibleTextKeys
-                )
-                if !overflowItems.isEmpty {
-                    _ = renderAppOverflow(items: overflowItems,
-                                          area: iconArea,
-                                          top: iconBottom - 6,
-                                          scope: scope,
-                                          buttonHorizontalOutset: 16,
-                                          visibleIconKeys: &visibleIconKeys,
-                                          visibleTextKeys: &visibleTextKeys)
-                }
-                _ = renderAppListGroups(groups: listGroups,
-                                        area: listArea,
-                                        top: bodyTop,
-                                        scope: scope,
-                                        visibleIconKeys: &visibleIconKeys,
-                                        visibleTextKeys: &visibleTextKeys)
-            } else {
-                var nextTop = renderContainerPinnedRows(
-                    items: iconItems,
-                    workspace: workspace,
-                    area: bodyArea,
-                    top: bodyTop,
-                    visibleIconKeys: &visibleIconKeys,
-                    visibleTextKeys: &visibleTextKeys
-                )
-                if !overflowItems.isEmpty {
-                    nextTop = renderAppOverflow(items: overflowItems,
-                                                area: bodyArea,
-                                                top: nextTop - 6,
-                                                scope: scope,
-                                                buttonHorizontalOutset: 16,
-                                                visibleIconKeys: &visibleIconKeys,
-                                                visibleTextKeys: &visibleTextKeys)
-                }
-                if !listGroups.isEmpty {
-                    _ = renderAppListGroups(groups: listGroups,
-                                            area: bodyArea,
-                                            top: nextTop - 18,
-                                            scope: scope,
-                                            visibleIconKeys: &visibleIconKeys,
-                                            visibleTextKeys: &visibleTextKeys)
-                }
-            }
-
-            columnTops[columnIndex] = cardFrame.minY - 12
-        }
-
-        if workspaceOverviewAvailable {
-            var columnIndex = 0
-            if columnTops.count > 1 {
-                for index in 1..<columnTops.count where columnTops[index] > columnTops[columnIndex] {
-                    columnIndex = index
-                }
-            }
-            let cardX = area.minX + CGFloat(columnIndex) * (cardWidth + cardGap)
-            let cardHeight: CGFloat = 100
-            let cardFrame = CGRect(x: cardX,
-                                   y: columnTops[columnIndex] - cardHeight,
-                                   width: cardWidth,
-                                   height: cardHeight)
-            workspaceOverviewCreateFrame = cardFrame
-            renderAddContainerCard(frame: cardFrame)
-            columnTops[columnIndex] = cardFrame.minY - 12
-        }
-
-        if cardCount > 0 {
-            cursor = columnTops.min() ?? cursor
-        }
-
-        if !workspacePanelMessage.isEmpty {
-            let message = makeTextLayer(size: 11,
-                                        weight: .medium,
-                                        color: workspacePanelMessage.lowercased().contains("could not")
-                                            ? .systemRed
-                                            : .secondaryLabelColor)
-            message.string = workspacePanelMessage
-            message.frame = CGRect(x: area.minX, y: cursor - 18, width: area.width, height: 18)
-            addAppsSublayer(message)
-            cursor -= 26
-        }
-        return cursor - 10
-    }
-
     private func renderAddContainerCard(frame: CGRect) {
         let card = CALayer()
         card.frame = frame
@@ -5666,38 +4709,11 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         }
     }
 
-    private func isAppUnlisted(_ item: AppLauncherItem) -> Bool {
-        item.frontend.listName.isEmpty ||
-            item.frontend.listName == alwaysShownAppListName ||
-            item.frontend.listName == moreAppsListName
-    }
-
     private func isAppProminent(_ item: AppLauncherItem) -> Bool {
         if let keys = overviewLayout.pins[overviewGroupID(for: item)] {
             return keys.contains(overviewKey(for: item))
         }
         return ["org.outershell.files", "org.outershell.top"].contains(item.backend.serviceID.lowercased())
-    }
-
-    private func appOverflowHeight(itemCount: Int,
-                                   width: CGFloat,
-                                   scope: AppLauncherScope) -> CGFloat {
-        let progress = appOverflowProgress(for: scope, itemCount: itemCount)
-        let rowsHeight = flatAppRowsHeight(itemCount: itemCount,
-                                           includesAddApp: false,
-                                           width: width)
-        return 24 + progress * (6 + rowsHeight)
-    }
-
-    private func appOverflowProgress(for scope: AppLauncherScope,
-                                     itemCount: Int) -> CGFloat {
-        guard itemCount > 0 else {
-            return 0
-        }
-        if let progress = appOverflowAnimationProgress[scope] {
-            return min(max(progress, 0), 1)
-        }
-        return expandedAppOverflowScopes.contains(scope) ? 1 : 0
     }
 
     private func toggleAppOverflow(_ scope: AppLauncherScope) {
@@ -5754,102 +4770,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                               startTime: startTime,
                                               duration: duration)
         }
-    }
-
-    private func renderAppOverflow(items: [AppLauncherItem],
-                                   area: CGRect,
-                                   top: CGFloat,
-                                   scope: AppLauncherScope,
-                                   buttonHorizontalOutset: CGFloat = 0,
-                                   visibleIconKeys: inout Set<String>,
-                                   visibleTextKeys: inout Set<String>) -> CGFloat {
-        let progress = appOverflowProgress(for: scope, itemCount: items.count)
-        let buttonHeight: CGFloat = 24
-        let rowsHeight = flatAppRowsHeight(itemCount: items.count,
-                                           includesAddApp: false,
-                                           width: area.width)
-        let height = appOverflowHeight(itemCount: items.count,
-                                       width: area.width,
-                                       scope: scope)
-        let frame = CGRect(x: area.minX, y: top - height, width: area.width, height: height)
-        let buttonFrame = CGRect(
-            x: frame.minX - buttonHorizontalOutset,
-            y: frame.maxY - buttonHeight,
-            width: frame.width + buttonHorizontalOutset * 2,
-            height: buttonHeight
-        )
-        appUnlistedDropFrames.append((frame, scope, .moreApps))
-        appOverflowFrames.append((buttonFrame, scope))
-
-        let button = CALayer()
-        button.frame = buttonFrame
-        button.backgroundColor = resolvedCGColor(
-            NSColor.controlBackgroundColor.withAlphaComponent(0.2)
-        )
-        button.borderWidth = 0.5
-        button.borderColor = resolvedCGColor(.separatorColor)
-        if buttonHorizontalOutset > 0 {
-            button.cornerRadius = 12
-            button.maskedCorners = [.layerMinXMinYCorner, .layerMaxXMinYCorner]
-            if progress > 0.001 {
-                button.cornerRadius = 0
-                button.maskedCorners = []
-            }
-        } else {
-            button.cornerRadius = 6
-        }
-        addAppsSublayer(button)
-
-        let disclosure = CALayer()
-        disclosure.frame = CGRect(x: floor(buttonFrame.midX - 7),
-                                  y: floor(buttonFrame.midY - 7),
-                                  width: 14,
-                                  height: 14)
-        disclosure.contentsGravity = .resizeAspect
-        disclosure.contentsScale = 2
-        disclosure.contents = symbolCGImage(named: "chevron.down",
-                                             pointSize: 11,
-                                             color: .secondaryLabelColor)
-        disclosure.setAffineTransform(CGAffineTransform(rotationAngle: .pi * progress))
-        addAppsSublayer(disclosure)
-
-        guard progress > 0.001, rowsHeight > 0 else {
-            return frame.minY
-        }
-
-        let listFrame = CGRect(x: frame.minX,
-                               y: buttonFrame.minY - 6 - rowsHeight,
-                               width: frame.width,
-                               height: rowsHeight)
-        let visibleRowsHeight = rowsHeight * progress
-        let visibleRowsMaxY = buttonFrame.minY - 6 * progress
-        let clipFrame = CGRect(x: listFrame.minX,
-                               y: visibleRowsMaxY - visibleRowsHeight,
-                               width: listFrame.width,
-                               height: visibleRowsHeight)
-        let rowsClip = CALayer()
-        rowsClip.bounds = clipFrame
-        rowsClip.position = CGPoint(x: clipFrame.midX, y: clipFrame.midY)
-        rowsClip.masksToBounds = true
-        addAppsSublayer(rowsClip)
-        let iconKeysBeforeRendering = visibleIconKeys
-        let textKeysBeforeRendering = visibleTextKeys
-        appsRenderTargetOverride = rowsClip
-        renderFlatAppRows(items: items,
-                          frame: listFrame,
-                          includesAddApp: false,
-                          visibleIconKeys: &visibleIconKeys,
-                          visibleTextKeys: &visibleTextKeys)
-        appsRenderTargetOverride = nil
-        let animatedIconKeys = visibleIconKeys.subtracting(iconKeysBeforeRendering)
-        let animatedTextKeys = visibleTextKeys.subtracting(textKeysBeforeRendering)
-        for key in animatedIconKeys {
-            iconMatchLayers[key]?.opacity = Float(progress)
-        }
-        for key in animatedTextKeys {
-            textMatchLayers[key]?.opacity = Float(progress)
-        }
-        return frame.minY
     }
 
     private func flatAppColumnCount(for width: CGFloat) -> Int {
@@ -5947,118 +4867,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                           visibleTextKeys: &visibleTextKeys)
 
         appUnlistedDropFrames.append((frame, scope, .pinned))
-        return frame.minY
-    }
-
-    private func renderContainerPinnedRows(
-        items: [AppLauncherItem],
-        workspace: LocalWorkspaceRecord,
-        area: CGRect,
-        top: CGFloat,
-        visibleIconKeys: inout Set<String>,
-        visibleTextKeys: inout Set<String>
-    ) -> CGFloat {
-        let commands = workspace.commandLaunchers
-        let appsHeight = flatAppRowsHeight(
-            itemCount: items.count,
-            includesAddApp: false,
-            width: area.width
-        )
-        let appsFrame = CGRect(
-            x: area.minX,
-            y: top - appsHeight,
-            width: area.width,
-            height: appsHeight
-        )
-        if !items.isEmpty {
-            renderFlatAppRows(
-                items: items,
-                frame: appsFrame,
-                includesAddApp: false,
-                visibleIconKeys: &visibleIconKeys,
-                visibleTextKeys: &visibleTextKeys
-            )
-        }
-
-        let headingTop = appsFrame.minY
-        let heading = makeTextLayer(
-            size: 10,
-            weight: .semibold,
-            color: .secondaryLabelColor
-        )
-        heading.string = "COMMAND LINE TOOLS"
-        heading.frame = CGRect(
-            x: area.minX + 8,
-            y: headingTop - 18,
-            width: max(area.width - 16, 1),
-            height: 14
-        )
-        addAppsSublayer(heading)
-
-        let terminalTop = headingTop - 24
-        let totalCount = commands.count + 1
-        let rowHeight: CGFloat = 42
-        let columnGap: CGFloat = 18
-        let columns = min(flatAppColumnCount(for: area.width), totalCount)
-        let rows = Int(ceil(Double(totalCount) / Double(columns)))
-        let height = flatAppRowsHeight(
-            itemCount: totalCount,
-            includesAddApp: false,
-            width: area.width
-        )
-        let frame = CGRect(
-            x: area.minX,
-            y: terminalTop - height,
-            width: area.width,
-            height: height
-        )
-        let columnWidth = floor(
-            (frame.width - CGFloat(columns - 1) * columnGap) / CGFloat(columns)
-        )
-
-        for index in 0..<totalCount {
-            let column = index / rows
-            let row = index % rows
-            let columnX = frame.minX + CGFloat(column) * (columnWidth + columnGap)
-            let actualColumnWidth = column == columns - 1
-                ? frame.maxX - columnX
-                : columnWidth
-            let rowFrame = CGRect(
-                x: columnX + 8,
-                y: frame.maxY - 8 - CGFloat(row + 1) * rowHeight,
-                width: actualColumnWidth - 16,
-                height: rowHeight
-            )
-            if index == 0 {
-                renderContainerTerminalRow(
-                    workspace: workspace,
-                    frame: rowFrame,
-                    showsSeparator: row > 0,
-                    visibleIconKeys: &visibleIconKeys,
-                    visibleTextKeys: &visibleTextKeys
-                )
-            } else {
-                renderContainerCommandRow(
-                    workspace: workspace,
-                    command: commands[index - 1],
-                    frame: rowFrame,
-                    showsSeparator: row > 0,
-                    visibleIconKeys: &visibleIconKeys,
-                    visibleTextKeys: &visibleTextKeys
-                )
-            }
-        }
-
-        appUnlistedDropFrames.append((
-            CGRect(
-                x: area.minX,
-                y: frame.minY,
-                width: area.width,
-                height: top - frame.minY
-            ),
-            .container(workspace.id),
-            .pinned
-        ))
         return frame.minY
     }
 
@@ -6813,43 +5621,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         } else {
             bundledAppInstallFrames.append((frame, backend))
         }
-    }
-
-    private func renderAppListGroups(groups: [(name: String, items: [AppLauncherItem])],
-                                     area: CGRect,
-                                     top: CGFloat,
-                                     scope: AppLauncherScope = .server,
-                                     visibleIconKeys: inout Set<String>,
-                                     visibleTextKeys: inout Set<String>) -> CGFloat {
-        guard !groups.isEmpty else { return top }
-
-        let rowHeight: CGFloat = 42
-        let labelHeight: CGFloat = 18
-        let widgetTopPadding: CGFloat = 8
-        let widgetBottomPadding: CGFloat = 8
-        var y = top
-
-        for group in groups {
-            let rowCount = max(group.items.count, 1)
-            let widgetHeight = widgetTopPadding + CGFloat(rowCount) * rowHeight + widgetBottomPadding
-            y -= widgetHeight
-            let widgetFrame = CGRect(x: area.minX, y: y, width: area.width, height: widgetHeight)
-            appListDropFrames.append((widgetFrame, group.name, scope))
-            renderAppListWidget(name: group.name,
-                                items: group.items,
-                                frame: widgetFrame,
-                                rowHeight: rowHeight,
-                                visibleIconKeys: &visibleIconKeys,
-                                visibleTextKeys: &visibleTextKeys)
-
-            let label = makeTextLayer(size: 12, weight: .medium, color: .secondaryLabelColor, alignment: .center)
-            label.string = group.name
-            label.frame = CGRect(x: widgetFrame.minX, y: widgetFrame.minY - labelHeight, width: widgetFrame.width, height: 16)
-            addAppsSublayer(label)
-            y -= labelHeight + 14
-        }
-
-        return y
     }
 
     private func renderAppListWidget(name: String,
@@ -9865,82 +8636,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         return components.url ?? currentURL
     }
 
-    private func setFrontendList(for item: AppLauncherItem, listName: String, didRecoverNetworking: Bool = false) {
-        let message: String
-        switch listName {
-        case alwaysShownAppListName:
-            message = "Always showing \(item.displayName)…"
-        case moreAppsListName:
-            message = "Moving \(item.displayName) to More Apps…"
-        case "":
-            message = "Moving \(item.displayName) to Apps…"
-        default:
-            message = "Moving \(item.displayName) to \(listName)…"
-        }
-        if let context = item.containerContext {
-            workspacePanelMessage = message
-            sendWorkspaceRequest(operation: "setAppList",
-                                 workspaceID: context.container.id,
-                                 frontendID: context.app.frontendID,
-                                 listName: listName)
-            return
-        }
-        guard !isPerformingAction, let controlEndpoint, let urlSession else { return }
-        isPerformingAction = true
-        backendsRefreshGeneration += 1
-        backendError = message
-        updateLayout()
-
-        var components = URLComponents(url: controlEndpoint, resolvingAgainstBaseURL: false)
-        components?.queryItems = [
-            URLQueryItem(name: "serviceID", value: item.backend.serviceID),
-            URLQueryItem(name: "operation", value: "setFrontendList")
-        ]
-        guard let url = components?.url else {
-            isPerformingAction = false
-            backendError = "Could not build list update request."
-            updateLayout()
-            return
-        }
-
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.setValue("application/x-www-form-urlencoded; charset=utf-8", forHTTPHeaderField: "Content-Type")
-        request.httpBody = formEncodedBody([
-            "frontendID": item.frontend.id,
-            "frontendURL": item.frontend.url,
-            "list": listName
-        ])
-        urlSession.dataTask(with: request) { [weak self] data, _, error in
-            Task { @MainActor in
-                guard let self else { return }
-                self.isPerformingAction = false
-                if let error {
-                    if !didRecoverNetworking, self.recoverNetworkingIfNeeded(after: error) {
-                        self.setFrontendList(for: item,
-                                             listName: listName,
-                                             didRecoverNetworking: true)
-                        return
-                    }
-                    self.backendError = error.localizedDescription
-                } else if let data,
-                          let response = try? ActionResponse.decodeBinary(data) {
-                    self.backendError = response.ok ? "" : response.message
-                    if response.ok {
-                        self.applyOptimisticFrontendList(serviceID: item.backend.serviceID,
-                                                         frontendURL: item.frontend.url,
-                                                         listName: listName)
-                    } else {
-                        self.updateLayout()
-                    }
-                } else {
-                    self.backendError = "List update request failed."
-                    self.updateLayout()
-                }
-            }
-        }.resume()
-    }
-
     private func controlContainerApp(_ context: ContainerAppLauncherContext,
                                      operation: String) {
         let action: String
@@ -10012,53 +8707,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                  menuBarVisibilityEnabled: backend.menuBarVisibilityEnabled,
                                  menuBarVisibilityAvailable: backend.menuBarVisibilityAvailable,
                                  frontends: backend.frontends,
-                                 logFiles: backend.logFiles)
-        }
-        updateLayout()
-    }
-
-    private func applyOptimisticFrontendList(serviceID: String, frontendURL: String, listName: String) {
-        backends = backends.map { backend in
-            guard backend.serviceID == serviceID else { return backend }
-            let frontends = backend.frontends.map { frontend in
-                guard frontend.url == frontendURL else { return frontend }
-                return FrontendRecord(id: frontend.id,
-                                      name: frontend.name,
-                                      url: frontend.url,
-                                      port: frontend.port,
-                                      socketPath: frontend.socketPath,
-                                      iconPath: frontend.iconPath,
-                                      iconByteCount: frontend.iconByteCount,
-                                      iconCGImage: frontend.iconCGImage,
-                                      iconObservationToken: frontend.iconObservationToken,
-                                      list: listName.isEmpty ? nil : listName,
-                                      isRunning: frontend.isRunning,
-                                      iconURL: frontend.iconURL)
-            }
-            return BackendRecord(serviceID: backend.serviceID,
-                                 displayName: backend.displayName,
-                                 serviceUnit: backend.serviceUnit,
-                                 serviceUnitPath: backend.serviceUnitPath,
-                                 serviceScope: backend.serviceScope,
-                                 status: backend.status,
-                                 canControl: backend.canControl,
-                                 canUninstall: backend.canUninstall,
-                                 isBundled: backend.isBundled,
-                                 isInstalled: backend.isInstalled,
-                                 isMigration: backend.isMigration,
-                                 supportsRoot: backend.supportsRoot,
-                                 rootOnly: backend.rootOnly,
-                                 hasRootSupport: backend.hasRootSupport,
-                                 installedVersion: backend.installedVersion,
-                                 availableVersion: backend.availableVersion,
-                                 scriptPath: backend.scriptPath,
-                                 publicBaseURL: backend.publicBaseURL,
-                                 iconSymbolName: backend.iconSymbolName,
-                                 launchdPlistPath: backend.launchdPlistPath,
-                                 ownsLaunchdPlist: backend.ownsLaunchdPlist,
-                                 menuBarVisibilityEnabled: backend.menuBarVisibilityEnabled,
-                                 menuBarVisibilityAvailable: backend.menuBarVisibilityAvailable,
-                                 frontends: frontends,
                                  logFiles: backend.logFiles)
         }
         updateLayout()
@@ -13593,9 +12241,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 )
                 return
             }
-            let isInteractive = workspaceCloseFrame.contains(point) ||
-                workspaceCreateFrame.contains(point) ||
-                workspaceActionFrames.contains { $0.frame.contains(point) }
+            let isInteractive = workspaceCloseFrame.contains(point)
             setCursorIfNeeded(isInteractive ? .pointingHand : .arrow)
             return
         }
@@ -14444,31 +13090,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 dismissWorkspacePanel()
                 return
             }
-            guard !isPerformingWorkspaceOperation else { return }
-            if workspaceCreateFrame.contains(point) {
-                armButtonClick(frame: workspaceCreateFrame,
-                               performAtPoint: { [weak self] releasePoint in
-                    self?.showSafeSpaceProviderMenu(at: releasePoint)
-                })
-                return
-            }
-            if let action = workspaceActionFrames.first(where: { $0.frame.contains(point) }) {
-                armButtonClick(frame: action.frame,
-                               performAtPoint: { [weak self] releasePoint in
-                    guard let self else { return }
-                    if action.operation == "copyShell" {
-                        self.showWorkspaceShellCommandMenu(action.workspace,
-                                                           at: releasePoint)
-                    } else if action.operation == "rename" {
-                        self.showWorkspaceRename(action.workspace)
-                    } else {
-                        self.sendWorkspaceRequest(operation: action.operation,
-                                                  workspaceID: action.workspace.id)
-                    }
-                })
-            }
             return
         }
+
         if pendingInstallBackend != nil {
             if installConfirmFrame.contains(point) {
                 armButtonClick(frame: installConfirmFrame, action: .installConfirm(operation: "run"))
@@ -16193,13 +14817,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             return true
         }
         return false
-    }
-
-    private func showWorkspacePanel() {
-        isShowingWorkspacePanel = true
-        workspacePanelMessage = ""
-        sendWorkspaceRequest(operation: "list")
-        updateLayout()
     }
 
     private func dismissWorkspacePanel() {
@@ -18666,9 +17283,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             dy: workspacePanelFrame.minY
         )
         workspaceCloseFrame = .zero
-        workspaceCreateFrame = .zero
-        workspaceRowFrames.removeAll()
-        workspaceActionFrames.removeAll()
     }
 
     private func renderWorkspacePanelIfNeeded(width: CGFloat, height: CGFloat) {
@@ -18677,9 +17291,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             workspacePanelLayer.sublayers = nil
             workspacePanelFrame = .zero
             workspaceCloseFrame = .zero
-            workspaceCreateFrame = .zero
-            workspaceRowFrames.removeAll()
-            workspaceActionFrames.removeAll()
             workspaceRenamePanelFrame = .zero
             workspaceRenameFieldFrame = .zero
             workspaceRenameTextFrame = .zero
@@ -18714,19 +17325,21 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         }
 
         workspaceOverlayLayer.backgroundColor = resolvedCGColor(NSColor.black.withAlphaComponent(0.24))
-        let showsStandaloneNamePrompt = workspaceNamePromptDismissesPanel &&
-            isWorkspaceNamePromptVisible
+        let showsStandaloneNamePrompt = isWorkspaceNamePromptVisible
         let showsDeletePrompt = pendingWorkspaceDeletion != nil
-        let panelWidth = showsStandaloneNamePrompt || showsDeletePrompt
-            ? (pendingSharedContainerImport != nil
+        guard showsStandaloneNamePrompt || showsDeletePrompt else {
+            isShowingWorkspacePanel = false
+            workspaceOverlayLayer.isHidden = true
+            workspacePanelLayer.sublayers = nil
+            workspacePanelFrame = .zero
+            return
+        }
+        let panelWidth = pendingSharedContainerImport != nil
                 ? min(max(width - 72, 460), 680)
                 : (isDockerfileFragmentPrompt
                 ? min(max(width - 72, 520), 760)
-                : min(max(width - 72, 320), 460)))
-            : min(max(width - 48, 420), 680)
-        let desiredHeight = CGFloat(localWorkspaces.count) * 74 + 170
-        let panelHeight = showsStandaloneNamePrompt || showsDeletePrompt
-            ? (pendingSharedContainerImport != nil
+                : min(max(width - 72, 320), 460))
+        let panelHeight = pendingSharedContainerImport != nil
                 ? min(
                     CGFloat(224 + min(pendingSharedContainerImport?.mounts.count ?? 0, 5) * 50),
                     max(height - 72, 274)
@@ -18737,8 +17350,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                     ? 184
                     : (isBaseImageChoicePrompt
                         ? 310
-                        : (isCreatingWorkspace && !isEditingCreationBaseImage ? 224 : 174)))))
-            : min(max(desiredHeight, 290), max(height - 48, 220))
+                        : (isCreatingWorkspace && !isEditingCreationBaseImage ? 224 : 174))))
         workspacePanelFrame = CGRect(x: floor((width - panelWidth) / 2),
                                      y: floor((height - panelHeight) / 2),
                                      width: panelWidth,
@@ -18753,8 +17365,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         workspacePanelLayer.shadowRadius = 18
         workspacePanelLayer.shadowOffset = CGSize(width: 0, height: -4)
         workspacePanelLayer.sublayers = nil
-        workspaceRowFrames.removeAll()
-        workspaceActionFrames.removeAll()
 
         if showsDeletePrompt {
             renderWorkspaceDeletionPrompt(panelWidth: panelWidth,
@@ -18768,135 +17378,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             return
         }
 
-        let title = makeTextLayer(size: 20, weight: .semibold, color: .labelColor)
-        title.string = "Containers"
-        title.frame = CGRect(x: 24, y: panelHeight - 48, width: panelWidth - 190, height: 26)
-        workspacePanelLayer.addSublayer(title)
-
-        let subtitle = makeTextLayer(size: 12, weight: .regular, color: .secondaryLabelColor)
-        subtitle.string = "Isolated local servers. Drop files onto one to import them without uploading."
-        subtitle.frame = CGRect(x: 24, y: panelHeight - 72, width: panelWidth - 48, height: 18)
-        workspacePanelLayer.addSublayer(subtitle)
-
-        let close = makeSymbolButtonLayer(symbolName: "xmark.circle.fill",
-                                          accessibilityTitle: "Close Containers")
-        let localCloseFrame = CGRect(x: panelWidth - 42, y: panelHeight - 43, width: 24, height: 24)
-        close.frame = localCloseFrame
-        workspaceCloseFrame = localCloseFrame.offsetBy(dx: workspacePanelFrame.minX,
-                                                        dy: workspacePanelFrame.minY)
-        workspacePanelLayer.addSublayer(close)
-
-        let create = makeButtonLayer(title: "New Container", emphasized: true)
-        let localCreateFrame = CGRect(x: panelWidth - 142,
-                                      y: panelHeight - 113,
-                                      width: 118,
-                                      height: 30)
-        create.frame = localCreateFrame
-        workspaceCreateFrame = localCreateFrame.offsetBy(dx: workspacePanelFrame.minX,
-                                                          dy: workspacePanelFrame.minY)
-        workspacePanelLayer.addSublayer(create)
-
-        let heading = makeTextLayer(size: 13, weight: .semibold, color: .labelColor)
-        heading.string = localWorkspaces.isEmpty ? "No containers yet" : "On This Mac"
-        heading.frame = CGRect(x: 24, y: panelHeight - 108, width: panelWidth - 190, height: 20)
-        workspacePanelLayer.addSublayer(heading)
-
-        var rowY = panelHeight - 178
-        for workspace in localWorkspaces {
-            guard rowY >= 50 else { break }
-            let localRowFrame = CGRect(x: 20, y: rowY, width: panelWidth - 40, height: 64)
-            let rowFrame = localRowFrame.offsetBy(dx: workspacePanelFrame.minX,
-                                                  dy: workspacePanelFrame.minY)
-            workspaceRowFrames.append((rowFrame, workspace))
-
-            let row = CALayer()
-            row.frame = localRowFrame
-            row.cornerRadius = 9
-            row.backgroundColor = resolvedCGColor(NSColor.controlBackgroundColor.withAlphaComponent(0.78))
-            row.borderWidth = 0.5
-            row.borderColor = resolvedCGColor(.separatorColor)
-            workspacePanelLayer.addSublayer(row)
-
-            let name = makeTextLayer(size: 14, weight: .semibold, color: .labelColor)
-            name.string = workspace.name
-            name.frame = CGRect(x: 14, y: 34, width: max(localRowFrame.width - 350, 80), height: 20)
-            row.addSublayer(name)
-
-            let details = makeTextLayer(size: 11, weight: .regular, color: .secondaryLabelColor)
-            let displayedState = displayedWorkspaceState(for: workspace)
-            details.string = "\(displayedState.capitalized) • Drop files here"
-            details.frame = CGRect(x: 14, y: 12, width: max(localRowFrame.width - 280, 80), height: 17)
-            row.addSublayer(details)
-
-            let renameButton = makeSymbolButtonLayer(
-                symbolName: "pencil",
-                accessibilityTitle: "Rename \(workspace.name)"
-            )
-            let localRenameFrame = CGRect(x: localRowFrame.width - 278,
-                                          y: 19,
-                                          width: 26,
-                                          height: 26)
-            renameButton.frame = localRenameFrame
-            row.addSublayer(renameButton)
-            workspaceActionFrames.append((
-                localRenameFrame.offsetBy(dx: rowFrame.minX, dy: rowFrame.minY),
-                workspace,
-                "rename"
-            ))
-
-            if !workspace.shellCommand.isEmpty {
-                let shellButton = makeButtonLayer(title: "Copy Shell", emphasized: false)
-                let localShellFrame = CGRect(x: localRowFrame.width - 246,
-                                             y: 17,
-                                             width: 82,
-                                             height: 30)
-                shellButton.frame = localShellFrame
-                row.addSublayer(shellButton)
-                workspaceActionFrames.append((
-                    localShellFrame.offsetBy(dx: rowFrame.minX, dy: rowFrame.minY),
-                    workspace,
-                    "copyShell"
-                ))
-            }
-
-            let operation = displayedState == "running" ? "stop" : "start"
-            let stateButton = makeButtonLayer(title: operation == "stop" ? "Stop" : "Start",
-                                              emphasized: false)
-            let localStateFrame = CGRect(x: localRowFrame.width - 154, y: 17, width: 60, height: 30)
-            stateButton.frame = localStateFrame
-            stateButton.opacity = isPerformingWorkspaceOperation ? 0.55 : 1
-            row.addSublayer(stateButton)
-            workspaceActionFrames.append((
-                localStateFrame.offsetBy(dx: rowFrame.minX, dy: rowFrame.minY),
-                workspace,
-                operation
-            ))
-
-            let openButton = makeButtonLayer(title: "Open", emphasized: true)
-            let localOpenFrame = CGRect(x: localRowFrame.width - 84, y: 17, width: 66, height: 30)
-            openButton.frame = localOpenFrame
-            openButton.opacity = isPerformingWorkspaceOperation ? 0.55 : 1
-            row.addSublayer(openButton)
-            workspaceActionFrames.append((
-                localOpenFrame.offsetBy(dx: rowFrame.minX, dy: rowFrame.minY),
-                workspace,
-                "open"
-            ))
-            rowY -= 74
-        }
-
-        if !workspacePanelMessage.isEmpty {
-            let message = makeTextLayer(size: 11,
-                                        weight: .medium,
-                                        color: workspacePanelMessage.lowercased().contains("could not")
-                                            ? .systemRed
-                                            : .secondaryLabelColor)
-            message.string = workspacePanelMessage
-            message.frame = CGRect(x: 24, y: 18, width: panelWidth - 48, height: 18)
-            workspacePanelLayer.addSublayer(message)
-        }
-        renderWorkspaceRenamePromptIfNeeded(panelWidth: panelWidth,
-                                            panelHeight: panelHeight)
     }
 
     private func renderContainerConfigurationPanel(width: CGFloat, height: CGFloat) {
@@ -21060,18 +19541,15 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         var operationByItemID: [String: String] = [:]
         var items: [OuterframeContextMenuItem] = []
         if backend.isBackendsSelf {
-            operationByItemID["workspaces"] = "showWorkspaces"
-            items.append(OuterframeContextMenuItem(id: "workspaces",
-                                                   title: "Containers…",
-                                                   isEnabled: true))
             operationByItemID["about"] = "aboutOuterShell"
             items.append(OuterframeContextMenuItem(id: "about",
                                                    title: "About Outer Shell",
                                                    isEnabled: true))
             operationByItemID["showLogs"] = "showLogs:\(backend.serviceID):\(backend.serviceScope)"
             items.append(OuterframeContextMenuItem(id: "showLogs",
-                                                   title: "View Logs for Outer Shell",
-                                                   isEnabled: true))
+                                                   title: "Show logs",
+                                                   isEnabled: true,
+                                                   systemImageName: "doc.plaintext"))
             if backend.menuBarVisibilityAvailable {
                 operationByItemID["menuBarVisibility"] = "toggleMenuBarVisibility"
                 items.append(OuterframeContextMenuItem(id: "menuBarVisibility",
@@ -21590,10 +20068,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
         guard let menuAction = pendingMenuActions.removeValue(forKey: menuID),
               let operation = menuAction.operationByItemID[itemID] else {
-            return
-        }
-        if operation == "showWorkspaces" {
-            showWorkspacePanel()
             return
         }
         guard let backend = backends.first(where: {

@@ -5946,12 +5946,7 @@ static uint64_t frontend_icon_path_hash(const char *path) {
     return hash;
 }
 
-static size_t frontend_icon_target_size(const char *list) {
-    return list && list[0] ? 60 : 92;
-}
-
 static const char *frontend_icon_data_path(const char *icon_path,
-                                           const char *list,
                                            char *cached_path,
                                            size_t cached_path_size) {
     if (!icon_path || !icon_path[0] || !cached_path || cached_path_size == 0) return icon_path;
@@ -5963,7 +5958,7 @@ static const char *frontend_icon_data_path(const char *icon_path,
         source_stat.st_size > 1024 * 1024) {
         return icon_path;
     }
-    size_t target_size = frontend_icon_target_size(list);
+    const size_t target_size = 96;
     size_t source_width = 0;
     size_t source_height = 0;
     char image_error[256] = "";
@@ -6113,7 +6108,6 @@ static bool build_frontend_payload(const char *name,
                                    StringBuilder *payload) {
     char cached_icon_path[PATH_MAX];
     const char *icon_data_path = frontend_icon_data_path(icon_path,
-                                                         list,
                                                          cached_icon_path,
                                                          sizeof(cached_icon_path));
     char icon_url[128] = "";
@@ -6974,101 +6968,6 @@ static bool install_bundled_app_user_launchagent_for_system_payload(const Bundle
 #endif
 static bool uninstall_backend(const char *service_id, const char *sudo_password, bool *needs_password, char *message, size_t message_size);
 
-static bool frontend_exists_in_registry_at(const char *registry_path,
-                                           const char *service_id,
-                                           const char *frontend_id,
-                                           const char *frontend_url,
-                                           bool *found,
-                                           char *error,
-                                           size_t error_size) {
-    if (found) *found = false;
-    RegistryStore database;
-    if (!registry_store_open_at(&database, registry_path, false, error, error_size)) return false;
-    bool use_frontend_id = frontend_id && frontend_id[0];
-    for (size_t i = 0; i < database.frontend_count; i++) {
-        RegistryFrontendRecord *record = &database.frontends[i];
-        if (strcmp(record->service_id ? record->service_id : "", service_id ? service_id : "") != 0) continue;
-        const char *key = use_frontend_id ? record->frontend_id : record->url;
-        const char *wanted = use_frontend_id ? frontend_id : frontend_url;
-        if (strcmp(key ? key : "", wanted ? wanted : "") == 0) {
-            if (found) *found = true;
-            break;
-        }
-    }
-    registry_store_free(&database);
-    return true;
-}
-
-static bool update_frontend_layout_in_user_registry(const char *frontend_id,
-                                                    const char *frontend_url,
-                                                    const char *list_name,
-                                                    char *error,
-                                                    size_t error_size) {
-    RegistryStore database;
-    if (!registry_store_open_user_readwrite(&database, error, error_size)) return false;
-    const char *layout_key = (frontend_id && frontend_id[0])
-        ? frontend_id
-        : ((frontend_url && frontend_url[0]) ? frontend_url : "");
-    bool ok = registry_store_upsert_layout(&database,
-                                           layout_key,
-                                           list_name ? list_name : "");
-    if (ok && frontend_id && frontend_id[0] && frontend_url && frontend_url[0] && strcmp(frontend_id, frontend_url) != 0) {
-        /* Older versions keyed manual layout by URL. URLs such as "/" are shared by
-           many socket-backed apps, so retaining that row makes one drag relabel all
-           of them. A stable frontend ID supersedes and safely removes that fallback. */
-        registry_store_remove_layout(&database, frontend_url);
-    }
-    if (!ok) snprintf(error, error_size, "Out of memory.");
-    return registry_store_close(&database, ok, error, error_size) && ok;
-}
-
-static bool update_frontend_list_any_registry(const char *service_id,
-                                              const char *frontend_id,
-                                              const char *frontend_url,
-                                              const char *list_name,
-                                              char *message,
-                                              size_t message_size) {
-    bool found = false;
-    char error[512] = "";
-    if (!frontend_exists_in_registry_at(g_registry_database_path,
-                                        service_id,
-                                        frontend_id,
-                                        frontend_url,
-                                        &found,
-                                        error,
-                                        sizeof(error))) {
-        snprintf(message, message_size, "Could not read user registry: %s", error);
-        return false;
-    }
-
-    if (!found && g_system_registry_database_path[0] && registry_storage_exists_at(g_system_registry_database_path)) {
-        error[0] = '\0';
-        if (!frontend_exists_in_registry_at(g_system_registry_database_path,
-                                            service_id,
-                                            frontend_id,
-                                            frontend_url,
-                                            &found,
-                                            error,
-                                            sizeof(error))) {
-            snprintf(message, message_size, "Could not read system registry: %s", error);
-            return false;
-        }
-    }
-
-    if (!found) {
-        snprintf(message, message_size, "Frontend was not found.");
-        return false;
-    }
-
-    if (update_frontend_layout_in_user_registry(frontend_id, frontend_url, list_name, error, sizeof(error))) {
-        snprintf(message, message_size, "Updated app list.");
-        return true;
-    }
-
-    snprintf(message, message_size, "Could not update app layout: %s", error);
-    return false;
-}
-
 static void send_control_response(int fd, const char *query, const char *body) {
     char service_id[PATH_MAX] = "";
     char operation[32] = "";
@@ -7091,31 +6990,6 @@ static void send_control_response(int fd, const char *query, const char *body) {
     trim_whitespace_in_place(operation);
     trim_whitespace_in_place(requested_scope);
     log_event("Control request operation=%s serviceID=%s scope=%s.", operation, service_id, requested_scope);
-
-    if (strcmp(operation, "setFrontendList") == 0) {
-        char frontend_id[PATH_MAX] = "";
-        char frontend_url[PATH_MAX] = "";
-        char list_name[PATH_MAX] = "";
-        query_value_any(query, body, "frontendID", frontend_id, sizeof(frontend_id));
-        query_value_any(query, body, "frontendURL", frontend_url, sizeof(frontend_url));
-        if (!frontend_id[0] && !frontend_url[0]) {
-            send_action_response(fd, 400, false, "Missing frontend identifier.");
-            return;
-        }
-        query_value_any(query, body, "list", list_name, sizeof(list_name));
-        char message[1024] = "";
-        bool ok = update_frontend_list_any_registry(service_id, frontend_id, frontend_url, list_name, message, sizeof(message));
-        log_event("%s frontend list update for %s frontend=%s url=%s list=%s: %s",
-                  ok ? "Completed" : "Failed",
-                  service_id,
-                  frontend_id,
-                  frontend_url,
-                  list_name,
-                  message);
-        if (ok) mark_backend_event_changed();
-        send_action_response(fd, ok ? 200 : 500, ok, message);
-        return;
-    }
 
     if (is_home_screen_service_id(service_id)) {
         char message[4096] = "";
