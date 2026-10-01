@@ -1426,13 +1426,23 @@ private struct PendingFilePicker {
     var error: String
 }
 
-@MainActor
 private struct OverviewLayout: Codable {
     var version = 1
     var pins: [String: [String]] = [:]
     var order: [String: [String]] = [:]
     var groups: [String] = []
     var names: [String: String] = [:]
+
+    init() {}
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        version = try values.decodeIfPresent(Int.self, forKey: .version) ?? 1
+        pins = try values.decodeIfPresent([String: [String]].self, forKey: .pins) ?? [:]
+        order = try values.decodeIfPresent([String: [String]].self, forKey: .order) ?? [:]
+        groups = try values.decodeIfPresent([String].self, forKey: .groups) ?? []
+        names = try values.decodeIfPresent([String: String].self, forKey: .names) ?? [:]
+    }
 
     static func decode(_ data: Data) throws -> (OverviewLayout, UInt64) {
         guard data.count >= 18, data.prefix(8) == Data("OSLAY001".utf8) else { throw URLError(.cannotParseResponse) }
