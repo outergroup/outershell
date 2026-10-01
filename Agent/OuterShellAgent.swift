@@ -1043,9 +1043,9 @@ private final class OuterShellAgentDelegate: NSObject, NSApplicationDelegate, NS
     }
 
     private func updateStatusItem() {
-        let privilegedAppCount = services.filter(\.state.isRunning).count
+        let hostAppCount = services.filter(\.state.isRunning).count
         let containerAppCount = runningContainers.reduce(0) { $0 + $1.apps.count }
-        let running = privilegedAppCount + containerAppCount
+        let running = hostAppCount + containerAppCount
         let shouldShow = MenuBarVisibilityPreference.isEnabled && running > 0
         if shouldShow {
             ensureStatusItem()
@@ -1055,9 +1055,7 @@ private final class OuterShellAgentDelegate: NSObject, NSApplicationDelegate, NS
         }
         guard let button = statusItem?.button else { return }
         button.title = " \(running)"
-        button.toolTip = lastError ??
-            "\(privilegedAppCount) privileged app\(privilegedAppCount == 1 ? "" : "s") and " +
-            "\(containerAppCount) container app\(containerAppCount == 1 ? "" : "s") running"
+        button.toolTip = lastError ?? "\(running) endpoint\(running == 1 ? "" : "s") running"
     }
 
     private func ensureStatusItem() {
@@ -1081,30 +1079,22 @@ private final class OuterShellAgentDelegate: NSObject, NSApplicationDelegate, NS
             menu.addItem(item)
             menu.addItem(.separator())
         }
-        if !services.isEmpty {
-            let heading = NSMenuItem(title: "PRIVILEGED APPS", action: nil, keyEquivalent: "")
-            heading.isEnabled = false
-            heading.view = SectionHeadingMenuItemView(title: "PRIVILEGED APPS")
-            menu.addItem(heading)
-            let duplicateDisplayNameKeys = duplicateMenuDisplayNameKeys(for: services)
-            for service in services {
-                let displayName = menuDisplayName(
-                    for: service,
-                    showsScope: duplicateDisplayNameKeys.contains(menuDisplayNameKey(for: service))
-                )
-                append(service, displayName: displayName)
+        var hasSection = false
+        for isRoot in [false, true] {
+            let group = services.filter { ($0.registryScope == "system") == isRoot }
+            guard !group.isEmpty else { continue }
+            if hasSection { menu.addItem(.separator()) }
+            appendSectionHeading(isRoot ? "root" : NSUserName())
+            for service in group {
+                let name = service.displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+                append(service, displayName: name.isEmpty ? service.serviceID : name)
             }
+            hasSection = true
         }
-        if !runningContainers.isEmpty {
-            if !services.isEmpty {
-                menu.addItem(.separator())
-            }
-            for (index, container) in runningContainers.enumerated() {
-                append(container)
-                if index < runningContainers.count - 1 {
-                    menu.addItem(.separator())
-                }
-            }
+        for container in runningContainers {
+            if hasSection { menu.addItem(.separator()) }
+            append(container)
+            hasSection = true
         }
         if !menu.items.isEmpty {
             menu.addItem(.separator())
@@ -1124,13 +1114,8 @@ private final class OuterShellAgentDelegate: NSObject, NSApplicationDelegate, NS
     }
 
     private func append(_ service: ManagedBackend, displayName: String) {
-        let heading = NSMenuItem(title: displayName, action: nil, keyEquivalent: "")
-        heading.isEnabled = false
-        heading.view = SectionHeadingMenuItemView(title: displayName)
-        menu.addItem(heading)
-
         let frontend = preferredFrontend(for: service)
-        let open = NSMenuItem(title: "Open",
+        let open = NSMenuItem(title: displayName,
                               action: #selector(openFrontendMenuItemClicked(_:)),
                               keyEquivalent: "")
         open.target = self
@@ -1148,6 +1133,7 @@ private final class OuterShellAgentDelegate: NSObject, NSApplicationDelegate, NS
                                   keyEquivalent: "")
             copy.target = self
             copy.representedObject = FrontendMenuItemPayload(frontend: frontend)
+            copy.indentationLevel = 1
             copy.image = menuImage(systemSymbolName: "doc.on.doc")
             menu.addItem(copy)
         }
@@ -1155,11 +1141,7 @@ private final class OuterShellAgentDelegate: NSObject, NSApplicationDelegate, NS
     }
 
     private func append(_ container: SafeSpaceMenuBarContainer) {
-        let title = container.name.uppercased()
-        let heading = NSMenuItem(title: title, action: nil, keyEquivalent: "")
-        heading.isEnabled = false
-        heading.view = SectionHeadingMenuItemView(title: title)
-        menu.addItem(heading)
+        appendSectionHeading(container.name)
         if container.apps.isEmpty {
             let empty = NSMenuItem(title: "No apps running", action: nil, keyEquivalent: "")
             empty.isEnabled = false
@@ -1174,12 +1156,7 @@ private final class OuterShellAgentDelegate: NSObject, NSApplicationDelegate, NS
     private func append(_ app: SafeSpaceMenuBarApp) {
         let displayName = app.displayName.trimmingCharacters(in: .whitespacesAndNewlines)
         let title = displayName.isEmpty ? app.serviceID : displayName
-        let heading = NSMenuItem(title: title, action: nil, keyEquivalent: "")
-        heading.isEnabled = false
-        heading.view = SectionHeadingMenuItemView(title: title)
-        menu.addItem(heading)
-
-        let open = NSMenuItem(title: "Open",
+        let open = NSMenuItem(title: title,
                               action: #selector(openContainerAppMenuItemClicked(_:)),
                               keyEquivalent: "")
         open.target = self
@@ -1193,28 +1170,17 @@ private final class OuterShellAgentDelegate: NSObject, NSApplicationDelegate, NS
                                   keyEquivalent: "")
             copy.target = self
             copy.representedObject = app
+            copy.indentationLevel = 1
             copy.image = menuImage(systemSymbolName: "doc.on.doc")
             menu.addItem(copy)
         }
     }
 
-    private func duplicateMenuDisplayNameKeys(for services: [ManagedBackend]) -> Set<String> {
-        let counts = services.reduce(into: [String: Int]()) { result, service in
-            result[menuDisplayNameKey(for: service), default: 0] += 1
-        }
-        return Set(counts.compactMap { key, count in count > 1 ? key : nil })
-    }
-
-    private func menuDisplayNameKey(for service: ManagedBackend) -> String {
-        let displayName = service.displayName.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return "\(service.serviceID.lowercased())\u{1f}\(displayName)"
-    }
-
-    private func menuDisplayName(for service: ManagedBackend, showsScope: Bool) -> String {
-        let base = service.displayName.trimmingCharacters(in: .whitespacesAndNewlines)
-        let displayName = base.isEmpty ? service.serviceID : base
-        guard showsScope else { return displayName }
-        return "\(displayName) (\(service.registryScope == "system" ? "root" : "user"))"
+    private func appendSectionHeading(_ title: String) {
+        let heading = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+        heading.isEnabled = false
+        heading.view = SectionHeadingMenuItemView(title: title)
+        menu.addItem(heading)
     }
 
     fileprivate func setMenuBarVisibilityEnabled(_ enabled: Bool) {
