@@ -2,6 +2,7 @@ import Darwin
 import Foundation
 import AppKit
 import CoreFoundation
+import CryptoKit
 
 @_silgen_name("OuterShellRegistryCopyResource")
 private func outerShellRegistryCopyResource(
@@ -426,7 +427,7 @@ final class SafeSpaceManager: @unchecked Sendable {
             if operationChangesMenuBarState(operation) {
                 notifyOuterShellSafeSpacesChanged()
             }
-            return (200, try await response(requestID: requestID, extra: extra))
+            return (200, try await response(requestID: requestID, extra: extra, overview: request["overview"] as? Bool == true))
         } catch {
             let fallbackRequestID = (try? JSONSerialization.jsonObject(with: data))
                 .flatMap { $0 as? [String: Any] }?["requestID"] as? String ?? UUID().uuidString
@@ -760,16 +761,16 @@ final class SafeSpaceManager: @unchecked Sendable {
     }
 
     private func response(requestID: String,
-                          extra: [String: Any] = [:]) async throws -> Data {
+                          extra: [String: Any] = [:], overview: Bool = false) async throws -> Data {
         var body: [String: Any] = [
             "requestID": requestID,
             "providers": providerDictionaries(),
-            "workspaces": try await safeSpaceDictionaries()
+            "workspaces": try await safeSpaceDictionaries(overview: overview)
         ]
         for (key, value) in extra {
             body[key] = value
         }
-        return try JSONSerialization.data(withJSONObject: body)
+        return try JSONSerialization.data(withJSONObject: body, options: [.sortedKeys])
     }
 
     private func providerDictionaries() -> [[String: Any]] {
@@ -807,7 +808,7 @@ final class SafeSpaceManager: @unchecked Sendable {
         ]
     }
 
-    private func safeSpaceDictionaries() async throws -> [[String: Any]] {
+    private func safeSpaceDictionaries(overview: Bool = false) async throws -> [[String: Any]] {
         try refreshRecords()
         let currentRecords = lock.withSafeSpaceLock { records }
         var values: [[String: Any]] = []
@@ -878,7 +879,7 @@ final class SafeSpaceManager: @unchecked Sendable {
             let ownsContainer = recordOwnsContainer(record)
             var mounts: [[String: Any]] = []
             var persistentData: [[String: Any]] = []
-            if ownsContainer {
+            if ownsContainer && !overview {
                 let recipe = try recipe(for: record)
                 let base = try safeSpaceDirectory(record.id)
                 mounts = [[
@@ -945,16 +946,43 @@ final class SafeSpaceManager: @unchecked Sendable {
                 "mounts": mounts,
                 "persistentData": persistentData
             ]
-            if ownsContainer {
+            if ownsContainer && !overview {
                 value["recipe"] = try recipeDictionary(for: record)
             }
             if let progress = lock.withSafeSpaceLock({ buildProgress[record.id] }) {
                 value["buildProgress"] = progress.dictionary
             }
+            if overview {
+                for key in ["recipe", "mounts", "persistentData"] { value.removeValue(forKey: key) }
+                for key in ["apps", "commands"] {
+                    value[key] = try (value[key] as? [[String: Any]] ?? []).map { item in
+                        var item = item
+                        if let encoded = item.removeValue(forKey: "iconData") as? String,
+                           let data = Data(base64Encoded: encoded) {
+                            item["iconURL"] = try overviewIconURL(data)
+                        }
+                        return item
+                    }
+                }
+            }
             values.append(value)
         }
         try saveCachedApps()
         return values
+    }
+
+    private func overviewIconURL(_ data: Data) throws -> String {
+        let key = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+        let root = ProcessInfo.processInfo.environment["OUTERSHELL_HOME"]
+            ?? NSHomeDirectory() + "/Library/Application Support/outershell"
+        let directory = URL(fileURLWithPath: (root as NSString).expandingTildeInPath)
+            .appendingPathComponent("web-icons", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let file = directory.appendingPathComponent(key + ".png")
+        if !FileManager.default.fileExists(atPath: file.path) {
+            try data.write(to: file, options: .atomic)
+        }
+        return "/api/icon?key=" + key
     }
 
     private func runtimeDictionary(for record: SafeSpaceRecord) throws -> [String: Any] {

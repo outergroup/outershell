@@ -1168,6 +1168,7 @@ static bool registry_binary_output_path(const char *registry_path, char *out, si
 static int registry_binary_lock(const char *registry_path, int operation, char *error, size_t error_size);
 static bool registry_storage_exists_at(const char *database_path);
 static void mark_backend_event_changed(void);
+static void publish_backend_event_changed(void);
 
 static const BundledAppOpenerDefinition kPlaintextOpeners[] = {
     {
@@ -5370,43 +5371,140 @@ static bool launchd_is_system_domain(const char *domain) {
     return domain && strcmp(domain, "system") == 0;
 }
 
-static void launchd_status(const char *label,
-                           const char *plist_path,
-                           char *out,
-                           size_t out_size) {
-    if (!launchd_label_is_safe(label)) {
-        snprintf(out, out_size, "unknown");
-        return;
-    }
+typedef struct LaunchdStatusEntry {
+    char label[241];
+    char plist_path[PATH_MAX];
+    char status[32];
+    struct LaunchdStatusEntry *next;
+} LaunchdStatusEntry;
 
-    char domain[64];
-    launchd_domain_for_plist(plist_path, domain, sizeof(domain));
+static LaunchdStatusEntry *g_launchd_status_entries = NULL;
+static pthread_mutex_t g_launchd_status_mutex = PTHREAD_MUTEX_INITIALIZER;
+static bool g_launchd_status_refreshing = false;
+static int64_t g_launchd_status_refresh_ms = 0;
+static uint64_t g_launchd_status_generation = 0;
 
-    char quoted_target[384];
-    char target[320];
-    snprintf(target, sizeof(target), "%s/%s", domain, label);
+typedef struct {
+    LaunchdStatusEntry *entries;
+    uint64_t generation;
+} LaunchdStatusRefresh;
+
+static void invalidate_launchd_status(void) {
+    pthread_mutex_lock(&g_launchd_status_mutex);
+    g_launchd_status_generation++;
+    g_launchd_status_refresh_ms = 0;
+    pthread_mutex_unlock(&g_launchd_status_mutex);
+}
+
+static void read_launchd_status(LaunchdStatusEntry *entry) {
+    char domain[64], target[320], quoted_target[384], command[512];
+    launchd_domain_for_plist(entry->plist_path, domain, sizeof(domain));
+    snprintf(target, sizeof(target), "%s/%s", domain, entry->label);
     shell_quote(target, quoted_target, sizeof(quoted_target));
+    snprintf(command, sizeof(command), "launchctl print %s 2>/dev/null", quoted_target);
+    FILE *output = popen(command, "r");
+    if (!output) return;
+    bool running = false, passive = false;
+    char line[4096];
+    while (fgets(line, sizeof(line), output)) {
+        if (strstr(line, "state = running")) running = true;
+        if (strstr(line, "passive = 1")) passive = true;
+    }
+    bool failed = ferror(output);
+    int result = pclose(output);
+    if (failed || result == -1 || !WIFEXITED(result)) return;
+    snprintf(entry->status, sizeof(entry->status), "%s",
+             WEXITSTATUS(result) == 0 && running ? "running" :
+             WEXITSTATUS(result) == 0 && passive ? "available" :
+             access(entry->plist_path, F_OK) == 0 ? "stopped" : "registered");
+}
 
-    char command[512];
-    snprintf(command, sizeof(command), "launchctl print %s 2>/dev/null | grep -q 'state = running'", quoted_target);
-    int result = system(command);
-    if (result == 0) {
-        snprintf(out, out_size, "running");
+static void *refresh_launchd_status(void *context) {
+    LaunchdStatusRefresh *refresh = context;
+    for (LaunchdStatusEntry *entry = refresh->entries; entry; entry = entry->next)
+        read_launchd_status(entry);
+    bool changed = false;
+    pthread_mutex_lock(&g_launchd_status_mutex);
+    if (refresh->generation == g_launchd_status_generation) {
+        for (LaunchdStatusEntry *entry = refresh->entries; entry; entry = entry->next) {
+            for (LaunchdStatusEntry *cached = g_launchd_status_entries; cached; cached = cached->next) {
+                if (strcmp(entry->label, cached->label) || strcmp(entry->plist_path, cached->plist_path)) continue;
+                if (strcmp(entry->status, cached->status)) {
+                    snprintf(cached->status, sizeof(cached->status), "%s", entry->status);
+                    changed = true;
+                }
+                break;
+            }
+        }
+        g_launchd_status_refresh_ms = monotonic_milliseconds();
+    }
+    g_launchd_status_refreshing = false;
+    pthread_mutex_unlock(&g_launchd_status_mutex);
+    while (refresh->entries) {
+        LaunchdStatusEntry *entry = refresh->entries;
+        refresh->entries = entry->next;
+        free(entry);
+    }
+    free(refresh);
+    if (changed) publish_backend_event_changed();
+    return NULL;
+}
+
+static void maintain_launchd_status(void) {
+    pthread_mutex_lock(&g_launchd_status_mutex);
+    if (!g_launchd_status_entries || g_launchd_status_refreshing ||
+        (g_launchd_status_refresh_ms && monotonic_milliseconds() - g_launchd_status_refresh_ms < 5000)) {
+        pthread_mutex_unlock(&g_launchd_status_mutex);
         return;
     }
-
-    snprintf(command, sizeof(command), "launchctl print %s 2>/dev/null | grep -q 'passive = 1'", quoted_target);
-    result = system(command);
-    if (result == 0) {
-        snprintf(out, out_size, "available");
-        return;
+    LaunchdStatusRefresh *refresh = calloc(1, sizeof(*refresh));
+    bool ok = refresh != NULL;
+    for (LaunchdStatusEntry *entry = g_launchd_status_entries; ok && entry; entry = entry->next) {
+        LaunchdStatusEntry *copy = malloc(sizeof(*copy));
+        if (!copy) { ok = false; break; }
+        *copy = *entry;
+        copy->next = refresh->entries;
+        refresh->entries = copy;
     }
-
-    if (plist_path && plist_path[0] && access(plist_path, F_OK) == 0) {
-        snprintf(out, out_size, "stopped");
-    } else {
-        snprintf(out, out_size, "registered");
+    pthread_t thread;
+    if (ok) {
+        refresh->generation = g_launchd_status_generation;
+        ok = pthread_create(&thread, NULL, refresh_launchd_status, refresh) == 0;
     }
+    if (ok) {
+        g_launchd_status_refreshing = true;
+        pthread_detach(thread);
+    } else if (refresh) {
+        while (refresh->entries) {
+            LaunchdStatusEntry *entry = refresh->entries;
+            refresh->entries = entry->next;
+            free(entry);
+        }
+        free(refresh);
+    }
+    pthread_mutex_unlock(&g_launchd_status_mutex);
+}
+
+static void launchd_status(const char *label, const char *plist_path, char *out, size_t out_size) {
+    snprintf(out, out_size, "unknown");
+    if (!launchd_label_is_safe(label)) return;
+    pthread_mutex_lock(&g_launchd_status_mutex);
+    LaunchdStatusEntry *entry = g_launchd_status_entries;
+    while (entry && (strcmp(entry->label, label) || strcmp(entry->plist_path, plist_path))) entry = entry->next;
+    if (!entry) {
+        entry = calloc(1, sizeof(*entry));
+        if (entry) {
+            snprintf(entry->label, sizeof(entry->label), "%s", label);
+            snprintf(entry->plist_path, sizeof(entry->plist_path), "%s", plist_path);
+            snprintf(entry->status, sizeof(entry->status), "unknown");
+            entry->next = g_launchd_status_entries;
+            g_launchd_status_entries = entry;
+            g_launchd_status_generation++;
+            g_launchd_status_refresh_ms = 0;
+        }
+    }
+    if (entry) snprintf(out, out_size, "%s", entry->status);
+    pthread_mutex_unlock(&g_launchd_status_mutex);
 }
 
 static bool run_launchctl_capture(const char *command, char *message, size_t message_size) {
@@ -6533,6 +6631,13 @@ static uint64_t current_log_path_event_version(const char *raw_path) {
 }
 
 static void mark_backend_event_changed(void) {
+#ifdef __APPLE__
+    invalidate_launchd_status();
+#endif
+    publish_backend_event_changed();
+}
+
+static void publish_backend_event_changed(void) {
     pthread_mutex_lock(&g_backend_event_mutex);
     g_backend_event_sequence++;
     if (g_backend_event_sequence == 0) g_backend_event_sequence = 1;
@@ -14867,7 +14972,72 @@ static bool g_snapshot_refresh_failed = false;
 
 // The provider calls back into the registry through the normal API socket. Keep
 // discovery outside the reactor, and collect its response without blocking it.
+typedef struct {
+    OuterShelldSafeSpaceRequestCallback callback;
+    unsigned char *body;
+    size_t length;
+    int output;
+} ContainerCallbackJob;
+
+static bool write_callback_bytes(int fd, const void *data, size_t length) {
+    const unsigned char *bytes = data;
+    while (length) {
+        ssize_t count = write(fd, bytes, length);
+        if (count < 0 && errno == EINTR) continue;
+        if (count <= 0) return false;
+        bytes += count;
+        length -= (size_t)count;
+    }
+    return true;
+}
+
+static void *run_container_callback(void *context) {
+    ContainerCallbackJob *job = context;
+    size_t length = 0;
+    int status = 500;
+    unsigned char *result = job->callback(job->body, job->length, &length, &status);
+    if (!result && length) { status = 500; length = 0; }
+    if (write_callback_bytes(job->output, &status, sizeof(status)) && length)
+        write_callback_bytes(job->output, result, length);
+    free(result);
+    free(job->body);
+    close(job->output);
+    free(job);
+    return NULL;
+}
+
+static bool start_container_callback(ReactorClient *client, const char *body, size_t length) {
+    int output[2];
+    if (pipe(output) != 0) return false;
+    fcntl(output[0], F_SETFD, FD_CLOEXEC);
+    fcntl(output[1], F_SETFD, FD_CLOEXEC);
+    ContainerCallbackJob *job = calloc(1, sizeof(*job));
+    if (job) job->body = malloc(length ? length : 1);
+    if (!job || !job->body) {
+        free(job);
+        close(output[0]); close(output[1]);
+        return false;
+    }
+    memcpy(job->body, body, length);
+    job->length = length;
+    job->output = output[1];
+    job->callback = g_safe_space_request_callback;
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, run_container_callback, job) != 0) {
+        free(job->body); free(job);
+        close(output[0]); close(output[1]);
+        return false;
+    }
+    pthread_detach(thread);
+    set_fd_nonblocking(output[0], true);
+    // A negative PID identifies an in-process provider; its pipe owns completion.
+    client->provider_pid = -1;
+    client->provider_output_fd = output[0];
+    return true;
+}
+
 static bool start_provider_request(ReactorClient *client, const char *body, size_t length) {
+    if (g_safe_space_request_callback) return start_container_callback(client, body, length);
     const char *provider = getenv("OUTER_SHELL_CONTAINER_PROVIDER");
     if (!provider || !provider[0] || access(provider, X_OK) != 0) return false;
     FILE *input = tmpfile();
@@ -14966,12 +15136,21 @@ static bool collect_provider_response(ReactorClient *client) {
         }
     }
     if (!client->provider_output_closed) return false;
-    int status = 0;
-    pid_t result = waitpid(client->provider_pid, &status, WNOHANG);
-    if (result == 0 || (result < 0 && errno == EINTR)) return false;
-    client->provider_pid = 0;
     UiApiResponse response = {0};
-    response.status = result > 0 && WIFEXITED(status) && WEXITSTATUS(status) == 0 ? 200 : 500;
+    if (client->provider_pid < 0) {
+        response.status = 500;
+        if (client->provider_output.length >= sizeof(int)) {
+            memcpy(&response.status, client->provider_output.data, sizeof(int));
+            client->provider_output.length -= sizeof(int);
+            memmove(client->provider_output.data, client->provider_output.data + sizeof(int), client->provider_output.length);
+        }
+    } else {
+        int status = 0;
+        pid_t result = waitpid(client->provider_pid, &status, WNOHANG);
+        if (result == 0 || (result < 0 && errno == EINTR)) return false;
+        response.status = result > 0 && WIFEXITED(status) && WEXITSTATUS(status) == 0 ? 200 : 500;
+    }
+    client->provider_pid = 0;
     response.content_kind = UI_API_CONTENT_BINARY;
     response.body = client->provider_output;
     if (client->provider_snapshot) {
@@ -15026,10 +15205,7 @@ static bool process_api_ui_request(ReactorClient *client, const unsigned char *m
         }
     } else if (route == OUTERSHELLD_UI_ROUTE_CONTAINER_SNAPSHOT) {
         g_snapshot_requested_ms = monotonic_milliseconds();
-        if (g_safe_space_request_callback) {
-            const char *request = "{\"operation\":\"list\"}";
-            process_ui_route_request(OUTERSHELLD_UI_ROUTE_SAFE_SPACES, "", request, strlen(request), &response);
-        } else if (g_container_snapshot.data) {
+        if (g_container_snapshot.data) {
             response.status = 200;
             response.content_kind = UI_API_CONTENT_BINARY;
             sb_append_n(&response.body, g_container_snapshot.data, g_container_snapshot.length);
@@ -15038,7 +15214,7 @@ static bool process_api_ui_request(ReactorClient *client, const unsigned char *m
             free(query);
             return true;
         }
-    } else if (route == OUTERSHELLD_UI_ROUTE_SAFE_SPACES && !g_safe_space_request_callback) {
+    } else if (route == OUTERSHELLD_UI_ROUTE_SAFE_SPACES) {
         g_snapshot_generation++;
         g_snapshot_refresh_ms = 0;
         if (start_provider_request(client, (const char *)body, body_length)) {
@@ -16690,11 +16866,10 @@ static void close_reactor_client(ReactorClient *clients, size_t *client_count, s
 }
 
 static void maintain_container_snapshot(ReactorClient *clients, size_t *count) {
-    if (g_safe_space_request_callback) return;
     int64_t now = monotonic_milliseconds();
     bool busy = false;
     for (size_t i = 0; i < *count; i++) {
-        if (clients[i].provider_pid > 0) busy = true;
+        if (clients[i].provider_pid != 0) busy = true;
     }
     for (size_t i = *count; i > 0; i--) {
         ReactorClient *client = &clients[i - 1];
@@ -16714,7 +16889,7 @@ static void maintain_container_snapshot(ReactorClient *clients, size_t *count) {
         (g_snapshot_requested_ms && now - g_snapshot_requested_ms > 60000) ||
         (g_snapshot_refresh_ms && now - g_snapshot_refresh_ms < 2000)) return;
     const char *provider = getenv("OUTER_SHELL_CONTAINER_PROVIDER");
-    if (!provider || !provider[0]) { g_snapshot_refresh_failed = true; return; }
+    if (!g_safe_space_request_callback && (!provider || !provider[0])) { g_snapshot_refresh_failed = true; return; }
     ReactorClient job = {.fd = -1, .api_response_fd = -1, .provider_output_fd = -1,
                          .provider_snapshot = true, .snapshot_generation = g_snapshot_generation};
     const char *request = "{\"operation\":\"list\",\"requestID\":\"snapshot\",\"overview\":true}";
@@ -16911,23 +17086,29 @@ static void run_api_reactor(int api_listener) {
     set_fd_nonblocking(api_listener, true);
     while (!g_shutdown_requested && !outer_service_manager_exit_requested(g_outer_service_manager)) {
         flush_ready_event_clients(clients, &client_count);
+#ifdef __APPLE__
+        maintain_launchd_status();
+#endif
         maintain_container_snapshot(clients, &client_count);
         for (size_t i = client_count; i > 0; i--) {
-            if (clients[i - 1].provider_pid > 0 && clients[i - 1].provider_output_closed &&
+            if (clients[i - 1].provider_pid != 0 && clients[i - 1].provider_output_closed &&
                 collect_provider_response(&clients[i - 1])) close_reactor_client(clients, &client_count, i - 1);
         }
+#ifdef __APPLE__
+        maintain_launchd_status();
+#endif
         maintain_container_snapshot(clients, &client_count);
         struct pollfd poll_fds[MAX_REACTOR_CLIENTS + 1];
         size_t polled_client_count = client_count;
         poll_fds[0] = (struct pollfd){.fd = api_listener, .events = POLLIN, .revents = 0};
         for (size_t i = 0; i < polled_client_count; i++) {
-            poll_fds[i + 1] = (struct pollfd){.fd = clients[i].provider_pid > 0 ? clients[i].provider_output_fd : clients[i].fd, .events = POLLIN, .revents = 0};
+            poll_fds[i + 1] = (struct pollfd){.fd = clients[i].provider_pid != 0 ? clients[i].provider_output_fd : clients[i].fd, .events = POLLIN, .revents = 0};
         }
 
         int timeout_ms = socket_activation_enabled() && !g_stay_alive_when_socket_idle && polled_client_count == 0 ? 60000 : 1000;
         if (monotonic_milliseconds() - g_snapshot_requested_ms <= 60000) timeout_ms = 1000;
         for (size_t i = 0; i < client_count; i++) {
-            if (clients[i].provider_pid > 0 && clients[i].provider_output_closed) timeout_ms = 10;
+            if (clients[i].provider_pid != 0 && clients[i].provider_output_closed) timeout_ms = 10;
         }
         int poll_result = poll(poll_fds, (nfds_t)(polled_client_count + 1), timeout_ms);
         if (poll_result == 0) {
@@ -16949,7 +17130,7 @@ static void run_api_reactor(int api_listener) {
             size_t index = i - 1;
             short revents = poll_fds[index + 1].revents;
             if (revents == 0) continue;
-            if (clients[index].provider_pid > 0) {
+            if (clients[index].provider_pid != 0) {
                 if (collect_provider_response(&clients[index])) close_reactor_client(clients, &client_count, index);
                 continue;
             }
@@ -16986,7 +17167,7 @@ static void run_api_reactor(int api_listener) {
         int64_t now = monotonic_milliseconds();
         for (size_t i = client_count; i > 0; i--) {
             size_t index = i - 1;
-            if (clients[index].waiting_for_events || clients[index].waiting_for_snapshot || clients[index].provider_pid > 0) continue;
+            if (clients[index].waiting_for_events || clients[index].waiting_for_snapshot || clients[index].provider_pid != 0) continue;
             if (now - clients[index].last_activity_ms > CLIENT_IDLE_TIMEOUT_MS) {
                 close_reactor_client(clients, &client_count, index);
             }
