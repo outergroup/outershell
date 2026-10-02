@@ -154,7 +154,8 @@ echo "==> Building Outer Shell agent"
     -target OuterShellAgent \
     -configuration "${CONFIGURATION}" \
     SYMROOT="${BUILD_ROOT}" \
-    ONLY_ACTIVE_ARCH=YES \
+    ARCHS="arm64 x86_64" \
+    ONLY_ACTIVE_ARCH=NO \
     build
 
 echo "==> Archiving OuterShell bundles"
