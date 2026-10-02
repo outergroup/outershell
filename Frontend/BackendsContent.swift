@@ -2194,6 +2194,15 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         case .accessibilityAction(let identifier, let action, let value):
             performAccessibilityAction(identifier: identifier, action: action, value: value)
 
+        case .accessibilityActionAndSnapshot(let requestID, let identifier, let action, let value):
+            performAccessibilityAction(identifier: identifier, action: action, value: value)
+            outerframeHost.sendAccessibilitySnapshotResponse(requestID: requestID, snapshot: buildAccessibilitySnapshot())
+
+        case .accessibilityTextQuery(let requestID, let identifier, let query, let range, let point):
+            _ = buildAccessibilitySnapshot()
+            outerframeHost.sendAccessibilityTextResponse(requestID: requestID,
+                result: accessibilityTextResult(identifier: identifier, query: query, range: range, point: point))
+
         case .accessibilitySnapshotRequest(let requestID):
             outerframeHost.sendAccessibilitySnapshotResponse(requestID: requestID,
                                                              snapshot: buildAccessibilitySnapshot())
@@ -7677,6 +7686,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private var accessibilityKeyOccurrences: [String: Int] = [:]
     private var accessibilityCurrentNodes: [UInt32: OuterframeAccessibilityNode] = [:]
     private var accessibilityContext = ""
+    private var accessibilityFocusedIdentifier: UInt32?
+    private var accessibilityTextTargets: [UInt32: String] = [:]
+
     private var accessibilityReorderTargets: [UInt32: (group: String, item: AppLauncherItem?)] = [:]
 
     private func performAccessibilityAction(identifier: UInt32, action: OuterframeAccessibilityAction, value: String) {
@@ -7686,6 +7698,13 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         let point = CGPoint(x: node.frame.midX, y: node.frame.midY)
         switch action {
         case .press, .focus, .setValue:
+            accessibilityFocusedIdentifier = identifier
+            if action == .focus && node.role == .button {
+                blurWorkspaceRenameField()
+                blurCreateField()
+                blurPasswordField()
+                break
+            }
             handleMouseDown(at: point, modifierFlags: [], clickCount: 1)
             handleMouseUp(at: point, modifierFlags: [])
             if action == .setValue {
@@ -7726,6 +7745,21 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 layout.groups = groups
                 saveOverviewLayout(layout)
             }
+        case .setSelectedTextRange:
+            guard let target = accessibilityTextTargets[identifier] else { return }
+            let controller = target == "workspace" ? workspaceRenameInputController : createInputController
+            if target == "workspace" { focusWorkspaceRenameField() }
+            else { focusCreateField(target) }
+            let parts = value.split(separator: ":", omittingEmptySubsequences: false)
+            guard parts.count == 2, let location = Int(parts[0]), let length = Int(parts[1]),
+                  OuterframeAccessibilityTextRange.isValid(NSRange(location: location, length: length), in: controller.text),
+                  let selection = Range(NSRange(location: location, length: length), in: controller.text),
+                  controller.text.indices.contains(selection.lowerBound) || selection.lowerBound == controller.text.endIndex,
+                  controller.text.indices.contains(selection.upperBound) || selection.upperBound == controller.text.endIndex else { return }
+            controller.setCursorPosition(controller.text.distance(from: controller.text.startIndex, to: selection.lowerBound), modifySelection: false, notifyDelegate: false)
+            controller.setCursorPosition(controller.text.distance(from: controller.text.startIndex, to: selection.upperBound), modifySelection: true)
+        case .increment, .decrement, .expand, .collapse:
+            break
         case .scrollUp, .scrollDown:
             handleScroll(at: point, delta: CGPoint(x: 0, y: node.frame.height * (action == .scrollUp ? 0.8 : -0.8)), precise: true)
         }
@@ -7736,6 +7770,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         accessibilityKeyOccurrences.removeAll(keepingCapacity: true)
         accessibilityCurrentNodes.removeAll(keepingCapacity: true)
         accessibilityReorderTargets.removeAll(keepingCapacity: true)
+        accessibilityTextTargets.removeAll(keepingCapacity: true)
         accessibilityContext = "\(mode)-\(isShowingWorkspacePanel)-\(pendingDockerfileWorkspace?.id.uuidString ?? "")-\(pendingWorkspaceRename?.id.uuidString ?? "")-\(isCreatingWorkspace)-\(pendingAboutBackend != nil)-\(pendingOuterShellUpdate != nil)-\(pendingInstallBackend != nil)-\(pendingPasswordAction != nil)-\(pendingFilePicker != nil)"
         var nextIdentifier: UInt32 = 1
         var children: [OuterframeAccessibilityNode] = []
@@ -7767,9 +7802,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         }
 
         let root = OuterframeAccessibilityNode(identifier: 0,
-                                               role: .container,
+                                               role: pendingAboutBackend != nil || pendingOuterShellUpdate != nil || (mode == .create && pendingInstallBackend == nil && pendingPasswordAction == nil && pendingFilePicker == nil) ? .dialog : .container,
                                                frame: rootLayer.bounds,
-                                               label: "Outer Shell",
+                                               label: pendingAboutBackend != nil ? "About Outer Shell" : pendingOuterShellUpdate != nil ? "Update Outer Shell" : mode == .create ? "Add apps and endpoints" : "Outer Shell",
                                                children: children)
         return OuterframeAccessibilitySnapshot(rootNodes: [root])
     }
@@ -7786,14 +7821,28 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                    isEnabled: Bool = true,
                                    key: String? = nil,
                                    actions: OuterframeAccessibilityActions? = nil,
-                                   isFocused: Bool = false) -> OuterframeAccessibilityNode {
+                                   isFocused: Bool = false,
+                                   textTarget: String? = nil) -> OuterframeAccessibilityNode {
         let baseKey = "\(accessibilityContext)|\(key ?? "\(role.rawValue)|\(label ?? "")|\(hint ?? "")")"
         let occurrence = accessibilityKeyOccurrences[baseKey, default: 0]
         accessibilityKeyOccurrences[baseKey] = occurrence + 1
         let uniqueKey = "\(baseKey)|\(occurrence)"
         let identifier = accessibilityIdentifiers[uniqueKey] ?? UInt32(accessibilityIdentifiers.count + 1)
         accessibilityIdentifiers[uniqueKey] = identifier
-        let supported = actions ?? (role == .button ? [.press] : role == .textField ? [.press, .focus, .setValue] : [])
+        var supported = actions ?? (role == .button ? [.press] : (role == .textField || role == .textArea) ? [.press, .focus, .setValue] : [])
+        if role == .button { supported.insert(.focus) }
+        var selectedRange: NSRange?
+        if let textTarget {
+            accessibilityTextTargets[identifier] = textTarget
+            supported.insert(.setSelectedTextRange)
+            let controller = textTarget == "workspace" ? workspaceRenameInputController : createInputController
+            if controller.isFocused && (textTarget == "workspace" || activeCreateFieldKey == textTarget) {
+                let selection = controller.selectionRange ?? controller.cursorPosition..<controller.cursorPosition
+                let start = utf16Offset(forCharacterIndex: selection.lowerBound, in: controller.text)
+                selectedRange = NSRange(location: start, length: utf16Offset(forCharacterIndex: selection.upperBound, in: controller.text) - start)
+            }
+        }
+        let textHasFocus = workspaceRenameInputController.isFocused || createInputController.isFocused || passwordInputController.isFocused
         let node = OuterframeAccessibilityNode(identifier: identifier,
                                            role: role,
                                            frame: frame,
@@ -7805,9 +7854,104 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                            columnCount: columnCount,
                                            isEnabled: isEnabled,
                                            actions: supported,
-                                           isFocused: isFocused)
+                                           isFocused: isFocused || (role == .button && !textHasFocus && accessibilityFocusedIdentifier == identifier),
+                                           selectedTextRange: selectedRange,
+                                           supportsTextGeometry: textTarget != nil,
+                                           supportsActionSnapshot: true)
         accessibilityCurrentNodes[identifier] = node
         return node
+    }
+
+    private func accessibilityTextResult(identifier: UInt32, query: OuterframeAccessibilityTextQuery,
+                                         range: NSRange, point: CGPoint) -> OuterframeAccessibilityTextResult? {
+        guard let target = accessibilityTextTargets[identifier],
+              let node = accessibilityCurrentNodes[identifier], let text = node.value else { return nil }
+        let layout: CreateFieldLayout
+        let sourceLayer: CALayer
+        if target == "workspace" {
+            layout = CreateFieldLayout(fieldFrame: workspaceRenameFieldFrame, textFrame: workspaceRenameTextFrame,
+                                       key: target, monospaced: isDockerfileFragmentPrompt, multiline: isDockerfileFragmentPrompt)
+            sourceLayer = rootLayer
+        } else {
+            guard let field = createFieldLayouts[target] else { return nil }
+            layout = field
+            sourceLayer = createLayer
+        }
+        let fragments = layout.multiline ? createTextAreaLineFragments(text: text, layout: layout)
+            : [CreateTextLineFragment(text: text, start: 0, end: text.count, y: layout.textFrame.minY)]
+        let ranges = fragments.map { fragment -> NSRange in
+            let start = utf16Offset(forCharacterIndex: fragment.start, in: text)
+            return NSRange(location: start, length: fragment.text.utf16.count)
+        }
+        func lineFrame(_ index: Int) -> CGRect {
+            rootLayer.convert(CGRect(x: layout.textFrame.minX, y: fragments[index].y,
+                                     width: layout.textFrame.width, height: layout.multiline ? 16 : layout.textFrame.height), from: sourceLayer)
+        }
+        func line(_ index: Int) -> CTLine {
+            target == "workspace" && !layout.multiline
+                ? makeWorkspaceNameFieldLine(for: fragments[index].text)
+                : makeCreateFieldLine(for: fragments[index].text, monospaced: layout.monospaced)
+        }
+        func lineIndex(_ offset: Int) -> Int? {
+            ranges.indices.last { ranges[$0].location <= offset }
+        }
+        switch query {
+        case .rangeForLine:
+            guard ranges.indices.contains(range.location) else { return nil }
+            let index = range.location
+            let end = index + 1 < ranges.count ? ranges[index + 1].location : text.utf16.count
+            return OuterframeAccessibilityTextResult(range: NSRange(location: ranges[index].location, length: end - ranges[index].location), index: index)
+        case .lineForIndex:
+            guard OuterframeAccessibilityTextRange.isValid(NSRange(location: range.location, length: 0), in: text),
+                  let index = lineIndex(range.location) else { return nil }
+            return OuterframeAccessibilityTextResult(index: index)
+        case .visibleRange:
+            let visible = ranges.indices.filter { lineFrame($0).intersection(node.frame).height > 0 }
+            guard let first = visible.first, let last = visible.last else { return nil }
+            return OuterframeAccessibilityTextResult(range: NSRange(location: ranges[first].location,
+                length: NSMaxRange(ranges[last]) - ranges[first].location))
+        case .rangeForPosition:
+            guard node.frame.contains(point),
+                  let index = ranges.indices.min(by: { abs(lineFrame($0).midY - point.y) < abs(lineFrame($1).midY - point.y) }) else { return nil }
+            let ctLine = line(index)
+            let x = point.x - lineFrame(index).minX
+            let fragmentText = fragments[index].text as NSString
+            var character = 0
+            while character < fragmentText.length {
+                let cluster = fragmentText.rangeOfComposedCharacterSequence(at: character)
+                let left = CTLineGetOffsetForStringIndex(ctLine, cluster.location, nil)
+                let right = CTLineGetOffsetForStringIndex(ctLine, NSMaxRange(cluster), nil)
+                if x >= min(left, right) && x < max(left, right) {
+                    return OuterframeAccessibilityTextResult(range: NSRange(location: ranges[index].location + cluster.location, length: cluster.length))
+                }
+                character = NSMaxRange(cluster)
+            }
+            let hit = CTLineGetStringIndexForPosition(ctLine, CGPoint(x: x, y: 0))
+            let localOffset = hit == kCFNotFound ? ranges[index].length : max(0, min(hit, ranges[index].length))
+            let offset = ranges[index].location + localOffset
+            let characterRange = offset < text.utf16.count ? (text as NSString).rangeOfComposedCharacterSequence(at: offset) : NSRange(location: offset, length: 0)
+            return OuterframeAccessibilityTextResult(range: characterRange)
+        case .frameForRange:
+            guard OuterframeAccessibilityTextRange.isValid(range, in: text) else { return nil }
+            var frame = CGRect.null
+            for index in ranges.indices {
+                let fragmentRange = ranges[index]
+                let start = max(range.location, fragmentRange.location)
+                let end = min(NSMaxRange(range), NSMaxRange(fragmentRange))
+                let logicalEnd = index + 1 < ranges.count ? ranges[index + 1].location : text.utf16.count
+                let includesNewline = range.length > 0 && NSMaxRange(fragmentRange) < logicalEnd &&
+                    range.location < logicalEnd && NSMaxRange(range) > NSMaxRange(fragmentRange)
+                guard start <= end,
+                      range.length > 0 ? (start < end || includesNewline) : lineIndex(start) == index else { continue }
+                let ctLine = line(index)
+                let x1 = CTLineGetOffsetForStringIndex(ctLine, start - fragmentRange.location, nil)
+                let x2 = CTLineGetOffsetForStringIndex(ctLine, end - fragmentRange.location, nil)
+                let row = lineFrame(index)
+                frame = frame.union(CGRect(x: row.minX + min(x1, x2), y: row.minY, width: max(1, abs(x2 - x1)), height: row.height))
+            }
+            guard !frame.isNull else { return nil }
+            return OuterframeAccessibilityTextResult(range: range, frame: frame)
+        }
     }
 
     private func accessibilityVisibleText(in layer: CALayer, clippedBy inheritedClip: CGRect? = nil, nextIdentifier: inout UInt32) -> [OuterframeAccessibilityNode] {
@@ -7894,16 +8038,19 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             nodes.append(accessibilityNode(nextIdentifier: &nextIdentifier, role: .button, frame: frame, label: label, value: selectedTab ? "Selected" : nil))
         }
         if let fieldLabel, !fieldFrame.isEmpty {
-            nodes.append(accessibilityNode(nextIdentifier: &nextIdentifier, role: .textField, frame: fieldFrame, label: fieldLabel,
-                                           value: workspaceRenameName, actions: isContainerConfigurationEditorVisible ? [.press, .focus, .setValue, .scrollUp, .scrollDown] : [.press, .focus, .setValue], isFocused: workspaceRenameInputController.isFocused))
+            nodes.append(accessibilityNode(nextIdentifier: &nextIdentifier, role: isDockerfileFragmentPrompt ? .textArea : .textField, frame: fieldFrame, label: fieldLabel,
+                                           value: workspaceRenameName, actions: isContainerConfigurationEditorVisible && !isRenamingContainerConfiguration ? [.press, .focus, .setValue, .scrollUp, .scrollDown] : [.press, .focus, .setValue], isFocused: workspaceRenameInputController.isFocused, textTarget: "workspace"))
         }
         let interactiveFrames = nodes.map(\.frame)
-        nodes += accessibilityVisibleText(in: workspacePanelLayer, nextIdentifier: &nextIdentifier).filter { node in
+        let visibleLayer = workspacePanelLayer.sublayers?.last(where: {
+            rootLayer.convert($0.bounds, from: $0) == dialogFrame && $0.sublayers?.isEmpty == false
+        }) ?? workspacePanelLayer
+        nodes += accessibilityVisibleText(in: visibleLayer, nextIdentifier: &nextIdentifier).filter { node in
             let center = CGPoint(x: node.frame.midX, y: node.frame.midY)
             return dialogFrame.contains(center) && !interactiveFrames.contains(where: { $0.contains(center) })
         }
         nodes.sort { abs($0.frame.midY - $1.frame.midY) > 8 ? $0.frame.midY > $1.frame.midY : $0.frame.minX < $1.frame.minX }
-        return [accessibilityNode(nextIdentifier: &nextIdentifier, role: .container, frame: dialogFrame, label: title, children: nodes)]
+        return [accessibilityNode(nextIdentifier: &nextIdentifier, role: .dialog, frame: dialogFrame, label: title, children: nodes)]
     }
 
     private func accessibilityFrame(_ frame: CGRect,
@@ -8123,13 +8270,14 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             guard let frame = accessibilityFrame(field.frame, from: createLayer, clippedBy: clipFrame) else { continue }
             let description = createFieldAccessibilityDescription(key: field.key)
             nodes.append(accessibilityNode(nextIdentifier: &nextIdentifier,
-                                           role: .textField,
+                                           role: createFieldLayouts[field.key]?.multiline == true ? .textArea : .textField,
                                            frame: frame,
                                            label: description.label,
-                                           value: description.value,
+                                           value: description.value ?? "",
                                            hint: description.hint,
                                            key: "create-field:\(field.key)",
-                                           isFocused: createInputController.isFocused && activeCreateFieldKey == field.key))
+                                           isFocused: createInputController.isFocused && activeCreateFieldKey == field.key,
+                                           textTarget: field.key))
         }
 
         for choice in createChoiceFrames {
@@ -8241,7 +8389,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         guard let frame = accessibilityFrame(installPanelFrame) else { return children }
         return [
             accessibilityNode(nextIdentifier: &nextIdentifier,
-                              role: .container,
+                              role: .dialog,
                               frame: frame,
                               label: "Install \(backend.displayName)",
                               value: "Outer Shell will download this app.",
@@ -8274,7 +8422,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         guard let frame = accessibilityFrame(passwordPanelFrame) else { return children }
         return [
             accessibilityNode(nextIdentifier: &nextIdentifier,
-                              role: .container,
+                              role: .dialog,
                               frame: frame,
                               label: "Administrator Password",
                               value: "\(action.displayName): \(sudoPasswordMessage)",
@@ -8331,7 +8479,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         }
         return [
             accessibilityNode(nextIdentifier: &nextIdentifier,
-                              role: .container,
+                              role: .dialog,
                               frame: frame,
                               label: title,
                               value: picker.error.isEmpty ? picker.directory : picker.error,
