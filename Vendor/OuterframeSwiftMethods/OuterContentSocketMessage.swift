@@ -122,6 +122,7 @@ enum BrowserToContentMessage {
     case filePromiseWriteRequest(requestID: UUID, promiseID: UUID)
     case hostSpecificMessage(name: String, payload: Data)
     case hostSpecificMessageUnrecognized(name: String)
+    case accessibilityAction(identifier: UInt32, action: OuterframeAccessibilityAction, value: String)
     case accessibilitySnapshotRequest(requestID: UUID)
     case historyEntryAccepted(entryID: UUID, url: String)
     case historyEntryRejected(entryID: UUID, errorMessage: String)
@@ -439,6 +440,13 @@ enum BrowserToContentMessage {
             var payload = OffsetPayloadBuilder()
             try payload.append(stringReference: name)
             return makeBrowserToContentFrame(type: .hostSpecificMessageUnrecognized, payload: try payload.finalize())
+
+        case .accessibilityAction(let identifier, let action, let value):
+            var payload = OffsetPayloadBuilder()
+            payload.append(uint32: identifier)
+            payload.append(uint8: action.rawValue)
+            try payload.append(stringReference: value)
+            return makeBrowserToContentFrame(type: .accessibilityAction, payload: try payload.finalize())
 
         case .accessibilitySnapshotRequest(let requestID):
             var payload = Data(capacity: 16)
@@ -881,6 +889,15 @@ enum BrowserToContentMessage {
                 throw OuterframeContentSocketMessageError.truncatedPayload
             }
             return .hostSpecificMessageUnrecognized(name: name)
+
+        case .accessibilityAction:
+            guard let identifier = cursor.readUInt32(),
+                  let rawAction = cursor.readUInt8(),
+                  let action = OuterframeAccessibilityAction(rawValue: rawAction),
+                  let value = cursor.readStringReference() else {
+                throw OuterframeContentSocketMessageError.truncatedPayload
+            }
+            return .accessibilityAction(identifier: identifier, action: action, value: value)
 
         case .accessibilitySnapshotRequest:
             guard let requestID = cursor.readUUID() else {
@@ -1758,6 +1775,7 @@ private enum BrowserToContentMessageKind: UInt16 {
     case editCommandValidationRequest = 1040
     case hostSpecificMessage = 1041
     case hostSpecificMessageUnrecognized = 1042
+    case accessibilityAction = 1043
 
     // Assign new indices in contiguous blocks to make the switch statement more efficient
 }

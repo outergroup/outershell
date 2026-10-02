@@ -2191,6 +2191,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             blurCreateField()
             applyNavigation(url)
 
+        case .accessibilityAction(let identifier, let action, let value):
+            performAccessibilityAction(identifier: identifier, action: action, value: value)
+
         case .accessibilitySnapshotRequest(let requestID):
             outerframeHost.sendAccessibilitySnapshotResponse(requestID: requestID,
                                                              snapshot: buildAccessibilitySnapshot())
@@ -4331,7 +4334,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                   weight: .medium,
                                   color: .labelColor,
                                   italic: true)
-        title.string = "Add container"
+        title.string = "Add container (beta)"
         title.frame = CGRect(x: iconFrame.maxX + 12,
                              y: addWorkspaceMessage.isEmpty ? floor((frame.height - 20) / 2) : 51,
                              width: max(frame.width - iconFrame.maxX - 28, 1),
@@ -7670,11 +7673,83 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         background.addSublayer(subtitleLayer)
     }
 
+    private var accessibilityIdentifiers: [String: UInt32] = [:]
+    private var accessibilityKeyOccurrences: [String: Int] = [:]
+    private var accessibilityCurrentNodes: [UInt32: OuterframeAccessibilityNode] = [:]
+    private var accessibilityContext = ""
+    private var accessibilityReorderTargets: [UInt32: (group: String, item: AppLauncherItem?)] = [:]
+
+    private func performAccessibilityAction(identifier: UInt32, action: OuterframeAccessibilityAction, value: String) {
+        _ = buildAccessibilitySnapshot()
+        guard let node = accessibilityCurrentNodes[identifier], node.isEnabled,
+              node.actions.supports(action) else { return }
+        let point = CGPoint(x: node.frame.midX, y: node.frame.midY)
+        switch action {
+        case .press, .focus, .setValue:
+            handleMouseDown(at: point, modifierFlags: [], clickCount: 1)
+            handleMouseUp(at: point, modifierFlags: [])
+            if action == .setValue {
+                if isWorkspaceNamePromptVisible {
+                    focusWorkspaceRenameField(selectAll: true)
+                    if value.isEmpty { workspaceRenameInputController.deleteBackward() }
+                    insertWorkspaceRenameText(value, hasReplacementRange: false, replacementLocation: 0, replacementLength: 0)
+                } else if pendingPasswordAction != nil {
+                    passwordInputController.selectAll()
+                    if value.isEmpty { passwordInputController.deleteBackward() }
+                    insertPasswordText(value, hasReplacementRange: false, replacementLocation: 0, replacementLength: 0)
+                } else if mode == .create, let key = activeCreateFieldKey {
+                    focusCreateField(key, selectAll: true)
+                    if value.isEmpty { createInputController.deleteBackward() }
+                    insertCreateText(value, hasReplacementRange: false, replacementLocation: 0, replacementLength: 0)
+                }
+            }
+        case .showMenu:
+            handleRightMouseDown(at: point, modifierFlags: [], clickCount: 1)
+        case .moveEarlier, .moveLater:
+            guard let target = accessibilityReorderTargets[identifier], !overviewLayoutSaving else { return }
+            let offset = action == .moveEarlier ? -1 : 1
+            if let item = target.item {
+                let pinned = isAppProminent(item)
+                let items = item.containerContext.map { appLauncherItems(in: $0.container) } ?? appLauncherItems().filter { overviewGroupID(for: $0) == target.group }
+                var ordered = overviewOrderedItems(items.filter { isAppProminent($0) == pinned }, group: target.group, pinned: pinned)
+                guard let index = ordered.firstIndex(where: { $0.identityKey == item.identityKey }), ordered.indices.contains(index + offset) else { return }
+                ordered.swapAt(index, index + offset)
+                var layout = overviewLayout
+                if pinned { layout.pins[target.group] = ordered.map(overviewKey) }
+                else { layout.order[target.group] = ordered.map(overviewKey) }
+                saveOverviewLayout(layout)
+            } else {
+                var groups = overviewGroupFrames.map(\.id)
+                guard let index = groups.firstIndex(of: target.group), groups.indices.contains(index + offset) else { return }
+                groups.swapAt(index, index + offset)
+                var layout = overviewLayout
+                layout.groups = groups
+                saveOverviewLayout(layout)
+            }
+        case .scrollUp, .scrollDown:
+            handleScroll(at: point, delta: CGPoint(x: 0, y: node.frame.height * (action == .scrollUp ? 0.8 : -0.8)), precise: true)
+        }
+        outerframeHost.notifyAccessibilityTreeChanged([.layoutChanged, .focusedElementChanged])
+    }
+
     private func buildAccessibilitySnapshot() -> OuterframeAccessibilitySnapshot {
+        accessibilityKeyOccurrences.removeAll(keepingCapacity: true)
+        accessibilityCurrentNodes.removeAll(keepingCapacity: true)
+        accessibilityReorderTargets.removeAll(keepingCapacity: true)
+        accessibilityContext = "\(mode)-\(isShowingWorkspacePanel)-\(pendingDockerfileWorkspace?.id.uuidString ?? "")-\(pendingWorkspaceRename?.id.uuidString ?? "")-\(isCreatingWorkspace)-\(pendingAboutBackend != nil)-\(pendingOuterShellUpdate != nil)-\(pendingInstallBackend != nil)-\(pendingPasswordAction != nil)-\(pendingFilePicker != nil)"
         var nextIdentifier: UInt32 = 1
         var children: [OuterframeAccessibilityNode] = []
 
-        if pendingInstallBackend != nil {
+        if isShowingWorkspacePanel {
+            children = buildWorkspaceAccessibilityNodes(nextIdentifier: &nextIdentifier)
+        } else if pendingAboutBackend != nil {
+            children = accessibilityVisibleText(in: aboutOverlayLayer, nextIdentifier: &nextIdentifier)
+            children.append(accessibilityNode(nextIdentifier: &nextIdentifier, role: .button, frame: aboutDoneFrame, label: "Done"))
+        } else if pendingOuterShellUpdate != nil {
+            children = accessibilityVisibleText(in: updateOverlayLayer, nextIdentifier: &nextIdentifier)
+            children.append(accessibilityNode(nextIdentifier: &nextIdentifier, role: .button, frame: updateCancelFrame, label: "Cancel"))
+            children.append(accessibilityNode(nextIdentifier: &nextIdentifier, role: .button, frame: updateConfirmFrame, label: "Update"))
+        } else if pendingInstallBackend != nil {
             children.append(contentsOf: buildInstallPromptAccessibilityNodes(nextIdentifier: &nextIdentifier))
         } else if pendingPasswordAction != nil {
             children.append(contentsOf: buildPasswordPromptAccessibilityNodes(nextIdentifier: &nextIdentifier))
@@ -7708,10 +7783,18 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                    children: [OuterframeAccessibilityNode] = [],
                                    rowCount: Int? = nil,
                                    columnCount: Int? = nil,
-                                   isEnabled: Bool = true) -> OuterframeAccessibilityNode {
-        let identifier = nextIdentifier
-        nextIdentifier = nextIdentifier == UInt32.max ? 1 : nextIdentifier + 1
-        return OuterframeAccessibilityNode(identifier: identifier,
+                                   isEnabled: Bool = true,
+                                   key: String? = nil,
+                                   actions: OuterframeAccessibilityActions? = nil,
+                                   isFocused: Bool = false) -> OuterframeAccessibilityNode {
+        let baseKey = "\(accessibilityContext)|\(key ?? "\(role.rawValue)|\(label ?? "")|\(hint ?? "")")"
+        let occurrence = accessibilityKeyOccurrences[baseKey, default: 0]
+        accessibilityKeyOccurrences[baseKey] = occurrence + 1
+        let uniqueKey = "\(baseKey)|\(occurrence)"
+        let identifier = accessibilityIdentifiers[uniqueKey] ?? UInt32(accessibilityIdentifiers.count + 1)
+        accessibilityIdentifiers[uniqueKey] = identifier
+        let supported = actions ?? (role == .button ? [.press] : role == .textField ? [.press, .focus, .setValue] : [])
+        let node = OuterframeAccessibilityNode(identifier: identifier,
                                            role: role,
                                            frame: frame,
                                            label: label,
@@ -7720,7 +7803,107 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                            children: children,
                                            rowCount: rowCount,
                                            columnCount: columnCount,
-                                           isEnabled: isEnabled)
+                                           isEnabled: isEnabled,
+                                           actions: supported,
+                                           isFocused: isFocused)
+        accessibilityCurrentNodes[identifier] = node
+        return node
+    }
+
+    private func accessibilityVisibleText(in layer: CALayer, clippedBy inheritedClip: CGRect? = nil, nextIdentifier: inout UInt32) -> [OuterframeAccessibilityNode] {
+        guard !layer.isHidden, layer.opacity > 0 else { return [] }
+        let bounds = rootLayer.convert(layer.bounds, from: layer)
+        let clip = layer.masksToBounds ? (inheritedClip?.intersection(bounds) ?? bounds) : inheritedClip
+        var nodes: [OuterframeAccessibilityNode] = []
+        if let textLayer = layer as? CATextLayer {
+            let text = (textLayer.string as? String) ?? (textLayer.string as? NSAttributedString)?.string ?? ""
+            if !text.isEmpty, let frame = accessibilityFrame(layer.bounds, from: layer, clippedBy: clip) {
+                nodes.append(accessibilityNode(nextIdentifier: &nextIdentifier, role: .staticText, frame: frame, label: text))
+            }
+        }
+        for child in layer.sublayers ?? [] {
+            nodes += accessibilityVisibleText(in: child, clippedBy: clip, nextIdentifier: &nextIdentifier)
+        }
+        return nodes
+    }
+
+    private func buildWorkspaceAccessibilityNodes(nextIdentifier: inout UInt32) -> [OuterframeAccessibilityNode] {
+        var controls: [(CGRect, String)] = []
+        var fieldLabel: String?
+        var fieldFrame = workspaceRenameFieldFrame
+        var dialogFrame = workspacePanelFrame
+        var title = "Container"
+        if containerConfigurationBuildError != nil {
+            controls = [(containerConfigurationBuildErrorCopyFrame, "Copy error"), (containerConfigurationBuildErrorDismissFrame, "Dismiss error")]
+            dialogFrame = containerConfigurationBuildErrorTextFrame.union(containerConfigurationBuildErrorDismissFrame)
+            title = "Build error"
+        } else if !containerConfigurationDismissPromptFrame.isEmpty {
+            dialogFrame = containerConfigurationDismissPromptFrame
+            title = "Save changes?"
+            controls = [(containerConfigurationDismissSaveFrame, "Save"), (containerConfigurationDismissWithoutSavingFrame, "Discard changes"), (containerConfigurationDismissCancelFrame, "Cancel")]
+        } else if !containerConfigurationRebuildPromptFrame.isEmpty {
+            dialogFrame = containerConfigurationRebuildPromptFrame
+            title = "Rebuild container"
+            controls = [(containerConfigurationRebuildSaveFrame, "Save and rebuild"), (containerConfigurationRebuildWithoutSavingFrame, "Rebuild without saving"), (containerConfigurationRebuildCancelFrame, "Cancel")]
+        } else if pendingWorkspaceDeletion != nil {
+            title = "Delete container"
+            controls = [(workspaceDeleteConfirmFrame, "Delete container"), (workspaceDeleteCancelFrame, "Cancel")]
+        } else if isContainerConfigurationEditorVisible && !isRenamingContainerConfiguration {
+            title = "Edit \(pendingDockerfileWorkspace?.name ?? "container")"
+            controls = [(workspaceCloseFrame, "Close container editor"),
+                        (containerConfigurationRenameFrame, "Rename container"),
+                        (containerConfigurationDockerfileTabFrame, "Dockerfile"),
+                        (containerConfigurationMountsTabFrame, "Folder mounts"),
+                        (containerConfigurationEnvironmentTabFrame, "Environment"),
+                        (containerConfigurationPortsTabFrame, "Ports"),
+                        (containerConfigurationRuntimeTabFrame, "Runtime"),
+                        (containerConfigurationSaveFrame, "Save"),
+                        (containerConfigurationDiscardFrame, "Discard changes"),
+                        (containerConfigurationRebuildFrame, "Rebuild container")]
+            switch containerConfigurationTab {
+            case .dockerfile, .environment, .ports:
+                fieldLabel = containerConfigurationTab == .dockerfile ? "Dockerfile contents" : containerConfigurationTab == .environment ? "Environment variables" : "Port mappings"
+                fieldFrame = containerConfigurationTextVisibleFrame
+                if containerConfigurationTab == .dockerfile {
+                    controls += [(containerConfigurationCookbookFrame, "Dockerfile cookbook"), (containerConfigurationCopyPathFrame, "Copy Dockerfile path")]
+                }
+            case .mounts:
+                controls.append((containerConfigurationAddMountFrame, "Add folder mount"))
+                controls += containerConfigurationMountActionFrames.map { ($0.frame, "\($0.action) mount \($0.id)") }
+            case .runtime:
+                controls.append((containerConfigurationChangeRuntimeFrame, "Change runtime"))
+            }
+        } else if isWorkspaceNamePromptVisible {
+            title = isCreatingWorkspace ? "Add container" : "Container settings"
+            dialogFrame = workspaceRenamePanelFrame
+            fieldLabel = isCreatingWorkspace && !isEditingCreationBaseImage ? "Container name" : pendingWorkspaceRename != nil ? "Container name" : "Value"
+            controls = [(workspaceRenameCancelFrame, "Cancel"), (workspaceRenameConfirmFrame, isCreatingWorkspace ? (isEditingCreationBaseImage ? "Done" : "Create") : pendingWorkspaceRename != nil ? "Rename" : "Save"),
+                        (workspaceCreationBaseImageFrame, "Choose base image"), (workspaceOuterShellBaseImageFrame, "Outer Shell base image"),
+                        (workspaceCustomBaseImageFrame, "Custom base image with support"), (workspaceCustomAsIsFrame, "Custom base image unchanged")]
+        } else {
+            controls = [(workspaceCloseFrame, "Close")]
+        }
+        var nodes: [OuterframeAccessibilityNode] = []
+        for (frame, label) in controls where !frame.isEmpty {
+            let selectedTab = isContainerConfigurationEditorVisible &&
+                ((label == "Dockerfile" && containerConfigurationTab == .dockerfile) ||
+                 (label == "Folder mounts" && containerConfigurationTab == .mounts) ||
+                 (label == "Environment" && containerConfigurationTab == .environment) ||
+                 (label == "Ports" && containerConfigurationTab == .ports) ||
+                 (label == "Runtime" && containerConfigurationTab == .runtime))
+            nodes.append(accessibilityNode(nextIdentifier: &nextIdentifier, role: .button, frame: frame, label: label, value: selectedTab ? "Selected" : nil))
+        }
+        if let fieldLabel, !fieldFrame.isEmpty {
+            nodes.append(accessibilityNode(nextIdentifier: &nextIdentifier, role: .textField, frame: fieldFrame, label: fieldLabel,
+                                           value: workspaceRenameName, actions: isContainerConfigurationEditorVisible ? [.press, .focus, .setValue, .scrollUp, .scrollDown] : [.press, .focus, .setValue], isFocused: workspaceRenameInputController.isFocused))
+        }
+        let interactiveFrames = nodes.map(\.frame)
+        nodes += accessibilityVisibleText(in: workspacePanelLayer, nextIdentifier: &nextIdentifier).filter { node in
+            let center = CGPoint(x: node.frame.midX, y: node.frame.midY)
+            return dialogFrame.contains(center) && !interactiveFrames.contains(where: { $0.contains(center) })
+        }
+        nodes.sort { abs($0.frame.midY - $1.frame.midY) > 8 ? $0.frame.midY > $1.frame.midY : $0.frame.minX < $1.frame.minX }
+        return [accessibilityNode(nextIdentifier: &nextIdentifier, role: .container, frame: dialogFrame, label: title, children: nodes)]
     }
 
     private func accessibilityFrame(_ frame: CGRect,
@@ -7788,7 +7971,11 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                            frame: frame,
                                            label: "Open \(overviewTitle(for: card.item))",
                                            value: status,
-                                           hint: card.item.subtitle))
+                                           hint: card.item.containerContext?.container.name ?? (card.item.backend.serviceScope == "system" ? "root" : overviewUsername),
+                                           key: "endpoint:\(card.item.identityKey)", actions: [.press, .showMenu, .moveEarlier, .moveLater]))
+            if let node = nodes.last {
+                accessibilityReorderTargets[node.identifier] = (overviewGroupID(for: card.item), card.item)
+            }
         }
 
         for badge in appBadgeFrames {
@@ -7803,22 +7990,22 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
         for target in overviewMenuFrames {
             if let frame = accessibilityFrame(target.frame, from: appsScrollContentLayer, clippedBy: clipFrame) {
-                nodes.append(accessibilityNode(nextIdentifier: &nextIdentifier, role: .button, frame: frame, label: "Actions for \(overviewTitle(for: target.item))"))
+                nodes.append(accessibilityNode(nextIdentifier: &nextIdentifier, role: .button, frame: frame, label: "Actions for \(overviewTitle(for: target.item))", key: "menu:\(target.item.identityKey)"))
             }
         }
         for target in overviewAddFrames {
             if let frame = accessibilityFrame(target, from: appsScrollContentLayer, clippedBy: clipFrame) {
-                nodes.append(accessibilityNode(nextIdentifier: &nextIdentifier, role: .button, frame: frame, label: "Add more…"))
+                nodes.append(accessibilityNode(nextIdentifier: &nextIdentifier, role: .button, frame: frame, label: "Add more…", key: "add-more:\(overviewGroupFrames.first(where: { $0.frame.contains(CGPoint(x: target.midX, y: target.midY)) })?.id ?? "unknown")"))
             }
         }
         for target in workspaceOverviewActionFrames {
             if let frame = accessibilityFrame(target.frame, from: appsScrollContentLayer, clippedBy: clipFrame) {
-                let label = target.operation == "menu" ? "Manage \(target.workspace.name)" : target.operation == "editContainer" ? "Edit \(target.workspace.name)" : "Copy command"
-                nodes.append(accessibilityNode(nextIdentifier: &nextIdentifier, role: .button, frame: frame, label: label))
+                let label = target.operation == "menu" ? "Manage \(target.workspace.name)" : target.operation == "editContainer" ? "Edit \(target.workspace.name)" : target.operation == "copyShell" ? "Copy Terminal command" : "Copy \(target.workspace.commandLaunchers.first(where: { "copyCommand:\($0.id)" == target.operation })?.displayName ?? "command") command"
+                nodes.append(accessibilityNode(nextIdentifier: &nextIdentifier, role: .button, frame: frame, label: label, key: "workspace-action:\(target.workspace.id):\(target.operation)"))
             }
         }
         if let frame = accessibilityFrame(workspaceOverviewCreateFrame, from: appsScrollContentLayer, clippedBy: clipFrame) {
-            nodes.append(accessibilityNode(nextIdentifier: &nextIdentifier, role: .button, frame: frame, label: "Add container…"))
+            nodes.append(accessibilityNode(nextIdentifier: &nextIdentifier, role: .button, frame: frame, label: "Add container (beta)…"))
         }
         if let frame = accessibilityFrame(addAppFrame, from: appsScrollContentLayer, clippedBy: clipFrame) {
             nodes.append(accessibilityNode(nextIdentifier: &nextIdentifier,
@@ -7835,7 +8022,21 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                            frame: frame,
                                            label: message))
         }
-        return nodes
+        var grouped: [OuterframeAccessibilityNode] = []
+        for group in overviewGroupFrames {
+            guard let frame = accessibilityFrame(group.frame, from: appsScrollContentLayer, clippedBy: clipFrame) else { continue }
+            let name = group.id == "user" ? overviewUsername : group.id == "root" ? "root" : localWorkspaces.first(where: { "container:\($0.id.uuidString.lowercased())" == group.id })?.name ?? "Container"
+            let members = nodes.filter { frame.contains(CGPoint(x: $0.frame.midX, y: $0.frame.midY)) }.sorted {
+                if abs($0.frame.midY - $1.frame.midY) > 8 { return $0.frame.midY > $1.frame.midY }
+                return $0.frame.minX < $1.frame.minX
+            }
+            let identifiers = Set(members.map(\.identifier))
+            nodes.removeAll { identifiers.contains($0.identifier) }
+            grouped.append(accessibilityNode(nextIdentifier: &nextIdentifier, role: .container, frame: frame, label: name, children: members, key: "group:\(group.id)", actions: [.moveEarlier, .moveLater]))
+            if let node = grouped.last { accessibilityReorderTargets[node.identifier] = (group.id, nil) }
+        }
+        grouped.append(contentsOf: nodes)
+        return [accessibilityNode(nextIdentifier: &nextIdentifier, role: .scrollArea, frame: clipFrame, label: "Users and containers", children: grouped, actions: [.scrollUp, .scrollDown])]
     }
 
     private func buildLogAccessibilityNodes(nextIdentifier: inout UInt32) -> [OuterframeAccessibilityNode] {
@@ -7926,7 +8127,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                            frame: frame,
                                            label: description.label,
                                            value: description.value,
-                                           hint: description.hint))
+                                           hint: description.hint,
+                                           key: "create-field:\(field.key)",
+                                           isFocused: createInputController.isFocused && activeCreateFieldKey == field.key))
         }
 
         for choice in createChoiceFrames {
