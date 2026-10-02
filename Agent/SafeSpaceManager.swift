@@ -675,6 +675,8 @@ final class SafeSpaceManager: @unchecked Sendable {
         switch operation {
         case "list":
             break
+        case "checkRuntimes":
+            _ = runtimeReadiness(refresh: true)
         case "create":
             try create(request)
         case "duplicate":
@@ -747,15 +749,43 @@ final class SafeSpaceManager: @unchecked Sendable {
         return try JSONSerialization.data(withJSONObject: body, options: [.sortedKeys])
     }
 
+    private let runtimeReadinessLock = NSLock()
+    private var runtimeReadinessCache: (date: Date, values: [String: ContainerRuntimeReadiness])?
+
+    private func runtimeReadiness(refresh: Bool = false) -> [String: ContainerRuntimeReadiness] {
+        runtimeReadinessLock.withSafeSpaceLock {
+            if !refresh, let cached = runtimeReadinessCache, Date().timeIntervalSince(cached.date) < 15 {
+                return cached.values
+            }
+            #if arch(arm64)
+            let appleSupported = ProcessInfo.processInfo.operatingSystemVersion.majorVersion >= 26
+            #else
+            let appleSupported = false
+            #endif
+            var values: [String: ContainerRuntimeReadiness] = [:]
+            for provider in [SafeSpaceRuntimeProviderID.appleContainer, .docker] {
+                values[provider.rawValue] = ContainerRuntime.readiness(
+                    apple: provider == .appleContainer,
+                    executable: runtimeExecutableURL(for: provider), appleSupported: appleSupported,
+                    probe: { try ContainerRuntime.probe($0, arguments: $1) })
+            }
+            runtimeReadinessCache = (Date(), values)
+            return values
+        }
+    }
+
     private func providerDictionaries() -> [[String: Any]] {
+        let readiness = runtimeReadiness()
         return [
             [
                 "id": "apple.container",
                 "name": "Apple container",
-                "detail": "A portable OCI container running locally in its own lightweight virtual machine.",
+                "detail": readiness["apple.container"]?.detail ?? "Runtime check failed.",
                 "defaultBaseImage": rootContainerBaseImage,
                 "isolationName": "",
-                "isAvailable": runtimeExecutableURL(for: .appleContainer) != nil,
+                "isAvailable": readiness["apple.container"]?.isAvailable ?? false,
+                "status": readiness["apple.container"]?.status ?? "failed",
+                "setupURL": readiness["apple.container"]?.setupURL ?? "",
                 "capabilities": [
                     "supportsApps": true,
                     "supportsShell": true,
@@ -767,10 +797,12 @@ final class SafeSpaceManager: @unchecked Sendable {
             [
                 "id": "docker",
                 "name": "Docker",
-                "detail": "A broadly compatible OCI runtime with live host file notifications.",
+                "detail": readiness["docker"]?.detail ?? "Runtime check failed.",
                 "defaultBaseImage": rootContainerBaseImage,
                 "isolationName": "",
-                "isAvailable": dockerExecutableURL() != nil,
+                "isAvailable": readiness["docker"]?.isAvailable ?? false,
+                "status": readiness["docker"]?.status ?? "failed",
+                "setupURL": readiness["docker"]?.setupURL ?? "",
                 "capabilities": [
                     "supportsApps": true,
                     "supportsShell": true,
@@ -1243,6 +1275,10 @@ final class SafeSpaceManager: @unchecked Sendable {
         guard let provider = SafeSpaceRuntimeProviderID(rawValue: providerID),
               runtimeExecutableURL(for: provider) != nil else {
             throw SafeSpaceManagerError.unsupportedProvider
+        }
+        if let readiness = runtimeReadiness(refresh: true)[provider.rawValue],
+           !readiness.isAvailable && !(provider == .appleContainer && readiness.status == "stopped") {
+            throw SafeSpaceManagerError.commandFailed(readiness.detail)
         }
         let requestedBaseImage = try (request["baseImage"] as? String).map {
             try validatedBaseImage($0)
@@ -6180,10 +6216,7 @@ final class SafeSpaceManager: @unchecked Sendable {
     ) -> URL? {
         switch provider {
         case .appleContainer:
-            let path = "/usr/local/bin/container"
-            return FileManager.default.isExecutableFile(atPath: path)
-                ? URL(fileURLWithPath: path)
-                : nil
+            return ContainerRuntime.executable(named: "container")
         case .docker:
             return dockerExecutableURL()
         }
@@ -6197,14 +6230,7 @@ final class SafeSpaceManager: @unchecked Sendable {
     }
 
     private func dockerExecutableURL() -> URL? {
-        let candidates = [
-            "/usr/local/bin/docker",
-            "/opt/homebrew/bin/docker",
-            "/Applications/Docker.app/Contents/Resources/bin/docker"
-        ]
-        return candidates.first(where: {
-            FileManager.default.isExecutableFile(atPath: $0)
-        }).map(URL.init(fileURLWithPath:))
+        ContainerRuntime.executable(named: "docker")
     }
 
     private func runRuntime(_ record: SafeSpaceRecord,
@@ -6233,12 +6259,12 @@ final class SafeSpaceManager: @unchecked Sendable {
         }
         return try runCommand(executable: executable.path,
                               arguments: arguments,
-                              environment: try dockerEnvironment(executable: executable),
+                              environment: dockerEnvironment(executable: executable),
                               currentDirectoryURL: currentDirectoryURL,
                               progress: progress)
     }
 
-    private func dockerEnvironment(executable: URL) throws -> [String: String] {
+    private func dockerEnvironment(executable: URL) -> [String: String] {
         let resolvedExecutable = executable.resolvingSymlinksInPath()
         let inheritedPath = ProcessInfo.processInfo.environment["PATH"] ?? ""
         let candidates = [
@@ -6256,51 +6282,7 @@ final class SafeSpaceManager: @unchecked Sendable {
         var seen: Set<String> = []
         let path = candidates.filter { !$0.isEmpty && seen.insert($0).inserted }
             .joined(separator: ":")
-        let configurationDirectory = try applicationDirectory()
-            .appendingPathComponent("Docker", isDirectory: true)
-        try FileManager.default.createDirectory(
-            at: configurationDirectory,
-            withIntermediateDirectories: true,
-            attributes: [.posixPermissions: 0o700]
-        )
-        try installDockerCLIPlugins(in: configurationDirectory)
-        return [
-            "PATH": path,
-            "DOCKER_CONFIG": configurationDirectory.path,
-            "DOCKER_HOST": "unix:///var/run/docker.sock"
-        ]
-    }
-
-    private func installDockerCLIPlugins(in configurationDirectory: URL) throws {
-        let sourceCandidates = [
-            "/Applications/Docker.app/Contents/Resources/cli-plugins/docker-buildx",
-            "/usr/local/lib/docker/cli-plugins/docker-buildx",
-            "/opt/homebrew/lib/docker/cli-plugins/docker-buildx"
-        ]
-        guard let sourcePath = sourceCandidates.first(where: {
-            FileManager.default.isExecutableFile(atPath: $0)
-        }) else {
-            return
-        }
-        let directory = configurationDirectory
-            .appendingPathComponent("cli-plugins", isDirectory: true)
-        try FileManager.default.createDirectory(
-            at: directory,
-            withIntermediateDirectories: true,
-            attributes: [.posixPermissions: 0o700]
-        )
-        let destination = directory.appendingPathComponent("docker-buildx")
-        if FileManager.default.fileExists(atPath: destination.path) {
-            let currentTarget = try? FileManager.default.destinationOfSymbolicLink(
-                atPath: destination.path
-            )
-            guard currentTarget != sourcePath else { return }
-            try FileManager.default.removeItem(at: destination)
-        }
-        try FileManager.default.createSymbolicLink(
-            at: destination,
-            withDestinationURL: URL(fileURLWithPath: sourcePath)
-        )
+        return ["PATH": path]
     }
 
     private func removeRuntimeContainer(
@@ -6352,8 +6334,7 @@ final class SafeSpaceManager: @unchecked Sendable {
                               currentDirectoryURL: URL? = nil,
                               progress: ((String) -> Void)? = nil) throws
         -> (status: Int32, stdout: String, stderr: String) {
-        let executable = "/usr/local/bin/container"
-        guard FileManager.default.isExecutableFile(atPath: executable) else {
+        guard let executable = runtimeExecutableURL(for: .appleContainer)?.path else {
             throw SafeSpaceManagerError.unsupportedProvider
         }
         let result = try runCommand(executable: executable,
@@ -6373,7 +6354,8 @@ final class SafeSpaceManager: @unchecked Sendable {
                 return retry
             }
             let start = try runCommand(executable: executable,
-                                       arguments: ["system", "start"])
+                                       arguments: ["system", "start", "--enable-kernel-install", "--timeout", "30"],
+                                       progress: progress, timeout: 60)
             try requireSuccess(start, action: "start Apple container")
             return try runCommand(executable: executable,
                                   arguments: arguments,
@@ -6398,7 +6380,8 @@ final class SafeSpaceManager: @unchecked Sendable {
                             arguments: [String],
                             environment: [String: String] = [:],
                             currentDirectoryURL: URL? = nil,
-                            progress: ((String) -> Void)? = nil) throws
+                            progress: ((String) -> Void)? = nil,
+                            timeout: TimeInterval? = nil) throws
         -> (status: Int32, stdout: String, stderr: String) {
         let outputDirectory = FileManager.default.temporaryDirectory
             .appendingPathComponent("outershell-container-\(UUID().uuidString)",
@@ -6425,6 +6408,7 @@ final class SafeSpaceManager: @unchecked Sendable {
                 uniquingKeysWith: { _, replacement in replacement }
             )
         }
+        process.standardInput = FileHandle.nullDevice
         process.standardOutput = stdout
         process.standardError = stderr
         do {
@@ -6434,35 +6418,37 @@ final class SafeSpaceManager: @unchecked Sendable {
             try? stderr.close()
             throw error
         }
-        if let progress {
+        if progress == nil && timeout == nil {
+            process.waitUntilExit()
+        } else {
             let stdoutReader = try FileHandle(forReadingFrom: stdoutURL)
             let stderrReader = try FileHandle(forReadingFrom: stderrURL)
             defer {
                 try? stdoutReader.close()
                 try? stderrReader.close()
             }
+            let started = ProcessInfo.processInfo.systemUptime
             while process.isRunning {
+                if let timeout, ProcessInfo.processInfo.systemUptime - started >= timeout {
+                    kill(process.processIdentifier, SIGKILL)
+                    process.waitUntilExit()
+                    throw SafeSpaceManagerError.commandFailed("The container runtime did not finish starting within \(Int(timeout)) seconds. Run container system start on this server, then try again.")
+                }
+                if let progress {
+                    if let data = try stdoutReader.readToEnd(), !data.isEmpty,
+                       let text = String(data: data, encoding: .utf8) { progress(text) }
+                    if let data = try stderrReader.readToEnd(), !data.isEmpty,
+                       let text = String(data: data, encoding: .utf8) { progress(text) }
+                }
                 Thread.sleep(forTimeInterval: 0.1)
+            }
+            process.waitUntilExit()
+            if let progress {
                 if let data = try stdoutReader.readToEnd(), !data.isEmpty,
-                   let text = String(data: data, encoding: .utf8) {
-                    progress(text)
-                }
+                   let text = String(data: data, encoding: .utf8) { progress(text) }
                 if let data = try stderrReader.readToEnd(), !data.isEmpty,
-                   let text = String(data: data, encoding: .utf8) {
-                    progress(text)
-                }
+                   let text = String(data: data, encoding: .utf8) { progress(text) }
             }
-            process.waitUntilExit()
-            if let data = try stdoutReader.readToEnd(), !data.isEmpty,
-               let text = String(data: data, encoding: .utf8) {
-                progress(text)
-            }
-            if let data = try stderrReader.readToEnd(), !data.isEmpty,
-               let text = String(data: data, encoding: .utf8) {
-                progress(text)
-            }
-        } else {
-            process.waitUntilExit()
         }
         try? stdout.close()
         try? stderr.close()

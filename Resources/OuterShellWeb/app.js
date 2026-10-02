@@ -1407,8 +1407,21 @@
     return `<header class="dialog-header"><h2 id="dialog-title">${escapeHTML(title)}</h2><button class="dialog-close" type="button" data-action="close-dialog" aria-label="Close">×</button></header>`;
   }
 
+  function runtimeCanCreate(provider) {
+    return provider.isAvailable === true || (provider.id === "apple.container" && provider.status === "stopped");
+  }
+
+  function runtimeGuidance() {
+    if (!state.providers.length) return "Runtime discovery has not completed. Choose Check again.";
+    return state.providers.map(provider => {
+      const setup = typeof provider.setupURL === "string" && provider.setupURL.startsWith("https://")
+        ? ` <a href="${escapeHTML(provider.setupURL)}" target="_blank" rel="noopener noreferrer">Setup instructions</a>` : "";
+      return `<p><strong>${escapeHTML(provider.name)}</strong>: ${escapeHTML(provider.detail || "Runtime status unavailable.")}${!provider.isAvailable ? setup : ""}</p>`;
+    }).join("");
+  }
+
   function runtimeOptions(selected = "") {
-    return state.providers.map(provider => `<option value="${escapeHTML(provider.id)}" ${provider.id === selected ? "selected" : ""} ${provider.isAvailable ? "" : "disabled"}>${escapeHTML(provider.name)}${provider.isAvailable ? "" : " (unavailable)"}</option>`).join("");
+    return state.providers.map(provider => `<option value="${escapeHTML(provider.id)}" ${provider.id === selected ? "selected" : ""} ${runtimeCanCreate(provider) ? "" : "disabled"}>${escapeHTML(provider.name)}${provider.isAvailable ? "" : provider.status === "stopped" ? " (stopped)" : " (unavailable)"}</option>`).join("");
   }
 
   async function containerOperation(operation, values) {
@@ -1426,7 +1439,7 @@
   }
 
   function openCreateContainer() {
-    const provider = state.providers.find(value => value.isAvailable);
+    const provider = state.providers.find(runtimeCanCreate);
     const dialog = openDialog(`${containerDialogHeader("New container")}
       <form class="container-form"><div class="dialog-body form-grid">
         <label class="field full">Name<input name="name" required autocomplete="off"></label>
@@ -1435,9 +1448,29 @@
         <label class="field">Max CPUs<input name="cpus" type="number" min="1" step="1" value="4" required></label>
         <label class="field">Max Memory (GB)<input name="memoryInGB" type="number" min="1" step="1" value="8" required></label>
         <p class="field-note full">The container is built on this server. You can edit its Dockerfile and runtime configuration after creation.</p>
-        <p class="container-message full" role="status">${provider ? "" : "No container runtime is available on this server."}</p>
+        <div class="runtime-guidance full">${runtimeGuidance()}</div>
+        <button type="button" class="runtime-recheck">Check again</button>
+        <p class="container-message full" role="status">${provider ? "" : "No container runtime is ready on this server."}</p>
       </div><footer class="dialog-footer"><button type="button" data-action="close-dialog">Cancel</button><button class="primary-button" type="submit" ${provider ? "" : "disabled"}>Create</button></footer></form>`);
     const form = dialog.querySelector("form");
+    form.querySelector(".runtime-recheck").addEventListener("click", async event => {
+      const button = event.currentTarget;
+      button.disabled = true;
+      const message = form.querySelector(".container-message");
+      message.textContent = "Checking runtimes on this server…";
+      try {
+        await safeSpaceRequest("checkRuntimes");
+        if (!dialog.isConnected) return;
+        const select = form.elements.runtimeProviderID;
+        const selected = state.providers.find(value => value.id === select.value && runtimeCanCreate(value)) || state.providers.find(runtimeCanCreate);
+        select.innerHTML = runtimeOptions(selected?.id);
+        if (!form.elements.baseImage.value && selected) form.elements.baseImage.value = selected.defaultBaseImage || "";
+        form.querySelector(".runtime-guidance").innerHTML = runtimeGuidance();
+        form.querySelector('[type="submit"]').disabled = !selected;
+        message.textContent = selected ? "Runtime check complete." : "No container runtime is ready on this server.";
+      } catch (error) { message.textContent = error.message; }
+      finally { button.disabled = false; }
+    });
     form.addEventListener("submit", async event => {
       event.preventDefault();
       const data = new FormData(form);

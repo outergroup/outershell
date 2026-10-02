@@ -353,3 +353,35 @@ docker run --mount \
 Outer Shell stores the equivalent mapping beside the Dockerfile and reconnects
 it when creating the container. Moving the project to another server requires
 choosing the corresponding folder on that server.
+
+## Runtime setup and readiness
+
+Outer Shell reports runtime states as `unsupported`, `notInstalled`, `stopped`,
+`ready`, or `failed`. Open New container to see setup guidance for the server
+hosting Outer Shell. Check again refreshes detection after installing or starting
+a runtime, without restarting Outer Shell. Installing a runtime remains an
+explicit user action; setup links open the vendor documentation.
+
+On macOS, Docker uses the server user's Docker context and configuration,
+including explicit Docker environment variables. Outer Shell does not require
+`/var/run/docker.sock` or replace the user's Docker configuration. Apple container
+requires Apple Silicon and macOS 26 or later. A stopped Apple runtime can start
+when creating a container; this permits its initial kernel download and bounds
+startup to 60 seconds. Readiness probes time out after three seconds and the
+macOS provider caches them for 15 seconds; Check again bypasses that cache.
+
+On Linux, Outer Shell requires rootless Docker. It checks the endpoint selected
+by `OUTER_SHELL_DOCKER_HOST`, or the user runtime directory's `docker.sock`, and
+verifies that the responding engine reports rootless mode. An inherited
+`DOCKER_CONTEXT` does not override that endpoint. The installer can start an
+existing user service or invoke an installed rootless setup tool; it does not
+install Docker or its system prerequisites.
+
+Focused tests (no real container engine required):
+
+```sh
+sh Scripts/test_container_runtime.sh
+python3 Scripts/test_container_readiness.py
+sh Scripts/test_container_provider_rootless_docker.sh
+node Scripts/test_web_runtime_readiness.cjs .
+```

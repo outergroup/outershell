@@ -1087,3 +1087,7 @@ h1 { margin: 0; font-size: clamp(30px, 5vw, 45px); line-height: 1.05; letter-spa
 .container-command-icon { display: grid; place-items: center; width: 22px; height: 22px; flex: 0 0 22px; color: var(--muted); }
 .container-command-icon img, .container-command-icon svg { width: 100%; height: 100%; object-fit: contain; }
 .container-command-copy { margin-left: auto; min-width: 22px; text-align: center; color: var(--muted); }
+
+.runtime-guidance { color: var(--muted); font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; }
+.runtime-guidance p { margin: 0 0 8px; }
+.runtime-guidance a { color: var(--accent); }

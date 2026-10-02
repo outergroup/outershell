@@ -25,6 +25,7 @@
 		AG0000000000000000000020 /* OuterShellPlatform.c in Sources */ = {isa = PBXBuildFile; fileRef = 37B4F9E22FA1B00100873894 /* OuterShellPlatform.c */; };
 		AG0000000000000000000021 /* OuterShellDownloader.c in Sources */ = {isa = PBXBuildFile; fileRef = 37B4F9F12FA1B00100873894 /* OuterShellDownloader.c */; };
 		AG0000000000000000000022 /* OuterShellDownloaderApple.m in Sources */ = {isa = PBXBuildFile; fileRef = 37B4F9F22FA1B00100873894 /* OuterShellDownloaderApple.m */; };
+		C011DA7A0000000000000001 /* ContainerRuntime.swift in Sources */ = {isa = PBXBuildFile; fileRef = C011DA7A0000000000000002 /* ContainerRuntime.swift */; };
 		SS0000000000000000000001 /* SafeSpaceManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = SS0000000000000000000011 /* SafeSpaceManager.swift */; };
 		SS0000000000000000000005 /* SafeSpaceSocketRelay.swift in Sources */ = {isa = PBXBuildFile; fileRef = SS0000000000000000000015 /* SafeSpaceSocketRelay.swift */; };
 /* End PBXBuildFile section */
@@ -71,6 +72,7 @@
 		AG0000000000000000000001 /* Outer Shell.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "Outer Shell.app"; sourceTree = BUILT_PRODUCTS_DIR; };
 		AG0000000000000000000003 /* OuterShellAgent.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OuterShellAgent.swift; sourceTree = "<group>"; };
 		AG0000000000000000000023 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		C011DA7A0000000000000002 /* ContainerRuntime.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContainerRuntime.swift; sourceTree = "<group>"; };
 		SS0000000000000000000011 /* SafeSpaceManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SafeSpaceManager.swift; sourceTree = "<group>"; };
 		SS0000000000000000000015 /* SafeSpaceSocketRelay.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SafeSpaceSocketRelay.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
@@ -183,6 +185,7 @@
 			children = (
 				AG0000000000000000000003 /* OuterShellAgent.swift */,
 				SS0000000000000000000011 /* SafeSpaceManager.swift */,
+				C011DA7A0000000000000002 /* ContainerRuntime.swift */,
 				SS0000000000000000000015 /* SafeSpaceSocketRelay.swift */,
 				AG0000000000000000000023 /* Info.plist */,
 			);
@@ -353,6 +356,7 @@
 				AG0000000000000000000005 /* outershelld.c in Sources */,
 				37B4F9EE2FA1B00100873894 /* OuterShellBackend.c in Sources */,
 				SS0000000000000000000001 /* SafeSpaceManager.swift in Sources */,
+				C011DA7A0000000000000001 /* ContainerRuntime.swift in Sources */,
 				SS0000000000000000000005 /* SafeSpaceSocketRelay.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;

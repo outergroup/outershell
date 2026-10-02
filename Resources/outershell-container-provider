@@ -340,12 +340,47 @@ def docker_host():
 
 def docker_environment():
     environment = os.environ.copy()
+    environment.pop("DOCKER_CONTEXT", None)
     environment["DOCKER_HOST"] = docker_host()
     return environment
 
 
+_docker_readiness_cache = None
+
+
+def docker_readiness():
+    global _docker_readiness_cache
+    now = time.monotonic()
+    if _docker_readiness_cache is None or now - _docker_readiness_cache[0] >= 15:
+        _docker_readiness_cache = (now, probe_docker_readiness())
+    return _docker_readiness_cache[1]
+
+
+def probe_docker_readiness():
+    if docker_path() is None:
+        return "notInstalled", "Install Docker Engine with rootless support on this server, then configure it for this user and choose Check again."
+    host = docker_host()
+    if host.startswith("unix://") and not pathlib.Path(host[7:]).is_socket():
+        return "stopped", "Rootless Docker is not running at " + host + ". Run dockerd-rootless-setuptool.sh install, or systemctl --user start docker if already configured, then choose Check again."
+    try:
+        result = run([docker_path(), "info", "--format", "{{json .SecurityOptions}}"],
+                     environment=docker_environment(), timeout=3)
+        if result.returncode == 0:
+            options = json.loads(result.stdout)
+            if isinstance(options, list) and any("rootless" in value for value in options):
+                return "ready", "Rootless Docker is ready for this server user."
+            return "failed", "The selected Docker engine is not rootless. Configure rootless Docker for this user; Outer Shell does not use the host-root daemon."
+        message = (result.stderr or result.stdout).strip()
+        status = "stopped" if any(value in message.lower() for value in ("cannot connect", "connection refused", "is not running")) else "failed"
+        return status, "Rootless Docker is not ready. Check docker info against " + host + ". " + message[:400]
+    except subprocess.TimeoutExpired:
+        return "failed", "Rootless Docker did not respond within 3 seconds. Check its user service, then choose Check again."
+    except (OSError, ValueError, TypeError) as error:
+        return "failed", "Could not check rootless Docker: " + str(error)
+
+
 def rootless_docker_available():
-    return docker_path() is not None and rootless_docker_socket().is_socket()
+    return docker_readiness()[0] == "ready"
 
 
 def docker_cli_prefix():
@@ -362,25 +397,16 @@ def interactive_command(arguments):
 
 
 def provider_dictionary():
-    available = rootless_docker_available()
-    if available:
-        detail = (
-            "A broadly compatible OCI runtime running without host-root privileges."
-        )
-    elif docker_path() is None:
-        detail = "Docker is not installed or is not available in PATH."
-    else:
-        detail = (
-            "Rootless Docker is not running for this server user. "
-            "Outer Shell does not use the host-root Docker daemon."
-        )
+    status, detail = docker_readiness()
     return {
         "id": PROVIDER_ID,
         "name": "Docker",
         "detail": detail,
         "defaultBaseImage": DEFAULT_BASE_IMAGE,
         "isolationName": "",
-        "isAvailable": available,
+        "isAvailable": status == "ready",
+        "status": status,
+        "setupURL": "https://docs.docker.com/engine/security/rootless/",
         "capabilities": capabilities(),
     }
 
@@ -545,12 +571,9 @@ def docker(arguments, **kwargs):
     executable = docker_path()
     if not executable:
         raise RuntimeError("Docker is not installed or is not available in PATH.")
-    socket_path = rootless_docker_socket()
-    if not socket_path.is_socket():
-        raise RuntimeError(
-            "Rootless Docker is not running for this server user. "
-            f"Expected its socket at {socket_path}."
-        )
+    status, detail = docker_readiness()
+    if status != "ready":
+        raise RuntimeError(detail)
     return run(
         [executable] + arguments,
         environment=docker_environment(),
@@ -902,6 +925,9 @@ def start_container(container_id):
 
 
 def operation_create(request):
+    status, detail = docker_readiness()
+    if status != "ready":
+        raise RuntimeError(detail)
     container_id = str(uuid.uuid4())
     name = request.get("name", "Container").strip() or "Container"
     base_image = request.get("baseImage") or DEFAULT_BASE_IMAGE
@@ -2192,6 +2218,9 @@ def handle_request(request):
         extra = None
         if operation == "list":
             pass
+        elif operation == "checkRuntimes":
+            global _docker_readiness_cache
+            _docker_readiness_cache = None
         elif operation == "create":
             operation_create(request)
         elif operation == "rename":

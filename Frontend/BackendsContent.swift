@@ -834,7 +834,10 @@ private struct LocalSafeSpaceProviderRecord: Decodable, Equatable {
     let isAvailable: Bool?
     let capabilities: LocalWorkspaceRecord.Capabilities
 
-    var canCreate: Bool { isAvailable ?? true }
+    let status: String?
+    let setupURL: String?
+
+    var canCreate: Bool { isAvailable == true || (id == "apple.container" && status == "stopped") }
 }
 
 private struct LocalWorkspaceHostRequest: Encodable {
@@ -1737,7 +1740,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private let statusLayer = CATextLayer()
     private let privilegedAppsHeaderLayer = CATextLayer()
     private let safeSpacesHeaderLayer = CATextLayer()
-    private let outerShellActionLayer = SymbolButtonLayer(symbolName: "ellipsis.circle", accessibilityTitle: "Outer Shell Actions")
     private let contentLayer = CALayer()
     private let appsLayer = CALayer()
     private let appsScrollContentLayer = CALayer()
@@ -1781,7 +1783,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private var appOverflowAnimationTargets: [AppLauncherScope: CGFloat] = [:]
     private var appOverflowAnimationGenerations: [AppLauncherScope: Int] = [:]
     private var addAppFrame = CGRect.zero
-    private var outerShellActionFrame = CGRect.zero
     private var appsContentBottom: CGFloat = 0
     private var workspaceContentBottom: CGFloat = 0
     private var workspacePaneFrame = CGRect.zero
@@ -1833,6 +1834,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private var sharedContainerDragFrame = CGRect.zero
     private var sharedContainerCloseFrame = CGRect.zero
     private var pendingSharedContainerDrag = false
+    private var runtimeMenuPoint: CGPoint?
     private var pendingSafeSpaceProviderMenuSelections: [UUID: [String: String]] = [:]
     private var pendingContainerPathMenuSelections: [UUID: [String: String]] = [:]
     private var pendingSafeSpaceAppMenuSelections: [UUID: (
@@ -2433,9 +2435,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             setCursorIfNeeded(.arrow)
         }
         mode = nextMode
-        if mode == .create || mode == .apps {
-            clampScrollOffsets()
-        }
+        clampScrollOffsets()
         let shouldAnimateCreateIn = previousMode != .create && nextMode == .create
         if shouldAnimateCreateIn {
             createLayer.removeAnimation(forKey: "create-overlay-fade-out")
@@ -2611,7 +2611,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         toolbarLayer.addSublayer(statusLayer)
         toolbarLayer.addSublayer(privilegedAppsHeaderLayer)
         toolbarLayer.addSublayer(safeSpacesHeaderLayer)
-        toolbarLayer.addSublayer(outerShellActionLayer)
         contentLayer.addSublayer(appsLayer)
         appsLayer.addSublayer(appsScrollContentLayer)
         appsLayer.addSublayer(workspacePaneClipLayer)
@@ -2645,7 +2644,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         safeSpacesHeaderLayer.string = "SAFE SPACES"
         privilegedAppsHeaderLayer.isHidden = true
         safeSpacesHeaderLayer.isHidden = true
-        outerShellActionLayer.isHidden = true
         installOverlayLayer.isHidden = true
         updateOverlayLayer.isHidden = true
         aboutOverlayLayer.isHidden = true
@@ -2706,7 +2704,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 let width = max(currentSize.width, 1)
                 let height = max(currentSize.height, 1)
                 rootLayer.frame = CGRect(origin: .zero, size: CGSize(width: width, height: height))
-                let visibleToolbarHeight: CGFloat = mode == .apps && backendError.isEmpty ? 0 : toolbarHeight
+                let visibleToolbarHeight: CGFloat = backendError.isEmpty ? 0 : toolbarHeight
                 toolbarLayer.frame = CGRect(x: 0, y: max(height - visibleToolbarHeight, 0), width: width, height: visibleToolbarHeight)
                 toolbarLayer.isHidden = visibleToolbarHeight == 0
                 contentLayer.frame = CGRect(x: 0, y: 0, width: width, height: max(height - visibleToolbarHeight, 0))
@@ -2718,49 +2716,30 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 copyConfirmationLayer.frame = rootLayer.bounds
 
                 titleLayer.frame = .zero
-                outerShellActionFrame = mode == .create && outerShellActionsBackend() != nil
-                    ? CGRect(x: max(width - horizontalInset - 28, horizontalInset),
-                             y: 10,
-                             width: 28,
-                             height: 28)
-                    : .zero
-                outerShellActionLayer.frame = outerShellActionFrame
-                outerShellActionLayer.isHidden = outerShellActionFrame.isEmpty
-                outerShellActionLayer.opacity = outerShellActionFrame.isEmpty ? 0 : 1
-                statusLayer.frame = CGRect(x: horizontalInset, y: 14, width: max(width - horizontalInset * 2 - 36, 1), height: 18)
+                statusLayer.frame = CGRect(x: horizontalInset, y: 14, width: max(width - horizontalInset * 2, 1), height: 18)
                 statusSelectionLayer.frame = statusLayer.frame
 
                 let contentHeight = contentLayer.bounds.height
-                if mode == .apps || mode == .create {
-                    outerframeHost.sendTextInputGeometryUpdate(nil)
-                    appsLayer.isHidden = false
-                    dividerLayer.isHidden = selectedServiceID == nil
-                    logHeaderLayer.isHidden = selectedServiceID == nil
-                    logRowsClipLayer.isHidden = selectedServiceID == nil
-                    createLayer.isHidden = mode != .create
-                    let appWidth = selectedServiceID == nil ? width : max(floor(width * 0.42), 320)
-                    appsLayer.frame = CGRect(x: 0, y: 0, width: appWidth, height: contentHeight)
-                    updateAppsScrollLayerFrames()
-                    if selectedServiceID != nil {
-                        dividerLayer.frame = CGRect(x: appWidth, y: 0, width: 1, height: contentHeight)
-                        let logX = appWidth + 1
-                        let logWidth = max(width - logX, 1)
-                        logHeaderLayer.frame = CGRect(x: logX, y: max(contentHeight - logHeaderHeight, 0), width: logWidth, height: logHeaderHeight)
-                        logRowsClipLayer.frame = CGRect(x: logX, y: 0, width: logWidth, height: max(contentHeight - logHeaderHeight, 0))
-                        renderLogHeader()
-                        renderLogRows()
-                    }
-                    renderAppsPage()
-                    if mode == .create {
-                        renderCreateForm()
-                    }
-                } else {
-                    appsLayer.isHidden = true
-                    dividerLayer.isHidden = true
-                    logHeaderLayer.isHidden = true
-                    logRowsClipLayer.isHidden = true
-                    createLayer.isHidden = false
-                    createLayer.frame = CGRect(x: 0, y: 0, width: width, height: contentHeight)
+                outerframeHost.sendTextInputGeometryUpdate(nil)
+                appsLayer.isHidden = false
+                dividerLayer.isHidden = selectedServiceID == nil
+                logHeaderLayer.isHidden = selectedServiceID == nil
+                logRowsClipLayer.isHidden = selectedServiceID == nil
+                createLayer.isHidden = mode != .create
+                let appWidth = selectedServiceID == nil ? width : max(floor(width * 0.42), 320)
+                appsLayer.frame = CGRect(x: 0, y: 0, width: appWidth, height: contentHeight)
+                updateAppsScrollLayerFrames()
+                if selectedServiceID != nil {
+                    dividerLayer.frame = CGRect(x: appWidth, y: 0, width: 1, height: contentHeight)
+                    let logX = appWidth + 1
+                    let logWidth = max(width - logX, 1)
+                    logHeaderLayer.frame = CGRect(x: logX, y: max(contentHeight - logHeaderHeight, 0), width: logWidth, height: logHeaderHeight)
+                    logRowsClipLayer.frame = CGRect(x: logX, y: 0, width: logWidth, height: max(contentHeight - logHeaderHeight, 0))
+                    renderLogHeader()
+                    renderLogRows()
+                }
+                renderAppsPage()
+                if mode == .create {
                     renderCreateForm()
                 }
                 if mode == .create {
@@ -2849,8 +2828,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 renderStatusSelection()
                 privilegedAppsHeaderLayer.foregroundColor = resolvedCGColor(.secondaryLabelColor)
                 safeSpacesHeaderLayer.foregroundColor = resolvedCGColor(.secondaryLabelColor)
-                outerShellActionLayer.applyStyle(tintCGColor: resolvedCGColor(.secondaryLabelColor),
-                                                 backgroundCGColor: resolvedCGColor(.clear))
                 updateLogTextContentIfNeeded(text: currentLogText(), force: true)
                 updateLogTextViewport()
                 updateLogTextSelectionLayers(force: true)
@@ -4164,8 +4141,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         background.frame = frame
         background.cornerRadius = 7
         background.cornerCurve = .continuous
-        background.backgroundColor = resolvedCGColor(.controlColor)
-        background.borderWidth = 0.5
+        background.backgroundColor = resolvedCGColor(NSColor.labelColor.withAlphaComponent(0.035))
+        background.borderWidth = 1
         background.borderColor = resolvedCGColor(.separatorColor)
         addAppsSublayer(background)
         let text = makeTextLayer(size: 12, weight: .regular, color: .labelColor, alignment: .center)
@@ -4380,7 +4357,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private func styleWorkspaceOverviewCard(_ card: CALayer) {
         let cornerRadius: CGFloat = 12
         card.cornerRadius = cornerRadius
-        card.backgroundColor = resolvedCGColor(pageBackgroundColor())
+        card.backgroundColor = resolvedCGColor(.controlBackgroundColor)
         card.borderWidth = 2
         card.borderColor = resolvedCGColor(.separatorColor)
         card.shadowOpacity = 0
@@ -7783,13 +7760,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                            role: .staticText,
                                            frame: frame,
                                            label: status))
-        }
-        if !outerShellActionLayer.isHidden,
-           let frame = accessibilityFrame(outerShellActionFrame, from: toolbarLayer) {
-            nodes.append(accessibilityNode(nextIdentifier: &nextIdentifier,
-                                           role: .button,
-                                           frame: frame,
-                                           label: "Outer Shell Actions"))
         }
         return nodes
     }
@@ -12298,7 +12268,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         } else if pendingPasswordAction == nil, mode == .apps {
             let contentPoint = contentLayer.convert(point, from: rootLayer)
             let appsPoint = appsContentPoint(for: contentPoint)
-            let toolbarPoint = toolbarLayer.convert(point, from: rootLayer)
             if dockerfileTextBlock(
                 at: appsPoint,
                 contentSpace: appsTextContentSpace(for: contentPoint)
@@ -12322,8 +12291,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                             safeSpaceDetailEditStepFrames.contains { $0.frame.contains(appsPoint) } ||
                             safeSpaceDetailStepFrames.contains { $0.frame.contains(appsPoint) } ||
                             overviewAddFrames.contains { $0.contains(appsPoint) } ||
-                            addAppFrame.contains(appsPoint) ||
-                            outerShellActionFrame.contains(toolbarPoint)
+                            addAppFrame.contains(appsPoint)
         }
         if isOverCreateField || isOverPasswordField || isOverCreateMessage {
             setCursorIfNeeded(.iBeam)
@@ -12416,12 +12384,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
         let contentPoint = contentLayer.convert(point, from: rootLayer)
         if mode == .apps {
-            let toolbarPoint = toolbarLayer.convert(point, from: rootLayer)
-            if outerShellActionFrame.contains(toolbarPoint),
-               let backend = outerShellActionsBackend() {
-                showBackendActionsMenu(for: backend, at: point)
-                return
-            }
             let appsPoint = appsContentPoint(for: contentPoint)
             if handleDockerfileRightMouseDown(
                 at: appsPoint,
@@ -13179,16 +13141,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             return
         }
 
-        let toolbarPoint = toolbarLayer.convert(point, from: rootLayer)
-        if mode == .apps,
-           outerShellActionFrame.contains(toolbarPoint),
-           let backend = outerShellActionsBackend() {
-            armButtonClick(frame: rootFrame(outerShellActionFrame, from: toolbarLayer),
-                           performAtPoint: { [weak self] releasePoint in
-                self?.showBackendActionsMenu(for: backend, at: releasePoint)
-            })
-            return
-        }
         let contentPoint = contentLayer.convert(point, from: rootLayer)
         if mode == .apps {
             if handleLogHeaderMouseDown(at: point, modifierFlags: modifierFlags, clickCount: clickCount) {
@@ -14185,38 +14137,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         backends.first { $0.isBackendsSelf }
     }
 
-    private func outerShellActionsBackend() -> BackendRecord? {
-        if let backend = outerShellBackend() {
-            return backend
-        }
-        guard controlEndpoint != nil else { return nil }
-        return BackendRecord(serviceID: "org.outershell.OuterShell",
-                             displayName: "Outer Shell",
-                             serviceUnit: "",
-                             serviceUnitPath: nil,
-                             serviceScope: "user",
-                             status: backendError.isEmpty ? "" : "error",
-                             canControl: true,
-                             canUninstall: true,
-                             isBundled: false,
-                             isInstalled: true,
-                             isMigration: false,
-                             supportsRoot: false,
-                             rootOnly: false,
-                             hasRootSupport: false,
-                             installedVersion: nil,
-                             availableVersion: nil,
-                             scriptPath: nil,
-                             publicBaseURL: nil,
-                             iconSymbolName: nil,
-                             launchdPlistPath: "",
-                             ownsLaunchdPlist: true,
-                             menuBarVisibilityEnabled: nil,
-                             menuBarVisibilityAvailable: false,
-                             frontends: [],
-                             logFiles: [])
-    }
-
     private func currentLogFile(for backend: BackendRecord) -> LogFileRecord? {
         guard let selectedLog,
               selectedLog.serviceID == backend.serviceID,
@@ -15100,6 +15020,13 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         }
         if let providers = response.providers {
             availableSafeSpaceProviders = providers
+        }
+        if operation == "checkRuntimes" {
+            isPerformingWorkspaceOperation = false
+            workspacePanelMessage = response.error ?? ""
+            updateLayout()
+            if let point = runtimeMenuPoint { showSafeSpaceProviderMenu(at: point) }
+            return
         }
         if let selected = selectedContainerLogContext,
            let container = localWorkspaces.first(where: { $0.id == selected.container.id }),
@@ -16056,38 +15983,13 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func showSafeSpaceProviderMenu(at point: CGPoint) {
-        let providers: [LocalSafeSpaceProviderRecord]
-        if availableSafeSpaceProviders.isEmpty {
-            providers = [
-                LocalSafeSpaceProviderRecord(
-                    id: "apple.container",
-                    name: "Apple container",
-                    detail: "Portable OCI container",
-                    defaultBaseImage: "outershell/container-base:6",
-                    isolationName: "",
-                    isAvailable: true,
-                    capabilities: LocalWorkspaceRecord.Capabilities(
-                        supportsApps: true,
-                        supportsShell: true,
-                        supportsLiveMounts: false,
-                        supportsMounts: true,
-                        supportsRecipes: true
-                    )
-                )
-            ]
-        } else {
-            providers = availableSafeSpaceProviders
-        }
-        let availableProviders = providers.filter(\.canCreate)
-        if availableProviders.count == 1, let provider = availableProviders.first {
-            createWorkspace(providerID: provider.id)
-            return
-        }
+        runtimeMenuPoint = point
+        let providers = availableSafeSpaceProviders
         let menuID = UUID()
         pendingSafeSpaceProviderMenuSelections[menuID] = Dictionary(
             uniqueKeysWithValues: providers.map { ($0.id, $0.id) }
         )
-        let items = providers.map { provider in
+        var items = providers.map { provider in
             OuterframeContextMenuItem(
                 id: provider.id,
                 title: "\(provider.name) — \(provider.detail)",
@@ -16097,6 +15999,15 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                     : "shippingbox"
             )
         }
+        for provider in providers where provider.isAvailable != true {
+            if let setupURL = provider.setupURL, URL(string: setupURL)?.scheme == "https" {
+                let id = "setup:" + provider.id
+                pendingSafeSpaceProviderMenuSelections[menuID]?[id] = setupURL
+                items.append(OuterframeContextMenuItem(id: id, title: "\(provider.name) setup instructions…", isEnabled: true, systemImageName: "book"))
+            }
+        }
+        pendingSafeSpaceProviderMenuSelections[menuID]?["check"] = "check"
+        items.append(OuterframeContextMenuItem(id: "check", title: "Check runtimes again", isEnabled: true, systemImageName: "arrow.clockwise"))
         outerframeHost.showContextMenu(menuID: menuID, items: items, at: point)
     }
 
@@ -20027,7 +19938,13 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         }
         if let providers = pendingSafeSpaceProviderMenuSelections.removeValue(forKey: menuID),
            let providerID = providers[itemID] {
-            createWorkspace(providerID: providerID)
+            if itemID == "check" {
+                sendWorkspaceRequest(operation: "checkRuntimes")
+            } else if itemID.hasPrefix("setup:"), let url = URL(string: providerID), url.scheme == "https" {
+                outerframeHost.openURLExternally(url)
+            } else {
+                createWorkspace(providerID: providerID)
+            }
             return
         }
         if let action = pendingWorkspaceOverviewMenuActions.removeValue(forKey: menuID),

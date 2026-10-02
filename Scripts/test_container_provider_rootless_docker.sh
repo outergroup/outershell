@@ -9,7 +9,11 @@ trap 'rm -rf "$temporary"' EXIT INT TERM
 mkdir -p "$temporary/bin" "$temporary/runtime"
 cat > "$temporary/bin/docker" <<'EOF'
 #!/bin/sh
-printf '%s' "$DOCKER_HOST"
+if [ "$1" = info ]; then
+    printf '%s' '["name=rootless"]'
+else
+    printf '%s' "$DOCKER_HOST"
+fi
 EOF
 chmod 0755 "$temporary/bin/docker"
 
@@ -32,9 +36,10 @@ socket_path = pathlib.Path(os.environ["XDG_RUNTIME_DIR"]) / "docker.sock"
 listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 listener.bind(str(socket_path))
 try:
+    provider["docker_readiness"].__globals__["_docker_readiness_cache"] = None
     dictionary = provider["provider_dictionary"]()
     assert dictionary["isAvailable"]
-    assert "without host-root privileges" in dictionary["detail"]
+    assert "Rootless Docker is ready" in dictionary["detail"]
     expected_host = "unix://" + str(socket_path)
     assert provider["docker_host"]() == expected_host
     assert provider["docker_cli_prefix"]() == [
