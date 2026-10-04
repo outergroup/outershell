@@ -776,17 +776,18 @@
   function safeSpaceAppNavigationURL(workspace, app) {
     const target = safeSpaceAppURL(app);
     if (target === "#") return target;
+    const name = app.displayName || app.serviceID || "App";
+    const user = String(app.socketPath || "").startsWith("/run/user/0/") ? "root" : "workspace";
+    const display = `${workspace.name || "Container"} / ${user} / ${name}`;
     if (window.outerLoopPageIconObservationSupported === true && !app.iconData && !app.iconURL && app.iconObservationToken) {
       const callback = new URL("/api/icon-observation", window.location.href);
       callback.search = new URLSearchParams({ token: app.iconObservationToken }).toString();
-      return `outerloop://observe-page-icon?${new URLSearchParams({ url: target, callback: callback.href })}`;
+      return `outerloop://observe-page-icon?${new URLSearchParams({ url: target, callback: callback.href, display }).toString().replace(/\+/g, "%20")}`;
     }
     if (window.outerLoopFriendlyNavigationSupported !== true) return target;
-    const name = app.displayName || app.serviceID || "App";
-    const user = String(app.socketPath || "").startsWith("/run/user/0/") ? "root" : "workspace";
     const parameters = [
       `url=${encodeURIComponent(target)}`,
-      `display=${encodeURIComponent(`${workspace.name || "Container"} / ${user} / ${name}`)}`
+      `display=${encodeURIComponent(display)}`
     ].join("&");
     return `outerloop://navigate?${parameters}`;
   }
