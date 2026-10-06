@@ -174,7 +174,7 @@ macOS root install:
 
 The LaunchDaemon sets `OUTERCTL_PATH` to `<system-state>/bin/outerctl` and `OUTERSHELL_SERVICE_STATE_DIR` to `<system-state>/apps/<service-id>`.
 
-When root support is installed from a non-root macOS session for an app that also supports user mode, Outer Shell also writes `$HOME/Library/LaunchAgents/<service-id>.plist`, `$HOME/Library/Logs/<service-id>/output.log`, and `<user-runtime>/<service-id>`. That LaunchAgent points at the root-owned payload under `<system-state>/apps/<service-id>`; it does not install another copy under `<user-state>/apps/<service-id>`.
+User and root bundled-app installations are independent. Installing in either scope copies its own payload and registers only that scope’s service. It does not create, replace, or remove the other scope’s installation.
 
 Linux user install:
 
@@ -214,11 +214,7 @@ state, and runtime socket paths remain the same.
 
 Linux root app services use `<system-state>/bin/outerctl` directly. A root install initiated from a non-root Outer Shell session first installs Linux root support, then writes the root app systemd unit with `OUTERCTL_PATH=<system-state>/bin/outerctl`.
 
-When a Linux root install is initiated from a non-root Outer Shell session and the app supports both root and user mode, the installer also writes a user systemd unit that points at the root-owned payload:
-
-- `$HOME/.config/systemd/user/<service-id>.service`
-- `$HOME/.config/systemd/user/<service-id>.socket` for socket-activated apps
-- `<user-state>/apps/<service-id>/backend.log`
+Linux user and root installations also use separate payloads and services. The User and Root catalogs track installation independently, and uninstall removes only the selected scope.
 
 Bundled app table:
 

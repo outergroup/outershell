@@ -41,6 +41,7 @@
     busy: false,
     query: "",
     addTab: "catalog",
+    addScope: "user",
     backendsVersion: 0n,
     logVersion: 0n,
     logSelection: null,
@@ -706,7 +707,7 @@
       const controls = workspace ? `<div class="overview-controls">${!safeSpaceIsRunning(workspace) ? `<button type="button" data-action="start-safe-space" data-safe-space-id="${id}" ${preparing ? "disabled" : ""}>${preparing ? "Starting…" : "Start"}</button>` : ""}<button type="button" data-action="edit-container" data-safe-space-id="${id}" aria-label="Manage ${escapeHTML(group.name)}">Manage…</button></div>` : "";
       const addMore = workspace
         ? `<button class="overview-add-more" type="button" data-action="configure-container" data-safe-space-id="${id}" ${preparing || !managedContainer(workspace) ? "disabled" : ""} ${!managedContainer(workspace) ? 'title="This container is managed externally"' : ""}>Add more to Dockerfile…</button>`
-        : `<button class="overview-add-more" type="button" data-action="open-add">Add more…</button>`;
+        : `<button class="overview-add-more" type="button" data-action="open-add" data-scope="${group.id === "root" ? "system" : "user"}">Add more…</button>`;
       return `<section class="overview-identity" data-group-id="${escapeHTML(group.id)}"><header class="overview-group-handle" tabindex="0" aria-label="Reorder ${escapeHTML(group.name)}. Hold and drag, or use arrow keys." title="Hold and drag to reorder" data-group-handle><div class="overview-group-heading"><h2>${escapeHTML(group.name)}</h2><p>${escapeHTML(group.note)}</p></div>${controls}</header><div class="overview-shortcuts" data-endpoint-area="pins">${pins.map(key => group.entries.find(entry => entry.key === key)).filter(Boolean).map(overviewShortcut).join("")}</div><div class="overview-list" data-endpoint-area="list">${listed.map(overviewEndpoint).join("") || `<p class="overview-empty">${state.loading || (workspace && state.safeSpacesLoading) ? "Loading…" : group.entries.length ? "" : "No registered endpoints."}</p>`}</div>${containerCommandsHTML(workspace)}${workspace?.buildProgress ? `<details class="container-build-progress"><summary>${escapeHTML(workspace.buildProgress.detail || workspace.buildProgress.phase)}</summary><pre>${escapeHTML(workspace.buildProgress.log || "")}</pre></details>` : ""}${addMore}</section>`;
     }).join("") + `<button class="overview-add-container" type="button" data-action="create-container"><span aria-hidden="true">+</span>Add container (beta)…</button>`;
     if (state.overviewMarkup !== markup) {
@@ -1275,13 +1276,13 @@
 
   function openAddDialog(tab = state.addTab) {
     state.addTab = tab;
-    const available = state.backends.filter(backend => backend.isBundled && !backend.isInstalled && !backend.isMigration);
+    const available = state.backends.filter(backend => backend.isBundled && !backend.isInstalled && !backend.isMigration && backend.serviceScope === state.addScope);
     const catalog = available.length ? `<div class="catalog-list">${available.map(backend => {
       const item = { backend, frontend: null, displayName: backend.displayName };
       return `<article class="catalog-item">
         ${iconHTML(item)}
         <div><h3>${escapeHTML(backend.displayName)}</h3><p>${escapeHTML(backend.rootOnly ? "Runs with full system access" : "Bundled with Outer Shell")}</p></div>
-        <button class="primary-button" type="button" data-action="install" data-backend-key="${escapeHTML(backendKey(backend))}">${backend.rootOnly ? "Install as root" : "Install"}</button>
+        <button class="primary-button" type="button" data-action="install" data-backend-key="${escapeHTML(backendKey(backend))}">${backend.serviceScope === "system" ? "Install as root" : "Install"}</button>
       </article>`;
     }).join("")}</div>` : `<div class="empty-state"><div class="empty-glyph">✓</div><h2>Bundled apps installed</h2><p>There are no additional bundled apps available.</p></div>`;
     const bash = `<form id="bash-form">
@@ -1406,9 +1407,6 @@
       renameEndpointMenuHTML(item),
       `<button class="context-menu-item" type="button" data-action="copy-url" data-app-key="${escapeHTML(item.identity)}" role="menuitem">${contextMenuGlyph("⧉")}<span>Copy URL</span></button>`
     ];
-    if (backend.supportsRoot && backend.serviceScope !== "system" && !backend.rootOnly) {
-      management.push(`<button class="context-menu-item" type="button" data-action="control" data-operation="${backend.hasRootSupport ? "removeRootSupport" : "addRootSupport"}" data-backend-key="${escapeHTML(backendKey(backend))}" role="menuitem">${contextMenuGlyph("◇")}<span>${backend.hasRootSupport ? "Remove root support" : "Add root shortcut"}</span></button>`);
-    }
     const isOuterShell = backend.serviceID === "org.outershell.OuterShell" && backend.serviceScope !== "system";
     if (isOuterShell) {
       const key = escapeHTML(backendKey(backend));
@@ -1845,7 +1843,7 @@
     button.disabled = true;
     button.textContent = "Installing…";
     try {
-      const operation = backend.rootOnly ? "runRoot" : "run";
+      const operation = backend.serviceScope === "system" ? "runRoot" : "runUser";
       const result = await control(backend, operation);
       if (!result.ok) throw new Error(result.message || `Could not install ${backend.displayName}.`);
       closeDialog();
@@ -1854,7 +1852,7 @@
     } catch (error) {
       toast(error.message || String(error), true);
       button.disabled = false;
-      button.textContent = backend.rootOnly ? "Install as root" : "Install";
+      button.textContent = backend.serviceScope === "system" ? "Install as root" : "Install";
     }
   }
 
@@ -2205,7 +2203,7 @@
       return;
     }
     if (action === "close-dialog") { closeDialog(); return; }
-    if (action === "open-add") { openAddDialog(); return; }
+    if (action === "open-add") { state.addScope = actionElement.dataset.scope || (state.backends.some(backend => backend.serviceID === "org.outershell.OuterShell" && backend.serviceScope === "system") ? "system" : "user"); openAddDialog(); return; }
     if (action === "start-safe-space") {
       try { await startSafeSpace(actionElement.dataset.safeSpaceId); }
       catch (error) { toast(error.message || String(error), true); }

@@ -6419,7 +6419,7 @@ static bool append_registered_backend_payloads(const RegistryStore *database,
     return ok;
 }
 
-static bool append_bundled_backend_placeholder_payload(BinaryPayloadList *payloads, const BundledAppDefinition *app) {
+static bool append_bundled_backend_placeholder_payload(BinaryPayloadList *payloads, const BundledAppDefinition *app, const char *scope) {
     StringBuilder frontends = {0};
     StringBuilder logs = {0};
     StringBuilder payload = {0};
@@ -6429,7 +6429,7 @@ static bool append_bundled_backend_placeholder_payload(BinaryPayloadList *payloa
                                     app->display_name,
                                     "",
                                     "",
-                                    direct_root_session_uses_system_scope() ? "system" : "user",
+                                    scope,
                                     "available",
                                     BACKEND_FLAG_CAN_CONTROL |
                                         BACKEND_FLAG_IS_BUNDLED |
@@ -6475,6 +6475,7 @@ static void send_backends_response(int fd) {
         error = user_error[0] ? user_error : system_error;
     }
     bool bundled_installed[sizeof(kBundledApps) / sizeof(kBundledApps[0])] = {0};
+    bool system_bundled_installed[sizeof(kBundledApps) / sizeof(kBundledApps[0])] = {0};
     const char *primary_registry_scope = direct_root_session_uses_system_scope() ? "system" : "user";
     if (have_user_database) {
         ok = ok && append_registered_backend_payloads(&user_database, &payloads, bundled_installed,
@@ -6482,19 +6483,21 @@ static void send_backends_response(int fd) {
                                                        primary_registry_scope);
     }
     if (have_system_database) {
-        ok = ok && append_registered_backend_payloads(&system_database, &payloads, bundled_installed,
+        ok = ok && append_registered_backend_payloads(&system_database, &payloads, system_bundled_installed,
                                                        sizeof(bundled_installed) / sizeof(bundled_installed[0]),
                                                        "system");
     }
     for (size_t i = 0; ok && i < sizeof(kBundledApps) / sizeof(kBundledApps[0]); i++) {
         if (!bundled_app_is_available_on_platform(&kBundledApps[i])) continue;
-        if (bundled_installed[i]) continue;
-        if (g_internal_service_manager &&
-            !direct_root_session_uses_system_scope() &&
-            kBundledApps[i].root_only) {
-            continue;
+        const BundledAppDefinition *app = &kBundledApps[i];
+        bool direct_root = direct_root_session_uses_system_scope();
+        if (!bundled_installed[i] && (direct_root ? app->supports_root : !app->root_only)) {
+            ok = append_bundled_backend_placeholder_payload(&payloads, app, primary_registry_scope);
         }
-        ok = ok && append_bundled_backend_placeholder_payload(&payloads, &kBundledApps[i]);
+        if (ok && !direct_root && !g_internal_service_manager && app->supports_root &&
+            !system_bundled_installed[i]) {
+            ok = append_bundled_backend_placeholder_payload(&payloads, app, "system");
+        }
     }
     if (have_user_database) registry_store_free(&user_database);
     if (have_system_database) registry_store_free(&system_database);
@@ -6939,12 +6942,7 @@ static bool install_bundled_app(const BundledAppDefinition *app,
                                 bool *needs_password,
                                 char *message,
                                 size_t message_size);
-#ifdef __APPLE__
-static bool install_bundled_app_user_launchagent_for_system_payload(const BundledAppDefinition *app,
-                                                                    char *message,
-                                                                    size_t message_size);
-#endif
-static bool uninstall_backend(const char *service_id, const char *sudo_password, bool *needs_password, char *message, size_t message_size);
+static bool uninstall_backend(const char *service_id, const char *requested_scope, const char *sudo_password, bool *needs_password, char *message, size_t message_size);
 
 static void send_control_response(int fd, const char *query, const char *body) {
     char service_id[PATH_MAX] = "";
@@ -7084,7 +7082,9 @@ static void send_control_response(int fd, const char *query, const char *body) {
         bool needs_password = false;
         const char *scope = direct_root_session_uses_system_scope()
             ? "system"
-            : ((strcmp(operation, "runRoot") == 0 || strcmp(operation, "installRoot") == 0) ? "system" : "user");
+            : ((strcmp(operation, "runRoot") == 0 || strcmp(operation, "installRoot") == 0) ? "system"
+               : ((strcmp(operation, "runUser") == 0 || strcmp(operation, "installUser") == 0) ? "user"
+                  : (strcmp(requested_scope, "system") == 0 ? "system" : "user")));
         if (g_internal_service_manager &&
             !direct_root_session_uses_system_scope() &&
             strcmp(scope, "system") == 0) {
@@ -7100,24 +7100,6 @@ static void send_control_response(int fd, const char *query, const char *body) {
             return;
         }
         bool ok = install_bundled_app(app, scope, bundled_stage_root, sudo_password, &needs_password, message, sizeof(message));
-#ifdef __APPLE__
-        if (ok && strcmp(scope, "system") == 0 && !app->root_only) {
-            char user_message[4096] = "";
-            bool user_ok = install_bundled_app_user_launchagent_for_system_payload(app, user_message, sizeof(user_message));
-            log_event("%s user LaunchAgent for app %s after root install: %s",
-                      user_ok ? "Installed" : "Failed to install",
-                      app->service_id,
-                      user_message);
-            if (user_ok) {
-                snprintf(message, sizeof(message), "Installed %s for user and root.", app->display_name);
-            } else {
-                snprintf(message, sizeof(message), "Installed %s as root, but failed to install its user LaunchAgent: %s",
-                         app->display_name,
-                         user_message);
-                ok = false;
-            }
-        }
-#endif
 	        log_event("%s app %s as %s: %s",
 	                  ok ? "Installed" : "Failed to install",
 	                  app->service_id,
@@ -7150,45 +7132,7 @@ static void send_control_response(int fd, const char *query, const char *body) {
         bool ok = false;
         if (strcmp(operation, "addRootSupport") == 0) {
             ok = install_bundled_app(app, "system", bundled_stage_root, sudo_password, &needs_password, message, sizeof(message));
-#ifdef __APPLE__
-            if (ok && !app->root_only) {
-                char user_message[4096] = "";
-                bool user_ok = install_bundled_app_user_launchagent_for_system_payload(app, user_message, sizeof(user_message));
-                log_event("%s user LaunchAgent for app %s after adding root support: %s",
-                          user_ok ? "Installed" : "Failed to install",
-                          app->service_id,
-                          user_message);
-                if (user_ok) {
-                    snprintf(message, sizeof(message), "Added root support for %s.", app->display_name);
-                } else {
-                    snprintf(message, sizeof(message), "Added root support for %s, but failed to update its user LaunchAgent: %s",
-                             app->display_name,
-                             user_message);
-                    ok = false;
-                }
-            }
-#endif
         } else {
-#ifndef __APPLE__
-            if (!app->root_only) {
-                char user_unit[256] = "";
-                char user_scope[32] = "user";
-                RegistryStore database;
-                bool has_user_install = false;
-                if (registry_store_open_user_readonly(&database, message, sizeof(message))) {
-                    has_user_install = lookup_systemd_backend(&database, service_id, user_unit, sizeof(user_unit), user_scope, sizeof(user_scope), "user");
-                    registry_store_free(&database);
-                }
-                if (has_user_install) {
-                    ok = install_bundled_app(app, "user", bundled_stage_root, NULL, NULL, message, sizeof(message));
-                    if (!ok) {
-                        log_event("Failed to restore user install before removing root support for %s: %s", service_id, message);
-                        send_action_response(fd, 500, false, message);
-                        return;
-                    }
-                }
-            }
-#endif
             ok = remove_bundled_root_support(app, sudo_password, &needs_password, message, sizeof(message));
         }
 	        log_event("%s root support for app %s: %s",
@@ -7206,7 +7150,7 @@ static void send_control_response(int fd, const char *query, const char *body) {
     if (strcmp(operation, "uninstall") == 0) {
         char message[4096] = "";
         bool needs_password = false;
-        bool ok = uninstall_backend(service_id, sudo_password, &needs_password, message, sizeof(message));
+        bool ok = uninstall_backend(service_id, requested_scope, sudo_password, &needs_password, message, sizeof(message));
         log_event("%s backend %s: %s", ok ? "Uninstalled" : "Failed to uninstall", service_id, message);
         if (ok) mark_backend_event_changed();
         send_action_response_ex(fd, ok ? 200 : (needs_password ? 401 : 500), ok, message, needs_password);
@@ -11321,145 +11265,6 @@ static void cleanup_user_systemd_bundled_app(const BundledAppDefinition *app,
 }
 #endif
 
-#ifndef __APPLE__
-static bool install_bundled_user_systemd_unit_from_paths(const BundledAppDefinition *app,
-                                                         const char *working_directory,
-                                                         const char *binary_path,
-                                                         const char *bundles_dir,
-                                                         const char *icon_path,
-                                                         const char *log_path,
-                                                         const char *api_socket_path,
-                                                         char *message,
-                                                         size_t message_size) {
-    char error[1024] = "";
-    char unit_path[PATH_MAX];
-    snprintf(unit_path, sizeof(unit_path), "%s/.config/systemd/user/%s", home_directory(), app->unit_name);
-    char socket_unit_name[256] = "";
-    char socket_unit_path[PATH_MAX] = "";
-    if (app->socket_activated) {
-        systemd_socket_unit_name(app->unit_name, socket_unit_name, sizeof(socket_unit_name));
-        snprintf(socket_unit_path, sizeof(socket_unit_path), "%s/.config/systemd/user/%s", home_directory(), socket_unit_name);
-    }
-
-    cleanup_user_systemd_bundled_app(app, true, false);
-
-    char user_name[128] = "";
-    struct passwd *pw = getpwuid(getuid());
-    snprintf(user_name, sizeof(user_name), "%s", pw && pw->pw_name ? pw->pw_name : "");
-
-    char quoted_socket_path[PATH_MAX + 32];
-    char actual_socket_path[PATH_MAX] = "";
-    char systemd_socket_path[PATH_MAX] = "";
-    if (app->socket_name && app->socket_name[0]) {
-        snprintf(systemd_socket_path, sizeof(systemd_socket_path), "%%t/%s", app->socket_name);
-        shell_quote(systemd_socket_path, quoted_socket_path, sizeof(quoted_socket_path));
-        bundled_socket_path_for_scope(app, "user", actual_socket_path, sizeof(actual_socket_path));
-    } else {
-        quoted_socket_path[0] = '\0';
-    }
-
-    char exec_start[PATH_MAX * 6];
-    bundled_systemd_exec_start(binary_path,
-                               app->service_id,
-                               systemd_socket_path,
-                               bundles_dir,
-                               icon_path,
-                               exec_start,
-                               sizeof(exec_start));
-
-    char description[256];
-    unit_description_text(app->display_name, description, sizeof(description));
-    char unit_contents[12000];
-    snprintf(unit_contents, sizeof(unit_contents),
-             "[Unit]\n"
-             "Description=%s\n"
-             "After=network.target\n"
-             "\n"
-             "[Service]\n"
-             "Type=simple\n"
-             "WorkingDirectory=%s\n"
-             "Environment=HOME=%s\n"
-             "Environment=USER=%s\n"
-             "Environment=LOGNAME=%s\n"
-             "Environment=OUTERSHELLD_API_SOCKET=%s\n"
-             "ExecStart=%s\n"
-             "Restart=on-failure\n"
-             "KillMode=control-group\n"
-             "StandardOutput=append:%s\n"
-             "StandardError=append:%s\n"
-             "\n"
-             "[Install]\n"
-             "WantedBy=default.target\n",
-             description,
-             working_directory,
-             home_directory(),
-             user_name,
-             user_name,
-             api_socket_path,
-             exec_start,
-             log_path,
-             log_path);
-    char socket_contents[2048] = "";
-    if (app->socket_activated && quoted_socket_path[0]) {
-        snprintf(socket_contents, sizeof(socket_contents),
-                 "[Unit]\n"
-                 "Description=%s Socket\n"
-                 "\n"
-                 "[Socket]\n"
-                 "ListenStream=%s\n"
-                 "SocketMode=0600\n"
-                 "\n"
-                 "[Install]\n"
-                 "WantedBy=sockets.target\n",
-                 description,
-                 systemd_socket_path);
-    }
-    if (!write_text_file(unit_path, unit_contents, error, sizeof(error))) {
-        snprintf(message, message_size, "%s", error);
-        return false;
-    }
-    if (socket_unit_path[0] && !write_text_file(socket_unit_path, socket_contents, error, sizeof(error))) {
-        unlink(unit_path);
-        snprintf(message, message_size, "%s", error);
-        return false;
-    }
-    if (!upsert_systemd_backend_registry(app->service_id, app->display_name, app->unit_name, "user", actual_socket_path, log_path, icon_path, error, sizeof(error))) {
-        unlink(unit_path);
-        if (socket_unit_path[0]) unlink(socket_unit_path);
-        snprintf(message, message_size, "%s", error);
-        return false;
-    }
-
-    char quoted_unit[320];
-    shell_quote(app->unit_name, quoted_unit, sizeof(quoted_unit));
-    char enable_command[512];
-    run_shell_ignored("systemctl --user daemon-reload >/dev/null 2>&1");
-    if (socket_unit_name[0]) {
-        char quoted_socket_unit[320];
-        shell_quote(socket_unit_name, quoted_socket_unit, sizeof(quoted_socket_unit));
-        snprintf(enable_command, sizeof(enable_command), "systemctl --user enable --now %s >/dev/null 2>&1", quoted_socket_unit);
-        int status = system(enable_command);
-        if (status != 0) {
-            snprintf(message, message_size, "Installed %s, but failed to enable its user socket.", app->display_name);
-            return false;
-        }
-    } else {
-        snprintf(enable_command, sizeof(enable_command), "systemctl --user enable %s >/dev/null 2>&1 || true", quoted_unit);
-        run_shell_ignored(enable_command);
-        char systemd_message[4096] = "";
-        bool started = run_systemd_operation(app->unit_name, "user", "restart", NULL, NULL, systemd_message, sizeof(systemd_message));
-        if (!started) {
-            started = run_systemd_operation(app->unit_name, "user", "start", NULL, NULL, systemd_message, sizeof(systemd_message));
-        }
-        if (!started) {
-            snprintf(message, message_size, "Installed %s, but failed to start its user service: %s", app->display_name, systemd_message);
-            return false;
-        }
-    }
-    return true;
-}
-#endif
-
 static bool install_bundled_app_macos(const BundledAppDefinition *app,
                                       const char *scope,
                                       const char *requested_stage_root,
@@ -11787,10 +11592,6 @@ static bool install_bundled_app(const BundledAppDefinition *app,
             snprintf(socket_unit_path, sizeof(socket_unit_path), "/etc/systemd/system/%s", socket_unit_name);
         }
 
-        if (!direct_root_install) {
-            cleanup_user_systemd_bundled_app(app, true, false);
-        }
-
         char quoted_unit[320];
         shell_quote(app->unit_name, quoted_unit, sizeof(quoted_unit));
 
@@ -12097,33 +11898,9 @@ static bool install_bundled_app(const BundledAppDefinition *app,
             }
         }
 
-        if (!app->root_only && !direct_root_install) {
-            char user_state_root[PATH_MAX];
-            default_user_outershell_app_root(app->install_directory_name, user_state_root, sizeof(user_state_root));
-            if (!mkdir_p(user_state_root)) {
-                snprintf(message, message_size, "Failed to create %s: %s", user_state_root, strerror(errno));
-                return false;
-            }
-            char user_log_path[PATH_MAX];
-            snprintf(user_log_path, sizeof(user_log_path), "%s/backend.log", user_state_root);
-            char user_api_socket_path[PATH_MAX];
-            outer_shell_default_api_socket_path(user_api_socket_path, sizeof(user_api_socket_path));
-            if (!install_bundled_user_systemd_unit_from_paths(app,
-                                                              install_root,
-                                                              target_binary,
-                                                              bundles_dir,
-                                                              target_icon,
-                                                              user_log_path,
-                                                              user_api_socket_path,
-                                                              message,
-                                                              message_size)) {
-                return false;
-            }
-        }
-
         snprintf(message,
                  message_size,
-                 direct_root_install ? "Installed %s." : "Installed %s with root support.",
+                 "Installed %s as root.",
                  app->display_name);
         return true;
     }
@@ -12584,159 +12361,6 @@ static bool make_bundled_launchd_plist(const char *label,
     return ok;
 }
 
-static bool install_bundled_app_user_launchagent_for_system_payload(const BundledAppDefinition *app,
-                                                                    char *message,
-                                                                    size_t message_size) {
-    if (!app) {
-        snprintf(message, message_size, "Missing app definition.");
-        return false;
-    }
-
-    char system_install_root[PATH_MAX];
-    snprintf(system_install_root, sizeof(system_install_root), "%s/apps/%s", kSystemOuterShellRoot, app->install_directory_name);
-    char system_app_bundle[PATH_MAX];
-    bundled_app_macos_app_bundle_path(app, system_install_root, system_app_bundle, sizeof(system_app_bundle));
-    bool uses_app_bundle = bundled_app_macos_app_has_expected_files(app, system_app_bundle);
-    char bundles_dir[PATH_MAX];
-    if (uses_app_bundle) {
-        bundled_app_macos_app_bundles_dir(system_app_bundle, bundles_dir, sizeof(bundles_dir));
-    } else {
-        snprintf(bundles_dir, sizeof(bundles_dir), "%s/bundles", system_install_root);
-    }
-    char target_binary[PATH_MAX];
-    if (uses_app_bundle) {
-        bundled_app_macos_app_binary_path(app, system_app_bundle, target_binary, sizeof(target_binary));
-    } else {
-        snprintf(target_binary, sizeof(target_binary), "%s/%s", system_install_root, app->binary_name);
-    }
-    char bundle_arm[PATH_MAX];
-    snprintf(bundle_arm, sizeof(bundle_arm), "%s/%s.bundle.macos-arm.aar", bundles_dir, app->bundle_prefix);
-    char bundle_x86[PATH_MAX];
-    snprintf(bundle_x86, sizeof(bundle_x86), "%s/%s.bundle.macos-x86.aar", bundles_dir, app->bundle_prefix);
-    char target_icon[PATH_MAX] = "";
-    if (app->icon_name && app->icon_name[0]) {
-        if (uses_app_bundle) {
-            bundled_app_macos_app_icon_path(app, system_app_bundle, target_icon, sizeof(target_icon));
-        } else {
-            snprintf(target_icon, sizeof(target_icon), "%s/%s", system_install_root, app->icon_name);
-        }
-    }
-
-    struct stat st;
-    if (stat(target_binary, &st) != 0 || !S_ISREG(st.st_mode)) {
-        snprintf(message, message_size, "Missing root-installed %s backend at %s.", app->display_name, target_binary);
-        return false;
-    }
-    if (stat(bundle_arm, &st) != 0 || !S_ISREG(st.st_mode) ||
-        stat(bundle_x86, &st) != 0 || !S_ISREG(st.st_mode)) {
-        snprintf(message, message_size, "Missing root-installed %s content archives under %s.", app->display_name, bundles_dir);
-        return false;
-    }
-    if (target_icon[0] && (stat(target_icon, &st) != 0 || !S_ISREG(st.st_mode))) {
-        snprintf(message, message_size, "Missing root-installed %s icon at %s.", app->display_name, target_icon);
-        return false;
-    }
-
-    char socket_path[PATH_MAX] = "";
-    bundled_socket_path_for_scope(app, "user", socket_path, sizeof(socket_path));
-    char log_path[PATH_MAX];
-    snprintf(log_path, sizeof(log_path), "%s/Library/Logs/%s/output.log", home_directory(), app->service_id);
-    char plist_path[PATH_MAX];
-    snprintf(plist_path, sizeof(plist_path), "%s/Library/LaunchAgents/%s.plist", home_directory(), app->service_id);
-
-    char log_dir[PATH_MAX];
-    snprintf(log_dir, sizeof(log_dir), "%s", log_path);
-    char *slash = strrchr(log_dir, '/');
-    if (slash) {
-        *slash = '\0';
-        if (!mkdir_p(log_dir)) {
-            snprintf(message, message_size, "Failed to create %s: %s", log_dir, strerror(errno));
-            return false;
-        }
-    }
-    char launch_agents_dir[PATH_MAX];
-    snprintf(launch_agents_dir, sizeof(launch_agents_dir), "%s/Library/LaunchAgents", home_directory());
-    if (!mkdir_p(launch_agents_dir)) {
-        snprintf(message, message_size, "Failed to create %s: %s", launch_agents_dir, strerror(errno));
-        return false;
-    }
-
-    char target[320];
-    char quoted_target[384];
-    snprintf(target, sizeof(target), "gui/%d/%s", (int)getuid(), app->service_id);
-    shell_quote(target, quoted_target, sizeof(quoted_target));
-    char bootout_command[512];
-    snprintf(bootout_command, sizeof(bootout_command), "launchctl bootout %s >/dev/null 2>&1 || true", quoted_target);
-    run_shell_ignored(bootout_command);
-
-    char user_install_root[PATH_MAX];
-    default_user_outershell_app_root(app->install_directory_name, user_install_root, sizeof(user_install_root));
-    char quoted_user_install_root[PATH_MAX + 8];
-    shell_quote(user_install_root, quoted_user_install_root, sizeof(quoted_user_install_root));
-    char cleanup_command[PATH_MAX + 64];
-    snprintf(cleanup_command, sizeof(cleanup_command), "rm -rf -- %s", quoted_user_install_root);
-    run_shell_ignored(cleanup_command);
-
-    StringBuilder plist = {0};
-    if (!make_bundled_launchd_plist(app->service_id,
-                                    target_binary,
-                                    uses_app_bundle ? "" : bundles_dir,
-                                    uses_app_bundle ? "" : target_icon,
-                                    socket_path,
-                                    0600,
-                                    uses_app_bundle ? system_app_bundle : system_install_root,
-                                    NULL,
-                                    log_path,
-                                    "",
-                                    &plist)) {
-        free(plist.data);
-        snprintf(message, message_size, "Failed to generate LaunchAgent plist.");
-        return false;
-    }
-
-    char error[1024] = "";
-    if (!write_text_file(plist_path, plist.data ? plist.data : "", error, sizeof(error))) {
-        free(plist.data);
-        snprintf(message, message_size, "%s", error);
-        return false;
-    }
-    free(plist.data);
-
-    if (!upsert_launchd_backend_registry_at(g_registry_database_path,
-                                            app->service_id,
-                                            app->display_name,
-                                            plist_path,
-                                            socket_path,
-                                            log_path,
-                                            target_icon,
-                                            error,
-                                            sizeof(error))) {
-        unlink(plist_path);
-        snprintf(message, message_size, "%s", error);
-        return false;
-    }
-
-    char quoted_plist[PATH_MAX + 8];
-    shell_quote(plist_path, quoted_plist, sizeof(quoted_plist));
-    char bootstrap_message[4096] = "";
-    char bootstrap_command[PATH_MAX + 128];
-    snprintf(bootstrap_command, sizeof(bootstrap_command), "launchctl enable gui/%d/%s 2>&1", (int)getuid(), app->service_id);
-    if (!run_launchctl_capture(bootstrap_command, bootstrap_message, sizeof(bootstrap_message))) {
-        snprintf(message, message_size, "Could not enable %s: %s", app->display_name, bootstrap_message);
-        return false;
-    }
-    snprintf(bootstrap_command, sizeof(bootstrap_command), "launchctl bootstrap gui/%d %s 2>&1", (int)getuid(), quoted_plist);
-    if (!bootstrap_launchd_capture(bootstrap_command, bootstrap_message, sizeof(bootstrap_message))) {
-        snprintf(message, message_size, "Installed %s user LaunchAgent, but failed to bootstrap its socket: %s",
-                 app->display_name,
-                 bootstrap_message);
-        return false;
-    }
-
-    snprintf(message, message_size, "Installed %s user LaunchAgent using the root payload.", app->display_name);
-    return true;
-}
-
 static bool install_bundled_app_macos(const BundledAppDefinition *app,
                                       const char *scope,
                                       const char *requested_stage_root,
@@ -13148,13 +12772,16 @@ static bool install_bundled_app_macos(const BundledAppDefinition *app,
 }
 #endif
 
-static bool uninstall_backend(const char *service_id, const char *sudo_password, bool *needs_password, char *message, size_t message_size) {
+static bool uninstall_backend(const char *service_id, const char *requested_scope, const char *sudo_password, bool *needs_password, char *message, size_t message_size) {
     if (needs_password) *needs_password = false;
     char error[1024] = "";
     bool found_any = false;
+    const char *selected_scope = direct_root_session_uses_system_scope() ? "system"
+        : (requested_scope && strcmp(requested_scope, "system") == 0 ? "system" : "user");
+    bool primary_scope = direct_root_session_uses_system_scope() || strcmp(selected_scope, "user") == 0;
 
 #ifdef __APPLE__
-    const char *launchd_scopes[] = {"system", "user"};
+    const char *launchd_scopes[] = {selected_scope};
     for (size_t i = 0; i < sizeof(launchd_scopes) / sizeof(launchd_scopes[0]); i++) {
         char plist_path[PATH_MAX] = "";
         int owns_plist = 0;
@@ -13233,7 +12860,7 @@ static bool uninstall_backend(const char *service_id, const char *sudo_password,
 #endif
 
 #ifndef __APPLE__
-    if (g_internal_service_manager && g_outer_service_manager) {
+    if (primary_scope && g_internal_service_manager && g_outer_service_manager) {
         char service_file[PATH_MAX];
         snprintf(service_file, sizeof(service_file), "%s/%s.outerservice", g_outer_services_directory, service_id);
         bool loaded = outer_service_manager_has_service(g_outer_service_manager, service_id);
@@ -13300,7 +12927,7 @@ static bool uninstall_backend(const char *service_id, const char *sudo_password,
     }
 #endif
 
-    const char *systemd_scopes[] = {"system", "user"};
+    const char *systemd_scopes[] = {selected_scope};
     for (size_t i = 0; i < sizeof(systemd_scopes) / sizeof(systemd_scopes[0]); i++) {
         char unit_name[256] = "";
         char scope[32] = "";
@@ -13383,6 +13010,13 @@ static bool uninstall_backend(const char *service_id, const char *sudo_password,
             if (quoted_install_root[0]) {
                 fprintf(script, "rm -rf -- %s\n", quoted_install_root);
             }
+            if (safe_service_directory_name(install_name)) {
+                char payload_root[PATH_MAX];
+                char quoted_payload_root[PATH_MAX + 8];
+                snprintf(payload_root, sizeof(payload_root), "/opt/outershell/%s", install_name);
+                shell_quote(payload_root, quoted_payload_root, sizeof(quoted_payload_root));
+                fprintf(script, "rm -rf -- %s\n", quoted_payload_root);
+            }
             fprintf(script,
                     "rm -f -- %s\n"
                     "systemctl --system daemon-reload\n",
@@ -13423,11 +13057,11 @@ static bool uninstall_backend(const char *service_id, const char *sudo_password,
     }
 
     const BundledAppDefinition *bundled_app = bundled_app_for_service_id(service_id);
-    if (!found_any && bundled_app) {
+    if (primary_scope && !found_any && bundled_app) {
         cleanup_user_systemd_bundled_app(bundled_app, true, false);
     }
 
-    if (!unregister_backend_records(service_id, error, sizeof(error))) {
+    if (primary_scope && !unregister_backend_records(service_id, error, sizeof(error))) {
         snprintf(message, message_size, "%s", error);
         return false;
     }
@@ -13436,7 +13070,7 @@ static bool uninstall_backend(const char *service_id, const char *sudo_password,
     if (app) {
         cleanup_bundled_app_cache(app);
     }
-    if (app || safe_service_directory_name(service_id)) {
+    if (primary_scope && (app || safe_service_directory_name(service_id))) {
         char install_name[PATH_MAX];
         snprintf(install_name, sizeof(install_name), "%s", app ? app->install_directory_name : service_id);
         if (safe_service_directory_name(install_name)) {
@@ -16326,23 +15960,6 @@ static bool process_api_bundled_app_control_request(ReactorClient *client,
                                       &needs_password,
                                       result,
                                       sizeof(result));
-#ifdef __APPLE__
-        if (ok && strcmp(scope, "system") == 0 && !app->root_only) {
-            char user_message[4096] = "";
-            ok = install_bundled_app_user_launchagent_for_system_payload(app,
-                                                                         user_message,
-                                                                         sizeof(user_message));
-            if (ok) {
-                snprintf(result, sizeof(result), "Installed %s for user and root.", app->display_name);
-            } else {
-                snprintf(result,
-                         sizeof(result),
-                         "Installed %s as root, but failed to install its user LaunchAgent: %s",
-                         app->display_name,
-                         user_message);
-            }
-        }
-#endif
         if (ok) {
             mark_backend_event_changed();
             sb_append(&stdout_buffer, result[0] ? result : "Installed bundled app.");
@@ -16357,6 +15974,7 @@ static bool process_api_bundled_app_control_request(ReactorClient *client,
         }
     } else if (strcmp(action, "uninstall") == 0) {
         bool ok = uninstall_backend(app->service_id,
+                                    scope,
                                     sudo_password,
                                     &needs_password,
                                     result,

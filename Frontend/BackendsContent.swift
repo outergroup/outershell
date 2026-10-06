@@ -1878,6 +1878,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private var workspaceOverviewAppFrames: [(frame: CGRect, workspace: LocalWorkspaceRecord, app: LocalWorkspaceAppRecord)] = []
     private var overviewMenuFrames: [(frame: CGRect, item: AppLauncherItem)] = []
     private var overviewAddFrames: [CGRect] = []
+    private var catalogScope = "user"
     private var overviewDropFrames: [(frame: CGRect, group: String, target: AppDropTarget)] = []
     private var overviewGroupFrames: [(frame: CGRect, header: CGRect, id: String)] = []
     private let overviewDragFeedbackLayer = CALayer()
@@ -6009,12 +6010,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         installOverlayLayer.backgroundColor = resolvedCGColor(NSColor.black.withAlphaComponent(0.18))
 
         let systemOnlyPlaceholder = installsBundledPlaceholderAsSystemOnly(backend)
-        let hasRootChoice = !systemOnlyPlaceholder && (backend.supportsRoot ?? false) && !(backend.rootOnly ?? false)
         let isRootOnly = systemOnlyPlaceholder || (backend.rootOnly ?? false)
-        let preferredPanelWidth: CGFloat = hasRootChoice ? 430 : 360
-        let panelWidth = min(max(width - 48, 280), preferredPanelWidth)
-        let stacksButtons = hasRootChoice && panelWidth < 398
-        let panelHeight: CGFloat = stacksButtons ? 208 : 160
+        let panelWidth = min(max(width - 48, 280), 360)
+        let panelHeight: CGFloat = 160
         let panelFrame = CGRect(x: floor((width - panelWidth) / 2),
                                 y: floor((height - panelHeight) / 2),
                                 width: panelWidth,
@@ -6049,61 +6047,24 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         panel.addSublayer(title)
 
         let message = makeTextLayer(size: 12, weight: .regular, color: .secondaryLabelColor)
-        message.string = "Outer Shell will download this app."
+        message.string = isRootOnly ? "Install this app for root." : "Install this app for your user."
         message.isWrapped = true
         message.frame = CGRect(x: 72, y: panelHeight - 74, width: panelWidth - 90, height: 20)
         panel.addSublayer(message)
 
-        let buttonY: CGFloat = 18
-        let rootButtonWidth: CGFloat = hasRootChoice ? 156 : 112
-        let installButtonWidth: CGFloat = hasRootChoice ? 118 : (isRootOnly ? 112 : 118)
-        let cancelButtonWidth: CGFloat = 70
-        let rootLocalFrame: CGRect
-        let installLocalFrame: CGRect
-        let cancelLocalFrame: CGRect
-        if stacksButtons {
-            let buttonWidth = panelWidth - 36
-            rootLocalFrame = CGRect(x: 18, y: buttonY, width: buttonWidth, height: 30)
-            installLocalFrame = CGRect(x: 18, y: buttonY + 38, width: buttonWidth, height: 30)
-            cancelLocalFrame = CGRect(x: 18, y: buttonY + 76, width: buttonWidth, height: 30)
-        } else {
-            rootLocalFrame = (hasRootChoice || isRootOnly)
-                ? CGRect(x: panelWidth - rootButtonWidth - 18,
-                         y: buttonY,
-                         width: rootButtonWidth,
-                         height: 30)
-                : .zero
-            installLocalFrame = isRootOnly
-                ? .zero
-                : CGRect(x: (hasRootChoice ? rootLocalFrame.minX : panelWidth) - installButtonWidth - 8,
-                         y: buttonY,
-                         width: installButtonWidth,
-                         height: 30)
-            let cancelAnchorX = isRootOnly ? rootLocalFrame.minX : installLocalFrame.minX
-            cancelLocalFrame = CGRect(x: cancelAnchorX - cancelButtonWidth - 8,
-                                      y: buttonY,
-                                      width: cancelButtonWidth,
-                                      height: 30)
-        }
-        installConfirmFrame = installLocalFrame.offsetBy(dx: panelFrame.minX, dy: panelFrame.minY)
-        installRootConfirmFrame = (hasRootChoice || isRootOnly) ? rootLocalFrame.offsetBy(dx: panelFrame.minX, dy: panelFrame.minY) : .zero
+        let confirmLocalFrame = CGRect(x: panelWidth - 136, y: 18, width: 118, height: 30)
+        let cancelLocalFrame = CGRect(x: confirmLocalFrame.minX - 84, y: 18, width: 76, height: 30)
+        let confirmFrame = confirmLocalFrame.offsetBy(dx: panelFrame.minX, dy: panelFrame.minY)
+        installConfirmFrame = isRootOnly ? .zero : confirmFrame
+        installRootConfirmFrame = isRootOnly ? confirmFrame : .zero
         installCancelFrame = cancelLocalFrame.offsetBy(dx: panelFrame.minX, dy: panelFrame.minY)
 
         let cancelButton = makeButtonLayer(title: "Cancel", emphasized: false)
         cancelButton.frame = cancelLocalFrame
         panel.addSublayer(cancelButton)
-
-        if !isRootOnly {
-            let installButton = makeButtonLayer(title: "Enable for user", emphasized: true)
-            installButton.frame = installLocalFrame
-            panel.addSublayer(installButton)
-        }
-        if hasRootChoice || isRootOnly {
-            let rootButtonTitle = systemOnlyPlaceholder ? "Enable" : (hasRootChoice ? "Enable for user and root" : "Enable for root")
-            let rootButton = makeButtonLayer(title: rootButtonTitle, emphasized: true)
-            rootButton.frame = rootLocalFrame
-            panel.addSublayer(rootButton)
-        }
+        let installButton = makeButtonLayer(title: isRootOnly ? "Install as root" : "Install", emphasized: true)
+        installButton.frame = confirmLocalFrame
+        panel.addSublayer(installButton)
     }
 
     private func renderPasswordPromptIfNeeded(width: CGFloat, height: CGFloat) {
@@ -8328,19 +8289,13 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             children.append(accessibilityNode(nextIdentifier: &nextIdentifier,
                                               role: .button,
                                               frame: frame,
-                                              label: "Enable for user"))
+                                              label: "Install"))
         }
         if let frame = accessibilityFrame(installRootConfirmFrame) {
-            let systemOnlyPlaceholder = installsBundledPlaceholderAsSystemOnly(backend)
-            let label = systemOnlyPlaceholder
-                ? "Enable"
-                : ((backend.supportsRoot ?? false) && !(backend.rootOnly ?? false)
-                    ? "Enable for user and root"
-                    : "Enable for root")
             children.append(accessibilityNode(nextIdentifier: &nextIdentifier,
                                               role: .button,
                                               frame: frame,
-                                              label: label))
+                                              label: "Install as root"))
         }
         if let frame = accessibilityFrame(installCancelFrame) {
             children.append(accessibilityNode(nextIdentifier: &nextIdentifier,
@@ -12147,6 +12102,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                             at point: CGPoint) {
         switch action {
         case .addApp:
+            catalogScope = isDirectRootSession ? "system" : "user"
             navigateToMode(.create, pushHistory: true)
         case .appBadge(let endpoint, let displayName, let opensInNewTab):
             openLauncherEndpoint(endpoint,
@@ -13686,7 +13642,13 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 return
             }
             if let frame = overviewAddFrames.first(where: { $0.contains(appsPoint) }) {
-                armButtonClick(frame: rootFrame(frame, from: appsScrollContentLayer), action: .addApp)
+                let groupID = overviewGroupFrames.first { $0.frame.contains(appsPoint) }?.id
+                armButtonClick(frame: rootFrame(frame, from: appsScrollContentLayer),
+                               performAtPoint: { [weak self] _ in
+                    guard let self else { return }
+                    self.catalogScope = groupID == "root" ? "system" : "user"
+                    self.navigateToMode(.create, pushHistory: true)
+                })
                 return
             }
             if workspaceOverviewCreateFrame.contains(appsPoint) {
@@ -14559,7 +14521,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func bundledCatalogBackends() -> [BundledCatalogEntry] {
-        let grouped = Dictionary(grouping: backends.filter { $0.isBundledCatalogEntry }, by: \.serviceID)
+        let grouped = Dictionary(grouping: backends.filter { $0.isBundledCatalogEntry && $0.serviceScope == (isDirectRootSession ? "system" : catalogScope) }, by: \.serviceID)
         return grouped.values.compactMap { records in
             guard let displayRecord = records.first(where: { $0.isBundledPlaceholder }) ??
                     records.first(where: { ($0.iconSymbolName ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false }) ??
@@ -19832,18 +19794,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 items.append(OuterframeContextMenuItem(id: "run",
                                                        title: (backend.rootOnly ?? false) && !systemOnlyPlaceholder ? "Run as root" : "Run",
                                                        isEnabled: true))
-                if !systemOnlyPlaceholder && (backend.supportsRoot ?? false) && !(backend.rootOnly ?? false) {
-                    operationByItemID["runRoot"] = "runRoot"
-                    items.append(OuterframeContextMenuItem(id: "runRoot",
-                                                           title: "Run as root",
-                                                           isEnabled: true))
-                }
-            } else if (backend.supportsRoot ?? false) && !(backend.rootOnly ?? false) && !isDirectRootSession {
-                let hasRootSupport = backend.hasRootSupport ?? (backend.serviceScope == "system")
-                operationByItemID["rootSupport"] = hasRootSupport ? "removeRootSupport" : "addRootSupport"
-                items.append(OuterframeContextMenuItem(id: "rootSupport",
-                                                       title: hasRootSupport ? "Reinstall as user-only" : "Reinstall with root support",
-                                                       isEnabled: true))
             }
         }
         if backend.canUninstallBackend {
@@ -20185,19 +20135,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         ))
 
         let management = backendManagementMenuItems(for: item.backend, includePlaceholderRunActions: false)
-        var managementOperationByItemID = management.operationByItemID
+        let managementOperationByItemID = management.operationByItemID
         var managementItems = management.items
-        if (item.backend.isBundled ?? false),
-           (item.backend.supportsRoot ?? false),
-           !(item.backend.rootOnly ?? false),
-           !isDirectRootSession {
-            let hasRootSupport = item.rootEndpoint != nil || (item.backend.hasRootSupport ?? false)
-            managementOperationByItemID["rootSupport"] = hasRootSupport ? "removeRootSupport" : "addRootSupport"
-            managementItems.removeAll { $0.id == "rootSupport" }
-            managementItems.append(OuterframeContextMenuItem(id: "rootSupport",
-                                                             title: hasRootSupport ? "Reinstall as user-only" : "Reinstall with root support",
-                                                             isEnabled: true))
-        }
         managementItems = managementItems.filter { $0.id == "uninstall" } + managementItems.filter { $0.id != "uninstall" }
         if !managementItems.isEmpty {
             appendSeparatorIfNeeded()
@@ -20460,7 +20399,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         case "run":
             return "Installing \(backend.displayName)..."
         case "runRoot", "installRoot", "addRootSupport":
-            return "Adding root support for \(backend.displayName)..."
+            return "Installing \(backend.displayName) as root..."
         case "runUser", "installUser":
             return "Installing \(backend.displayName)..."
         case "removeRootSupport":
