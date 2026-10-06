@@ -42,6 +42,7 @@ extern char **environ;
 #include "../Backend/OuterShellImage.h"
 #include "../Backend/OuterShellPlatform.h"
 #include "../Resources/OuterShellPaths.h"
+#include "../Resources/LaunchdSocket.h"
 #include "OuterService.h"
 
 #ifdef __APPLE__
@@ -1925,34 +1926,10 @@ static void bundled_socket_path_for_scope(const BundledAppDefinition *app,
         out[0] = '\0';
         return;
     }
-    if (scope && strcmp(scope, "system") == 0) {
 #ifdef __APPLE__
-        snprintf(out, out_size, "/var/run/%s", app->socket_name);
+    snprintf(out, out_size, "/launchd/%s/%s", scope && strcmp(scope, "system") == 0 ? "system" : "user", app->service_id);
 #else
-        snprintf(out, out_size, "/run/%s", app->socket_name);
-#endif
-        return;
-    }
-#ifdef __APPLE__
-    size_t required_length = confstr(_CS_DARWIN_USER_TEMP_DIR, NULL, 0);
-    if (required_length > 0) {
-        char temp_dir[PATH_MAX];
-        if (required_length < sizeof(temp_dir) &&
-            confstr(_CS_DARWIN_USER_TEMP_DIR, temp_dir, required_length) > 0 &&
-            temp_dir[0]) {
-            size_t length = strlen(temp_dir);
-            snprintf(out,
-                     out_size,
-                     "%s%s%s",
-                     temp_dir,
-                     length > 0 && temp_dir[length - 1] == '/' ? "" : "/",
-                     app->socket_name);
-            return;
-        }
-    }
-    snprintf(out, out_size, "/tmp/%s", app->socket_name);
-#else
-    if (direct_root_session_uses_system_scope()) {
+    if ((scope && strcmp(scope, "system") == 0) || direct_root_session_uses_system_scope()) {
         snprintf(out, out_size, "/run/%s", app->socket_name);
         return;
     }
@@ -1967,6 +1944,10 @@ static void bundled_socket_path_for_scope(const BundledAppDefinition *app,
 
 static void runtime_socket_path(const char *name, char *out, size_t out_size) {
 #ifdef __APPLE__
+    if (strcmp(name, "org.outershell.OuterShell") == 0) {
+        snprintf(out, out_size, "/launchd/user/%s", name);
+        return;
+    }
     size_t required_length = confstr(_CS_DARWIN_USER_TEMP_DIR, NULL, 0);
     if (required_length > 0) {
         char temp_dir[PATH_MAX];
@@ -5519,6 +5500,15 @@ static bool run_launchctl_capture(const char *command, char *message, size_t mes
     return status == 0;
 }
 
+static bool bootstrap_launchd_capture(const char *command, char *message, size_t message_size) {
+    for (unsigned attempt = 0; attempt < 20; attempt++) {
+        if (run_launchctl_capture(command, message, message_size)) return true;
+        if (!strstr(message, "Bootstrap failed: 5:")) return false;
+        usleep(100000);
+    }
+    return false;
+}
+
 static void unload_launchd_service_if_needed(const char *label, const char *domain) {
     if (!launchd_label_is_safe(label) || launchd_is_system_domain(domain)) return;
     char target[320];
@@ -5607,7 +5597,7 @@ static bool run_launchd_operation_unlocked(const char *label,
     snprintf(command, sizeof(command), "launchctl enable %s >/dev/null 2>&1 || true", quoted_target);
     system(command);
     snprintf(command, sizeof(command), "launchctl bootstrap %s %s 2>&1", quoted_domain, quoted_plist);
-    if (!run_launchctl_capture(command, message, message_size)) {
+    if (!bootstrap_launchd_capture(command, message, message_size)) {
         if (message[0] == '\0') snprintf(message, message_size, "Failed to bootstrap launchd service.");
         return false;
     }
@@ -12553,9 +12543,10 @@ static bool make_bundled_launchd_plist(const char *label,
                          "    <dict>\n"
                          "        <key>Listener</key>\n"
                          "        <dict>\n"
-                         "            <key>SockPathName</key>\n"
+                         "            <key>SecureSocketWithKey</key>\n"
                          "            <string>");
-    ok = ok && sb_append_xml_escaped(builder, socket_path);
+    ok = ok && sb_append(builder, OUTER_LAUNCHD_KEY_PREFIX);
+    ok = ok && sb_append_xml_escaped(builder, label);
     ok = ok && sb_append(builder,
                          "</string>\n"
                          "            <key>SockPathMode</key>\n"
@@ -12710,8 +12701,13 @@ static bool install_bundled_app_user_launchagent_for_system_payload(const Bundle
     shell_quote(plist_path, quoted_plist, sizeof(quoted_plist));
     char bootstrap_message[4096] = "";
     char bootstrap_command[PATH_MAX + 128];
-    snprintf(bootstrap_command, sizeof(bootstrap_command), "launchctl bootstrap gui/%d %s 2>&1", (int)getuid(), quoted_plist);
+    snprintf(bootstrap_command, sizeof(bootstrap_command), "launchctl enable gui/%d/%s 2>&1", (int)getuid(), app->service_id);
     if (!run_launchctl_capture(bootstrap_command, bootstrap_message, sizeof(bootstrap_message))) {
+        snprintf(message, message_size, "Could not enable %s: %s", app->display_name, bootstrap_message);
+        return false;
+    }
+    snprintf(bootstrap_command, sizeof(bootstrap_command), "launchctl bootstrap gui/%d %s 2>&1", (int)getuid(), quoted_plist);
+    if (!bootstrap_launchd_capture(bootstrap_command, bootstrap_message, sizeof(bootstrap_message))) {
         snprintf(message, message_size, "Installed %s user LaunchAgent, but failed to bootstrap its socket: %s",
                  app->display_name,
                  bootstrap_message);
@@ -12936,6 +12932,7 @@ static bool install_bundled_app_macos(const BundledAppDefinition *app,
                 "chmod 0644 %s\n"
                 "touch %s\n"
                 "chmod 0644 %s\n"
+                "launchctl enable system/%s\n"
                 "launchctl bootstrap system %s\n",
                 quoted_install_root,
                 quoted_plist_path,
@@ -12943,6 +12940,7 @@ static bool install_bundled_app_macos(const BundledAppDefinition *app,
                 quoted_plist_path,
                 quoted_log_path,
                 quoted_log_path,
+                app->service_id,
                 quoted_plist_path);
         fclose(script);
         free(plist.data);
@@ -13117,8 +13115,13 @@ static bool install_bundled_app_macos(const BundledAppDefinition *app,
     shell_quote(plist_path, quoted_plist, sizeof(quoted_plist));
     char bootstrap_message[4096] = "";
     char bootstrap_command[PATH_MAX + 128];
-    snprintf(bootstrap_command, sizeof(bootstrap_command), "launchctl bootstrap gui/%d %s 2>&1", (int)getuid(), quoted_plist);
+    snprintf(bootstrap_command, sizeof(bootstrap_command), "launchctl enable gui/%d/%s 2>&1", (int)getuid(), app->service_id);
     if (!run_launchctl_capture(bootstrap_command, bootstrap_message, sizeof(bootstrap_message))) {
+        snprintf(message, message_size, "Could not enable %s: %s", app->display_name, bootstrap_message);
+        return false;
+    }
+    snprintf(bootstrap_command, sizeof(bootstrap_command), "launchctl bootstrap gui/%d %s 2>&1", (int)getuid(), quoted_plist);
+    if (!bootstrap_launchd_capture(bootstrap_command, bootstrap_message, sizeof(bootstrap_message))) {
         snprintf(message, message_size, "Installed %s, but failed to bootstrap its socket: %s", app->display_name, bootstrap_message);
         return false;
     }
@@ -15651,6 +15654,13 @@ static void api_send_file_openers_response(int fd,
 
 static bool unix_socket_path_accessible_to_current_user(const char *socket_path) {
     if (!socket_path || !socket_path[0]) return false;
+#ifdef __APPLE__
+    char resolved[PATH_MAX], error[512];
+    if (strncmp(socket_path, OUTER_LAUNCHD_PREFIX, strlen(OUTER_LAUNCHD_PREFIX)) == 0) {
+        if (!outer_launchd_resolve(socket_path, resolved, sizeof(resolved), error, sizeof(error))) return false;
+        socket_path = resolved;
+    }
+#endif
     struct stat st;
     if (stat(socket_path, &st) != 0 || !S_ISSOCK(st.st_mode)) return false;
     return access(socket_path, R_OK | W_OK) == 0;

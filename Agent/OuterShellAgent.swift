@@ -1513,7 +1513,7 @@ private final class OuterShellAgentDelegate: NSObject, NSApplicationDelegate, NS
         var frontend = HostedFrontend(serviceID: "org.outershell.OuterShell",
                                       name: "Outer Shell",
                                       port: 0,
-                                      socketPath: defaultSocketPath(),
+                                      socketPath: "/launchd/user/org.outershell.OuterShell",
                                       url: "/")
         if let registered = try? OuterShellRegistry.loadBackends()
             .flatMap(\.frontends)
@@ -1653,6 +1653,9 @@ private func appendOptionIfPresent(_ option: String, from source: [String], to d
 }
 
 private func defaultSocketPath() -> String {
+    if let path = ProcessInfo.processInfo.environment["OUTERSHELL_SOCKET_org.outershell.OuterShell"], !path.isEmpty {
+        return path
+    }
     var buffer = [CChar](repeating: 0, count: Int(PATH_MAX))
     let result = confstr(_CS_DARWIN_USER_TEMP_DIR, &buffer, buffer.count)
     let directory: String

@@ -2986,6 +2986,10 @@ int OuterShellBackendMain(int argc, char **argv) {
     if (listener < 0 && !use_port) {
         listener = launchd_activated_listener(launchd_socket_name);
     }
+    if (listener < 0 && !use_port && strncmp(socket_path, "/launchd/", 9) == 0) {
+        fprintf(stderr, "Outer Shell's launchd socket is unavailable. Reinstall Outer Shell to restore its service configuration.\n");
+        return 1;
+    }
     if (listener < 0) {
         listener = use_port ? create_tcp_listener(port) : create_unix_listener(socket_path);
     }

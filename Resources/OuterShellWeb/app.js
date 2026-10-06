@@ -340,6 +340,10 @@
   }
 
   function endpointFailure(endpoint, name) {
+    if (/^\/(?:private\/)?var\/folders\//.test(endpoint.frontend.socketPath || "") &&
+        ["socket unavailable", "failed", "suspended after failures"].includes(endpoint.backend.status)) {
+      return `${name} uses an older macOS socket configuration that is failing on this Mac. Reinstall the bundled app to let launchd choose its socket location. Its new service address will stay stable when the Mac restarts.`;
+    }
     if (endpoint.backend.status === "suspended after failures") return `${name} was suspended after repeated launch failures to stop automatic restarts. Check the logs, then choose Retry when ready.`;
     if (endpoint.backend.status === "socket unavailable") return `${name} couldn’t start: its connection socket is unavailable.`;
     if (endpoint.backend.status === "failed") return `${name} exited with an error.`;

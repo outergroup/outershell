@@ -380,7 +380,7 @@ if [ "$os_name" = "Darwin" ]; then
     outershell_cache_root="$HOME/Library/Caches/outershell"
     launch_agent_dir="$HOME/Library/LaunchAgents"
     plist_path="$launch_agent_dir/org.outershell.OuterShell.plist"
-    socket_path="$(getconf DARWIN_USER_TEMP_DIR)org.outershell.OuterShell"
+    socket_path="/launchd/user/org.outershell.OuterShell"
     api_socket_path="$(getconf DARWIN_USER_TEMP_DIR)outershelld-api"
     log_dir="$HOME/Library/Logs/org.outershell.OuterShell"
     log_path="$log_dir/output.log"
@@ -596,8 +596,8 @@ EOF
   <dict>
     <key>Listener</key>
     <dict>
-      <key>SockPathName</key>
-      <string>$socket_path_xml</string>
+      <key>SecureSocketWithKey</key>
+      <string>OUTERSHELL_SOCKET_org.outershell.OuterShell</string>
       <key>SockPathMode</key>
       <integer>384</integer>
     </dict>
@@ -635,7 +635,7 @@ EOF
 
     attempts=50
     while [ "$attempts" -gt 0 ]; do
-        if [ -S "$socket_path" ]; then
+        if launchctl print "gui/$(id -u)/$service_id" >/dev/null 2>&1; then
             printf '%s\n' "$socket_path"
             install_completed=true
             exit 0

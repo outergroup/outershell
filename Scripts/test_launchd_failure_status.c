@@ -17,6 +17,14 @@ static void check_status(LaunchdStatusEntry *entry, const char *fixture, const c
 
 int main(int argc, char **argv) {
     assert(argc == 2);
+    StringBuilder plist = {0};
+    assert(make_bundled_launchd_plist("org.outershell.Test", "/tmp/backend", "", "",
+        "/launchd/user/org.outershell.Test", 0600, "/tmp", "/tmp/api", "/tmp/log", "", &plist));
+    assert(strstr(plist.data, "<key>SecureSocketWithKey</key>"));
+    assert(strstr(plist.data, "OUTERSHELL_SOCKET_org.outershell.Test"));
+    assert(strstr(plist.data, "/launchd/user/org.outershell.Test"));
+    assert(!strstr(plist.data, "<key>SockPathName</key>"));
+    free(plist.data);
     char fixture[PATH_MAX], socket_path[PATH_MAX], text[8192];
     snprintf(fixture, sizeof(fixture), "%s/fixture", argv[1]);
     snprintf(socket_path, sizeof(socket_path), "%s/socket", argv[1]);
