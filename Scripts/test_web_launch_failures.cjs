@@ -8,6 +8,14 @@ vm.createContext(context);
 vm.runInContext(source.slice(source.indexOf("  function endpointRunning("), source.indexOf("  function launcherItems(")), context);
 vm.runInContext(source.slice(source.indexOf("  function showLaunchFailure("), source.indexOf("  const delay =")), context);
 (async () => {
+  const jupyter = { backend: { status: "stopped" }, frontend: { socketPath: "/var/folders/test/jupyter.sock" } };
+  assert.equal(context.endpointFailure(jupyter, "Jupyter Lab"), "");
+  jupyter.backend.status = "failed";
+  assert.equal(context.endpointFailure(jupyter, "Jupyter Lab"), "Jupyter Lab exited with an error.");
+  jupyter.backend.status = "suspended after failures";
+  assert.match(context.endpointFailure(jupyter, "Jupyter Lab"), /suspended after repeated launch failures/);
+  jupyter.backend.status = "socket unavailable";
+  assert.match(context.endpointFailure(jupyter, "Jupyter Lab"), /older macOS socket configuration/);
   assert.equal(context.endpointReady(endpoint), false);
   await context.launch("test");
   assert.equal(starts, 0); assert.equal(navigations, 0);
@@ -24,5 +32,19 @@ vm.runInContext(source.slice(source.indexOf("  function showLaunchFailure("), so
   await context.launch("test");
   assert.equal(starts, 3); assert.equal(navigations, 1);
   assert.match(dialog, /suspended after repeated launch failures/);
+  endpoint.backend.status = "stopped";
+  endpoint.frontend.socketPath = "/var/folders/test/jupyter.sock";
+  endpoint.frontend.isRunning = false;
+  let readinessPolls = 0;
+  context.refreshBackends = async () => {
+    readinessPolls++;
+    assert.equal(navigations, 1);
+    endpoint.backend.status = "running";
+    endpoint.frontend.isRunning = readinessPolls >= 3;
+  };
+  await context.launch("test");
+  assert.equal(readinessPolls, 3);
+  assert.equal(starts, 4);
+  assert.equal(navigations, 2);
   console.log("PASS: failed launch stays in Outer Shell, logs/retry, stale running flag, recovery and post-start failure");
 })().catch(error => { console.error(error); process.exitCode = 1; });

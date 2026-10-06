@@ -5369,14 +5369,15 @@ static void read_launchd_status(LaunchdStatusEntry *entry) {
     bool failed = ferror(output);
     int result = pclose(output);
     if (failed || result == -1 || !WIFEXITED(result)) return;
+    bool unsuccessful_exit = exit_code != 0 && exit_code != 128 + SIGTERM && exit_code != 128 + SIGINT;
     snprintf(entry->status, sizeof(entry->status), "%s",
              WEXITSTATUS(result) == 0 && missing_socket ? "socket unavailable" :
              WEXITSTATUS(result) == 0 && running ? "running" :
-             WEXITSTATUS(result) == 0 && exit_code != 0 ? "failed" :
+             WEXITSTATUS(result) == 0 && unsuccessful_exit ? "failed" :
              WEXITSTATUS(result) == 0 && passive ? "available" :
              access(entry->plist_path, F_OK) == 0 ? "stopped" : "registered");
     int64_t now = monotonic_milliseconds();
-    if (WEXITSTATUS(result) == 0 && !running && exit_code != 0 && runs > 0) {
+    if (WEXITSTATUS(result) == 0 && !running && unsuccessful_exit && runs > 0) {
         if (!entry->failure_window_ms || now - entry->failure_window_ms > 60000 || runs < entry->last_runs) {
             entry->failure_window_ms = now;
             entry->failed_launches = 1;
@@ -6180,7 +6181,7 @@ static bool build_frontends_array_payload(const RegistryStore *database,
         const char *url = record->url ? record->url : "";
         const char *frontend_id = record->frontend_id ? record->frontend_id : "";
         bool frontend_running = is_running;
-        if (is_running && record->port > 0) {
+        if (is_running && (record->port > 0 || (record->socket_path && record->socket_path[0]))) {
             frontend_running = frontend_endpoint_is_passively_ready(record->port,
                                                                     record->socket_path ? record->socket_path : "");
         }
@@ -6645,7 +6646,15 @@ static bool frontend_endpoint_is_passively_ready(int port, const char *socket_pa
     if (port > 0) {
         return try_connect_tcp_port(port);
     }
-    (void)socket_path;
+    if (socket_path && socket_path[0]) {
+#ifdef __APPLE__
+        bool system;
+        const char *label;
+        if (outer_launchd_address(socket_path, &system, &label)) return true;
+#endif
+        struct stat info;
+        return lstat(socket_path, &info) == 0 && S_ISSOCK(info.st_mode);
+    }
     return false;
 }
 
@@ -6655,8 +6664,9 @@ static uint64_t frontend_endpoint_readiness_store_token(const RegistryStore *dat
         const RegistryFrontendRecord *record = &database->frontends[i];
         int port = record->port;
         const char *socket_path = record->socket_path ? record->socket_path : "";
-        if (port <= 0) continue;
+        if (port <= 0 && !socket_path[0]) continue;
 
+        token = mix_u64(token, string_state_token(socket_path));
         token = mix_u64(token, string_state_token(record->service_id ? record->service_id : ""));
         token = mix_u64(token, string_state_token(record->frontend_id ? record->frontend_id : ""));
         token = mix_u64(token, (uint64_t)port);

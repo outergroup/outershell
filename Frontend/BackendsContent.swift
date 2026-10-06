@@ -14742,7 +14742,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private func launcherFailureMessage(_ endpoint: AppLauncherEndpoint, displayName: String) -> String? {
         let socketPath = endpoint.frontend.socketPath
         if (socketPath.hasPrefix("/var/folders/") || socketPath.hasPrefix("/private/var/folders/")),
-           ["socket unavailable", "failed", "suspended after failures"].contains(endpoint.backend.status) {
+           endpoint.backend.status == "socket unavailable" {
             return "\(displayName) uses an older macOS socket configuration that is failing on this Mac. Reinstall the bundled app to let launchd choose its socket location. Its new service address will stay stable when the Mac restarts."
         }
         switch endpoint.backend.status {
