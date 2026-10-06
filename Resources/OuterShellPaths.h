@@ -6,6 +6,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#ifdef __APPLE__
+#include "LaunchdSocket.h"
+#endif
 
 static inline const char *outer_shell_home_directory(void) {
     const char *home = getenv("HOME");
@@ -48,6 +51,16 @@ static inline void outer_shell_default_api_socket_path(char *out, size_t out_siz
         return;
     }
 #ifdef __APPLE__
+    const char *activated = getenv("OUTERSHELL_API_SOCKET_org.outershell.OuterShell");
+    struct stat socket_info;
+    if (activated && activated[0] && lstat(activated, &socket_info) == 0 &&
+        S_ISSOCK(socket_info.st_mode) && socket_info.st_uid == getuid()) {
+        snprintf(out, out_size, "%s", activated);
+        return;
+    }
+    char error[512];
+    if (outer_launchd_resolve_with_key_prefix("/launchd/user/org.outershell.OuterShell",
+            "OUTERSHELL_API_SOCKET_", out, out_size, error, sizeof(error))) return;
     const char *tmp = getenv("DARWIN_USER_TEMP_DIR");
     if (!tmp || !tmp[0]) tmp = getenv("TMPDIR");
     if (tmp && tmp[0]) {

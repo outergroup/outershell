@@ -60,7 +60,7 @@ static inline int outer_launchd_run(char *const arguments[]) {
     return -1;
 }
 
-static inline bool outer_launchd_resolve(const char *address, char *out, size_t capacity,
+static inline bool outer_launchd_resolve_with_key_prefix(const char *address, const char *key_prefix, char *out, size_t capacity,
                                         char *error, size_t error_capacity) {
     bool system;
     const char *label;
@@ -76,7 +76,8 @@ static inline bool outer_launchd_resolve(const char *address, char *out, size_t 
     if (system) snprintf(domain, sizeof(domain), "system");
     else snprintf(domain, sizeof(domain), "gui/%u", getuid());
     snprintf(target, sizeof(target), "%s/%s", domain, label);
-    char *check[] = {"launchctl", "print", target, NULL};
+    char command[] = "launchctl", print_command[] = "print";
+    char *check[] = {command, print_command, target, NULL};
     if (outer_launchd_run(check) != 0) {
         snprintf(error, error_capacity, "The launchd service %s is not loaded in %s.", label, domain);
         return false;
@@ -99,10 +100,11 @@ static inline bool outer_launchd_resolve(const char *address, char *out, size_t 
                 "<key>ProgramArguments</key><array><string>/usr/bin/printenv</string><string>%s%s</string></array>"
                 "<key>RunAtLoad</key><true/>"
                 "<key>StandardOutPath</key><string>%s</string>"
-                "</dict></plist>", resolver, OUTER_LAUNCHD_KEY_PREFIX, label, output);
+                "</dict></plist>", resolver, key_prefix, label, output);
         bool written = !ferror(file);
         if (fclose(file) != 0) written = false;
-        char *bootstrap[] = {"launchctl", "bootstrap", domain, plist, NULL};
+        char bootstrap_command[] = "bootstrap";
+        char *bootstrap[] = {command, bootstrap_command, domain, plist, NULL};
         loaded = written && outer_launchd_run(bootstrap) == 0;
     }
     for (unsigned attempt = 0; loaded && attempt < 100; attempt++) {
@@ -124,7 +126,8 @@ static inline bool outer_launchd_resolve(const char *address, char *out, size_t 
         usleep(10000);
     }
     if (loaded) {
-        char *bootout[] = {"launchctl", "bootout", resolver_target, NULL};
+        char bootout_command[] = "bootout";
+        char *bootout[] = {command, bootout_command, resolver_target, NULL};
         if (outer_launchd_run(bootout) != 0) success = false;
     }
     unlink(output);
@@ -132,6 +135,11 @@ static inline bool outer_launchd_resolve(const char *address, char *out, size_t 
     rmdir(directory);
     if (!success) snprintf(error, error_capacity, "The launchd service %s has no available socket. Reinstall the app if its socket configuration is outdated.", label);
     return success;
+}
+static inline bool outer_launchd_resolve(const char *address, char *out, size_t capacity,
+                                        char *error, size_t error_capacity) {
+    return outer_launchd_resolve_with_key_prefix(address, OUTER_LAUNCHD_KEY_PREFIX,
+                                                out, capacity, error, error_capacity);
 }
 #endif
 #endif

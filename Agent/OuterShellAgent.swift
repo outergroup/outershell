@@ -14,6 +14,17 @@ private func OuterShellBackendRequestShutdown()
 @_silgen_name("OuterShelldRequestShutdown")
 private func OuterShelldRequestShutdown()
 
+@_silgen_name("OuterShellBackendIdleSeconds")
+private func OuterShellBackendIdleSeconds() -> Double
+@_silgen_name("OuterShelldRequireSocketActivation")
+private func OuterShelldRequireSocketActivation()
+@_silgen_name("OuterShelldIdleSeconds")
+private func OuterShelldIdleSeconds() -> Double
+@_silgen_name("OuterShellBackendRequestIdleShutdown")
+private func OuterShellBackendRequestIdleShutdown()
+@_silgen_name("OuterShelldRequestIdleShutdown")
+private func OuterShelldRequestIdleShutdown()
+
 private typealias MenuBarVisibilityCallback = @convention(c) (Int32) -> Void
 private typealias MenuBarVisibilityGetter = @convention(c) () -> Int32
 private typealias BackendEventChangedCallback = @convention(c) () -> Void
@@ -875,6 +886,11 @@ private final class OuterShellAgentDelegate: NSObject, NSApplicationDelegate, NS
     private var runningContainers: [SafeSpaceMenuBarContainer] = []
     private var lastError: String?
     private var refreshTimer: Timer?
+    private var idleTimer: Timer?
+    private var isShuttingDown = false
+    private var finishedWorkers = 0
+    private var activeOperations = 0
+    private var refreshingContainers = false
     private var followUpRefreshTask: Task<Void, Never>?
     private var containerRefreshTask: Task<Void, Never>?
     private var pendingLifecycleActions: [String: PendingLifecycleAction] = [:]
@@ -896,6 +912,9 @@ private final class OuterShellAgentDelegate: NSObject, NSApplicationDelegate, NS
                                                             name: MenuBarVisibilityPreference.changedNotification,
                                                             object: nil)
         refresh()
+        idleTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.checkIdleShutdown() }
+        }
         refreshTimer = Timer.scheduledTimer(withTimeInterval: 300, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in
                 self?.refresh()
@@ -904,6 +923,7 @@ private final class OuterShellAgentDelegate: NSObject, NSApplicationDelegate, NS
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        idleTimer?.invalidate()
         refreshTimer?.invalidate()
         followUpRefreshTask?.cancel()
         containerRefreshTask?.cancel()
@@ -923,19 +943,46 @@ private final class OuterShellAgentDelegate: NSObject, NSApplicationDelegate, NS
     }
 
     private func startBackend() {
+        if containsOption(CommandLine.arguments, "--launchd-socket-name") { OuterShelldRequireSocketActivation() }
         let brokerArguments = brokerArguments()
-        brokerThread = Thread {
-            _ = runBroker(arguments: brokerArguments)
+        brokerThread = Thread { [weak self] in
+            let status = runBroker(arguments: brokerArguments)
+            Task { @MainActor [weak self] in self?.workerFinished(status: status) }
         }
         brokerThread?.name = "outershelld"
         brokerThread?.start()
 
         let arguments = backendArguments()
-        backendThread = Thread {
-            _ = runBackend(arguments: arguments)
+        backendThread = Thread { [weak self] in
+            let status = runBackend(arguments: arguments)
+            Task { @MainActor [weak self] in self?.workerFinished(status: status) }
         }
         backendThread?.name = "OuterShellBackend"
         backendThread?.start()
+    }
+
+    private func checkIdleShutdown() {
+        guard !isShuttingDown, statusItem == nil, activeOperations == 0,
+              !refreshingContainers, OuterShellBackendIdleSeconds() >= 60,
+              OuterShelldIdleSeconds() >= 60 else { return }
+        isShuttingDown = true
+        idleTimer?.invalidate()
+        refreshTimer?.invalidate()
+        followUpRefreshTask?.cancel()
+        cancelAllServiceExitMonitors()
+        OuterShellBackendRequestIdleShutdown()
+        OuterShelldRequestIdleShutdown()
+    }
+
+    private func workerFinished(status: Int32) {
+        finishedWorkers += 1
+        if !isShuttingDown {
+            isShuttingDown = true
+            OuterShellBackendRequestShutdown()
+            OuterShelldRequestShutdown()
+        }
+        if status != 0 { NSLog("Outer Shell worker exited with status %d", status) }
+        if finishedWorkers == 2 { NSApplication.shared.terminate(nil) }
     }
 
     private func brokerArguments() -> [String] {
@@ -943,7 +990,9 @@ private final class OuterShellAgentDelegate: NSObject, NSApplicationDelegate, NS
         if !CommandLine.arguments.contains("--stay-alive") {
             args.append("--stay-alive")
         }
-        if !containsOption(CommandLine.arguments, "--api-socket-path") {
+        if containsOption(CommandLine.arguments, "--api-socket-path") {
+            appendOptionIfPresent("--api-socket-path", from: CommandLine.arguments, to: &args)
+        } else {
             args.append("--api-socket-path")
             args.append(defaultApiSocketPath())
         }
@@ -1010,6 +1059,7 @@ private final class OuterShellAgentDelegate: NSObject, NSApplicationDelegate, NS
     }
 
     private func refresh() {
+        guard !isShuttingDown else { return }
         let previousServices = services
         let previousError = lastError
         do {
@@ -1029,12 +1079,15 @@ private final class OuterShellAgentDelegate: NSObject, NSApplicationDelegate, NS
     }
 
     private func refreshContainers() {
-        containerRefreshTask?.cancel()
+        guard !refreshingContainers else { return }
+        refreshingContainers = true
         containerRefreshTask = Task.detached(priority: .userInitiated) { [weak self] in
             let containers = await SafeSpaceManager.shared.menuBarContainers()
             guard !Task.isCancelled else { return }
             await MainActor.run { [weak self] in
-                guard let self, self.runningContainers != containers else { return }
+                guard let self else { return }
+                self.refreshingContainers = false
+                guard !self.isShuttingDown, self.runningContainers != containers else { return }
                 self.runningContainers = containers
                 self.updateStatusItem()
                 self.rebuildMenu()
@@ -1232,6 +1285,7 @@ private final class OuterShellAgentDelegate: NSObject, NSApplicationDelegate, NS
 
     @objc private func openContainerAppMenuItemClicked(_ sender: NSMenuItem) {
         guard let app = sender.representedObject as? SafeSpaceMenuBarApp else { return }
+        activeOperations += 1
         Task.detached(priority: .userInitiated) { [weak self] in
             do {
                 let url = try await SafeSpaceManager.shared.menuBarURL(for: app)
@@ -1246,6 +1300,9 @@ private final class OuterShellAgentDelegate: NSObject, NSApplicationDelegate, NS
                     self?.lastError = error.localizedDescription
                     self?.rebuildMenu()
                 }
+            }
+            await MainActor.run { [weak self] in
+                self?.activeOperations -= 1
             }
         }
     }
@@ -1330,7 +1387,9 @@ private final class OuterShellAgentDelegate: NSObject, NSApplicationDelegate, NS
         updateStatusItem()
         rebuildMenu()
 
+        activeOperations += 1
         Task { [service] in
+            defer { activeOperations -= 1 }
             let success = runLifecycleCommand(for: service)
             await MainActor.run {
                 if !success {
@@ -1668,6 +1727,9 @@ private func defaultSocketPath() -> String {
 }
 
 private func defaultApiSocketPath() -> String {
+    if let path = ProcessInfo.processInfo.environment["OUTERSHELL_API_SOCKET_org.outershell.OuterShell"], !path.isEmpty {
+        return path
+    }
     var buffer = [CChar](repeating: 0, count: Int(PATH_MAX))
     let result = confstr(_CS_DARWIN_USER_TEMP_DIR, &buffer, buffer.count)
     let directory: String

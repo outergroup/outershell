@@ -3,6 +3,7 @@
 #endif
 #define _GNU_SOURCE
 
+#include "../Resources/OuterShellIdle.h"
 #include <arpa/inet.h>
 #include <ctype.h>
 #include <dirent.h>
@@ -149,6 +150,9 @@ static char g_http_proxy_api_socket_path[PATH_MAX] = "";
 static char g_container_transfers_directory[PATH_MAX] = "";
 static bool g_systemd_socket_activation = false;
 static bool g_launchd_socket_activation = false;
+static OuterShellIdleState g_idle_state = {.mutex = PTHREAD_MUTEX_INITIALIZER};
+double OuterShellBackendIdleSeconds(void) { return outer_shell_idle_seconds(&g_idle_state); }
+void OuterShellBackendRequestIdleShutdown(void) { outer_shell_idle_stop(&g_idle_state); }
 static bool g_stay_alive_when_socket_idle = false;
 static time_t g_backend_start_time = 0;
 static volatile sig_atomic_t g_shutdown_requested = 0;
@@ -2794,7 +2798,9 @@ static void run_http_reactor(int listener) {
             timeout_ms = 60000;
         }
 
+        if (outer_shell_idle_poll(&g_idle_state, g_launchd_socket_activation && client_count == 0)) break;
         int poll_result = poll(poll_fds, (nfds_t)(polled_client_count + 1), timeout_ms);
+        outer_shell_idle_activity(&g_idle_state, poll_result > 0);
         if (poll_result == 0) {
             if (socket_activation_enabled() && !g_stay_alive_when_socket_idle && client_count == 0) {
                 break;

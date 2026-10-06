@@ -3,6 +3,7 @@
 #endif
 #define _GNU_SOURCE
 
+#include "../Resources/OuterShellIdle.h"
 #include <arpa/inet.h>
 #include <ctype.h>
 #include <dirent.h>
@@ -17,6 +18,7 @@
 
 extern char **environ;
 #include <stdbool.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -1059,6 +1061,12 @@ static char g_api_socket_path[PATH_MAX] = "";
 static bool g_systemd_socket_activation = false;
 static bool g_api_systemd_socket_activation = false;
 static bool g_launchd_socket_activation = false;
+static atomic_size_t g_active_container_callbacks;
+static bool g_require_socket_activation;
+void OuterShelldRequireSocketActivation(void) { g_require_socket_activation = true; }
+static OuterShellIdleState g_idle_state = {.mutex = PTHREAD_MUTEX_INITIALIZER};
+double OuterShelldIdleSeconds(void) { return outer_shell_idle_seconds(&g_idle_state); }
+void OuterShelldRequestIdleShutdown(void) { outer_shell_idle_stop(&g_idle_state); }
 static bool g_stay_alive_when_socket_idle = false;
 static volatile sig_atomic_t g_shutdown_requested = 0;
 static volatile sig_atomic_t g_listener_fd = -1;
@@ -12505,12 +12513,15 @@ static bool make_bundled_launchd_plist(const char *label,
     ok = ok && sb_append(builder,
                          "    </array>\n"
                          "    <key>EnvironmentVariables</key>\n"
-                         "    <dict>\n"
-                         "        <key>OUTERSHELLD_API_SOCKET</key>\n"
-                         "        <string>");
-    ok = ok && sb_append_xml_escaped(builder, api_socket_path);
+                         "    <dict>\n");
+    if (api_socket_path && api_socket_path[0]) {
+        ok = ok && sb_append(builder,
+                             "        <key>OUTERSHELLD_API_SOCKET</key>\n"
+                             "        <string>");
+        ok = ok && sb_append_xml_escaped(builder, api_socket_path);
+        ok = ok && sb_append(builder, "</string>\n");
+    }
     ok = ok && sb_append(builder,
-                         "</string>\n"
                          "        <key>OUTERSHELL_LOG_PATH</key>\n"
                          "        <string>");
     ok = ok && sb_append_xml_escaped(builder, log_path);
@@ -12622,8 +12633,6 @@ static bool install_bundled_app_user_launchagent_for_system_payload(const Bundle
     snprintf(log_path, sizeof(log_path), "%s/Library/Logs/%s/output.log", home_directory(), app->service_id);
     char plist_path[PATH_MAX];
     snprintf(plist_path, sizeof(plist_path), "%s/Library/LaunchAgents/%s.plist", home_directory(), app->service_id);
-    char api_socket_path[PATH_MAX];
-    outer_shell_default_api_socket_path(api_socket_path, sizeof(api_socket_path));
 
     char log_dir[PATH_MAX];
     snprintf(log_dir, sizeof(log_dir), "%s", log_path);
@@ -12666,7 +12675,7 @@ static bool install_bundled_app_user_launchagent_for_system_payload(const Bundle
                                     socket_path,
                                     0600,
                                     uses_app_bundle ? system_app_bundle : system_install_root,
-                                    api_socket_path,
+                                    NULL,
                                     log_path,
                                     "",
                                     &plist)) {
@@ -13007,8 +13016,6 @@ static bool install_bundled_app_macos(const BundledAppDefinition *app,
     snprintf(log_path, sizeof(log_path), "%s/Library/Logs/%s/output.log", home_directory(), app->service_id);
     char plist_path[PATH_MAX];
     snprintf(plist_path, sizeof(plist_path), "%s/Library/LaunchAgents/%s.plist", home_directory(), app->service_id);
-    char api_socket_path[PATH_MAX];
-    outer_shell_default_api_socket_path(api_socket_path, sizeof(api_socket_path));
 
     char error[1024] = "";
     if (!mkdir_p(source_is_app_bundle ? install_root : bundles_dir)) {
@@ -13082,7 +13089,7 @@ static bool install_bundled_app_macos(const BundledAppDefinition *app,
                                     socket_path,
                                     0600,
                                     source_is_app_bundle ? target_app_bundle : install_root,
-                                    api_socket_path,
+                                    NULL,
                                     log_path,
                                     "",
                                     &plist)) {
@@ -14827,6 +14834,7 @@ static void *run_container_callback(void *context) {
     free(job->body);
     close(job->output);
     free(job);
+    atomic_fetch_sub(&g_active_container_callbacks, 1);
     return NULL;
 }
 
@@ -14847,7 +14855,9 @@ static bool start_container_callback(ReactorClient *client, const char *body, si
     job->output = output[1];
     job->callback = g_safe_space_request_callback;
     pthread_t thread;
+    atomic_fetch_add(&g_active_container_callbacks, 1);
     if (pthread_create(&thread, NULL, run_container_callback, job) != 0) {
+        atomic_fetch_sub(&g_active_container_callbacks, 1);
         free(job->body); free(job);
         close(output[0]); close(output[1]);
         return false;
@@ -16932,7 +16942,9 @@ static void run_api_reactor(int api_listener) {
         for (size_t i = 0; i < client_count; i++) {
             if (clients[i].provider_pid != 0 && clients[i].provider_output_closed) timeout_ms = 10;
         }
+        if (outer_shell_idle_poll(&g_idle_state, g_launchd_socket_activation && !g_internal_service_manager && client_count == 0 && atomic_load(&g_active_container_callbacks) == 0)) break;
         int poll_result = poll(poll_fds, (nfds_t)(polled_client_count + 1), timeout_ms);
+        outer_shell_idle_activity(&g_idle_state, poll_result > 0);
         if (poll_result == 0) {
             if (socket_activation_enabled() && !g_stay_alive_when_socket_idle && client_count == 0 && timeout_ms == 60000) break;
             continue;
@@ -17096,6 +17108,12 @@ int OuterShelldMain(int argc, char **argv) {
     if (api_listener < 0) {
         api_listener = launchd_activated_listener("API");
     }
+#ifdef __APPLE__
+    if (api_listener < 0 && g_require_socket_activation) {
+        fprintf(stderr, "Outer Shell's launchd API socket is unavailable. Reinstall Outer Shell to restore its service configuration.\n");
+        return 1;
+    }
+#endif
     if (api_listener < 0) {
         api_listener = create_unix_listener(api_socket_path);
     }
@@ -17120,7 +17138,7 @@ int OuterShelldMain(int argc, char **argv) {
     run_api_reactor(api_listener);
     close(api_listener);
     g_api_listener_fd = -1;
-    if (g_api_socket_path[0] && !g_api_systemd_socket_activation) {
+    if (g_api_socket_path[0] && !g_api_systemd_socket_activation && !g_launchd_socket_activation) {
         unlink(g_api_socket_path);
     }
     int manager_exit_status = outer_service_manager_exit_status(g_outer_service_manager);

@@ -34,7 +34,7 @@ Registry overrides:
 API socket:
 
 - `OUTERSHELLD_API_SOCKET` overrides the API socket path.
-- macOS user default: `<user-runtime>/outershelld-api`
+- macOS user default: the launchd-managed API socket exported as `OUTERSHELL_API_SOCKET_org.outershell.OuterShell`; clients resolve its current location at runtime. Standalone mode falls back to `<user-runtime>/outershelld-api`.
 - macOS root default: `/var/run/outershelld-api`
 - Linux user default: `<user-runtime>/outershelld-api`
 - Linux direct-root default: `/run/outershelld-api`
@@ -57,8 +57,9 @@ macOS public install:
 - `<user-state>/bin/outerctl`
 - `$HOME/Library/LaunchAgents/org.outershell.OuterShell.plist`
 - `$HOME/Library/Logs/org.outershell.OuterShell/output.log`
-- `<user-runtime>/org.outershell.OuterShell`
-- `<user-runtime>/outershelld-api`
+- launchd-managed public and API sockets at generated locations under `/var/run/com.apple.launchd.*`
+
+The LaunchAgent runs once at login and on socket demand, without `KeepAlive`. It stays running while its menu-bar item is visible, clients are connected, or management work is active. Otherwise, it exits after 60 seconds of inactivity. Both sockets remain available to activate it again. Running backends appear in the menu bar unless the user has hidden it; socket-activated backends that have not started do not count as running.
 
 Linux public install:
 

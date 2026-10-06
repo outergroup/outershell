@@ -592,8 +592,17 @@ EOF
     <key>OUTER_SHELL_SERVICE_MANAGER</key>
     <string>launchd</string>
   </dict>
+  <key>RunAtLoad</key>
+  <true/>
   <key>Sockets</key>
   <dict>
+    <key>API</key>
+    <dict>
+      <key>SecureSocketWithKey</key>
+      <string>OUTERSHELL_API_SOCKET_org.outershell.OuterShell</string>
+      <key>SockPathMode</key>
+      <integer>384</integer>
+    </dict>
     <key>Listener</key>
     <dict>
       <key>SecureSocketWithKey</key>
@@ -616,7 +625,7 @@ EOF
     launchctl kickstart -k "gui/$(id -u)/$service_id" >/dev/null 2>&1 || true
     attempts=50
     while [ "$attempts" -gt 0 ]; do
-        if [ -S "$api_socket_path" ]; then
+        if OUTERSHELL_HOME="$outershell_home" "$outerctl_path" backend list >/dev/null 2>&1; then
             break
         fi
         sleep 0.1

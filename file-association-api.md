@@ -156,7 +156,7 @@ and needs all apps that can open it.
 
 Default API socket:
 
-- macOS: `$OUTERSHELLD_API_SOCKET`, otherwise `$DARWIN_USER_TEMP_DIR/outershelld-api`, `$TMPDIR/outershelld-api`, or `/tmp/outershelld-api-<uid>`
+- macOS: `$OUTERSHELLD_API_SOCKET`, otherwise the current launchd-managed Outer Shell API socket. Standalone mode falls back to `$DARWIN_USER_TEMP_DIR/outershelld-api`, `$TMPDIR/outershelld-api`, or `/tmp/outershelld-api-<uid>`.
 - Linux: `$OUTERSHELLD_API_SOCKET`, otherwise `$XDG_RUNTIME_DIR/outershelld-api` or `/run/user/<uid>/outershelld-api`
 
 Request message type: `25` (`OUTERSHELLD_API_FILE_OPENERS_QUERY`)
