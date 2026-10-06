@@ -167,7 +167,6 @@
       iconPath: reader.stringRef(24),
       iconData: flags & 2 ? new Uint8Array() : reader.bytesRef(32),
       iconURL: flags & 2 ? reader.stringRef(32) : "",
-      list: reader.stringRef(40),
       port: reader.u32(48),
       id: reader.bytes.length >= 60 ? reader.stringRef(52) : "",
       iconObservationToken: reader.bytes.length >= 72 ? reader.stringRef(64) : "",

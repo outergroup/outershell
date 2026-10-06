@@ -243,7 +243,6 @@ private struct SafeSpaceCachedApp: Codable {
     let iconPath: String
     var iconData: Data?
     let iconObservationToken: String?
-    var listName: String
     var isRunning: Bool?
     let publishedPort: Int?
 }
@@ -256,7 +255,6 @@ private struct SafeSpaceAppSnapshot {
     let externalSocketPath: String
     let url: String
     let iconPath: String
-    let listName: String
     let isRunning: Bool
     let publishedPort: Int?
 }
@@ -3125,7 +3123,6 @@ final class SafeSpaceManager: @unchecked Sendable {
                     externalSocketPath: publishedPath,
                     url: externalURL,
                     iconPath: snapshot.iconPath,
-                    listName: snapshot.listName,
                     isRunning: snapshot.isRunning,
                     publishedPort: snapshot.publishedPort
                 ))
@@ -3163,9 +3160,6 @@ final class SafeSpaceManager: @unchecked Sendable {
         ]
         if !snapshot.iconPath.isEmpty {
             arguments.append(contentsOf: ["--icon-path", snapshot.iconPath])
-        }
-        if !snapshot.listName.isEmpty {
-            arguments.append(contentsOf: ["--list", snapshot.listName])
         }
         let update = try runRuntime(record, arguments)
         try requireSuccess(update, action: "publish the container app endpoint")
@@ -3294,7 +3288,6 @@ final class SafeSpaceManager: @unchecked Sendable {
                 externalSocketPath: field("external_socket_path"),
                 url: field("url"),
                 iconPath: field("icon_path"),
-                listName: field("list"),
                 isRunning: runningServiceIDs.contains(serviceID),
                 publishedPort: publishedPort
             )
@@ -3318,7 +3311,6 @@ final class SafeSpaceManager: @unchecked Sendable {
                                    iconData: old[$0.frontendID]?.iconData,
                                    iconObservationToken: old[$0.frontendID]?.iconObservationToken
                                        ?? UUID().uuidString,
-                                   listName: old[$0.frontendID]?.listName ?? $0.listName,
                                    isRunning: $0.isRunning,
                                    publishedPort: $0.publishedPort)
             }
@@ -3429,7 +3421,6 @@ final class SafeSpaceManager: @unchecked Sendable {
             "url": app.url,
             "iconPath": app.iconPath,
             "iconObservationToken": app.iconObservationToken ?? "",
-            "listName": app.listName,
             "isRunning": running && (app.isRunning ?? false),
             "publishedPort": app.publishedPort ?? 0
         ]
@@ -4069,7 +4060,7 @@ final class SafeSpaceManager: @unchecked Sendable {
             publish|register-live) shift ;;
             *)
                 /usr/bin/printf '%s\n' \
-                    'Usage: outershell-app publish --id ID --name NAME --service-file PATH --socket PATH [--url PATH] [--log PATH] [--icon PATH] [--list NAME]' >&2
+                    'Usage: outershell-app publish --id ID --name NAME --service-file PATH --socket PATH [--url PATH] [--log PATH] [--icon PATH]' >&2
                 exit 64
                 ;;
         esac
@@ -4081,7 +4072,6 @@ final class SafeSpaceManager: @unchecked Sendable {
         frontend_url=/
         log_path=
         icon_path=
-        list_name=
         while [ "$#" -gt 0 ]; do
             option=$1
             [ "$#" -ge 2 ] || {
@@ -4098,7 +4088,6 @@ final class SafeSpaceManager: @unchecked Sendable {
                 --url) frontend_url=${value} ;;
                 --log) log_path=${value} ;;
                 --icon) icon_path=${value} ;;
-                --list) list_name=${value} ;;
                 *)
                     /usr/bin/printf 'Unknown option: %s\n' "${option}" >&2
                     exit 64
@@ -4155,10 +4144,6 @@ final class SafeSpaceManager: @unchecked Sendable {
                     append_argument --icon
                     append_argument "${icon_path}"
                 fi
-                if [ -n "${list_name}" ]; then
-                    append_argument --list
-                    append_argument "${list_name}"
-                fi
                 /usr/bin/printf '\n'
             } >"${temporary}"
             /bin/chmod 0755 "${temporary}"
@@ -4184,7 +4169,6 @@ final class SafeSpaceManager: @unchecked Sendable {
             --name "${display_name}" \
             --url "${frontend_url}"
         if [ -n "${icon_path}" ]; then set -- "$@" --icon-path "${icon_path}"; fi
-        if [ -n "${list_name}" ]; then set -- "$@" --list "${list_name}"; fi
         "${outerctl}" "$@"
         if [ -n "${log_path}" ]; then
             "${outerctl}" log add --backend "${service_id}" --path "${log_path}"

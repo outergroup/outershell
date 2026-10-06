@@ -55,7 +55,7 @@ Descriptors are ordered as follows:
 ```text
 0 backends
 1 frontends
-2 frontend_layouts
+2 reserved (former frontend_layouts)
 3 log_files
 4 content_types
 5 file_openers
@@ -90,7 +90,7 @@ bytes 0..7:    StringRef32 frontend_id
 bytes 8..15:   StringRef32 service_id
 bytes 16..23:  StringRef32 display_name
 bytes 24..31:  StringRef32 icon_path
-bytes 32..39:  StringRef32 suggested_list
+bytes 32..39:  reserved (zero)
 bytes 40..41:  UInt16 endpoint_kind; 0 none, 1 TCP, 2 Unix
 bytes 42..43:  UInt16 endpoint_flags
 bytes 44..45:  UInt16 endpoint_scheme; 0 default, 1 HTTP, 2 HTTPS
@@ -103,17 +103,13 @@ For a TCP endpoint the payload contains a host `StringRef32` at bytes 56..63
 and a `UInt16` port at bytes 64..65. For a Unix endpoint it contains socket and
 external-socket `StringRef32` values at bytes 56..63 and 64..71.
 
-The registry stores endpoint metadata, not runtime status. User placement in
-`frontend_layouts` overrides `suggested_list` when present.
+The registry stores endpoint metadata, not runtime status.
 
-### `frontend_layouts`
+### Reserved table 2
 
-Row size: 32 bytes.
-
-```text
-bytes 0..15:   StringRef64 URL
-bytes 16..31:  StringRef64 list
-```
+The former `frontend_layouts` table is no longer loaded or populated. Its
+32-byte row layout and descriptor position remain reserved. Writers emit zero
+rows; readers ignore obsolete rows in existing registries.
 
 ### `log_files`
 
@@ -236,8 +232,9 @@ registry.orwa.tmp.XXXXXX -> registry.orwa
 
 ## Retired UI metadata
 
-`suggested_list` and `frontend_layouts` are retained as stored metadata; current
-Outer Shell pinning, ordering, and display-name overrides use `/api/layout`.
+The former app-list field and `frontend_layouts` table are ignored when loading
+existing registries and cleared when the registry is next written. Outer Shell
+pinning, ordering, and display-name overrides use `/api/layout`.
 The former `setFrontendList` and container `setAppList` UI operations are retired.
 List names no longer determine icon resolution.
 

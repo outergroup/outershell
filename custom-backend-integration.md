@@ -284,8 +284,7 @@ platforms:
   --port "$PORT" \
   --name "$DISPLAY_NAME" \
   --url "127.0.0.1:$PORT/" \
-  --icon-path "$APP_ROOT/icon.png" \
-  --list "Machine Learning"
+  --icon-path "$APP_ROOT/icon.png"
 
 "$OUTERCTL" log add \
   --backend "$SERVICE_ID" \
@@ -390,8 +389,7 @@ sudo OUTERSHELL_HOME=/var/lib/outershell "$OUTERCTL" app upsert \
   --port "$PORT" \
   --name "$DISPLAY_NAME" \
   --url "127.0.0.1:$PORT/" \
-  --icon-path /opt/example-tensorboard/icon.png \
-  --list "Machine Learning"
+  --icon-path /opt/example-tensorboard/icon.png
 
 sudo OUTERSHELL_HOME=/var/lib/outershell "$OUTERCTL" log add \
   --backend "$SERVICE_ID" \

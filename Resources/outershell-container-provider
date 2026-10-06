@@ -1608,7 +1608,6 @@ def app_snapshots(container_id, recipe):
             "url": row.get("url", ""),
             "iconPath": row.get("icon_path", ""),
             "iconObservationToken": "",
-            "listName": row.get("list", ""),
             "isRunning": is_running,
             "publishedPort": published_ports.get(declared_ports.get(service_id), 0),
         }

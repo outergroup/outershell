@@ -37,6 +37,42 @@ mkdir -p "$build_dir/home/services"
 "$cxx_command" -std=c++17 -O2 -I "$repo_root/Resources" \
     -o "$build_dir/outerctl" "$repo_root/Resources/outerctl.cpp"
 
+python3 - "$build_dir/home/registry.orwa" <<'PYFIXTURE'
+from pathlib import Path
+import struct
+import sys
+
+sizes = [68, 80, 32, 32, 96, 56, 32, 104]
+counts = [1, 1, 1, 0, 0, 0, 0, 0]
+data = bytearray(b'ORWA' + struct.pack('<I', 1) + bytes(160))
+offsets = []
+for table, (size, count) in enumerate(zip(sizes, counts)):
+    offsets.append(len(data))
+    struct.pack_into('<QQI', data, 8 + table * 20, len(data), count, size)
+    data.extend(bytes(size * count))
+
+def ref(position, value, width=32):
+    value = value.encode()
+    struct.pack_into('<II' if width == 32 else '<QQ', data, position, len(data), len(value))
+    data.extend(value)
+
+backend, app, layout = offsets[:3]
+ref(backend, 'legacy.backend', 64)
+ref(backend + 16, 'Legacy backend', 64)
+ref(app, 'legacy.app')
+ref(app + 8, 'legacy.backend')
+ref(app + 16, 'Legacy app')
+ref(app + 24, '/icons/legacy.png')
+ref(app + 32, 'Retired suggested group')
+struct.pack_into('<HHHH', data, app + 40, 1, 0, 1, 0)
+ref(app + 48, '/legacy')
+ref(app + 56, '127.0.0.1')
+struct.pack_into('<H', data, app + 64, 8123)
+ref(layout, 'legacy.app', 64)
+ref(layout + 16, 'Retired user group', 64)
+Path(sys.argv[1]).write_bytes(data)
+PYFIXTURE
+
 OUTERSHELL_HOME="$build_dir/home" "$build_dir/outershelld" \
     --service-manager internal \
     --services-dir "$build_dir/home/services" \
@@ -55,6 +91,31 @@ outerctl() {
     OUTERSHELLD_API_SOCKET="$api_socket" "$build_dir/outerctl" "$@"
 }
 
+outerctl app list --backend legacy.backend >"$build_dir/legacy.tsv"
+awk -F '\t' '
+    NR == 1 && NF != 12 { exit 1 }
+    NR == 2 && NF == 12 && $1 == "legacy.app" && $7 == "8123" &&
+        $10 == "/legacy" && $12 == "/icons/legacy.png" { found = 1 }
+    END { exit !found }
+' "$build_dir/legacy.tsv"
+outerctl app upsert --backend legacy.backend --frontend-id legacy.app \
+    --name "Legacy app" --host 127.0.0.1 --port 8123 --path /legacy
+python3 - "$build_dir/home/registry.orwa" <<'PYCHECK'
+from pathlib import Path
+import struct
+import sys
+
+data = Path(sys.argv[1]).read_bytes()
+app_offset, app_count, app_size = struct.unpack_from('<QQI', data, 28)
+assert app_count == 1 and app_size == 80
+assert data[app_offset + 32:app_offset + 40] == bytes(8)
+assert struct.unpack_from('<Q', data, 56)[0] == 0
+assert b'Retired suggested group' not in data
+assert b'Retired user group' not in data
+assert b'/icons/legacy.png' in data
+PYCHECK
+outerctl backend remove --backend legacy.backend
+
 for number in 1 2 3; do
     outerctl backend upsert \
         --backend "test.backend.$number" \
@@ -67,8 +128,7 @@ for number in 1 2 3; do
         --host 127.0.0.1 \
         --port "$((8000 + number))" \
         --path "/app-$number" \
-        --icon-path "/icons/$number.png" \
-        --list "List $number"
+        --icon-path "/icons/$number.png"
     outerctl log add \
         --backend "test.backend.$number" \
         --path "/tmp/test-$number.log"
@@ -103,6 +163,12 @@ assert_three_rows app
 assert_three_rows log
 assert_three_rows opener
 
+if outerctl app upsert --backend test.backend.1 --frontend-id test.app.1 --list obsolete >"$build_dir/obsolete-option.log" 2>&1; then
+    echo "Removed --list option was accepted" >&2
+    exit 1
+fi
+grep -q 'Unknown argument: --list' "$build_dir/obsolete-option.log"
+
 outerctl app list --icons >"$build_dir/app-with-deprecated-icons.tsv"
 cmp "$build_dir/app.tsv" "$build_dir/app-with-deprecated-icons.tsv"
 
@@ -113,8 +179,8 @@ awk -F '\t' '
 ' "$build_dir/backend.tsv"
 
 awk -F '\t' '
-    NR == 2 && $1 == "test.app.1" && $3 == "App 1" && $13 == "List 1" { first = 1 }
-    NR == 4 && $1 == "test.app.3" && $3 == "App 3" && $13 == "List 3" { last = 1 }
+    NR == 2 && $1 == "test.app.1" && $3 == "App 1" && NF == 12 && $12 == "/icons/1.png" { first = 1 }
+    NR == 4 && $1 == "test.app.3" && $3 == "App 3" && NF == 12 && $12 == "/icons/3.png" { last = 1 }
     END { exit !(first && last) }
 ' "$build_dir/app.tsv"
 

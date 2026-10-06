@@ -147,7 +147,8 @@ bytes 34..41:  StringRef32 URL path
 bytes 42..49:  StringRef32 TCP host
 bytes 50..57:  StringRef32 Unix socket path
 bytes 58..65:  StringRef32 icon path
-bytes 66..73:  StringRef32 frontend list
+bytes 66..73:  reserved (zero)
+bytes 74..81:  StringRef32 external Unix socket path
 ```
 
 Returns `commandResponse` (`messageType = 100`).
@@ -308,7 +309,7 @@ bytes 28..35:  StringRef32 launchd plist path
 
 `appListResponse` (`102`) uses the common list response header. Its `row count`
 field tells you how many app rows follow at byte 22. Use the header's `row
-size` field as the stride between rows; the current row size is 80 bytes:
+size` field as the stride between rows; the current row size is 88 bytes:
 
 ```text
 bytes 0..1:    UInt16 endpoint kind
@@ -320,10 +321,11 @@ bytes 16..23:  StringRef32 backend service id
 bytes 24..31:  StringRef32 display name
 bytes 32..39:  StringRef32 TCP host
 bytes 40..47:  StringRef32 Unix socket path
-bytes 48..55:  StringRef32 URL path
-bytes 56..63:  StringRef32 derived URL
-bytes 64..71:  StringRef32 icon path
-bytes 72..79:  StringRef32 frontend list
+bytes 48..55:  StringRef32 external Unix socket path
+bytes 56..63:  StringRef32 URL path
+bytes 64..71:  StringRef32 derived URL
+bytes 72..79:  StringRef32 icon path
+bytes 80..87:  reserved (zero)
 ```
 
 `logListResponse` (`103`) uses the common list response header. Its `row count`

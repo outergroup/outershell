@@ -412,7 +412,6 @@ struct CommandRequest {
     const char *path = "";
     const char *frontendId = "";
     const char *iconPath = "";
-    const char *frontendList = "";
     const char *socketPath = "";
     const char *externalSocketPath = "";
     const char *contentType = "";
@@ -712,8 +711,6 @@ bool parseCommandRequest(int argc, char *argv[], CommandRequest &request, Buffer
             REQUIRE_VALUE("--frontend-id", request.frontendId);
         } else if (strcmp(arg, "--icon-path") == 0 || strcmp(arg, "--icon-file") == 0) {
             REQUIRE_VALUE("--icon-path", request.iconPath);
-        } else if (strcmp(arg, "--list") == 0) {
-            REQUIRE_VALUE("--list", request.frontendList);
         } else if (strcmp(arg, "--socket-path") == 0) {
             REQUIRE_VALUE("--socket-path", request.socketPath);
         } else if (strcmp(arg, "--external-socket-path") == 0) {
@@ -870,7 +867,7 @@ bool appendCommandRequestMessage(Buffer &message, const CommandRequest &request)
         break;
     }
     case kMessageAppUpsertRequest: {
-        const char *values[] = {request.backend, request.frontendId, request.displayName, request.path, request.host, request.socketPath, request.iconPath, request.frontendList, request.externalSocketPath};
+        const char *values[] = {request.backend, request.frontendId, request.displayName, request.path, request.host, request.socketPath, request.iconPath, "", request.externalSocketPath};
         ok = ok &&
             appendLittleEndianUInt16(message, request.endpointKind) &&
             appendLittleEndianUInt16(message, request.endpointScheme) &&
@@ -1022,7 +1019,7 @@ bool writeRegistryListResponse(const CommandRequest &request, const Buffer &resp
     freeBuffer(errorBuffer);
 
     const char *backendHeaders[] = {"service_id", "display_name", "unit_name", "unit_path", "owns_unit"};
-    const char *appHeaders[] = {"frontend_id", "service_id", "display_name", "endpoint_kind", "scheme", "host", "port", "socket_path", "external_socket_path", "path", "url", "icon_path", "list"};
+    const char *appHeaders[] = {"frontend_id", "service_id", "display_name", "endpoint_kind", "scheme", "host", "port", "socket_path", "external_socket_path", "path", "url", "icon_path"};
     const char *logHeaders[] = {"path", "service_id"};
     const char *contentTypeHeaders[] = {"service_id", "identifier", "display_name", "conforms_to", "extensions", "mime_types"};
     const char *openerHeaders[] = {"content_type", "frontend_id", "url_template", "rank", "capabilities"};
@@ -1070,7 +1067,7 @@ bool writeRegistryListResponse(const CommandRequest &request, const Buffer &resp
             snprintf(schemeBuffer, sizeof(schemeBuffer), "%u", readLittleEndianUInt16(bytes + offset + 2));
             snprintf(portBuffer, sizeof(portBuffer), "%u", readLittleEndianUInt16(bytes + offset + 6));
             const size_t firstRefs[] = {8, 16, 24};
-            const size_t lastRefs[] = {40, 48, 56, 64, 72, 80};
+            const size_t lastRefs[] = {40, 48, 56, 64, 72};
             ok = writeTsvRefs(response, offset, firstRefs, sizeof(firstRefs) / sizeof(firstRefs[0])) &&
                 fputc('\t', stdout) != EOF &&
                 writeTsvString(kindBuffer) &&

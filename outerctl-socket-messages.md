@@ -225,7 +225,6 @@ outerctl app upsert \
   [--path <url-path>] \
   [--url <legacy-url-or-path>] \
   [--icon-path <path>] \
-  [--list <suggested-list>] \
   [--port <port> | --socket-path <socket-path>]
 ```
 
@@ -248,7 +247,8 @@ bytes 34..41:  StringRef32 URL path
 bytes 42..49:  StringRef32 TCP host
 bytes 50..57:  StringRef32 Unix socket path
 bytes 58..65:  StringRef32 icon path
-bytes 66..73:  StringRef32 frontend list
+bytes 66..73:  reserved (zero)
+bytes 74..81:  StringRef32 external Unix socket path
 ```
 
 Response: `commandResponse` (`messageType = 100`).
@@ -300,10 +300,10 @@ Response message: `appListResponse` (`messageType = 102`)
 
 This response uses the common list response header above. Its `row count`
 field tells you how many app rows follow at byte 22. Use the header's
-`row size` field as the stride between rows; the current row size is 80 bytes.
+`row size` field as the stride between rows; the current row size is 88 bytes.
 
 ```text
-App row, 80 bytes:
+App row, 88 bytes:
 bytes 0..1:    UInt16 endpoint kind
 bytes 2..3:    UInt16 scheme
 bytes 4..5:    UInt16 endpoint flags, currently 0
@@ -313,16 +313,17 @@ bytes 16..23:  StringRef32 backend service id
 bytes 24..31:  StringRef32 display name
 bytes 32..39:  StringRef32 TCP host
 bytes 40..47:  StringRef32 Unix socket path
-bytes 48..55:  StringRef32 URL path
-bytes 56..63:  StringRef32 derived URL
-bytes 64..71:  StringRef32 icon path
-bytes 72..79:  StringRef32 frontend list
+bytes 48..55:  StringRef32 external Unix socket path
+bytes 56..63:  StringRef32 URL path
+bytes 64..71:  StringRef32 derived URL
+bytes 72..79:  StringRef32 icon path
+bytes 80..87:  reserved (zero)
 ```
 
 `outerctl` prints these rows as TSV columns `frontend_id`, `service_id`,
 `display_name`, `endpoint_kind`, `scheme`, `host`, `port`, `socket_path`,
-`path`, `url`, `icon_path`, and `list`. The `url` column is derived from the
-structured endpoint fields for compatibility and display.
+`external_socket_path`, `path`, `url`, and `icon_path`. The `url` column is
+derived from the structured endpoint fields for compatibility and display.
 
 ## Log Commands
 

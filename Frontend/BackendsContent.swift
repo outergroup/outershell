@@ -179,7 +179,6 @@ private struct FrontendRecord {
     let iconByteCount: Int
     let iconCGImage: CGImage?
     let iconObservationToken: String
-    let list: String?
     let isRunning: Bool
 
     var hasEndpoint: Bool {
@@ -188,10 +187,6 @@ private struct FrontendRecord {
         }
         let trimmedURL = url.trimmingCharacters(in: .whitespacesAndNewlines)
         return URL(string: trimmedURL)?.scheme != nil
-    }
-
-    var listName: String {
-        list?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     }
 
     var iconURL: String? = nil
@@ -418,7 +413,6 @@ private extension FrontendRecord {
                               iconByteCount: iconData.count,
                               iconCGImage: decodedIconCGImage(iconData),
                               iconObservationToken: reader.data.count >= 72 ? try reader.stringRef(at: 64) : "",
-                              list: emptyToNil(try reader.stringRef(at: 40)),
                               isRunning: (flags & 0x01) != 0,
                               iconURL: (flags & 2) != 0 ? try reader.stringRef(at: 32) : nil)
     }
@@ -562,7 +556,6 @@ private struct LocalWorkspaceAppRecord: Decodable, Equatable {
     let iconPath: String
     let iconData: Data?
     let iconObservationToken: String
-    let listName: String
     let isRunning: Bool
     let publishedPort: Int
     var iconURL: String? = nil
@@ -847,7 +840,6 @@ private struct LocalWorkspaceHostRequest: Encodable {
     let name: String?
     let frontendID: String?
     let serviceID: String?
-    let listName: String?
     let cpus: Int?
     let memoryInGB: Int?
     let runtimeKind: String?
@@ -1111,8 +1103,6 @@ private enum AppLauncherScope: Hashable, Sendable {
     case container(UUID)
 }
 
-private let alwaysShownAppListName = "__outershell_always_shown__"
-private let moreAppsListName = "__outershell_more_apps__"
 
 private struct ContainerAppLauncherContext {
     let container: LocalWorkspaceRecord
@@ -1331,18 +1321,6 @@ private struct CopyConfirmation {
 private enum AppDropTarget: Equatable {
     case pinned
     case moreApps
-    case list(String)
-
-    var listName: String {
-        switch self {
-        case .pinned:
-            return alwaysShownAppListName
-        case .moreApps:
-            return moreAppsListName
-        case .list(let name):
-            return name
-        }
-    }
 }
 
 private struct PendingAppDrag {
@@ -1771,7 +1749,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
     private var appCardFrames: [(frame: CGRect, item: AppLauncherItem)] = []
     private var appBadgeFrames: [AppLauncherBadgeTarget] = []
-    private var appListDropFrames: [(frame: CGRect, listName: String, scope: AppLauncherScope)] = []
     private var appUnlistedDropFrames: [(
         frame: CGRect,
         scope: AppLauncherScope,
@@ -3052,7 +3029,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         overviewDropFrames.removeAll()
         overviewGroupFrames.removeAll()
         appBadgeFrames.removeAll()
-        appListDropFrames.removeAll()
         appUnlistedDropFrames.removeAll()
         appOverflowFrames.removeAll()
         workspaceOverviewRowFrames.removeAll()
@@ -5721,12 +5697,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
            let highlightFrame = appDropHighlightFrame(for: target, scope: drag.item.scope) {
             let highlight = CALayer()
             highlight.frame = highlightFrame.insetBy(dx: -4, dy: -4)
-            switch target {
-            case .list:
-                highlight.cornerRadius = 16
-            case .pinned, .moreApps:
-                highlight.cornerRadius = 4
-            }
+            highlight.cornerRadius = 4
             highlight.borderWidth = 2
             highlight.borderColor = resolvedCGColor(.controlAccentColor)
             highlight.backgroundColor = resolvedCGColor(NSColor.controlAccentColor.withAlphaComponent(0.08))
@@ -5760,11 +5731,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         if let frame = overviewDropFrames.first(where: {
             $0.group == overviewGroupID(for: item) && $0.frame.contains(appsPoint)
         }) { return frame.target }
-        if let frame = appListDropFrames.first(where: {
-            $0.scope == item.scope && $0.frame.contains(appsPoint)
-        }) {
-            return .list(frame.listName)
-        }
         if let frame = appUnlistedDropFrames.first(where: {
             $0.scope == item.scope && $0.frame.contains(appsPoint)
         }) {
@@ -5779,8 +5745,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             return isAppProminent(item)
         case .moreApps:
             return !isAppProminent(item)
-        case .list(let name):
-            return item.frontend.listName == name
         }
     }
 
@@ -5794,10 +5758,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                     guard let partial else { return item.frame }
                     return partial.union(item.frame)
                 }
-        case .list(let name):
-            return appListDropFrames.first(where: {
-                $0.scope == scope && $0.listName == name
-            })?.frame
         }
     }
 
@@ -14690,7 +14650,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 iconByteCount: app.iconData?.count ?? 0,
                 iconCGImage: app.iconData.flatMap(decodedIconCGImage),
                 iconObservationToken: app.iconObservationToken,
-                list: app.listName,
                 isRunning: app.isRunning
             )
             let backend = BackendRecord(
@@ -14896,7 +14855,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 String(iconBytes),
                 item.frontend.iconObservationToken,
                 item.frontend.iconURL ?? "",
-                item.frontend.listName,
                 item.userEndpoint.map { frontendIdentityKey(backend: $0.backend, frontend: $0.frontend, frontendIndex: $0.frontendIndex) } ?? "",
                 item.userEndpoint?.backend.status ?? "",
                 item.userEndpoint?.backend.scriptPath ?? "",
@@ -15122,7 +15080,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                       name: String? = nil,
                                       frontendID: String? = nil,
                                       serviceID: String? = nil,
-                                      listName: String? = nil,
                                       mountID: UUID? = nil,
                                       readOnly: Bool? = nil,
                                       recipeStepID: UUID? = nil,
@@ -15152,7 +15109,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                                 name: name,
                                                 frontendID: frontendID,
                                                 serviceID: serviceID,
-                                                listName: listName,
                                                 cpus: operation == "create" ? 4 : nil,
                                                 memoryInGB: operation == "create" ? 8 : nil,
                                                 runtimeKind: operation == "create"
