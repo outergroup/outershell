@@ -1776,8 +1776,9 @@
     const backend = findBackend(key);
     if (!backend) return;
     button.disabled = true;
-    const original = button.textContent;
-    button.textContent = "Checking for Updates…";
+    const label = button.querySelector(":scope > span:not(.context-menu-glyph)") || button;
+    const original = label.textContent;
+    label.textContent = "Checking for Updates…";
     try {
       const result = await control(backend, "checkUpdate");
       if (!result.ok) throw new Error(result.message || "Could not check for updates.");
@@ -1790,7 +1791,7 @@
     } catch (error) {
       toast(error.message || String(error), true);
       button.disabled = false;
-      button.textContent = original;
+      label.textContent = original;
     }
   }
 
@@ -1798,8 +1799,9 @@
     const backend = findBackend(key);
     if (!backend) return;
     button.disabled = true;
-    const original = button.textContent;
-    button.textContent = `${original}…`;
+    const label = button.querySelector(":scope > span:not(.context-menu-glyph)") || button;
+    const original = label.textContent;
+    label.textContent = `${original}…`;
     try {
       const result = await control(backend, operation);
       if (!result.ok) throw new Error(result.message || "The action failed.");
@@ -1809,7 +1811,7 @@
     } catch (error) {
       toast(error.message || String(error), true);
       button.disabled = false;
-      button.textContent = original;
+      label.textContent = original;
     }
   }
 
@@ -1822,8 +1824,9 @@
     const backend = findBackend(key);
     if (!backend) return;
     button.disabled = true;
-    const original = button.textContent;
-    button.textContent = `${original}…`;
+    const label = button.querySelector(":scope > span:not(.context-menu-glyph)") || button;
+    const original = label.textContent;
+    label.textContent = `${original}…`;
     try {
       const result = await control(backend, operation);
       if (!result.ok) throw new Error(result.message || "The action failed.");
@@ -1833,7 +1836,7 @@
     } catch (error) {
       toast(error.message || String(error), true);
       button.disabled = false;
-      button.textContent = original;
+      label.textContent = original;
     }
   }
 
