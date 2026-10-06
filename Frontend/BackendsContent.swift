@@ -3858,8 +3858,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
     private func renderOverviewCards(visibleIconKeys: inout Set<String>,
                                      visibleTextKeys: inout Set<String>) -> CGFloat {
-        guard overviewLayoutReady, !backends.isEmpty || !isLoadingBackends,
-              workspaceContextID != nil || workspaceOverviewAvailable else { return appsLayer.bounds.height - 18 }
+        guard overviewLayoutReady, !backends.isEmpty || !isLoadingBackends else {
+            return appsLayer.bounds.height - 18
+        }
         let width = max(appsLayer.bounds.width - horizontalInset * 2, 1)
         let gap: CGFloat = 18
         let columns = max(1, Int((width + gap) / 340))

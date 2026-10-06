@@ -601,7 +601,7 @@
 
   function renderInitialLoading() {
     if (state.overviewReady) return false;
-    if (state.layoutReady && state.backendsReady && state.safeSpacesReady) {
+    if (state.layoutReady && state.backendsReady) {
       state.overviewReady = true;
       window.clearTimeout(state.initialLoadingTimer);
       elements.shell.setAttribute("aria-busy", "false");

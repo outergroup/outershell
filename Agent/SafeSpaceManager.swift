@@ -821,19 +821,23 @@ final class SafeSpaceManager: @unchecked Sendable {
         }) {
             let transientState = lock.withSafeSpaceLock { transientStates[record.id] }
             let state: String
+            var runtimeError: String?
             if let transientState {
                 state = transientState
             } else {
                 do {
                     state = try runtimeState(record)
-                } catch SafeSpaceManagerError.unsupportedProvider {
+                } catch {
                     state = "unavailable"
+                    runtimeError = error.localizedDescription
                 }
             }
-            let outerShellSupport = outerShellSupportDictionary(
-                for: record,
-                state: state
-            )
+            let outerShellSupport: [String: Any]
+            if let runtimeError {
+                outerShellSupport = ["status": "unknown", "detail": runtimeError]
+            } else {
+                outerShellSupport = outerShellSupportDictionary(for: record, state: state)
+            }
             let supportsRunningApps = outerShellSupport["status"] as? String == "available"
             var snapshots: [SafeSpaceAppSnapshot]?
             if state == "running" && supportsRunningApps {
