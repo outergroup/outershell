@@ -866,7 +866,8 @@ h1 { margin: 0; font-size: clamp(30px, 5vw, 45px); line-height: 1.05; letter-spa
 .directory-name { display: flex; align-items: baseline; gap: 5px; padding: 1px 0; color: var(--text); text-decoration: none; font-size: 11px; line-height: 16px; overflow-wrap: anywhere; }
 .address-status { flex-shrink: 0; width: 5px; height: 5px; border-radius: 50%; background: var(--quiet); align-self: baseline; margin-top: 6px; }
 .address-status.is-running { background: var(--success); }
-.address-status:not(.is-running) { background: transparent; }
+.address-status:not(.is-running):not(.is-failed) { background: transparent; }
+.address-status.is-failed { background: var(--danger); }
 .directory-address { min-width: 0; }
 .address-link { display: block; width: 100%; min-height: 18px; padding: 1px 0; font-size: 11px; line-height: 16px; border: 0; border-radius: 0; color: var(--muted); background: transparent; text-align: left; text-decoration: none; }
 .address-link code { font: 11px/16px var(--mono); overflow-wrap: anywhere; }

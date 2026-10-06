@@ -211,7 +211,7 @@ private struct LogFileRecord: Decodable {
     let readable: Bool
 }
 
-private struct LogResponse: Decodable {
+private struct LogResponse: Decodable, Equatable {
     let serviceID: String
     let path: String
     let contents: String
@@ -4144,7 +4144,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                          separator: Bool, visibleIconKeys: inout Set<String>,
                                          visibleTextKeys: inout Set<String>) {
         appCardFrames.append((frame, item))
-        let title = overviewTitle(for: item)
+        let failed = launcherFailureMessage(item.primaryEndpoint, displayName: item.displayName) != nil
+        let title = overviewTitle(for: item) + (failed ? " — Unavailable" : "")
         let size: CGFloat = pinned ? 44 : 24
         let iconFrame = CGRect(x: pinned ? frame.midX - size / 2 : frame.minX + 14,
                                y: pinned ? frame.maxY - size - 8 : frame.midY - size / 2,
@@ -4161,9 +4162,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                           title: title, fontSize: 13, weight: .regular,
                           alignment: pinned ? .center : .left, isWrapped: pinned)
         visibleTextKeys.insert(item.iconKey)
-        if endpointIsRunning(item.primaryEndpoint) {
+        if failed || endpointIsRunning(item.primaryEndpoint) {
             let dot = CALayer()
-            dot.backgroundColor = resolvedCGColor(.systemGreen)
+            dot.backgroundColor = resolvedCGColor(failed ? .systemRed : .systemGreen)
             dot.cornerRadius = 2.5
             let titleWidth = (title as NSString).size(withAttributes: [.font: NSFont.systemFont(ofSize: 13)]).width
             let x = pinned ? max(frame.minX + 2, frame.midX - min(titleWidth, textFrame.width) / 2 - 11) : frame.minX
@@ -8793,6 +8794,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 }
                 do {
                     let snapshot = try LogResponse.decodeBinary(data)
+                    if quiet && !scrollToBottom && self.logSnapshot == snapshot && self.logError == snapshot.error { return }
                     self.logSnapshot = snapshot
                     self.logError = snapshot.error
                     if scrollToBottom || shouldFollowLogTail {
@@ -9008,6 +9010,11 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                       displayName: String,
                                       opensInNewTab: Bool,
                                       opensInNewWindow: Bool = false) {
+        if let failure = launcherFailureMessage(endpoint, displayName: displayName) {
+            backendError = failure
+            showLogs(for: endpoint.backend)
+            return
+        }
         if !endpointIsReadyToOpen(endpoint) {
             startAndOpenLauncherEndpoint(endpoint,
                                          displayName: displayName,
@@ -9345,6 +9352,14 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 if let data,
                    let response = try? BackendsResponse.decodeBinary(data) {
                     self.backends = response.backends
+                    if let failedEndpoint = self.findLauncherEndpoint(serviceID: endpoint.backend.serviceID,
+                                                                       serviceScope: endpoint.backend.serviceScope,
+                                                                       frontendID: endpoint.frontend.id),
+                       let failure = self.launcherFailureMessage(failedEndpoint, displayName: displayName) {
+                        self.backendError = failure
+                        self.showLogs(for: failedEndpoint.backend)
+                        return
+                    }
                     if let nextEndpoint = self.findLauncherEndpoint(serviceID: endpoint.backend.serviceID,
                                                                     serviceScope: endpoint.backend.serviceScope,
                                                                     frontendID: endpoint.frontend.id),
@@ -9488,7 +9503,12 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             let scope = String(operation.dropFirst(prefix.count))
             let endpoint = scope == "system" ? item.rootEndpoint : item.userEndpoint
             guard let endpoint else { return }
-            performControlAction(for: endpoint.backend, operation: controlOperation)
+            if controlOperation == "start", launcherFailureMessage(endpoint, displayName: item.displayName) != nil {
+                startAndOpenLauncherEndpoint(endpoint, displayName: item.displayName,
+                                             opensInNewTab: false, opensInNewWindow: false)
+            } else {
+                performControlAction(for: endpoint.backend, operation: controlOperation)
+            }
             return
         }
         if operation.hasPrefix("editScript:") {
@@ -14719,6 +14739,19 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         return endpoints
     }
 
+    private func launcherFailureMessage(_ endpoint: AppLauncherEndpoint, displayName: String) -> String? {
+        switch endpoint.backend.status {
+        case "suspended after failures":
+            return "\(displayName) was suspended after repeated launch failures to stop automatic restarts. Check the logs below, then choose Retry from the app’s menu when ready."
+        case "socket unavailable":
+            return "\(displayName) couldn’t start: its connection socket is unavailable. Check the logs below, or choose Retry from the app’s menu."
+        case "failed":
+            return "\(displayName) exited with an error. Check the logs below, or choose Retry from the app’s menu."
+        default:
+            return nil
+        }
+    }
+
     private func endpointIsRunning(_ endpoint: AppLauncherEndpoint) -> Bool {
         if endpoint.frontend.hasEndpoint {
             return endpoint.frontend.isRunning
@@ -14727,7 +14760,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func endpointIsReadyToOpen(_ endpoint: AppLauncherEndpoint) -> Bool {
-        endpointIsRunning(endpoint) ||
+        guard launcherFailureMessage(endpoint, displayName: endpoint.backend.displayName) == nil else { return false }
+        return endpointIsRunning(endpoint) ||
             ((endpoint.backend.status == "available" || endpoint.backend.status == "awaiting") && endpoint.frontend.hasEndpoint)
     }
 
@@ -20064,7 +20098,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 let controlItemID = "\(idPrefix)-\(controlOperation)"
                 operationByItemID[controlItemID] = "\(controlOperation):\(endpoint.backend.serviceScope)"
                 items.append(OuterframeContextMenuItem(id: controlItemID,
-                                                       title: isRunning ? "Stop" : "Start",
+                                                       title: isRunning ? "Stop" : (launcherFailureMessage(endpoint, displayName: item.displayName) == nil ? "Start" : "Retry"),
                                                        isEnabled: true,
                                                        systemImageName: isRunning ? "stop.fill" : "play.fill"))
             }

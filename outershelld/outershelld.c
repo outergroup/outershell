@@ -5258,11 +5258,17 @@ typedef struct LaunchdStatusEntry {
     char label[241];
     char plist_path[PATH_MAX];
     char status[32];
+    bool can_suspend;
+    unsigned long long last_runs;
+    unsigned int failed_launches;
+    int64_t failure_window_ms;
+    int64_t last_suspend_attempt_ms;
     struct LaunchdStatusEntry *next;
 } LaunchdStatusEntry;
 
 static LaunchdStatusEntry *g_launchd_status_entries = NULL;
 static pthread_mutex_t g_launchd_status_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_launchd_control_mutex = PTHREAD_MUTEX_INITIALIZER;
 static bool g_launchd_status_refreshing = false;
 static int64_t g_launchd_status_refresh_ms = 0;
 static uint64_t g_launchd_status_generation = 0;
@@ -5276,10 +5282,72 @@ static void invalidate_launchd_status(void) {
     pthread_mutex_lock(&g_launchd_status_mutex);
     g_launchd_status_generation++;
     g_launchd_status_refresh_ms = 0;
+    for (LaunchdStatusEntry *entry = g_launchd_status_entries; entry; entry = entry->next) {
+        if (strcmp(entry->status, "suspended after failures"))
+            snprintf(entry->status, sizeof(entry->status), "unknown");
+    }
     pthread_mutex_unlock(&g_launchd_status_mutex);
 }
 
+static void launchd_suspension_path(const char *label, char *path, size_t size) {
+    char root[PATH_MAX];
+    default_user_outershell_root(root, sizeof(root));
+    snprintf(path, size, "%s/launchd-failures/%s", root, label);
+}
+
+static bool launchd_service_is_suspended(const LaunchdStatusEntry *entry) {
+    if (!entry->can_suspend || !launchd_label_is_safe(entry->label)) return false;
+    char path[PATH_MAX];
+    launchd_suspension_path(entry->label, path, sizeof(path));
+    FILE *file = fopen(path, "r");
+    if (!file) return false;
+    unsigned long long token = 0;
+    bool matches = fscanf(file, "%llu", &token) == 1 && token != 0 &&
+                   token == file_state_token(entry->plist_path);
+    fclose(file);
+    return matches;
+}
+
+static bool suspend_failing_launchd_service(LaunchdStatusEntry *entry) {
+    char domain[64];
+    launchd_domain_for_plist(entry->plist_path, domain, sizeof(domain));
+    int64_t now = monotonic_milliseconds();
+    if (!entry->can_suspend || launchd_is_system_domain(domain) || is_home_screen_service_id(entry->label) ||
+        !launchd_label_is_safe(entry->label) || entry->failed_launches < 3 ||
+        (strcmp(entry->status, "socket unavailable") && strcmp(entry->status, "failed")) ||
+        (entry->last_suspend_attempt_ms && now - entry->last_suspend_attempt_ms < 60000)) return false;
+    entry->last_suspend_attempt_ms = now;
+    char path[PATH_MAX], directory[PATH_MAX];
+    launchd_suspension_path(entry->label, path, sizeof(path));
+    snprintf(directory, sizeof(directory), "%s", path);
+    char *slash = strrchr(directory, '/');
+    if (!slash) return false;
+    *slash = '\0';
+    if (!mkdir_p(directory)) return false;
+    FILE *file = fopen(path, "w");
+    if (!file) return false;
+    bool saved = fprintf(file, "%llu\n", (unsigned long long)file_state_token(entry->plist_path)) > 0;
+    if (fclose(file) != 0) saved = false;
+    if (!saved) { unlink(path); return false; }
+    char target[320], quoted_target[384], command[1024];
+    snprintf(target, sizeof(target), "%s/%s", domain, entry->label);
+    shell_quote(target, quoted_target, sizeof(quoted_target));
+    snprintf(command, sizeof(command), "launchctl disable %s && launchctl bootout %s", quoted_target, quoted_target);
+    if (system(command) != 0) {
+        snprintf(command, sizeof(command), "launchctl enable %s", quoted_target);
+        system(command);
+        unlink(path);
+        return false;
+    }
+    snprintf(entry->status, sizeof(entry->status), "suspended after failures");
+    return true;
+}
+
 static void read_launchd_status(LaunchdStatusEntry *entry) {
+    if (launchd_service_is_suspended(entry)) {
+        snprintf(entry->status, sizeof(entry->status), "suspended after failures");
+        return;
+    }
     char domain[64], target[320], quoted_target[384], command[512];
     launchd_domain_for_plist(entry->plist_path, domain, sizeof(domain));
     snprintf(target, sizeof(target), "%s/%s", domain, entry->label);
@@ -5287,23 +5355,55 @@ static void read_launchd_status(LaunchdStatusEntry *entry) {
     snprintf(command, sizeof(command), "launchctl print %s 2>/dev/null", quoted_target);
     FILE *output = popen(command, "r");
     if (!output) return;
-    bool running = false, passive = false;
+    bool running = false, passive = false, missing_socket = false;
+    int exit_code = 0;
+    unsigned long long runs = 0;
     char line[4096];
     while (fgets(line, sizeof(line), output)) {
-        if (strstr(line, "state = running")) running = true;
+        if (strcmp(line, "\tstate = running\n") == 0) running = true;
         if (strstr(line, "passive = 1")) passive = true;
+        if (strncmp(line, "\tlast exit code = ", 18) == 0)
+            sscanf(line, "\tlast exit code = %d", &exit_code);
+        if (strncmp(line, "\truns = ", 8) == 0) sscanf(line, "\truns = %llu", &runs);
+        const char *socket_prefix = "\t\t\tpath = ";
+        if (strncmp(line, socket_prefix, strlen(socket_prefix)) == 0) {
+            char *path = line + strlen(socket_prefix);
+            path[strcspn(path, "\r\n")] = '\0';
+            struct stat st;
+            if (lstat(path, &st) == 0) {
+                if (!S_ISSOCK(st.st_mode)) missing_socket = true;
+            } else if (errno == ENOENT || errno == ENOTDIR) {
+                missing_socket = true;
+            }
+        }
     }
     bool failed = ferror(output);
     int result = pclose(output);
     if (failed || result == -1 || !WIFEXITED(result)) return;
     snprintf(entry->status, sizeof(entry->status), "%s",
+             WEXITSTATUS(result) == 0 && missing_socket ? "socket unavailable" :
              WEXITSTATUS(result) == 0 && running ? "running" :
+             WEXITSTATUS(result) == 0 && exit_code != 0 ? "failed" :
              WEXITSTATUS(result) == 0 && passive ? "available" :
              access(entry->plist_path, F_OK) == 0 ? "stopped" : "registered");
+    int64_t now = monotonic_milliseconds();
+    if (WEXITSTATUS(result) == 0 && !running && exit_code != 0 && runs > 0) {
+        if (!entry->failure_window_ms || now - entry->failure_window_ms > 60000 || runs < entry->last_runs) {
+            entry->failure_window_ms = now;
+            entry->failed_launches = 1;
+        } else if (runs > entry->last_runs) {
+            if (entry->failed_launches < 3) entry->failed_launches++;
+        }
+    } else {
+        entry->failure_window_ms = 0;
+        entry->failed_launches = 0;
+    }
+    entry->last_runs = runs;
 }
 
 static void *refresh_launchd_status(void *context) {
     LaunchdStatusRefresh *refresh = context;
+    pthread_mutex_lock(&g_launchd_control_mutex);
     for (LaunchdStatusEntry *entry = refresh->entries; entry; entry = entry->next)
         read_launchd_status(entry);
     bool changed = false;
@@ -5312,6 +5412,12 @@ static void *refresh_launchd_status(void *context) {
         for (LaunchdStatusEntry *entry = refresh->entries; entry; entry = entry->next) {
             for (LaunchdStatusEntry *cached = g_launchd_status_entries; cached; cached = cached->next) {
                 if (strcmp(entry->label, cached->label) || strcmp(entry->plist_path, cached->plist_path)) continue;
+                entry->can_suspend = cached->can_suspend;
+                suspend_failing_launchd_service(entry);
+                cached->last_runs = entry->last_runs;
+                cached->failed_launches = entry->failed_launches;
+                cached->failure_window_ms = entry->failure_window_ms;
+                cached->last_suspend_attempt_ms = entry->last_suspend_attempt_ms;
                 if (strcmp(entry->status, cached->status)) {
                     snprintf(cached->status, sizeof(cached->status), "%s", entry->status);
                     changed = true;
@@ -5323,6 +5429,7 @@ static void *refresh_launchd_status(void *context) {
     }
     g_launchd_status_refreshing = false;
     pthread_mutex_unlock(&g_launchd_status_mutex);
+    pthread_mutex_unlock(&g_launchd_control_mutex);
     while (refresh->entries) {
         LaunchdStatusEntry *entry = refresh->entries;
         refresh->entries = entry->next;
@@ -5368,7 +5475,7 @@ static void maintain_launchd_status(void) {
     pthread_mutex_unlock(&g_launchd_status_mutex);
 }
 
-static void launchd_status(const char *label, const char *plist_path, char *out, size_t out_size) {
+static void launchd_status(const char *label, const char *plist_path, bool can_suspend, char *out, size_t out_size) {
     snprintf(out, out_size, "unknown");
     if (!launchd_label_is_safe(label)) return;
     pthread_mutex_lock(&g_launchd_status_mutex);
@@ -5386,7 +5493,12 @@ static void launchd_status(const char *label, const char *plist_path, char *out,
             g_launchd_status_refresh_ms = 0;
         }
     }
-    if (entry) snprintf(out, out_size, "%s", entry->status);
+    if (entry) {
+        entry->can_suspend = can_suspend && strncmp(plist_path, "/Library/LaunchDaemons/", 23) != 0;
+        if (launchd_service_is_suspended(entry))
+            snprintf(entry->status, sizeof(entry->status), "suspended after failures");
+        snprintf(out, out_size, "%s", entry->status);
+    }
     pthread_mutex_unlock(&g_launchd_status_mutex);
 }
 
@@ -5418,7 +5530,7 @@ static void unload_launchd_service_if_needed(const char *label, const char *doma
     system(command);
 }
 
-static bool run_launchd_operation(const char *label,
+static bool run_launchd_operation_unlocked(const char *label,
                                   const char *plist_path,
                                   const char *operation,
                                   char *message,
@@ -5507,6 +5619,34 @@ static bool run_launchd_operation(const char *label,
     }
     if (message[0] == '\0') snprintf(message, message_size, "ok");
     return true;
+}
+
+static bool run_launchd_operation(const char *label,
+                                  const char *plist_path,
+                                  const char *operation,
+                                  char *message,
+                                  size_t message_size) {
+    pthread_mutex_lock(&g_launchd_control_mutex);
+    if (launchd_label_is_safe(label) && plist_path && access(plist_path, R_OK) == 0 &&
+        (!strcmp(operation, "start") || !strcmp(operation, "restart"))) {
+        char path[PATH_MAX];
+        launchd_suspension_path(label, path, sizeof(path));
+        unlink(path);
+        pthread_mutex_lock(&g_launchd_status_mutex);
+        for (LaunchdStatusEntry *entry = g_launchd_status_entries; entry; entry = entry->next) {
+            if (strcmp(entry->label, label) || strcmp(entry->plist_path, plist_path)) continue;
+            snprintf(entry->status, sizeof(entry->status), "unknown");
+            entry->last_runs = 0;
+            entry->failed_launches = 0;
+            entry->failure_window_ms = 0;
+            entry->last_suspend_attempt_ms = 0;
+        }
+        pthread_mutex_unlock(&g_launchd_status_mutex);
+        invalidate_launchd_status();
+    }
+    bool ok = run_launchd_operation_unlocked(label, plist_path, operation, message, message_size);
+    pthread_mutex_unlock(&g_launchd_control_mutex);
+    return ok;
 }
 
 static bool run_launchd_operation_privileged(const char *label,
@@ -6197,7 +6337,7 @@ static bool append_registered_backend_payloads(const RegistryStore *database,
                      sizeof(effective_service_scope),
                      "%s",
                      strncmp(plist_path, "/Library/LaunchDaemons/", 23) == 0 ? "system" : "user");
-            launchd_status(service_id, plist_path, status, sizeof(status));
+            launchd_status(service_id, plist_path, owns_plist && !is_self, status, sizeof(status));
         } else
 #endif
         if (has_systemd_unit) {

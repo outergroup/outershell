@@ -1,0 +1,28 @@
+const assert = require("node:assert/strict"), fs = require("node:fs"), vm = require("node:vm");
+const source = fs.readFileSync(`${process.argv[2] || process.cwd()}/Resources/OuterShellWeb/app.js`, "utf8");
+let dialog = "", navigations = 0, starts = 0, refreshedStatus = "failed";
+const endpoint = { backend: { status: "socket unavailable", serviceID: "test" }, frontend: { socketPath: "/missing", isRunning: true } };
+const item = { identity: "test", displayName: "Test <app>", primary: endpoint };
+const context = { findItem: () => item, backendKey: () => "test", escapeHTML: s => String(s).replaceAll("<", "&lt;"), openDialog: s => { dialog = s; }, toast() {}, delay: async () => {}, control: async () => { starts++; return { ok: true }; }, refreshBackends: async () => { endpoint.backend.status = refreshedStatus; endpoint.frontend.isRunning = false; }, navigationURL: () => "http://app/", window: { location: { assign() { navigations++; } } } };
+vm.createContext(context);
+vm.runInContext(source.slice(source.indexOf("  function endpointRunning("), source.indexOf("  function launcherItems(")), context);
+vm.runInContext(source.slice(source.indexOf("  function showLaunchFailure("), source.indexOf("  const delay =")), context);
+(async () => {
+  assert.equal(context.endpointReady(endpoint), false);
+  await context.launch("test");
+  assert.equal(starts, 0); assert.equal(navigations, 0);
+  assert.match(dialog, /connection socket is unavailable/); assert.match(dialog, /View Logs/); assert.match(dialog, /Retry/); assert.match(dialog, /Test &lt;app>/);
+  await context.launch("test", "primary", true);
+  assert.equal(starts, 1); assert.equal(navigations, 0); assert.match(dialog, /exited with an error/);
+  refreshedStatus = "available";
+  await context.launch("test", "primary", true);
+  assert.equal(starts, 2); assert.equal(navigations, 1);
+  endpoint.backend.status = "stopped"; refreshedStatus = "socket unavailable";
+  await context.launch("test");
+  assert.equal(starts, 3); assert.equal(navigations, 1);
+  endpoint.backend.status = "suspended after failures";
+  await context.launch("test");
+  assert.equal(starts, 3); assert.equal(navigations, 1);
+  assert.match(dialog, /suspended after repeated launch failures/);
+  console.log("PASS: failed launch stays in Outer Shell, logs/retry, stale running flag, recovery and post-start failure");
+})().catch(error => { console.error(error); process.exitCode = 1; });

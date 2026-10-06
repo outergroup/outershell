@@ -339,7 +339,15 @@
     return hasEndpoint ? endpoint.frontend.isRunning : endpoint.frontend.isRunning || endpoint.backend.status === "running";
   }
 
+  function endpointFailure(endpoint, name) {
+    if (endpoint.backend.status === "suspended after failures") return `${name} was suspended after repeated launch failures to stop automatic restarts. Check the logs, then choose Retry when ready.`;
+    if (endpoint.backend.status === "socket unavailable") return `${name} couldn’t start: its connection socket is unavailable.`;
+    if (endpoint.backend.status === "failed") return `${name} exited with an error.`;
+    return "";
+  }
+
   function endpointReady(endpoint) {
+    if (endpointFailure(endpoint, "The app")) return false;
     const frontend = endpoint.frontend;
     const hasEndpoint = Boolean(frontend.socketPath || frontend.port > 0 || /^[a-z][a-z0-9+.-]*:/i.test(frontend.url || ""));
     return endpointRunning(endpoint) || (["available", "awaiting"].includes(endpoint.backend.status) && hasEndpoint);
@@ -505,6 +513,7 @@
       key: hostBookmarkKey(item), name: item.displayName, item,
       kind: addressKind(item.frontend), address: registeredURL(item.frontend),
       socket: item.frontend.socketPath || "", running: endpointRunning(item.primary),
+      failure: endpointFailure(item.primary, item.displayName),
       serviceID: item.backend.serviceID, groupID: "host", groupName: "This server"
     }));
     const containers = state.safeSpaces.flatMap(workspace => (workspace.apps || []).map(app => {
@@ -532,7 +541,7 @@
     const menu = entry.item
       ? `data-action="edit-bookmark" data-app-key="${escapeHTML(entry.item.identity)}"`
       : `data-action="edit-container-bookmark" data-safe-space-id="${escapeHTML(entry.workspace.id)}" data-service-id="${escapeHTML(entry.app.serviceID)}" data-frontend-key="${escapeHTML(containerFrontendKey(entry.app))}"`;
-    return `<div class="overview-row" data-endpoint-key="${escapeHTML(entry.key)}"><a href="${escapeHTML(target)}" ${overviewLaunchAttributes(entry)} ${entry.item ? "" : `data-app-key="${escapeHTML(entry.key)}"`}><span class="address-status${entry.running ? " is-running" : ""}" aria-label="${entry.running ? "Running" : "Not running"}"></span>${icon}<span>${escapeHTML(entry.name)}${isThisPage ? ' <small class="this-page-label">This page</small>' : ""}</span></a><button class="endpoint-menu" type="button" ${menu} aria-label="Actions for ${escapeHTML(entry.name)}" aria-haspopup="dialog">•••</button></div>`;
+    return `<div class="overview-row" data-endpoint-key="${escapeHTML(entry.key)}"><a href="${escapeHTML(target)}" ${overviewLaunchAttributes(entry)} ${entry.item ? "" : `data-app-key="${escapeHTML(entry.key)}"`}><span class="address-status${entry.failure ? " is-failed" : entry.running ? " is-running" : ""}" aria-label="${entry.failure ? "Unavailable" : entry.running ? "Running" : "Not running"}"></span>${icon}<span>${escapeHTML(entry.name)}${entry.failure ? " — Unavailable" : ""}${isThisPage ? ' <small class="this-page-label">This page</small>' : ""}</span></a><button class="endpoint-menu" type="button" ${menu} aria-label="Actions for ${escapeHTML(entry.name)}" aria-haspopup="dialog">•••</button></div>`;
   }
 
   function endpointGroupID(entry) {
@@ -596,7 +605,7 @@
     const icon = listIconHTML(item);
     const target = entry.item ? navigationURL(entry.item.frontend) : safeSpaceAppNavigationURL(entry.workspace, entry.app);
     const identity = entry.item?.identity || entry.key;
-    return `<div class="overview-shortcut-wrap" data-endpoint-key="${escapeHTML(entry.key)}"><a class="overview-shortcut" href="${escapeHTML(target)}" ${overviewLaunchAttributes(entry)} ${entry.item ? "" : `data-app-key="${escapeHTML(identity)}"`}>${icon}<span class="shortcut-title"><span class="address-status${entry.running ? " is-running" : ""}" aria-label="${entry.running ? "Running" : "Not running"}"></span>${escapeHTML(entry.name)}</span></a></div>`;
+    return `<div class="overview-shortcut-wrap" data-endpoint-key="${escapeHTML(entry.key)}"><a class="overview-shortcut" href="${escapeHTML(target)}" ${overviewLaunchAttributes(entry)} ${entry.item ? "" : `data-app-key="${escapeHTML(identity)}"`}>${icon}<span class="shortcut-title"><span class="address-status${entry.failure ? " is-failed" : entry.running ? " is-running" : ""}" aria-label="${entry.failure ? "Unavailable" : entry.running ? "Running" : "Not running"}"></span>${escapeHTML(entry.name)}${entry.failure ? " — Unavailable" : ""}</span></a></div>`;
   }
 
   function renderInitialLoading() {
@@ -1108,11 +1117,26 @@
     state.pressFeedback = null;
   }
 
-  async function launch(identity, scope = "primary") {
+  function showLaunchFailure(item, endpoint, scope) {
+    const key = escapeHTML(backendKey(endpoint.backend));
+    openDialog(`<h2 id="dialog-title">Could not open ${escapeHTML(item.displayName)}</h2>
+      <p>${escapeHTML(endpointFailure(endpoint, item.displayName))}</p>
+      <div class="dialog-actions">
+        <button type="button" data-action="retry-launch" data-app-key="${escapeHTML(item.identity)}" data-app-scope="${escapeHTML(scope)}">Retry</button>
+        <button type="button" data-action="logs" data-backend-key="${key}">View Logs</button>
+        <button type="button" data-action="close-dialog">Close</button>
+      </div>`);
+  }
+
+  async function launch(identity, scope = "primary", retry = false) {
     let item = findItem(identity);
     if (!item) return;
     let endpoint = item[scope];
     if (!endpoint) throw new Error(`${item.displayName} is not available for this account.`);
+    if (!retry && endpointFailure(endpoint, item.displayName)) {
+      showLaunchFailure(item, endpoint, scope);
+      return;
+    }
     if (!endpointReady(endpoint)) {
       toast(`Starting ${item.displayName}…`);
       const action = await control(endpoint.backend, "start");
@@ -1122,6 +1146,10 @@
         await refreshBackends({ quiet: true });
         item = findItem(identity);
         endpoint = item?.[scope];
+        if (endpoint && endpointFailure(endpoint, item.displayName)) {
+          showLaunchFailure(item, endpoint, scope);
+          return;
+        }
         if (endpoint && endpointReady(endpoint)) break;
       }
     }
@@ -1344,7 +1372,7 @@
     return `<section class="context-menu-section">
       <h3>${escapeHTML(title)}</h3>
       <a class="context-menu-item" href="${escapeHTML(navigationURL(endpoint.frontend))}" data-action="launch-endpoint" data-app-key="${escapeHTML(item.identity)}" data-app-scope="${scope}" role="menuitem">${contextMenuGlyph("↗")}<span>Open</span></a>
-      ${showControl ? `<button class="context-menu-item" type="button" data-action="control" data-operation="${running ? "stop" : "start"}" data-backend-key="${key}" role="menuitem">${contextMenuGlyph(running ? "■" : "▶")}<span>${running ? "Stop" : "Start"}</span></button>` : ""}
+      ${showControl ? `<button class="context-menu-item" type="button" data-action="control" data-operation="${running ? "stop" : "start"}" data-backend-key="${key}" role="menuitem">${contextMenuGlyph(running ? "■" : "▶")}<span>${running ? "Stop" : endpointFailure(endpoint, item.displayName) ? "Retry" : "Start"}</span></button>` : ""}
       ${backend.logFiles.length ? `<button class="context-menu-item" type="button" data-action="logs" data-backend-key="${key}" role="menuitem">${contextMenuGlyph("≡")}<span>View Logs</span></button>` : ""}
       ${script ? `<button class="context-menu-item" type="button" data-action="copy-script" data-script="${escapeHTML(script)}" role="menuitem">${contextMenuGlyph("⧉")}<span>Copy Script Path</span></button>` : ""}
     </section>`;
@@ -1883,8 +1911,10 @@
       const { buffer } = await requestBuffer(`/api/logs?${query}`);
       const log = decodeLog(buffer);
       if (!state.logSelection || state.logSelection.backendKey !== selection.backendKey || state.logSelection.index !== selection.index) return;
-      if (output) output.textContent = log.error || log.contents || "No logs yet.";
-      if (meta) meta.textContent = `${log.path || "No registered log"}${log.truncated ? " · showing latest output" : ""} · ${formatBytes(log.fileSize)}`;
+      const contents = log.error || log.contents || "No logs yet.";
+      const description = `${log.path || "No registered log"}${log.truncated ? " · showing latest output" : ""} · ${formatBytes(log.fileSize)}`;
+      if (output && output.textContent !== contents) output.textContent = contents;
+      if (meta && meta.textContent !== description) meta.textContent = description;
       if (output && output.scrollHeight - output.scrollTop - output.clientHeight < 90) output.scrollTop = output.scrollHeight;
     } catch (error) {
       if (output) output.textContent = error.message || String(error);
@@ -2224,6 +2254,13 @@
     if (action === "control") { await performControl(actionElement.dataset.backendKey, actionElement.dataset.operation, actionElement); return; }
     if (action === "uninstall") { await uninstallBackend(actionElement.dataset.backendKey, actionElement); return; }
     if (action === "copy-script") { const script = actionElement.dataset.script; closeDialog(); await copyText(script); return; }
+    if (action === "retry-launch") {
+      actionElement.disabled = true;
+      try { await launch(actionElement.dataset.appKey, actionElement.dataset.appScope, true); }
+      catch (error) { toast(error.message || String(error), true); }
+      finally { actionElement.disabled = false; }
+      return;
+    }
     if (action === "logs") { openLogs(actionElement.dataset.backendKey); return; }
     if (action === "refresh-log") { await fetchSelectedLog(); }
   });
