@@ -134,6 +134,7 @@ private struct BackendRecord {
     let availableVersion: String?
     let scriptPath: String?
     let publicBaseURL: String?
+    var iconCGImage: CGImage? = nil
     let iconSymbolName: String?
     let launchdPlistPath: String
     let ownsLaunchdPlist: Bool
@@ -389,6 +390,7 @@ private extension BackendRecord {
                              availableVersion: reader.data.count >= 100 ? emptyToNil(try reader.stringRef(at: 92)) : nil,
                              scriptPath: reader.data.count >= 108 ? emptyToNil(try reader.stringRef(at: 100)) : nil,
                              publicBaseURL: reader.data.count >= 116 ? emptyToNil(try reader.stringRef(at: 108)) : nil,
+                             iconCGImage: (flags & 0x800) != 0 ? decodedIconCGImage(try reader.dataRef(at: 116)) : nil,
                              iconSymbolName: emptyToNil(try reader.stringRef(at: 48)),
                              launchdPlistPath: try reader.stringRef(at: 56),
                              ownsLaunchdPlist: (flags & 0x20) != 0,
@@ -5563,7 +5565,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         icon.frame = iconFrame
         icon.contentsGravity = .resizeAspect
         icon.contentsScale = 2
-        if let symbolName = appIconSymbolName(for: backend),
+        if let image = backend.iconCGImage ?? backend.frontends.first?.iconCGImage {
+            icon.contents = image
+        } else if let symbolName = appIconSymbolName(for: backend),
            !symbolName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             icon.contents = symbolCGImage(named: symbolName,
                                           pointSize: symbolPointSize,
@@ -6035,7 +6039,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         icon.contentsGravity = .resizeAspect
         icon.contentsScale = 2
         configureLauncherIconLayer(icon,
-                                   image: nil,
+                                   image: backend.iconCGImage,
                                    symbolName: backend.iconSymbolName,
                                    title: backend.displayName,
                                    iconSize: iconSize)
@@ -14598,6 +14602,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func launcherIconImage(for item: AppLauncherItem) -> CGImage? {
+        if let image = item.backend.iconCGImage { return image }
         if let path = item.containerContext?.app.iconURL ?? item.frontend.iconURL,
            let image = endpointIcons[path] { return image }
         if let image = item.iconCGImage {

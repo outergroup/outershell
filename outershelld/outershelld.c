@@ -5934,6 +5934,7 @@ static bool lookup_launchd_backend_any_for_scope(const char *service_id,
 #define BACKEND_FLAG_HAS_ROOT_SUPPORT 0x100u
 #define BACKEND_FLAG_MENU_BAR_VISIBILITY_ENABLED 0x200u
 #define BACKEND_FLAG_MENU_BAR_VISIBILITY_AVAILABLE 0x400u
+#define BACKEND_FLAG_HAS_ICON_DATA 0x800u
 #define LOG_FILE_FLAG_READABLE 0x01u
 #define FILE_PICKER_FLAG_IS_DIRECTORY 0x01u
 #define FILE_PICKER_FLAG_WILL_CREATE 0x02u
@@ -6240,7 +6241,15 @@ static bool build_backend_payload(const char *service_id,
                                   StringBuilder *frontends_array,
                                   StringBuilder *log_files_array,
                                   StringBuilder *payload) {
-    if (!binary_append_zero(payload, 116)) return false;
+    char icon_path[PATH_MAX] = "";
+    if (flags & BACKEND_FLAG_IS_BUNDLED) {
+        char root[PATH_MAX];
+        bundled_apps_root(root, sizeof(root));
+        char parent[PATH_MAX];
+        parent_directory(root, parent, sizeof(parent));
+        snprintf(icon_path, sizeof(icon_path), "%s/web/icons/%s.png", parent, service_id);
+    }
+    if (!binary_append_zero(payload, 124)) return false;
     return binary_append_string_ref_at(payload, 0, service_id) &&
            binary_append_string_ref_at(payload, 8, display_name && display_name[0] ? display_name : service_id) &&
            binary_append_string_ref_at(payload, 16, service_unit) &&
@@ -6249,13 +6258,14 @@ static bool build_backend_payload(const char *service_id,
            binary_append_string_ref_at(payload, 40, status) &&
            binary_append_string_ref_at(payload, 48, icon_symbol_name) &&
            binary_append_string_ref_at(payload, 56, launchd_plist_path) &&
-           binary_write_u32_at(payload, 64, flags) &&
+           binary_write_u32_at(payload, 64, flags | BACKEND_FLAG_HAS_ICON_DATA) &&
            binary_append_child_ref_at(payload, 68, frontends_array) &&
            binary_append_child_ref_at(payload, 76, log_files_array) &&
            binary_append_string_ref_at(payload, 84, installed_version) &&
            binary_append_string_ref_at(payload, 92, available_version) &&
            binary_append_string_ref_at(payload, 100, script_path) &&
-           binary_append_string_ref_at(payload, 108, public_base_url);
+           binary_append_string_ref_at(payload, 108, public_base_url) &&
+           binary_append_file_ref_at(payload, 116, icon_path);
 }
 
 static void managed_backend_script_path(const char *service_id,

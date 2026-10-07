@@ -27,7 +27,8 @@ vm.runInContext(source.slice(source.indexOf("  async function installBackend("),
   await context.installBackend("user", {});
   state.addScope = "system";
   context.openAddDialog();
-  assert.match(html, /There are no additional bundled apps available/);
+  assert.match(html, /catalog-installed/);
+  assert.doesNotMatch(html, /data-action="install"/);
   state.backends = [record("user", true), record("system", false)];
   context.openAddDialog();
   assert.match(html, /data-backend-key="system"/);

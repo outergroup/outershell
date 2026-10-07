@@ -133,6 +133,7 @@
       serviceScope: reader.stringRef(32),
       status: reader.stringRef(40),
       iconSymbolName: reader.stringRef(48),
+      iconData: flags & 0x800 ? reader.bytesRef(116) : new Uint8Array(),
       launchdPlistPath: reader.stringRef(56),
       canControl: Boolean(flags & 0x01),
       canUninstall: Boolean(flags & 0x02),
@@ -253,15 +254,15 @@
   }
 
   function iconHTML(item, extraClass = "") {
-    const source = (item.frontend?.iconURL || dataURL(item.frontend?.iconData));
+    const source = dataURL(item.backend?.iconData) || item.frontend?.iconURL || dataURL(item.frontend?.iconData);
     const content = source
       ? `<img src="${escapeHTML(source)}" alt="">`
       : `<span>${escapeHTML(initials(item.displayName || item.backend.displayName))}</span>`;
-    return `<span class="app-icon ${extraClass}" aria-hidden="true">${content}</span>`;
+    return `<span class="app-icon${source ? " has-image" : ""} ${extraClass}" aria-hidden="true">${content}</span>`;
   }
 
   function launcherIconHTML(item) {
-    const source = item.app?.iconURL || (item.app?.iconData
+    const source = dataURL(item.backend?.iconData) || item.app?.iconURL || (item.app?.iconData
       ? `data:image/png;base64,${escapeHTML(item.app.iconData)}`
       : (item.frontend?.iconURL || dataURL(item.frontend?.iconData)));
     const content = source
@@ -271,7 +272,7 @@
   }
 
   function listIconHTML(item) {
-    const source = item.app?.iconURL || (item.app?.iconData
+    const source = dataURL(item.backend?.iconData) || item.app?.iconURL || (item.app?.iconData
       ? `data:image/png;base64,${escapeHTML(item.app.iconData)}`
       : (item.frontend?.iconURL || dataURL(item.frontend?.iconData)));
     const content = source
@@ -1276,15 +1277,16 @@
 
   function openAddDialog(tab = state.addTab) {
     state.addTab = tab;
-    const available = state.backends.filter(backend => backend.isBundled && !backend.isInstalled && !backend.isMigration && backend.serviceScope === state.addScope);
-    const catalog = available.length ? `<div class="catalog-list">${available.map(backend => {
-      const item = { backend, frontend: null, displayName: backend.displayName };
-      return `<article class="catalog-item">
-        ${iconHTML(item)}
-        <div><h3>${escapeHTML(backend.displayName)}</h3><p>${escapeHTML(backend.rootOnly ? "Runs with full system access" : "Bundled with Outer Shell")}</p></div>
-        <button class="primary-button" type="button" data-action="install" data-backend-key="${escapeHTML(backendKey(backend))}">${backend.serviceScope === "system" ? "Install as root" : "Install"}</button>
+    const apps = state.backends.filter(backend => backend.isBundled && !backend.isMigration && backend.serviceScope === state.addScope)
+      .sort((a, b) => a.displayName.localeCompare(b.displayName));
+    const catalog = apps.length ? `<div class="add-catalog">${apps.map(backend => {
+      const item = { backend, frontend: backend.frontends?.[0], displayName: backend.displayName };
+      const icon = iconHTML(item);
+      return `<article class="add-catalog-app ${backend.isInstalled ? "installed" : ""}">
+        ${icon}<h3>${escapeHTML(backend.displayName)}</h3>
+        ${backend.isInstalled ? '<span class="catalog-installed">Installed</span>' : `<button class="secondary-button" type="button" data-action="install" data-backend-key="${escapeHTML(backendKey(backend))}">${backend.serviceScope === "system" ? "Install as root" : "Install"}</button>`}
       </article>`;
-    }).join("")}</div>` : `<div class="empty-state"><div class="empty-glyph">✓</div><h2>Bundled apps installed</h2><p>There are no additional bundled apps available.</p></div>`;
+    }).join("")}</div>` : `<p class="add-empty">No bundled apps are available for this account.</p>`;
     const bash = `<form id="bash-form">
       <div class="form-grid">
         <div class="field"><label for="bash-name">Display name</label><input id="bash-name" name="name" placeholder="My server" required></div>
@@ -1298,13 +1300,79 @@
       <p id="bash-message" class="form-message" role="status"></p>
       <footer class="dialog-footer"><button class="secondary-button" type="button" data-action="close-dialog">Cancel</button><button class="primary-button" type="submit">Create app</button></footer>
     </form>`;
+    const categories = [
+      ["catalog", "Outer Shell app catalog", '<rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/>'],
+      ["bash", "Run bash commands", '<rect x="2" y="3" width="20" height="18" rx="2"/><path d="m6 8 3 3-3 3m6 0h5"/>'],
+      ["recipes", "Other recipes", '<rect x="2" y="3" width="20" height="18" rx="2"/><path d="M6 8h1m3 0h8M6 12h1m3 0h8M6 16h1m3 0h5"/>']
+    ];
     const dialog = openDialog(`
-      <header class="dialog-header"><div class="dialog-title-wrap"><h2 id="dialog-title">Add apps</h2><p>Install a bundled app or run your own command.</p></div><button class="dialog-close" type="button" data-action="close-dialog" aria-label="Close">×</button></header>
+      <header class="dialog-header"><div class="dialog-title-wrap"><h2 id="dialog-title">Add Apps</h2></div><button class="dialog-close" type="button" data-action="close-dialog" aria-label="Close">×</button></header>
       <div class="dialog-body">
-        <nav class="tabs" aria-label="Add app type"><button class="tab ${tab === "catalog" ? "active" : ""}" type="button" data-action="add-tab" data-tab="catalog">Install apps</button><button class="tab ${tab === "bash" ? "active" : ""}" type="button" data-action="add-tab" data-tab="bash">Bash command</button></nav>
-        ${tab === "catalog" ? catalog : bash}
-      </div>`, tab === "catalog" ? "" : "wide");
+        <nav class="add-categories" aria-label="Add app type">${categories.map(([id, title, paths]) => `<button class="add-category" type="button" data-action="add-tab" data-tab="${id}" aria-pressed="${tab === id}"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${paths}</svg><span>${title}</span></button>`).join("")}</nav>
+        <section class="add-content" aria-label="${categories.find(([id]) => id === tab)?.[1] || "Apps"}">${tab === "catalog" ? catalog : tab === "bash" ? bash : '<div id="add-recipes" aria-live="polite">Loading recipes…</div>'}</section>
+      </div>`, "add-apps-dialog");
     if (tab === "bash") wireBashForm(dialog);
+    if (tab === "recipes") loadAddRecipes(dialog);
+  }
+
+  async function loadAddRecipes(dialog) {
+    const host = dialog.querySelector("#add-recipes");
+    try {
+      const { buffer } = await requestBuffer("/api/recipes");
+      if (!dialog.isConnected) return;
+      const recipes = new PayloadReader(buffer).child(8).payloadArray().map(reader => ({
+        id: reader.stringRef(0), name: reader.stringRef(8), summary: reader.stringRef(16),
+        fields: reader.child(24).payloadArray().map(field => ({
+          key: field.stringRef(0), label: field.stringRef(8), value: field.stringRef(16),
+          type: field.stringRef(24), placeholder: field.stringRef(32),
+          choices: field.child(48).payloadArray().map(choice => ({ title: choice.stringRef(0), value: choice.stringRef(8) }))
+        }))
+      })).filter(recipe => ["jupyter", "jupyter-uv"].includes(recipe.id));
+      if (!recipes.length) { host.textContent = "No other recipes are available on this server."; return; }
+      host.innerHTML = `<div class="recipe-choices">${recipes.map((recipe, index) => `<button type="button" class="recipe-choice" data-recipe-index="${index}" aria-pressed="${index === 0}">${escapeHTML(recipe.name)}</button>`).join("")}</div><div class="recipe-editor"></div>`;
+      const selectRecipe = index => {
+        const recipe = recipes[index];
+        host.querySelectorAll("[data-recipe-index]").forEach(button => button.setAttribute("aria-pressed", String(Number(button.dataset.recipeIndex) === index)));
+        host.querySelector(".recipe-editor").innerHTML = `<p class="recipe-summary">${escapeHTML(recipe.summary)}</p><form id="recipe-form"><div class="form-grid">${recipe.fields.map(field => {
+          const id = `recipe-${field.key}`;
+          const input = field.type === "choice"
+            ? `<select id="${escapeHTML(id)}" name="${escapeHTML(field.key)}">${field.choices.map(choice => `<option value="${escapeHTML(choice.value)}" ${choice.value === field.value ? "selected" : ""}>${escapeHTML(choice.title)}</option>`).join("")}</select>`
+            : `<input id="${escapeHTML(id)}" name="${escapeHTML(field.key)}" value="${escapeHTML(field.value)}" placeholder="${escapeHTML(field.placeholder)}" ${["name", "identifier", "python", "workdir", "projectDir"].includes(field.key) ? "required" : ""}>`;
+          return `<div class="field" ${field.key === "port" ? 'data-recipe-port' : ""}><label for="${escapeHTML(id)}">${escapeHTML(field.label)}</label>${input}</div>`;
+        }).join("")}</div><p class="form-message" role="status"></p><footer class="dialog-footer"><button class="secondary-button" type="button" data-action="close-dialog">Cancel</button><button class="primary-button" type="submit">Create app</button></footer></form>`;
+        const form = host.querySelector("form");
+        const transport = form.elements.namedItem("frontendTransport");
+        const updateTransport = () => {
+          const port = form.querySelector("[data-recipe-port]");
+          if (port) { port.hidden = transport.value !== "port"; port.querySelector("input").disabled = port.hidden; }
+        };
+        transport?.addEventListener("change", updateTransport);
+        if (transport) updateTransport();
+        form.addEventListener("submit", async event => {
+          event.preventDefault();
+          const button = form.querySelector('[type="submit"]');
+          const message = form.querySelector(".form-message");
+          button.disabled = true; button.textContent = "Creating…"; message.textContent = "";
+          try {
+            const query = new URLSearchParams(new FormData(form)); query.set("recipe", recipe.id);
+            const { buffer } = await requestBuffer(`/api/create?${query}`, { method: "POST" }, true);
+            const result = decodeAction(buffer);
+            if (!result.ok) throw new Error(result.message || "Could not create the app.");
+            if (dialog.isConnected) closeDialog();
+            toast(result.message || `Created ${recipe.name}.`);
+            await refreshBackends({ quiet: true });
+          } catch (error) { message.textContent = error.message || String(error); button.disabled = false; button.textContent = "Create app"; }
+        });
+      };
+      host.querySelectorAll("[data-recipe-index]").forEach(button => button.addEventListener("click", () => selectRecipe(Number(button.dataset.recipeIndex))));
+      selectRecipe(0);
+    } catch (error) {
+      if (!dialog.isConnected) return;
+      host.textContent = error.message || "Could not load recipes.";
+      const retry = document.createElement("button"); retry.type = "button"; retry.className = "secondary-button"; retry.textContent = "Retry";
+      retry.addEventListener("click", () => { host.textContent = "Loading recipes…"; loadAddRecipes(dialog); });
+      host.append(retry);
+    }
   }
 
   function wireBashForm(dialog) {

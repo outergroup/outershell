@@ -135,3 +135,16 @@ build/release/outer-shell/latest/outer-shell-macos-arm64.zip
 build/release/outer-shell/latest/outer-shell-macos-x86_64.zip
 build/release/outer-shell/app-catalog.json
 ```
+
+## Bundled app icons
+
+Each app repository's `app-icon.png` is the source for its outerframe page icon,
+HTML favicon, and Outer Shell catalog icon. After changing an app icon, run
+`python3 Scripts/sync_bundled_icons.py` in Outer Shell with the app repositories
+as siblings. Use `--check` to verify that the catalog and development web copies
+match. App release packaging copies the source PNG into the web payload.
+
+Outer Shell includes catalog PNGs in backend records for both available and
+installed apps. HTML and outerframe catalog and home views use these images.
+The UI backend record has a data reference at offset 116, indicated by flag
+`0x800`; its fixed header is 124 bytes.
