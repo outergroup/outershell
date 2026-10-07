@@ -1300,8 +1300,32 @@
       <p id="bash-message" class="form-message" role="status"></p>
       <footer class="dialog-footer"><button class="secondary-button" type="button" data-action="close-dialog">Cancel</button><button class="primary-button" type="submit">Create app</button></footer>
     </form>`;
+    const sshArguments = window.outerLoop?.sessionContext?.sshCommandArguments;
+    const sshCommand = Array.isArray(sshArguments) && sshArguments.length && sshArguments.every(value => typeof value === "string")
+      ? sshArguments.map(shellQuotedArgument).join(" ") : null;
+    const connectionInstructions = sshCommand
+      ? `Connect to this server using:\n${sshCommand}`
+      : "Connect to this server over SSH using its host and account.";
+    const connectionHint = sshCommand
+      ? "Share the example request below, along with the Outer Shell API documentation."
+      : "Give it the SSH host and account you use for this server, plus the Outer Shell API documentation.";
+    const serviceDescription = state.backends.some(backend => (backend.serviceUnitPath || backend.serviceUnit || "").endsWith(".plist"))
+      ? "a launchd service on macOS"
+      : state.backends.some(backend => (backend.serviceUnit || "").endsWith(".service"))
+        ? "a systemd service on Linux" : "a background service";
+    const codingAgent = `<div class="coding-agent-panel">
+      <h3>Ask your coding agent</h3>
+      <p>Ask your coding agent to SSH to this server and install the app you want. ${connectionHint}</p>
+      <p>The agent should install the app and its dependencies, configure ${serviceDescription}, and use outerctl as the appropriate user to register the backend, app endpoint, and log files. Apps can use a loopback TCP port or a Unix socket.</p>
+      <h4>Example request</h4>
+      <blockquote>${escapeHTML(connectionInstructions)}
+
+Install &lt;app&gt;. Set it up as a service and register it with Outer Shell so I can open it and manage it here. Follow https://outershell.org/api/ for backend, app, and log registration, then verify that the app starts and responds.</blockquote>
+      <a href="https://outershell.org/api/" target="_blank" rel="noopener noreferrer">Outer Shell API documentation ↗</a>
+    </div>`;
     const categories = [
       ["catalog", "Outer Shell app catalog", '<rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/>'],
+      ["agent", "Ask your coding agent", '<path d="M21 11a8 8 0 0 1-8 8H7l-5 3V11a9 9 0 0 1 19 0Z"/><path d="m7 9 3 3-3 3m6 0h4"/>'],
       ["bash", "Run bash commands", '<rect x="2" y="3" width="20" height="18" rx="2"/><path d="m6 8 3 3-3 3m6 0h5"/>'],
       ["recipes", "Other recipes", '<rect x="2" y="3" width="20" height="18" rx="2"/><path d="M6 8h1m3 0h8M6 12h1m3 0h8M6 16h1m3 0h5"/>']
     ];
@@ -1309,7 +1333,7 @@
       <header class="dialog-header"><div class="dialog-title-wrap"><h2 id="dialog-title">Add Apps</h2></div><button class="dialog-close" type="button" data-action="close-dialog" aria-label="Close">×</button></header>
       <div class="dialog-body">
         <nav class="add-categories" aria-label="Add app type">${categories.map(([id, title, paths]) => `<button class="add-category" type="button" data-action="add-tab" data-tab="${id}" aria-pressed="${tab === id}"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${paths}</svg><span>${title}</span></button>`).join("")}</nav>
-        <section class="add-content" aria-label="${categories.find(([id]) => id === tab)?.[1] || "Apps"}">${tab === "catalog" ? catalog : tab === "bash" ? bash : '<div id="add-recipes" aria-live="polite">Loading recipes…</div>'}</section>
+        <section class="add-content" aria-label="${categories.find(([id]) => id === tab)?.[1] || "Apps"}">${tab === "catalog" ? catalog : tab === "bash" ? bash : tab === "agent" ? codingAgent : '<div id="add-recipes" aria-live="polite">Loading recipes…</div>'}</section>
       </div>`, "add-apps-dialog");
     if (tab === "bash") wireBashForm(dialog);
     if (tab === "recipes") loadAddRecipes(dialog);

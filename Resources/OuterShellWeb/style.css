@@ -1098,7 +1098,7 @@ h1 { margin: 0; font-size: clamp(30px, 5vw, 45px); line-height: 1.05; letter-spa
 .add-apps-dialog .dialog-header { border-bottom: 0; padding: 28px; }
 .add-apps-dialog .dialog-header h2 { font-size: 24px; }
 .add-apps-dialog .dialog-body { padding: 20px 28px 28px; }
-.add-categories { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; margin-bottom: 36px; }
+.add-categories { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; margin-bottom: 36px; }
 .add-category { display: flex; align-items: center; gap: 14px; min-height: 82px; padding: 16px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel-solid); text-align: left; font-size: 14px; font-weight: 600; }
 .add-category svg { flex: 0 0 26px; width: 26px; height: 26px; color: #1683ff; }
 .add-category[aria-pressed="true"] { border-color: #1683ff; box-shadow: inset 0 0 0 1px #1683ff; background: color-mix(in srgb, #1683ff 11%, var(--panel-solid)); }
@@ -1125,3 +1125,8 @@ h1 { margin: 0; font-size: clamp(30px, 5vw, 45px); line-height: 1.05; letter-spa
   .add-catalog { grid-template-columns: repeat(auto-fill, minmax(95px, 1fr)); gap: 18px 12px; }
 }
 
+
+.coding-agent-panel { max-width: 720px; line-height: 1.6; }
+.coding-agent-panel p { color: var(--muted); }
+.coding-agent-panel blockquote { white-space: pre-wrap; margin: 16px 0 24px; padding: 16px 20px; border-left: 3px solid #1683ff; background: var(--panel-solid); overflow-wrap: anywhere; user-select: text; }
+.coding-agent-panel a { color: #1683ff; }

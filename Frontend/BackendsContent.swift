@@ -1250,6 +1250,7 @@ private struct DockerfileTextLine {
 }
 
 private enum AppsTextContentSpace: Equatable {
+    case create
     case apps
     case workspace
     case workspacePanel
@@ -1278,12 +1279,14 @@ private struct PendingTextSelectionDrag {
 
 private enum CreateSection: String {
     case appCatalog
+    case codingAgent
     case bashCommands
     case nativeApp
     case otherRecipes
 }
 
 private enum PendingButtonAction {
+    case codingAgentDocumentation
     case addApp
     case appBadge(AppLauncherEndpoint, displayName: String, opensInNewTab: Bool)
     case bundledInstall(BackendRecord)
@@ -1827,6 +1830,13 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     )] = [:]
     private var pendingLogMenuSelections: [UUID: (serviceID: String, serviceScope: String, logIndexByItemID: [String: Int])] = [:]
     private var logSelectorFrame = CGRect.zero
+    private var serverSSHCommand: String?
+    private var codingAgentDocumentationFrame = CGRect.zero
+    private var codingAgentTextBlocks: [DockerfileTextBlock] = []
+    private var selectableTextBlocks: [DockerfileTextBlock] {
+        mode == .create ? codingAgentTextBlocks : safeSpaceDockerfileTextBlocks
+    }
+    private var codingAgentTextFrames: [(frame: CGRect, text: String)] = []
     private var createSectionFrames: [(frame: CGRect, section: CreateSection)] = []
     private var recipeFrames: [(frame: CGRect, recipeID: String)] = []
     private var bundledAppInstallFrames: [(frame: CGRect, backend: BackendRecord)] = []
@@ -2016,6 +2026,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             loadOverviewLayout()
             outerframeHost.requestOuterLoopSSHCommandArguments { [weak self] arguments in
                 guard let self, let arguments else { return }
+                self.serverSSHCommand = arguments.isEmpty ? nil : arguments.map(Self.shellQuotedArgument).joined(separator: " ")
                 if let index = arguments.firstIndex(of: "-l"), arguments.indices.contains(index + 1) {
                     self.overviewUsername = arguments[index + 1]
                 } else if let destination = arguments.last, let at = destination.firstIndex(of: "@") {
@@ -2979,6 +2990,20 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
         createFormContentLayer.frame = createFormContentLayer.frame.offsetBy(dx: 0, dy: deltaY)
 
+        codingAgentDocumentationFrame = codingAgentDocumentationFrame.offsetBy(dx: 0, dy: deltaY)
+        codingAgentTextBlocks = codingAgentTextBlocks.map { block in
+            DockerfileTextBlock(fragmentID: block.fragmentID,
+                                text: block.text,
+                                frame: block.frame.offsetBy(dx: 0, dy: deltaY),
+                                lines: block.lines.map {
+                                    DockerfileTextLine(text: $0.text, range: $0.range,
+                                                       frame: $0.frame.offsetBy(dx: 0, dy: deltaY))
+                                },
+                                font: block.font,
+                                contentSpace: .create,
+                                selectionLayer: block.selectionLayer)
+        }
+        codingAgentTextFrames = codingAgentTextFrames.map { ($0.frame.offsetBy(dx: 0, dy: deltaY), $0.text) }
         createSectionFrames = createSectionFrames.map { ($0.frame.offsetBy(dx: 0, dy: deltaY), $0.section) }
         recipeFrames = recipeFrames.map { ($0.frame.offsetBy(dx: 0, dy: deltaY), $0.recipeID) }
         bundledAppInstallFrames = bundledAppInstallFrames.map { ($0.frame.offsetBy(dx: 0, dy: deltaY), $0.backend) }
@@ -3608,7 +3633,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
     private func dockerfileWrappedLines(
         _ text: String,
-        width: CGFloat
+        width: CGFloat,
+        font: NSFont? = nil
     ) -> [(text: String, range: NSRange)] {
         let source = text as NSString
         let length = source.length
@@ -3616,7 +3642,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             return [("", NSRange(location: 0, length: 0))]
         }
 
-        let attributed = NSAttributedString(string: text, attributes: [.font: dockerfileFont()])
+        let attributed = NSAttributedString(string: text, attributes: [.font: font ?? dockerfileFont()])
         let typesetter = CTTypesetterCreateWithAttributedString(attributed)
         var lines: [(text: String, range: NSRange)] = []
         var location = 0
@@ -3705,7 +3731,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
     private func updateDockerfileSelectionLayers() {
         withoutImplicitAnimations {
-            for block in safeSpaceDockerfileTextBlocks {
+            for block in selectableTextBlocks {
                 renderDockerfileSelection(in: block)
             }
         }
@@ -3725,7 +3751,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         at point: CGPoint,
         contentSpace: AppsTextContentSpace
     ) -> DockerfileTextBlock? {
-        safeSpaceDockerfileTextBlocks.first {
+        selectableTextBlocks.first {
             $0.contentSpace == contentSpace && $0.frame.contains(point)
         }
     }
@@ -3781,7 +3807,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
     private func selectedDockerfileAttributedText() -> NSAttributedString? {
         guard let fragmentID = selectedDockerfileFragmentID,
-              let block = safeSpaceDockerfileTextBlocks.first(where: {
+              let block = selectableTextBlocks.first(where: {
                   $0.fragmentID == fragmentID
               }),
               let selection = normalizedDockerfileSelectionRange(
@@ -3800,13 +3826,15 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private func handleDockerfileMouseDragged(to point: CGPoint) -> Bool {
         guard let fragmentID = selectedDockerfileFragmentID,
               let anchor = dockerfileDragAnchorOffset,
-              let block = safeSpaceDockerfileTextBlocks.first(where: {
+              let block = selectableTextBlocks.first(where: {
                   $0.fragmentID == fragmentID
               }) else {
             return false
         }
         let textPoint: CGPoint
         switch block.contentSpace {
+        case .create:
+            textPoint = createLayer.convert(point, from: rootLayer)
         case .apps, .workspace:
             let contentPoint = contentLayer.convert(point, from: rootLayer)
             textPoint = appsContentPoint(for: contentPoint)
@@ -4992,10 +5020,11 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                           width: CGFloat) -> CGFloat {
         let gap: CGFloat = 12
         let cardHeight: CGFloat = 72
-        let columns: CGFloat = width >= 820 ? 4 : (width >= 520 ? 2 : 1)
+        let columns: CGFloat = width >= 960 ? 5 : (width >= 520 ? 2 : 1)
         let cardWidth = floor((width - gap * (columns - 1)) / columns)
         let sections: [(CreateSection, String, String)] = [
             (.appCatalog, "Outer Shell app catalog", "square.grid.2x2"),
+            (.codingAgent, "Ask your coding agent", "bubble.left.and.bubble.right"),
             (.bashCommands, "Run bash commands", "terminal"),
             (.nativeApp, "New App", "hammer"),
             (.otherRecipes, "Other recipes", "list.bullet.rectangle")
@@ -5050,8 +5079,92 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
         let titleLayer = makeTextLayer(size: 12, weight: .semibold, color: .labelColor)
         titleLayer.string = title
-        titleLayer.frame = CGRect(x: 48, y: floor((frame.height - 16) / 2), width: max(frame.width - 62, 1), height: 16)
+        titleLayer.isWrapped = true
+        titleLayer.frame = CGRect(x: 48, y: floor((frame.height - 32) / 2), width: max(frame.width - 62, 1), height: 32)
         card.addSublayer(titleLayer)
+    }
+
+    private func renderCodingAgentText(_ text: String, identifier: String,
+                                       left: CGFloat, top: CGFloat, width: CGFloat,
+                                       size: CGFloat, weight: NSFont.Weight = .regular,
+                                       color: NSColor = .labelColor) -> CGFloat {
+        let font = NSFont.systemFont(ofSize: size, weight: weight)
+        let lineHeight = ceil(size * 1.5)
+        let lines = dockerfileWrappedLines(text, width: width, font: font)
+        let frame = CGRect(x: left, y: top - CGFloat(lines.count) * lineHeight,
+                           width: width, height: CGFloat(lines.count) * lineHeight)
+        let selectionLayer = CALayer()
+        selectionLayer.frame = frame
+        addCreateFormSublayer(selectionLayer)
+        var renderedLines: [DockerfileTextLine] = []
+        for (index, line) in lines.enumerated() {
+            let lineFrame = CGRect(x: left, y: top - CGFloat(index + 1) * lineHeight,
+                                   width: width, height: lineHeight)
+            let layer = makeTextLayer(size: size, weight: weight, color: color)
+            layer.string = line.text
+            layer.frame = lineFrame
+            addCreateFormSublayer(layer)
+            renderedLines.append(DockerfileTextLine(text: line.text, range: line.range, frame: lineFrame))
+        }
+        let block = DockerfileTextBlock(fragmentID: identifier, text: text, frame: frame,
+                                       lines: renderedLines, font: font, contentSpace: .create,
+                                       selectionLayer: selectionLayer)
+        codingAgentTextBlocks.append(block)
+        codingAgentTextFrames.append((frame, text))
+        renderDockerfileSelection(in: block)
+        return frame.minY
+    }
+
+    private func renderCodingAgentSection(left: CGFloat, top: CGFloat, width: CGFloat) -> CGFloat {
+        let serviceDescription: String
+        if backends.contains(where: { $0.serviceUnitPath?.hasSuffix(".plist") == true || $0.serviceUnit.hasSuffix(".plist") }) {
+            serviceDescription = "a launchd service on macOS"
+        } else if backends.contains(where: { $0.serviceUnit.hasSuffix(".service") }) {
+            serviceDescription = "a systemd service on Linux"
+        } else {
+            serviceDescription = "a background service"
+        }
+        let connectionInstructions = serverSSHCommand.map { "Connect to this server using:\n\($0)" }
+            ?? "Connect to this server over SSH using its host and account."
+        let connectionHint = serverSSHCommand == nil
+            ? "Share the SSH host and account, along with the Outer Shell API documentation."
+            : "Share the example request below, along with the Outer Shell API documentation."
+        let contentWidth = min(width, 740)
+        var y = renderCodingAgentText("Let your agent handle the setup", identifier: "agent-heading",
+                                      left: left, top: top, width: contentWidth,
+                                      size: 22, weight: .semibold) - 10
+        y = renderCodingAgentText(
+            """
+            Ask your coding agent to SSH to this server and install the app you want. \(connectionHint)
+
+            Your agent should install the dependencies, configure \(serviceDescription), and use outerctl as the appropriate user to register the backend, app endpoint, and logs. Apps can use a loopback TCP port or a Unix socket.
+            """,
+            identifier: "agent-instructions", left: left, top: y, width: contentWidth, size: 14
+        ) - 28
+
+        let cardTop = y
+        let card = CALayer()
+        card.cornerRadius = 10
+        card.borderWidth = 1
+        card.borderColor = resolvedCGColor(NSColor.controlAccentColor.withAlphaComponent(0.25))
+        card.backgroundColor = resolvedCGColor(NSColor.controlAccentColor.withAlphaComponent(0.06))
+        addCreateFormSublayer(card)
+        let inset: CGFloat = 20
+        y = renderCodingAgentText("Example request", identifier: "agent-example-heading",
+                                  left: left + inset, top: y - inset, width: contentWidth - inset * 2,
+                                  size: 12, weight: .semibold, color: .controlAccentColor) - 12
+        y = renderCodingAgentText(
+            "\(connectionInstructions)\n\nInstall <app>. Set it up as a service and register it with Outer Shell so I can open it and manage it here. Follow https://outershell.org/api/ for backend, app, and log registration, then verify that the app starts and responds.",
+            identifier: "agent-example", left: left + inset, top: y,
+            width: contentWidth - inset * 2, size: 14
+        ) - inset
+        card.frame = CGRect(x: left, y: y, width: contentWidth, height: cardTop - y)
+
+        codingAgentDocumentationFrame = CGRect(x: left, y: y - 60, width: min(width, 260), height: 36)
+        let button = makeButtonLayer(title: "Outer Shell API documentation", emphasized: false)
+        button.frame = codingAgentDocumentationFrame
+        addCreateFormSublayer(button)
+        return codingAgentDocumentationFrame.minY - 24
     }
 
     private func renderCreateEmptyMessage(_ message: String,
@@ -7146,6 +7259,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private func renderCreateForm() {
         createLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
         createFormContentLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
+        codingAgentDocumentationFrame = .zero
+        codingAgentTextFrames.removeAll()
+        codingAgentTextBlocks.removeAll()
         createSectionFrames.removeAll()
         recipeFrames.removeAll()
         bundledAppInstallFrames.removeAll()
@@ -7228,6 +7344,12 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                                   width: pageWidth)
 
         switch selectedCreateSection {
+        case .codingAgent:
+            createContentBottom = renderCodingAgentSection(left: left, top: contentTop, width: pageWidth)
+            if clampCreateScrollUsingRenderedContent() {
+                renderCreateForm()
+            }
+            return
         case .appCatalog:
             let addableApps = bundledCatalogBackends()
             if addableApps.isEmpty {
@@ -8165,6 +8287,20 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                            label: "Close Add Apps"))
         }
 
+        for paragraph in codingAgentTextFrames {
+            guard let frame = accessibilityFrame(paragraph.frame, from: createLayer, clippedBy: clipFrame) else { continue }
+            nodes.append(accessibilityNode(nextIdentifier: &nextIdentifier,
+                                           role: .staticText,
+                                           frame: frame,
+                                           label: paragraph.text))
+        }
+        if let frame = accessibilityFrame(codingAgentDocumentationFrame, from: createLayer, clippedBy: clipFrame) {
+            nodes.append(accessibilityNode(nextIdentifier: &nextIdentifier,
+                                           role: .button,
+                                           frame: frame,
+                                           label: "Outer Shell API documentation"))
+        }
+
         for section in createSectionFrames {
             guard let frame = accessibilityFrame(section.frame, from: createLayer, clippedBy: clipFrame) else { continue }
             nodes.append(accessibilityNode(nextIdentifier: &nextIdentifier,
@@ -8410,6 +8546,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
     private func createSectionAccessibilityLabel(_ section: CreateSection) -> String {
         switch section {
+        case .codingAgent:
+            return "Ask your coding agent"
         case .appCatalog:
             return "Outer Shell app catalog"
         case .bashCommands:
@@ -10707,7 +10845,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 if command == "cancelOperation" {
                     dismissContainerConfigurationBuildError()
                 } else if command == "selectAll",
-                          let block = safeSpaceDockerfileTextBlocks.first(where: {
+                          let block = selectableTextBlocks.first(where: {
                               $0.contentSpace == .workspacePanel
                           }) {
                     setDockerfileSelection(
@@ -10753,7 +10891,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
         if command == "selectAll",
            let fragmentID = selectedDockerfileFragmentID,
-           let block = safeSpaceDockerfileTextBlocks.first(where: {
+           let block = selectableTextBlocks.first(where: {
                $0.fragmentID == fragmentID
            }) {
             setDockerfileSelection(
@@ -12105,6 +12243,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private func performPendingButtonAction(_ action: PendingButtonAction,
                                             at point: CGPoint) {
         switch action {
+        case .codingAgentDocumentation:
+            guard let url = URL(string: "https://outershell.org/api/") else { return }
+            outerframeHost.openURLExternally(url)
         case .addApp:
             catalogScope = isDirectRootSession ? "system" : "user"
             navigateToMode(.create, pushHistory: true)
@@ -12130,6 +12271,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         case .createSubmit:
             submitCreateForm()
         case .createSection(let section):
+            setDockerfileSelection(fragmentID: nil, range: nil)
             blurCreateField()
             selectedCreateSection = section
             if section == .bashCommands {
@@ -12547,12 +12689,17 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             let contentPoint = contentLayer.convert(point, from: rootLayer)
             let createPoint = createLayer.convert(contentPoint, from: contentLayer)
             let isInCreateContent = createContentClipFrame.contains(createPoint)
+            if isInCreateContent, dockerfileTextBlock(at: createPoint, contentSpace: .create) != nil {
+                setCursorIfNeeded(.iBeam)
+                return
+            }
             isOverCreateMessage = isInCreateContent && !createMessage.isEmpty && createMessageFrame.insetBy(dx: 0, dy: -3).contains(createPoint)
             isOverBundledApp = isInCreateContent && bundledAppInstallFrames.contains { $0.frame.contains(createPoint) }
             isOverDirectorySelect = isInCreateContent && createDirectorySelectFrames.contains { $0.frame.contains(createPoint) }
             isOverAppTile = createDismissFrame.contains(createPoint) ||
                             (isInCreateContent && (createSectionFrames.contains { $0.frame.contains(createPoint) } ||
                                                    recipeFrames.contains { $0.frame.contains(createPoint) } ||
+                                                   codingAgentDocumentationFrame.contains(createPoint) ||
                                                    createButtonFrame.contains(createPoint) ||
                                                    bashIconSelectFrame.contains(createPoint) ||
                                                    createChoiceFrames.contains { $0.frame.contains(createPoint) } ||
@@ -12701,6 +12848,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
         guard pendingPasswordAction == nil, mode == .create else { return }
         let createPoint = createLayer.convert(contentPoint, from: contentLayer)
+        if createContentClipFrame.contains(createPoint),
+           handleDockerfileRightMouseDown(at: createPoint, contentSpace: .create, rootPoint: point) {
+            return
+        }
         if !createMessage.isEmpty,
            createMessageFrame.insetBy(dx: 0, dy: -3).contains(createPoint) {
             blurCreateField()
@@ -12947,7 +13098,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             }
         }
 
-        if let index = safeSpaceDockerfileTextBlocks.firstIndex(where: {
+        if let index = selectableTextBlocks.firstIndex(where: {
             $0.fragmentID == "container-build-error"
         }) {
             let block = safeSpaceDockerfileTextBlocks[index]
@@ -13725,6 +13876,33 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                     blurCreateField()
                     updateLayout()
                 }
+                return
+            }
+            if let block = dockerfileTextBlock(at: createPoint, contentSpace: .create) {
+                blurCreateField()
+                let offset = dockerfileTextOffset(at: createPoint, in: block)
+                dockerfileDragAnchorOffset = offset
+                let range: NSRange?
+                switch clickCount {
+                case 3...:
+                    range = NSRange(location: 0, length: (block.text as NSString).length)
+                case 2:
+                    range = dockerfileWordRange(containing: offset, in: block)
+                default:
+                    range = nil
+                }
+                setDockerfileSelection(fragmentID: block.fragmentID, range: range)
+                if modifierFlags.contains(.control) {
+                    _ = handleDockerfileRightMouseDown(at: createPoint, contentSpace: .create, rootPoint: point)
+                }
+                return
+            }
+            if selectedCreateSection == .codingAgent {
+                setDockerfileSelection(fragmentID: nil, range: nil)
+            }
+            if codingAgentDocumentationFrame.contains(createPoint) {
+                armButtonClick(frame: rootFrame(codingAgentDocumentationFrame, from: createLayer),
+                               action: .codingAgentDocumentation)
                 return
             }
             if let sectionFrame = createSectionFrames.first(where: { $0.frame.contains(createPoint) }) {
