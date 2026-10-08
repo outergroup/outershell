@@ -304,7 +304,7 @@
     const socket = String(frontend.socketPath || "").trim();
     if (socket && raw === socket) return "/";
     if (socket && raw.startsWith(socket)) return normalizedPath(raw.slice(socket.length));
-    if (raw.toLowerCase().startsWith("http+unix://")) {
+    if (/^http\+(unix|pipe):\/\//i.test(raw)) {
       const rest = raw.slice("http+unix://".length);
       const index = rest.search(/[/?#]/);
       return index < 0 ? "/" : normalizedPath(rest.slice(index));
@@ -321,7 +321,7 @@
   function navigationURL(frontend) {
     const socket = String(frontend.socketPath || "").trim();
     let target;
-    if (socket) target = `http+unix://${encodeURIComponent(socket)}${pathAndQuery(frontend)}`;
+    if (socket) target = `http+${socket.startsWith("\\\\.\\pipe\\") ? "pipe" : "unix"}://${encodeURIComponent(socket)}${pathAndQuery(frontend)}`;
     else if (frontend.port > 0) target = `http://127.0.0.1:${frontend.port}${pathAndQuery(frontend)}`;
     else target = String(frontend.url || "").trim() || "#";
 
@@ -509,7 +509,7 @@
 
   function registeredURL(frontend) {
     const socket = String(frontend.socketPath || "").trim();
-    if (socket) return `http+unix://${encodeURIComponent(socket)}${pathAndQuery(frontend)}`;
+    if (socket) return `http+${socket.startsWith("\\\\.\\pipe\\") ? "pipe" : "unix"}://${encodeURIComponent(socket)}${pathAndQuery(frontend)}`;
     if (Number(frontend.port) > 0) return `http://127.0.0.1:${Number(frontend.port)}${pathAndQuery(frontend)}`;
     return String(frontend.url || "");
   }
@@ -784,7 +784,7 @@
     const path = safeSpacePathAndQuery(app);
     if (Number(app.publishedPort) > 0) return `http://127.0.0.1:${Number(app.publishedPort)}${path}`;
     const socket = String(app.externalSocketPath || "").trim();
-    return socket ? `http+unix://${encodeURIComponent(socket)}${path}` : "#";
+    return socket ? `http+${socket.startsWith("\\\\.\\pipe\\") ? "pipe" : "unix"}://${encodeURIComponent(socket)}${path}` : "#";
   }
 
   function safeSpaceAppNavigationURL(workspace, app) {
