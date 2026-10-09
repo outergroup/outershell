@@ -6,7 +6,7 @@ set(FILES_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../Files" CACHE PATH "Files repos
 add_library(outer-windows-runtime STATIC Runtime.c ../Backend/OuterShellBuffer.c)
 target_include_directories(outer-windows-runtime PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
 target_link_libraries(outer-windows-runtime PUBLIC advapi32 shell32 ole32)
-add_executable(OuterShell OuterShell.c)
+add_executable(OuterShell OuterShell.c Wsl.c)
 target_link_libraries(OuterShell PRIVATE outer-windows-runtime bcrypt)
 add_executable(FilesBackend "${FILES_ROOT}/Windows/FilesBackend.c")
 target_link_libraries(FilesBackend PRIVATE outer-windows-runtime)

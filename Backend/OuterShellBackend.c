@@ -42,6 +42,8 @@
 extern int launch_activate_socket(const char *name, int **fds, size_t *cnt);
 #endif
 
+static bool g_web_only = false;
+
 static int64_t api_monotonic_milliseconds(void) {
     struct timespec ts;
     if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
@@ -2406,7 +2408,7 @@ static bool process_http_client_request(ReactorClient *client, char *request, si
     } else if (strcmp(target, "/api/native-app-template") == 0) {
         send_native_app_template_archive(fd);
     } else if (is_navigator_route(target)) {
-        if (strcmp(target, "/backends.outer") == 0 || request_accepts_outerframe(request, header_length)) {
+        if (!g_web_only && (strcmp(target, "/backends.outer") == 0 || request_accepts_outerframe(request, header_length))) {
             send_outer_descriptor(fd, request, header_length,
                                   strcasecmp(method, "HEAD") != 0);
         } else {
@@ -2898,7 +2900,7 @@ static void run_http_reactor(int listener) {
 }
 
 static void outer_shell_backend_usage(const char *program) {
-    fprintf(stderr, "Usage: %s [--port PORT | --socket-path PATH] [--api-socket-path PATH] [--container-transfers-dir DIR] [--launchd-socket-name NAME] [--bundles-dir DIR] [--web-root DIR] [--native-app-template-dir DIR] [--stay-alive]\n", program);
+    fprintf(stderr, "Usage: %s [--port PORT | --socket-path PATH] [--api-socket-path PATH] [--container-transfers-dir DIR] [--launchd-socket-name NAME] [--bundles-dir DIR] [--web-root DIR] [--web-only] [--native-app-template-dir DIR] [--stay-alive]\n", program);
 }
 
 static void initialize_runtime_paths(char *api_socket_path, size_t api_socket_path_size) {
@@ -2942,6 +2944,8 @@ int OuterShellBackendMain(int argc, char **argv) {
             snprintf(launchd_socket_name, sizeof(launchd_socket_name), "%s", argv[++i]);
         } else if (strcmp(argv[i], "--bundles-dir") == 0 && i + 1 < argc) {
             bundles_dir = argv[++i];
+        } else if (strcmp(argv[i], "--web-only") == 0) {
+            g_web_only = true;
         } else if (strcmp(argv[i], "--web-root") == 0 && i + 1 < argc) {
             expand_tilde_path(argv[++i], g_web_root_directory, sizeof(g_web_root_directory));
         } else if (strcmp(argv[i], "--native-app-template-dir") == 0 && i + 1 < argc) {

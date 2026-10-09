@@ -10,7 +10,7 @@
 #define HTTP_BODY_LIMIT (16u * 1024u * 1024u)
 typedef struct PipeServer PipeServer;
 typedef struct {
-    HANDLE pipe, stop;
+    HANDLE pipe, stop, cancel;
     unsigned char buffer[8192];
     size_t offset, length;
     bool responded;
@@ -35,6 +35,7 @@ bool win_read_file(const char *path, size_t limit, StringBuilder *result);
 bool win_allow_pipes(const char *const *paths, size_t count);
 PipeServer *pipe_server_start(const char *name, PipeHandler handler, void *context);
 void pipe_server_stop(PipeServer *server);
+bool connection_read_some(Connection *connection, void *data, size_t capacity, size_t *length);
 bool connection_read(Connection *connection, void *data, size_t length);
 bool connection_write(Connection *connection, const void *data, size_t length);
 bool http_read(Connection *connection, HttpRequest *request);

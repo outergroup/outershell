@@ -3,7 +3,8 @@ param(
     [string]$CoreDirectory,
     [ValidateSet('arm64', 'x64', 'x86')][string]$Architecture = [Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString().ToLowerInvariant(),
     [string]$VisualStudioRoot,
-    [string]$FilesRoot
+    [string]$FilesRoot,
+    [string]$OuterLoopRoot = "$PSScriptRoot/../../outerloop/OuterLoop"
 )
 $ErrorActionPreference = 'Stop'
 if (!$FilesRoot) { $FilesRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..\Files')) }
@@ -41,6 +42,8 @@ exit /b %errorlevel%
 foreach ($file in @('OuterShell.exe', 'FilesBackend.exe')) {
     Copy-Item (Join-Path $CoreDirectory $file) $OutputDirectory -Force
 }
+Copy-Item (Join-Path $OuterLoopRoot "Resources/WindowsHelpers/outer-socket-bridge-windows-$Architecture.exe") (Join-Path $OutputDirectory 'outer-socket-bridge.exe') -Force
+Copy-Item (Join-Path $OuterLoopRoot 'WindowsSocketBridge/install.ps1') (Join-Path $OutputDirectory 'install-ssh-bridge.ps1') -Force
 foreach ($obsolete in @('OuterShell.Windows.Runtime.dll', 'outershell-core.dll')) {
     Remove-Item (Join-Path $OutputDirectory $obsolete) -Force -ErrorAction SilentlyContinue
 }

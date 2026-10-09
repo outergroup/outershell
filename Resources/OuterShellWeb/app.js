@@ -693,7 +693,7 @@
     const groups = [
       { id: "user", name: userName || "Your user", note: "User", entries: entries.filter(entry => entry.item && entry.item.backend.serviceScope !== "system") },
       { id: "root", name: "root", note: "Administrator", entries: entries.filter(entry => entry.item && entry.item.backend.serviceScope === "system") },
-      ...state.safeSpaces.map(workspace => ({ id: `container:${workspace.id}`, name: workspace.name || "Container", note: `Container · ${safeSpaceState(workspace)}`, workspace, entries: entries.filter(entry => entry.workspace?.id === workspace.id) }))
+      ...state.safeSpaces.map(workspace => ({ id: `container:${workspace.id}`, name: workspace.name || "Container", note: `${workspace.runtimeKind === "wsl" ? "WSL" : "Container"} · ${safeSpaceState(workspace)}`, workspace, entries: entries.filter(entry => entry.workspace?.id === workspace.id) }))
     ];
     const ranks = new Map(state.groupOrder.map((id, index) => [id, index]));
     groups.sort((a, b) => (ranks.get(a.id) ?? Infinity) - (ranks.get(b.id) ?? Infinity));
@@ -706,7 +706,9 @@
       const ranks = new Map(order.map((key, index) => [key, index]));
       const listed = group.entries.filter(entry => !pins.includes(entry.key)).sort((a, b) => (ranks.get(a.key) ?? Infinity) - (ranks.get(b.key) ?? Infinity));
       const controls = workspace ? `<div class="overview-controls">${!safeSpaceIsRunning(workspace) ? `<button type="button" data-action="start-safe-space" data-safe-space-id="${id}" ${preparing ? "disabled" : ""}>${preparing ? "Starting…" : "Start"}</button>` : ""}<button type="button" data-action="edit-container" data-safe-space-id="${id}" aria-label="Manage ${escapeHTML(group.name)}">Manage…</button></div>` : "";
-      const addMore = workspace
+      const addMore = workspace?.runtimeKind === "wsl"
+        ? `<p class="overview-empty">Apps registered in this Linux distribution appear here.</p>`
+        : workspace
         ? `<button class="overview-add-more" type="button" data-action="configure-container" data-safe-space-id="${id}" ${preparing || !managedContainer(workspace) ? "disabled" : ""} ${!managedContainer(workspace) ? 'title="This container is managed externally"' : ""}>Add more to Dockerfile…</button>`
         : `<button class="overview-add-more" type="button" data-action="open-add" data-scope="${group.id === "root" ? "system" : "user"}">Add more…</button>`;
       return `<section class="overview-identity" data-group-id="${escapeHTML(group.id)}"><header class="overview-group-handle" tabindex="0" aria-label="Reorder ${escapeHTML(group.name)}. Hold and drag, or use arrow keys." title="Hold and drag to reorder" data-group-handle><div class="overview-group-heading"><h2>${escapeHTML(group.name)}</h2><p>${escapeHTML(group.note)}</p></div>${controls}</header><div class="overview-shortcuts" data-endpoint-area="pins">${pins.map(key => group.entries.find(entry => entry.key === key)).filter(Boolean).map(overviewShortcut).join("")}</div><div class="overview-list" data-endpoint-area="list">${listed.map(overviewEndpoint).join("") || `<p class="overview-empty">${state.loading || (workspace && state.safeSpacesLoading) ? "Loading…" : group.entries.length ? "" : "No registered endpoints."}</p>`}</div>${containerCommandsHTML(workspace)}${workspace?.buildProgress ? `<details class="container-build-progress"><summary>${escapeHTML(workspace.buildProgress.detail || workspace.buildProgress.phase)}</summary><pre>${escapeHTML(workspace.buildProgress.log || "")}</pre></details>` : ""}${addMore}</section>`;
@@ -791,7 +793,7 @@
     const target = safeSpaceAppURL(app);
     if (target === "#") return target;
     const name = app.displayName || app.serviceID || "App";
-    const user = String(app.socketPath || "").startsWith("/run/user/0/") ? "root" : "workspace";
+    const user = app.userName || (String(app.socketPath || "").startsWith("/run/user/0/") ? "root" : "workspace");
     const display = `${workspace.name || "Container"} / ${user} / ${name}`;
     if (window.outerLoopPageIconObservationSupported === true && !app.iconData && !app.iconURL && app.iconObservationToken) {
       const callback = new URL("/api/icon-observation", window.location.href);

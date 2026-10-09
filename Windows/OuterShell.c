@@ -1,4 +1,5 @@
 #include "Runtime.h"
+#include "Wsl.h"
 #include "NativeRegistry.c"
 #include "../Backend/OuterShellLayout.h"
 #include <shlobj.h>
@@ -11,6 +12,7 @@ typedef struct {
     CONDITION_VARIABLE changed;
     uint64_t version;
     PipeServer *http, *api;
+    Wsl *wsl;
 } ShellHost;
 static ShellHost shell;
 static SERVICE_STATUS_HANDLE service_handle;
@@ -375,6 +377,11 @@ static void serve_http(Connection *c, void *context) {
         http_free(&r);
         return;
     }
+    if (!strcmp(r.path, "/api/container-snapshot") || !strcmp(r.path, "/api/safe-spaces")) {
+        wsl_serve(s->wsl, c, &r);
+        http_free(&r);
+        return;
+    }
     EnterCriticalSection(&s->gate);
     StringBuilder body = {0};
     int status = 200;
@@ -386,18 +393,24 @@ static void serve_http(Connection *c, void *context) {
         char *value = http_query(&r, "sinceBackends");
         uint64_t previous = value ? _strtoui64(value, NULL, 10) : 0;
         free(value);
+        char *overview = http_query(&r, "sinceOverview");
+        uint64_t prior_overview = overview ? _strtoui64(overview, NULL, 10) : 0;
+        free(overview);
+        uint64_t current_overview = (s->version << 32) ^ wsl_version(s->wsl);
         ULONGLONG deadline = GetTickCount64() + 15000;
         while (previous == s->version && GetTickCount64() < deadline &&
                WaitForSingleObject(s->stop, 0) != WAIT_OBJECT_0) {
             files_running(s);
-            if (previous != s->version)
+            current_overview = (s->version << 32) ^ wsl_version(s->wsl);
+            if (previous != s->version || prior_overview != current_overview)
                 break;
             SleepConditionVariableCS(&s->changed, &s->gate, 250);
         }
         body = payload(32);
-        payload_u32(&body, 0, previous == s->version ? 4 : 1);
+        payload_u32(&body, 0, (previous == s->version ? 4 : 1) |
+                    (prior_overview != current_overview ? 8 : 0));
         payload_u64(&body, 8, s->version);
-        payload_u64(&body, 24, s->version);
+        payload_u64(&body, 24, current_overview);
     } else if (!strcmp(r.path, "/api/control")) {
         if (strcmp(r.method, "POST"))
             status = 405;
@@ -407,12 +420,6 @@ static void serve_http(Connection *c, void *context) {
         body = payload(16);
         uint32_t empty = 0;
         payload_data(&body, 8, &empty, 4);
-    } else if (!strcmp(r.path, "/api/container-snapshot")) {
-        LeaveCriticalSection(&s->gate);
-        const char *json = "{\"providers\":[],\"workspaces\":[]}";
-        http_send(c, &r, 200, "application/json", json, strlen(json));
-        http_free(&r);
-        return;
     } else {
         LeaveCriticalSection(&s->gate);
         if (!strncmp(r.path, "/api/", 5))
@@ -488,6 +495,7 @@ static bool shell_start(ShellHost *s) {
     if (!s->job ||
         !SetInformationJobObject(s->job, JobObjectExtendedLimitInformation, &limits, sizeof(limits)))
         return false;
+    s->wsl = wsl_start(s->stop);
     char *api = win_pipe("org.outershell.outershelld"), *http = win_pipe(shell_id);
     s->api = api ? pipe_server_start(api, serve_registry, s) : NULL;
     s->http = http ? pipe_server_start(http, serve_http, s) : NULL;
@@ -508,6 +516,8 @@ static void shell_stop(ShellHost *s) {
     pipe_server_stop(s->http);
     pipe_server_stop(s->api);
     s->http = s->api = NULL;
+    wsl_stop(s->wsl);
+    s->wsl = NULL;
     EnterCriticalSection(&s->gate);
     stop_files(s);
     LeaveCriticalSection(&s->gate);
@@ -561,6 +571,7 @@ static void WINAPI service_main(DWORD argc, LPWSTR *argv) {
     report_service(SERVICE_STOPPED, ok ? 0 : ERROR_SERVICE_SPECIFIC_ERROR);
 }
 int wmain(int argc, wchar_t **argv) {
+    if (argc == 2 && !wcscmp(argv[1], L"--wsl-list")) return wsl_inspect();
     bool service = false, initialize = false;
     shell.service_name = win_strdup("");
     char *local = win_folder(CSIDL_LOCAL_APPDATA);

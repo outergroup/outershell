@@ -205,7 +205,7 @@ bool win_read_file(const char *path, size_t limit, StringBuilder *result) {
     CloseHandle(h);
     return ok;
 }
-bool win_allow_pipes(const char *const *paths, size_t count) {
+static bool allow_pipes(const char *const *paths, size_t count) {
     char *base = win_folder(CSIDL_LOCAL_APPDATA);
     if (!base)
         return false;
@@ -247,6 +247,14 @@ bool win_allow_pipes(const char *const *paths, size_t count) {
     return ok;
 }
 
+bool win_allow_pipes(const char *const *paths, size_t count) {
+    static SRWLOCK lock = SRWLOCK_INIT;
+    AcquireSRWLockExclusive(&lock);
+    bool ok = allow_pipes(paths, count);
+    ReleaseSRWLockExclusive(&lock);
+    return ok;
+}
+
 struct PipeServer {
     HANDLE stop, listener, slots, first;
     wchar_t *name;
@@ -265,14 +273,27 @@ static bool pipe_io(Connection *c, void *data, DWORD size, DWORD *count, bool wr
         return false;
     BOOL ok = write ? WriteFile(c->pipe, data, size, count, &ov) : ReadFile(c->pipe, data, size, count, &ov);
     if (!ok && GetLastError() == ERROR_IO_PENDING) {
-        HANDLE events[] = {c->stop, ov.hEvent};
-        DWORD wait = WaitForMultipleObjects(2, events, FALSE, 35000);
+        HANDLE events[] = {c->stop, ov.hEvent, c->cancel};
+        DWORD wait = WaitForMultipleObjects(c->cancel ? 3 : 2, events, FALSE, 35000);
         if (wait != WAIT_OBJECT_0 + 1)
             CancelIoEx(c->pipe, &ov);
         ok = GetOverlappedResult(c->pipe, &ov, count, TRUE) && wait == WAIT_OBJECT_0 + 1;
     }
     CloseHandle(ov.hEvent);
     return ok && *count;
+}
+bool connection_read_some(Connection *c, void *data, size_t capacity, size_t *length) {
+    if (c->offset < c->length) {
+        *length = c->length - c->offset;
+        if (*length > capacity) *length = capacity;
+        memcpy(data, c->buffer + c->offset, *length);
+        c->offset += *length;
+        return true;
+    }
+    DWORD count = 0;
+    if (!capacity || !pipe_io(c, data, (DWORD)(capacity > 65536 ? 65536 : capacity), &count, false)) return false;
+    *length = count;
+    return true;
 }
 bool connection_read(Connection *c, void *data, size_t length) {
     char *out = data;

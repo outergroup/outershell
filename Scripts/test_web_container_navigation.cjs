@@ -18,5 +18,6 @@ for (const title of ['JupyterLab: work', 'C++ / notes + examples', '雪 notebook
     assert.equal(fields.url, c.safeSpaceAppURL());
   }
 }
+u=new URL(c.safeSpaceAppNavigationURL({name:'Ubuntu'}, {...a,userName:'mrcslws',iconURL:'/icon.png'})); assert.equal(u.searchParams.get('display'),'Ubuntu / mrcslws / JupyterLab: work');
 c.window.outerLoopPageIconObservationSupported=false; c.window.outerLoopFriendlyNavigationSupported=false; assert.equal(c.safeSpaceAppNavigationURL(w,a),c.safeSpaceAppURL());
 console.log('PASS container navigation with icon discovery, known icons, and ordinary browser fallback');
