@@ -1913,6 +1913,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private var overviewDragFrameScheduled = false
     private var pendingOverviewGroupDrag: (id: String, start: CGPoint, current: CGPoint, active: Bool)?
     private var isWindowsHost = false
+    private var isWindowsCommandHost: Bool { isWindowsHost && catalogWorkspaceID == nil }
+    private var commandSectionTitle: String { isWindowsCommandHost ? "Run commands" : "Run bash commands" }
+    private var commandEditorLabel: String { isWindowsCommandHost ? "Command Prompt commands (cmd.exe)" : "Bash commands" }
+    private var commandPipePlaceholder: String { #"\\.\pipe\my-app"# }
     private var administrativeRoleName: String { isWindowsHost && catalogWorkspaceID == nil ? "administrator" : "root" }
     private var administratorOverviewName: String { isWindowsHost ? overviewUsername : "root" }
     private var administratorOverviewLabel: String {
@@ -5114,10 +5118,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         let sections: [(CreateSection, String, String)] = [
             (.appCatalog, "Outer Shell app catalog", "square.grid.2x2"),
             (.codingAgent, "Ask your coding agent", "bubble.left.and.bubble.right"),
-            (.bashCommands, "Run bash commands", "terminal"),
+            (.bashCommands, commandSectionTitle, "terminal"),
             (.nativeApp, "New App", "hammer"),
             (.otherRecipes, "Other recipes", "list.bullet.rectangle")
-        ].filter { catalogWorkspaceID == nil || catalogScope != "system" || $0.0 == .appCatalog || $0.0 == .codingAgent }
+        ].filter { (catalogScope != "system" || (!isWindowsHost && catalogWorkspaceID == nil) || $0.0 == .appCatalog || $0.0 == .codingAgent) && (!isWindowsCommandHost || $0.0 != .nativeApp && $0.0 != .otherRecipes) }
 
         var x = left
         var y = top - cardHeight
@@ -5277,10 +5281,12 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         var y = top - 18
 
         let help = makeTextLayer(size: 12, weight: .regular, color: .secondaryLabelColor)
-        help.string = "Run a script that launches a web app on some port or socket"
-        help.frame = CGRect(x: detailLeft, y: y, width: detailWidth, height: 18)
+        help.string = isWindowsCommandHost ? "Outer Shell starts these commands as your signed-in user. Keep the server in the foreground and configure it to listen on the port or named pipe below. Use Start to run it again after it exits." : "Run a script that launches a web app on some port or socket"
+        let helpHeight: CGFloat = isWindowsCommandHost ? 54 : 18
+        help.isWrapped = isWindowsCommandHost
+        help.frame = CGRect(x: detailLeft, y: y - helpHeight + 18, width: detailWidth, height: helpHeight)
         addCreateFormSublayer(help)
-        y -= 58
+        y -= 40 + helpHeight
 
         addCreateField(RecipeFieldRecord(key: "bashDisplayName",
                                          label: "Display Name",
@@ -5294,7 +5300,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         y -= 26
 
         addCreateTextArea(key: "bashCommands",
-                          label: "Bash commands",
+                          label: commandEditorLabel,
                           placeholder: "Paste commands here",
                           frame: CGRect(x: detailLeft, y: y - 132, width: detailWidth, height: 132))
         y -= 194
@@ -5307,18 +5313,18 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                                 suggestions: [],
                                                choices: [
                                                     RecipeChoiceRecord(title: "Port", value: "port"),
-                                                    RecipeChoiceRecord(title: "Unix Socket", value: "unixSocket")
+                                                    RecipeChoiceRecord(title: isWindowsCommandHost ? "Named pipe" : "Unix Socket", value: isWindowsCommandHost ? "namedPipe" : "unixSocket")
                                                 ])
         addCreateChoiceField(transportField, frame: CGRect(x: detailLeft, y: y, width: transportWidth, height: 50))
         let endpointFieldX = detailLeft + transportWidth + 18
         let endpointFieldWidth = max(detailWidth - transportWidth - 18, 180)
 
-        if createValues["bashFrontendTransport", default: "port"] == "unixSocket" {
+        if ["unixSocket", "namedPipe"].contains(createValues["bashFrontendTransport", default: "port"]) {
             addCreateField(RecipeFieldRecord(key: "bashSocketPath",
-                                             label: "Socket Path",
+                                             label: isWindowsCommandHost ? "Named pipe path" : "Socket Path",
                                              defaultValue: "",
                                              fieldType: "text",
-                                             placeholder: "/tmp/my-service.sock",
+                                             placeholder: isWindowsCommandHost ? commandPipePlaceholder : "/tmp/my-service.sock",
                                              suggestions: [],
                                              choices: []),
                            value: createValues["bashSocketPath", default: ""],
@@ -5338,25 +5344,27 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         }
         y -= 72
 
-        let iconButtonWidth: CGFloat = 70
-        addCreateField(RecipeFieldRecord(key: "bashIconPath",
-                                         label: "Icon Path",
-                                         defaultValue: "",
-                                         fieldType: "text",
-                                         placeholder: "Optional",
-                                         suggestions: [],
-                                         choices: []),
-                       value: createValues["bashIconPath", default: ""],
-                       frame: CGRect(x: detailLeft, y: y, width: max(detailWidth - iconButtonWidth - 10, 160), height: 46),
-                       monospaced: true)
-        bashIconSelectFrame = CGRect(x: detailLeft + max(detailWidth - iconButtonWidth, 160),
-                                     y: y,
-                                     width: iconButtonWidth,
-                                     height: 30)
-        let iconSelect = makeButtonLayer(title: "Select", emphasized: false)
-        iconSelect.frame = bashIconSelectFrame
-        addCreateFormSublayer(iconSelect)
-        y -= 72
+        if !isWindowsCommandHost {
+            let iconButtonWidth: CGFloat = 70
+            addCreateField(RecipeFieldRecord(key: "bashIconPath",
+                                             label: "Icon Path",
+                                             defaultValue: "",
+                                             fieldType: "text",
+                                             placeholder: "Optional",
+                                             suggestions: [],
+                                             choices: []),
+                           value: createValues["bashIconPath", default: ""],
+                           frame: CGRect(x: detailLeft, y: y, width: max(detailWidth - iconButtonWidth - 10, 160), height: 46),
+                           monospaced: true)
+            bashIconSelectFrame = CGRect(x: detailLeft + max(detailWidth - iconButtonWidth, 160),
+                                         y: y,
+                                         width: iconButtonWidth,
+                                         height: 30)
+            let iconSelect = makeButtonLayer(title: "Select", emphasized: false)
+            iconSelect.frame = bashIconSelectFrame
+            addCreateFormSublayer(iconSelect)
+            y -= 72
+        }
 
         addCreateField(RecipeFieldRecord(key: "bashIdentifier",
                                          label: "ID",
@@ -8640,7 +8648,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         case .appCatalog:
             return "Outer Shell app catalog"
         case .bashCommands:
-            return "Run bash commands"
+            return commandSectionTitle
         case .nativeApp:
             return "New App"
         case .otherRecipes:
@@ -8651,9 +8659,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private func createFieldAccessibilityDescription(key: String) -> (label: String, value: String?, hint: String?) {
         let bashLabels: [String: (String, String)] = [
             "bashDisplayName": ("Display Name", "My App"),
-            "bashCommands": ("Bash commands", "Paste commands here"),
+            "bashCommands": (commandEditorLabel, "Paste commands here"),
             "bashFrontendTransport": ("Connection", ""),
-            "bashSocketPath": ("Socket Path", "/tmp/my-service.sock"),
+            "bashSocketPath": (isWindowsCommandHost ? "Named pipe path" : "Socket Path", isWindowsCommandHost ? commandPipePlaceholder : "/tmp/my-service.sock"),
             "bashPort": ("Port", "4000"),
             "bashIconPath": ("Icon Path", "Optional"),
             "bashIdentifier": ("ID", "my-app")
@@ -8687,6 +8695,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             switch value {
             case "port":
                 return "Port"
+            case "namedPipe":
+                return "Named pipe"
             case "unixSocket":
                 return "Unix Socket"
             default:
@@ -9870,15 +9880,15 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         }
         let commands = createValues["bashCommands", default: ""].trimmingCharacters(in: .whitespacesAndNewlines)
         if commands.isEmpty {
-            createMessage = "Bash commands are required."
+            createMessage = isWindowsCommandHost ? "Commands are required." : "Bash commands are required."
             updateLayout()
             return
         }
         let transport = createValues["bashFrontendTransport", default: "port"]
-        if transport == "unixSocket" {
+        if transport == "unixSocket" || transport == "namedPipe" {
             let socketPath = createValues["bashSocketPath", default: ""].trimmingCharacters(in: .whitespacesAndNewlines)
             if socketPath.isEmpty {
-                createMessage = "Socket Path is required."
+                createMessage = isWindowsCommandHost ? "Named pipe path is required." : "Socket Path is required."
                 updateLayout()
                 return
             }
@@ -10228,18 +10238,19 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             URLQueryItem(name: "name", value: createValues["bashDisplayName", default: ""].trimmingCharacters(in: .whitespacesAndNewlines)),
             URLQueryItem(name: "identifier", value: identifier)
         ]
-        if transport == "unixSocket" {
+        if transport == "unixSocket" || transport == "namedPipe" {
             queryItems.append(URLQueryItem(name: "socketPath", value: createValues["bashSocketPath", default: ""].trimmingCharacters(in: .whitespacesAndNewlines)))
         } else {
             queryItems.append(URLQueryItem(name: "port", value: createValues["bashPort", default: ""].trimmingCharacters(in: .whitespacesAndNewlines)))
         }
+        if isWindowsCommandHost { queryItems.append(URLQueryItem(name: "scope", value: catalogScope)) }
         let iconPath = createValues["bashIconPath", default: ""].trimmingCharacters(in: .whitespacesAndNewlines)
         if !iconPath.isEmpty {
             queryItems.append(URLQueryItem(name: "iconPath", value: iconPath))
         }
 
         var components = URLComponents(url: createEndpoint, resolvingAgainstBaseURL: false)
-        components?.queryItems = queryItems
+        components?.queryItems = isWindowsCommandHost ? nil : queryItems
         guard let url = components?.url else {
             isPerformingAction = false
             createMessage = "Could not build create request."
@@ -10248,6 +10259,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         }
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
+        if isWindowsCommandHost {
+            request.setValue("application/x-www-form-urlencoded; charset=utf-8", forHTTPHeaderField: "Content-Type")
+            request.httpBody = formEncodedBody(Dictionary(uniqueKeysWithValues: queryItems.map { ($0.name, $0.value ?? "") }))
+        }
         urlSession.dataTask(with: request) { [weak self] data, _, error in
             Task { @MainActor in
                 guard let self else { return }
@@ -14585,6 +14600,13 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func ensureBashDefaults() {
+        if isWindowsCommandHost && createValues["bashFrontendTransport"] == "unixSocket" {
+            createValues["bashFrontendTransport"] = "namedPipe"
+            createValues["bashSocketPath"] = ""
+        } else if !isWindowsCommandHost && createValues["bashFrontendTransport"] == "namedPipe" {
+            createValues["bashFrontendTransport"] = "unixSocket"
+            createValues["bashSocketPath"] = ""
+        }
         if createValues["bashFrontendTransport", default: ""].trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             createValues["bashFrontendTransport"] = "port"
         }

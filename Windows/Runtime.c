@@ -247,14 +247,71 @@ static bool allow_pipes(const char *const *paths, size_t count) {
     return ok;
 }
 
+static SRWLOCK pipe_allow_lock = SRWLOCK_INIT;
+bool win_pipe_is_allowed(const char *pipe) {
+    char *base = win_folder(CSIDL_LOCAL_APPDATA);
+    if (!base) return false;
+    char *path = win_join(base, "OuterSSH/http-pipe.allow"); free(base);
+    StringBuilder text = {0};
+    bool found = false;
+    AcquireSRWLockShared(&pipe_allow_lock);
+    if (win_read_file(path, HTTP_BODY_LIMIT, &text)) {
+        for (size_t at = 0; at < text.length;) {
+            size_t end = at; while (end < text.length && text.data[end] != '\n') end++;
+            size_t trim = end; if (trim > at && text.data[trim - 1] == '\r') trim--;
+            if (trim - at == strlen(pipe) && !_strnicmp(text.data + at, pipe, trim - at)) found = true;
+            at = end + 1;
+        }
+    }
+    ReleaseSRWLockShared(&pipe_allow_lock);
+    free(path); free(text.data); return found;
+}
+bool win_disallow_pipe(const char *pipe) {
+    char *base = win_folder(CSIDL_LOCAL_APPDATA);
+    if (!base) return false;
+    char *path = win_join(base, "OuterSSH/http-pipe.allow"); free(base);
+    StringBuilder text = {0}, updated = {0};
+    AcquireSRWLockExclusive(&pipe_allow_lock);
+    bool ok = win_read_file(path, HTTP_BODY_LIMIT, &text);
+    for (size_t at = 0; ok && at < text.length;) {
+        size_t end = at; while (end < text.length && text.data[end] != '\n') end++;
+        size_t trim = end; if (trim > at && text.data[trim - 1] == '\r') trim--;
+        size_t next = end < text.length ? end + 1 : end;
+        if (trim - at != strlen(pipe) || _strnicmp(text.data + at, pipe, trim - at))
+            ok = sb_append_n(&updated, text.data + at, next - at);
+        at = next;
+    }
+    ok = ok && win_atomic_write(path, updated.data, updated.length);
+    ReleaseSRWLockExclusive(&pipe_allow_lock);
+    free(path); free(text.data); free(updated.data); return ok;
+}
+
 bool win_allow_pipes(const char *const *paths, size_t count) {
-    static SRWLOCK lock = SRWLOCK_INIT;
-    AcquireSRWLockExclusive(&lock);
+    AcquireSRWLockExclusive(&pipe_allow_lock);
     bool ok = allow_pipes(paths, count);
-    ReleaseSRWLockExclusive(&lock);
+    ReleaseSRWLockExclusive(&pipe_allow_lock);
     return ok;
 }
 
+static SRWLOCK pipe_activity_lock = SRWLOCK_INIT;
+static ULONGLONG pipe_last_activity;
+static unsigned pipe_active_connections;
+void pipe_servers_wait_idle(HANDLE stop, DWORD timeout_ms) {
+    for (;;) {
+        if (WaitForSingleObject(stop, 500) != WAIT_TIMEOUT) return;
+        AcquireSRWLockShared(&pipe_activity_lock);
+        bool idle = !pipe_active_connections && GetTickCount64() - pipe_last_activity >= timeout_ms;
+        ReleaseSRWLockShared(&pipe_activity_lock);
+        if (idle) return;
+    }
+}
+static void pipe_activity(bool begin) {
+    AcquireSRWLockExclusive(&pipe_activity_lock);
+    if (begin) pipe_active_connections++;
+    else pipe_active_connections--;
+    pipe_last_activity = GetTickCount64();
+    ReleaseSRWLockExclusive(&pipe_activity_lock);
+}
 struct PipeServer {
     HANDLE stop, listener, slots, first;
     wchar_t *name;
@@ -336,6 +393,7 @@ static unsigned __stdcall pipe_worker(void *argument) {
     free(work);
     s->handler(&c, s->context);
     CloseHandle(c.pipe);
+    pipe_activity(false);
     ReleaseSemaphore(s->slots, 1, NULL);
     return 0;
 }
@@ -376,10 +434,12 @@ static unsigned __stdcall pipe_listener(void *argument) {
             PipeWork *work = win_alloc(sizeof(*work));
             work->server = s;
             work->pipe = pipe;
+            pipe_activity(true);
             HANDLE thread = (HANDLE)_beginthreadex(NULL, 0, pipe_worker, work, 0, NULL);
             if (thread)
                 CloseHandle(thread);
             else {
+                pipe_activity(false);
                 free(work);
                 CloseHandle(pipe);
                 ReleaseSemaphore(s->slots, 1, NULL);
@@ -392,6 +452,9 @@ static unsigned __stdcall pipe_listener(void *argument) {
     return 0;
 }
 PipeServer *pipe_server_start(const char *name, PipeHandler handler, void *context) {
+    AcquireSRWLockExclusive(&pipe_activity_lock);
+    pipe_last_activity = GetTickCount64();
+    ReleaseSRWLockExclusive(&pipe_activity_lock);
     PipeServer *s = win_alloc(sizeof(*s));
     s->name = win_wide(name);
     s->sd = security_descriptor(false);
@@ -503,7 +566,7 @@ static int hex_value(unsigned char c) {
         return c - 'A' + 10;
     return -1;
 }
-static char *url_decode(const char *s, size_t length, bool plus) {
+static char *url_decode(const char *s, size_t length, bool plus, bool multiline) {
     char *r = win_alloc(length + 1);
     size_t out = 0;
     for (size_t i = 0; i < length; i++) {
@@ -517,7 +580,7 @@ static char *url_decode(const char *s, size_t length, bool plus) {
             i += 2;
         } else if (c == '+' && plus)
             c = ' ';
-        if (!c || c < 32 || c == 127) {
+        if (!c || (c < 32 && !(multiline && (c == '\r' || c == '\n' || c == '\t'))) || c == 127) {
             free(r);
             return NULL;
         }
@@ -531,8 +594,8 @@ static char *url_decode(const char *s, size_t length, bool plus) {
     free(wide);
     return r;
 }
-char *http_query(const HttpRequest *r, const char *name) {
-    const char *p = r->query ? r->query : "";
+static char *form_value(const char *form, const char *name, bool multiline) {
+    const char *p = form ? form : "";
     size_t n = strlen(name);
     while (*p) {
         const char *end = strchr(p, '&');
@@ -540,11 +603,13 @@ char *http_query(const HttpRequest *r, const char *name) {
             end = p + strlen(p);
         const char *equal = memchr(p, '=', (size_t)(end - p));
         if (equal && (size_t)(equal - p) == n && !memcmp(p, name, n))
-            return url_decode(equal + 1, (size_t)(end - equal - 1), true);
+            return url_decode(equal + 1, (size_t)(end - equal - 1), true, multiline);
         p = *end ? end + 1 : end;
     }
     return NULL;
 }
+char *http_query(const HttpRequest *r, const char *name) { return form_value(r->query, name, false); }
+char *http_form(const HttpRequest *r, const char *name) { return form_value(r->body.data, name, !strcmp(name, "command")); }
 static bool http_body_read(Connection *c, StringBuilder *body, size_t length) {
     if (length > HTTP_BODY_LIMIT - body->length || !sb_reserve(body, length))
         return false;
@@ -578,7 +643,7 @@ bool http_read(Connection *c, HttpRequest *r) {
     if (query)
         *query++ = 0;
     r->query = win_strdup(query ? query : "");
-    r->path = url_decode(space, strlen(space), false);
+    r->path = url_decode(space, strlen(space), false, false);
     if (!r->path)
         goto done;
     for (;;) {
@@ -849,4 +914,51 @@ void http_static(Connection *c, const HttpRequest *r, const char *root) {
     char *path = win_join(root, relative);
     http_file(c, r, path, false, false);
     free(path);
+}
+
+bool win_set_pipe_activation(const char *pipe, const char *task) {
+    if (!pipe || _strnicmp(pipe, "\\\\.\\pipe\\", 9) || !pipe[9] || strpbrk(pipe, "\t\r\n") ||
+        (task && (task[0] != '\\' || !task[1] || strpbrk(task, "\t\r\n")))) return false;
+    char *local = win_folder(CSIDL_LOCAL_APPDATA);
+    if (!local) return false;
+    char *directory = win_join(local, "org.outerssh"); free(local);
+    bool ok = win_secure_directory(directory);
+    char *path = win_join(directory, "activations.tsv"), *lock_path = win_join(directory, "activations.lock");
+    wchar_t *lock_w = win_wide(lock_path); free(lock_path); free(directory);
+    HANDLE lock = INVALID_HANDLE_VALUE;
+    ULONGLONG deadline = GetTickCount64() + 5000;
+    while (ok && lock_w) {
+        lock = CreateFileW(lock_w, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+        if (lock != INVALID_HANDLE_VALUE) break;
+        if (GetLastError() != ERROR_SHARING_VIOLATION || GetTickCount64() >= deadline) break;
+        Sleep(20);
+    }
+    free(lock_w);
+    ok = ok && lock != INVALID_HANDLE_VALUE;
+    StringBuilder contents = {0}, updated = {0};
+    if (ok && !win_read_file(path, 1024 * 1024, &contents)) ok = GetLastError() == ERROR_FILE_NOT_FOUND;
+    bool found = false;
+    for (size_t offset = 0; ok && offset < contents.length;) {
+        size_t end = offset;
+        while (end < contents.length && contents.data[end] != '\n') end++;
+        size_t length = end - offset;
+        if (length && contents.data[offset + length - 1] == '\r') length--;
+        if (length) {
+            char *line = win_alloc(length + 1); memcpy(line, contents.data + offset, length);
+            char *tab = strchr(line, '\t');
+            ok = strlen(line) == length && tab && tab != line && tab[1] == '\\' && tab[2] && !strchr(tab + 1, '\t') && !strchr(line, '\r');
+            if (ok) {
+                *tab = 0;
+                if (!_stricmp(line, pipe)) { if (found) ok = false; found = true; }
+                else { *tab = '\t'; ok = sb_append_n(&updated, line, length) && sb_append(&updated, "\n"); }
+            }
+            free(line);
+        }
+        offset = end + 1;
+    }
+    if (ok && task) ok = sb_append(&updated, pipe) && sb_append(&updated, "\t") && sb_append(&updated, task) && sb_append(&updated, "\n");
+    if (ok) ok = win_atomic_write(path, updated.data, updated.length);
+    if (lock != INVALID_HANDLE_VALUE) CloseHandle(lock);
+    free(contents.data); free(updated.data); free(path);
+    return ok;
 }

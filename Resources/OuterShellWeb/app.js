@@ -1316,6 +1316,7 @@
   }
 
   function openAddDialog(tab = state.addTab) {
+    const windowsCommands = state.hostPlatform === "windows" && !state.addWorkspace;
     state.addTab = tab;
     const apps = (state.addWorkspace ? state.workspaceCatalog || [] : state.backends).filter(backend => backend.serviceID !== "org.outershell.OuterShell" && backend.isBundled && !backend.isMigration && backend.serviceScope === state.addScope)
       .sort((a, b) => a.displayName.localeCompare(b.displayName));
@@ -1331,12 +1332,13 @@
       <div class="form-grid">
         <div class="field"><label for="bash-name">Display name</label><input id="bash-name" name="name" placeholder="My server" required></div>
         <div class="field"><label for="bash-id">Identifier</label><input id="bash-id" class="mono" name="identifier" placeholder="my-server" required><span class="field-note">Used for the service and files.</span></div>
-        <div class="field full"><label for="bash-command">Bash commands</label><textarea id="bash-command" name="command" placeholder="cd ~/dev/my-app&#10;npm start" required></textarea></div>
-        <div class="field"><label for="bash-transport">Connection</label><select id="bash-transport" name="frontendTransport"><option value="port">TCP port</option><option value="unixSocket">Unix socket</option></select></div>
+        <div class="field full"><label for="bash-command">${windowsCommands ? "Command Prompt commands (cmd.exe)" : "Bash commands"}</label><textarea id="bash-command" name="command" placeholder="${windowsCommands ? "cd /d C:\\dev\\my-app&#10;npm start" : "cd ~/dev/my-app&#10;npm start"}" required></textarea></div>
+        <div class="field"><label for="bash-transport">Connection</label><select id="bash-transport" name="frontendTransport"><option value="port">TCP port</option>${windowsCommands ? '<option value="namedPipe">Named pipe</option>' : '<option value="unixSocket">Unix socket</option>'}</select></div>
         <div class="field" data-transport="port"><label for="bash-port">Port</label><input id="bash-port" class="mono" name="port" inputmode="numeric" placeholder="4000" required></div>
-        <div class="field" data-transport="unixSocket" hidden><label for="bash-socket">Socket path</label><input id="bash-socket" class="mono" name="socketPath" placeholder="/run/user/1000/my-app.sock"></div>
-        <div class="field full"><label for="bash-icon">Icon path <span class="field-note">(optional)</span></label><input id="bash-icon" class="mono" name="iconPath" placeholder="~/Pictures/my-app.png"></div>
+        <div class="field" data-transport="${windowsCommands ? "namedPipe" : "unixSocket"}" hidden><label for="bash-socket">${windowsCommands ? "Named pipe path" : "Socket path"}</label><input id="bash-socket" class="mono" name="socketPath" placeholder="${windowsCommands ? String.raw`\\.\pipe\my-app` : "/run/user/1000/my-app.sock"}"></div>
+        <div class="field full" ${windowsCommands ? "hidden" : ""}><label for="bash-icon">Icon path <span class="field-note">(optional)</span></label><input id="bash-icon" class="mono" name="iconPath" placeholder="~/Pictures/my-app.png"></div>
       </div>
+      ${windowsCommands ? "<p>Outer Shell starts these commands as your signed-in user. Keep the server in the foreground and configure it to listen on this port or named pipe. Use Start to run it again after it exits.</p>" : ""}
       <p id="bash-message" class="form-message" role="status"></p>
       <footer class="dialog-footer"><button class="secondary-button" type="button" data-action="close-dialog">Cancel</button><button class="primary-button" type="submit">Create app</button></footer>
     </form>`;
@@ -1366,9 +1368,9 @@ Install &lt;app&gt;. Set it up as a service and register it with Outer Shell so 
     const categories = [
       ["catalog", "Outer Shell app catalog", '<rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/>'],
       ["agent", "Ask your coding agent", '<path d="M21 11a8 8 0 0 1-8 8H7l-5 3V11a9 9 0 0 1 19 0Z"/><path d="m7 9 3 3-3 3m6 0h4"/>'],
-      ["bash", "Run bash commands", '<rect x="2" y="3" width="20" height="18" rx="2"/><path d="m6 8 3 3-3 3m6 0h5"/>'],
+      ["bash", windowsCommands ? "Run commands" : "Run bash commands", '<rect x="2" y="3" width="20" height="18" rx="2"/><path d="m6 8 3 3-3 3m6 0h5"/>'],
       ["recipes", "Other recipes", '<rect x="2" y="3" width="20" height="18" rx="2"/><path d="M6 8h1m3 0h8M6 12h1m3 0h8M6 16h1m3 0h5"/>']
-    ].filter(([id]) => !state.addWorkspace || state.addScope !== "system" || id === "catalog" || id === "agent");
+    ].filter(([id]) => (!(state.addWorkspace || windowsCommands) || state.addScope !== "system" || id === "catalog" || id === "agent") && (!windowsCommands || id !== "recipes"));
     const dialog = openDialog(`
       <header class="dialog-header"><div class="dialog-title-wrap"><h2 id="dialog-title">Add Apps${state.addWorkspace ? ` · ${escapeHTML(state.addWorkspace.name)} / ${state.addScope === "system" ? "root" : escapeHTML(state.addWorkspace.userName || "user")}` : ""}</h2></div><button class="dialog-close" type="button" data-action="close-dialog" aria-label="Close">×</button></header>
       <div class="dialog-body">
@@ -1466,6 +1468,7 @@ Install &lt;app&gt;. Set it up as a service and register it with Outer Shell so 
     const message = form.querySelector("#bash-message");
     const submit = form.querySelector("button[type=submit]");
     const values = Object.fromEntries(new FormData(form));
+    const windowsCommands = state.hostPlatform === "windows" && !state.addWorkspace;
     const query = new URLSearchParams({
       recipe: "command-port",
       command: values.command,
@@ -1474,14 +1477,15 @@ Install &lt;app&gt;. Set it up as a service and register it with Outer Shell so 
       name: values.name.trim(),
       identifier: values.identifier.trim()
     });
-    if (values.frontendTransport === "unixSocket") query.set("socketPath", values.socketPath.trim());
+    if (values.frontendTransport === "unixSocket" || values.frontendTransport === "namedPipe") query.set("socketPath", values.socketPath.trim());
     else query.set("port", values.port.trim());
     if (values.iconPath.trim()) query.set("iconPath", values.iconPath.trim());
+    if (windowsCommands) query.set("scope", state.addScope);
     submit.disabled = true;
     submit.textContent = "Creating…";
     message.textContent = "";
     try {
-      const { buffer } = await requestBuffer(`/api/create?${query}`, { method: "POST" }, true);
+      const { buffer } = await requestBuffer(windowsCommands ? "/api/create" : `/api/create?${query}`, { method: "POST", ...(windowsCommands ? {headers: {"Content-Type": "application/x-www-form-urlencoded"}, body: query} : {}) }, true);
       const result = decodeAction(buffer);
       if (!result.ok) throw new Error(result.message || "Could not create the app.");
       closeDialog();

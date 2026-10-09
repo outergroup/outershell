@@ -4,9 +4,9 @@ Outer Shell and Files are native C executables, with a statically linked runtime
 and no CLR or managed DLL dependency. The Windows host uses the same C registry
 model and ORWA persistence format as `outershelld`, plus the shared layout
 validator. Files shares its binary listing encoder with its Unix backend. The
-Windows adapter supplies named-pipe HTTP, process supervision, and SCM integration.
+Windows adapter supplies named-pipe HTTP, process supervision, Task Scheduler, and optional SCM integration.
 It serves the macOS outerframe frontend to Outer Loop, the shared HTML frontend
-to web clients, and starts a separate Files process.
+to web clients. The normal user installation runs Files independently.
 Native Windows apps require neither WSL nor a TCP listener. WSL distributions can
 optionally expose their Linux apps through the same Windows host.
 
@@ -36,11 +36,29 @@ harness and is not installed. The installer removes obsolete managed/runtime DLL
 when upgrading an existing installation.
 
 Install as the ordinary desktop user. Files, registry data, logs, and layout live
-in `%LOCALAPPDATA%\OuterShell`. Installation registers an interactive logon task
-`OuterShell-<SID>`; `-Start` starts that task, so it survives an installing SSH
-connection closing. The user must have an interactive logon session. The task
-restarts the host after failures. A Windows job object kills Files if its owning host exits, including abrupt
-termination. Service shutdown cancels pending named-pipe I/O and waits for workers.
+in `%LOCALAPPDATA%\OuterShell`. Installation registers two interactive-user tasks:
+`OuterShell-<SID>` and `OuterShell-Files-<SID>`. Neither has a logon trigger;
+`-Start` optionally starts Outer Shell immediately. The user must have a desktop
+session. No password is stored. Tasks ignore duplicate launch requests, have no
+execution time limit, and can recover after failures.
+
+The installer writes pipe-to-task mappings to
+`%LOCALAPPDATA%\org.outerssh\activations.tsv`. Opening an allowlisted endpoint
+through Outer Loop's Windows Localhost mode or Windows SSH bridge activates its
+task if its pipe is absent. Files survives Outer Shell exit. Both apps exit
+normally after five minutes without active named-pipe connections; active WSL
+relays count as activity for Outer Shell. Idle exits leave tasks enabled.
+Manual Stop disables a task; Start or Restart re-enables it.
+
+`activations.tsv` is UTF-8 without a BOM, one full pipe path and absolute task
+path per line separated by a literal tab. Blank lines and LF/CRLF are accepted.
+No quoting, escaping, or comments are supported. Duplicates (case-insensitive)
+and malformed rows are rejected. The maximum size is 1 MiB. The bridge validates
+file/directory ownership and ACLs separately from the HTTP allowlist. Writers
+atomically replace the file while holding `activations.lock` in the same folder.
+
+The optional `-SystemService` deployment retains its existing SCM behavior and
+host-owned Files process; it does not install SYSTEM-account tasks.
 
 The exact registered HTTP endpoints are added to
 `%LOCALAPPDATA%\OuterSSH\http-pipe.allow`:
@@ -119,7 +137,8 @@ account's normal filesystem permissions; Files is not a filesystem sandbox.
 `test_host.py <path-to-packaged-OuterShell.exe>` exercises HTTP framing, origin
 checks, outerframe negotiation and both macOS bundle downloads, layout conflicts
 and persistence, Unicode Files listings, binary/chunked
-transfers, controls, concurrency, and child cleanup. Run it under an account with
+transfers, controls, concurrency, and Files independence. Install the package first
+so the Files task exists. Run it under an account with
 no existing Outer Shell process, because it uses that account's canonical pipes.
 It uses temporary registry state and restores the account's prior allowlist.
 
@@ -239,3 +258,29 @@ revocation (restored afterward), stopped-distribution discovery, and reconnectio
 Outer Loop's Windows named-pipe browser integration test additionally launches
 WSL Files from its own group through the Localhost AppContainer and verifies the
 Linux home directory and verified Windows pipe identity.
+
+## Commands
+
+On a Windows user card, **Add more… → Run commands** registers an independent,
+least-privilege interactive task. Supply a display name, identifier, multiline
+`cmd.exe` script, and TCP port (the default) or named pipe. Keep the server in the foreground. The form
+uses a POST body and supports UTF-8 commands; working directory defaults to the
+user profile. Configure the app itself to listen on the specified endpoint. TCP endpoints use
+`127.0.0.1`; no firewall rule or public listener is created by Outer Shell.
+
+Scripts, a private runner copy, and output logs live beneath
+`%LOCALAPPDATA%\OuterShell\commands\org.outershell.command.<identifier>`.
+The runner contains the process tree in a Windows job object. Start/stop/restart,
+logs, and uninstall are exposed in the backend menu. Uninstall removes the task,
+activation registration, script, runner, log, and only allowlist entries owned
+by that registration. Commands start when created and are launched explicitly
+through Outer Shell thereafter. They do not add task activation mappings: opening
+a stopped command endpoint does not launch it. Built-in Outer Shell and Files
+retain their independent bridge activation mappings.
+Administrator-scope command registration is not offered by this form.
+
+`test_task_activation.py <installed-OuterShell.exe>` checks cold and concurrent
+activation, independent Files lifetime, invalid registrations, and allowlist
+checks. `test_commands.py <OuterShell.exe>` tests command creation, Unicode,
+logs, process-tree cleanup, persistence, restart, and uninstall. Run both as the
+signed-in desktop user, with existing same-user hosts stopped for the latter.

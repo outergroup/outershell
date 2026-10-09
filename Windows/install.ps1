@@ -17,10 +17,11 @@ if ($SystemService) {
     $service = Get-Service $serviceName -ErrorAction SilentlyContinue
     if ($service -and $service.Status -ne 'Stopped') { Stop-Service $serviceName; $service.WaitForStatus('Stopped', [TimeSpan]::FromSeconds(20)) }
  } else {
-    $taskName = "OuterShell-$sid"
-    if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) {
-        Disable-ScheduledTask -TaskName $taskName | Out-Null
-        Stop-ScheduledTask -TaskName $taskName
+    foreach ($taskName in @("OuterShell-$sid", "OuterShell-Files-$sid")) {
+        if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) {
+            Disable-ScheduledTask -TaskName $taskName | Out-Null
+            Stop-ScheduledTask -TaskName $taskName
+        }
     }
     Get-CimInstance Win32_Process -Filter "Name='OuterShell.exe' OR Name='FilesBackend.exe'" | Where-Object { $_.ExecutablePath -eq "$destination\OuterShell.exe" -or $_.ExecutablePath -eq "$destination\FilesBackend.exe" } | ForEach-Object { $process = Get-Process -Id $_.ProcessId -ErrorAction SilentlyContinue
         if ($process) { $process.Kill(); if (!$process.WaitForExit(10000)) { throw 'The existing app did not stop.' }; $process.Dispose() }
@@ -65,12 +66,13 @@ if ($SystemService) {
 } else {
     & $executable --initialize
     if ($LASTEXITCODE) { throw 'Could not initialize the HTTP named-pipe allowlist.' }
-    $action = New-ScheduledTaskAction -Execute $executable -WorkingDirectory $destination
-    $trigger = New-ScheduledTaskTrigger -AtLogOn -User $identity.Name
     $principal = New-ScheduledTaskPrincipal -UserId $identity.Name -LogonType Interactive -RunLevel Limited
-    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
-    Register-ScheduledTask -TaskName "OuterShell-$sid" -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
-    Enable-ScheduledTask -TaskName "OuterShell-$sid" | Out-Null
+    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
+    foreach ($app in @(@{Name="OuterShell-$sid"; File='OuterShell.exe'}, @{Name="OuterShell-Files-$sid"; File='FilesBackend.exe'})) {
+        $action = New-ScheduledTaskAction -Execute (Join-Path $destination $app.File) -WorkingDirectory $destination
+        Register-ScheduledTask -TaskName $app.Name -Action $action -Principal $principal -Settings $settings -Force | Out-Null
+        Enable-ScheduledTask -TaskName $app.Name | Out-Null
+    }
     if ($Start) { Start-ScheduledTask -TaskName "OuterShell-$sid" }
 }
 Write-Output "Installed Outer Shell and Files in $destination"

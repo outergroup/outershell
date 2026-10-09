@@ -1,4 +1,4 @@
-"""Integration tests for native Windows Outer Shell and Files (no running same-user host)."""
+"""Integration tests for installed native Windows tasks (no running same-user host)."""
 import concurrent.futures
 import json
 import os
@@ -130,6 +130,7 @@ with tempfile.TemporaryDirectory(prefix='outer-c-test-') as temporary:
             assert request(pipe, bundle + '/' + platform, method='HEAD') == (200, b'')
         assert request(pipe, bundle + '/../../install.ps1')[0] == 404
         assert b'<html' in request(pipe, '/')[1].lower()
+        control('start')
         assert request(files, '/')[0] == 200
         duplicate = subprocess.run([str(exe), '--state', str(state)], capture_output=True, timeout=10)
         assert duplicate.returncode != 0
@@ -178,17 +179,14 @@ with tempfile.TemporaryDirectory(prefix='outer-c-test-') as temporary:
         assert replies == [200] * 32
         process.kill(); process.wait(timeout=10)
         time.sleep(.3)
-        try:
-            open(files, 'r+b', buffering=0).close()
-        except OSError:
-            pass
-        else:
-            raise AssertionError('Files survived its owning host')
+        assert request(files, '/')[0] == 200, 'Independent Files task exited with Outer Shell'
         process = subprocess.Popen([str(exe), '--state', str(state)], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         children.append(process)
         assert request(pipe, '/api/layout') == (200, updated)
-        print('PASS native host: registry, web, layout CAS/persistence, framing, origin, Unicode Files, transfers, controls, concurrency, job cleanup')
+        print('PASS native host: registry, web, layout CAS/persistence, framing, origin, Unicode Files, transfers, controls, concurrency, independent Files task')
     finally:
+        sid = subprocess.check_output(['whoami','/user','/fo','csv','/nh'],text=True).strip().split(',')[-1].strip('"')
+        subprocess.run(['schtasks','/End','/TN','OuterShell-Files-'+sid],capture_output=True)
         if process.poll() is None:
             process.kill()
         process.wait(timeout=10)

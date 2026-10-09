@@ -11,6 +11,8 @@ typedef struct {
     CRITICAL_SECTION gate;
     CONDITION_VARIABLE changed;
     uint64_t version;
+    DWORD files_task_state;
+    ULONGLONG files_queried;
     PipeServer *http, *api;
     Wsl *wsl;
 } ShellHost;
@@ -66,7 +68,9 @@ static bool update_allowlist(ShellHost *s) {
     free(paths);
     return store_close(s, &store, false) && ok;
 }
-static bool files_running(ShellHost *s) {
+#include "Commands.inc"
+
+static bool legacy_files_running(ShellHost *s) {
     if (!s->files)
         return false;
     if (WaitForSingleObject(s->files, 0) == WAIT_TIMEOUT)
@@ -76,8 +80,8 @@ static bool files_running(ShellHost *s) {
     changed(s);
     return false;
 }
-static bool start_files(ShellHost *s) {
-    if (files_running(s))
+static bool legacy_start_files(ShellHost *s) {
+    if (legacy_files_running(s))
         return true;
     if (WaitForSingleObject(s->stop, 0) == WAIT_OBJECT_0)
         return false;
@@ -113,8 +117,8 @@ static bool start_files(ShellHost *s) {
         log_error(s, "Files process could not start.");
     return ok;
 }
-static bool stop_files(ShellHost *s) {
-    if (!files_running(s))
+static bool legacy_stop_files(ShellHost *s) {
+    if (!legacy_files_running(s))
         return true;
     if (!TerminateProcess(s->files, 0) || WaitForSingleObject(s->files, 5000) != WAIT_OBJECT_0)
         return false;
@@ -123,14 +127,34 @@ static bool stop_files(ShellHost *s) {
     changed(s);
     return true;
 }
-static bool set_files_enabled(ShellHost *s, bool enabled) {
-    RegistryStore store;
-    if (!store_open(s, &store, true))
-        return false;
-    unsigned char flag = enabled ? 1 : 0;
-    bool ok = registry_store_upsert_resource(&store, "windows.files.enabled", &flag, 1);
-    return store_close(s, &store, ok) && ok;
+static char *files_task_name(void) {
+    char *sid = win_sid();
+    if (!sid) return NULL;
+    StringBuilder name = {0}; sb_append(&name, "\\OuterShell-Files-"); sb_append(&name, sid);
+    free(sid); return name.data;
 }
+static bool files_running(ShellHost *s) {
+    if (s->service_name[0]) return legacy_files_running(s);
+    ULONGLONG now = GetTickCount64();
+    if (!s->files_queried || now - s->files_queried >= 1000) {
+        char *name = files_task_name(); DWORD state = 0;
+        if (name) command_task(name, "query", NULL, &state);
+        free(name);
+        if (state != s->files_task_state) { s->files_task_state = state; changed(s); }
+        s->files_queried = now;
+    }
+    return s->files_task_state == 4;
+}
+static bool files_task_control(ShellHost *s, const char *operation) {
+    char *name = files_task_name();
+    HRESULT hr = name ? command_task(name, operation, NULL, NULL) : E_FAIL;
+    free(name);
+    s->files_queried = 0;
+    if (FAILED(hr)) { log_error(s, "Could not control the Files task."); return false; }
+    changed(s); return true;
+}
+static bool start_files(ShellHost *s) { return s->service_name[0] ? legacy_start_files(s) : files_task_control(s, "start"); }
+static bool stop_files(ShellHost *s) { return s->service_name[0] ? legacy_stop_files(s) : files_task_control(s, "stop"); }
 static DWORD service_query(const char *name) {
     SC_HANDLE manager = OpenSCManagerW(NULL, NULL, SC_MANAGER_CONNECT);
     if (!manager)
@@ -228,6 +252,10 @@ static StringBuilder backends(ShellHost *s) {
             running = files_running(s);
             status = running ? "running" : "stopped";
             controls = true;
+        } else if (command_find(b->service_id)) {
+            running = command_running(s, command_find(b->service_id));
+            status = running ? "running" : "stopped";
+            controls = true;
         } else if (b->unit_name[0]) {
             DWORD state = service_query(b->unit_name);
             running = state == SERVICE_RUNNING;
@@ -263,7 +291,7 @@ static StringBuilder backends(ShellHost *s) {
             payload_u32(&app, 48, (uint32_t)a->port);
             payload_text(&app, 52, a->frontend_id);
             payload_u32(&app, 60,
-                        running || (strcmp(b->service_id, files_id) && strcmp(b->service_id, shell_id)) ? 1
+                        running || (!controls && strcmp(b->service_id, shell_id)) ? 1
                                                                                                         : 0);
             payload_data(&apps, 4 + index++ * 8, app.data, app.length);
             free(app.data);
@@ -274,10 +302,17 @@ static StringBuilder backends(ShellHost *s) {
         payload_text(&row, 16, b->unit_name);
         payload_text(&row, 32, scope);
         payload_text(&row, 40, status);
-        payload_u32(&row, 64, 8u | (controls ? 1u : 0u));
+        payload_u32(&row, 64, 8u | (controls ? 1u : 0u) | (command_find(b->service_id) ? 2u : 0u));
         payload_data(&row, 68, apps.data, apps.length);
         uint32_t empty = 0;
-        payload_data(&row, 76, &empty, 4);
+        if (command_find(b->service_id)) {
+            char *path = command_path(s, b->service_id, "output.log");
+            StringBuilder log = payload(44), logs = payload(12);
+            payload_text(&log, 0, "output"); payload_text(&log, 8, "Output"); payload_text(&log, 16, path);
+            payload_u32(&log, 40, 1); payload_u32(&logs, 0, 1); payload_data(&logs, 4, log.data, log.length);
+            payload_data(&row, 76, logs.data, logs.length);
+            free(path); free(log.data); free(logs.data);
+        } else payload_data(&row, 76, &empty, 4);
         payload_data(&result, 12 + i * 8, row.data, row.length);
         free(row.data);
         free(apps.data);
@@ -289,15 +324,19 @@ static StringBuilder backends(ShellHost *s) {
     return result;
 }
 static StringBuilder control(ShellHost *s, HttpRequest *r) {
+    char task_error[256];
     char *id = http_query(r, "serviceID"), *operation = http_query(r, "operation");
     bool ok = false;
     const char *message = "This operation is not supported for this backend.";
     if (id && operation && !strcmp(id, files_id)) {
         if (!strcmp(operation, "stop") || !strcmp(operation, "disable"))
-            ok = stop_files(s) && set_files_enabled(s, false);
+            ok = stop_files(s);
         else if (!strcmp(operation, "start") || !strcmp(operation, "enable") || !strcmp(operation, "restart"))
-            ok = (strcmp(operation, "restart") || stop_files(s)) && set_files_enabled(s, true) &&
+            ok = (strcmp(operation, "restart") || stop_files(s)) &&
                  start_files(s);
+    } else if (id && operation && command_find(id)) {
+        ok = command_control(s, command_find(id), operation, task_error, sizeof(task_error));
+        if (!ok) message = task_error;
     } else if (id && operation) {
         RegistryStore store;
         if (store_open(s, &store, false)) {
@@ -460,6 +499,7 @@ static void serve_http(Connection *c, void *context) {
         while (previous == s->version && GetTickCount64() < deadline &&
                WaitForSingleObject(s->stop, 0) != WAIT_OBJECT_0) {
             files_running(s);
+            for (CommandApp *a = command_apps; a; a = a->next) command_running(s, a);
             current_overview = (s->version << 32) ^ wsl_version(s->wsl);
             if (previous != s->version || prior_overview != current_overview)
                 break;
@@ -475,6 +515,12 @@ static void serve_http(Connection *c, void *context) {
             status = 405;
         else
             body = control(s, &r);
+    } else if (!strcmp(r.path, "/api/logs")) {
+        if (strcmp(r.method, "GET")) status = 405;
+        else body = command_logs(s, &r);
+    } else if (!strcmp(r.path, "/api/create")) {
+        if (strcmp(r.method, "POST")) status = 405;
+        else body = command_create(s, &r);
     } else if (!strcmp(r.path, "/api/recipes")) {
         body = payload(16);
         uint32_t empty = 0;
@@ -543,24 +589,22 @@ static bool shell_start(ShellHost *s) {
                                                      "", true);
         free(pipe);
     }
-    RegistryResourceRecord *enabled = registry_store_find_resource(&store, "windows.files.enabled");
-    bool start = !enabled || !enabled->data_length || enabled->data[0];
     ok = store_close(s, &store, ok) && ok;
-    if (!ok || !update_allowlist(s))
-        return false;
-    s->job = CreateJobObjectW(NULL, NULL);
-    JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits = {0};
-    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-    if (!s->job ||
-        !SetInformationJobObject(s->job, JobObjectExtendedLimitInformation, &limits, sizeof(limits)))
-        return false;
+    if (!ok || !update_allowlist(s)) return false;
+    if (s->service_name[0]) {
+        s->job = CreateJobObjectW(NULL, NULL);
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits = {0};
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if (!s->job || !SetInformationJobObject(s->job, JobObjectExtendedLimitInformation, &limits, sizeof(limits))) return false;
+        if (!legacy_start_files(s)) return false;
+    }
     s->wsl = wsl_start(s->stop);
     char *api = win_pipe("org.outershell.outershelld"), *http = win_pipe(shell_id);
     s->api = api ? pipe_server_start(api, serve_registry, s) : NULL;
     s->http = http ? pipe_server_start(http, serve_http, s) : NULL;
     free(api);
     free(http);
-    if (!s->api || !s->http || (start && !start_files(s)))
+    if (!s->api || !s->http || !commands_load(s))
         return false;
     char pid[32];
     int n = snprintf(pid, sizeof(pid), "%lu", GetCurrentProcessId());
@@ -578,12 +622,14 @@ static void shell_stop(ShellHost *s) {
     wsl_stop(s->wsl);
     s->wsl = NULL;
     EnterCriticalSection(&s->gate);
-    stop_files(s);
-    LeaveCriticalSection(&s->gate);
-    if (s->job) {
-        CloseHandle(s->job);
-        s->job = NULL;
+    if (s->service_name[0]) legacy_stop_files(s);
+    if (s->job) { CloseHandle(s->job); s->job = NULL; }
+    while (command_apps) {
+        CommandApp *a = command_apps; command_apps = a->next;
+        free(a->id); free(a->task_name); free(a);
     }
+    LeaveCriticalSection(&s->gate);
+
 }
 static BOOL WINAPI console_control(DWORD event) {
     (void)event;
@@ -624,7 +670,7 @@ static void WINAPI service_main(DWORD argc, LPWSTR *argv) {
     LeaveCriticalSection(&shell.gate);
     if (ok) {
         report_service(SERVICE_RUNNING, 0);
-        WaitForSingleObject(shell.stop, INFINITE);
+        pipe_servers_wait_idle(shell.stop, 300000);
     }
     shell_stop(&shell);
     report_service(SERVICE_STOPPED, ok ? 0 : ERROR_SERVICE_SPECIFIC_ERROR);
@@ -632,6 +678,7 @@ static void WINAPI service_main(DWORD argc, LPWSTR *argv) {
 int wmain(int argc, wchar_t **argv) {
     if (argc == 2 && !wcscmp(argv[1], L"--wsl-list")) return wsl_inspect();
     bool service = false, initialize = false;
+    char *run_command_id = NULL;
     shell.service_name = win_strdup("");
     char *local = win_folder(CSIDL_LOCAL_APPDATA);
     if (!local)
@@ -656,6 +703,8 @@ int wmain(int argc, wchar_t **argv) {
         } else if (!wcscmp(argv[i], L"--service-name") && i + 1 < argc) {
             free(shell.service_name);
             shell.service_name = win_utf8(argv[++i]);
+        } else if (!wcscmp(argv[i], L"--run-command") && i + 1 < argc) {
+            run_command_id = win_utf8(argv[++i]);
         } else if (!wcscmp(argv[i], L"--state") && i + 1 < argc) {
             wchar_t full[32768];
             DWORD n = GetFullPathNameW(argv[++i], 32768, full, NULL);
@@ -676,6 +725,11 @@ int wmain(int argc, wchar_t **argv) {
         char *a = win_pipe(shell_id), *b = win_pipe(files_id);
         const char *paths[] = {a, b};
         bool ok = a && b && win_allow_pipes(paths, 2);
+        char *sid = win_sid(), *api = win_pipe("org.outershell.outershelld"), *files_task = files_task_name();
+        StringBuilder task = {0}; sb_append(&task, "\\OuterShell-"); if (sid) sb_append(&task, sid);
+        ok = ok && sid && api && files_task && win_set_pipe_activation(a, task.data) &&
+             win_set_pipe_activation(api, task.data) && win_set_pipe_activation(b, files_task);
+        free(sid); free(api); free(files_task); free(task.data);
         free(a);
         free(b);
         return ok ? 0 : 1;
@@ -694,6 +748,26 @@ int wmain(int argc, wchar_t **argv) {
     InitializeCriticalSection(&shell.gate);
     InitializeConditionVariable(&shell.changed);
     shell.version = 1;
+    if (run_command_id) {
+        FreeConsole();
+        if (strpbrk(run_command_id, "/\\:") || strncmp(run_command_id, "org.outershell.command.", 22)) return 1;
+        char *script_path = command_path(&shell, run_command_id, "run.cmd");
+        wchar_t *script_w = win_wide(script_path); free(script_path);
+        DWORD script_attributes = script_w ? GetFileAttributesW(script_w) : INVALID_FILE_ATTRIBUTES;
+        free(script_w);
+        if (script_attributes == INVALID_FILE_ATTRIBUTES) return 1;
+        char *lock_path = command_path(&shell, run_command_id, "runner.lock");
+        wchar_t *lock_w = win_wide(lock_path); free(lock_path);
+        HANDLE lock = lock_w ? CreateFileW(lock_w, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL) : INVALID_HANDLE_VALUE;
+        free(lock_w);
+        if (lock == INVALID_HANDLE_VALUE) return 1;
+        CommandApp app = {0}; app.id = run_command_id;
+        if (!command_spawn(&shell, &app)) return 1;
+        WaitForSingleObject(app.process, INFINITE);
+        DWORD exit_code = 1; GetExitCodeProcess(app.process, &exit_code);
+        command_stop(&app); CloseHandle(lock); free(run_command_id);
+        return (int)exit_code;
+    }
     bool ok;
     if (service) {
         wchar_t *name = win_wide(shell.service_name);
@@ -707,7 +781,7 @@ int wmain(int argc, wchar_t **argv) {
         LeaveCriticalSection(&shell.gate);
         if (ok) {
             puts("Outer Shell is listening.");
-            WaitForSingleObject(shell.stop, INFINITE);
+            pipe_servers_wait_idle(shell.stop, 300000);
         } else
             log_error(&shell, "Outer Shell could not start.");
         shell_stop(&shell);

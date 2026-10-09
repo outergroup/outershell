@@ -33,6 +33,8 @@ char *win_pipe(const char *app);
 bool win_secure_directory(const char *path);
 bool win_atomic_write(const char *path, const void *data, size_t length);
 bool win_read_file(const char *path, size_t limit, StringBuilder *result);
+bool win_pipe_is_allowed(const char *pipe);
+bool win_disallow_pipe(const char *pipe);
 bool win_allow_pipes(const char *const *paths, size_t count);
 PipeServer *pipe_server_start(const char *name, PipeHandler handler, void *context);
 void pipe_server_stop(PipeServer *server);
@@ -41,6 +43,7 @@ bool connection_read(Connection *connection, void *data, size_t length);
 bool connection_write(Connection *connection, const void *data, size_t length);
 bool http_read(Connection *connection, HttpRequest *request);
 void http_free(HttpRequest *request);
+char *http_form(const HttpRequest *request, const char *name);
 char *http_query(const HttpRequest *request, const char *name);
 bool http_authorize(Connection *connection, const HttpRequest *request);
 bool http_header(Connection *connection, int status, const char *type, uint64_t length,
@@ -60,4 +63,8 @@ void payload_u32(StringBuilder *p, size_t offset, uint32_t value);
 void payload_u64(StringBuilder *p, size_t offset, uint64_t value);
 char *payload_string(const void *bytes, size_t length, size_t offset);
 uint64_t payload_read64(const void *bytes);
+bool win_set_pipe_activation(const char *pipe, const char *task);
+
+void pipe_servers_wait_idle(HANDLE stop, DWORD timeout_ms);
+
 #endif
