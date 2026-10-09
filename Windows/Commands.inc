@@ -1,6 +1,8 @@
+static bool admin_secure_directory(const char *path);
+static bool admin_secure_file(const wchar_t *path);
 #include "CommandTasks.h"
 
-typedef struct CommandApp {
+struct CommandApp {
     struct CommandApp *next;
     char *id;
     bool owns_allowlist_entry;
@@ -8,11 +10,10 @@ typedef struct CommandApp {
     DWORD task_state;
     ULONGLONG queried_at;
     HANDLE process, job;
-} CommandApp;
-static CommandApp *command_apps;
+};
 
-static CommandApp *command_find(const char *id) {
-    for (CommandApp *a = command_apps; a; a = a->next)
+static CommandApp *command_find(ShellHost *s, const char *id) {
+    for (CommandApp *a = s->commands; a; a = a->next)
         if (!strcmp(a->id, id)) return a;
     return NULL;
 }
@@ -99,10 +100,10 @@ static bool command_spawn(ShellHost *s, CommandApp *a) {
 static void command_key(char *key, size_t size, const char *id) {
     snprintf(key, size, "windows.command.%s", id);
 }
-static char *command_task_name(const char *id) {
+static char *command_task_name(ShellHost *s, const char *id) {
     char *sid = win_sid();
     if (!sid) return NULL;
-    StringBuilder name = {0}; sb_append(&name, "\\OuterShell-App-"); sb_append(&name, sid); sb_append(&name, "-"); sb_append(&name, id);
+    StringBuilder name = {0}; sb_append(&name, s->administrator ? "\\OuterShell-Admin-App-" : "\\OuterShell-App-"); sb_append(&name, sid); sb_append(&name, "-"); sb_append(&name, id);
     free(sid); return name.data;
 }
 static bool command_running(ShellHost *s, CommandApp *a) {
@@ -134,13 +135,16 @@ static HRESULT command_register(ShellHost *s, CommandApp *a) {
     if (!target || !length || length >= 32768 || !CopyFileW(executable, target, TRUE)) {
         DWORD error = GetLastError(); free(runner); free(target); return HRESULT_FROM_WIN32(error ? error : ERROR_INVALID_DATA);
     }
+    if (s->administrator && !admin_secure_file(target)) { free(target); free(runner); return E_ACCESSDENIED; }
     free(target);
     char *sid = win_sid(), *home = win_folder(CSIDL_PROFILE);
     if (!sid || !home) { free(sid); free(home); free(runner); return E_FAIL; }
     StringBuilder xml = {0};
     sb_append(&xml, "<Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\"><Principals><Principal id=\"Author\"><UserId>");
     command_xml_text(&xml, sid);
-    sb_append(&xml, "</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals><Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><AllowHardTerminate>true</AllowHardTerminate><StartWhenAvailable>true</StartWhenAvailable><ExecutionTimeLimit>PT0S</ExecutionTimeLimit><Enabled>true</Enabled><RestartOnFailure><Interval>PT1M</Interval><Count>3</Count></RestartOnFailure></Settings><Actions Context=\"Author\"><Exec><Command>");
+    sb_append(&xml, "</UserId><LogonType>InteractiveToken</LogonType><RunLevel>");
+    sb_append(&xml, s->administrator ? "HighestAvailable" : "LeastPrivilege");
+    sb_append(&xml, "</RunLevel></Principal></Principals><Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><AllowHardTerminate>true</AllowHardTerminate><StartWhenAvailable>true</StartWhenAvailable><ExecutionTimeLimit>PT0S</ExecutionTimeLimit><Enabled>true</Enabled><RestartOnFailure><Interval>PT1M</Interval><Count>3</Count></RestartOnFailure></Settings><Actions Context=\"Author\"><Exec><Command>");
     command_xml_text(&xml, runner);
     sb_append(&xml, "</Command><Arguments>--run-command "); command_xml_text(&xml, a->id);
     sb_append(&xml, " --state &quot;"); command_xml_text(&xml, s->state); sb_append(&xml, "&quot;</Arguments><WorkingDirectory>");
@@ -159,7 +163,7 @@ static bool commands_load(ShellHost *s) {
         if (!r || r->data_length != 1) continue;
         CommandApp *a = win_alloc(sizeof(*a));
         a->owns_allowlist_entry = (r->data[0] & 2) != 0;
-        a->id = win_strdup(id); a->task_name = command_task_name(id); a->next = command_apps; command_apps = a;
+        a->id = win_strdup(id); a->task_name = command_task_name(s, id); a->next = s->commands; s->commands = a;
 
     }
     return store_close(s, &store, false);
@@ -235,7 +239,7 @@ static bool command_control(ShellHost *s, CommandApp *a, const char *operation, 
         Sleep(25);
     } while (GetTickCount64() < cleanup_deadline);
     free(wide); free(dir);
-    for (CommandApp **p = &command_apps; *p; p = &(*p)->next) if (*p == a) { *p = a->next; break; }
+    for (CommandApp **p = &s->commands; *p; p = &(*p)->next) if (*p == a) { *p = a->next; break; }
     free(a->id); free(a->task_name); free(a);
     if (!cleaned) { log_error(s, error); return false; }
     return update_allowlist(s);
@@ -256,7 +260,7 @@ static StringBuilder command_create(ShellHost *s, HttpRequest *r) {
     char *dir = NULL, *script = NULL;
     bool named_pipe = transport && !strcmp(transport, "namedPipe");
     unsigned long port = 0;
-    if (scope && strcmp(scope, "user")) { message = "Windows commands currently run as the Outer Shell user, not as administrator."; goto done; }
+    if (scope && strcmp(scope, s->administrator ? "system" : "user")) { message = "Windows commands currently run as the Outer Shell user, not as administrator."; goto done; }
     if (!name || !*name || strlen(name) > 256 || !text || !*text || strlen(text) > 256 * 1024 || !id || !*id || strlen(id) > 100) goto done;
     for (const unsigned char *p = (const unsigned char *)id; *p; p++)
         if (!((*p >= 'a' && *p <= 'z') || (*p >= '0' && *p <= '9') || *p == '-')) { message = "Use lowercase letters, numbers, and hyphens for the ID."; goto done; }
@@ -283,24 +287,34 @@ static StringBuilder command_create(ShellHost *s, HttpRequest *r) {
         if (named_pipe && store.frontends[i].endpoint_kind == 3 && !_stricmp(store.frontends[i].socket_path, pipe)) duplicate = true;
     if (duplicate) { store_close(s, &store, false); message = "That ID or named pipe is already registered."; goto done; }
     char *root = win_join(s->state, "commands");
-    ok = win_secure_directory(root); free(root);
+    ok = s->administrator ? admin_secure_directory(root) : win_secure_directory(root); free(root);
     dir = command_path(s, service, NULL); script = command_path(s, service, "run.cmd");
     StringBuilder batch = {0};
-    ok = ok && win_secure_directory(dir) && sb_append(&batch, "@echo off\r\nchcp 65001 >nul\r\n");
+    ok = ok && (s->administrator ? admin_secure_directory(dir) : win_secure_directory(dir)) && sb_append(&batch, "@echo off\r\nchcp 65001 >nul\r\n");
     for (const char *p = text; ok && *p; p++) {
         if (*p == '\r') continue;
         ok = sb_append_n(&batch, *p == '\n' ? "\r\n" : p, *p == '\n' ? 2 : 1);
     }
     ok = ok && sb_append(&batch, "\r\n") && win_atomic_write(script, batch.data, batch.length);
     free(batch.data);
-    bool owns_allowlist_entry = named_pipe && !win_pipe_is_allowed(pipe);
+    if (ok && s->administrator) {
+        wchar_t *wide = win_wide(script);
+        ok = wide && admin_secure_file(wide);
+        free(wide);
+    }
+    bool owns_allowlist_entry = !s->administrator && named_pipe && !win_pipe_is_allowed(pipe);
     unsigned char enabled = 1 | (owns_allowlist_entry ? 2 : 0);
     ok = ok && registry_store_upsert_backend(&store, service, name, "", "", false) &&
         registry_store_upsert_frontend_endpoint(&store, app_id, service, name, named_pipe ? 3 : 1, 1, 0, named_pipe ? "" : "127.0.0.1", (uint16_t)port, "/", named_pipe ? pipe : "", "", true) &&
         registry_store_upsert_resource(&store, key, &enabled, 1);
     ok = store_close(s, &store, ok) && ok;
+    if (ok && s->administrator) {
+        wchar_t *wide = win_wide(s->registry);
+        ok = wide && admin_secure_file(wide);
+        free(wide);
+    }
     if (!ok) { message = "Could not save the Windows command."; goto done; }
-    CommandApp *a = win_alloc(sizeof(*a)); a->owns_allowlist_entry = owns_allowlist_entry; a->id = win_strdup(service); a->task_name = command_task_name(service); a->next = command_apps; command_apps = a;
+    CommandApp *a = win_alloc(sizeof(*a)); a->owns_allowlist_entry = owns_allowlist_entry; a->id = win_strdup(service); a->task_name = command_task_name(s, service); a->next = s->commands; s->commands = a;
     HRESULT task_result = command_register(s, a);
     if (FAILED(task_result)) {
         RegistryStore rollback;
@@ -309,7 +323,7 @@ static StringBuilder command_create(ShellHost *s, HttpRequest *r) {
             registry_store_remove_resource(&rollback, key);
             store_close(s, &rollback, true);
         }
-        command_apps = a->next;
+        s->commands = a->next;
         const char *files[] = {"run.cmd", "runner.exe"};
         for (size_t i = 0; i < 2; i++) {
             char *path = command_path(s, a->id, files[i]); wchar_t *wide = win_wide(path);
@@ -321,7 +335,7 @@ static StringBuilder command_create(ShellHost *s, HttpRequest *r) {
         snprintf(task_error, sizeof(task_error), "Windows could not register the app task (0x%08lx).", (unsigned long)task_result);
         message = task_error; ok = false; goto done;
     }
-    ok = update_allowlist(s) && SUCCEEDED(command_task(a->task_name, "start", NULL, NULL));
+    ok = (s->administrator || update_allowlist(s)) && SUCCEEDED(command_task(a->task_name, "start", NULL, NULL));
     message = ok ? "Created Windows app." : "The app was saved but could not start. Check its command script and try Start.";
     changed(s);
 done:
@@ -334,7 +348,7 @@ static StringBuilder command_logs(ShellHost *s, HttpRequest *r) {
     char *id = http_query(r, "serviceID");
     StringBuilder result = payload(52), contents = {0};
     const char *error = "This app has no command output log.";
-    if (id && command_find(id)) {
+    if (id && command_find(s, id)) {
         char *path = command_path(s, id, "output.log");
         wchar_t *wide = win_wide(path);
         HANDLE file = wide ? CreateFileW(wide, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL) : INVALID_HANDLE_VALUE;

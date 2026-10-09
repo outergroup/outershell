@@ -1338,7 +1338,7 @@
         <div class="field" data-transport="${windowsCommands ? "namedPipe" : "unixSocket"}" hidden><label for="bash-socket">${windowsCommands ? "Named pipe path" : "Socket path"}</label><input id="bash-socket" class="mono" name="socketPath" placeholder="${windowsCommands ? String.raw`\\.\pipe\my-app` : "/run/user/1000/my-app.sock"}"></div>
         <div class="field full" ${windowsCommands ? "hidden" : ""}><label for="bash-icon">Icon path <span class="field-note">(optional)</span></label><input id="bash-icon" class="mono" name="iconPath" placeholder="~/Pictures/my-app.png"></div>
       </div>
-      ${windowsCommands ? "<p>Outer Shell starts these commands as your signed-in user. Keep the server in the foreground and configure it to listen on this port or named pipe. Use Start to run it again after it exits.</p>" : ""}
+      ${windowsCommands && state.addScope === "system" ? "<p>Creating this app requires Windows administrator approval. These commands run as your account with administrator privileges. The command script must keep running until your server exits. For example, use <code>python server.py</code>, not <code>start python server.py</code>. Use protected, absolute paths for scripts and programs.</p>" : windowsCommands ? "<p>Outer Shell starts these commands as your signed-in user. The command script must keep running until your server exits. For example, use <code>python server.py</code>, not <code>start python server.py</code>. Configure the server to listen on this port or named pipe.</p>" : ""}
       <p id="bash-message" class="form-message" role="status"></p>
       <footer class="dialog-footer"><button class="secondary-button" type="button" data-action="close-dialog">Cancel</button><button class="primary-button" type="submit">Create app</button></footer>
     </form>`;
@@ -1370,14 +1370,22 @@ Install &lt;app&gt;. Set it up as a service and register it with Outer Shell so 
       ["agent", "Ask your coding agent", '<path d="M21 11a8 8 0 0 1-8 8H7l-5 3V11a9 9 0 0 1 19 0Z"/><path d="m7 9 3 3-3 3m6 0h4"/>'],
       ["bash", windowsCommands ? "Run commands" : "Run bash commands", '<rect x="2" y="3" width="20" height="18" rx="2"/><path d="m6 8 3 3-3 3m6 0h5"/>'],
       ["recipes", "Other recipes", '<rect x="2" y="3" width="20" height="18" rx="2"/><path d="M6 8h1m3 0h8M6 12h1m3 0h8M6 16h1m3 0h5"/>']
-    ].filter(([id]) => (!(state.addWorkspace || windowsCommands) || state.addScope !== "system" || id === "catalog" || id === "agent") && (!windowsCommands || id !== "recipes"));
+    ].filter(([id]) => (!(state.addWorkspace || windowsCommands) || state.addScope !== "system" || id === "catalog" || id === "agent" || windowsCommands && id === "bash") && (!windowsCommands || id !== "recipes"));
     const dialog = openDialog(`
       <header class="dialog-header"><div class="dialog-title-wrap"><h2 id="dialog-title">Add Apps${state.addWorkspace ? ` · ${escapeHTML(state.addWorkspace.name)} / ${state.addScope === "system" ? "root" : escapeHTML(state.addWorkspace.userName || "user")}` : ""}</h2></div><button class="dialog-close" type="button" data-action="close-dialog" aria-label="Close">×</button></header>
       <div class="dialog-body">
         <nav class="add-categories" aria-label="Add app type">${categories.map(([id, title, paths]) => `<button class="add-category" type="button" data-action="add-tab" data-tab="${id}" aria-pressed="${tab === id}"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${paths}</svg><span>${title}</span></button>`).join("")}</nav>
         <section class="add-content" aria-label="${categories.find(([id]) => id === tab)?.[1] || "Apps"}">${tab === "catalog" ? catalog : tab === "bash" ? bash : tab === "agent" ? codingAgent : '<div id="add-recipes" aria-live="polite">Loading recipes…</div>'}</section>
       </div>`, "add-apps-dialog");
-    if (tab === "bash") wireBashForm(dialog);
+    if (tab === "bash" && windowsCommands && state.addScope === "system") {
+      const content = dialog.querySelector(".add-content");
+      content.innerHTML = '<p>Set up administrator commands locally on this Windows machine. Open Outer Loop in Localhost mode, choose Administrator → Add more… → Run commands, and approve the Windows UAC prompt.</p>';
+      fetch("/api/admin-commands", { cache: "no-store" }).then(response => response.json()).then(capabilities => {
+        if (!dialog.isConnected || !capabilities.localSetup) return;
+        content.innerHTML = bash;
+        wireBashForm(dialog);
+      }).catch(() => {});
+    } else if (tab === "bash") wireBashForm(dialog);
     if (tab === "recipes") loadAddRecipes(dialog);
   }
 
@@ -1485,7 +1493,7 @@ Install &lt;app&gt;. Set it up as a service and register it with Outer Shell so 
     submit.textContent = "Creating…";
     message.textContent = "";
     try {
-      const { buffer } = await requestBuffer(windowsCommands ? "/api/create" : `/api/create?${query}`, { method: "POST", ...(windowsCommands ? {headers: {"Content-Type": "application/x-www-form-urlencoded"}, body: query} : {}) }, true);
+      const { buffer } = await requestBuffer(windowsCommands ? (state.addScope === "system" ? "/api/admin-commands" : "/api/create") : `/api/create?${query}`, { method: "POST", ...(windowsCommands ? {headers: {"Content-Type": "application/x-www-form-urlencoded"}, body: query} : {}) }, !(windowsCommands && state.addScope === "system"));
       const result = decodeAction(buffer);
       if (!result.ok) throw new Error(result.message || "Could not create the app.");
       closeDialog();

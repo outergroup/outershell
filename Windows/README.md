@@ -263,7 +263,7 @@ Linux home directory and verified Windows pipe identity.
 
 On a Windows user card, **Add more… → Run commands** registers an independent,
 least-privilege interactive task. Supply a display name, identifier, multiline
-`cmd.exe` script, and TCP port (the default) or named pipe. Keep the server in the foreground. The form
+`cmd.exe` script, and TCP port (the default) or named pipe. The command script must keep running until the server exits. For example, use `python server.py`, not `start python server.py`. The form
 uses a POST body and supports UTF-8 commands; working directory defaults to the
 user profile. Configure the app itself to listen on the specified endpoint. TCP endpoints use
 `127.0.0.1`; no firewall rule or public listener is created by Outer Shell.
@@ -284,3 +284,40 @@ activation, independent Files lifetime, invalid registrations, and allowlist
 checks. `test_commands.py <OuterShell.exe>` tests command creation, Unicode,
 logs, process-tree cleanup, persistence, restart, and uninstall. Run both as the
 signed-in desktop user, with existing same-user hosts stopped for the latter.
+
+
+### Administrator commands
+
+Administrator → Add more… → Run commands is available in both frontends.
+Remote sessions explain that setup must be performed locally. In Windows
+Localhost mode uses the usual inline command form. Creating the app requests
+UAC approval and launches a short-lived elevated helper to apply the submitted
+values. Success closes the form; cancellation or failure leaves its values intact.
+
+`GET /api/admin-commands` reports `localSetup`. POST accepts a bounded form only
+when Windows reports that the named-pipe client belongs to the same nonzero
+desktop session as Outer Shell. Windows OpenSSH clients are in session zero and
+receive HTTP 403, even if their SSH token is elevated. `/api/create` continues to
+reject system scope. The helper receives the form and returns the normal action
+result over a private, randomly named, local-only pipe. Outer Shell verifies the
+client PID matches the process launched through UAC before sending any commands.
+The helper requires elevation, the same account, and the same desktop session.
+No command text is passed on the process command line or stored in a staging file.
+
+Approved commands use independent InteractiveToken/HighestAvailable tasks named
+`OuterShell-Admin-App-<SID>-<service-id>`. The registry, script, runner, and output
+are stored beneath `Program Files/OuterShell Commands/<SID>`, with administrator
+ownership and read access for that user. The task grants that user read/execute
+access, not permission to change its definition. Administrator backends appear
+in their own card and support start/stop/restart and output logs. Uninstall and
+command editing are not exposed remotely; manage task definitions locally.
+Scripts invoked by a command must also be protected against unelevated edits.
+
+For an isolated test machine, build with `OUTERSHELL_ADMIN_TESTS=ON`, run
+`OuterShellAdminFixture.exe` elevated in the signed-in account, then run
+`test_admin_commands.py` unelevated with the installed Outer Shell running. The
+fixture registers only the fixed `admin-regression-fixture` command (whoami,
+a marker, and a timed loopback ping). The Python checks cover high-integrity
+execution, scoped discovery/logs, approved task controls, rejected empty setup requests, denied unelevated writes, and denied task-definition changes. Run
+`OuterShellAdminFixture.exe --cleanup-fixture` elevated in the same signed-in
+account afterward to remove its task, registry entry, and command directory.

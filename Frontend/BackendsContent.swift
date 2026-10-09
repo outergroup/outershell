@@ -5121,7 +5121,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             (.bashCommands, commandSectionTitle, "terminal"),
             (.nativeApp, "New App", "hammer"),
             (.otherRecipes, "Other recipes", "list.bullet.rectangle")
-        ].filter { (catalogScope != "system" || (!isWindowsHost && catalogWorkspaceID == nil) || $0.0 == .appCatalog || $0.0 == .codingAgent) && (!isWindowsCommandHost || $0.0 != .nativeApp && $0.0 != .otherRecipes) }
+        ].filter { (catalogScope != "system" || (!isWindowsHost && catalogWorkspaceID == nil) || $0.0 == .appCatalog || $0.0 == .codingAgent || (isWindowsCommandHost && $0.0 == .bashCommands)) && (!isWindowsCommandHost || $0.0 != .nativeApp && $0.0 != .otherRecipes) }
 
         var x = left
         var y = top - cardHeight
@@ -5273,6 +5273,14 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private func renderBashCommandsSection(left: CGFloat,
                                            top: CGFloat,
                                            width: CGFloat) -> CGFloat {
+        if isWindowsCommandHost && catalogScope == "system" {
+            let explanation = makeTextLayer(size: 13, weight: .regular, color: .secondaryLabelColor)
+            explanation.string = "Set up administrator commands locally on this Windows machine. Open Outer Loop in Localhost mode, choose Administrator → Add more… → Run commands, and approve the Windows UAC prompt."
+            explanation.isWrapped = true
+            explanation.frame = CGRect(x: left, y: top - 90, width: min(width, 680), height: 80)
+            addCreateFormSublayer(explanation)
+            return top - 110
+        }
         ensureBashDefaults()
 
         let detailWidth = min(width, 680)
@@ -5281,7 +5289,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         var y = top - 18
 
         let help = makeTextLayer(size: 12, weight: .regular, color: .secondaryLabelColor)
-        help.string = isWindowsCommandHost ? "Outer Shell starts these commands as your signed-in user. Keep the server in the foreground and configure it to listen on the port or named pipe below. Use Start to run it again after it exits." : "Run a script that launches a web app on some port or socket"
+        help.string = isWindowsCommandHost ? "Outer Shell starts these commands as your signed-in user. The command script must keep running until your server exits. For example, use ‘python server.py’, not ‘start python server.py’. Configure the server to listen on the port or named pipe below." : "Run a script that launches a web app on some port or socket"
         let helpHeight: CGFloat = isWindowsCommandHost ? 54 : 18
         help.isWrapped = isWindowsCommandHost
         help.frame = CGRect(x: detailLeft, y: y - helpHeight + 18, width: detailWidth, height: helpHeight)
