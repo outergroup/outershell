@@ -11,6 +11,7 @@
 AppId=org.outershell.windows
 AppName=Outer Shell
 AppVersion={#ReleaseVersion}
+VersionInfoVersion={#ReleaseVersion}.0
 AppPublisher=Outer Group
 AppPublisherURL=https://outershell.org
 DefaultDirName={localappdata}\OuterShell

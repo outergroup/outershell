@@ -75,6 +75,7 @@ static bool update_allowlist(ShellHost *s) {
 #include "Commands.inc"
 #include "AdminCommands.inc"
 #include "Setup.inc"
+#include "Updates.inc"
 static StringBuilder all_backends(ShellHost *s);
 
 static bool legacy_files_running(ShellHost *s) {
@@ -252,9 +253,13 @@ static StringBuilder backends(ShellHost *s) {
         RegistryBackendRecord *b = &store.backends[i];
         bool running = false, controls = false;
         const char *status = "registered";
+        StringBuilder update_result = {0};
         if (!strcmp(b->service_id, shell_id)) {
             running = true;
             status = "running";
+            char *result_path = win_join(s->state, "update-result.txt");
+            if (win_read_file(result_path, 512, &update_result) && update_result.data && !strncmp(update_result.data, "Update failed", 13)) status = update_result.data;
+            free(result_path);
         } else if (!strcmp(b->service_id, files_id)) {
             running = files_running(s);
             status = running ? "running" : "stopped";
@@ -304,6 +309,13 @@ static StringBuilder backends(ShellHost *s) {
             free(app.data);
         }
         StringBuilder row = payload(116);
+        if (!strcmp(b->service_id, shell_id) && !s->administrator) {
+            payload_text(&row, 84, OUTERSHELL_VERSION);
+            EnterCriticalSection(&update_gate);
+            payload_text(&row, 92, update_version);
+            LeaveCriticalSection(&update_gate);
+            payload_text(&row, 108, UPDATE_SOURCE);
+        }
         payload_text(&row, 0, b->service_id);
         payload_text(&row, 8, b->display_name);
         payload_text(&row, 16, b->unit_name);
@@ -322,6 +334,7 @@ static StringBuilder backends(ShellHost *s) {
         } else payload_data(&row, 76, &empty, 4);
         payload_data(&result, 12 + i * 8, row.data, row.length);
         free(row.data);
+        free(update_result.data);
         free(apps.data);
     }
     if (!store_close(s, &store, false)) {
@@ -535,6 +548,19 @@ static void serve_http(Connection *c, void *context) {
         http_free(&r);
         return;
     }
+    if (!strcmp(r.path, "/api/control") && !strcmp(r.method, "POST")) {
+        char *id = http_query(&r, "serviceID"), *operation = http_query(&r, "operation"), *scope = http_query(&r, "scope");
+        bool handles = id && !strcmp(id, shell_id) && operation && (!scope || !strcmp(scope, "user"));
+        if (handles) {
+            StringBuilder response = update_control(operation);
+            http_send(c, &r, 200, "application/octet-stream", response.data, response.length);
+            free(response.data);
+            EnterCriticalSection(&s->gate); changed(s); LeaveCriticalSection(&s->gate);
+        }
+        free(id); free(operation); free(scope);
+        if (handles) { http_free(&r); return; }
+    }
+    if (!strcmp(r.path, "/api/backends") && !strcmp(r.method, "GET")) update_interacted(s);
     EnterCriticalSection(&s->gate);
     StringBuilder body = {0};
     int status = 200;
@@ -684,6 +710,7 @@ static void shell_stop(ShellHost *s) {
     pipe_server_stop(s->http);
     pipe_server_stop(s->api);
     s->http = s->api = NULL;
+    if (update_thread) { WaitForSingleObject(update_thread, INFINITE); CloseHandle(update_thread); update_thread = NULL; }
     wsl_stop(s->wsl);
     s->wsl = NULL;
     EnterCriticalSection(&s->gate);
@@ -741,6 +768,8 @@ static void WINAPI service_main(DWORD argc, LPWSTR *argv) {
     report_service(SERVICE_STOPPED, ok ? 0 : ERROR_SERVICE_SPECIFIC_ERROR);
 }
 int wmain(int argc, wchar_t **argv) {
+    if (argc == 2 && !wcscmp(argv[1], L"--apply-update")) return update_apply();
+    InitializeCriticalSection(&update_gate);
     if (argc == 2 && !wcscmp(argv[1], L"--setup-install")) return setup_tasks("install");
     if (argc == 2 && !wcscmp(argv[1], L"--setup-stop")) return setup_tasks("stop");
     if (argc == 2 && !wcscmp(argv[1], L"--setup-remove")) return setup_tasks("remove");

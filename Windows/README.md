@@ -360,3 +360,30 @@ a user-writable maintenance helper with administrator privileges.
 
 See `OuterLoop/WindowsInstaller/README.md` in the Outer Loop repository for signing
 service setup, publisher configuration and signature-verification tests.
+
+### Windows updates
+
+Outer Shell checks `/outer-shell/latest/windows-version.txt` when the homepage
+requests `/api/backends`, at most once per day. The attempt timestamp persists across
+restarts, including failed checks. There is no startup check or periodic timer; an
+untouched server makes no update requests. Explicit Check for Updates bypasses the
+automatic daily limit. The existing HTML and outerframe Check for Updates actions use the same
+version metadata and control responses as Unix. Windows release versions are three
+numeric components from `VERSION`; package generation uses that same version.
+The release packaging script emits the Windows version marker only when all three
+Windows installers are supplied. Publish the marker after the corresponding files.
+
+Updates run as the ordinary user. The backend downloads the native-architecture
+installer over HTTPS, rejects redirects and oversized responses, verifies its
+Authenticode chain and Marcus Lewis publisher, and checks its file version against
+the advertised release. It registers a separate least-privilege Task Scheduler job
+using a staged copy of Outer Shell. This runner re-verifies the installer, waits for
+installation to finish, records the result, and restarts the main task. It survives
+the installer stopping the old backend. Failures appear in the backend status after
+reconnection. Existing registry data and command tasks remain in place. Elevated
+legacy service instances cannot invoke this per-user update path.
+
+The `OUTERSHELL_UPDATE_TESTS` CMake option builds `OuterShellUpdateFixture` for
+local signature rejection, version binding, and scheduled upgrade tests. Its local
+payload injection is confined to the test binary; the production API accepts no
+custom download URL, executable path, publisher, or installer arguments.

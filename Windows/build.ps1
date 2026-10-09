@@ -1,4 +1,5 @@
 param(
+    [switch]$UpdateTests,
     [string]$OutputDirectory = "$PSScriptRoot/../build/windows",
     [string]$CoreDirectory,
     [ValidateSet('arm64', 'x64', 'x86')][string]$Architecture = [Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString().ToLowerInvariant(),
@@ -18,6 +19,7 @@ if (!$CoreDirectory) {
         if (!$VisualStudioRoot) { throw 'Visual Studio Build Tools was not found.' }
     }
     $CoreDirectory = Join-Path $OutputDirectory "native-$Architecture"
+    $updateTestsValue = if ($UpdateTests) { 'ON' } else { 'OFF' }
     $triple = @{ arm64='aarch64-pc-windows-msvc'; x64='x86_64-pc-windows-msvc'; x86='i686-pc-windows-msvc' }[$Architecture]
     $cmake = Join-Path $VisualStudioRoot 'Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe'
     $ninja = Join-Path $VisualStudioRoot 'Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja'
@@ -29,7 +31,7 @@ if (!$CoreDirectory) {
 call "$VisualStudioRoot\Common7\Tools\VsDevCmd.bat" -no_logo -arch=$Architecture -host_arch=$hostArchitecture
 if errorlevel 1 exit /b %errorlevel%
 set "PATH=$llvm;$ninja;%PATH%"
-"$cmake" -S "$PSScriptRoot" -B "$CoreDirectory" -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang-cl -DCMAKE_C_COMPILER_TARGET=$triple -DFILES_ROOT="$FilesRoot"
+"$cmake" -S "$PSScriptRoot" -B "$CoreDirectory" -G Ninja -DOUTERSHELL_UPDATE_TESTS=$updateTestsValue -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang-cl -DCMAKE_C_COMPILER_TARGET=$triple -DFILES_ROOT="$FilesRoot"
 if errorlevel 1 exit /b %errorlevel%
 "$cmake" --build "$CoreDirectory" --parallel 4
 exit /b %errorlevel%

@@ -1,7 +1,7 @@
 param(
     [Parameter(Mandatory=$true)][string]$PayloadDirectory,
     [ValidateSet('x64','arm64','x86')][string]$Architecture = 'x64',
-    [string]$Version = '0.1.0',
+    [string]$Version = (Get-Content "$PSScriptRoot/../VERSION" -Raw).Trim(),
     [string]$Compiler = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
     [string]$SignCommand,
     [switch]$DevelopmentUnsigned

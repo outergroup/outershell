@@ -1447,6 +1447,7 @@ if [[ -n "${WINDOWS_INSTALLER_ROOT:-}" ]]; then
         require_file "${WINDOWS_INSTALLER_ROOT}/${installer}"
         install -m 0644 "${WINDOWS_INSTALLER_ROOT}/${installer}" "${OUTPUT_ROOT}/latest/${installer}"
     done
+    printf '%s\n' "${OUTER_SHELL_VERSION}" > "${OUTPUT_ROOT}/latest/windows-version.txt"
 fi
 
 echo "Packaged assets under ${OUTPUT_ROOT}"
