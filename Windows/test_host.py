@@ -110,6 +110,26 @@ with tempfile.TemporaryDirectory(prefix='outer-c-test-') as temporary:
         registry(29, 18, [(2, b'native.test'), (10, b'\x00binary\xff')])
         assert registry(28, 10, [(2, b'native.test')]) == b'\x00binary\xff'
         assert request(pipe, '/')[0] == 200
+        native_header = b'Outerframe-Accept: application/vnd.outerframe\r\n'
+        status, descriptor = request(pipe, '/', extra=native_header)
+        assert status == 200 and descriptor[:4] == b'OUTR'
+        version, offset, length, data_offset, data_length = struct.unpack_from('<IQQQQ', descriptor, 4)
+        assert version == 1 and offset == 40 and data_offset == offset + length
+        assert len(descriptor) == data_offset + data_length
+        bundle = descriptor[offset:offset + length].decode()
+        assert json.loads(descriptor[data_offset:])['backendsAPIPath'] == '/api/backends'
+        assert json.loads(descriptor[data_offset:])['hostPlatform'] == 'windows'
+        snapshot_status, snapshot = request(pipe, '/api/container-snapshot')
+        assert snapshot_status == 200 and json.loads(snapshot)['hostPlatform'] == 'windows'
+        assert request(pipe, '/', method='HEAD', extra=native_header) == (200, b'')
+        assert request(pipe, '/backends.outer') == (200, descriptor)
+        assert request(pipe, bundle) == (200, b'macos-arm\nmacos-x86\n')
+        for platform in ('macos-arm', 'macos-x86'):
+            expected = (exe.parent / 'bundles' / ('OuterShell.bundle.' + platform + '.aar')).read_bytes()
+            assert request(pipe, bundle + '/' + platform) == (200, expected)
+            assert request(pipe, bundle + '/' + platform, method='HEAD') == (200, b'')
+        assert request(pipe, bundle + '/../../install.ps1')[0] == 404
+        assert b'<html' in request(pipe, '/')[1].lower()
         assert request(files, '/')[0] == 200
         duplicate = subprocess.run([str(exe), '--state', str(state)], capture_output=True, timeout=10)
         assert duplicate.returncode != 0

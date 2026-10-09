@@ -1,7 +1,7 @@
 """Exercise a configured WSL host over the same SSH/named-pipe bridge as Outer Loop.
 
 Usage: python3 test_wsl.py SSH_ALIAS WINDOWS_BRIDGE_EXE DISTRIBUTION
-The selected distribution must have Outer Shell and Files installed. This test
+The selected distribution must have the standard Linux Outer Shell, Files, Top, and Plaintext installed. This test
 stops and restarts that distribution, and restores any allowlist edits it makes.
 """
 import base64
@@ -24,10 +24,11 @@ def powershell(script):
 def literal(text):
     return "'" + text.replace("'", "''") + "'"
 
-def linux(code):
+def linux(code, root=False):
     encoded = base64.b64encode(code.encode()).decode()
     argument = f"import base64;exec(base64.b64decode('{encoded}'))"
-    command = f'wsl --distribution {literal(distribution)} --exec python3 -c {literal(argument)}; exit $LASTEXITCODE'
+    user = " --user root" if root else ""
+    command = f'wsl --distribution {literal(distribution)}{user} --exec python3 -c {literal(argument)}; exit $LASTEXITCODE'
     return subprocess.run(powershell(command), capture_output=True, timeout=45, check=True).stdout
 
 sid = subprocess.check_output(powershell('[Security.Principal.WindowsIdentity]::GetCurrent().User.Value'), timeout=20).decode().strip().lower()
@@ -61,14 +62,15 @@ class Bridge:
     def send(self, kind, body=b''):
         self.process.stdin.write(struct.pack('<IHHII', 0x3142524f, 1, kind, self.stream, len(body)) + body)
         self.process.stdin.flush()
-    def request(self, route, body=b'', method='GET'):
+    def request(self, route, body=b'', method='GET', native=False):
         self.stream += 1
         self.send(2)
         while True:
             kind, stream, data = self.frame()
             if stream == self.stream: break
         assert kind == 3, (kind, data)
-        request = f'{method} {route} HTTP/1.1\r\nHost: localhost\r\nAccept: application/vnd.outerframe, text/html\r\nConnection: close\r\nContent-Length: {len(body)}\r\n\r\n'.encode() + body
+        accept = 'Outerframe-Accept: application/vnd.outerframe\r\n' if native else ''
+        request = f'{method} {route} HTTP/1.1\r\nHost: localhost\r\n{accept}Accept: application/vnd.outerframe, text/html\r\nConnection: close\r\nContent-Length: {len(body)}\r\n\r\n'.encode() + body
         for offset in range(0, len(request), 32768): self.send(5, request[offset:offset + 32768])
         self.send(6)
         result = bytearray()
@@ -82,7 +84,7 @@ class Bridge:
         header, body = bytes(result).split(b'\r\n\r\n', 1)
         status = int(header.split(b' ')[1])
         fields = {k.lower(): v.strip() for k, v in (line.split(b':', 1) for line in header.split(b'\r\n')[1:])}
-        if b'content-length' in fields: assert len(body) == int(fields[b'content-length'])
+        if method != 'HEAD' and b'content-length' in fields: assert len(body) == int(fields[b'content-length'])
         return status, body
     def close(self):
         self.process.stdin.close()
@@ -102,7 +104,22 @@ def expect(client, path, body=b'', method='GET'):
     assert status == 200, (status, result[:300])
     return result
 
+def check_outerframe(client, shell=True):
+    status, descriptor = client.request('/', native=True)
+    assert status == 200 and descriptor[:4] == b'OUTR'
+    version, url_offset, url_length, json_offset, json_length = struct.unpack_from('<IQQQQ', descriptor, 4)
+    assert version == 1 and url_offset == 40 and json_offset == url_offset + url_length
+    assert len(descriptor) == json_offset + json_length
+    if shell: assert json.loads(descriptor[json_offset:])['backendsAPIPath'] == '/api/backends'
+    url = descriptor[url_offset:json_offset].decode()
+    assert client.request('/', method='HEAD', native=True) == (200, b'')
+    assert expect(client, url) == b'macos-arm\nmacos-x86\n'
+    for platform in ('macos-arm', 'macos-x86'):
+        assert len(expect(client, url + '/' + platform)) > 1000
+
+
 with Bridge(shell_pipe) as host_client:
+    check_outerframe(host_client)
     def snapshot(): return json.loads(expect(host_client, '/api/container-snapshot'))
     def workspace(): return next((w for w in snapshot()['workspaces'] if w['name'] == distribution), None)
     def wait_for(predicate):
@@ -114,16 +131,37 @@ with Bridge(shell_pipe) as host_client:
         raise AssertionError('WSL state did not converge: ' + repr({k: v for k, v in (item or {}).items() if k != 'apps'}))
     workspace_id = wait_for(lambda w: True)['id']
     def operation(name, **values):
-        return json.loads(expect(host_client, '/api/safe-spaces', json.dumps(dict(operation=name, workspaceID=workspace_id, **values)).encode(), 'POST'))
+        request_id = str(uuid.uuid4()).upper()
+        result = json.loads(expect(host_client, '/api/safe-spaces', json.dumps(dict(requestID=request_id, operation=name, workspaceID=workspace_id.upper(), **values)).encode(), 'POST'))
+        assert result['requestID'] == request_id
+        return result
     operation('start')
     print('Requested distribution start; waiting for Linux app discovery', flush=True)
     item = wait_for(lambda w: w['state'] == 'running' and len(w['apps']) >= 2)
+    for field in ('cpus', 'memoryInGB', 'shellCommand'): assert field in item
+    for app in item['apps']:
+        for field in ('iconPath', 'iconObservationToken', 'publishedPort', 'externalSocketPath'): assert field in app
     apps = {a['serviceID']: a for a in item['apps']}
     files = apps['org.outershell.Files']
     operation('startApp', serviceID='org.outershell.Files')
     wait_for(lambda w: any(a['serviceID'] == 'org.outershell.Files' and a['isRunning'] for a in w['apps']))
     print('PASS discovery, distinct WSL identity, and app start control', flush=True)
+    api = '/api/wsl/' + workspace_id
+    catalog = expect(host_client, api + '/backends?web=1')
+    scopes = set()
+    for i in range(struct.unpack_from('<I', catalog, 8)[0]):
+        backend = ref(catalog, 12 + i * 8)
+        scopes.add(ref(backend, 32).decode())
+    assert {'user', 'system'} <= scopes
+    assert len(expect(host_client, api + '/recipes')) > 100
+    assert host_client.request(api + '/control')[0] == 405
+    assert host_client.request(api + '/logs')[0] == 404
+    status, result = host_client.request(api + '/control', urlencode(dict(serviceID='outer-test-missing', scope='user', operation='start')).encode(), 'POST')
+    assert status == 404 and struct.unpack_from('<I', result)[0] & 1 == 0
+    print('PASS flattened Linux catalogs, recipes, POST body and error forwarding', flush=True)
+
     with Bridge(apps['org.outershell.OuterShell']['externalSocketPath']) as guest_shell:
+        check_outerframe(guest_shell)
         assert b'<!doctype html' in expect(guest_shell, '/').lower()
         data = expect(guest_shell, '/api/backends?web=1')
         mapped = []
@@ -134,6 +172,49 @@ with Bridge(shell_pipe) as host_client:
                 mapped.append(ref(app, 16).decode())
         assert files['externalSocketPath'] in mapped, mapped
     print('PASS nested Linux homepage links map back to WSL pipes', flush=True)
+    for name in ('Files', 'Top', 'Plaintext'):
+        with Bridge(apps['org.outershell.' + name]['externalSocketPath']) as client:
+            check_outerframe(client, shell=False)
+    print('PASS standard Files, Top, and Plaintext native bundles', flush=True)
+    root_apps = [app for app in item['apps'] if app['userName'] == 'root']
+    if root_apps:
+        root_app = root_apps[0]
+        with Bridge(root_app['externalSocketPath']) as client:
+            check_outerframe(client, shell=False)
+        allow = linux("from pathlib import Path; import base64; print(base64.b64encode(Path('/etc/outerssh/http-unix.allow').read_bytes()).decode())", root=True).strip()
+        try:
+            linux("from pathlib import Path; p=Path('/etc/outerssh/http-unix.allow'); p.write_text(''.join(line for line in p.read_text().splitlines(True) if line.strip().replace('%%T', '/run')!=%r))" % root_app['socketPath'], root=True)
+            with Bridge(root_app['externalSocketPath']) as client:
+                assert client.request('/', native=True)[0] == 0
+        finally:
+            linux("from pathlib import Path; import base64; Path('/etc/outerssh/http-unix.allow').write_bytes(base64.b64decode(%r))" % allow.decode(), root=True)
+        with Bridge(root_app['externalSocketPath']) as client:
+            check_outerframe(client, shell=False)
+        print('PASS root app transport and root allowlist revocation/restoration', flush=True)
+        siblings = [app for app in item['apps'] if app['serviceID'] == root_app['serviceID']]
+        if {app.get('serviceScope') for app in siblings} == {'user', 'system'}:
+            assert len({app['userName'] for app in siblings}) == 2
+            assert len({app['externalSocketPath'] for app in siblings}) == 2
+            for app in siblings:
+                with Bridge(app['externalSocketPath']) as client:
+                    check_outerframe(client, shell=False)
+            for app in siblings:
+                scope = app['serviceScope']
+                unit = app['serviceID'] + '.service'
+                def active(system):
+                    return linux("import subprocess; print(subprocess.run(['systemctl',%s'is-active',%r],capture_output=True,text=True).stdout.strip())" % ("" if system else "'--user',", unit), root=system).strip()
+                try:
+                    operation('stopApp', serviceID=app['serviceID'], serviceScope=scope)
+                    assert active(scope == 'system') == b'inactive'
+                    wait_for(lambda w: any(a['serviceID'] == app['serviceID'] and a.get('serviceScope') == scope and not a['isRunning'] for a in w['apps']))
+                    assert active(scope != 'system') == b'active'
+                finally:
+                    operation('startApp', serviceID=app['serviceID'], serviceScope=scope)
+                    with Bridge(app['externalSocketPath']) as client:
+                        check_outerframe(client, shell=False)
+            print('PASS separate user/root card metadata and independent app controls', flush=True)
+
+
     temporary = '/tmp/outer-wsl-test-' + uuid.uuid4().hex
     try:
         with Bridge(files['externalSocketPath']) as client:
@@ -163,8 +244,8 @@ with Bridge(shell_pipe) as host_client:
     for _ in range(3):
         time.sleep(3); assert workspace()['state'] == 'stopped'
     print('PASS snapshot discovery leaves stopped Ubuntu asleep', flush=True)
-    operation('start')
-    print('Requested distribution start; waiting for Linux app discovery', flush=True)
+    expect(host_client, api + '/backends?web=1')
+    print('PASS opening the Linux catalog starts the stopped distribution', flush=True)
     item = wait_for(lambda w: w['state'] == 'running' and w['apps'])
     with Bridge(files['externalSocketPath']) as client:
         assert expect(client, '/api/files?path=~')[:4] == b'FFLS'

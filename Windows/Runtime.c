@@ -608,6 +608,15 @@ bool http_read(Connection *c, HttpRequest *r) {
         for (char *p = colon; *p; p++)
             if ((unsigned char)*p < 32 && *p != '\t')
                 goto done;
+        if (!strcmp(line.data, "outerframe-accept")) {
+            const char *media = "application/vnd.outerframe";
+            for (const char *p = colon; *p; p++) {
+                if (!_strnicmp(p, media, strlen(media))) {
+                    r->accepts_outerframe = true;
+                    break;
+                }
+            }
+        }
         if (!strcmp(line.data, "content-length")) {
             if (!*colon)
                 goto done;

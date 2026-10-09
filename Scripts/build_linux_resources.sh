@@ -35,7 +35,11 @@ build_socket_bridge() {
     local output="${output_dir}/outer-socket-bridge"
 
     mkdir -p "${output_dir}"
-    cc -std=gnu17 -O2 -Wall -Wextra \
+    local link_flags=()
+    if [[ "${OUTER_SHELL_LINUX_LIBC:-}" == musl ]]; then
+        link_flags+=(-static)
+    fi
+    cc -std=gnu17 -O2 -Wall -Wextra "${link_flags[@]}" \
         -o "${output}" \
         "${SOCKET_BRIDGE_SOURCE}"
     if command -v strip >/dev/null 2>&1; then

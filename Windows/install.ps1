@@ -45,7 +45,7 @@ foreach ($obsolete in @('OuterShell.Windows.Runtime.dll', 'outershell-core.dll')
         }
     }
 }
-foreach ($folder in @('web', 'files-web')) {
+foreach ($folder in @('web', 'files-web', 'bundles')) {
     New-Item -ItemType Directory -Force (Join-Path $destination $folder) | Out-Null
     Copy-Item (Join-Path $SourceDirectory "$folder/*") (Join-Path $destination $folder) -Recurse -Force
 }

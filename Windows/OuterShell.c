@@ -370,6 +370,61 @@ static StringBuilder layout(ShellHost *s, HttpRequest *r, int *status) {
         changed(s);
     return current;
 }
+static bool serve_outerframe(ShellHost *s, Connection *c, const HttpRequest *r) {
+    bool navigator = !strcmp(r->path, "/") || !strcmp(r->path, "/apps") ||
+                     !strcmp(r->path, "/backends") || !strcmp(r->path, "/new") ||
+                     !strcmp(r->path, "/backends.outer");
+    if (!(navigator && (r->accepts_outerframe || !strcmp(r->path, "/backends.outer"))) &&
+        strncmp(r->path, "/bundles/OuterShell.bundle", 26))
+        return false;
+    if (strcmp(r->method, "GET") && strcmp(r->method, "HEAD")) {
+        http_text(c, r, 405, "Unsupported method.");
+        return true;
+    }
+    char *directory = win_join(s->directory, "bundles");
+    char *arm = win_join(directory, "OuterShell.bundle.macos-arm.aar");
+    char *x86 = win_join(directory, "OuterShell.bundle.macos-x86.aar");
+    wchar_t *arm_wide = win_wide(arm), *x86_wide = win_wide(x86);
+    WIN32_FILE_ATTRIBUTE_DATA a, x;
+    bool available = GetFileAttributesExW(arm_wide, GetFileExInfoStandard, &a) &&
+                     GetFileAttributesExW(x86_wide, GetFileExInfoStandard, &x) &&
+                     !(a.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
+                     !(x.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY);
+    free(arm_wide); free(x86_wide);
+    if (!available) {
+        http_text(c, r, 503, "The macOS outerframe bundles are not installed.");
+    } else {
+        char url[256], arm_url[272], x86_url[272];
+        snprintf(url, sizeof(url), "/bundles/OuterShell.bundle-%08lx%08lx-%08lx%08lx-%08lx%08lx-%08lx%08lx",
+                 a.ftLastWriteTime.dwHighDateTime, a.ftLastWriteTime.dwLowDateTime,
+                 a.nFileSizeHigh, a.nFileSizeLow, x.ftLastWriteTime.dwHighDateTime,
+                 x.ftLastWriteTime.dwLowDateTime, x.nFileSizeHigh, x.nFileSizeLow);
+        snprintf(arm_url, sizeof(arm_url), "%s/macos-arm", url);
+        snprintf(x86_url, sizeof(x86_url), "%s/macos-x86", url);
+        if (navigator) {
+            const char *json = "{\"hostPlatform\":\"windows\",\"backendsAPIPath\":\"/api/backends\",\"logsAPIPath\":\"/api/logs\",\"controlAPIPath\":\"/api/control\",\"createAPIPath\":\"/api/create\",\"recipesAPIPath\":\"/api/recipes\",\"filePickerAPIPath\":\"/api/file-picker\"}";
+            StringBuilder descriptor = payload(40);
+            memcpy(descriptor.data, "OUTR", 4);
+            payload_u32(&descriptor, 4, 1);
+            payload_u64(&descriptor, 8, 40);
+            payload_u64(&descriptor, 16, strlen(url));
+            payload_u64(&descriptor, 24, 40 + strlen(url));
+            payload_u64(&descriptor, 32, strlen(json));
+            sb_append(&descriptor, url);
+            sb_append(&descriptor, json);
+            http_send(c, r, 200, "application/vnd.outerframe", descriptor.data, descriptor.length);
+            free(descriptor.data);
+        } else if (!strcmp(r->path, url)) {
+            http_text(c, r, 200, "macos-arm\nmacos-x86\n");
+        } else if (!strcmp(r->path, arm_url) || !strcmp(r->path, x86_url)) {
+            http_file(c, r, !strcmp(r->path, arm_url) ? arm : x86, false, false);
+        } else {
+            http_text(c, r, 404, "Bundle not found.");
+        }
+    }
+    free(directory); free(arm); free(x86);
+    return true;
+}
 static void serve_http(Connection *c, void *context) {
     ShellHost *s = context;
     HttpRequest r = {0};
@@ -377,7 +432,11 @@ static void serve_http(Connection *c, void *context) {
         http_free(&r);
         return;
     }
-    if (!strcmp(r.path, "/api/container-snapshot") || !strcmp(r.path, "/api/safe-spaces")) {
+    if (serve_outerframe(s, c, &r)) {
+        http_free(&r);
+        return;
+    }
+    if (!strcmp(r.path, "/api/container-snapshot") || !strcmp(r.path, "/api/safe-spaces") || !strncmp(r.path, "/api/wsl/", 9)) {
         wsl_serve(s->wsl, c, &r);
         http_free(&r);
         return;

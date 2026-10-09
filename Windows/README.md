@@ -5,17 +5,25 @@ and no CLR or managed DLL dependency. The Windows host uses the same C registry
 model and ORWA persistence format as `outershelld`, plus the shared layout
 validator. Files shares its binary listing encoder with its Unix backend. The
 Windows adapter supplies named-pipe HTTP, process supervision, and SCM integration.
-It serves the shared Outer Shell web app and starts a separate Files process.
+It serves the macOS outerframe frontend to Outer Loop, the shared HTML frontend
+to web clients, and starts a separate Files process.
 Native Windows apps require neither WSL nor a TCP listener. WSL distributions can
 optionally expose their Linux apps through the same Windows host.
 
 ## Build and install
 
 Place the `Backends` and `Files` repositories beside each other. Install Visual
-Studio C++ Build Tools, its CMake/Ninja components, and LLVM. From Windows PowerShell:
+Studio C++ Build Tools, its CMake/Ninja components, and LLVM. Build the frontend
+archives on a Mac first:
+
+```sh
+bash Windows/build-outerframe-bundles.sh
+```
+
+Copy `build/outerframe/bundles` to the Windows build machine. From Windows PowerShell:
 
 ```powershell
-.\Windows\build.ps1
+.\Windows\build.ps1 -BundlesDirectory C:\path\to\bundles
 .\build\windows\install.ps1 -Start
 ```
 
@@ -23,7 +31,7 @@ Studio C++ Build Tools, its CMake/Ninja components, and LLVM. From Windows Power
 `-Architecture arm64`, `x64`, or `x86` selects the target; the default is the host
 architecture. `-CoreDirectory` uses an already-built directory containing both
 executables. The production package contains `OuterShell.exe`, `FilesBackend.exe`,
-and the shared web assets. `outershell-core.dll` is built only as a registry-test
+the SSH bridge, both macOS outerframe archives, and the shared web assets. `outershell-core.dll` is built only as a registry-test
 harness and is not installed. The installer removes obsolete managed/runtime DLLs
 when upgrading an existing installation.
 
@@ -109,7 +117,8 @@ account's normal filesystem permissions; Files is not a filesystem sandbox.
 ## Validation
 
 `test_host.py <path-to-packaged-OuterShell.exe>` exercises HTTP framing, origin
-checks, layout conflicts and persistence, Unicode Files listings, binary/chunked
+checks, outerframe negotiation and both macOS bundle downloads, layout conflicts
+and persistence, Unicode Files listings, binary/chunked
 transfers, controls, concurrency, and child cleanup. Run it under an account with
 no existing Outer Shell process, because it uses that account's canonical pipes.
 It uses temporary registry state and restores the account's prior allowlist.
@@ -164,28 +173,53 @@ Windows pipes so nested homepage links work.
 
 ### Install Linux support
 
-Use a systemd-enabled WSL 2 distribution, with `Backends` and `Files` checked out
-beside one another inside the Linux filesystem. On Ubuntu:
+Use a systemd-enabled WSL 2 distribution. As its ordinary Linux user, run:
 
 ```sh
-sudo apt-get install build-essential libpng-dev libcurl4-openssl-dev
-bash Backends/Windows/build-wsl-support.sh
-sudo install -m 755 Backends/build/wsl/outer-socket-bridge /usr/local/bin/outer-socket-bridge
-sudo loginctl enable-linger "$USER"
 bash Backends/Windows/install-wsl-support.sh
 ```
 
-The user installer installs Outer Shell and Files under
-`~/.local/state/outershell/wsl`, registers their real Linux apps, and enables
-systemd user socket units. Both bundled services use `--web-only`, so Mac clients
-receive the installed web UI rather than a descriptor for an absent outerframe
-bundle. The sockets have mode 0600 and are listed in
-`~/.config/outerssh/http-unix.allow`. Linger makes the user manager available when
-WSL starts without an interactive Linux login. Refresh the Windows homepage after
-installation. `OuterShell.exe --wsl-list` prints a diagnostic snapshot.
+This invokes the standard Linux release installer, then installs the packaged
+Linux socket bridge under `/usr/local/bin` and enables user lingering with sudo
+when needed. It does not require a compiler or a Files source checkout. Outer
+Shell uses the normal Linux registry, installation paths, systemd socket units,
+app catalog, and app installers. Top, Plaintext, Files, and the other bundled
+apps are installed through **Add more…**, using the same release archives as any
+other Linux host. Their backends run in Linux and serve the normal macOS
+outerframe bundles to Mac clients and HTML where supported.
 
-The adapter currently exposes only the distribution's default user's Unix-socket
-apps, with at most 256 published endpoints and 64 simultaneous relay connections.
+For development, build the ordinary Linux release package and pass its installer
+and archive explicitly:
+
+```sh
+bash Backends/Windows/install-wsl-support.sh /path/to/install.sh /path/to/outer-shell-linux-x86_64-musl.tar.gz
+```
+
+The archive override supports the same static Linux packages as `./app deploy`.
+The Windows host only supplies distribution discovery and transport to the
+Linux sockets; it does not supply a separate WSL app catalog. Linger makes the
+user manager available when WSL starts without an interactive Linux login.
+Refresh the Windows homepage after installation. `OuterShell.exe --wsl-list`
+prints a diagnostic snapshot.
+
+The adapter exposes Unix-socket apps registered with the distribution's default
+user, including system-scoped apps. System-scoped endpoints launch the trusted
+Linux bridge with `wsl --user root`; the bridge still enforces the root-owned
+`/etc/outerssh/http-unix.allow`. User endpoints run as the default Linux user.
+The Windows account already owns the distribution and can launch WSL as root.
+The homepage presents separate WSL user and root cards. App service and frontend
+IDs remain unchanged; display caches and ordering are scoped to each card.
+Each WSL card exposes **Add more…** directly in the Windows homepage. The
+Windows API forwards catalog, recipe, and installation requests to the standard
+Linux Outer Shell, including its administrator-password flow. Opening the
+catalog starts a stopped distribution. The inner Outer Shell launcher is hidden;
+its backend remains responsible for Linux app management. WSL app menus include
+scoped uninstall actions. Running indicators reflect the Linux service process;
+a listening socket alone does not mean the app is running.
+App controls carry service scope, and system controls use the registered systemd
+unit through `wsl --user root`, without an interactive sudo prompt.
+The adapter supports at most 256 published endpoints and 64 simultaneous relay
+connections.
 Discovery refreshes every five seconds while the homepage is being observed.
 It does not install support automatically or expose Linux root as Windows SYSTEM.
 Cross-app Open With and WSL recipe/mount/shell editors are not implemented.
@@ -199,7 +233,8 @@ python3 Windows/test_wsl.py marcbook-windows 'C:\path\to\outer-socket-bridge.exe
 ```
 
 This test starts and stops the selected distribution. It checks discovery, app
-controls, nested homepage routing, binary/Unicode transfers, Linux allowlist
+controls, native Windows and WSL homepage bundles, nested homepage routing,
+standard Files, Top, and Plaintext native bundles, binary/Unicode transfers, Linux allowlist
 revocation (restored afterward), stopped-distribution discovery, and reconnection.
 Outer Loop's Windows named-pipe browser integration test additionally launches
 WSL Files from its own group through the Localhost AppContainer and verifies the

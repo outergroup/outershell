@@ -4,7 +4,8 @@ param(
     [ValidateSet('arm64', 'x64', 'x86')][string]$Architecture = [Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString().ToLowerInvariant(),
     [string]$VisualStudioRoot,
     [string]$FilesRoot,
-    [string]$OuterLoopRoot = "$PSScriptRoot/../../outerloop/OuterLoop"
+    [string]$OuterLoopRoot = "$PSScriptRoot/../../outerloop/OuterLoop",
+    [string]$BundlesDirectory = "$PSScriptRoot/../build/outerframe/bundles"
 )
 $ErrorActionPreference = 'Stop'
 if (!$FilesRoot) { $FilesRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..\Files')) }
@@ -46,6 +47,10 @@ Copy-Item (Join-Path $OuterLoopRoot "Resources/WindowsHelpers/outer-socket-bridg
 Copy-Item (Join-Path $OuterLoopRoot 'WindowsSocketBridge/install.ps1') (Join-Path $OutputDirectory 'install-ssh-bridge.ps1') -Force
 foreach ($obsolete in @('OuterShell.Windows.Runtime.dll', 'outershell-core.dll')) {
     Remove-Item (Join-Path $OutputDirectory $obsolete) -Force -ErrorAction SilentlyContinue
+}
+New-Item -ItemType Directory -Force "$OutputDirectory/bundles" | Out-Null
+foreach ($platform in @('macos-arm', 'macos-x86')) {
+    Copy-Item (Join-Path $BundlesDirectory "OuterShell.bundle.$platform.aar") "$OutputDirectory/bundles" -Force
 }
 New-Item -ItemType Directory -Force "$OutputDirectory/web", "$OutputDirectory/files-web" | Out-Null
 Copy-Item "$PSScriptRoot/../Resources/OuterShellWeb/*" "$OutputDirectory/web" -Recurse -Force

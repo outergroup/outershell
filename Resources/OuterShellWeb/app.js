@@ -15,6 +15,7 @@
   };
 
   const state = {
+    hostPlatform: null,
     backends: [],
     backendsReady: false,
     safeSpacesReady: false,
@@ -236,7 +237,7 @@
   }
 
   function findBackend(key) {
-    return state.backends.find(backend => backendKey(backend) === key);
+    return (state.addWorkspace ? state.workspaceCatalog || [] : state.backends).find(backend => backendKey(backend) === key);
   }
 
   function initials(name) {
@@ -522,7 +523,7 @@
       failure: endpointFailure(item.primary, item.displayName),
       serviceID: item.backend.serviceID, groupID: "host", groupName: "This server"
     }));
-    const containers = state.safeSpaces.flatMap(workspace => (workspace.apps || []).map(app => {
+    const containers = state.safeSpaces.flatMap(workspace => (workspace.apps || []).filter(app => workspace.runtimeKind !== "wsl" || app.serviceID !== "org.outershell.OuterShell").map(app => {
       const frontend = { ...app, port: app.port || 0 };
       return {
         key: containerBookmarkKey(workspace, app), name: state.endpointNames[containerBookmarkKey(workspace, app)] || app.displayName || app.serviceID,
@@ -551,7 +552,7 @@
   }
 
   function endpointGroupID(entry) {
-    return entry.workspace ? `container:${entry.workspace.id}` : entry.item.backend.serviceScope === "system" ? "root" : "user";
+    return entry.workspace ? `container:${entry.workspace.id}${entry.workspace.runtimeKind === "wsl" ? ":" + (entry.app.userName || "workspace") : ""}` : entry.item.backend.serviceScope === "system" ? "root" : "user";
   }
 
   function groupPinKeys(id, entries) {
@@ -690,14 +691,23 @@
     if (renderInitialLoading()) return;
     const sessionUsername = window.outerLoop?.sessionContext?.username;
     const userName = typeof sessionUsername === "string" ? sessionUsername.trim() : "";
+    const isWindows = state.hostPlatform === "windows";
     const groups = [
       { id: "user", name: userName || "Your user", note: "User", entries: entries.filter(entry => entry.item && entry.item.backend.serviceScope !== "system") },
-      { id: "root", name: "root", note: "Administrator", entries: entries.filter(entry => entry.item && entry.item.backend.serviceScope === "system") },
-      ...state.safeSpaces.map(workspace => ({ id: `container:${workspace.id}`, name: workspace.name || "Container", note: `${workspace.runtimeKind === "wsl" ? "WSL" : "Container"} · ${safeSpaceState(workspace)}`, workspace, entries: entries.filter(entry => entry.workspace?.id === workspace.id) }))
+      { id: "root", name: isWindows ? userName || "Your user" : "root", note: "Administrator", shield: isWindows, entries: entries.filter(entry => entry.item && entry.item.backend.serviceScope === "system") },
+      ...state.safeSpaces.flatMap(workspace => {
+        const apps = entries.filter(entry => entry.workspace?.id === workspace.id);
+        if (workspace.runtimeKind !== "wsl") return [{ id: `container:${workspace.id}`, name: workspace.name || "Container", note: `${workspace.runtimeKind === "wsl" ? "WSL" : "Container"} · ${safeSpaceState(workspace)}`, workspace, entries: apps }];
+        return [...new Set([...apps.map(entry => entry.app.userName || "workspace"), workspace.userName || "workspace", "root"])].sort((a, b) => (a === "root") - (b === "root") || a.localeCompare(b)).map(user => ({
+          id: `container:${workspace.id}:${user}`, name: `${workspace.name} / ${user}`, note: `WSL · ${user === "root" ? "Administrator" : "User"} · ${safeSpaceState(workspace)}`, workspace,
+          entries: apps.filter(entry => (entry.app.userName || "workspace") === user)
+        }));
+      })
     ];
     const ranks = new Map(state.groupOrder.map((id, index) => [id, index]));
     groups.sort((a, b) => (ranks.get(a.id) ?? Infinity) - (ranks.get(b.id) ?? Infinity));
     const markup = groups.map(group => {
+      const shield = group.shield ? '<svg aria-hidden="true" viewBox="0 0 16 18" width="14" height="16" style="vertical-align:middle;margin-right:6px;color:#2678d4"><path d="M8 1L14 3V8C14 12 11 15 8 17C5 15 2 12 2 8V3Z" fill="none" stroke="currentColor"/><path d="M8 1V17C11 15 14 12 14 8V3Z" fill="currentColor"/></svg>' : "";
       const workspace = group.workspace;
       const id = escapeHTML(workspace?.id || "");
       const preparing = workspace && containerPreparing(workspace);
@@ -707,11 +717,11 @@
       const listed = group.entries.filter(entry => !pins.includes(entry.key)).sort((a, b) => (ranks.get(a.key) ?? Infinity) - (ranks.get(b.key) ?? Infinity));
       const controls = workspace ? `<div class="overview-controls">${!safeSpaceIsRunning(workspace) ? `<button type="button" data-action="start-safe-space" data-safe-space-id="${id}" ${preparing ? "disabled" : ""}>${preparing ? "Starting…" : "Start"}</button>` : ""}<button type="button" data-action="edit-container" data-safe-space-id="${id}" aria-label="Manage ${escapeHTML(group.name)}">Manage…</button></div>` : "";
       const addMore = workspace?.runtimeKind === "wsl"
-        ? `<p class="overview-empty">Apps registered in this Linux distribution appear here.</p>`
+        ? `<button class="overview-add-more" type="button" data-action="open-wsl-add" data-safe-space-id="${id}" data-scope="${group.id.endsWith(":root") ? "system" : "user"}" >Add more…</button>`
         : workspace
         ? `<button class="overview-add-more" type="button" data-action="configure-container" data-safe-space-id="${id}" ${preparing || !managedContainer(workspace) ? "disabled" : ""} ${!managedContainer(workspace) ? 'title="This container is managed externally"' : ""}>Add more to Dockerfile…</button>`
         : `<button class="overview-add-more" type="button" data-action="open-add" data-scope="${group.id === "root" ? "system" : "user"}">Add more…</button>`;
-      return `<section class="overview-identity" data-group-id="${escapeHTML(group.id)}"><header class="overview-group-handle" tabindex="0" aria-label="Reorder ${escapeHTML(group.name)}. Hold and drag, or use arrow keys." title="Hold and drag to reorder" data-group-handle><div class="overview-group-heading"><h2>${escapeHTML(group.name)}</h2><p>${escapeHTML(group.note)}</p></div>${controls}</header><div class="overview-shortcuts" data-endpoint-area="pins">${pins.map(key => group.entries.find(entry => entry.key === key)).filter(Boolean).map(overviewShortcut).join("")}</div><div class="overview-list" data-endpoint-area="list">${listed.map(overviewEndpoint).join("") || `<p class="overview-empty">${state.loading || (workspace && state.safeSpacesLoading) ? "Loading…" : group.entries.length ? "" : "No registered endpoints."}</p>`}</div>${containerCommandsHTML(workspace)}${workspace?.buildProgress ? `<details class="container-build-progress"><summary>${escapeHTML(workspace.buildProgress.detail || workspace.buildProgress.phase)}</summary><pre>${escapeHTML(workspace.buildProgress.log || "")}</pre></details>` : ""}${addMore}</section>`;
+      return `<section class="overview-identity" data-group-id="${escapeHTML(group.id)}"><header class="overview-group-handle" tabindex="0" aria-label="Reorder ${escapeHTML(group.name)}${group.shield ? ", Administrator" : ""}. Hold and drag, or use arrow keys." title="Hold and drag to reorder" data-group-handle><div class="overview-group-heading"><h2>${escapeHTML(group.name)}</h2><p>${shield}${escapeHTML(group.note)}</p></div>${controls}</header><div class="overview-shortcuts" data-endpoint-area="pins">${pins.map(key => group.entries.find(entry => entry.key === key)).filter(Boolean).map(overviewShortcut).join("")}</div><div class="overview-list" data-endpoint-area="list">${listed.map(overviewEndpoint).join("") || `<p class="overview-empty">${state.loading || (workspace && state.safeSpacesLoading) ? "Loading…" : group.entries.length ? "" : "No registered endpoints."}</p>`}</div>${containerCommandsHTML(workspace)}${workspace?.buildProgress ? `<details class="container-build-progress"><summary>${escapeHTML(workspace.buildProgress.detail || workspace.buildProgress.phase)}</summary><pre>${escapeHTML(workspace.buildProgress.log || "")}</pre></details>` : ""}${addMore}</section>`;
     }).join("") + `<button class="overview-add-container" type="button" data-action="create-container"><span aria-hidden="true">+</span>Add container (beta)…</button>`;
     if (state.overviewMarkup !== markup) {
       elements.overview.innerHTML = markup;
@@ -744,7 +754,7 @@
   }
 
   function allEndpointItems() {
-    const containers = state.safeSpaces.flatMap(workspace => (workspace.apps || []).map(app => ({
+    const containers = state.safeSpaces.flatMap(workspace => (workspace.apps || []).filter(app => workspace.runtimeKind !== "wsl" || app.serviceID !== "org.outershell.OuterShell").map(app => ({
       identity: containerBookmarkKey(workspace, app), workspace, app,
       displayName: state.endpointNames[containerBookmarkKey(workspace, app)] || app.displayName || app.serviceID,
       subtitle: workspace.name || "Container",
@@ -841,7 +851,30 @@
     });
   }
 
+  function workspaceAPIPath(path) {
+    return state.addWorkspace ? `/api/wsl/${state.addWorkspace.id}/${path.replace(/^\/api\//, "")}` : path;
+  }
+
+  async function openWorkspaceAdd(workspace, scope) {
+    state.addWorkspace = workspace;
+    state.addScope = scope;
+    state.workspaceCatalog = [];
+    state.recipes = [];
+    try {
+      const { buffer } = await requestBuffer(workspaceAPIPath("/api/backends?web=1"));
+      if (state.addWorkspace !== workspace) return;
+      const result = decodeBackends(buffer);
+      if (result.error) throw new Error(result.error);
+      state.workspaceCatalog = result.backends;
+      openAddDialog("catalog");
+    } catch (error) {
+      state.addWorkspace = null;
+      toast(error.message || String(error), true);
+    }
+  }
+
   async function requestBuffer(url, options = {}, acceptErrors = false) {
+    if (/^\/api\/(control|create|recipes|file-picker)(\?|$)/.test(url)) url = workspaceAPIPath(url);
     const response = await fetch(url, { cache: "no-store", ...options });
     const buffer = await response.arrayBuffer();
     if (!response.ok && !acceptErrors) {
@@ -883,6 +916,7 @@
     });
     const result = await response.json();
     if (!response.ok || result.error) throw new Error(result.error || `Outer Shell returned HTTP ${response.status}.`);
+    if (!signal?.aborted && typeof result.hostPlatform === "string") state.hostPlatform = result.hostPlatform;
     if (!signal?.aborted && Array.isArray(result.providers)) state.providers = result.providers;
     return result;
   }
@@ -959,7 +993,7 @@
         workspace = findSafeSpace(workspaceID) || workspace;
         app = findSafeSpaceApp(workspace, serviceID, frontendKey) || app;
       }
-      if (app.isRunning !== true) await safeSpaceRequest("startApp", { workspaceID, serviceID });
+      if (app.isRunning !== true) await safeSpaceRequest("startApp", { workspaceID, serviceID, serviceScope: app.serviceScope });
       const ready = await waitForSafeSpaceApp(workspaceID, serviceID, frontendKey);
       window.location.assign(safeSpaceAppNavigationURL(ready.workspace, ready.app));
     } finally {
@@ -1167,10 +1201,11 @@
 
   const delay = milliseconds => new Promise(resolve => window.setTimeout(resolve, milliseconds));
 
-  async function control(backend, operation, values = {}, allowPassword = true) {
+  async function control(backend, operation, values = {}, allowPassword = true, workspace = state.addWorkspace) {
     const query = new URLSearchParams({ serviceID: backend.serviceID, scope: backend.serviceScope, operation });
     const body = new URLSearchParams(values);
-    const { buffer } = await requestBuffer(`/api/control?${query}`, {
+    const path = workspace ? `/api/wsl/${workspace.id}/control?${query}` : `/api/control?${query}`;
+    const { buffer } = await requestBuffer(path, {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded; charset=utf-8" },
       body
@@ -1184,7 +1219,7 @@
     if (!result.ok && result.needsPassword && allowPassword) {
       const password = await requestPassword(backend.displayName, result.message);
       if (password === null) return result;
-      return control(backend, operation, { ...values, sudoPassword: password }, false);
+      return control(backend, operation, { ...values, sudoPassword: password }, false, workspace);
     }
     return result;
   }
@@ -1230,6 +1265,9 @@
     elements.dialogLayer.replaceChildren();
     unlockPageScroll();
     state.logSelection = null;
+    state.addWorkspace = null;
+    state.workspaceCatalog = [];
+    state.recipes = [];
     restartEventWatch();
   }
 
@@ -1279,14 +1317,14 @@
 
   function openAddDialog(tab = state.addTab) {
     state.addTab = tab;
-    const apps = state.backends.filter(backend => backend.isBundled && !backend.isMigration && backend.serviceScope === state.addScope)
+    const apps = (state.addWorkspace ? state.workspaceCatalog || [] : state.backends).filter(backend => backend.serviceID !== "org.outershell.OuterShell" && backend.isBundled && !backend.isMigration && backend.serviceScope === state.addScope)
       .sort((a, b) => a.displayName.localeCompare(b.displayName));
     const catalog = apps.length ? `<div class="add-catalog">${apps.map(backend => {
       const item = { backend, frontend: backend.frontends?.[0], displayName: backend.displayName };
       const icon = iconHTML(item);
       return `<article class="add-catalog-app ${backend.isInstalled ? "installed" : ""}">
         ${icon}<h3>${escapeHTML(backend.displayName)}</h3>
-        ${backend.isInstalled ? '<span class="catalog-installed">Installed</span>' : `<button class="secondary-button" type="button" data-action="install" data-backend-key="${escapeHTML(backendKey(backend))}">${backend.serviceScope === "system" ? "Install as root" : "Install"}</button>`}
+        ${backend.isInstalled ? '<span class="catalog-installed">Installed</span>' : `<button class="secondary-button" type="button" data-action="install" data-backend-key="${escapeHTML(backendKey(backend))}">${backend.serviceScope === "system" ? (state.hostPlatform === "windows" && !state.addWorkspace ? "Install as administrator" : "Install as root") : "Install"}</button>`}
       </article>`;
     }).join("")}</div>` : `<p class="add-empty">No bundled apps are available for this account.</p>`;
     const bash = `<form id="bash-form">
@@ -1330,9 +1368,9 @@ Install &lt;app&gt;. Set it up as a service and register it with Outer Shell so 
       ["agent", "Ask your coding agent", '<path d="M21 11a8 8 0 0 1-8 8H7l-5 3V11a9 9 0 0 1 19 0Z"/><path d="m7 9 3 3-3 3m6 0h4"/>'],
       ["bash", "Run bash commands", '<rect x="2" y="3" width="20" height="18" rx="2"/><path d="m6 8 3 3-3 3m6 0h5"/>'],
       ["recipes", "Other recipes", '<rect x="2" y="3" width="20" height="18" rx="2"/><path d="M6 8h1m3 0h8M6 12h1m3 0h8M6 16h1m3 0h5"/>']
-    ];
+    ].filter(([id]) => !state.addWorkspace || state.addScope !== "system" || id === "catalog" || id === "agent");
     const dialog = openDialog(`
-      <header class="dialog-header"><div class="dialog-title-wrap"><h2 id="dialog-title">Add Apps</h2></div><button class="dialog-close" type="button" data-action="close-dialog" aria-label="Close">×</button></header>
+      <header class="dialog-header"><div class="dialog-title-wrap"><h2 id="dialog-title">Add Apps${state.addWorkspace ? ` · ${escapeHTML(state.addWorkspace.name)} / ${state.addScope === "system" ? "root" : escapeHTML(state.addWorkspace.userName || "user")}` : ""}</h2></div><button class="dialog-close" type="button" data-action="close-dialog" aria-label="Close">×</button></header>
       <div class="dialog-body">
         <nav class="add-categories" aria-label="Add app type">${categories.map(([id, title, paths]) => `<button class="add-category" type="button" data-action="add-tab" data-tab="${id}" aria-pressed="${tab === id}"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${paths}</svg><span>${title}</span></button>`).join("")}</nav>
         <section class="add-content" aria-label="${categories.find(([id]) => id === tab)?.[1] || "Apps"}">${tab === "catalog" ? catalog : tab === "bash" ? bash : tab === "agent" ? codingAgent : '<div id="add-recipes" aria-live="polite">Loading recipes…</div>'}</section>
@@ -1834,6 +1872,7 @@ Install &lt;app&gt;. Set it up as a service and register it with Outer Shell so 
         ${app ? pinMenuHTML(containerBookmarkKey(workspace, app), context === "shortcut") + renameEndpointMenuHTML(findItem(containerBookmarkKey(workspace, app))) : ""}
         ${app ? `<a class="context-menu-item" href="${escapeHTML(url)}" data-action="launch-safe-space-app" ${attributes} role="menuitem">${contextMenuGlyph("↗")}<span>Open</span></a>` : `<p class="container-details">${escapeHTML(safeSpaceRuntimeDescription(workspace))}</p>`}
         <button class="context-menu-item" type="button" data-action="container-control" data-operation="${operation}" ${attributes} role="menuitem" ${preparing ? "disabled" : ""}>${contextMenuGlyph(running ? "■" : "▶")}<span>${preparing ? "Preparing…" : running ? "Stop" : "Start"}</span></button>
+        ${app && workspace.runtimeKind === "wsl" ? `<button class="context-menu-item" type="button" data-action="uninstall-wsl-app" ${attributes} role="menuitem">${contextMenuGlyph("×")}<span>Uninstall</span></button>` : ""}
         ${app && url !== "#" ? `<button class="context-menu-item" type="button" data-action="copy-container-url" ${attributes} role="menuitem">${contextMenuGlyph("⧉")}<span>Copy URL</span></button>` : ""}
       </section>`, point, `${name} actions`);
   }
@@ -1945,11 +1984,11 @@ Install &lt;app&gt;. Set it up as a service and register it with Outer Shell so 
       if (!result.ok) throw new Error(result.message || `Could not install ${backend.displayName}.`);
       closeDialog();
       toast(result.message || `Installed ${backend.displayName}.`);
-      await refreshBackends({ quiet: true });
+      await Promise.all([refreshBackends({ quiet: true }), refreshSafeSpaces({ quiet: true })]);
     } catch (error) {
       toast(error.message || String(error), true);
       button.disabled = false;
-      button.textContent = backend.serviceScope === "system" ? "Install as root" : "Install";
+      button.textContent = backend.serviceScope === "system" ? (state.hostPlatform === "windows" && !state.addWorkspace ? "Install as administrator" : "Install as root") : "Install";
     }
   }
 
@@ -2290,17 +2329,33 @@ Install &lt;app&gt;. Set it up as a service and register it with Outer Shell so 
       if (app) { closeDialog(); await copyText(safeSpaceAppNavigationURL(workspace, app)); }
       return;
     }
+    if (action === "uninstall-wsl-app") {
+      const workspace = findSafeSpace(actionElement.dataset.safeSpaceId);
+      const app = findSafeSpaceApp(workspace, actionElement.dataset.serviceId, actionElement.dataset.frontendKey);
+      if (!app || !window.confirm(`Uninstall ${app.displayName}?`)) return;
+      actionElement.disabled = true;
+      try {
+        const result = await control(app, "uninstall", {}, true, workspace);
+        if (!result.ok) throw new Error(result.message || "Uninstall failed.");
+        closeDialog();
+        await refreshSafeSpaces({ quiet: true });
+      } catch (error) { toast(error.message || String(error), true); actionElement.disabled = false; }
+      return;
+    }
     if (action === "container-control") {
       actionElement.disabled = true;
       try {
-        await safeSpaceRequest(actionElement.dataset.operation, { workspaceID: actionElement.dataset.safeSpaceId, serviceID: actionElement.dataset.serviceId });
+        const workspace = findSafeSpace(actionElement.dataset.safeSpaceId);
+        const app = findSafeSpaceApp(workspace, actionElement.dataset.serviceId, actionElement.dataset.frontendKey);
+        await safeSpaceRequest(actionElement.dataset.operation, { workspaceID: actionElement.dataset.safeSpaceId, serviceID: actionElement.dataset.serviceId, serviceScope: app?.serviceScope });
         closeDialog();
         await refreshSafeSpaces({ quiet: true });
       } catch (error) { toast(error.message || String(error), true); actionElement.disabled = false; }
       return;
     }
     if (action === "close-dialog") { closeDialog(); return; }
-    if (action === "open-add") { state.addScope = actionElement.dataset.scope || (state.backends.some(backend => backend.serviceID === "org.outershell.OuterShell" && backend.serviceScope === "system") ? "system" : "user"); openAddDialog(); return; }
+    if (action === "open-wsl-add") { const workspace = findSafeSpace(actionElement.dataset.safeSpaceId); if (workspace) await openWorkspaceAdd(workspace, actionElement.dataset.scope); return; }
+    if (action === "open-add") { state.addWorkspace = null; state.addScope = actionElement.dataset.scope || (state.backends.some(backend => backend.serviceID === "org.outershell.OuterShell" && backend.serviceScope === "system") ? "system" : "user"); openAddDialog(); return; }
     if (action === "start-safe-space") {
       try { await startSafeSpace(actionElement.dataset.safeSpaceId); }
       catch (error) { toast(error.message || String(error), true); }

@@ -19,7 +19,7 @@ struct Endpoint {
     Distribution *distribution;
     char *socket, *pipe;
     PipeServer *server;
-    bool enabled;
+    bool enabled, system;
 };
 struct Distribution {
     Distribution *next;
@@ -265,8 +265,10 @@ static bool capture(Wsl *w, const char *const *arguments, StringBuilder *result)
                    GetTickCount64() > deadline) {
             ok = false;
             break;
-        } else if (WaitForSingleObject(p.process, 0) == WAIT_OBJECT_0)
-            break;
+        } else if (WaitForSingleObject(p.process, 0) == WAIT_OBJECT_0) {
+            if (!PeekNamedPipe(p.output.pipe, NULL, 0, NULL, &available, NULL) || !available)
+                break;
+        }
     }
     DWORD exit_code = 1;
     ok = ok && WaitForSingleObject(p.process, 5000) == WAIT_OBJECT_0 &&
@@ -306,9 +308,18 @@ static bool receive_frame(Child *p, uint16_t *type, StringBuilder *data) {
     data->data[length] = 0;
     return true;
 }
-static bool bridge_start(Distribution *d, const char *socket, Child *p) {
-    const char *args[] = {"--distribution", d->name,    "--exec", WSL_BRIDGE,
-                          "bridge",         "--socket", socket,   NULL};
+static bool bridge_start(Distribution *d, const char *socket, bool system, Child *p) {
+    const char *args[12] = {"--distribution", d->name};
+    size_t count = 2;
+    if (system) {
+        args[count++] = "--user";
+        args[count++] = "root";
+    }
+    args[count++] = "--exec";
+    args[count++] = WSL_BRIDGE;
+    args[count++] = "bridge";
+    args[count++] = "--socket";
+    args[count++] = socket;
     if (!child_start(d->owner, args, p))
         return false;
     StringBuilder data = {0};
@@ -332,7 +343,7 @@ static bool guest_http(Distribution *d, const char *method, const char *target,
              d->uid ? "/run/user/%lu/org.outershell.OuterShell" : "/run/org.outershell.OuterShell",
              d->uid);
     Child p = {0};
-    if (!bridge_start(d, socket, &p))
+    if (!bridge_start(d, socket, d->uid == 0, &p))
         return false;
     StringBuilder request = {0}, response = {0}, frame = {0};
     append(&request, method);
@@ -391,11 +402,12 @@ static void relay_client_impl(Connection *client, void *context) {
     Wsl *w = endpoint->distribution->owner;
     EnterCriticalSection(&w->gate);
     bool enabled = endpoint->enabled && endpoint->distribution->present;
+    bool system = endpoint->system;
     LeaveCriticalSection(&w->gate);
     if (!enabled || serve_guest_backends(endpoint, client))
         return;
     Child p = {0};
-    if (!bridge_start(endpoint->distribution, endpoint->socket, &p))
+    if (!bridge_start(endpoint->distribution, endpoint->socket, system, &p))
         return;
     client->cancel = p.cancel;
     Relay relay = {&p, client};
@@ -425,11 +437,12 @@ static void relay_client(Connection *client, void *context) {
         relay_client_impl(client, context);
     InterlockedDecrement(&w->active_relays);
 }
-static Endpoint *publish(Distribution *d, const char *socket) {
+static Endpoint *publish(Distribution *d, const char *socket, bool system) {
     Wsl *w = d->owner;
     for (Endpoint *e = w->endpoints; e; e = e->next)
         if (e->distribution == d && !strcmp(e->socket, socket)) {
             e->enabled = true;
+            e->system = system;
             return e;
         }
     if (w->endpoint_count >= 256 || socket[0] != '/' || strlen(socket) >= 108)
@@ -455,6 +468,7 @@ static Endpoint *publish(Distribution *d, const char *socket) {
     Endpoint *e = win_alloc(sizeof(*e));
     e->distribution = d;
     e->socket = win_strdup(socket);
+    e->system = system;
     e->pipe = win_pipe(app);
     e->server = e->pipe && !w->inspect ? pipe_server_start(e->pipe, relay_client, e) : NULL;
     const char *paths[] = {e->pipe};
@@ -512,13 +526,16 @@ static bool rewrite_backends(Distribution *d, StringBuilder *response) {
             free(backend.data);
             continue;
         }
+        char *scope = string_reference(source, 32);
+        bool system = !strcmp(scope, "system");
+        free(scope);
         StringBuilder updated = copy_payload(apps);
         for (uint32_t j = 0; j < n; j++) {
             StringBuilder original = reference(apps, 4 + j * 8);
             if (original.length < 64)
                 continue;
             char *socket = string_reference(original, 16);
-            Endpoint *endpoint = socket[0] == '/' ? publish(d, socket) : NULL;
+            Endpoint *endpoint = socket[0] == '/' ? publish(d, socket, system) : NULL;
             if (endpoint) {
                 StringBuilder app = copy_payload(original);
                 char *url = string_reference(original, 8);
@@ -541,6 +558,65 @@ static bool rewrite_backends(Distribution *d, StringBuilder *response) {
     *response = result;
     return true;
 }
+static bool control_app(Distribution *d, const char *service, const char *verb, bool system) {
+    StringBuilder response = {0};
+    if (!guest_http(d, "GET", "/api/backends", &response) || response.length < 12) {
+        free(response.data);
+        return false;
+    }
+    uint32_t count = read_uint32_le((unsigned char *)response.data + 8);
+    char *unit = NULL;
+    if (count <= 256 && response.length >= 12 + (size_t)count * 8) {
+        for (uint32_t i = 0; i < count; i++) {
+            StringBuilder backend = reference(response, 12 + i * 8);
+            char *id = string_reference(backend, 0), *scope = string_reference(backend, 32);
+            bool match = !strcmp(id, service) && !strcmp(scope, system ? "system" : "user");
+            free(id);
+            free(scope);
+            if (match) {
+                unit = string_reference(backend, 16);
+                break;
+            }
+        }
+    }
+    free(response.data);
+    if (!unit)
+        return false;
+    size_t length = strlen(unit);
+    bool valid = length > 8 && length < 256 && !strcmp(unit + length - 8, ".service");
+    for (const char *p = unit; *p; p++)
+        if (!isalnum((unsigned char)*p) && *p != '.' && *p != '-' && *p != '_')
+            valid = false;
+    bool ok = false;
+    if (valid) {
+        char socket[256];
+        snprintf(socket, sizeof(socket), "%.*s.socket", (int)(length - 8), unit);
+        const char *args[14] = {"--distribution", d->name};
+        size_t count = 2;
+        if (system) {
+            args[count++] = "--user";
+            args[count++] = "root";
+        }
+        args[count++] = "--exec";
+        args[count++] = "/usr/bin/systemctl";
+        args[count++] = system ? "--system" : "--user";
+        args[count++] = verb;
+        args[count++] = unit;
+        if (!strcmp(verb, "start"))
+            args[count] = socket;
+        StringBuilder output = {0};
+        ok = capture(d->owner, args, &output);
+        if (!ok && !strcmp(verb, "start")) {
+            args[count] = NULL;
+            output.length = 0;
+            ok = capture(d->owner, args, &output);
+        }
+        free(output.data);
+    }
+    free(unit);
+    return ok;
+}
+
 static bool serve_guest_backends(Endpoint *endpoint, Connection *client) {
     char shell_socket[160];
     Distribution *d = endpoint->distribution;
@@ -577,21 +653,6 @@ static bool serve_guest_backends(Endpoint *endpoint, Connection *client) {
     http_free(&request);
     return true;
 }
-static bool socket_available(StringBuilder listing, const char *socket) {
-    size_t length = strlen(socket);
-    const char *p = listing.data;
-    while (p && *p) {
-        const char *end = strchr(p, '\n');
-        if (!end)
-            end = p + strlen(p);
-        const char *tab = memchr(p, '\t', (size_t)(end - p));
-        if (tab && (size_t)(end - tab - 1) == length + 10 && !memcmp(tab + 1, socket, length) &&
-            !memcmp(tab + 1 + length, "\tavailable", 10))
-            return true;
-        p = *end ? end + 1 : NULL;
-    }
-    return false;
-}
 static bool app_list(Distribution *d, StringBuilder *json) {
     StringBuilder response = {0};
     if (!guest_http(d, "GET", "/api/backends", &response) || response.length < 12 ||
@@ -604,9 +665,6 @@ static bool app_list(Distribution *d, StringBuilder *json) {
         free(response.data);
         return false;
     }
-    StringBuilder listing = {0};
-    const char *list_args[] = {"--distribution", d->name, "--exec", WSL_BRIDGE, "list", NULL};
-    capture(d->owner, list_args, &listing);
     EnterCriticalSection(&d->owner->gate);
     for (Endpoint *e = d->owner->endpoints; e; e = e->next)
         if (e->distribution == d)
@@ -617,6 +675,9 @@ static bool app_list(Distribution *d, StringBuilder *json) {
         StringBuilder backend = reference(response, 12 + i * 8);
         if (backend.length < 84)
             continue;
+        char *scope = string_reference(backend, 32);
+        bool system = !strcmp(scope, "system");
+        free(scope);
         char *service = string_reference(backend, 0);
         StringBuilder apps = reference(backend, 68);
         uint32_t n = apps.length >= 4 ? read_uint32_le((unsigned char *)apps.data) : 0;
@@ -628,7 +689,7 @@ static bool app_list(Distribution *d, StringBuilder *json) {
                 continue;
             char *socket = string_reference(app, 16), *name = string_reference(app, 0),
                  *url = string_reference(app, 8), *id = string_reference(app, 52);
-            Endpoint *endpoint = socket[0] == '/' ? publish(d, socket) : NULL;
+            Endpoint *endpoint = socket[0] == '/' ? publish(d, socket, system) : NULL;
             if (endpoint) {
                 if (added++)
                     append(json, ",");
@@ -645,16 +706,17 @@ static bool app_list(Distribution *d, StringBuilder *json) {
                 append(json, ",");
                 field(json, "url", url);
                 append(json, ",");
-                field(json, "userName", d->user);
+                field(json, "userName", system ? "root" : d->user);
+                append(json, ",");
+                field(json, "serviceScope", system ? "system" : "user");
                 StringBuilder icon = reference(app, 32);
                 if (icon.length && icon.length <= 512 * 1024 &&
                     !(read_uint32_le((unsigned char *)app.data + 60) & 2)) {
                     append(json, ",\"iconData\":");
                     json_base64(json, icon);
                 }
-                append(json, ",\"isRunning\":");
-                append(json, ((read_uint32_le((unsigned char *)app.data + 60) & 1) ||
-                              socket_available(listing, socket))
+                append(json, ",\"iconPath\":\"\",\"iconObservationToken\":\"\",\"publishedPort\":0,\"isRunning\":");
+                append(json, (read_uint32_le((unsigned char *)app.data + 60) & 1)
                                  ? "true"
                                  : "false");
                 append(json, "}");
@@ -668,7 +730,6 @@ static bool app_list(Distribution *d, StringBuilder *json) {
     }
     append(json, "]");
     LeaveCriticalSection(&d->owner->gate);
-    free(listing.data);
     free(response.data);
     return true;
 }
@@ -789,7 +850,7 @@ static void discover_impl(Wsl *w) {
         RegCloseKey(root);
     free(running_names);
     StringBuilder snapshot = {0};
-    append(&snapshot, "{\"providers\":[],\"workspaces\":[");
+    append(&snapshot, "{\"hostPlatform\":\"windows\",\"providers\":[],\"workspaces\":[");
     size_t count = 0;
     EnterCriticalSection(&w->gate);
     for (Distribution *d = w->distributions; d; d = d->next) {
@@ -802,13 +863,16 @@ static void discover_impl(Wsl *w) {
         append(&snapshot, ",");
         field(&snapshot, "name", d->name);
         append(&snapshot, ",");
+        field(&snapshot, "userName", d->user);
+        append(&snapshot, ",");
         field(&snapshot, "state", d->running ? "running" : "stopped");
         append(&snapshot, ",\"runtimeKind\":\"wsl\",\"managementKind\":\"attached\","
-                          "\"ownsContainer\":false,"
+                          "\"ownsContainer\":false,\"cpus\":0,\"memoryInGB\":0,\"shellCommand\":\"\","
                           "\"runtime\":{\"providerID\":\"wsl\",\"providerName\":\"WSL\","
-                          "\"operatingSystemName\":\"Linux\"},"
+                          "\"operatingSystemName\":\"Linux\",\"operatingSystemVersion\":\"\","
+                          "\"architecture\":\"\",\"isolationKind\":\"wsl\",\"isolationName\":\"\"},"
                           "\"capabilities\":{\"supportsApps\":true,\"supportsShell\":false,"
-                          "\"supportsRecipes\":false,\"supportsMounts\":false},"
+                          "\"supportsRecipes\":false,\"supportsMounts\":false,\"supportsLiveMounts\":false},"
                           "\"outerShellSupport\":{");
         field(&snapshot, "status", d->apps.data ? "available" : "unknown");
         append(&snapshot, ",");
@@ -981,15 +1045,118 @@ static char *request_string(const HttpRequest *request, const char *name) {
 static void send_snapshot(Wsl *w, Connection *c, HttpRequest *r) {
     wsl_version(w);
     EnterCriticalSection(&w->gate);
-    const char *json = w->snapshot.data ? w->snapshot.data : "{\"providers\":[],\"workspaces\":[]}";
+    const char *json = w->snapshot.data ? w->snapshot.data : "{\"hostPlatform\":\"windows\",\"providers\":[],\"workspaces\":[]}";
     char *copy = win_strdup(json);
     LeaveCriticalSection(&w->gate);
-    http_send(c, r, 200, "application/json", copy, strlen(copy));
+    char *request_id = r->body.length ? request_string(r, "requestID") : NULL;
+    if (request_id) {
+        StringBuilder response = {0};
+        append(&response, "{");
+        field(&response, "requestID", request_id);
+        append(&response, ",");
+        append(&response, copy + 1);
+        http_send(c, r, 200, "application/json", response.data, response.length);
+        free(response.data);
+    } else {
+        http_send(c, r, 200, "application/json", copy, strlen(copy));
+    }
+    free(request_id);
     free(copy);
 }
+static void serve_workspace_api(Wsl *w, Connection *c, HttpRequest *r) {
+    const char *id = r->path + strlen("/api/wsl/");
+    const char *route = strchr(id, '/');
+    if (!route || route - id != 36 ||
+        (strcmp(route, "/backends") && strcmp(route, "/control") &&
+         strcmp(route, "/recipes") && strcmp(route, "/create") &&
+         strcmp(route, "/file-picker") && strcmp(route, "/native-app-projects"))) {
+        http_text(c, r, 404, "Unknown Linux API.");
+        return;
+    }
+    bool read = !strcmp(route, "/backends") || !strcmp(route, "/recipes") || !strcmp(route, "/file-picker");
+    if (strcmp(r->method, read ? "GET" : "POST")) {
+        http_text(c, r, 405, "Unsupported method.");
+        return;
+    }
+    EnterCriticalSection(&w->gate);
+    Distribution *d;
+    for (d = w->distributions; d; d = d->next)
+        if (d->present && !_strnicmp(d->id, id, 36))
+            break;
+    bool running = d && d->running;
+    LeaveCriticalSection(&w->gate);
+    if (!d) {
+        http_text(c, r, 409, "The Linux distribution is no longer registered.");
+        return;
+    }
+    if (!running) {
+        EnterCriticalSection(&w->commands);
+        if (d->keepalive.process && WaitForSingleObject(d->keepalive.process, 0) == WAIT_OBJECT_0)
+            child_close(&d->keepalive);
+        const char *keepalive[] = {"--distribution", d->name, "--exec", "/bin/cat", NULL};
+        const char *start[] = {"--distribution", d->name, "--exec", "/bin/true", NULL};
+        StringBuilder output = {0};
+        bool started = (d->keepalive.process || child_start(w, keepalive, &d->keepalive)) &&
+                       capture(w, start, &output);
+        free(output.data);
+        LeaveCriticalSection(&w->commands);
+        if (!started) {
+            http_text(c, r, 502, "Could not start the Linux distribution.");
+            return;
+        }
+        SetEvent(w->refresh);
+    }
+    char socket[160];
+    snprintf(socket, sizeof(socket), d->uid ? "/run/user/%lu/org.outershell.OuterShell" : "/run/org.outershell.OuterShell", d->uid);
+    Child child = {0};
+    if (!bridge_start(d, socket, d->uid == 0, &child)) {
+        http_text(c, r, 502, "Could not connect to the Linux app manager.");
+        return;
+    }
+    StringBuilder request = {0}, frame = {0};
+    append(&request, r->method);
+    append(&request, " /api");
+    append(&request, route);
+    if (r->query && *r->query) {
+        append(&request, "?");
+        append(&request, r->query);
+    }
+    append(&request, " HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Type: ");
+    append(&request, !strcmp(route, "/native-app-projects")
+                         ? "application/vnd.outershell.native-app-project"
+                         : "application/x-www-form-urlencoded");
+    char length[80];
+    snprintf(length, sizeof(length), "\r\nContent-Length: %zu\r\n\r\n", r->body.length);
+    append(&request, length);
+    bool ok = send_frame(&child, 5, request.data, request.length);
+    for (size_t offset = 0; ok && offset < r->body.length; offset += 32768) {
+        size_t remaining = r->body.length - offset;
+        ok = send_frame(&child, 5, r->body.data + offset, remaining < 32768 ? remaining : 32768);
+    }
+    uint16_t type = 0;
+    while (ok && receive_frame(&child, &type, &frame)) {
+        if (type == 6 || type == 7)
+            break;
+        if (type == 10)
+            continue;
+        if (type != 5)
+            break;
+        ok = connection_write(c, frame.data, frame.length);
+    }
+    free(request.data);
+    free(frame.data);
+    child_close(&child);
+    if (!read)
+        SetEvent(w->refresh);
+}
+
 void wsl_serve(Wsl *w, Connection *c, HttpRequest *r) {
     if (!w) {
         http_text(c, r, 503, "WSL discovery is unavailable.");
+        return;
+    }
+    if (!strncmp(r->path, "/api/wsl/", 9)) {
+        serve_workspace_api(w, c, r);
         return;
     }
     if (!strcmp(r->path, "/api/container-snapshot")) {
@@ -1010,7 +1177,7 @@ void wsl_serve(Wsl *w, Connection *c, HttpRequest *r) {
     EnterCriticalSection(&w->gate);
     Distribution *d;
     for (d = w->distributions; d; d = d->next)
-        if (id && d->present && !strcmp(d->id, id))
+        if (id && d->present && !_stricmp(d->id, id))
             break;
     LeaveCriticalSection(&w->gate);
     if (!d) {
@@ -1038,6 +1205,7 @@ void wsl_serve(Wsl *w, Connection *c, HttpRequest *r) {
         error = "WSL could not change the distribution state.";
     } else if (!strcmp(operation, "startApp") || !strcmp(operation, "stopApp") ||
                !strcmp(operation, "restartApp")) {
+        char *scope = request_string(r, "serviceScope");
         char *service = request_string(r, "serviceID");
         bool valid = service && service[0] && strlen(service) < 256;
         if (service)
@@ -1045,17 +1213,12 @@ void wsl_serve(Wsl *w, Connection *c, HttpRequest *r) {
                 if (!isalnum((unsigned char)*p) && *p != '.' && *p != '-' && *p != '_')
                     valid = false;
         if (valid) {
-            char target[512];
             const char *verb = !strcmp(operation, "startApp")  ? "start"
                                : !strcmp(operation, "stopApp") ? "stop"
                                                                : "restart";
-            snprintf(target, sizeof(target), "/api/control?serviceID=%s&operation=%s", service,
-                     verb);
-            StringBuilder result = {0};
-            ok = guest_http(d, "POST", target, &result) && result.length >= 12 &&
-                 (read_uint32_le((unsigned char *)result.data) & 1);
-            free(result.data);
+            ok = control_app(d, service, verb, scope && !strcmp(scope, "system"));
         }
+        free(scope);
         free(service);
         error = "The Linux app could not complete this operation.";
     }

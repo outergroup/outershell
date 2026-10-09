@@ -554,6 +554,9 @@ private struct LocalWorkspaceAppRecord: Decodable, Equatable {
     let serviceID: String
     let displayName: String
     let socketPath: String
+    let externalSocketPath: String?
+    let userName: String?
+    let serviceScope: String?
     let url: String
     let iconPath: String
     let iconData: Data?
@@ -733,6 +736,7 @@ private struct LocalWorkspaceRecord: Decodable, Equatable {
     let id: UUID
     let name: String
     let state: String
+    var userName: String? = nil
     let cpus: Int
     let memoryInGB: Int
     let runtimeKind: String?
@@ -842,6 +846,7 @@ private struct LocalWorkspaceHostRequest: Encodable {
     let name: String?
     let frontendID: String?
     let serviceID: String?
+    let serviceScope: String?
     let cpus: Int?
     let memoryInGB: Int?
     let runtimeKind: String?
@@ -898,7 +903,12 @@ private struct LocalWorkspaceAppLogRecord: Decodable {
     let error: String
 }
 
+private struct OuterShellHostConfiguration: Decodable {
+    let hostPlatform: String?
+}
+
 private struct LocalWorkspaceHostResponse: Decodable {
+    let hostPlatform: String?
     let requestID: UUID
     let providers: [LocalSafeSpaceProviderRecord]?
     let workspaces: [LocalWorkspaceRecord]
@@ -1193,8 +1203,8 @@ private struct LogVisualLineMetrics {
 }
 
 private struct PendingPasswordAction {
-    let serviceID: String
-    let serviceScope: String
+    let backend: BackendRecord
+    let workspaceID: UUID?
     let operation: String
     let displayName: String
 }
@@ -1891,6 +1901,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private var overviewMenuFrames: [(frame: CGRect, item: AppLauncherItem)] = []
     private var overviewAddFrames: [CGRect] = []
     private var catalogScope = "user"
+    private var catalogWorkspaceID: UUID?
+    private var catalogWorkspace: LocalWorkspaceRecord?
+    private var workspaceCatalogBackends: [BackendRecord] = []
+    private var isLoadingWorkspaceCatalog = false
     private var overviewDropFrames: [(frame: CGRect, group: String, target: AppDropTarget)] = []
     private var overviewGroupFrames: [(frame: CGRect, header: CGRect, id: String)] = []
     private let overviewDragFeedbackLayer = CALayer()
@@ -1898,7 +1912,14 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private var overviewDragPreviewKey: String?
     private var overviewDragFrameScheduled = false
     private var pendingOverviewGroupDrag: (id: String, start: CGPoint, current: CGPoint, active: Bool)?
+    private var isWindowsHost = false
+    private var administrativeRoleName: String { isWindowsHost && catalogWorkspaceID == nil ? "administrator" : "root" }
+    private var administratorOverviewName: String { isWindowsHost ? overviewUsername : "root" }
+    private var administratorOverviewLabel: String {
+        isWindowsHost ? "\(overviewUsername), Administrator" : "root"
+    }
     private var overviewUsername = "Your user"
+    private var hasBackendUsername = false
     private var overviewLayout = OverviewLayout()
     private var overviewLayoutRevision: UInt64 = 0
     private var overviewLayoutReady = false
@@ -1997,6 +2018,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     func outerframeHost(_ host: OuterframeHost, didReceiveMessage message: BrowserToContentMessage) {
         switch message {
         case .initializeContent(let arguments):
+            if let data = arguments.data,
+               let configuration = try? JSONDecoder().decode(OuterShellHostConfiguration.self, from: data) {
+                isWindowsHost = configuration.hostPlatform == "windows"
+            }
             let initialURL = arguments.url ?? ""
             outerframeHost.configure(url: initialURL,
                                      bundleUrl: arguments.bundleUrl ?? "",
@@ -2007,6 +2032,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             outerframeHost.setTitle("Outer Shell")
             outerframeHost.setIcon(.bundleResource(path: "Contents/Resources/app-icon.png"))
             mode = modeFromURL(initialURL)
+            restoreCatalogContext(initialURL)
             workspaceContextID = workspaceIDFromURL(initialURL)
             selectedRecipeSafeSpaceID = recipeSafeSpaceIDFromURL(initialURL)
             didReceiveSystemAppearanceUpdate = false
@@ -2027,6 +2053,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             outerframeHost.requestOuterLoopSSHCommandArguments { [weak self] arguments in
                 guard let self, let arguments else { return }
                 self.serverSSHCommand = arguments.isEmpty ? nil : arguments.map(Self.shellQuotedArgument).joined(separator: " ")
+                if self.hasBackendUsername {
+                    self.updateLayout()
+                    return
+                }
                 if let index = arguments.firstIndex(of: "-l"), arguments.indices.contains(index + 1) {
                     self.overviewUsername = arguments[index + 1]
                 } else if let destination = arguments.last, let at = destination.firstIndex(of: "@") {
@@ -2035,7 +2065,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 self.updateLayout()
             }
             fetchBackends()
-            if mode == .create { fetchRecipes() }
+            if mode == .create { fetchRecipes(); fetchWorkspaceCatalog() }
             startEventWatch()
             if workspaceContextID == nil {
                 sendWorkspaceRequest(operation: "list")
@@ -2337,7 +2367,11 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             return nil
         }
         var queryItems = components.queryItems ?? []
-        queryItems.removeAll { $0.name == "view" }
+        queryItems.removeAll { ["view", "catalogWorkspace", "catalogScope"].contains($0.name) }
+        if mode == .create, let workspaceID = catalogWorkspaceID {
+            queryItems.append(URLQueryItem(name: "catalogWorkspace", value: workspaceID.uuidString.lowercased()))
+            queryItems.append(URLQueryItem(name: "catalogScope", value: catalogScope))
+        }
         switch mode {
         case .apps:
             components.path = "/"
@@ -2399,6 +2433,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
     private func applyNavigation(_ urlString: String) {
         let nextMode = modeFromURL(urlString)
+        restoreCatalogContext(urlString)
         selectedRecipeSafeSpaceID = nextMode == .apps
             ? recipeSafeSpaceIDFromURL(urlString)
             : nil
@@ -2415,6 +2450,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             endContainerConfigurationEditor()
         }
         applyMode(nextMode)
+        if nextMode == .create { fetchWorkspaceCatalog() }
     }
 
     private func returnFromRecipeSafeSpace() {
@@ -2431,6 +2467,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         if nextMode == .create && recipes.isEmpty { fetchRecipes() }
         let previousMode = mode
         if mode == .create && nextMode != .create {
+            catalogWorkspaceID = nil
+            catalogWorkspace = nil
+            workspaceCatalogBackends = []
+            recipes = []
             blurCreateField()
             discardGeneratedNativeProject()
         }
@@ -3879,8 +3919,25 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func overviewGroupID(for item: AppLauncherItem) -> String {
-        if let context = item.containerContext { return "container:\(context.container.id.uuidString.lowercased())" }
+        if let context = item.containerContext {
+            let group = "container:\(context.container.id.uuidString.lowercased())"
+            return context.container.runtimeKind == "wsl"
+                ? "\(group):\(context.app.userName ?? "workspace")" : group
+        }
         return item.backend.serviceScope == "system" ? "root" : "user"
+    }
+
+    private func overviewGroupName(_ id: String) -> String {
+        if id == "user" { return overviewUsername }
+        if id == "root" { return administratorOverviewLabel }
+        for workspace in localWorkspaces {
+            let prefix = "container:\(workspace.id.uuidString.lowercased())"
+            if id == prefix { return workspace.name }
+            if id.hasPrefix(prefix + ":") {
+                return "\(workspace.name) / \(id.dropFirst(prefix.count + 1))"
+            }
+        }
+        return "Container"
     }
 
     private func overviewTitle(for item: AppLauncherItem) -> String {
@@ -3889,7 +3946,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
     private func renderOverviewCards(visibleIconKeys: inout Set<String>,
                                      visibleTextKeys: inout Set<String>) -> CGFloat {
-        guard overviewLayoutReady, !backends.isEmpty || !isLoadingBackends else {
+        guard overviewLayoutReady, lastBackendsResponseData != nil || !isLoadingBackends else {
             return appsLayer.bounds.height - 18
         }
         let width = max(appsLayer.bounds.width - horizontalInset * 2, 1)
@@ -3900,11 +3957,28 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         let hostItems = appLauncherItems().filter { $0.backend.isInstalled ?? true }
         var groups: [(id: String, name: String, note: String, items: [AppLauncherItem], workspace: LocalWorkspaceRecord?)] = [
             ("user", overviewUsername, "User", hostItems.filter { $0.backend.serviceScope != "system" }, nil),
-            ("root", "root", "Administrator", hostItems.filter { $0.backend.serviceScope == "system" }, nil)
+            ("root", administratorOverviewName, "Administrator", hostItems.filter { $0.backend.serviceScope == "system" }, nil)
         ]
         if workspaceContextID == nil {
-            groups += localWorkspaces.map {
-                ("container:\($0.id.uuidString.lowercased())", $0.name, "Container · \(displayedWorkspaceState(for: $0))", appLauncherItems(in: $0), $0)
+            for workspace in localWorkspaces {
+                let items = appLauncherItems(in: workspace)
+                let prefix = "container:\(workspace.id.uuidString.lowercased())"
+                if workspace.runtimeKind == "wsl" {
+                    let users = Set(workspace.apps.map { $0.userName ?? "workspace" } + [workspace.userName ?? "workspace", "root"]).sorted {
+                        if ($0 == "root") != ($1 == "root") { return $1 == "root" }
+                        return $0 < $1
+                    }
+                    for user in users {
+                        let id = "\(prefix):\(user)"
+                        groups.append((id, "\(workspace.name) / \(user)",
+                            "WSL · \(user == "root" ? "Administrator" : "User") · \(displayedWorkspaceState(for: workspace))",
+                            items.filter { overviewGroupID(for: $0) == id }, workspace))
+                    }
+                } else {
+                    groups.append((prefix, workspace.name,
+                        "\(workspace.runtimeKind == "wsl" ? "WSL" : "Container") · \(displayedWorkspaceState(for: workspace))",
+                        items, workspace))
+                }
             }
         }
         groups.sort {
@@ -3922,7 +3996,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             let commandCount = commands.count + (hasTerminal ? 1 : 0)
             let commandsHeight: CGFloat = commandCount == 0 ? 0 : 38 + CGFloat(commandCount) * 38
             let listHeight = max(CGFloat(listed.count) * 38, 28)
-            let cardHeight = 80 + pinHeight + listHeight + commandsHeight + 62
+            let canAddApps = group.workspace?.runtimeKind == "wsl" || (group.workspace?.capabilities?.supportsRecipes ?? true)
+            let cardHeight = 80 + pinHeight + listHeight + commandsHeight + (canAddApps ? 62 : 16)
             let frame = CGRect(x: horizontalInset + CGFloat(column) * (cardWidth + gap),
                                y: tops[column] - cardHeight, width: cardWidth, height: cardHeight)
             let card = CALayer()
@@ -3941,7 +4016,19 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             addAppsSublayer(heading)
             let note = makeTextLayer(size: 12, weight: .regular, color: .secondaryLabelColor)
             note.string = group.note
-            note.frame = CGRect(x: frame.minX + 16, y: frame.maxY - 60, width: titleWidth, height: 18)
+            let showsAdministratorShield = isWindowsHost && group.id == "root"
+            let shieldInset: CGFloat = showsAdministratorShield ? 20 : 0
+            note.frame = CGRect(x: frame.minX + 16 + shieldInset, y: frame.maxY - 60, width: max(titleWidth - shieldInset, 1), height: 18)
+            if showsAdministratorShield,
+               let symbol = NSImage(systemSymbolName: "shield.lefthalf.filled", accessibilityDescription: nil)?
+                .withSymbolConfiguration(NSImage.SymbolConfiguration(hierarchicalColor: .systemBlue)),
+               let image = cgImage(for: symbol) {
+                let shield = CALayer()
+                shield.contents = image
+                shield.contentsGravity = .resizeAspect
+                shield.frame = CGRect(x: frame.minX + 16, y: frame.maxY - 58, width: 14, height: 16)
+                addAppsSublayer(shield)
+            }
             addAppsSublayer(note)
             if let workspace = group.workspace {
                 workspaceOverviewRowFrames.append((frame, workspace))
@@ -3970,7 +4057,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             if listed.isEmpty {
                 if pins.isEmpty {
                     let empty = makeTextLayer(size: 12, weight: .regular, color: .secondaryLabelColor)
-                    empty.string = isLoadingBackends ? "Loading…" : "No registered endpoints."
+                    empty.string = "No registered endpoints."
                     empty.frame = CGRect(x: frame.minX + 16, y: top - 22, width: innerWidth, height: 18)
                     addAppsSublayer(empty)
                 }
@@ -3997,13 +4084,15 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                     top -= 38
                 }
             }
-            let add = CGRect(x: frame.minX + 16, y: frame.minY + 16,
-                             width: min(innerWidth, group.workspace == nil ? 106 : 204), height: 28)
-            renderOverviewButton(group.workspace == nil ? "Add more…" : "Add more to Dockerfile…", frame: add)
-            if let workspace = group.workspace {
-                workspaceOverviewActionFrames.append((add, workspace, "editContainer"))
-            } else {
-                overviewAddFrames.append(add)
+            if canAddApps {
+                let add = CGRect(x: frame.minX + 16, y: frame.minY + 16,
+                                 width: min(innerWidth, group.workspace == nil || group.workspace?.runtimeKind == "wsl" ? 106 : 204), height: 28)
+                renderOverviewButton(group.workspace == nil || group.workspace?.runtimeKind == "wsl" ? "Add more…" : "Add more to Dockerfile…", frame: add)
+                if let workspace = group.workspace, workspace.runtimeKind != "wsl" {
+                    workspaceOverviewActionFrames.append((add, workspace, "editContainer"))
+                } else {
+                    overviewAddFrames.append(add)
+                }
             }
             tops[column] = frame.minY - gap
         }
@@ -4111,7 +4200,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 preview.shadowRadius = 8
                 preview.shadowOffset = CGSize(width: 0, height: -3)
                 let text = makeTextLayer(size: 16, weight: .semibold, color: .labelColor)
-                text.string = drag.id == "user" ? overviewUsername : drag.id == "root" ? "root" : localWorkspaces.first { "container:\($0.id.uuidString.lowercased())" == drag.id }?.name ?? "Container"
+                text.string = overviewGroupName(drag.id)
                 text.frame = CGRect(x: 16, y: 14, width: previewSize.width - 32, height: 24)
                 preview.addSublayer(text)
                 overviewDragPreview = preview
@@ -4317,7 +4406,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
     private func moveOverviewItem(_ item: AppLauncherItem, pinned: Bool, before: AppLauncherItem? = nil) {
         let group = overviewGroupID(for: item)
-        let items = item.containerContext.map { appLauncherItems(in: $0.container) } ?? appLauncherItems().filter { overviewGroupID(for: $0) == group }
+        let items = (item.containerContext.map { appLauncherItems(in: $0.container) } ?? appLauncherItems()).filter { overviewGroupID(for: $0) == group }
         let key = overviewKey(for: item)
         var pins = overviewOrderedItems(items.filter(isAppProminent), group: group, pinned: true).map(overviewKey).filter { $0 != key }
         var list = overviewOrderedItems(items.filter { !isAppProminent($0) }, group: group, pinned: false).map(overviewKey).filter { $0 != key }
@@ -5028,7 +5117,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             (.bashCommands, "Run bash commands", "terminal"),
             (.nativeApp, "New App", "hammer"),
             (.otherRecipes, "Other recipes", "list.bullet.rectangle")
-        ]
+        ].filter { catalogWorkspaceID == nil || catalogScope != "system" || $0.0 == .appCatalog || $0.0 == .codingAgent }
 
         var x = left
         var y = top - cardHeight
@@ -6164,7 +6253,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         panel.addSublayer(title)
 
         let message = makeTextLayer(size: 12, weight: .regular, color: .secondaryLabelColor)
-        message.string = isRootOnly ? "Install this app for root." : "Install this app for your user."
+        message.string = isRootOnly ? "Install this app for \(administrativeRoleName)." : "Install this app for your user."
         message.isWrapped = true
         message.frame = CGRect(x: 72, y: panelHeight - 74, width: panelWidth - 90, height: 20)
         panel.addSublayer(message)
@@ -6179,7 +6268,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         let cancelButton = makeButtonLayer(title: "Cancel", emphasized: false)
         cancelButton.frame = cancelLocalFrame
         panel.addSublayer(cancelButton)
-        let installButton = makeButtonLayer(title: isRootOnly ? "Install as root" : "Install", emphasized: true)
+        let installButton = makeButtonLayer(title: isRootOnly ? "Install as \(administrativeRoleName)" : "Install", emphasized: true)
         installButton.frame = confirmLocalFrame
         panel.addSublayer(installButton)
     }
@@ -7335,7 +7424,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         let top = max(panelFrame.maxY - 62, 0) + createScroll
 
         let pageTitle = makeTextLayer(size: 22, weight: .semibold, color: .labelColor)
-        pageTitle.string = "Add Apps"
+        pageTitle.string = catalogWorkspace.map { "Add Apps · \($0.name) / \(catalogScope == "system" ? "root" : ($0.userName ?? "user"))" } ?? "Add Apps"
         pageTitle.frame = CGRect(x: left, y: top, width: max(pageWidth - 48, 1), height: 28)
         addCreateFormSublayer(pageTitle)
 
@@ -7353,7 +7442,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         case .appCatalog:
             let addableApps = bundledCatalogBackends()
             if addableApps.isEmpty {
-                renderCreateEmptyMessage("No apps are currently available.",
+                renderCreateEmptyMessage(isLoadingWorkspaceCatalog ? "Loading apps…" : "No apps are currently available.",
                                          left: left,
                                          top: contentTop,
                                          width: pageWidth)
@@ -7778,7 +7867,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             let offset = action == .moveEarlier ? -1 : 1
             if let item = target.item {
                 let pinned = isAppProminent(item)
-                let items = item.containerContext.map { appLauncherItems(in: $0.container) } ?? appLauncherItems().filter { overviewGroupID(for: $0) == target.group }
+                let items = (item.containerContext.map { appLauncherItems(in: $0.container) } ?? appLauncherItems()).filter { overviewGroupID(for: $0) == target.group }
                 var ordered = overviewOrderedItems(items.filter { isAppProminent($0) == pinned }, group: target.group, pinned: pinned)
                 guard let index = ordered.firstIndex(where: { $0.identityKey == item.identityKey }), ordered.indices.contains(index + offset) else { return }
                 ordered.swapAt(index, index + offset)
@@ -8167,7 +8256,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                            frame: frame,
                                            label: "Open \(overviewTitle(for: card.item))",
                                            value: status,
-                                           hint: card.item.containerContext?.container.name ?? (card.item.backend.serviceScope == "system" ? "root" : overviewUsername),
+                                           hint: card.item.containerContext?.container.name ?? (card.item.backend.serviceScope == "system" ? administratorOverviewLabel : overviewUsername),
                                            key: "endpoint:\(card.item.identityKey)", actions: [.press, .showMenu, .moveEarlier, .moveLater]))
             if let node = nodes.last {
                 accessibilityReorderTargets[node.identifier] = (overviewGroupID(for: card.item), card.item)
@@ -8176,7 +8265,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
         for badge in appBadgeFrames {
             guard let frame = accessibilityFrame(badge.frame, from: appsScrollContentLayer, clippedBy: clipFrame) else { continue }
-            let scope = badge.endpoint.backend.serviceScope == "system" ? " as root" : ""
+            let scope = badge.endpoint.backend.serviceScope == "system" ? " as \(administrativeRoleName)" : ""
             nodes.append(accessibilityNode(nextIdentifier: &nextIdentifier,
                                            role: .button,
                                            frame: frame,
@@ -8197,7 +8286,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         for target in workspaceOverviewActionFrames {
             if let frame = accessibilityFrame(target.frame, from: appsScrollContentLayer, clippedBy: clipFrame) {
                 let label = target.operation == "menu" ? "Manage \(target.workspace.name)" : target.operation == "editContainer" ? "Edit \(target.workspace.name)" : target.operation == "copyShell" ? "Copy Terminal command" : "Copy \(target.workspace.commandLaunchers.first(where: { "copyCommand:\($0.id)" == target.operation })?.displayName ?? "command") command"
-                nodes.append(accessibilityNode(nextIdentifier: &nextIdentifier, role: .button, frame: frame, label: label, key: "workspace-action:\(target.workspace.id):\(target.operation)"))
+                nodes.append(accessibilityNode(nextIdentifier: &nextIdentifier, role: .button, frame: frame, label: label, key: "workspace-action:\(target.workspace.id):\(target.operation):\(overviewGroupFrames.first { $0.frame.contains(target.frame.origin) }?.id ?? "")"))
             }
         }
         if let frame = accessibilityFrame(workspaceOverviewCreateFrame, from: appsScrollContentLayer, clippedBy: clipFrame) {
@@ -8212,7 +8301,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
         if nodes.isEmpty,
            let frame = accessibilityFrame(appsLayer.bounds, from: appsLayer) {
-            let message = isLoadingBackends ? "Loading apps" : (backendError.isEmpty ? "No apps available" : backendError)
+            let message = isLoadingBackends && lastBackendsResponseData == nil ? "Loading apps" : (backendError.isEmpty ? "No apps available" : backendError)
             nodes.append(accessibilityNode(nextIdentifier: &nextIdentifier,
                                            role: .staticText,
                                            frame: frame,
@@ -8221,7 +8310,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         var grouped: [OuterframeAccessibilityNode] = []
         for group in overviewGroupFrames {
             guard let frame = accessibilityFrame(group.frame, from: appsScrollContentLayer, clippedBy: clipFrame) else { continue }
-            let name = group.id == "user" ? overviewUsername : group.id == "root" ? "root" : localWorkspaces.first(where: { "container:\($0.id.uuidString.lowercased())" == group.id })?.name ?? "Container"
+            let name = overviewGroupName(group.id)
             let members = nodes.filter { frame.contains(CGPoint(x: $0.frame.midX, y: $0.frame.midY)) }.sorted {
                 if abs($0.frame.midY - $1.frame.midY) > 8 { return $0.frame.midY > $1.frame.midY }
                 return $0.frame.minX < $1.frame.minX
@@ -8435,7 +8524,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             children.append(accessibilityNode(nextIdentifier: &nextIdentifier,
                                               role: .button,
                                               frame: frame,
-                                              label: "Install as root"))
+                                              label: "Install as \(administrativeRoleName)"))
         }
         if let frame = accessibilityFrame(installCancelFrame) {
             children.append(accessibilityNode(nextIdentifier: &nextIdentifier,
@@ -8674,6 +8763,47 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         }
     }
 
+    private func restoreCatalogContext(_ urlString: String) {
+        let query = URLComponents(string: urlString)?.queryItems
+        catalogWorkspaceID = query?.first { $0.name == "catalogWorkspace" }?.value.flatMap(UUID.init(uuidString:))
+        catalogWorkspace = localWorkspaces.first { $0.id == catalogWorkspaceID }
+        if let scope = query?.first(where: { $0.name == "catalogScope" })?.value {
+            catalogScope = scope == "system" ? "system" : "user"
+        }
+    }
+
+    private func workspaceAPIEndpoint(_ endpoint: URL?, workspaceID: UUID? = nil) -> URL? {
+        guard let endpoint, let workspaceID = workspaceID ?? catalogWorkspaceID,
+              var components = URLComponents(url: endpoint, resolvingAgainstBaseURL: false) else { return endpoint }
+        components.path = "/api/wsl/\(workspaceID.uuidString.lowercased())/\(endpoint.lastPathComponent)"
+        return components.url
+    }
+
+    private func fetchWorkspaceCatalog() {
+        guard let workspaceID = catalogWorkspaceID, let endpoint = workspaceAPIEndpoint(backendsEndpoint), let urlSession else { return }
+        isLoadingWorkspaceCatalog = true
+        urlSession.dataTask(with: endpoint) { [weak self] data, response, error in
+            Task { @MainActor in
+                guard let self, self.catalogWorkspaceID == workspaceID else { return }
+                self.isLoadingWorkspaceCatalog = false
+                do {
+                    if let error { throw error }
+                    guard let data, (response as? HTTPURLResponse)?.statusCode == 200 else {
+                        self.backendError = "Could not load the Linux app catalog."
+                        self.updateLayout()
+                        return
+                    }
+                    let result = try BackendsResponse.decodeBinary(data)
+                    self.workspaceCatalogBackends = result.backends
+                    self.backendError = result.error
+                } catch {
+                    self.backendError = error.localizedDescription
+                }
+                self.updateLayout()
+            }
+        }.resume()
+    }
+
     private func fetchBackends(quiet: Bool = false, didRecoverNetworking: Bool = false) {
         guard !isLoadingBackends, let backendsEndpoint, let urlSession else { return }
         isLoadingBackends = true
@@ -8731,11 +8861,11 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                     self.backendError = response.error
                     self.backends = response.backends
                     self.fetchEndpointIcons()
-                    if self.overviewUsername == "Your user",
-                       let path = self.backends.first(where: { $0.serviceScope == "user" && $0.serviceUnitPath != nil })?.serviceUnitPath {
+                    if let path = self.backends.first(where: { $0.serviceScope == "user" && $0.serviceUnitPath != nil })?.serviceUnitPath {
                         let components = path.split(separator: "/")
                         if components.count > 1 && ["home", "Users"].contains(String(components[0])) {
                             self.overviewUsername = String(components[1])
+                            self.hasBackendUsername = true
                         }
                     }
                     if self.selectedContainerLogContext == nil,
@@ -8785,7 +8915,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func fetchRecipes(didRecoverNetworking: Bool = false) {
-        guard !isLoadingRecipes, let recipesEndpoint, let urlSession else { return }
+        guard !isLoadingRecipes, let recipesEndpoint = workspaceAPIEndpoint(recipesEndpoint), let urlSession else { return }
         isLoadingRecipes = true
         urlSession.dataTask(with: recipesEndpoint) { [weak self] data, _, error in
             Task { @MainActor in
@@ -8838,7 +8968,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             }
             sendWorkspaceRequest(operation: "appLogs",
                                  workspaceID: context.container.id,
-                                 serviceID: context.app.serviceID)
+                                 serviceID: context.app.serviceID,
+                             serviceScope: context.app.serviceScope)
             return
         }
         guard let selection = selectedLog, let logsEndpoint, let urlSession else { return }
@@ -8910,8 +9041,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private func performControlAction(for backend: BackendRecord,
                                       operation: String,
                                       sudoPassword: String? = nil,
+                                      workspaceID: UUID? = nil,
                                       didRecoverNetworking: Bool = false) {
-        guard !isPerformingAction, let controlEndpoint, let urlSession else { return }
+        let actionWorkspaceID = workspaceID ?? catalogWorkspaceID
+        guard !isPerformingAction, let controlEndpoint = workspaceAPIEndpoint(controlEndpoint, workspaceID: actionWorkspaceID), let urlSession else { return }
         isPerformingAction = true
         backendError = actionProgressText(operation: operation, backend: backend)
         if sudoPassword != nil {
@@ -8950,6 +9083,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                         self.performControlAction(for: backend,
                                                   operation: operation,
                                                   sudoPassword: sudoPassword,
+                                                  workspaceID: actionWorkspaceID,
                                                   didRecoverNetworking: true)
                         return
                     }
@@ -8957,7 +9091,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 } else if let data,
                           let response = try? ActionResponse.decodeBinary(data) {
                     if response.needsPassword == true {
-                        self.showPasswordPrompt(for: backend, operation: operation, message: response.message)
+                        self.showPasswordPrompt(for: backend, operation: operation, message: response.message, workspaceID: actionWorkspaceID)
                         self.backendError = ""
                     } else if operation == "checkUpdate", response.ok, response.updateAvailable {
                         self.pendingOuterShellUpdate = PendingOuterShellUpdate(backend: backend,
@@ -8982,6 +9116,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                                serviceScope: backend.serviceScope,
                                                operation: operation)
                     self.scheduleBackendsRefreshes()
+                    self.fetchWorkspaceCatalog()
+                    self.sendWorkspaceRequest(operation: "list")
                     if operation == "uninstallOuterShell",
                        let url = self.outerframeHost.pluginURL() {
                         self.outerframeHost.navigate(to: url)
@@ -9033,7 +9169,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         workspacePanelMessage = "\(action) \(context.app.displayName)…"
         sendWorkspaceRequest(operation: operation,
                              workspaceID: context.container.id,
-                             serviceID: context.app.serviceID)
+                             serviceID: context.app.serviceID,
+                             serviceScope: context.app.serviceScope)
     }
 
     private func scheduleBackendsRefreshes() {
@@ -9147,14 +9284,17 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                   ) else {
                 return
             }
+            let pipeDisplayName = endpoint.frontend.socketPath.hasPrefix("\\\\.\\pipe\\wsl.")
+                ? "WSL / \(endpoint.backend.serviceScope == "system" ? "root" : self.overviewUsername) / \(displayName)"
+                : nil
             if opensInNewWindow {
                 self.outerframeHost.openNewWindow(with: url,
-                                                  displayString: displayName,
+                                                  displayString: pipeDisplayName ?? displayName,
                                                   preferredSize: nil)
             } else if opensInNewTab {
-                self.outerframeHost.openNewTab(with: url, displayString: displayName)
+                self.outerframeHost.openNewTab(with: url, displayString: pipeDisplayName ?? displayName)
             } else {
-                self.outerframeHost.navigate(to: url)
+                self.outerframeHost.navigate(to: url, displayString: pipeDisplayName)
             }
         }
 
@@ -9221,15 +9361,32 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                   opensInNewWindow: Bool = false) {
         guard !isPerformingAction else { return }
         let displayName = app.displayName.isEmpty ? app.serviceID : app.displayName
-        let endpointUserName = app.socketPath.hasPrefix("/run/user/0/")
+        let endpointUserName = app.userName ?? (app.socketPath.hasPrefix("/run/user/0/")
             ? "root"
-            : "workspace"
+            : "workspace")
         let endpointDisplayName = "\(workspace.name) / \(endpointUserName) / \(displayName)"
         isPerformingAction = true
         backendError = displayedWorkspaceState(for: workspace) == "running"
             ? "Opening \(displayName)…"
             : "Starting container \(workspace.name) and opening \(displayName)…"
         updateLayout()
+        if let pipe = app.externalSocketPath, pipe.hasPrefix("\\\\.\\pipe\\") {
+            let path = pathAndQuery(fromFrontendURL: app.url, socketPath: app.socketPath)
+            guard let url = URL(string: "http+pipe://\(percentEncodedSocketPath(pipe))\(path)") else {
+                isPerformingAction = false
+                backendError = "The app returned an invalid named pipe address."
+                updateLayout()
+                return
+            }
+            isPerformingAction = false
+            backendError = ""
+            updateLayout()
+            navigateToWorkspaceApp(workspaceAppNavigationURL(url, app: app),
+                                   displayName: endpointDisplayName,
+                                   opensInNewTab: opensInNewTab,
+                                   opensInNewWindow: opensInNewWindow)
+            return
+        }
         if app.publishedPort > 0 {
             let path = pathAndQuery(fromFrontendURL: app.url,
                                     socketPath: app.socketPath)
@@ -9349,7 +9506,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func invalidateBackendStateAfterEndpointActivation(didRecoverNetworking: Bool = false) {
-        guard let controlEndpoint, let urlSession else { return }
+        guard let controlEndpoint = workspaceAPIEndpoint(controlEndpoint), let urlSession else { return }
         var components = URLComponents(url: controlEndpoint, resolvingAgainstBaseURL: false)
         components?.queryItems = [
             URLQueryItem(name: "serviceID", value: "org.outershell.OuterShell"),
@@ -9373,7 +9530,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                               opensInNewTab: Bool,
                                               opensInNewWindow: Bool,
                                               didRecoverNetworking: Bool = false) {
-        guard !isPerformingAction, let controlEndpoint, let urlSession else { return }
+        guard !isPerformingAction, let controlEndpoint = workspaceAPIEndpoint(controlEndpoint), let urlSession else { return }
         isPerformingAction = true
         backendError = "Starting \(displayName)..."
         updateLayout()
@@ -9582,6 +9739,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 controlContainerApp(context, operation: "stopApp")
             case "containerRestart":
                 controlContainerApp(context, operation: "restartApp")
+            case "containerUninstall":
+                performControlAction(for: item.backend, operation: "uninstall", workspaceID: context.container.id)
             case "containerLogs":
                 showContainerLogs(context)
             default:
@@ -9682,7 +9841,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             submitNativeAppForm()
             return
         }
-        guard !isPerformingAction, let createEndpoint, let urlSession else { return }
+        guard !isPerformingAction, let createEndpoint = workspaceAPIEndpoint(createEndpoint), let urlSession else { return }
         guard let recipe = selectedRecipe() else {
             createMessage = "Choose a recipe."
             updateLayout()
@@ -9840,7 +9999,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                                iconPNGData: Data,
                                                stagingDirectory: URL,
                                                sshCommandArguments: [String]) {
-        guard let nativeAppProjectEndpoint, let nativeAppInstallSession else {
+        guard let nativeAppProjectEndpoint = workspaceAPIEndpoint(nativeAppProjectEndpoint), let nativeAppInstallSession else {
             isPerformingAction = false
             createMessage = "The Outer Shell backend cannot create server projects."
             updateLayout()
@@ -10053,7 +10212,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func performBashCreateRequest(didRecoverNetworking: Bool = false) {
-        guard !isPerformingAction, let createEndpoint, let urlSession else { return }
+        guard !isPerformingAction, let createEndpoint = workspaceAPIEndpoint(createEndpoint), let urlSession else { return }
         ensureBashDefaults()
         isPerformingAction = true
         createMessage = "Creating..."
@@ -10154,7 +10313,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func fetchFilePickerDirectory(path: String, didRecoverNetworking: Bool = false) {
-        guard let filePickerEndpoint, let urlSession else { return }
+        guard let filePickerEndpoint = workspaceAPIEndpoint(filePickerEndpoint), let urlSession else { return }
         if pendingFilePicker != nil {
             pendingFilePicker?.directory = path
             pendingFilePicker?.entries = []
@@ -13801,8 +13960,16 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 armButtonClick(frame: rootFrame(frame, from: appsScrollContentLayer),
                                performAtPoint: { [weak self] _ in
                     guard let self else { return }
-                    self.catalogScope = groupID == "root" ? "system" : "user"
+                    self.catalogScope = groupID == "root" || groupID?.hasSuffix(":root") == true ? "system" : "user"
+                    self.catalogWorkspace = self.localWorkspaces.first {
+                        $0.runtimeKind == "wsl" && groupID?.hasPrefix("container:\($0.id.uuidString.lowercased()):") == true
+                    }
+                    self.catalogWorkspaceID = self.catalogWorkspace?.id
+                    self.workspaceCatalogBackends = []
+                    self.recipes = []
+                    self.selectedCreateSection = .appCatalog
                     self.navigateToMode(.create, pushHistory: true)
+                    self.fetchWorkspaceCatalog()
                 })
                 return
             }
@@ -14228,9 +14395,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         updateLayout()
     }
 
-    private func showPasswordPrompt(for backend: BackendRecord, operation: String, message: String) {
-        pendingPasswordAction = PendingPasswordAction(serviceID: backend.serviceID,
-                                                      serviceScope: backend.serviceScope,
+    private func showPasswordPrompt(for backend: BackendRecord, operation: String, message: String, workspaceID: UUID? = nil) {
+        pendingPasswordAction = PendingPasswordAction(backend: backend,
+                                                      workspaceID: workspaceID,
                                                       operation: operation,
                                                       displayName: backend.displayName)
         sudoPasswordInput = ""
@@ -14248,16 +14415,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func submitPasswordPrompt() {
-        guard let pendingPasswordAction,
-              let backend = backends.first(where: {
-                  $0.serviceID == pendingPasswordAction.serviceID &&
-                      $0.serviceScope == pendingPasswordAction.serviceScope
-              }) else {
-            dismissPasswordPrompt()
-            return
-        }
+        guard let pendingPasswordAction else { return }
         let password = passwordInputController.isFocused ? passwordInputController.text : sudoPasswordInput
-        performControlAction(for: backend, operation: pendingPasswordAction.operation, sudoPassword: password)
+        performControlAction(for: pendingPasswordAction.backend, operation: pendingPasswordAction.operation, sudoPassword: password, workspaceID: pendingPasswordAction.workspaceID)
     }
 
     private func confirmOuterShellUpdate() {
@@ -14599,7 +14759,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         if let context = selectedContainerLogContext,
            context.app.serviceID == selectedServiceID {
             return appLauncherItems(in: context.container).first(where: {
-                $0.backend.serviceID == selectedServiceID
+                $0.containerContext?.app == context.app
             })?.backend
         }
         if let selectedLog,
@@ -14703,7 +14863,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func bundledCatalogBackends() -> [BundledCatalogEntry] {
-        let grouped = Dictionary(grouping: backends.filter { $0.isBundledCatalogEntry && $0.serviceScope == (isDirectRootSession ? "system" : catalogScope) }, by: \.serviceID)
+        let grouped = Dictionary(grouping: (catalogWorkspaceID == nil ? backends : workspaceCatalogBackends).filter { $0.serviceID != "org.outershell.OuterShell" && $0.isBundledCatalogEntry && $0.serviceScope == (isDirectRootSession ? "system" : catalogScope) }, by: \.serviceID)
         return grouped.values.compactMap { records in
             guard let displayRecord = records.first(where: { $0.isBundledPlaceholder }) ??
                     records.first(where: { ($0.iconSymbolName ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false }) ??
@@ -14805,7 +14965,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func appLauncherItems(in container: LocalWorkspaceRecord) -> [AppLauncherItem] {
-        container.apps.map { app in
+        container.apps.filter { container.runtimeKind != "wsl" || $0.serviceID != "org.outershell.OuterShell" }.map { app in
             let frontend = FrontendRecord(
                 id: app.frontendID,
                 name: app.displayName,
@@ -14823,7 +14983,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 displayName: app.displayName,
                 serviceUnit: app.serviceID,
                 serviceUnitPath: nil,
-                serviceScope: "container",
+                serviceScope: container.runtimeKind == "wsl" ? (app.serviceScope ?? "user") : "container",
                 status: app.isRunning ? "running" : "available",
                 canControl: true,
                 canUninstall: false,
@@ -14858,7 +15018,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                                frontend: frontend,
                                                frontendIndex: 0)
             return AppLauncherItem(
-                identityKey: "container:\(container.id.uuidString):\(app.frontendID)",
+                identityKey: "container:\(container.id.uuidString):\(container.runtimeKind == "wsl" ? (app.userName ?? "workspace") + ":" : "")\(app.frontendID)",
                 primaryEndpoint: endpoint,
                 userEndpoint: endpoint,
                 rootEndpoint: nil,
@@ -15265,6 +15425,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                       name: String? = nil,
                                       frontendID: String? = nil,
                                       serviceID: String? = nil,
+                                      serviceScope: String? = nil,
                                       mountID: UUID? = nil,
                                       readOnly: Bool? = nil,
                                       recipeStepID: UUID? = nil,
@@ -15294,6 +15455,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                                 name: name,
                                                 frontendID: frontendID,
                                                 serviceID: serviceID,
+                                                serviceScope: serviceScope,
                                                 cpus: operation == "create" ? 4 : nil,
                                                 memoryInGB: operation == "create" ? 8 : nil,
                                                 runtimeKind: operation == "create"
@@ -15486,12 +15648,14 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         let operationWorkspaceID = pendingWorkspaceOperationWorkspaceIDs.removeValue(
             forKey: effectiveRequestID
         )
+        if let platform = response.hostPlatform { isWindowsHost = platform == "windows" }
         if operation == "list" { isRefreshingWorkspaces = false }
         let workspacesChanged = localWorkspaces != response.workspaces
         let previousOverviewAvailability = workspaceOverviewAvailable
         let previousPanelMessage = workspacePanelMessage
         if response.error == nil || !response.workspaces.isEmpty {
             localWorkspaces = response.workspaces
+            catalogWorkspace = localWorkspaces.first { $0.id == catalogWorkspaceID }
             fetchEndpointIcons()
         }
         if let pendingID = pendingDockerfileWorkspace?.id,
@@ -19888,7 +20052,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         let text: String
         if isPerformingAction {
             text = mode == .create ? "Creating..." : backendError
-        } else if isLoadingBackends && backends.isEmpty {
+        } else if isLoadingBackends && lastBackendsResponseData == nil {
             text = "Loading..."
         } else if !backendError.isEmpty {
             text = backendError
@@ -19975,7 +20139,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 let systemOnlyPlaceholder = installsBundledPlaceholderAsSystemOnly(backend)
                 operationByItemID["run"] = ((backend.rootOnly ?? false) || systemOnlyPlaceholder) ? "runRoot" : "run"
                 items.append(OuterframeContextMenuItem(id: "run",
-                                                       title: (backend.rootOnly ?? false) && !systemOnlyPlaceholder ? "Run as root" : "Run",
+                                                       title: (backend.rootOnly ?? false) && !systemOnlyPlaceholder ? "Run as \(administrativeRoleName)" : "Run",
                                                        isEnabled: true))
             }
         }
@@ -20152,6 +20316,13 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                                        isEnabled: true,
                                                        systemImageName: "arrow.clockwise"))
             }
+            if context.container.runtimeKind == "wsl" {
+                operations["uninstall"] = "containerUninstall"
+                items.append(OuterframeContextMenuItem(id: "uninstall",
+                                                       title: "Uninstall",
+                                                       isEnabled: true,
+                                                       systemImageName: "trash"))
+            }
             operations["logs"] = "containerLogs"
             items.append(OuterframeContextMenuItem(id: "logs",
                                                    title: "Show Logs",
@@ -20257,7 +20428,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             }
             if let rootEndpoint = item.rootEndpoint,
                rootEndpoint.backend.scriptPath?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false {
-                candidates.append(("root", "Root", rootEndpoint))
+                candidates.append(("root", isWindowsHost ? "Administrator" : "Root", rootEndpoint))
             }
             guard !candidates.isEmpty else { return }
             appendSeparatorIfNeeded()
@@ -20283,7 +20454,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         }
 
         if item.backend.rootOnly ?? false {
-            appendEndpointSection(title: "Root",
+            appendEndpointSection(title: isWindowsHost ? "Administrator" : "Root",
                                   idPrefix: "root",
                                   endpoint: item.rootEndpoint,
                                   openOperation: "runRoot",
@@ -20296,7 +20467,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                   openOperation: "run",
                                   openNewTabOperation: "runNewTab",
                                   openNewWindowOperation: "runNewWindow")
-            appendEndpointSection(title: "Root",
+            appendEndpointSection(title: isWindowsHost ? "Administrator" : "Root",
                                   idPrefix: "root",
                                   endpoint: item.rootEndpoint,
                                   openOperation: "runRoot",
@@ -20517,7 +20688,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             .trimmingCharacters(in: .whitespacesAndNewlines)
         if !socketPath.isEmpty {
             let path = pathAndQuery(fromFrontendURL: frontend.url, socketPath: socketPath)
-            return URL(string: "http+unix://\(percentEncodedSocketPath(socketPath))\(path)")
+            let scheme = socketPath.hasPrefix("\\\\.\\pipe\\") ? "http+pipe" : "http+unix"
+            return URL(string: "\(scheme)://\(percentEncodedSocketPath(socketPath))\(path)")
         }
 
         let rawURL = frontend.url.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -20544,7 +20716,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             }
         }
 
-        if trimmed.lowercased().hasPrefix("http+unix://") {
+        if trimmed.lowercased().hasPrefix("http+unix://") || trimmed.lowercased().hasPrefix("http+pipe://") {
             let prefixLength = "http+unix://".count
             let startIndex = trimmed.index(trimmed.startIndex, offsetBy: prefixLength)
             let authorityAndSuffix = String(trimmed[startIndex...])
@@ -20582,11 +20754,11 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         case "run":
             return "Installing \(backend.displayName)..."
         case "runRoot", "installRoot", "addRootSupport":
-            return "Installing \(backend.displayName) as root..."
+            return "Installing \(backend.displayName) as \(administrativeRoleName)..."
         case "runUser", "installUser":
             return "Installing \(backend.displayName)..."
         case "removeRootSupport":
-            return "Removing root support from \(backend.displayName)..."
+            return "Removing \(administrativeRoleName) support from \(backend.displayName)..."
         case "uninstall":
             return "Uninstalling \(backend.displayName)..."
         case "uninstallOuterShell":

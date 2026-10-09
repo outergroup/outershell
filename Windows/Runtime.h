@@ -19,6 +19,7 @@ typedef void (*PipeHandler)(Connection *, void *);
 typedef struct {
     char *method, *path, *query, *host, *origin;
     StringBuilder headers, body;
+    bool accepts_outerframe;
 } HttpRequest;
 void *win_alloc(size_t size);
 char *win_strdup(const char *value);
