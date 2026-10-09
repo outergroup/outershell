@@ -27,15 +27,13 @@ if ($SystemService) {
         if ($process) { $process.Kill(); if (!$process.WaitForExit(10000)) { throw 'The existing app did not stop.' }; $process.Dispose() }
     }
 }
-foreach ($file in @('OuterShell.exe', 'FilesBackend.exe', 'outer-socket-bridge.exe')) {
+foreach ($file in @('OuterShell.exe', 'FilesBackend.exe')) {
     for ($attempt = 0; ; $attempt++) {
         try { Copy-Item (Join-Path $SourceDirectory $file) $destination -Force; break }
         catch [IO.IOException], [UnauthorizedAccessException] { if ($attempt -ge 20) { throw }; Start-Sleep -Milliseconds 250 }
     }
 }
-if (!$SystemService) {
-    & (Join-Path $SourceDirectory 'install-ssh-bridge.ps1') -SourcePath (Join-Path $destination 'outer-socket-bridge.exe')
-}
+
 foreach ($obsolete in @('OuterShell.Windows.Runtime.dll', 'outershell-core.dll')) {
     $oldFile = Join-Path $destination $obsolete
     for ($attempt = 0; Test-Path -LiteralPath $oldFile; $attempt++) {

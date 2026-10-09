@@ -83,13 +83,11 @@ the macOS client receives the verified account/app label from the Windows bridge
 
 ## Remote SSH access
 
-Remote SSH access uses the native bridge installed for the connecting user at
-`%USERPROFILE%\.outerssh\bin\outer-socket-bridge.exe`. The per-user installer
-copies this bundled helper into that protected location without changing PATH.
-System-service deployments should also run `install-ssh-bridge.ps1 -SourcePath
-<outer-socket-bridge.exe>` as each connecting user. Builds locate the matching
-architecture in the sibling Outer Loop repository; `-OuterLoopRoot` overrides
-that source directory.
+Outer Loop syncs its bundled native bridge over SSH for each session. The helper
+is not installed by Outer Shell and does not require a PATH entry. Elevated SSH
+sessions stage the helper under ProgramData with administrator-only write access;
+ordinary sessions use a private LocalAppData directory. Outer Loop removes its
+session copy on disconnect.
 
 Discovery, allowlist checks, and forwarding use native code. Set Windows
 OpenSSH's default shell to `cmd.exe` for the lowest launch overhead. PowerShell
@@ -321,3 +319,44 @@ a marker, and a timed loopback ping). The Python checks cover high-integrity
 execution, scoped discovery/logs, approved task controls, rejected empty setup requests, denied unelevated writes, and denied task-definition changes. Run
 `OuterShellAdminFixture.exe --cleanup-fixture` elevated in the same signed-in
 account afterward to remove its task, registry entry, and command directory.
+
+### Windows beta installer
+
+`OuterShell.iss` creates the per-user setup executable. It installs Outer Shell,
+Files, and their web/native frontend assets, and uses the bundled native setup
+helper to register InteractiveToken/LeastPrivilege tasks and pipe activation
+mappings. The SSH bridge belongs to Outer Loop, is synced by the client over SSH,
+and is not part of this installer. No PowerShell is used by setup itself.
+
+Build the backend first, sign its two executables, then run:
+
+```powershell
+.\Windows\package-installer.ps1 -PayloadDirectory .\build\windows -Architecture x64 -Version 0.1.0 -SignCommand '<SignTool command ending with $f>'
+```
+
+Use `-DevelopmentUnsigned` instead of `-SignCommand` only for manual testing.
+Automatic installation refuses unsigned packages and builds without a configured
+publisher. Repeat packaging for arm64 and x86. Publish the signed outputs as:
+
+- `/outer-shell/latest/outer-shell-windows-x64-setup.exe`
+- `/outer-shell/latest/outer-shell-windows-arm64-setup.exe`
+- `/outer-shell/latest/outer-shell-windows-x86-setup.exe`
+
+Serve these directly over HTTPS, without redirects. Setting
+`WINDOWS_INSTALLER_ROOT` when running `scripts/package_release.sh` adds these
+three prebuilt installers to its `latest` output directory.
+
+Double-click setup for interactive installation. Outer Loop uses
+`/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP-`. Installation is per-user even
+when started by an elevated SSH session; the resulting tasks run unelevated.
+An interactive Windows login is still required for task activation.
+
+Upgrades stop the two core tasks before replacing program files and register them
+again afterward. Run setup again to repair a failed task-registration step.
+Uninstall removes the core tasks, their activation mappings, and installed program
+files, while retaining registry data, user-created command apps and output logs.
+Run the per-user uninstaller unelevated; it refuses elevation so it cannot execute
+a user-writable maintenance helper with administrator privileges.
+
+See `OuterLoop/WindowsInstaller/README.md` in the Outer Loop repository for signing
+service setup, publisher configuration and signature-verification tests.

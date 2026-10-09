@@ -74,6 +74,7 @@ static bool update_allowlist(ShellHost *s) {
 }
 #include "Commands.inc"
 #include "AdminCommands.inc"
+#include "Setup.inc"
 static StringBuilder all_backends(ShellHost *s);
 
 static bool legacy_files_running(ShellHost *s) {
@@ -740,6 +741,9 @@ static void WINAPI service_main(DWORD argc, LPWSTR *argv) {
     report_service(SERVICE_STOPPED, ok ? 0 : ERROR_SERVICE_SPECIFIC_ERROR);
 }
 int wmain(int argc, wchar_t **argv) {
+    if (argc == 2 && !wcscmp(argv[1], L"--setup-install")) return setup_tasks("install");
+    if (argc == 2 && !wcscmp(argv[1], L"--setup-stop")) return setup_tasks("stop");
+    if (argc == 2 && !wcscmp(argv[1], L"--setup-remove")) return setup_tasks("remove");
     if (argc == 4 && !wcscmp(argv[1], L"--apply-admin-command")) return admin_apply_command(argv[2], argv[3]);
     if (argc == 2 && !wcscmp(argv[1], L"--wsl-list")) return wsl_inspect();
     bool service = false, initialize = false;

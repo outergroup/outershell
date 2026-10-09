@@ -1441,4 +1441,12 @@ path.write_text(text)
 PY
 chmod 0755 "${OUTPUT_ROOT}/latest/install.sh"
 
+if [[ -n "${WINDOWS_INSTALLER_ROOT:-}" ]]; then
+    for arch in x64 arm64 x86; do
+        installer="outer-shell-windows-${arch}-setup.exe"
+        require_file "${WINDOWS_INSTALLER_ROOT}/${installer}"
+        install -m 0644 "${WINDOWS_INSTALLER_ROOT}/${installer}" "${OUTPUT_ROOT}/latest/${installer}"
+    done
+fi
+
 echo "Packaged assets under ${OUTPUT_ROOT}"

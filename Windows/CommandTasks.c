@@ -23,11 +23,12 @@ HRESULT command_task(const char *name, const char *operation, const char *xml, D
     bool administrator = !strncmp(name, "\\OuterShell-Admin-App-", 22);
     VARIANT empty; VariantInit(&empty);
     VARIANT security; VariantInit(&security);
-    if (administrator && xml) {
+    bool core = !strcmp(operation, "register-core");
+    if ((administrator || core) && xml) {
         char *sid = win_sid();
         if (!sid) { CoUninitialize(); return E_FAIL; }
         char descriptor[256];
-        snprintf(descriptor, sizeof(descriptor), "O:BAG:BAD:P(A;;GA;;;BA)(A;;GA;;;SY)(A;;GRGX;;;%s)", sid);
+        snprintf(descriptor, sizeof(descriptor), administrator ? "O:BAG:BAD:P(A;;GA;;;BA)(A;;GA;;;SY)(A;;GRGX;;;%s)" : "D:P(A;;GA;;;BA)(A;;GA;;;SY)(A;;GA;;;%s)", sid);
         free(sid);
         security.vt = VT_BSTR; security.bstrVal = task_string(descriptor);
         if (!security.bstrVal) { CoUninitialize(); return E_OUTOFMEMORY; }
@@ -38,7 +39,7 @@ HRESULT command_task(const char *name, const char *operation, const char *xml, D
     if (SUCCEEDED(hr)) hr = ITaskService_Connect(service, empty, empty, empty, empty);
     if (SUCCEEDED(hr)) hr = ITaskService_GetFolder(service, root, &folder);
     if (SUCCEEDED(hr)) {
-        if (xml) hr = ITaskFolder_RegisterTask(folder, path, definition, TASK_CREATE | (administrator ? TASK_DONT_ADD_PRINCIPAL_ACE : 0), empty, empty, TASK_LOGON_INTERACTIVE_TOKEN, security, &task);
+        if (xml) hr = ITaskFolder_RegisterTask(folder, path, definition, (core ? TASK_CREATE_OR_UPDATE : TASK_CREATE) | ((administrator || core) ? TASK_DONT_ADD_PRINCIPAL_ACE : 0), empty, empty, TASK_LOGON_INTERACTIVE_TOKEN, security, &task);
         else hr = ITaskFolder_GetTask(folder, path, &task);
     }
     if (SUCCEEDED(hr) && !strcmp(operation, "query")) {
