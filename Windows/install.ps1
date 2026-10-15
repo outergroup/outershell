@@ -48,6 +48,12 @@ foreach ($folder in @('web', 'files-web', 'bundles')) {
     New-Item -ItemType Directory -Force (Join-Path $destination $folder) | Out-Null
     Copy-Item (Join-Path $SourceDirectory "$folder/*") (Join-Path $destination $folder) -Recurse -Force
 }
+
+if (Test-Path (Join-Path $SourceDirectory 'container-bootstrap')) {
+    New-Item -ItemType Directory -Force (Join-Path $destination 'container-bootstrap') | Out-Null
+    Copy-Item (Join-Path $SourceDirectory 'container-bootstrap/*') (Join-Path $destination 'container-bootstrap') -Recurse -Force
+}
+
 $executable = Join-Path $destination 'OuterShell.exe'
 if ($SystemService) {
     $command = '"' + $executable + '" --service --service-name ' + $serviceName

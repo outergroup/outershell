@@ -39,6 +39,7 @@ ArchitecturesAllowed=x64compatible
 ArchitecturesAllowed=x86compatible
 #endif
 [Files]
+Source: "{#PayloadDirectory}\container-bootstrap\*"; DestDir: "{app}\container-bootstrap"; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist
 Source: "{#PayloadDirectory}\OuterShell.exe"; DestName: "SetupTasks.exe"; Flags: dontcopy
 Source: "{#PayloadDirectory}\OuterShell.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#PayloadDirectory}\FilesBackend.exe"; DestDir: "{app}"; Flags: ignoreversion

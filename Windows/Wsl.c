@@ -1,6 +1,7 @@
 #include "Wsl.h"
 #include "../Backend/OuterShellLayout.h"
 #include <bcrypt.h>
+#include <shlobj.h>
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -26,7 +27,9 @@ struct Distribution {
     struct Wsl *owner;
     char *id, *name, *user;
     DWORD uid;
-    bool present, running;
+    bool present, running, container, managed;
+    unsigned cpus, memory_gb;
+    char *runtime_id;
     StringBuilder apps;
     Child keepalive;
 };
@@ -37,7 +40,7 @@ struct Wsl {
     Distribution *distributions;
     Endpoint *endpoints;
     size_t endpoint_count;
-    bool inspect;
+    bool inspect, containers_available;
     LONG active_relays;
     StringBuilder snapshot;
     uint64_t version;
@@ -157,7 +160,7 @@ static void child_close(Child *p) {
         CloseHandle(p->cancel);
     memset(p, 0, sizeof(*p));
 }
-static bool child_start(Wsl *w, const char *const *arguments, Child *p) {
+static bool child_start_runtime(Wsl *w, const char *const *arguments, Child *p, bool container) {
     wchar_t system[32768];
     UINT n = GetSystemDirectoryW(system, 32768);
     if (!n || n + 20 >= 32768)
@@ -170,6 +173,14 @@ static bool child_start(Wsl *w, const char *const *arguments, Child *p) {
         wcscat_s(system, 32768, L"\\Sysnative\\wsl.exe");
     } else
         wcscat_s(system, 32768, L"\\wsl.exe");
+    if (container) {
+        DWORD length = GetEnvironmentVariableW(L"ProgramW6432", system, 32768);
+        if (!length)
+            length = GetEnvironmentVariableW(L"ProgramFiles", system, 32768);
+        if (!length || length + 32 >= 32768)
+            return false;
+        wcscat_s(system, 32768, L"\\WSL\\wslc.exe");
+    }
     char *exe = win_utf8(system);
     if (!exe)
         return false;
@@ -187,6 +198,23 @@ static bool child_start(Wsl *w, const char *const *arguments, Child *p) {
     if (ok)
         error = CreateFileW(L"NUL", GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa,
                             OPEN_EXISTING, 0, NULL);
+    if (ok && container) {
+        char *local = win_folder(CSIDL_LOCAL_APPDATA);
+        char *root = local ? win_join(local, "OuterShell") : NULL;
+        char *path = root ? win_join(root, "container-runtime.log") : NULL;
+        wchar_t *log_path = path ? win_wide(path) : NULL;
+        HANDLE log = log_path ? CreateFileW(log_path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                            &sa, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL) : INVALID_HANDLE_VALUE;
+        if (log != INVALID_HANDLE_VALUE) {
+            if (error && error != INVALID_HANDLE_VALUE)
+                CloseHandle(error);
+            error = log;
+        }
+        free(log_path);
+        free(path);
+        free(root);
+        free(local);
+    }
     HANDLE inherited_error = NULL;
     HANDLE standard_error = GetStdHandle(STD_ERROR_HANDLE);
     if (standard_error && standard_error != INVALID_HANDLE_VALUE &&
@@ -242,11 +270,15 @@ static bool child_start(Wsl *w, const char *const *arguments, Child *p) {
     }
     return ok;
 }
-static bool capture(Wsl *w, const char *const *arguments, StringBuilder *result) {
+static bool child_start(Wsl *w, const char *const *arguments, Child *p) {
+    return child_start_runtime(w, arguments, p, false);
+}
+static bool capture_runtime(Wsl *w, const char *const *arguments, StringBuilder *result, bool container) {
     Child p = {0};
-    if (!child_start(w, arguments, &p))
+    if (!child_start_runtime(w, arguments, &p, container))
         return false;
-    ULONGLONG deadline = GetTickCount64() + 30000;
+    ULONGLONG deadline = GetTickCount64() +
+        (container && (!strcmp(arguments[0], "build") || !strcmp(arguments[0], "run")) ? 600000 : 30000);
     bool ok = true;
     for (;;) {
         DWORD available = 0;
@@ -278,6 +310,9 @@ static bool capture(Wsl *w, const char *const *arguments, StringBuilder *result)
                 result->length);
     child_close(&p);
     return ok;
+}
+static bool capture(Wsl *w, const char *const *arguments, StringBuilder *result) {
+    return capture_runtime(w, arguments, result, false);
 }
 static bool send_frame(Child *p, uint16_t type, const void *data, size_t length) {
     unsigned char header[16];
@@ -320,7 +355,13 @@ static bool bridge_start(Distribution *d, const char *socket, bool system, Child
     args[count++] = "bridge";
     args[count++] = "--socket";
     args[count++] = socket;
-    if (!child_start(d->owner, args, p))
+    if (d->container) {
+        const char *container_args[] = {"exec", "--interactive", "--user", "0",
+            "--env", "HOME=/root", "--env", "XDG_RUNTIME_DIR=/run/user/0",
+            d->runtime_id, WSL_BRIDGE, "bridge", "--socket", socket, NULL};
+        if (!child_start_runtime(d->owner, container_args, p, true))
+            return false;
+    } else if (!child_start(d->owner, args, p))
         return false;
     StringBuilder data = {0};
     uint16_t type = 0;
@@ -401,10 +442,11 @@ static void relay_client_impl(Connection *client, void *context) {
     Endpoint *endpoint = context;
     Wsl *w = endpoint->distribution->owner;
     EnterCriticalSection(&w->gate);
-    bool enabled = endpoint->enabled && endpoint->distribution->present;
+    bool enabled = endpoint->enabled && endpoint->distribution->present &&
+                   (!endpoint->distribution->container || endpoint->distribution->running);
     bool system = endpoint->system;
     LeaveCriticalSection(&w->gate);
-    if (!enabled || serve_guest_backends(endpoint, client))
+    if (!enabled || (!endpoint->distribution->container && serve_guest_backends(endpoint, client)))
         return;
     Child p = {0};
     if (!bridge_start(endpoint->distribution, endpoint->socket, system, &p))
@@ -464,7 +506,7 @@ static Endpoint *publish(Distribution *d, const char *socket, bool system) {
     char app[80], hash[33];
     for (size_t i = 0; i < 16; i++)
         snprintf(hash + i * 2, 3, "%02x", digest[i]);
-    snprintf(app, sizeof(app), "wsl.%s", hash);
+    snprintf(app, sizeof(app), "%s.%s", d->container ? "wslc" : "wsl", hash);
     Endpoint *e = win_alloc(sizeof(*e));
     e->distribution = d;
     e->socket = win_strdup(socket);
@@ -472,7 +514,15 @@ static Endpoint *publish(Distribution *d, const char *socket, bool system) {
     e->pipe = win_pipe(app);
     e->server = e->pipe && !w->inspect ? pipe_server_start(e->pipe, relay_client, e) : NULL;
     const char *paths[] = {e->pipe};
-    if (!e->pipe || (!w->inspect && (!e->server || !win_allow_pipes(paths, 1)))) {
+    StringBuilder task = {0};
+    char *sid = win_sid();
+    append(&task, "\\OuterShell-");
+    if (sid) append(&task, sid);
+    bool registered = w->inspect || (e->pipe && e->server && sid &&
+        win_allow_pipes(paths, 1) && win_set_pipe_activation(e->pipe, task.data));
+    free(sid);
+    free(task.data);
+    if (!e->pipe || !registered) {
         pipe_server_stop(e->server);
         free(e->socket);
         free(e->pipe);
@@ -558,8 +608,69 @@ static bool rewrite_backends(Distribution *d, StringBuilder *response) {
     *response = result;
     return true;
 }
+static bool container_ui(Distribution *d, uint16_t route, const char *form, StringBuilder *body) {
+    Child p = {0};
+    if (!bridge_start(d, "/run/user/0/outershelld-api", true, &p))
+        return false;
+    size_t form_length = strlen(form);
+    StringBuilder message = payload(28 + form_length);
+    unsigned char *b = (unsigned char *)message.data;
+    write_uint32_le(b, (uint32_t)(24 + form_length));
+    write_uint16_le(b + 4, 26);
+    write_uint16_le(b + 6, route);
+    write_uint32_le(b + 12, 24);
+    write_uint32_le(b + 20, 24);
+    write_uint32_le(b + 24, (uint32_t)form_length);
+    memcpy(b + 28, form, form_length);
+    bool ok = send_frame(&p, 5, b, message.length);
+    StringBuilder response = {0}, frame = {0};
+    uint16_t type;
+    size_t expected = 0;
+    while (ok && receive_frame(&p, &type, &frame)) {
+        if (type == 10)
+            continue;
+        if (type != 5 || response.length + frame.length > WSL_LIMIT) {
+            ok = false;
+            break;
+        }
+        bytes(&response, frame.data, frame.length);
+        if (response.length >= 4) {
+            expected = (size_t)read_uint32_le((unsigned char *)response.data) + 4;
+            if (expected < 28 || expected > WSL_LIMIT) { ok = false; break; }
+            if (response.length >= expected)
+                break;
+        }
+    }
+    ok = ok && expected && response.length == expected;
+    if (ok) {
+        StringBuilder packet = {response.data + 4, response.length - 4, 0};
+        ok = read_uint16_le((unsigned char *)packet.data) == 107 &&
+             read_uint32_le((unsigned char *)packet.data + 2) == 200;
+        StringBuilder value = reference(packet, 16);
+        ok = ok && value.data;
+        if (ok)
+            bytes(body, value.data, value.length);
+    }
+    free(message.data);
+    free(response.data);
+    free(frame.data);
+    child_close(&p);
+    return ok;
+}
 static bool control_app(Distribution *d, const char *service, const char *verb, bool system) {
     StringBuilder response = {0};
+    if (d->container) {
+        StringBuilder form = {0};
+        append(&form, "serviceID=");
+        append(&form, service);
+        append(&form, "&scope=user&operation=");
+        append(&form, verb);
+        bool ok = container_ui(d, 3, form.data, &response) && response.length >= 12 &&
+                  (read_uint32_le((unsigned char *)response.data) & 1);
+        free(form.data);
+        free(response.data);
+        return ok;
+    }
     if (!guest_http(d, "GET", "/api/backends", &response) || response.length < 12) {
         free(response.data);
         return false;
@@ -655,7 +766,7 @@ static bool serve_guest_backends(Endpoint *endpoint, Connection *client) {
 }
 static bool app_list(Distribution *d, StringBuilder *json) {
     StringBuilder response = {0};
-    if (!guest_http(d, "GET", "/api/backends", &response) || response.length < 12 ||
+    if (!(d->container ? container_ui(d, 1, "", &response) : guest_http(d, "GET", "/api/backends", &response)) || response.length < 12 ||
         reference(response, 0).length) {
         free(response.data);
         return false;
@@ -758,13 +869,15 @@ static bool contains_line(const char *list, const char *name) {
     }
     return false;
 }
+#include "WslContainers.inc"
+
 static void discover_impl(Wsl *w) {
     StringBuilder running = {0};
     const char *args[] = {"--list", "--running", "--quiet", NULL};
     if (!capture(w, args, &running)) {
         fprintf(stderr, "WSL list failed: %lu (%zu bytes)\n", GetLastError(), running.length);
         free(running.data);
-        return;
+        running = (StringBuilder){0};
     }
     char *running_names;
     if (running.length >= 2 && running.data[1] == 0) {
@@ -785,7 +898,8 @@ static void discover_impl(Wsl *w) {
     }
     EnterCriticalSection(&w->gate);
     for (Distribution *d = w->distributions; d; d = d->next)
-        d->present = false;
+        if (!d->container)
+            d->present = false;
     LeaveCriticalSection(&w->gate);
     for (DWORD index = 0; root && index < 64; index++) {
         wchar_t key_name[80];
@@ -849,8 +963,11 @@ static void discover_impl(Wsl *w) {
     if (root)
         RegCloseKey(root);
     free(running_names);
+    discover_containers(w);
     StringBuilder snapshot = {0};
-    append(&snapshot, "{\"hostPlatform\":\"windows\",\"providers\":[],\"workspaces\":[");
+    append(&snapshot, "{\"hostPlatform\":\"windows\",\"providers\":[");
+    container_provider(w, &snapshot);
+    append(&snapshot, "],\"workspaces\":[");
     size_t count = 0;
     EnterCriticalSection(&w->gate);
     for (Distribution *d = w->distributions; d; d = d->next) {
@@ -858,6 +975,10 @@ static void discover_impl(Wsl *w) {
             continue;
         if (count++)
             append(&snapshot, ",");
+        if (d->container) {
+            container_snapshot(d, &snapshot);
+            continue;
+        }
         append(&snapshot, "{");
         field(&snapshot, "id", d->id);
         append(&snapshot, ",");
@@ -958,6 +1079,7 @@ void wsl_stop(Wsl *w) {
         Distribution *d = w->distributions;
         w->distributions = d->next;
         child_close(&d->keepalive);
+        free(d->runtime_id);
         free(d->id);
         free(d->name);
         free(d->user);
@@ -1174,6 +1296,10 @@ void wsl_serve(Wsl *w, Connection *c, HttpRequest *r) {
     }
     EnterCriticalSection(&w->commands);
     locked = true;
+    if (!strcmp(operation, "create")) {
+        ok = create_container(w, r, &error);
+        goto done;
+    }
     EnterCriticalSection(&w->gate);
     Distribution *d;
     for (d = w->distributions; d; d = d->next)
@@ -1181,10 +1307,54 @@ void wsl_serve(Wsl *w, Connection *c, HttpRequest *r) {
             break;
     LeaveCriticalSection(&w->gate);
     if (!d) {
-        error = "The WSL distribution is no longer registered.";
+        error = "The Linux environment is no longer registered.";
         goto done;
     }
-    if (!strcmp(operation, "start") || !strcmp(operation, "stop")) {
+    if (d->container && !strcmp(operation, "appLogs")) {
+        container_logs(d, c, r);
+        LeaveCriticalSection(&w->commands);
+        free(operation);
+        free(id);
+        return;
+    }
+    if (d->container && !strcmp(operation, "rename")) {
+        char *name = request_string(r, "name");
+        if (d->managed && valid_container_name(name)) {
+            ok = save_container_metadata(d->id, name, d->cpus, d->memory_gb);
+        }
+        free(name);
+        error = "The container name could not be saved.";
+    } else if (d->container && !strcmp(operation, "delete")) {
+        if (d->managed) {
+            StringBuilder output = {0};
+            const char *args[] = {"remove", "--force", d->runtime_id, NULL};
+            ok = capture_runtime(w, args, &output, true);
+            free(output.data);
+            if (ok) {
+                EnterCriticalSection(&w->gate);
+                for (Endpoint *endpoint = w->endpoints; endpoint; endpoint = endpoint->next) {
+                    if (endpoint->distribution != d) continue;
+                    endpoint->enabled = false;
+                    win_set_pipe_activation(endpoint->pipe, NULL);
+                    win_disallow_pipe(endpoint->pipe);
+                }
+                LeaveCriticalSection(&w->gate);
+                char *path = container_metadata_path(d->id);
+                wchar_t *wide = path ? win_wide(path) : NULL;
+                if (wide) DeleteFileW(wide);
+                free(wide);
+                free(path);
+            }
+        }
+        error = "Only containers created by Outer Shell can be deleted here.";
+    } else if (d->container && (!strcmp(operation, "start") || !strcmp(operation, "stop") ||
+                         !strcmp(operation, "restart"))) {
+        StringBuilder output = {0};
+        const char *args[] = {operation, d->runtime_id, NULL};
+        ok = capture_runtime(w, args, &output, true);
+        free(output.data);
+        error = "WSL containers could not change the container state. See the Outer Shell log for details.";
+    } else if (!strcmp(operation, "start") || !strcmp(operation, "stop")) {
         StringBuilder output = {0};
         const char *start[] = {"--distribution", d->name, "--exec", "/bin/true", NULL};
         const char *stop[] = {"--terminate", d->name, NULL};

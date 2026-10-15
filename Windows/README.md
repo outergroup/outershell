@@ -31,7 +31,7 @@ Copy `build/outerframe/bundles` to the Windows build machine. From Windows Power
 `-Architecture arm64`, `x64`, or `x86` selects the target; the default is the host
 architecture. `-CoreDirectory` uses an already-built directory containing both
 executables. The production package contains `OuterShell.exe`, `FilesBackend.exe`,
-the SSH bridge, both macOS outerframe archives, and the shared web assets. `outershell-core.dll` is built only as a registry-test
+both macOS outerframe archives, and the shared web assets. `outershell-core.dll` is built only as a registry-test
 harness and is not installed. The installer removes obsolete managed/runtime DLLs
 when upgrading an existing installation.
 
@@ -367,3 +367,45 @@ The `OUTERSHELL_UPDATE_TESTS` CMake option builds `OuterShellUpdateFixture` for
 local signature rejection, version binding, and scheduled upgrade tests. Its local
 payload injection is confined to the test binary; the production API accepts no
 custom download URL, executable path, publisher, or installer arguments.
+
+## WSL containers
+
+Windows also discovers Linux containers created with Microsoft's `wslc.exe`
+(WSL 2.9.3 or later). This is separate from WSL distribution discovery. Docker
+is not required. The native host invokes the CLI directly, without PowerShell,
+and uses `exec --interactive` to carry the existing socket-bridge protocol.
+Each app receives a user-owned, allowlisted Windows named pipe with a Task Scheduler mapping that restarts Outer Shell after idle exit. The inner Linux
+service manager and app images are shared with the other container platforms.
+
+Outer Shell uses the ordinary interactive user's default WSL container session.
+WSL containers has a separate default session for elevated processes, including
+an elevated SSH shell. Containers created there do not appear in the ordinary
+user's Outer Shell. Use an unelevated local terminal for manual container work.
+
+The overview supports discovery, app opening and start/stop/restart, container
+start/stop, and creation from OCI images with CPU and memory limits. Containers
+created by Outer Shell can also be renamed and deleted; externally created
+containers are attached without claiming ownership. Display names and limits
+are stored as newline-delimited UTF-8 in `container-names` under the user's
+Outer Shell directory. Runtime diagnostics go to `container-runtime.log`.
+
+For a release payload, build static Linux `outershelld`, `outerctl`, and
+`outer-socket-bridge` for the target Linux architecture. Run
+`build-container-bootstrap.ps1 -LinuxBinariesDirectory ... -OutputDirectory ...`,
+then pass that directory as `-ContainerBootstrapDirectory` to `build.ps1`.
+The installer copies this optional image-building payload. These Linux tools
+run inside containers; the Windows SSH helper continues to be synced by Outer
+Loop and is not installed. The default image is built locally on first creation.
+
+This first Windows adapter does not yet implement the Dockerfile editor,
+rebuilds, mount configuration, image sharing, or terminal launcher discovery.
+These capabilities are marked unavailable in snapshots. Custom images can use
+the same `outerctl image add-app` and OCI app payload contract documented in
+`Docs/ContainerCookbook.md`. Container runtime support should not be confused
+with Windows-kernel containers; these are Linux containers.
+
+For integration coverage, build an image from the prepared base with
+`COPY --from=ghcr.io/outergroup/outershell-app-files:4 /outershell-rootfs/ /`,
+tag it `outershell/windows-test:1`, and run `test-containers.ps1` on Windows.
+The test creates and removes its own disposable container and covers native
+Files responses, app controls, container controls, names, and logs.

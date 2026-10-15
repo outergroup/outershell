@@ -627,6 +627,7 @@ static bool shell_start(ShellHost *s) {
         if (!legacy_start_files(s)) return false;
     }
     s->wsl = wsl_start(s->stop);
+    if (s->wsl) wsl_version(s->wsl);
     char *api = win_pipe("org.outershell.outershelld"), *http = win_pipe(shell_id);
     s->api = api ? pipe_server_start(api, serve_registry, s) : NULL;
     s->http = http ? pipe_server_start(http, serve_http, s) : NULL;

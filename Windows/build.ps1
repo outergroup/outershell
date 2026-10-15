@@ -2,6 +2,7 @@ param(
     [switch]$UpdateTests,
     [string]$OutputDirectory = "$PSScriptRoot/../build/windows",
     [string]$CoreDirectory,
+    [string]$ContainerBootstrapDirectory,
     [ValidateSet('arm64', 'x64', 'x86')][string]$Architecture = [Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString().ToLowerInvariant(),
     [string]$VisualStudioRoot,
     [string]$FilesRoot,
@@ -56,3 +57,8 @@ New-Item -ItemType Directory -Force "$OutputDirectory/web", "$OutputDirectory/fi
 Copy-Item "$PSScriptRoot/../Resources/OuterShellWeb/*" "$OutputDirectory/web" -Recurse -Force
 Copy-Item "$FilesRoot/Resources/FilesWeb/*" "$OutputDirectory/files-web" -Recurse -Force
 Copy-Item "$PSScriptRoot/install.ps1" $OutputDirectory -Force
+
+if ($ContainerBootstrapDirectory) {
+    New-Item -ItemType Directory -Force "$OutputDirectory/container-bootstrap" | Out-Null
+    Copy-Item "$ContainerBootstrapDirectory/*" "$OutputDirectory/container-bootstrap" -Recurse -Force
+}
