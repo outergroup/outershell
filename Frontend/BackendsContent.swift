@@ -1918,7 +1918,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private var commandEditorLabel: String { isWindowsCommandHost ? "Command Prompt commands (cmd.exe)" : "Bash commands" }
     private var commandPipePlaceholder: String { #"\\.\pipe\my-app"# }
     private var administrativeRoleName: String { isWindowsHost && catalogWorkspaceID == nil ? "administrator" : "root" }
-    private var administratorOverviewName: String { isWindowsHost ? overviewUsername : "root" }
     private var administratorOverviewLabel: String {
         isWindowsHost ? "\(overviewUsername), Administrator" : "root"
     }
@@ -3960,9 +3959,11 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         var tops = Array(repeating: appsLayer.bounds.height - 18, count: columns)
         let hostItems = appLauncherItems().filter { $0.backend.isInstalled ?? true }
         var groups: [(id: String, name: String, note: String, items: [AppLauncherItem], workspace: LocalWorkspaceRecord?)] = [
-            ("user", overviewUsername, "User", hostItems.filter { $0.backend.serviceScope != "system" }, nil),
-            ("root", administratorOverviewName, "Administrator", hostItems.filter { $0.backend.serviceScope == "system" }, nil)
+            ("user", overviewUsername, "User", hostItems.filter { isWindowsHost || $0.backend.serviceScope != "system" }, nil)
         ]
+        if !isWindowsHost {
+            groups.append(("root", "root", "Administrator", hostItems.filter { $0.backend.serviceScope == "system" }, nil))
+        }
         if workspaceContextID == nil {
             for workspace in localWorkspaces {
                 let items = appLauncherItems(in: workspace)
@@ -5273,14 +5274,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private func renderBashCommandsSection(left: CGFloat,
                                            top: CGFloat,
                                            width: CGFloat) -> CGFloat {
-        if isWindowsCommandHost && catalogScope == "system" {
-            let explanation = makeTextLayer(size: 13, weight: .regular, color: .secondaryLabelColor)
-            explanation.string = "Set up administrator commands locally on this Windows machine. Open Outer Loop in Localhost mode, choose Administrator → Add more… → Run commands, and approve the Windows UAC prompt."
-            explanation.isWrapped = true
-            explanation.frame = CGRect(x: left, y: top - 90, width: min(width, 680), height: 80)
-            addCreateFormSublayer(explanation)
-            return top - 110
-        }
         ensureBashDefaults()
 
         let detailWidth = min(width, 680)

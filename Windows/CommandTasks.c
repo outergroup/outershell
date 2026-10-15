@@ -20,15 +20,14 @@ HRESULT command_task(const char *name, const char *operation, const char *xml, D
     ITaskFolder *folder = NULL;
     IRegisteredTask *task = NULL;
     IRunningTask *running = NULL;
-    bool administrator = !strncmp(name, "\\OuterShell-Admin-App-", 22);
     VARIANT empty; VariantInit(&empty);
     VARIANT security; VariantInit(&security);
     bool core = !strcmp(operation, "register-core");
-    if ((administrator || core) && xml) {
+    if (core && xml) {
         char *sid = win_sid();
         if (!sid) { CoUninitialize(); return E_FAIL; }
         char descriptor[256];
-        snprintf(descriptor, sizeof(descriptor), administrator ? "O:BAG:BAD:P(A;;GA;;;BA)(A;;GA;;;SY)(A;;GRGX;;;%s)" : "D:P(A;;GA;;;BA)(A;;GA;;;SY)(A;;GA;;;%s)", sid);
+        snprintf(descriptor, sizeof(descriptor), "D:P(A;;GA;;;BA)(A;;GA;;;SY)(A;;GA;;;%s)", sid);
         free(sid);
         security.vt = VT_BSTR; security.bstrVal = task_string(descriptor);
         if (!security.bstrVal) { CoUninitialize(); return E_OUTOFMEMORY; }
@@ -39,7 +38,7 @@ HRESULT command_task(const char *name, const char *operation, const char *xml, D
     if (SUCCEEDED(hr)) hr = ITaskService_Connect(service, empty, empty, empty, empty);
     if (SUCCEEDED(hr)) hr = ITaskService_GetFolder(service, root, &folder);
     if (SUCCEEDED(hr)) {
-        if (xml) hr = ITaskFolder_RegisterTask(folder, path, definition, (core ? TASK_CREATE_OR_UPDATE : TASK_CREATE) | ((administrator || core) ? TASK_DONT_ADD_PRINCIPAL_ACE : 0), empty, empty, TASK_LOGON_INTERACTIVE_TOKEN, security, &task);
+        if (xml) hr = ITaskFolder_RegisterTask(folder, path, definition, (core ? TASK_CREATE_OR_UPDATE : TASK_CREATE) | (core ? TASK_DONT_ADD_PRINCIPAL_ACE : 0), empty, empty, TASK_LOGON_INTERACTIVE_TOKEN, security, &task);
         else hr = ITaskFolder_GetTask(folder, path, &task);
     }
     if (SUCCEEDED(hr) && !strcmp(operation, "query")) {
@@ -50,7 +49,7 @@ HRESULT command_task(const char *name, const char *operation, const char *xml, D
         bool stop = !strcmp(operation, "stop") || !strcmp(operation, "restart") || !strcmp(operation, "uninstall");
         bool start = !strcmp(operation, "start") || !strcmp(operation, "restart");
         if (stop) {
-            hr = administrator ? S_OK : IRegisteredTask_put_Enabled(task, VARIANT_FALSE);
+            hr = IRegisteredTask_put_Enabled(task, VARIANT_FALSE);
             if (SUCCEEDED(hr)) hr = IRegisteredTask_Stop(task, 0);
             if (hr == SCHED_E_TASK_NOT_RUNNING) hr = S_OK;
             else if (hr == S_FALSE) {
@@ -68,7 +67,7 @@ HRESULT command_task(const char *name, const char *operation, const char *xml, D
             if (SUCCEEDED(hr) && (value == TASK_STATE_RUNNING || value == TASK_STATE_QUEUED)) hr = HRESULT_FROM_WIN32(ERROR_TIMEOUT);
         }
         if (SUCCEEDED(hr) && start) {
-            hr = administrator ? S_OK : IRegisteredTask_put_Enabled(task, VARIANT_TRUE);
+            hr = IRegisteredTask_put_Enabled(task, VARIANT_TRUE);
             if (SUCCEEDED(hr)) hr = IRegisteredTask_Run(task, empty, &running);
         }
         if (SUCCEEDED(hr) && !strcmp(operation, "uninstall")) hr = ITaskFolder_DeleteTask(folder, path, 0);

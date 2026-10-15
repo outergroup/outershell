@@ -7,8 +7,6 @@
 static const char *shell_id = "org.outershell.OuterShell", *files_id = "org.outershell.Files";
 typedef struct CommandApp CommandApp;
 typedef struct {
-    bool administrator;
-    ULONGLONG admin_queried, admin_revision;
     CommandApp *commands;
     char *state, *registry, *directory, *web, *service_name;
     HANDLE stop, files, job;
@@ -73,11 +71,8 @@ static bool update_allowlist(ShellHost *s) {
     return store_close(s, &store, false) && ok;
 }
 #include "Commands.inc"
-#include "AdminCommands.inc"
 #include "Setup.inc"
 #include "Updates.inc"
-static StringBuilder all_backends(ShellHost *s);
-
 static bool legacy_files_running(ShellHost *s) {
     if (!s->files)
         return false;
@@ -247,7 +242,7 @@ static StringBuilder backends(ShellHost *s) {
     StringBuilder result = payload(12 + store.backend_count * 8);
     payload_u32(&result, 8, (uint32_t)store.backend_count);
     char *sid = win_sid();
-    const char *scope = s->administrator || (sid && !strcmp(sid, "S-1-5-18")) ? "system" : "user";
+    const char *scope = (sid && !strcmp(sid, "S-1-5-18")) ? "system" : "user";
     free(sid);
     for (size_t i = 0; i < store.backend_count; i++) {
         RegistryBackendRecord *b = &store.backends[i];
@@ -309,7 +304,7 @@ static StringBuilder backends(ShellHost *s) {
             free(app.data);
         }
         StringBuilder row = payload(116);
-        if (!strcmp(b->service_id, shell_id) && !s->administrator) {
+        if (!strcmp(b->service_id, shell_id)) {
             payload_text(&row, 84, OUTERSHELL_VERSION);
             EnterCriticalSection(&update_gate);
             payload_text(&row, 92, update_version);
@@ -321,7 +316,7 @@ static StringBuilder backends(ShellHost *s) {
         payload_text(&row, 16, b->unit_name);
         payload_text(&row, 32, scope);
         payload_text(&row, 40, status);
-        payload_u32(&row, 64, 8u | (controls ? 1u : 0u) | (command_find(s, b->service_id) && !s->administrator ? 2u : 0u));
+        payload_u32(&row, 64, 8u | (controls ? 1u : 0u) | (command_find(s, b->service_id) ? 2u : 0u));
         payload_data(&row, 68, apps.data, apps.length);
         uint32_t empty = 0;
         if (command_find(s, b->service_id)) {
@@ -343,54 +338,10 @@ static StringBuilder backends(ShellHost *s) {
     }
     return result;
 }
-static StringBuilder all_backends(ShellHost *s) {
-    StringBuilder user = backends(s);
-    ShellHost admin = {0};
-    if (!admin_host(&admin, false)) return user;
-    commands_load(&admin);
-    update_allowlist(&admin);
-    StringBuilder elevated = backends(&admin);
-    uint32_t u = user.length >= 12 ? read_uint32_le((unsigned char *)user.data + 8) : 0;
-    uint32_t a = elevated.length >= 12 ? read_uint32_le((unsigned char *)elevated.data + 8) : 0;
-    StringBuilder result = payload(12 + (u + a) * 8);
-    payload_u32(&result, 8, u + a);
-    size_t index = 0;
-    StringBuilder parts[] = {user, elevated};
-    for (size_t j = 0; j < 2; j++) {
-        uint32_t count = j ? a : u;
-        for (uint32_t i = 0; i < count; i++) {
-            unsigned char *ref = (unsigned char *)parts[j].data + 12 + i * 8;
-            uint32_t offset = read_uint32_le(ref), length = read_uint32_le(ref + 4);
-            payload_data(&result, 12 + index++ * 8, parts[j].data + offset, length);
-        }
-        free(parts[j].data);
-    }
-    admin_host_free(&admin);
-    return result;
-}
 static StringBuilder control(ShellHost *s, HttpRequest *r) {
     char task_error[256];
     char *id = http_query(r, "serviceID"), *operation = http_query(r, "operation");
     bool ok = false;
-    char *scope = http_query(r, "scope");
-    if (scope && !strcmp(scope, "system")) {
-        free(scope);
-        ShellHost admin = {0};
-        if (admin_host(&admin, false)) {
-            commands_load(&admin);
-            CommandApp *app = id ? command_find(&admin, id) : NULL;
-            if (app && operation && (!strcmp(operation, "start") || !strcmp(operation, "stop") || !strcmp(operation, "restart")))
-                ok = SUCCEEDED(command_task(app->task_name, operation, NULL, NULL));
-            admin_host_free(&admin);
-        }
-        free(id); free(operation);
-        StringBuilder result = payload(28);
-        payload_u32(&result, 0, ok ? 1 : 0);
-        payload_text(&result, 4, ok ? "Completed." : "Manage this administrator task locally in Windows Task Scheduler.");
-        changed(s);
-        return result;
-    }
-    free(scope);
     const char *message = "This operation is not supported for this backend.";
     if (id && operation && !strcmp(id, files_id)) {
         if (!strcmp(operation, "stop") || !strcmp(operation, "disable"))
@@ -535,10 +486,6 @@ static void serve_http(Connection *c, void *context) {
         http_free(&r);
         return;
     }
-    if (admin_commands_request(s, c, &r)) {
-        http_free(&r);
-        return;
-    }
     if (serve_outerframe(s, c, &r)) {
         http_free(&r);
         return;
@@ -565,7 +512,7 @@ static void serve_http(Connection *c, void *context) {
     StringBuilder body = {0};
     int status = 200;
     if (!strcmp(r.path, "/api/backends"))
-        body = all_backends(s);
+        body = backends(s);
     else if (!strcmp(r.path, "/api/layout"))
         body = layout(s, &r, &status);
     else if (!strcmp(r.path, "/api/events")) {
@@ -580,7 +527,6 @@ static void serve_http(Connection *c, void *context) {
         while (previous == s->version && GetTickCount64() < deadline &&
                WaitForSingleObject(s->stop, 0) != WAIT_OBJECT_0) {
             files_running(s);
-            admin_refresh(s);
             for (CommandApp *a = s->commands; a; a = a->next) command_running(s, a);
             current_overview = (s->version << 32) ^ wsl_version(s->wsl);
             if (previous != s->version || prior_overview != current_overview)
@@ -599,16 +545,7 @@ static void serve_http(Connection *c, void *context) {
             body = control(s, &r);
     } else if (!strcmp(r.path, "/api/logs")) {
         if (strcmp(r.method, "GET")) status = 405;
-        else {
-            char *scope = http_query(&r, "scope");
-            ShellHost admin = {0};
-            if (scope && !strcmp(scope, "system") && admin_host(&admin, false)) {
-                commands_load(&admin);
-                body = command_logs(&admin, &r);
-                admin_host_free(&admin);
-            } else body = command_logs(s, &r);
-            free(scope);
-        }
+        else body = command_logs(s, &r);
     } else if (!strcmp(r.path, "/api/create")) {
         if (strcmp(r.method, "POST")) status = 405;
         else body = command_create(s, &r);
@@ -773,7 +710,6 @@ int wmain(int argc, wchar_t **argv) {
     if (argc == 2 && !wcscmp(argv[1], L"--setup-install")) return setup_tasks("install");
     if (argc == 2 && !wcscmp(argv[1], L"--setup-stop")) return setup_tasks("stop");
     if (argc == 2 && !wcscmp(argv[1], L"--setup-remove")) return setup_tasks("remove");
-    if (argc == 4 && !wcscmp(argv[1], L"--apply-admin-command")) return admin_apply_command(argv[2], argv[3]);
     if (argc == 2 && !wcscmp(argv[1], L"--wsl-list")) return wsl_inspect();
     bool service = false, initialize = false;
     char *run_command_id = NULL;

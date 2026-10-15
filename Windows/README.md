@@ -42,6 +42,13 @@ in `%LOCALAPPDATA%\OuterShell`. Installation registers two interactive-user task
 session. No password is stored. Tasks ignore duplicate launch requests, have no
 execution time limit, and can recover after failures.
 
+Both executables use the Windows GUI subsystem with a shared background entry
+point, so Task Scheduler never allocates a console window for them. Command
+arguments, exit codes, and redirected standard output remain available. Run
+`Windows/test-background-launch.ps1` as the signed-in user after installation to
+check the executable subsystem, task launches, console absence, and HTTP responses.
+The test restarts both core tasks.
+
 The installer writes pipe-to-task mappings to
 `%LOCALAPPDATA%\org.outerssh\activations.tsv`. Opening an allowlisted endpoint
 through Outer Loop's Windows Localhost mode or Windows SSH bridge activates its
@@ -284,41 +291,14 @@ logs, process-tree cleanup, persistence, restart, and uninstall. Run both as the
 signed-in desktop user, with existing same-user hosts stopped for the latter.
 
 
-### Administrator commands
+### Administrator backends
 
-Administrator → Add more… → Run commands is available in both frontends.
-Remote sessions explain that setup must be performed locally. In Windows
-Localhost mode uses the usual inline command form. Creating the app requests
-UAC approval and launches a short-lived elevated helper to apply the submitted
-values. Success closes the form; cancellation or failure leaves its values intact.
-
-`GET /api/admin-commands` reports `localSetup`. POST accepts a bounded form only
-when Windows reports that the named-pipe client belongs to the same nonzero
-desktop session as Outer Shell. Windows OpenSSH clients are in session zero and
-receive HTTP 403, even if their SSH token is elevated. `/api/create` continues to
-reject system scope. The helper receives the form and returns the normal action
-result over a private, randomly named, local-only pipe. Outer Shell verifies the
-client PID matches the process launched through UAC before sending any commands.
-The helper requires elevation, the same account, and the same desktop session.
-No command text is passed on the process command line or stored in a staging file.
-
-Approved commands use independent InteractiveToken/HighestAvailable tasks named
-`OuterShell-Admin-App-<SID>-<service-id>`. The registry, script, runner, and output
-are stored beneath `Program Files/OuterShell Commands/<SID>`, with administrator
-ownership and read access for that user. The task grants that user read/execute
-access, not permission to change its definition. Administrator backends appear
-in their own card and support start/stop/restart and output logs. Uninstall and
-command editing are not exposed remotely; manage task definitions locally.
-Scripts invoked by a command must also be protected against unelevated edits.
-
-For an isolated test machine, build with `OUTERSHELL_ADMIN_TESTS=ON`, run
-`OuterShellAdminFixture.exe` elevated in the signed-in account, then run
-`test_admin_commands.py` unelevated with the installed Outer Shell running. The
-fixture registers only the fixed `admin-regression-fixture` command (whoami,
-a marker, and a timed loopback ping). The Python checks cover high-integrity
-execution, scoped discovery/logs, approved task controls, rejected empty setup requests, denied unelevated writes, and denied task-definition changes. Run
-`OuterShellAdminFixture.exe --cleanup-fixture` elevated in the same signed-in
-account afterward to remove its task, registry entry, and command directory.
+The built-in Windows experience creates ordinary-user tasks only. It does not
+provide an Administrator card, elevated command setup, or a UAC setup utility.
+Previously created administrator tasks are not deleted or automatically surfaced.
+Custom backends registered explicitly through the registry API remain supported;
+their privileges and named-pipe permissions are the responsibility of their owner.
+Linux root backends inside WSL retain the normal Linux authorization flow.
 
 ### Windows beta installer
 

@@ -62,8 +62,8 @@ if ($SystemService) {
     if ($LASTEXITCODE) { throw 'Could not configure service recovery.' }
     if ($Start) { Start-Service $serviceName }
 } else {
-    & $executable --initialize
-    if ($LASTEXITCODE) { throw 'Could not initialize the HTTP named-pipe allowlist.' }
+    $initialization = Start-Process -FilePath $executable -ArgumentList '--initialize' -Wait -PassThru
+    if ($initialization.ExitCode) { throw 'Could not initialize the HTTP named-pipe allowlist.' }
     $principal = New-ScheduledTaskPrincipal -UserId $identity.Name -LogonType Interactive -RunLevel Limited
     $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
     foreach ($app in @(@{Name="OuterShell-$sid"; File='OuterShell.exe'}, @{Name="OuterShell-Files-$sid"; File='FilesBackend.exe'})) {
