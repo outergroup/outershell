@@ -1729,6 +1729,12 @@ static void cleanup_bundled_app_cache_if_stage_root_is_download_cache(const Bund
 
 static void default_user_outerctl_path(char *out, size_t out_size) {
     if (!out || out_size == 0) return;
+#ifndef __APPLE__
+    if (geteuid() == 0) {
+        snprintf(out, out_size, "/opt/outershell/bin/outerctl");
+        return;
+    }
+#endif
     char root[PATH_MAX];
     default_user_outershell_root(root, sizeof(root));
     snprintf(out, out_size, "%s/bin/outerctl", root);
@@ -1736,6 +1742,12 @@ static void default_user_outerctl_path(char *out, size_t out_size) {
 
 static void default_outershell_install_root(char *out, size_t out_size) {
     if (!out || out_size == 0) return;
+#ifndef __APPLE__
+    if (geteuid() == 0) {
+        snprintf(out, out_size, "/opt/outershell/outer-shell");
+        return;
+    }
+#endif
     char root[PATH_MAX];
     default_user_outershell_root(root, sizeof(root));
     snprintf(out, out_size, "%s/outer-shell", root);
@@ -1752,7 +1764,11 @@ static void default_user_outershelld_path(char *out, size_t out_size) {
 
 static void default_system_outershelld_install_root(char *out, size_t out_size) {
     if (!out || out_size == 0) return;
+#ifdef __APPLE__
     snprintf(out, out_size, "%s/outershelld", kSystemOuterShellRoot);
+#else
+    snprintf(out, out_size, "/opt/outershell/libexec");
+#endif
 }
 
 static void default_system_outershelld_path(char *out, size_t out_size) {
@@ -1764,12 +1780,20 @@ static void default_system_outershelld_path(char *out, size_t out_size) {
 
 static void default_system_outerctl_path(char *out, size_t out_size) {
     if (!out || out_size == 0) return;
+#ifdef __APPLE__
     snprintf(out, out_size, "%s/bin/outerctl", kSystemOuterShellRoot);
+#else
+    snprintf(out, out_size, "/opt/outershell/bin/outerctl");
+#endif
 }
 
 #ifndef __APPLE__
 static void default_outershelld_install_root(char *out, size_t out_size) {
     if (!out || out_size == 0) return;
+    if (geteuid() == 0) {
+        snprintf(out, out_size, "/opt/outershell/libexec");
+        return;
+    }
     char root[PATH_MAX];
     default_user_outershell_root(root, sizeof(root));
     snprintf(out, out_size, "%s/outershelld", root);
@@ -6074,6 +6098,60 @@ static bool run_sudo_shell(const char *command, const char *password, char *outp
     return false;
 }
 
+enum { ROOT_SUPPORT_STARTUP_FAILURE = 70 };
+
+#ifndef __APPLE__
+static void write_linux_selinux_functions(FILE *script) {
+    fputs(
+        "restore_selinux_context() {\n"
+        "    if command -v selinuxenabled >/dev/null 2>&1; then\n"
+        "        selinuxenabled || return 0\n"
+        "    elif [ ! -e /sys/fs/selinux/enforce ]; then\n"
+        "        return 0\n"
+        "    fi\n"
+        "    if ! command -v restorecon >/dev/null 2>&1; then\n"
+        "        printf '%s\\n' 'Outer Shell needs restorecon to label its system executables for SELinux. On Fedora, install policycoreutils, then retry.' >&2\n"
+        "        exit 70\n"
+        "    fi\n"
+        "    if ! restorecon -F -- \"$@\"; then\n"
+        "        printf '%s\\n' 'Could not restore the default SELinux labels for Outer Shell executables.' >&2\n"
+        "        exit 70\n"
+        "    fi\n"
+        "}\n", script);
+}
+
+static void write_linux_root_support_readiness_check(FILE *script, const char *quoted_outerctl) {
+    fputs(
+        "root_support_since=$(date '+%Y-%m-%d %H:%M:%S')\n"
+        "root_support_failure() {\n"
+        "  printf '%s\\n' 'Root Outer Shell support could not start. The app operation was stopped during setup.' >&2\n"
+        "  printf '%s\\n' \"$1\" >&2\n"
+        "  root_support_status=$(timeout -k 2s 5s systemctl --system show outershelld.service --property=ActiveState --property=Result --property=ExecMainStatus 2>&1) || true\n"
+        "  case \"$root_support_status\" in\n"
+        "    *ExecMainStatus=203*) printf '%s\\n' 'systemd could not execute /opt/outershell/libexec/outershelld (203/EXEC). Check executable permissions and security policy, including SELinux.' >&2 ;;\n"
+        "  esac\n"
+        "  printf '\\nSystem service: outershelld.service\\n%s\\n' \"$root_support_status\" >&2\n"
+        "  printf '\\nRecent service log:\\n' >&2\n"
+        "  timeout -k 2s 5s journalctl --system --unit=outershelld.service --since=\"$root_support_since\" --lines=12 --no-pager --quiet --output=cat >&2 || true\n"
+        "  printf '\\nReadiness check: %s\\n' \"$2\" >&2\n", script);
+    fprintf(script, "  exit %d\n", ROOT_SUPPORT_STARTUP_FAILURE);
+    fputs(
+        "}\n"
+        "timeout -k 2s 5s systemctl --system reset-failed outershelld.service outershelld.socket >/dev/null 2>&1 || true\n"
+        "if root_support_error=$(timeout -k 2s 15s systemctl --system start outershelld.socket 2>&1); then :; else\n"
+        "  root_support_failure 'The system API socket could not start.' \"$root_support_error\"\n"
+        "fi\n", script);
+    fprintf(script,
+        "if root_support_error=$(OUTERSHELL_HOME=/var/lib/outershell OUTERSHELLD_API_SOCKET=/run/outershelld-api timeout -k 2s 15s %s backend list 2>&1 >/dev/null); then :; else\n"
+        "  root_support_exit=$?\n"
+        "  if [ \"$root_support_exit\" = 124 ] || [ \"$root_support_exit\" = 137 ]; then\n"
+        "    root_support_failure 'The root daemon did not answer an API request within 15 seconds.' \"$root_support_error\"\n"
+        "  fi\n"
+        "  root_support_failure 'The root daemon could not answer an API request.' \"$root_support_error\"\n"
+        "fi\n", quoted_outerctl);
+}
+#endif
+
 static bool run_root_script(const char *script_path, const char *sudo_password, bool *needs_password, char *message, size_t message_size) {
     if (needs_password) *needs_password = false;
     char quoted_script[PATH_MAX + 8];
@@ -6083,7 +6161,7 @@ static bool run_root_script(const char *script_path, const char *sudo_password, 
 
     int exit_status = -1;
     bool ok = run_sudo_shell(command, sudo_password, message, message_size, &exit_status);
-    if (!ok && sudo_failure_needs_password(message, exit_status)) {
+    if (!ok && exit_status != ROOT_SUPPORT_STARTUP_FAILURE && sudo_failure_needs_password(message, exit_status)) {
         if (needs_password) *needs_password = true;
         snprintf(message, message_size, "Administrator password required.");
     } else if (!ok && message[0] == '\0') {
@@ -6270,7 +6348,7 @@ static bool ensure_root_helper_installed(const char *sudo_password, bool *needs_
             "[Service]\n"
             "Environment=OUTERSHELL_HOME=/var/lib/outershell\n"
             "Environment=OUTER_SHELL_PUBLIC_BASE_URL=%s\n"
-            "ExecStart=/var/lib/outershell/outershelld/outershelld\n"
+            "ExecStart=/opt/outershell/libexec/outershelld\n"
             "Restart=no\n"
             "StandardOutput=append:/var/log/outershell/outershelld.log\n"
             "StandardError=append:/var/log/outershell/outershelld.log\n"
@@ -6286,8 +6364,7 @@ static bool ensure_root_helper_installed(const char *sudo_password, bool *needs_
             "ln -s %s %s\n"
             "ln -s %s %s\n"
             "systemctl --system daemon-reload\n"
-            "systemctl --system enable outershelld.socket >/dev/null 2>&1\n"
-            "systemctl --system start outershelld.socket\n",
+            "systemctl --system enable outershelld.socket >/dev/null 2>&1\n",
             quoted_service_name,
             quoted_socket_name,
             service_name,
@@ -6325,6 +6402,10 @@ static bool ensure_root_helper_installed(const char *sudo_password, bool *needs_
             quoted_user_outershelld,
             quoted_system_outerctl,
             quoted_user_outerctl);
+    write_linux_selinux_functions(script);
+    fprintf(script, "restore_selinux_context %s\nrestore_selinux_context %s\n",
+            quoted_system_outershelld, quoted_system_outerctl);
+    write_linux_root_support_readiness_check(script, quoted_system_outerctl);
 #else
     (void)owner_uid;
     (void)owner_name;
@@ -6560,6 +6641,9 @@ static void write_system_binary_cleanup_shell(FILE *script) {
             "  systemctl --system daemon-reload >/dev/null 2>&1 || true\n"
             "  rm -f \"$system_outershelld_path\" \"$system_outerctl_path\" \"$system_version_path\"\n"
             "  rm -f /var/log/outershell/outershelld.log /var/log/outershell/org.outershell.OuterShell.log\n"
+            "  rm -f /opt/outershell/libexec/outershell-container-provider\n"
+            "  rm -rf /opt/outershell/libexec/container-bootstrap\n"
+            "  rmdir /opt/outershell/bin /opt/outershell/libexec >/dev/null 2>&1 || true\n"
             "  if ! find \"$system_outershell_home/apps\" -mindepth 1 -print -quit 2>/dev/null | grep -q . &&\n"
             "     ! find /opt/outershell -mindepth 1 -print -quit 2>/dev/null | grep -q .; then\n"
             "    rm -f \"$system_outershell_home/registry.orwa\" \"$system_outershell_home/registry.orwa.lock\"\n"
@@ -6581,7 +6665,7 @@ static void write_root_apps_marker_cleanup_shell(FILE *script) {
     char quoted_root_apps_marker[PATH_MAX + 8];
     shell_quote(root_apps_marker, quoted_root_apps_marker, sizeof(quoted_root_apps_marker));
     fprintf(script,
-            "if ! find /opt/outershell -mindepth 1 -maxdepth 1 -type d -print -quit 2>/dev/null | grep -q .; then\n"
+            "if ! find /opt/outershell -mindepth 1 -maxdepth 1 -type d ! -name bin ! -name libexec ! -name outer-shell -print -quit 2>/dev/null | grep -q .; then\n"
             "  rm -f %s\n"
             "fi\n",
             quoted_root_apps_marker);
@@ -9281,7 +9365,7 @@ static bool install_bundled_app_internal(const BundledAppDefinition *app,
     char bundles_dir[PATH_MAX];
     snprintf(bundles_dir, sizeof(bundles_dir), "%s/bundles", install_root);
     char target_binary[PATH_MAX];
-    snprintf(target_binary, sizeof(target_binary), "%s/%s", install_root, app->binary_name);
+    snprintf(target_binary, sizeof(target_binary), system_scope ? "%s/bin/%s" : "%s/%s", install_root, app->binary_name);
     char target_bundle_arm[PATH_MAX];
     snprintf(target_bundle_arm, sizeof(target_bundle_arm), "%s/%s.bundle.macos-arm.aar", bundles_dir, app->bundle_prefix);
     char target_bundle_x86[PATH_MAX];
@@ -9313,7 +9397,12 @@ static bool install_bundled_app_internal(const BundledAppDefinition *app,
     shell_quote(install_root, quoted_install_root, sizeof(quoted_install_root));
     char remove_command[PATH_MAX + 64];
     snprintf(remove_command, sizeof(remove_command), "rm -rf -- %s", quoted_install_root);
-    if (system(remove_command) != 0 || !mkdir_p(bundles_dir) || !mkdir_p(service_state_root)) {
+    char binary_directory[PATH_MAX];
+    if (!parent_directory(target_binary, binary_directory, sizeof(binary_directory))) {
+        snprintf(message, message_size, "Could not resolve app executable directory.");
+        return false;
+    }
+    if (system(remove_command) != 0 || !mkdir_p(binary_directory) || !mkdir_p(bundles_dir) || !mkdir_p(service_state_root)) {
         snprintf(message, message_size, "Failed to prepare %s: %s", install_root, strerror(errno));
         return false;
     }
@@ -9335,6 +9424,24 @@ static bool install_bundled_app_internal(const BundledAppDefinition *app,
         return false;
     }
     chmod(version_path, data_mode);
+    if (system_scope) {
+        char *command = NULL;
+        size_t command_size = 0;
+        FILE *script = open_memstream(&command, &command_size);
+        if (!script) {
+            snprintf(message, message_size, "Could not prepare SELinux label restoration: %s", strerror(errno));
+            return false;
+        }
+        write_linux_selinux_functions(script);
+        char quoted_binary[PATH_MAX * 2 + 16];
+        shell_quote(target_binary, quoted_binary, sizeof(quoted_binary));
+        fprintf(script, "restore_selinux_context %s\n", quoted_binary);
+        fclose(script);
+        bool ok = run_sudo_shell(command, NULL, message, message_size, NULL);
+        free(command);
+        if (!ok) return false;
+    }
+
 
     const char *home = system_scope ? "/root" : home_directory();
     struct passwd *pw = getpwuid(getuid());
@@ -9542,7 +9649,7 @@ static bool install_bundled_app(const BundledAppDefinition *app,
         char bundles_dir[PATH_MAX];
         snprintf(bundles_dir, sizeof(bundles_dir), "%s/bundles", install_root);
         char target_binary[PATH_MAX];
-        snprintf(target_binary, sizeof(target_binary), "%s/%s", install_root, app->binary_name);
+        snprintf(target_binary, sizeof(target_binary), "%s/bin/%s", install_root, app->binary_name);
         char target_bundle_arm[PATH_MAX];
         snprintf(target_bundle_arm, sizeof(target_bundle_arm), "%s/%s.bundle.macos-arm.aar", bundles_dir, app->bundle_prefix);
         char target_bundle_x86[PATH_MAX];
@@ -9733,7 +9840,7 @@ static bool install_bundled_app(const BundledAppDefinition *app,
                 "mkdir -p %s %s /var/log/outershell %s %s\n"
                 "chmod 0755 %s\n"
                 "chmod 0700 %s\n"
-                "install -m 0755 %s %s\n"
+                "install -D -m 0755 %s %s\n"
                 "install -m 0644 %s %s\n"
                 "install -m 0644 %s %s\n",
                 quoted_unit,
@@ -9752,6 +9859,8 @@ static bool install_bundled_app(const BundledAppDefinition *app,
                 quoted_target_bundle_arm,
                 quoted_source_bundle_x86,
                 quoted_target_bundle_x86);
+        write_linux_selinux_functions(script);
+        fprintf(script, "restore_selinux_context %s\n", quoted_target_binary);
         if (quoted_source_web_dir[0]) {
             fprintf(script,
                     "if [ -L %s ] || [ -n \"$(find -P %s -mindepth 1 ! -type d ! -type f -print -quit)\" ]; then\n"
@@ -10892,7 +11001,9 @@ static bool uninstall_backend(const char *service_id, const char *requested_scop
                 if (apps) {
                     struct dirent *entry;
                     while ((entry = readdir(apps)) != NULL) {
-                        if (strcmp(entry->d_name, ".") != 0 && strcmp(entry->d_name, "..") != 0) {
+                        if (strcmp(entry->d_name, ".") != 0 && strcmp(entry->d_name, "..") != 0 &&
+                            strcmp(entry->d_name, "bin") != 0 && strcmp(entry->d_name, "libexec") != 0 &&
+                            strcmp(entry->d_name, "outer-shell") != 0) {
                             has_apps = true;
                             break;
                         }

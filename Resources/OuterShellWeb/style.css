@@ -753,7 +753,8 @@ h1 { margin: 0; font-size: clamp(30px, 5vw, 45px); line-height: 1.05; letter-spa
 .log-toolbar select { min-width: 190px; min-height: 34px; padding: 5px 8px; border: 1px solid var(--line); border-radius: 8px; color: var(--text); background: var(--panel-strong); }
 .log-meta { flex: 1; overflow: hidden; color: var(--muted); font: 11px var(--mono); text-overflow: ellipsis; white-space: nowrap; }
 .log-output { flex: 1; min-height: 0; margin: 0; overflow: auto; padding: 18px; color: var(--text); background: var(--panel-solid); font: 12px/1.55 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere; }
-.about-output { margin: 0; color: var(--text); font: 12px/1.5 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere; }
+.about-output, .operation-error { margin: 0; color: var(--text); font: 12px/1.5 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere; }
+.operation-error { max-height: 55vh; overflow: auto; user-select: text; }
 
 .toast-region { position: fixed; z-index: 200; right: max(18px, env(safe-area-inset-right)); bottom: calc(max(18px, env(safe-area-inset-bottom)) + var(--outerloop-overlay-clearance)); display: grid; gap: 8px; width: min(380px, calc(100% - 36px)); pointer-events: none; }
 .toast { padding: 12px 14px; border: 1px solid var(--line-strong); border-radius: 10px; background: var(--panel-strong); box-shadow: var(--shadow); animation: toast-in 180ms ease both; }

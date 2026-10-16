@@ -662,10 +662,30 @@ if [ "$(id -u)" -eq 0 ]; then
     root_install=true
 fi
 
+linux_selinux_shell_functions() {
+    cat <<'OUTERSHELL_SELINUX_SH'
+restore_selinux_context() {
+    if command -v selinuxenabled >/dev/null 2>&1; then
+        selinuxenabled || return 0
+    elif [ ! -e /sys/fs/selinux/enforce ]; then
+        return 0
+    fi
+    if ! command -v restorecon >/dev/null 2>&1; then
+        printf '%s\n' 'Outer Shell needs restorecon to label its system executables for SELinux. On Fedora, install policycoreutils, then retry.' >&2
+        exit 70
+    fi
+    if ! restorecon -F -- "$@"; then
+        printf '%s\n' 'Could not restore the default SELinux labels for Outer Shell executables.' >&2
+        exit 70
+    fi
+}
+OUTERSHELL_SELINUX_SH
+}
+
 system_outershell_home="/var/lib/outershell"
-system_daemon_root="$system_outershell_home/outershelld"
+system_daemon_root="/opt/outershell/libexec"
 system_outershelld_path="$system_daemon_root/outershelld"
-system_outerctl_path="$system_outershell_home/bin/outerctl"
+system_outerctl_path="/opt/outershell/bin/outerctl"
 system_version_path="$system_daemon_root/version"
 system_binary_users_dir="$system_outershell_home/system-binary-users"
 system_binary_user_marker="$system_binary_users_dir/uid-$(id -u)"
@@ -690,12 +710,13 @@ if [ "$root_install" = true ]; then
     outer_shell_install_cache="$outer_shell_cache_root/install"
     runtime_dir="/run"
     outershell_home="${OUTERSHELL_HOME:-$system_outershell_home}"
-    install_root="$outershell_home/outer-shell"
-    daemon_root="$outershell_home/outershelld"
+    install_root="/opt/outershell/outer-shell"
+    outer_shell_binary="$install_root/bin/OuterShellBackend"
+    daemon_root="$system_daemon_root"
     outershelld_path="$daemon_root/outershelld"
     daemon_version_path="$daemon_root/version"
     app_version_path="$install_root/version"
-    outerctl_path="$outershell_home/bin/outerctl"
+    outerctl_path="$system_outerctl_path"
     unit_dir="/etc/systemd/system"
     socket_path="/run/org.outershell.OuterShell"
     api_socket_path="/run/outershelld-api"
@@ -715,6 +736,7 @@ else
     state_home="${XDG_STATE_HOME:-$home_dir/.local/state}"
     outershell_home="${OUTERSHELL_HOME:-$state_home/outershell}"
     install_root="$outershell_home/outer-shell"
+    outer_shell_binary="$install_root/OuterShellBackend"
     daemon_root="$outershell_home/outershelld"
     outershelld_path="$daemon_root/outershelld"
     daemon_version_path="$daemon_root/version"
@@ -792,11 +814,11 @@ configure_rootless_docker() {
 }
 
 configure_rootless_docker
-services_dir="$daemon_root/services"
+services_dir="$outershell_home/outershelld/services"
 container_provider_path="$daemon_root/outershell-container-provider"
 container_provider_resources="$daemon_root/container-bootstrap"
 outer_shell_service_file="$services_dir/org.outershell.OuterShell.outerservice"
-outershelld_pid_path="$daemon_root/outershelld.pid"
+outershelld_pid_path="$outershell_home/outershelld/outershelld.pid"
 printf 'Outer Shell selected service manager: %s\n' "$service_manager"
 
 stop_internal_service_manager() {
@@ -993,6 +1015,9 @@ remove_system_binaries_if_unused() {
     systemctl --system daemon-reload >/dev/null 2>&1 || true
     rm -f "$system_outershelld_path" "$system_outerctl_path" "$system_version_path"
     rm -f /var/log/outershell/outershelld.log /var/log/outershell/org.outershell.OuterShell.log
+    rm -f /opt/outershell/libexec/outershell-container-provider
+    rm -rf /opt/outershell/libexec/container-bootstrap
+    rmdir /opt/outershell/bin /opt/outershell/libexec >/dev/null 2>&1 || true
     if ! find "$system_outershell_home/apps" -mindepth 1 -print -quit 2>/dev/null | grep -q . &&
        ! find /opt/outershell -mindepth 1 -print -quit 2>/dev/null | grep -q .; then
         rm -f "$system_outershell_home/registry.orwa" "$system_outershell_home/registry.orwa.lock"
@@ -1034,6 +1059,9 @@ remove_system_binaries_if_unused() {
     systemctl --system daemon-reload >/dev/null 2>&1 || true
     rm -f "$system_outershelld_path" "$system_outerctl_path" "$system_version_path"
     rm -f /var/log/outershell/outershelld.log /var/log/outershell/org.outershell.OuterShell.log
+    rm -f /opt/outershell/libexec/outershell-container-provider
+    rm -rf /opt/outershell/libexec/container-bootstrap
+    rmdir /opt/outershell/bin /opt/outershell/libexec >/dev/null 2>&1 || true
     if ! find "$system_outershell_home/apps" -mindepth 1 -print -quit 2>/dev/null | grep -q . &&
        ! find /opt/outershell -mindepth 1 -print -quit 2>/dev/null | grep -q .; then
         rm -f "$system_outershell_home/registry.orwa" "$system_outershell_home/registry.orwa.lock"
@@ -1092,9 +1120,12 @@ refresh_system_binaries_with_sudo() {
     cat > "$refresh_root_script" <<EOF
 #!/bin/sh
 set -eu
-mkdir -p "$system_daemon_root" "$system_outershell_home/bin"
+mkdir -p "$system_daemon_root" "$(dirname "$system_outerctl_path")"
 install -m 0755 "$payload_outershelld" "$system_outershelld_path"
 install -m 0755 "$payload_outerctl" "$system_outerctl_path"
+$(linux_selinux_shell_functions)
+restore_selinux_context "$system_outershelld_path"
+restore_selinux_context "$system_outerctl_path"
 printf '%s\n' "__OUTER_SHELL_VERSION__" > "$system_version_path"
 systemctl --system try-restart outershelld.service >/dev/null 2>&1 || true
 EOF
@@ -1177,7 +1208,7 @@ EOF
     exit 0
 fi
 
-mkdir -p "$install_root" "$daemon_root" "$outershell_home/bin" "$app_log_dir" "$daemon_log_dir"
+mkdir -p "$install_root" "$daemon_root" "$(dirname "$outerctl_path")" "$app_log_dir" "$daemon_log_dir"
 if [ "$service_manager" = systemd ]; then
     mkdir -p "$unit_dir"
 else
@@ -1199,7 +1230,7 @@ rm -f "$archive_path"
 payload="$payload_root/OuterShell"
 app_payload="$payload/apps/org.outershell.OuterShell"
 rm -rf "$install_root"
-mkdir -p "$install_root/bundles" "$daemon_root" "$outershell_home/bin" "$app_log_dir" "$daemon_log_dir"
+mkdir -p "$install_root/bundles" "$daemon_root" "$(dirname "$outerctl_path")" "$app_log_dir" "$daemon_log_dir"
 if [ "$service_manager" = systemd ]; then
     mkdir -p "$unit_dir"
 else
@@ -1211,7 +1242,7 @@ install -m 0755 "$payload/tools/outerctl" "$payload_outerctl_path"
 install -m 0755 "$payload/tools/outershell-container-provider" "$container_provider_path"
 rm -rf "$container_provider_resources"
 cp -R "$payload/container-bootstrap" "$container_provider_resources"
-install -m 0755 "$app_payload/OuterShellBackend" "$install_root/OuterShellBackend"
+install -D -m 0755 "$app_payload/OuterShellBackend" "$outer_shell_binary"
 install -m 0644 "$app_payload/app-icon.png" "$install_root/app-icon.png"
 install -m 0644 "$app_payload/bundles/OuterShell.bundle.macos-arm.aar" "$install_root/bundles/OuterShell.bundle.macos-arm.aar"
 install -m 0644 "$app_payload/bundles/OuterShell.bundle.macos-x86.aar" "$install_root/bundles/OuterShell.bundle.macos-x86.aar"
@@ -1222,7 +1253,7 @@ cp -R "$app_payload/web" "$install_root/web"
 refresh_system_binaries_with_sudo "$payload/tools/outershelld" "$payload_outerctl_path"
 rm -rf "$payload_root"
 chmod 0755 "$outershelld_path"
-chmod 0755 "$install_root/OuterShellBackend"
+chmod 0755 "$outer_shell_binary"
 chmod 0755 "$payload_outerctl_path"
 refresh_root_binaries_match
 if [ "$root_install" = true ]; then
@@ -1231,6 +1262,11 @@ if [ "$root_install" = true ]; then
     touch "$system_binary_user_marker"
     chown 0:0 "$system_binary_user_marker" 2>/dev/null || true
     install -m 0755 "$payload_outerctl_path" "$outerctl_path"
+    eval "$(linux_selinux_shell_functions)"
+    restore_selinux_context "$outershelld_path"
+    restore_selinux_context "$outerctl_path"
+    restore_selinux_context "$container_provider_path"
+    restore_selinux_context "$outer_shell_binary"
 elif [ "$root_binaries_match" = true ]; then
     rm -f "$outershelld_path" "$outerctl_path"
     ln -s "$system_outershelld_path" "$outershelld_path"
@@ -1243,7 +1279,7 @@ printf '%s\n' "__OUTER_SHELL_VERSION__" > "$app_version_path"
 printf '%s\n' "__OUTER_SHELL_VERSION__" > "$daemon_version_path"
 touch "$log_path" "$broker_log_path"
 
-outer_shell_exec="$(systemd_quote_arg "$install_root/OuterShellBackend") --socket-path $(systemd_quote_arg "$socket_path") --api-socket-path $(systemd_quote_arg "$api_socket_path") --container-transfers-dir $(systemd_quote_arg "$outershell_home/containers/Transfers") --bundles-dir $(systemd_quote_arg "$install_root/bundles") --web-root $(systemd_quote_arg "$install_root/web") --bundled-apps-dir $(systemd_quote_arg "$install_root/bundled-apps") --app-base-url $(systemd_quote_arg "$app_base_url") --public-base-url $(systemd_quote_arg "$public_base_url") --native-app-template-dir $(systemd_quote_arg "$install_root/native-app-template")"
+outer_shell_exec="$(systemd_quote_arg "$outer_shell_binary") --socket-path $(systemd_quote_arg "$socket_path") --api-socket-path $(systemd_quote_arg "$api_socket_path") --container-transfers-dir $(systemd_quote_arg "$outershell_home/containers/Transfers") --bundles-dir $(systemd_quote_arg "$install_root/bundles") --web-root $(systemd_quote_arg "$install_root/web") --bundled-apps-dir $(systemd_quote_arg "$install_root/bundled-apps") --app-base-url $(systemd_quote_arg "$app_base_url") --public-base-url $(systemd_quote_arg "$public_base_url") --native-app-template-dir $(systemd_quote_arg "$install_root/native-app-template")"
 
 if [ "$service_manager" = systemd ]; then
 cat > "$unit_dir/org.outershell.OuterShell.service" <<EOF
@@ -1316,7 +1352,7 @@ cat > "$outer_shell_service_file" <<EOF
 [Service]
 Format=1
 Name=Outer Shell
-Executable=$install_root/OuterShellBackend
+Executable=$outer_shell_binary
 Argument=--socket-path
 Argument=$socket_path
 Argument=--api-socket-path

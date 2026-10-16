@@ -1957,6 +1957,12 @@ Install &lt;app&gt;. Set it up as a service and register it with Outer Shell so 
     await performOuterShellOperation(key, "uninstallOuterShell", button);
   }
 
+  function showOperationFailure(title, error) {
+    openDialog(`<header class="dialog-header"><h2 id="dialog-title">${escapeHTML(title)}</h2></header>
+      <div class="dialog-body"><pre class="operation-error" role="alert">${escapeHTML(error.message || String(error))}</pre></div>
+      <footer class="dialog-footer"><button type="button" data-action="close-dialog">Close</button></footer>`);
+  }
+
   async function performControl(key, operation, button) {
     const backend = findBackend(key);
     if (!backend) return;
@@ -1971,7 +1977,7 @@ Install &lt;app&gt;. Set it up as a service and register it with Outer Shell so 
       toast(result.message);
       await refreshBackends({ quiet: true });
     } catch (error) {
-      toast(error.message || String(error), true);
+      showOperationFailure(`Could not complete the action for ${backend.displayName}`, error);
       button.disabled = false;
       label.textContent = original;
     }
@@ -1990,7 +1996,7 @@ Install &lt;app&gt;. Set it up as a service and register it with Outer Shell so 
       toast(result.message || `Installed ${backend.displayName}.`);
       await Promise.all([refreshBackends({ quiet: true }), refreshSafeSpaces({ quiet: true })]);
     } catch (error) {
-      toast(error.message || String(error), true);
+      showOperationFailure(`Could not install ${backend.displayName}`, error);
       button.disabled = false;
       button.textContent = backend.serviceScope === "system" ? (state.hostPlatform === "windows" && !state.addWorkspace ? "Install as administrator" : "Install as root") : "Install";
     }
