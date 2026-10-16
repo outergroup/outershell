@@ -109,7 +109,12 @@ with tempfile.TemporaryDirectory(prefix='outer-c-test-') as temporary:
         assert status == 200 and struct.unpack_from('<I', body, 8)[0] >= 2
         registry(29, 18, [(2, b'native.test'), (10, b'\x00binary\xff')])
         assert registry(28, 10, [(2, b'native.test')]) == b'\x00binary\xff'
-        assert request(pipe, '/')[0] == 200
+        status, homepage = request(pipe, '/')
+        assert status == 200 and b'href="/web/favicon.png"' in homepage
+        expected_icon = (Path(__file__).resolve().parent.parent / 'app-icon.png').read_bytes()
+        assert expected_icon.startswith(b'\x89PNG\r\n\x1a\n')
+        assert request(pipe, '/web/favicon.png') == (200, expected_icon)
+        assert request(pipe, '/web/favicon.png', method='HEAD') == (200, b'')
         native_header = b'Outerframe-Accept: application/vnd.outerframe\r\n'
         status, descriptor = request(pipe, '/', extra=native_header)
         assert status == 200 and descriptor[:4] == b'OUTR'

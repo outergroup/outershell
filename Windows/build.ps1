@@ -55,6 +55,7 @@ foreach ($platform in @('macos-arm', 'macos-x86')) {
 }
 New-Item -ItemType Directory -Force "$OutputDirectory/web", "$OutputDirectory/files-web" | Out-Null
 Copy-Item "$PSScriptRoot/../Resources/OuterShellWeb/*" "$OutputDirectory/web" -Recurse -Force
+Copy-Item "$PSScriptRoot/../app-icon.png" "$OutputDirectory/web/favicon.png" -Force
 Copy-Item "$FilesRoot/Resources/FilesWeb/*" "$OutputDirectory/files-web" -Recurse -Force
 Copy-Item "$PSScriptRoot/install.ps1" $OutputDirectory -Force
 
