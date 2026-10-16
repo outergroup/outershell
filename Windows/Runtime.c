@@ -610,8 +610,8 @@ static char *form_value(const char *form, const char *name, bool multiline) {
 }
 char *http_query(const HttpRequest *r, const char *name) { return form_value(r->query, name, false); }
 char *http_form(const HttpRequest *r, const char *name) { return form_value(r->body.data, name, !strcmp(name, "command")); }
-static bool http_body_read(Connection *c, StringBuilder *body, size_t length) {
-    if (length > HTTP_BODY_LIMIT - body->length || !sb_reserve(body, length))
+static bool http_body_read(Connection *c, StringBuilder *body, size_t length, size_t limit) {
+    if (length > limit - body->length || !sb_reserve(body, length))
         return false;
     if (!connection_read(c, body->data + body->length, length))
         return false;
@@ -646,6 +646,8 @@ bool http_read(Connection *c, HttpRequest *r) {
     r->path = url_decode(space, strlen(space), false, false);
     if (!r->path)
         goto done;
+    size_t body_limit = !strcmp(r->method, "PATCH") && !strncmp(r->path, "/api/container-transfers/", strlen("/api/container-transfers/"))
+                            ? 64u * 1024u * 1024u : HTTP_BODY_LIMIT;
     for (;;) {
         if (!http_line(c, &line, 65536) || (total += line.length + 2) > 65536)
             goto done;
@@ -687,12 +689,16 @@ bool http_read(Connection *c, HttpRequest *r) {
                 goto done;
             has_length = true;
             for (char *p = colon; *p; p++) {
-                if (*p < '0' || *p > '9' || content_length > HTTP_BODY_LIMIT / 10)
+                if (*p < '0' || *p > '9' || content_length > body_limit / 10)
                     goto done;
                 content_length = content_length * 10 + (size_t)(*p - '0');
-                if (content_length > HTTP_BODY_LIMIT)
+                if (content_length > body_limit)
                     goto done;
             }
+        } else if (!strcmp(line.data, "upload-offset")) {
+            r->upload_offset = win_strdup(colon);
+        } else if (!strcmp(line.data, "upload-protocol")) {
+            r->upload_protocol = win_strdup(colon);
         } else if (!strcmp(line.data, "transfer-encoding")) {
             if (_stricmp(colon, "chunked"))
                 goto done;
@@ -719,10 +725,10 @@ bool http_read(Connection *c, HttpRequest *r) {
             char *p = line.data;
             while (*p && *p != ';') {
                 int h = hex_value((unsigned char)*p++);
-                if (h < 0 || n > HTTP_BODY_LIMIT / 16)
+                if (h < 0 || n > body_limit / 16)
                     goto done;
                 n = n * 16 + (size_t)h;
-                if (n > HTTP_BODY_LIMIT)
+                if (n > body_limit)
                     goto done;
             }
             if (p == line.data)
@@ -736,10 +742,10 @@ bool http_read(Connection *c, HttpRequest *r) {
                 break;
             }
             char crlf[2];
-            if (!http_body_read(c, &r->body, n) || !connection_read(c, crlf, 2) || memcmp(crlf, "\r\n", 2))
+            if (!http_body_read(c, &r->body, n, body_limit) || !connection_read(c, crlf, 2) || memcmp(crlf, "\r\n", 2))
                 goto done;
         }
-    } else if (!http_body_read(c, &r->body, content_length))
+    } else if (!http_body_read(c, &r->body, content_length, body_limit))
         goto done;
     ok = true;
 done:
@@ -755,16 +761,19 @@ void http_free(HttpRequest *r) {
     free(r->query);
     free(r->host);
     free(r->origin);
+    free(r->upload_offset);
+    free(r->upload_protocol);
     free(r->headers.data);
     free(r->body.data);
     memset(r, 0, sizeof(*r));
 }
 bool http_authorize(Connection *c, const HttpRequest *r) {
-    if (strcmp(r->method, "GET") && strcmp(r->method, "HEAD") && strcmp(r->method, "POST")) {
+    bool upload = !strcmp(r->method, "PATCH") && !strncmp(r->path, "/api/container-transfers/", strlen("/api/container-transfers/"));
+    if (strcmp(r->method, "GET") && strcmp(r->method, "HEAD") && strcmp(r->method, "POST") && !upload) {
         http_text(c, r, 405, "Unsupported method.");
         return false;
     }
-    if (!strcmp(r->method, "POST") && r->origin) {
+    if ((!strcmp(r->method, "POST") || upload) && r->origin) {
         bool ok = r->host && !strncmp(r->origin, "http://", 7) && !_stricmp(r->origin + 7, r->host);
         if (!ok) {
             http_text(c, r, 403, "Origin is not allowed.");

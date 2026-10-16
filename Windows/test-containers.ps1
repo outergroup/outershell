@@ -1,4 +1,4 @@
-param([string]$Image = 'outershell/windows-test:1')
+param([string]$Image = 'outershell/windows-test:1', [ValidateSet('docker','wsl.container')][string]$Provider = 'wsl.container')
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value.ToLowerInvariant()
@@ -46,13 +46,13 @@ function Wait-Container([string]$Name, [string]$State) {
     throw "Container '$Name' did not become $State."
 }
 
-$name = 'WSL integration test ' + [guid]::NewGuid().ToString('N')
+$name = "$Provider integration test " + [guid]::NewGuid().ToString('N')
 $id = $null
 try {
-    Operation 'create' @{runtimeProviderID='wsl.container'; name=$name; baseImage=$Image; cpus=2; memoryInGB=2} | Out-Null
+    Operation 'create' @{runtimeProviderID=$Provider; name=$name; baseImage=$Image; cpus=2; memoryInGB=2} | Out-Null
     $container = Wait-Container $name 'running'
     $id = $container.id
-    if (!$container.ownsContainer -or $container.runtimeKind -ne 'wslContainer') { throw 'Incorrect ownership/runtime.' }
+    if (!$container.ownsContainer -or $container.runtime.providerID -ne $Provider) { throw 'Incorrect ownership/runtime.' }
     $app = $container.apps | Where-Object serviceID -eq 'org.outershell.Files' | Select-Object -First 1
     if (!$app) { throw 'The test image must contain the standard Files OCI payload.' }
     $descriptor = Request '/' '' $app.externalSocketPath -Native
@@ -71,6 +71,47 @@ try {
     Operation 'rename' @{workspaceID=$id; name="$name renamed"} | Out-Null
     Wait-Container "$name renamed" 'running' | Out-Null
     Write-Output 'PASS container stop/start, rename, and app logs'
+    Operation 'updateDockerfile' @{workspaceID=$id; dockerfile="FROM $Image`nRUN echo rebuilt > /rebuilt-marker`n"} | Out-Null
+    $folder="$env:USERPROFILE\Downloads\OuterShell mount test"
+    New-Item -ItemType Directory -Force $folder | Out-Null
+    Set-Content "$folder\probe.txt" 'mount works'
+    Operation 'updateContainerConfiguration' @{workspaceID=$id; mounts=@(@{id=[guid]::NewGuid().ToString();name='Test folder';hostPath=$folder;guestPath='/test-mount';isReadOnly=$true});environment=@(@{name='OUTER_TEST';value='configured'});publishedPorts=@(@{hostPort=47621;containerPort=8888})} | Out-Null
+    Operation 'rebuildRecipe' @{workspaceID=$id} | Out-Null
+    Start-Sleep -Seconds 3
+    for($i=0;$i -lt 120;$i++) {
+        $snapshot=Request '/api/container-snapshot' | ConvertFrom-Json
+        $container=$snapshot.workspaces | Where-Object id -eq $id | Select-Object -First 1
+        if($container.buildProgress.phase -eq 'failed'){throw $container.buildProgress.detail}
+        if($container.state -eq 'running' -and !$container.recipe.needsRebuild){break}
+        Start-Sleep -Seconds 1
+    }
+    if($container.recipe.needsRebuild){throw 'Rebuild did not complete'}
+    $runtime = if($Provider -eq 'docker'){"$env:LOCALAPPDATA\Programs\DockerDesktop\resources\bin\docker.exe"}else{'C:\Program Files\WSL\wslc.exe'}
+    $list = if($Provider -eq 'docker'){'ps'}else{'list'}
+    $format = if($Provider -eq 'docker'){'{{json .}}'}else{'json'}
+    $objects = & $runtime $list --all --no-trunc --format $format | ForEach-Object { $_ | ConvertFrom-Json }
+    $actual = $objects | Where-Object {$_.Names.StartsWith("outershell-$id-")} | Select-Object -First 1
+    if(!$actual){throw 'Replacement container not found in the current user runtime'}
+    $probe = & $runtime exec $actual.ID /bin/sh -c 'cat /rebuilt-marker /test-mount/probe.txt; printenv OUTER_TEST'
+    if($LASTEXITCODE -or ($probe -join "`n") -notmatch 'rebuilt[\r\n]+mount works[\r\n]+configured'){throw "Mount/environment probe failed: $probe"}
+    $ErrorActionPreference='Continue'
+    & $runtime exec $actual.ID /bin/sh -c 'echo forbidden > /test-mount/should-not-exist' 2>$null
+    $writeExit=$LASTEXITCODE
+    $ErrorActionPreference='Stop'
+    if(!$writeExit){throw 'Read-only mount allowed a write'}
+    Write-Output 'PASS Dockerfile/configuration update, rebuild, read-only mount, environment, port mapping, and stable identity'
+    Operation 'updateDockerfile' @{workspaceID=$id;dockerfile="FROM $Image`nRUN exit 37`n"} | Out-Null
+    Operation 'rebuildRecipe' @{workspaceID=$id} | Out-Null
+    for($i=0;$i -lt 60;$i++) {
+        $snapshot=Request '/api/container-snapshot' | ConvertFrom-Json
+        $container=$snapshot.workspaces | Where-Object id -eq $id | Select-Object -First 1
+        if($container.buildProgress.phase -eq 'failed'){break}
+        Start-Sleep -Seconds 1
+    }
+    if($container.buildProgress.phase -ne 'failed' -or $container.state -ne 'running'){throw 'Failed build did not preserve running container'}
+    if(!$container.buildProgress.log.Contains('37')){throw 'Missing build diagnostics'}
+    Write-Output 'PASS failed rebuild preserves existing container and reports build log'
+
 } finally {
     if ($id) {
         Operation 'delete' @{workspaceID=$id} | Out-Null

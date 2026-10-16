@@ -13,6 +13,7 @@ typedef struct {
     HANDLE process, cancel;
     Connection input, output;
 } Child;
+typedef enum { RUNTIME_WSL, RUNTIME_WSLC, RUNTIME_DOCKER, RUNTIME_TAR } ContainerRuntime;
 typedef struct Endpoint Endpoint;
 typedef struct Distribution Distribution;
 struct Endpoint {
@@ -27,7 +28,10 @@ struct Distribution {
     struct Wsl *owner;
     char *id, *name, *user;
     DWORD uid;
-    bool present, running, container, managed;
+    bool present, running, managed, building;
+    HANDLE build_thread;
+    char *build_error;
+    ContainerRuntime container;
     unsigned cpus, memory_gb;
     char *runtime_id;
     StringBuilder apps;
@@ -40,7 +44,8 @@ struct Wsl {
     Distribution *distributions;
     Endpoint *endpoints;
     size_t endpoint_count;
-    bool inspect, containers_available;
+    bool inspect;
+    bool containers_available[3];
     LONG active_relays;
     StringBuilder snapshot;
     uint64_t version;
@@ -160,7 +165,7 @@ static void child_close(Child *p) {
         CloseHandle(p->cancel);
     memset(p, 0, sizeof(*p));
 }
-static bool child_start_runtime(Wsl *w, const char *const *arguments, Child *p, bool container) {
+static bool child_start_runtime(Wsl *w, const char *const *arguments, Child *p, ContainerRuntime container) {
     wchar_t system[32768];
     UINT n = GetSystemDirectoryW(system, 32768);
     if (!n || n + 20 >= 32768)
@@ -173,13 +178,32 @@ static bool child_start_runtime(Wsl *w, const char *const *arguments, Child *p, 
         wcscat_s(system, 32768, L"\\Sysnative\\wsl.exe");
     } else
         wcscat_s(system, 32768, L"\\wsl.exe");
-    if (container) {
+    if (container == RUNTIME_WSLC) {
         DWORD length = GetEnvironmentVariableW(L"ProgramW6432", system, 32768);
         if (!length)
             length = GetEnvironmentVariableW(L"ProgramFiles", system, 32768);
         if (!length || length + 32 >= 32768)
             return false;
         wcscat_s(system, 32768, L"\\WSL\\wslc.exe");
+    }
+    if (container == RUNTIME_DOCKER) {
+        wchar_t *local = NULL;
+        if (FAILED(SHGetKnownFolderPath(&FOLDERID_LocalAppData, 0, NULL, &local)))
+            return false;
+        int written = swprintf_s(system, 32768, L"%s\\Programs\\DockerDesktop\\resources\\bin\\docker.exe", local);
+        CoTaskMemFree(local);
+        if (written < 0) return false;
+        if (GetFileAttributesW(system) == INVALID_FILE_ATTRIBUTES) {
+            DWORD length = GetEnvironmentVariableW(L"ProgramW6432", system, 32768);
+            if (!length) length = GetEnvironmentVariableW(L"ProgramFiles", system, 32768);
+            if (!length || length + 60 >= 32768) return false;
+            wcscat_s(system, 32768, L"\\Docker\\Docker\\resources\\bin\\docker.exe");
+        }
+    }
+    if (container == RUNTIME_TAR) {
+        UINT length = GetSystemDirectoryW(system, 32768);
+        if (!length || length + 10 >= 32768) return false;
+        wcscat_s(system, 32768, L"\\tar.exe");
     }
     char *exe = win_utf8(system);
     if (!exe)
@@ -223,6 +247,13 @@ static bool child_start_runtime(Wsl *w, const char *const *arguments, Child *p, 
         if (error && error != INVALID_HANDLE_VALUE)
             CloseHandle(error);
         error = inherited_error;
+    }
+    if (ok && container && !strcmp(arguments[0], "build")) {
+        HANDLE build_error = NULL;
+        if (DuplicateHandle(GetCurrentProcess(), output, GetCurrentProcess(), &build_error, 0, TRUE, DUPLICATE_SAME_ACCESS)) {
+            if (error && error != INVALID_HANDLE_VALUE) CloseHandle(error);
+            error = build_error;
+        } else ok = false;
     }
     ok = ok && error != INVALID_HANDLE_VALUE && error != NULL;
     p->cancel = CreateEventW(NULL, TRUE, FALSE, NULL);
@@ -273,12 +304,12 @@ static bool child_start_runtime(Wsl *w, const char *const *arguments, Child *p, 
 static bool child_start(Wsl *w, const char *const *arguments, Child *p) {
     return child_start_runtime(w, arguments, p, false);
 }
-static bool capture_runtime(Wsl *w, const char *const *arguments, StringBuilder *result, bool container) {
+static bool capture_runtime(Wsl *w, const char *const *arguments, StringBuilder *result, ContainerRuntime container) {
     Child p = {0};
     if (!child_start_runtime(w, arguments, &p, container))
         return false;
     ULONGLONG deadline = GetTickCount64() +
-        (container && (!strcmp(arguments[0], "build") || !strcmp(arguments[0], "run")) ? 600000 : 30000);
+        ((container == RUNTIME_TAR || (container && (!strcmp(arguments[0], "build") || !strcmp(arguments[0], "run")))) ? 600000 : 30000);
     bool ok = true;
     for (;;) {
         DWORD available = 0;
@@ -356,11 +387,15 @@ static bool bridge_start(Distribution *d, const char *socket, bool system, Child
     args[count++] = "--socket";
     args[count++] = socket;
     if (d->container) {
+        EnterCriticalSection(&d->owner->gate);
+        char *runtime_id = win_strdup(d->runtime_id);
+        LeaveCriticalSection(&d->owner->gate);
         const char *container_args[] = {"exec", "--interactive", "--user", "0",
             "--env", "HOME=/root", "--env", "XDG_RUNTIME_DIR=/run/user/0",
-            d->runtime_id, WSL_BRIDGE, "bridge", "--socket", socket, NULL};
-        if (!child_start_runtime(d->owner, container_args, p, true))
-            return false;
+            runtime_id, WSL_BRIDGE, "bridge", "--socket", socket, NULL};
+        bool started = child_start_runtime(d->owner, container_args, p, d->container);
+        free(runtime_id);
+        if (!started) return false;
     } else if (!child_start(d->owner, args, p))
         return false;
     StringBuilder data = {0};
@@ -506,7 +541,7 @@ static Endpoint *publish(Distribution *d, const char *socket, bool system) {
     char app[80], hash[33];
     for (size_t i = 0; i < 16; i++)
         snprintf(hash + i * 2, 3, "%02x", digest[i]);
-    snprintf(app, sizeof(app), "%s.%s", d->container ? "wslc" : "wsl", hash);
+    snprintf(app, sizeof(app), "%s.%s", d->container == RUNTIME_DOCKER ? "docker" : d->container ? "wslc" : "wsl", hash);
     Endpoint *e = win_alloc(sizeof(*e));
     e->distribution = d;
     e->socket = win_strdup(socket);
@@ -870,6 +905,7 @@ static bool contains_line(const char *list, const char *name) {
     return false;
 }
 #include "WslContainers.inc"
+#include "ContainerTransfer.inc"
 
 static void discover_impl(Wsl *w) {
     StringBuilder running = {0};
@@ -911,7 +947,7 @@ static void discover_impl(Wsl *w) {
             continue;
         char *name = registry_string(key, L"DistributionName"), *id = win_utf8(key_name);
         DWORD uid = 0, size = sizeof(uid);
-        bool valid = name && id && strlen(id) == 38 && id[0] == '{' && id[37] == '}' &&
+        bool valid = name && strncmp(name, "docker-desktop", 14) && id && strlen(id) == 38 && id[0] == '{' && id[37] == '}' &&
                      RegGetValueW(key, NULL, L"DefaultUid", RRF_RT_REG_DWORD, NULL, &uid, &size) ==
                          ERROR_SUCCESS;
         RegCloseKey(key);
@@ -963,10 +999,16 @@ static void discover_impl(Wsl *w) {
     if (root)
         RegCloseKey(root);
     free(running_names);
-    discover_containers(w);
+    discover_containers(w, RUNTIME_WSLC);
+    discover_containers(w, RUNTIME_DOCKER);
+    publish_snapshot(w);
+}
+static void publish_snapshot(Wsl *w) {
     StringBuilder snapshot = {0};
     append(&snapshot, "{\"hostPlatform\":\"windows\",\"providers\":[");
-    container_provider(w, &snapshot);
+    container_provider(w, &snapshot, RUNTIME_WSLC);
+    append(&snapshot, ",");
+    container_provider(w, &snapshot, RUNTIME_DOCKER);
     append(&snapshot, "],\"workspaces\":[");
     size_t count = 0;
     EnterCriticalSection(&w->gate);
@@ -1078,6 +1120,8 @@ void wsl_stop(Wsl *w) {
     while (w->distributions) {
         Distribution *d = w->distributions;
         w->distributions = d->next;
+        if (d->build_thread) { WaitForSingleObject(d->build_thread, INFINITE); CloseHandle(d->build_thread); }
+        free(d->build_error);
         child_close(&d->keepalive);
         free(d->runtime_id);
         free(d->id);
@@ -1142,12 +1186,25 @@ static char *request_string(const HttpRequest *request, const char *name) {
                             value =
                                 value * 16 + (c <= '9' ? c - '0' : (unsigned)tolower(c) - 'a' + 10);
                         }
-                        if (!value || value > 127) {
-                            free(result.data);
-                            return NULL;
+                        wchar_t wide[2] = {(wchar_t)value, 0};
+                        int units = 1;
+                        if (value >= 0xd800 && value <= 0xdbff && p + 6 < cursor - 1 && p[1] == '\\' && p[2] == 'u') {
+                            unsigned low = 0; p += 2;
+                            for (unsigned i = 0; i < 4; i++) { unsigned char digit = *++p; low = low * 16 + (digit <= '9' ? digit - '0' : (unsigned)tolower(digit) - 'a' + 10); }
+                            if (low < 0xdc00 || low > 0xdfff) { free(result.data); return NULL; }
+                            wide[1] = (wchar_t)low; units = 2;
                         }
-                        c = (unsigned char)value;
-                    } else if (c != '"' && c != '\\' && c != '/') {
+                        char utf8[8];
+                        int length = value ? WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, wide, units, utf8, sizeof(utf8), NULL, NULL) : 0;
+                        if (!length) { free(result.data); return NULL; }
+                        bytes(&result, utf8, (size_t)length);
+                        continue;
+                    } else if (c == 'n') c = '\n';
+                    else if (c == 'r') c = '\r';
+                    else if (c == 't') c = '\t';
+                    else if (c == 'b') c = '\b';
+                    else if (c == 'f') c = '\f';
+                    else if (c != '"' && c != '\\' && c != '/') {
                         free(result.data);
                         return NULL;
                     }
@@ -1277,6 +1334,10 @@ void wsl_serve(Wsl *w, Connection *c, HttpRequest *r) {
         http_text(c, r, 503, "WSL discovery is unavailable.");
         return;
     }
+    if (!strncmp(r->path, "/api/container-transfers/", strlen("/api/container-transfers/"))) {
+        container_http_upload(w, c, r);
+        return;
+    }
     if (!strncmp(r->path, "/api/wsl/", 9)) {
         serve_workspace_api(w, c, r);
         return;
@@ -1285,7 +1346,11 @@ void wsl_serve(Wsl *w, Connection *c, HttpRequest *r) {
         send_snapshot(w, c, r);
         return;
     }
-    const char *error = "This WSL operation is not supported.";
+    if (r->body.length >= 4 && !memcmp(r->body.data, "OSCT", 4) && !strcmp(r->method, "POST")) {
+        container_transfer(w, c, r);
+        return;
+    }
+    const char *error = "This container operation is not supported.";
     char *operation = request_string(r, "operation"), *id = request_string(r, "workspaceID");
     bool ok = false, locked = false;
     if (!operation || strcmp(r->method, "POST"))
@@ -1296,6 +1361,10 @@ void wsl_serve(Wsl *w, Connection *c, HttpRequest *r) {
     }
     EnterCriticalSection(&w->commands);
     locked = true;
+    if (!strcmp(operation, "beginImport") || !strcmp(operation, "cancelImport") || !strcmp(operation, "finishImport")) {
+        container_transfer_operation(w, c, r, operation);
+        LeaveCriticalSection(&w->commands); free(operation); free(id); return;
+    }
     if (!strcmp(operation, "create")) {
         ok = create_container(w, r, &error);
         goto done;
@@ -1310,6 +1379,13 @@ void wsl_serve(Wsl *w, Connection *c, HttpRequest *r) {
         error = "The Linux environment is no longer registered.";
         goto done;
     }
+    if (d->container && !strcmp(operation, "prepareShare")) {
+        StringBuilder extra = {0};
+        ok = container_share(d, r, &extra);
+        if (ok) container_extra_response(w, c, r, extra.data);
+        else http_text(c, r, 400, "Could not share the container. Linked folders and files cannot be included.");
+        free(extra.data); LeaveCriticalSection(&w->commands); free(operation); free(id); return;
+    }
     if (d->container && !strcmp(operation, "appLogs")) {
         container_logs(d, c, r);
         LeaveCriticalSection(&w->commands);
@@ -1317,7 +1393,14 @@ void wsl_serve(Wsl *w, Connection *c, HttpRequest *r) {
         free(id);
         return;
     }
-    if (d->container && !strcmp(operation, "rename")) {
+    if (d->container && (!strcmp(operation, "updateDockerfile") || !strcmp(operation, "updateContainerConfiguration"))) {
+        ok = container_definition_update(d, r, !strcmp(operation, "updateContainerConfiguration"));
+        error = "Could not save the definition. Check the Dockerfile, folder paths, environment, and ports.";
+        if (ok) publish_snapshot(w);
+    } else if (d->container && !strcmp(operation, "rebuildRecipe")) {
+        ok = container_rebuild(d);
+        error = "A rebuild is already running or this container is not managed by Outer Shell.";
+    } else if (d->container && !strcmp(operation, "rename")) {
         char *name = request_string(r, "name");
         if (d->managed && valid_container_name(name)) {
             ok = save_container_metadata(d->id, name, d->cpus, d->memory_gb);
@@ -1327,8 +1410,8 @@ void wsl_serve(Wsl *w, Connection *c, HttpRequest *r) {
     } else if (d->container && !strcmp(operation, "delete")) {
         if (d->managed) {
             StringBuilder output = {0};
-            const char *args[] = {"remove", "--force", d->runtime_id, NULL};
-            ok = capture_runtime(w, args, &output, true);
+            const char *args[] = {d->container == RUNTIME_DOCKER ? "rm" : "remove", "--force", d->runtime_id, NULL};
+            ok = !*d->runtime_id || capture_runtime(w, args, &output, d->container);
             free(output.data);
             if (ok) {
                 EnterCriticalSection(&w->gate);
@@ -1344,6 +1427,7 @@ void wsl_serve(Wsl *w, Connection *c, HttpRequest *r) {
                 if (wide) DeleteFileW(wide);
                 free(wide);
                 free(path);
+                d->present = false;
             }
         }
         error = "Only containers created by Outer Shell can be deleted here.";
@@ -1351,9 +1435,9 @@ void wsl_serve(Wsl *w, Connection *c, HttpRequest *r) {
                          !strcmp(operation, "restart"))) {
         StringBuilder output = {0};
         const char *args[] = {operation, d->runtime_id, NULL};
-        ok = capture_runtime(w, args, &output, true);
+        ok = capture_runtime(w, args, &output, d->container);
         free(output.data);
-        error = "WSL containers could not change the container state. See the Outer Shell log for details.";
+        error = "The container runtime could not change the container state. See the Outer Shell log for details.";
     } else if (!strcmp(operation, "start") || !strcmp(operation, "stop")) {
         StringBuilder output = {0};
         const char *start[] = {"--distribution", d->name, "--exec", "/bin/true", NULL};

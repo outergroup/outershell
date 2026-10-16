@@ -490,7 +490,7 @@ static void serve_http(Connection *c, void *context) {
         http_free(&r);
         return;
     }
-    if (!strcmp(r.path, "/api/container-snapshot") || !strcmp(r.path, "/api/safe-spaces") || !strncmp(r.path, "/api/wsl/", 9)) {
+    if (!strcmp(r.path, "/api/container-snapshot") || !strcmp(r.path, "/api/safe-spaces") || !strncmp(r.path, "/api/container-transfers/", strlen("/api/container-transfers/")) || !strncmp(r.path, "/api/wsl/", 9)) {
         wsl_serve(s->wsl, c, &r);
         http_free(&r);
         return;

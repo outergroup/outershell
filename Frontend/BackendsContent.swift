@@ -1631,6 +1631,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         }
         return controller
     }()
+    private var isAddingWindowsContainerFolder = false
     private var pendingWorkspaceRename: LocalWorkspaceRecord?
     private var pendingWorkspaceDeletion: LocalWorkspaceRecord?
     private var isCreatingWorkspace = false
@@ -8167,8 +8168,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         } else if isWorkspaceNamePromptVisible {
             title = isCreatingWorkspace ? "Add container" : "Container settings"
             dialogFrame = workspaceRenamePanelFrame
-            fieldLabel = isCreatingWorkspace && !isEditingCreationBaseImage ? "Container name" : pendingWorkspaceRename != nil ? "Container name" : "Value"
-            controls = [(workspaceRenameCancelFrame, "Cancel"), (workspaceRenameConfirmFrame, isCreatingWorkspace ? (isEditingCreationBaseImage ? "Done" : "Create") : pendingWorkspaceRename != nil ? "Rename" : "Save"),
+            fieldLabel = isAddingWindowsContainerFolder ? "Windows server folder" : isCreatingWorkspace && !isEditingCreationBaseImage ? "Container name" : pendingWorkspaceRename != nil ? "Container name" : "Value"
+            controls = [(workspaceRenameCancelFrame, "Cancel"), (workspaceRenameConfirmFrame, isAddingWindowsContainerFolder ? "Mount" : isCreatingWorkspace ? (isEditingCreationBaseImage ? "Done" : "Create") : pendingWorkspaceRename != nil ? "Rename" : "Save"),
                         (workspaceCreationBaseImageFrame, "Choose base image"), (workspaceOuterShellBaseImageFrame, "Outer Shell base image"),
                         (workspaceCustomBaseImageFrame, "Custom base image with support"), (workspaceCustomAsIsFrame, "Custom base image unchanged")]
         } else {
@@ -13548,8 +13549,16 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             } else if containerConfigurationAddMountFrame.contains(point),
                       let workspace = pendingDockerfileWorkspace {
                 armButtonClick(frame: containerConfigurationAddMountFrame) { [weak self] in
-                    self?.sendWorkspaceRequest(operation: "chooseFolder",
-                                               workspaceID: workspace.id)
+                    guard let self else { return }
+                    if self.isWindowsHost {
+                        self.showContainerConfigurationRename(workspace)
+                        self.isAddingWindowsContainerFolder = true
+                        self.workspaceRenameName = ""
+                        self.focusWorkspaceRenameField()
+                        self.updateLayout()
+                    } else {
+                        self.sendWorkspaceRequest(operation: "chooseFolder", workspaceID: workspace.id)
+                    }
                 }
             } else if let action = containerConfigurationMountActionFrames.first(where: {
                 $0.frame.contains(point)
@@ -15417,6 +15426,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func dismissWorkspacePanel() {
+        isAddingWindowsContainerFolder = false
         pendingWorkspaceDeletion = nil
         if isWorkspaceNamePromptVisible {
             blurWorkspaceRenameField()
@@ -16837,6 +16847,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func endContainerConfigurationEditor() {
+        isAddingWindowsContainerFolder = false
         guard pendingDockerfileWorkspace != nil else { return }
         blurWorkspaceRenameField()
         pendingDockerfileWorkspace = nil
@@ -17261,7 +17272,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private func appendSelectedContainerConfigurationFolder(_ path: String) {
         guard !path.isEmpty else { return }
         let url = URL(fileURLWithPath: path, isDirectory: true)
-        let name = url.lastPathComponent.isEmpty ? "Folder" : url.lastPathComponent
+        let folderComponent = isWindowsHost
+            ? path.replacingOccurrences(of: "\\", with: "/").split(separator: "/").last.map(String.init)
+            : url.lastPathComponent
+        let name = folderComponent.flatMap { $0.isEmpty ? nil : $0 } ?? "Folder"
         let base = name.lowercased()
             .components(separatedBy: CharacterSet.alphanumerics.inverted)
             .filter { !$0.isEmpty }
@@ -17280,7 +17294,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             ContainerConfigurationMountDraft(
                 id: UUID(),
                 name: name,
-                hostPath: url.standardizedFileURL.path,
+                hostPath: isWindowsHost ? path : url.standardizedFileURL.path,
                 guestPath: "/workspaces/mounts/\(component)",
                 isReadOnly: false,
                 isInfrastructure: false
@@ -17499,6 +17513,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func showWorkspaceRename(_ workspace: LocalWorkspaceRecord) {
+        isAddingWindowsContainerFolder = false
         isShowingWorkspacePanel = true
         isCreatingWorkspace = false
         workspaceNamePromptDismissesPanel = false
@@ -17539,6 +17554,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func restoreContainerConfigurationInputAfterRename() {
+        isAddingWindowsContainerFolder = false
         pendingWorkspaceRename = nil
         workspaceNamePromptDismissesPanel = true
         workspacePanelMessage = ""
@@ -17651,6 +17667,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         guard !name.isEmpty else {
             if pendingSharedContainerImport != nil {
                 workspacePanelMessage = "Choose a destination folder on this server."
+            } else if isAddingWindowsContainerFolder {
+                workspacePanelMessage = "Enter a folder path on the Windows server."
             } else if pendingWorkspaceRename != nil {
                 workspacePanelMessage = "Enter a name for the container."
             } else if pendingSafeSpaceAppWorkspace != nil {
@@ -17670,6 +17688,18 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             } else {
                 workspacePanelMessage = "Enter a name for the container."
             }
+            updateLayout()
+            return
+        }
+        if isAddingWindowsContainerFolder {
+            guard name.range(of: #"^[A-Za-z]:[\\/]"#, options: .regularExpression) != nil else {
+                workspacePanelMessage = "Enter an absolute Windows folder path, such as C:\\Users\\yourname\\Projects."
+                updateLayout()
+                return
+            }
+            appendSelectedContainerConfigurationFolder(name)
+            restoreContainerConfigurationInputAfterRename()
+            persistContainerRuntimeConfiguration()
             updateLayout()
             return
         }
@@ -19325,7 +19355,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
         let detail = makeTextLayer(size: 12, weight: .regular, color: .secondaryLabelColor)
         detail.string = workspace.isManagedContainer
-            ? "The container and its Outer Shell configuration will be permanently deleted. Mounted folders and their contents will remain on the server. This cannot be undone."
+            ? (isWindowsHost
+                ? "The container will be permanently deleted. Saved Dockerfiles, persistent data, and mounted folders will remain on the Windows server."
+                : "The container and its Outer Shell configuration will be permanently deleted. Mounted folders and their contents will remain on the server. This cannot be undone.")
             : "Outer Shell will forget this registration. The externally managed container and all of its data will remain unchanged."
         detail.isWrapped = true
         detail.frame = CGRect(x: 20, y: 65, width: panelWidth - 40, height: 47)
@@ -19453,7 +19485,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         } else if pendingRecipeCommandWorkspace != nil {
             title.string = "Add Dockerfile Fragment"
         } else {
-            title.string = isCreatingWorkspace ? "Add Container" : "Rename Container"
+            title.string = isAddingWindowsContainerFolder ? "Mount Windows Folder" : isCreatingWorkspace ? "Add Container" : "Rename Container"
         }
         title.frame = CGRect(x: 18, y: promptHeight - 44, width: promptWidth - 36, height: 23)
         prompt.addSublayer(title)
@@ -19469,6 +19501,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             detail.string = "Start with Outer Shell's image, add visible support steps to another image, or use it unchanged."
         } else if let workspace = pendingSafeSpaceAppWorkspace {
             detail.string = "Choose the folder JupyterLab opens in \(workspace.name)."
+        } else if isAddingWindowsContainerFolder {
+            detail.string = "Enter a folder path on the Windows server. Rebuild the container to apply the mount."
         } else if let workspace = pendingWorkspaceRename {
             detail.string = "Choose a new name for \(workspace.name)."
         } else if let workspace = pendingDockerfileWorkspace {
@@ -19867,7 +19901,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         }
 
         let confirm = makeButtonLayer(
-            title: pendingSharedContainerImport != nil
+            title: isAddingWindowsContainerFolder ? "Mount" : pendingSharedContainerImport != nil
                 ? "Import"
                 : (isCreatingWorkspace && isEditingCreationBaseImage
                 ? "Done"

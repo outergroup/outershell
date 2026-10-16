@@ -368,7 +368,7 @@ local signature rejection, version binding, and scheduled upgrade tests. Its loc
 payload injection is confined to the test binary; the production API accepts no
 custom download URL, executable path, publisher, or installer arguments.
 
-## WSL containers
+## Linux containers on Windows
 
 Windows also discovers Linux containers created with Microsoft's `wslc.exe`
 (WSL 2.9.3 or later). This is separate from WSL distribution discovery. Docker
@@ -397,15 +397,38 @@ The installer copies this optional image-building payload. These Linux tools
 run inside containers; the Windows SSH helper continues to be synced by Outer
 Loop and is not installed. The default image is built locally on first creation.
 
-This first Windows adapter does not yet implement the Dockerfile editor,
-rebuilds, mount configuration, image sharing, or terminal launcher discovery.
-These capabilities are marked unavailable in snapshots. Custom images can use
+Docker Desktop's Linux engine is also supported, alongside WSL containers. The
+host finds both per-user and all-users Docker Desktop installs and invokes the
+CLI directly. Docker's internal WSL distributions are omitted from the WSL list.
+
+Managed containers support editing their Dockerfile, rebuilding, read-only or
+writable folder mounts, environment variables, and localhost port mappings.
+Rebuilds prepare the image and replacement container before stopping the old
+container; failed builds retain the existing container. The editor reports build
+failures and logs. Folder/port changes take effect after rebuilding. Definitions
+live in `containers/<id>/Recipe`; runtime configuration is stored in ORWV binary
+archives outside the build context. Deletion removes the runtime container and
+registration but retains saved definitions and persistent files on disk.
+
+Sharing uses the existing gzip tar `.outershell-container` format and ORWV
+manifest/recipe records. It supports optional mounted-folder and persistent-data
+contents, import destination selection, and the existing chunked binary transfer
+protocol, plus resumable HTTP uploads with 64 MiB segments for the native Mac
+client. Imports reject links, traversal paths, and Windows device filenames.
+Local Windows drive paths are supported for mounts; UNC paths are not. Native
+Mac clients enter Windows server paths inline rather than opening a remote folder
+picker. Mounts are applied on rebuild, not dynamically. Terminal launcher
+discovery remains separate from this integration. Custom images can use
 the same `outerctl image add-app` and OCI app payload contract documented in
 `Docs/ContainerCookbook.md`. Container runtime support should not be confused
 with Windows-kernel containers; these are Linux containers.
 
 For integration coverage, build an image from the prepared base with
 `COPY --from=ghcr.io/outergroup/outershell-app-files:4 /outershell-rootfs/ /`,
-tag it `outershell/windows-test:1`, and run `test-containers.ps1` on Windows.
-The test creates and removes its own disposable container and covers native
-Files responses, app controls, container controls, names, and logs.
+tag it `outershell/windows-test:1`, and run `test-containers.ps1 -Provider docker`
+and `test-containers.ps1 -Provider wsl.container` in an ordinary user session.
+The tests cover native Files content, app/container controls, names, logs, actual
+read-only folder access, environment variables, published ports, stable rebuild
+identity, and failed-build recovery. `test_container_sharing.py` runs from a Mac
+or Linux client through the SSH bridge and verifies cross-runtime transfers,
+Unix archive compatibility, included data, and unsafe-archive rejection.

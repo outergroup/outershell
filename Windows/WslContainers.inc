@@ -6,11 +6,20 @@ static char *container_string(const char *json, size_t length, const char *key) 
     return request_string(&request, key);
 }
 
-static bool container_identity(const char *runtime_id, char id[37]) {
+static const char *container_provider_id(ContainerRuntime runtime) {
+    return runtime == RUNTIME_DOCKER ? "docker" : "wsl.container";
+}
+
+static const char *container_provider_name(ContainerRuntime runtime) {
+    return runtime == RUNTIME_DOCKER ? "Docker" : "WSL containers";
+}
+
+static bool container_identity(ContainerRuntime runtime, const char *runtime_id, char id[37]) {
     unsigned char hash[32];
     BCRYPT_ALG_HANDLE algorithm = NULL;
     StringBuilder input = {0};
-    append(&input, "wsl.container:");
+    append(&input, container_provider_id(runtime));
+    append(&input, ":");
     append(&input, runtime_id);
     bool ok = BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_SHA256_ALGORITHM, NULL, 0) == 0 &&
               BCryptHash(algorithm, NULL, 0, (PUCHAR)input.data, (ULONG)input.length, hash,
@@ -72,7 +81,7 @@ static unsigned container_number(const HttpRequest *request, const char *key, un
         if (!layout_json_value(&p, end, 0)) break;
         if (match) {
             unsigned value = 0;
-            if (p == start || p - start > 4) return 0;
+            if (p == start || p - start > 5) return 0;
             for (; start < p; start++) {
                 if (*start < '0' || *start > '9') return 0;
                 value = value * 10 + (*start - '0');
@@ -85,29 +94,33 @@ static unsigned container_number(const HttpRequest *request, const char *key, un
     return fallback;
 }
 
+#include "ContainerValue.inc"
+#include "ContainerRecipes.inc"
+
 static bool create_container(Wsl *w, HttpRequest *request, const char **error) {
     char *name = request_string(request, "name");
     char *provider = request_string(request, "runtimeProviderID");
     char *image = request_string(request, "baseImage");
+    ContainerRuntime runtime = provider && !strcmp(provider, "docker") ? RUNTIME_DOCKER : RUNTIME_WSLC;
     unsigned cpus = container_number(request, "cpus", 4);
     unsigned memory = container_number(request, "memoryInGB", 8);
     bool ok = false;
     StringBuilder output = {0};
     *error = "Enter a container name, a valid image reference, and CPU/memory limits between 1 and 128.";
-    if (!valid_container_name(name) || !provider || strcmp(provider, "wsl.container") ||
+    if (!valid_container_name(name) || !provider || (strcmp(provider, "wsl.container") && strcmp(provider, "docker")) ||
         !image || !*image || strlen(image) > 512 ||
         strspn(image, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-/:@") != strlen(image) ||
         !cpus || cpus > 128 || !memory || memory > 128)
         goto done;
     if (!strcmp(image, "outershell/container-base:17")) {
         const char *inspect[] = {"image", "inspect", image, NULL};
-        if (!capture_runtime(w, inspect, &output, true)) {
+        if (!capture_runtime(w, inspect, &output, runtime)) {
             free(output.data);
             output = (StringBuilder){0};
             char *directory = win_executable_directory();
             char *context = directory ? win_join(directory, "container-bootstrap") : NULL;
             const char *build[] = {"build", "--progress", "plain", "--tag", image, context, NULL};
-            ok = context && capture_runtime(w, build, &output, true);
+            ok = context && capture_runtime(w, build, &output, runtime);
             free(context);
             free(directory);
             if (!ok) {
@@ -125,27 +138,23 @@ static bool create_container(Wsl *w, HttpRequest *request, const char **error) {
     char *uuid = win_utf8(guid_text);
     if (!uuid) goto done;
     uuid[37] = 0;
-    char runtime_name[80], cpu_text[12], memory_text[12];
-    snprintf(runtime_name, sizeof(runtime_name), "outershell-%s", uuid + 1);
+    char runtime_name[80], cpu_text[12], memory_text[12], id[37];
+    strcpy_s(id, sizeof(id), uuid + 1); CharLowerBuffA(id, 36);
+    snprintf(runtime_name, sizeof(runtime_name), "outershell-%s", id);
     free(uuid);
+    *error = "Could not save the container definition.";
+    if (!save_container_metadata(id, name, cpus, memory) || !container_definition_create(id, image)) goto done;
+    char *context = container_recipe_directory(id);
+    StringBuilder mount = {0};
+    if (context) { append(&mount, "type=bind,source="); append(&mount, context); append(&mount, ",target=/var/lib/outershell/project"); }
     snprintf(cpu_text, sizeof(cpu_text), "%u", cpus);
     snprintf(memory_text, sizeof(memory_text), "%uG", memory);
     const char *run[] = {"run", "--detach", "--name", runtime_name, "--cpus", cpu_text,
-                        "--memory", memory_text, image, NULL};
-    *error = "WSL containers could not create the container. Check the image name and the Outer Shell log.";
-    if (!capture_runtime(w, run, &output, true)) goto done;
-    char *last = output.data;
-    for (char *line = output.data; line && *line;) {
-        char *end = strchr(line, '\n');
-        if (strspn(line, "0123456789abcdef") == 64) { last = line; break; }
-        line = end ? end + 1 : NULL;
-    }
-    char id[37], runtime_id[65];
-    if (!last || strspn(last, "0123456789abcdef") != 64) goto done;
-    memcpy(runtime_id, last, 64);
-    runtime_id[64] = 0;
-    ok = container_identity(runtime_id, id) && save_container_metadata(id, name, cpus, memory);
-    if (!ok) *error = "The container was created, but its display name could not be saved. It remains available as an attached container.";
+                        "--memory", memory_text, "--mount", mount.data, image, NULL};
+    *error = "The container runtime could not create the container. Check the image name and the Outer Shell log.";
+    ok = context && capture_runtime(w, run, &output, runtime);
+    free(context); free(mount.data);
+
 done:
     free(name);
     free(provider);
@@ -154,18 +163,28 @@ done:
     return ok;
 }
 
-static void discover_containers(Wsl *w) {
-    const char *args[] = {"list", "--all", "--no-trunc", "--format", "json", NULL};
+static void discover_containers(Wsl *w, ContainerRuntime runtime) {
+    const char *args[] = {runtime == RUNTIME_DOCKER ? "ps" : "list", "--all", "--no-trunc", "--format", runtime == RUNTIME_DOCKER ? "{{json .}}" : "json", NULL};
     StringBuilder output = {0};
-    bool available = capture_runtime(w, args, &output, true);
-    w->containers_available = available;
+    bool available = capture_runtime(w, args, &output, runtime);
+    if (available && runtime == RUNTIME_DOCKER) {
+        StringBuilder system = {0};
+        const char *info[] = {"info", "--format", "{{.OSType}}", NULL};
+        available = capture_runtime(w, info, &system, runtime) && system.data && !strncmp(system.data, "linux", 5);
+        free(system.data);
+    }
+    w->containers_available[runtime] = available;
     if (!available) {
+        EnterCriticalSection(&w->gate);
+        for (Distribution *d = w->distributions; d; d = d->next)
+            if (d->container == runtime) d->running = false;
+        LeaveCriticalSection(&w->gate);
         free(output.data);
         return;
     }
     EnterCriticalSection(&w->gate);
     for (Distribution *d = w->distributions; d; d = d->next)
-        if (d->container)
+        if (d->container == runtime && !d->building && *d->runtime_id)
             d->present = false;
     LeaveCriticalSection(&w->gate);
     size_t count = 0;
@@ -178,7 +197,14 @@ static void discover_containers(Wsl *w) {
         char id[37];
         bool valid = runtime_id && strlen(runtime_id) == 64 &&
                      strspn(runtime_id, "0123456789abcdef") == 64 && name && *name && state;
-        if (valid && container_identity(runtime_id, id)) {
+        if (valid && container_identity(runtime, runtime_id, id)) {
+            if (!strncmp(name, "outershell-", 11) && strlen(name) >= 47) {
+                char owned_id[37]; memcpy(owned_id, name + 11, 36); owned_id[36] = 0;
+                char *metadata_path = container_uuid(owned_id) ? container_metadata_path(owned_id) : NULL;
+                wchar_t *wide = metadata_path ? win_wide(metadata_path) : NULL;
+                if (wide && GetFileAttributesW(wide) != INVALID_FILE_ATTRIBUTES) strcpy_s(id, sizeof(id), owned_id);
+                free(wide); free(metadata_path);
+            }
             EnterCriticalSection(&w->gate);
             Distribution *d;
             for (d = w->distributions; d; d = d->next)
@@ -187,13 +213,15 @@ static void discover_containers(Wsl *w) {
             if (!d) {
                 d = win_alloc(sizeof(*d));
                 d->owner = w;
-                d->container = true;
+                d->container = runtime;
                 d->id = win_strdup(id);
                 d->runtime_id = win_strdup(runtime_id);
                 d->user = win_strdup("root");
                 d->next = w->distributions;
                 w->distributions = d;
             }
+            free(d->runtime_id);
+            d->runtime_id = win_strdup(runtime_id);
             free(d->name);
             d->name = win_strdup(name);
             char *path = container_metadata_path(id);
@@ -209,6 +237,15 @@ static void discover_containers(Wsl *w) {
             }
             free(metadata.data);
             free(path);
+            if (d->managed) {
+                char *definition = container_read(d->id, "Dockerfile", "");
+                if (!*definition) {
+                    char *image = container_string(line, length, "Image");
+                    if (image && *image && !strpbrk(image, "\r\n")) container_definition_create(d->id, image);
+                    free(image);
+                }
+                free(definition);
+            }
             d->present = true;
             d->running = !strcmp(state, "running");
             LeaveCriticalSection(&w->gate);
@@ -230,18 +267,25 @@ static void discover_containers(Wsl *w) {
     free(output.data);
 }
 
-static void container_provider(Wsl *w, StringBuilder *json) {
-    append(json, "{\"id\":\"wsl.container\",\"name\":\"WSL containers\",\"isAvailable\":");
-    append(json, w->containers_available ? "true" : "false");
+static void container_provider(Wsl *w, StringBuilder *json, ContainerRuntime runtime) {
+    append(json, "{");
+    field(json, "id", container_provider_id(runtime));
+    append(json, ",");
+    field(json, "name", container_provider_name(runtime));
+    append(json, ",\"isAvailable\":");
+    append(json, w->containers_available[runtime] ? "true" : "false");
     append(json, ",\"isolationName\":\"Linux containers\",\"capabilities\":{"
-                 "\"supportsApps\":true,\"supportsShell\":true,\"supportsRecipes\":false,"
-                 "\"supportsMounts\":false,\"supportsLiveMounts\":false},\"status\":");
-    json_string(json, w->containers_available ? "ready" : "unavailable");
+                 "\"supportsApps\":true,\"supportsShell\":true,\"supportsRecipes\":true,"
+                 "\"supportsMounts\":true,\"supportsLiveMounts\":false},\"status\":");
+    json_string(json, w->containers_available[runtime] ? "ready" : "unavailable");
     append(json, ",\"detail\":");
-    json_string(json, w->containers_available ? "WSL containers is ready." :
+    json_string(json, w->containers_available[runtime] ? "Ready." : runtime == RUNTIME_DOCKER ?
+                "Install and start Docker Desktop with its Linux containers backend, then check again." :
                 "Install or update WSL, then check again. WSL containers requires WSL 2.9.3 or later.");
-    append(json, ",\"setupURL\":\"https://learn.microsoft.com/windows/wsl/wsl-container\","
-                 "\"defaultBaseImage\":\"outershell/container-base:17\"}");
+    append(json, ",\"setupURL\":");
+    json_string(json, runtime == RUNTIME_DOCKER ? "https://docs.docker.com/desktop/setup/install/windows-install/" :
+                "https://learn.microsoft.com/windows/wsl/wsl-container");
+    append(json, ",\"defaultBaseImage\":\"outershell/container-base:17\"}");
 }
 
 static void container_snapshot(Distribution *d, StringBuilder *json) {
@@ -250,23 +294,37 @@ static void container_snapshot(Distribution *d, StringBuilder *json) {
     append(json, ",");
     field(json, "name", d->name);
     append(json, ",");
-    field(json, "state", d->running ? "running" : "stopped");
-    append(json, ",\"runtimeKind\":\"wslContainer\",\"managementKind\":");
+    field(json, "state", d->building ? "creating" : !d->owner->containers_available[d->container] ? "unavailable" : d->running ? "running" : "stopped");
+    if (d->building || d->build_error) {
+        append(json, ",\"buildProgress\":{");
+        field(json, "phase", d->building ? "building" : "failed");
+        append(json, ","); field(json, "detail", d->building ? "Building the container…" : d->build_error);
+        append(json, ","); char *log = container_read(d->id, "build.log", d->build_error ? d->build_error : "");
+        field(json, "log", log); free(log); append(json, "}");
+    }
+    append(json, ",\"runtimeKind\":");
+    json_string(json, d->container == RUNTIME_DOCKER ? "docker" : "wslContainer");
+    append(json, ",\"managementKind\":");
     json_string(json, d->managed ? "managed" : "attached");
     append(json, ",\"ownsContainer\":");
     append(json, d->managed ? "true" : "false");
     char limits[100];
     snprintf(limits, sizeof(limits), ",\"userName\":\"root\",\"cpus\":%u,\"memoryInGB\":%u,", d->cpus, d->memory_gb);
     append(json, limits);
-    append(json,
-                 "\"runtime\":{\"providerID\":\"wsl.container\",\"providerName\":\"WSL containers\","
+    append(json, "\"runtime\":{");
+    field(json, "providerID", container_provider_id(d->container));
+    append(json, ",");
+    field(json, "providerName", container_provider_name(d->container));
+    append(json, ","
                  "\"operatingSystemName\":\"Linux\",\"operatingSystemVersion\":\"\","
-                 "\"architecture\":\"\",\"isolationKind\":\"wslContainer\",\"isolationName\":\"\"},"
-                 "\"capabilities\":{\"supportsApps\":true,\"supportsShell\":true,"
-                 "\"supportsRecipes\":false,\"supportsMounts\":false,\"supportsLiveMounts\":false},"
-                 "\"shellCommand\":");
+                 "\"architecture\":\"\",\"isolationKind\":");
+    json_string(json, d->container == RUNTIME_DOCKER ? "container" : "wslContainer");
+    append(json, ",\"isolationName\":\"\"},\"capabilities\":{\"supportsApps\":true,\"supportsShell\":true,\"supportsRecipes\":");
+    append(json, d->managed ? "true" : "false");
+    append(json, ",\"supportsMounts\":"); append(json, d->managed ? "true" : "false");
+    append(json, ",\"supportsLiveMounts\":false},\"shellCommand\":");
     StringBuilder command = {0};
-    append(&command, "wslc exec -it ");
+    append(&command, d->container == RUNTIME_DOCKER ? "docker exec -it " : "wslc exec -it ");
     append(&command, d->runtime_id);
     append(&command, " /bin/sh");
     json_string(json, command.data);
@@ -287,7 +345,10 @@ static void container_snapshot(Distribution *d, StringBuilder *json) {
         apps = flag + strlen(running_flag);
     }
     append(json, apps);
-    append(json, ",\"commands\":[],\"mounts\":[],\"persistentData\":[]}");
+    append(json, ",\"commands\":[]");
+    if (d->managed) container_recipe_snapshot(d, json);
+    else append(json, ",\"mounts\":[],\"persistentData\":[]");
+    append(json, "}");
 }
 
 static bool container_service_id(const char *service) {
@@ -308,7 +369,7 @@ static void container_logs(Distribution *d, Connection *client, HttpRequest *req
     append(&path, "/backend.log");
     const char *args[] = {"exec", "--user", "0", d->runtime_id,
                           "/usr/bin/tail", "-c", "1048576", path.data, NULL};
-    bool ok = capture_runtime(d->owner, args, &output, true);
+    bool ok = capture_runtime(d->owner, args, &output, d->container);
     append(&json, "{");
     char *request_id = request_string(request, "requestID");
     if (request_id) {

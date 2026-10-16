@@ -17,7 +17,7 @@ typedef struct {
 } Connection;
 typedef void (*PipeHandler)(Connection *, void *);
 typedef struct {
-    char *method, *path, *query, *host, *origin;
+    char *method, *path, *query, *host, *origin, *upload_offset, *upload_protocol;
     StringBuilder headers, body;
     bool accepts_outerframe;
 } HttpRequest;
