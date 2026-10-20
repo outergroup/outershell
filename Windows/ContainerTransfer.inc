@@ -150,13 +150,31 @@ static bool container_share(Distribution *d, HttpRequest *request, StringBuilder
         free(mount_root);
     }
     if (ok && persistent_included) {
-        char *directory = container_directory(d->id), *from = directory ? win_join(directory, "Persistent Data") : NULL;
-        char *to = win_join(root, "Persistent Data");
-        wchar_t *wide = from ? win_wide(from) : NULL;
-        ok = wide && (GetFileAttributesW(wide) == INVALID_FILE_ATTRIBUTES ? win_secure_directory(to) : container_tree(from, to, 0));
-        free(directory); free(from); free(to); free(wide);
+        char *archives = win_join(root, "Volume Archives");
+        char *items = container_json_field(config, "persistentData");
+        ok = win_secure_directory(archives);
+        const unsigned char *p = (const unsigned char *)(items ? items : "[]") + 1;
+        const unsigned char *end = p + strlen((const char *)p);
+        while (ok && p < end) {
+            layout_json_space(&p, end); if (*p == ']') break;
+            const unsigned char *start = p; ok = layout_json_value(&p, end, 0);
+            char *item = ok ? container_string((const char *)start, (size_t)(p - start), "id") : NULL;
+            if (item) CharLowerBuffA(item, (DWORD)strlen(item));
+            ok = container_uuid(item);
+            if (ok) {
+                char *directory = container_directory(d->id), *pending_root = directory ? win_join(directory, "Volume Archives") : NULL;
+                StringBuilder filename = {0}; append(&filename, item); append(&filename, ".tar");
+                char *pending = pending_root ? win_join(pending_root, filename.data) : NULL;
+                char *target = win_join(archives, filename.data);
+                if (container_path_exists(pending)) ok = target && container_tree(pending, target, 0);
+                else ok = container_volume_transfer(d->owner, d->container, d->id, item, archives, false);
+                free(directory); free(pending_root); free(filename.data); free(pending); free(target);
+            }
+            free(item); layout_json_space(&p, end); if (p < end && *p == ',') p++;
+        }
+        free(archives); free(items);
     }
-    StringBuilder manifest = {0}; append(&manifest, "{\"version\":1,"); field(&manifest, "name", d->name);
+    StringBuilder manifest = {0}; append(&manifest, "{\"version\":2,"); field(&manifest, "name", d->name);
     char limits[100]; snprintf(limits, sizeof(limits), ",\"cpus\":%u,\"memoryInGB\":%u,", d->cpus, d->memory_gb); append(&manifest, limits);
     field(&manifest, "sourceRuntimeProviderID", container_provider_id(d->container));
     append(&manifest, ",\"includesPersistentData\":"); append(&manifest, persistent_included ? "true" : "false"); append(&manifest, ",\"includedMounts\":"); append(&manifest, included && mounts ? mounts : "[]");
@@ -168,7 +186,7 @@ static bool container_share(Distribution *d, HttpRequest *request, StringBuilder
         const char *args[10] = {"-czf", archive, "-C", root, "manifest.orwv", "Recipe", NULL};
         size_t argc = 6;
         if (included) args[argc++] = "Mounted Folders";
-        if (persistent_included) args[argc++] = "Persistent Data";
+        if (persistent_included) args[argc++] = "Volume Archives";
         ok = ok && capture_runtime(d->owner, args, &output, RUNTIME_TAR);
     }
     if (ok) {
@@ -245,7 +263,7 @@ static bool container_import_destination(const char *path) {
     free(wide); return ok;
 }
 
-static bool container_import(Wsl *w, HttpRequest *request, StringBuilder *extra) {
+static bool container_import(Wsl *w, HttpRequest *request, StringBuilder *extra, const char **error) {
     char *transfer_id = request_string(request, "transferID"), *provider = request_string(request, "runtimeProviderID");
     char *destination = request_string(request, "mountDestinationRoot");
     char *root = container_transfer_directory(transfer_id, false);
@@ -269,7 +287,8 @@ static bool container_import(Wsl *w, HttpRequest *request, StringBuilder *extra)
     HttpRequest record = {0};
     if (ok) {
         record.body = (StringBuilder){manifest, strlen(manifest), 0};
-        ok = container_number(&record, "version", 0) == 1;
+        ok = container_number(&record, "version", 0) == 2;
+        if (!ok) *error = "This archive uses an unsupported format. Export it again using the latest Outer Shell.";
         name = request_string(&record, "name"); mounts = container_json_field(manifest, "includedMounts");
         environment = container_json_field(config, "environment"); ports = container_json_field(config, "publishedPorts");
         ok = ok && valid_container_name(name) && mounts && mounts[0] == '[';
@@ -352,8 +371,8 @@ static bool container_import(Wsl *w, HttpRequest *request, StringBuilder *extra)
         free(value.data); container_arguments_free(&args);
     }
     if (ok) {
-        char *directory = container_directory(id), *from = win_join(extracted, "Persistent Data");
-        char *to = directory ? win_join(directory, "Persistent Data") : NULL;
+        char *directory = container_directory(id), *from = win_join(extracted, "Volume Archives");
+        char *to = directory ? win_join(directory, "Volume Archives") : NULL;
         wchar_t *wide = win_wide(from);
         if (wide && GetFileAttributesW(wide) != INVALID_FILE_ATTRIBUTES) ok = to && container_tree(from, to, 0);
         free(directory); free(from); free(to); free(wide);
@@ -383,6 +402,7 @@ done:
 
 static bool container_transfer_operation(Wsl *w, Connection *client, HttpRequest *request, const char *operation) {
     StringBuilder extra = {0}; bool ok = false;
+    const char *error = "Could not import the container. Check the archive, destination folders, and runtime log.";
     if (!strcmp(operation, "beginImport")) {
         char *id = container_new_id(), *root = id ? container_transfer_directory(id, true) : NULL;
         char *path = root ? win_join(root, "upload.outershell-container") : NULL;
@@ -392,9 +412,9 @@ static bool container_transfer_operation(Wsl *w, Connection *client, HttpRequest
     } else if (!strcmp(operation, "cancelImport")) {
         char *id = request_string(request, "transferID"), *root = container_transfer_directory(id, false);
         ok = root && container_tree(root, NULL, 0); free(root); free(id);
-    } else if (!strcmp(operation, "finishImport")) ok = container_import(w, request, &extra);
+    } else if (!strcmp(operation, "finishImport")) ok = container_import(w, request, &extra, &error);
     if (ok) container_extra_response(w, client, request, extra.data);
-    else http_text(client, request, 400, "Could not import the container. Check the archive, destination folders, and runtime log.");
+    else http_text(client, request, 400, error);
     free(extra.data); return ok;
 }
 

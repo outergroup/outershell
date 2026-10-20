@@ -167,11 +167,103 @@ static bool container_configuration(const char *json, ContainerArguments *args) 
     return true;
 }
 
-static bool container_persistent_arguments(const char *id, const char *config, ContainerArguments *args) {
+static bool container_path_exists(const char *path) {
+    wchar_t *wide = path ? win_wide(path) : NULL;
+    bool exists = wide && GetFileAttributesW(wide) != INVALID_FILE_ATTRIBUTES;
+    free(wide); return exists;
+}
+
+static char *container_volume_name(const char *id, const char *item) {
+    if (!container_uuid(id) || !container_uuid(item)) return NULL;
+    StringBuilder name = {0}; append(&name, "outershell-"); append(&name, id); append(&name, "-"); append(&name, item);
+    CharLowerBuffA(name.data, (DWORD)name.length); return name.data;
+}
+
+static char *container_volume_mount(const char *id, const char *item) {
+    char *directory = container_directory(id), *root = directory ? win_join(directory, "Persistent Data") : NULL;
+    char *legacy = root && container_uuid(item) ? win_join(root, item) : NULL;
+    char *name = container_volume_name(id, item);
+    StringBuilder mount = {0};
+    if (name) {
+        append(&mount, container_path_exists(legacy) ? "type=bind,source=" : "type=volume,source=");
+        append(&mount, container_path_exists(legacy) ? legacy : name);
+    }
+    free(directory); free(root); free(legacy); free(name); return mount.data;
+}
+
+static bool container_volume_transfer(Wsl *w, ContainerRuntime runtime, const char *id, const char *item,
+                                      const char *directory, bool restore) {
+    char *source = container_volume_mount(id, item);
+    StringBuilder data = {0}, transfer = {0}, file = {0}, output = {0};
+    if (source) append(&data, source);
+    append(&data, restore ? ",target=/data" : ",target=/data,readonly");
+    append(&transfer, "type=bind,source="); append(&transfer, directory);
+    append(&transfer, restore ? ",target=/transfer,readonly" : ",target=/transfer");
+    append(&file, "/transfer/"); append(&file, item); append(&file, ".tar");
+    const char *args[] = {"run", "--rm", "--network", "none", "--user", "0", "--mount", data.data,
+                          "--mount", transfer.data, "--entrypoint", "/bin/tar", "alpine:3.22",
+                          restore ? "-xpf" : "-cpf", file.data, "-C", "/data", restore ? NULL : ".", NULL};
+    bool ok = source && win_secure_directory(directory) && capture_runtime(w, args, &output, runtime);
+    free(source); free(data.data); free(transfer.data); free(file.data); free(output.data); return ok;
+}
+
+static bool container_volume_prepare(Wsl *w, ContainerRuntime runtime, const char *id, const char *item) {
+    char *mount = container_volume_mount(id, item);
+    if (mount && !strncmp(mount, "type=bind,", 10)) { free(mount); return true; }
+    free(mount);
+    char *name = container_volume_name(id, item), *directory = container_directory(id);
+    char *archives = directory ? win_join(directory, "Volume Archives") : NULL;
+    StringBuilder filename = {0}; append(&filename, item); append(&filename, ".tar");
+    char *archive = archives ? win_join(archives, filename.data) : NULL;
+    StringBuilder output = {0};
+    const char *inspect[] = {"volume", "inspect", name, NULL};
+    bool exists = name && capture_runtime(w, inspect, &output, runtime);
+    bool pending = container_path_exists(archive), ok = name && !(exists && pending);
+    free(output.data); output = (StringBuilder){0};
+    if (ok && !exists) {
+        const char *create[] = {"volume", "create", name, NULL};
+        ok = capture_runtime(w, create, &output, runtime);
+        if (ok && pending) {
+            ok = container_volume_transfer(w, runtime, id, item, archives, true);
+            if (ok) {
+                wchar_t *wide = win_wide(archive); ok = wide && DeleteFileW(wide); free(wide);
+            } else {
+                const char *remove[] = {"volume", runtime == RUNTIME_DOCKER ? "rm" : "remove", name, NULL};
+                free(output.data); output = (StringBuilder){0}; capture_runtime(w, remove, &output, runtime);
+            }
+        }
+    }
+    free(name); free(directory); free(archives); free(filename.data); free(archive); free(output.data); return ok;
+}
+
+static bool container_volumes_remove(Wsl *w, ContainerRuntime runtime, const char *id, const char *config) {
+    char *items = container_json_field(config, "persistentData");
+    const unsigned char *p = (const unsigned char *)(items ? items : "[]") + 1, *end = p + strlen((const char *)p);
+    bool ok = true;
+    while (ok && p < end) {
+        layout_json_space(&p, end); if (*p == ']') break;
+        const unsigned char *start = p; ok = layout_json_value(&p, end, 0);
+        char *item = ok ? container_string((const char *)start, (size_t)(p - start), "id") : NULL;
+        char *name = container_volume_name(id, item);
+        StringBuilder output = {0};
+        const char *inspect[] = {"volume", "inspect", name, NULL};
+        ok = name != NULL;
+        if (ok && capture_runtime(w, inspect, &output, runtime)) {
+            const char *remove[] = {"volume", runtime == RUNTIME_DOCKER ? "rm" : "remove", name, NULL};
+            free(output.data); output = (StringBuilder){0};
+            ok = capture_runtime(w, remove, &output, runtime);
+        }
+        free(item); free(name); free(output.data);
+        layout_json_space(&p, end); if (p < end && *p == ',') p++;
+    }
+    free(items); return ok;
+}
+
+static bool container_persistent_arguments(Wsl *w, ContainerRuntime runtime, const char *id,
+                                            const char *config, ContainerArguments *args) {
     char *array = container_json_field(config, "persistentData");
     if (!array) return true;
-    char *directory = container_directory(id), *root = directory ? win_join(directory, "Persistent Data") : NULL;
-    bool ok = root && win_secure_directory(root) && array[0] == '[';
+    bool ok = array[0] == '[';
     const unsigned char *p = (const unsigned char *)array + 1, *end = (const unsigned char *)array + strlen(array);
     size_t count = 0;
     while (ok && p < end) {
@@ -180,17 +272,21 @@ static bool container_persistent_arguments(const char *id, const char *config, C
         if (!ok) break;
         char *item = container_string((const char *)start, (size_t)(p - start), "id");
         char *guest = container_string((const char *)start, (size_t)(p - start), "guestPath");
-        char *path = container_uuid(item) ? win_join(root, item) : NULL;
-        ok = path && guest && guest[0] == '/' && guest[1] && !strpbrk(guest, ",\r\n\"") && win_secure_directory(path);
+        if (item) CharLowerBuffA(item, (DWORD)strlen(item));
+        ok = container_uuid(item) && guest && guest[0] == '/' && guest[1] && !strpbrk(guest, ",\r\n\"");
         StringBuilder mount = {0};
         if (ok) {
-            append(&mount, "type=bind,source="); append(&mount, path); append(&mount, ",target="); append(&mount, guest);
-            ok = container_argument(args, "--mount") && container_argument(args, mount.data);
+            ok = container_volume_prepare(w, runtime, id, item);
+            char *source = container_volume_mount(id, item);
+            if (source) append(&mount, source);
+            append(&mount, ",target="); append(&mount, guest);
+            ok = ok && source && container_argument(args, "--mount") && container_argument(args, mount.data);
+            free(source);
         }
-        free(item); free(guest); free(path); free(mount.data);
+        free(item); free(guest); free(mount.data);
         layout_json_space(&p, end); if (p < end && *p == ',') p++;
     }
-    free(array); free(directory); free(root); return ok;
+    free(array); return ok;
 }
 
 static const char *container_empty_configuration = "{\"mounts\":[],\"environment\":[],\"publishedPorts\":[]}";
@@ -340,6 +436,7 @@ static void container_recipe_snapshot(Distribution *d, StringBuilder *json) {
             char *guest = container_string((const char *)start, (size_t)(p - start), "guestPath");
             char *root = container_directory(d->id), *data = root ? win_join(root, "Persistent Data") : NULL;
             char *host = data && container_uuid(item) ? win_join(data, item) : NULL;
+            if (host && !container_path_exists(host)) { free(host); host = container_volume_name(d->id, item); }
             if (host && guest) {
                 if (count++) append(json, ","); append(json, "{"); field(json, "id", item);
                 append(json, ","); field(json, "hostPath", host); append(json, ","); field(json, "guestPath", guest); append(json, "}");
@@ -402,7 +499,7 @@ static DWORD WINAPI container_rebuild_thread(void *context) {
         StringBuilder mount = {0}; append(&mount, "type=bind,source="); append(&mount, directory);
         append(&mount, ",target=/var/lib/outershell/project");
         ok = ok && container_argument(&args, "--mount") && container_argument(&args, mount.data) &&
-             container_configuration(config, &args) && container_persistent_arguments(d->id, config, &args) && container_argument(&args, image);
+             container_configuration(config, &args) && container_persistent_arguments(w, d->container, d->id, config, &args) && container_argument(&args, image);
         free(mount.data); free(output.data); output = (StringBuilder){0};
         error = "Could not create the replacement container. The existing container was retained.";
         ok = ok && capture_runtime(w, (const char *const *)args.values, &output, d->container);

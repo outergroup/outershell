@@ -19356,8 +19356,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         let detail = makeTextLayer(size: 12, weight: .regular, color: .secondaryLabelColor)
         detail.string = workspace.isManagedContainer
             ? (isWindowsHost
-                ? "The container will be permanently deleted. Saved Dockerfiles, persistent data, and mounted folders will remain on the Windows server."
-                : "The container and its Outer Shell configuration will be permanently deleted. Mounted folders and their contents will remain on the server. This cannot be undone.")
+                ? "The container and its runtime-managed persistent data will be permanently deleted. Saved Dockerfiles and mounted folders will remain on the Windows server."
+                : "The container, its runtime-managed persistent data, and its Outer Shell configuration will be permanently deleted. Mounted folders will remain on the server. This cannot be undone.")
             : "Outer Shell will forget this registration. The externally managed container and all of its data will remain unchanged."
         detail.isWrapped = true
         detail.frame = CGRect(x: 20, y: 65, width: panelWidth - 40, height: 47)

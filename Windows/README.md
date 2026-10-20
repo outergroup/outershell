@@ -417,13 +417,17 @@ container; failed builds retain the existing container. The editor reports build
 failures and logs. Folder/port changes take effect after rebuilding. Definitions
 live in `containers/<id>/Recipe`; runtime configuration is stored in ORWV binary
 archives outside the build context. Deletion removes the runtime container and
-registration but retains saved definitions and persistent files on disk.
+registration and named persistent volumes, but retains saved definitions and legacy host-directory data on disk.
 
-Sharing uses the existing gzip tar `.outershell-container` format and ORWV
+Sharing uses version 2 of the gzip tar `.outershell-container` format and ORWV
 manifest/recipe records. It supports optional mounted-folder and persistent-data
 contents, import destination selection, and the existing chunked binary transfer
 protocol, plus resumable HTTP uploads with 64 MiB segments for the native Mac
-client. Imports reject links, traversal paths, and Windows device filenames.
+client. Persistent data travels as opaque `Volume Archives/<id>.tar` files and is
+restored inside Linux into runtime-managed named volumes. This preserves links,
+permissions, case-sensitive names, and Linux filenames on Windows. The outer
+archive rejects links, special files, traversal paths, and Windows device filenames.
+Version 1 exports must be recreated with the latest Outer Shell.
 Local Windows drive paths are supported for mounts; UNC paths are not. Native
 Mac clients enter Windows server paths inline rather than opening a remote folder
 picker. Mounts are applied on rebuild, not dynamically. Terminal launcher

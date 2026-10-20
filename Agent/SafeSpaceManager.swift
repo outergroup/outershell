@@ -930,7 +930,7 @@ final class SafeSpaceManager: @unchecked Sendable {
                         [
                             "id": item.id.uuidString,
                             "guestPath": item.guestPath,
-                            "hostPath": try persistentDataDirectory(record, item: item).path
+                            "hostPath": try persistentStorageLocation(record, item: item)
                         ] as [String: Any]
                     }
             }
@@ -1402,17 +1402,8 @@ final class SafeSpaceManager: @unchecked Sendable {
                     }
                 }
                 for item in duplicatedRecipe.persistentData ?? [] where item.isDeclared {
-                    let sourceDirectory = try self.persistentDataDirectory(source, item: item)
-                    guard FileManager.default.fileExists(atPath: sourceDirectory.path) else {
-                        continue
-                    }
-                    let destinationDirectory = try self.persistentDataDirectory(duplicate,
-                                                                                 item: item)
-                    if FileManager.default.fileExists(atPath: destinationDirectory.path) {
-                        try FileManager.default.removeItem(at: destinationDirectory)
-                    }
-                    try FileManager.default.copyItem(at: sourceDirectory,
-                                                     to: destinationDirectory)
+                    let archive = try self.volumeArchiveURL(duplicate, item: item)
+                    try self.exportPersistentVolume(source, item: item, archive: archive)
                 }
                 let imageReference = self.recipeImageReference(duplicate.id)
                 _ = try self.runContainerBuild(duplicate, imageReference: imageReference)
@@ -1463,13 +1454,9 @@ final class SafeSpaceManager: @unchecked Sendable {
         ]
         if includePersistentData {
             for item in persistentData {
-                let source = try persistentDataDirectory(record, item: item)
-                if FileManager.default.fileExists(atPath: source.path) {
-                    archiveSources.append((
-                        source,
-                        "Persistent Data/\(item.id.uuidString.lowercased())"
-                    ))
-                }
+                let archive = transferRoot.appendingPathComponent(item.id.uuidString.lowercased() + ".tar")
+                try exportPersistentVolume(record, item: item, archive: archive)
+                archiveSources.append((archive, "Volume Archives/\(archive.lastPathComponent)"))
             }
         }
         let mounts = recipe.mounts ?? []
@@ -1485,7 +1472,7 @@ final class SafeSpaceManager: @unchecked Sendable {
             }
         }
         let manifest = SafeSpaceTransferManifest(
-            version: 1,
+            version: 2,
             name: record.name,
             cpus: record.cpus,
             memoryInGB: record.memoryInGB,
@@ -1623,7 +1610,7 @@ final class SafeSpaceManager: @unchecked Sendable {
                 .filter { !$0.isEmpty }
                 .contains { line in
                     guard let type = line.first else { return true }
-                    return type == "l" || type == "h"
+                    return type != "-" && type != "d"
                 }
             guard !containsLinks else {
                 throw SafeSpaceManagerError.commandFailed(
@@ -1646,7 +1633,7 @@ final class SafeSpaceManager: @unchecked Sendable {
             SafeSpaceTransferManifest.self,
             from: manifestData
         )
-        guard manifest.version == 1 else {
+        guard manifest.version == 2 else {
             throw SafeSpaceManagerError.commandFailed("This shared container uses an unsupported format.")
         }
         let providerText = request["runtimeProviderID"] as? String
@@ -1807,9 +1794,9 @@ final class SafeSpaceManager: @unchecked Sendable {
         importedRecipe.realizedPublishedPorts = nil
         importedRecipe.hasUntrackedChanges = false
         try saveRecipe(importedRecipe, for: record)
-        let persistentSource = extracted.appendingPathComponent("Persistent Data", isDirectory: true)
+        let persistentSource = extracted.appendingPathComponent("Volume Archives", isDirectory: true)
         let persistentDestination = try safeSpaceDirectory(record.id)
-            .appendingPathComponent("Persistent Data", isDirectory: true)
+            .appendingPathComponent("Volume Archives", isDirectory: true)
         if FileManager.default.fileExists(atPath: persistentSource.path) {
             if FileManager.default.fileExists(atPath: persistentDestination.path) {
                 try FileManager.default.removeItem(at: persistentDestination)
@@ -1937,6 +1924,7 @@ final class SafeSpaceManager: @unchecked Sendable {
         var sourceWasStopped = false
         var targetWasCreated = false
         var providerWasChanged = false
+        var transferredItems: [SafeSpacePersistentData] = []
 
         do {
             let staleTarget = try removeRuntimeContainer(target, force: true)
@@ -1962,6 +1950,18 @@ final class SafeSpaceManager: @unchecked Sendable {
                     action: "pause the current container"
                 )
                 sourceWasStopped = true
+            }
+
+            for item in try recipe(for: source).persistentData ?? [] where item.isDeclared {
+                let legacy = try persistentDataDirectory(source, item: item)
+                if FileManager.default.fileExists(atPath: legacy.path) { continue }
+                let archive = try volumeArchiveURL(source, item: item)
+                transferredItems.append(item)
+                try transferPersistentVolume(source, item: item, archive: archive, restore: false)
+                let name = persistentVolumeName(target, item: item)
+                if try runRuntime(target, ["volume", "inspect", name]).status == 0 {
+                    try requireSuccess(try runRuntime(target, ["volume", "rm", name]), action: "replace previous target storage")
+                }
             }
 
             updateBuildProgressPhase(
@@ -2011,6 +2011,13 @@ final class SafeSpaceManager: @unchecked Sendable {
                     oldRuntime.stderr
                 )
             }
+            if oldRuntime.status == 0 || runtimeObjectIsMissing(oldRuntime) {
+                for item in transferredItems {
+                    if let removal = try? runRuntime(source, ["volume", "rm", persistentVolumeName(source, item: item)]), removal.status != 0 {
+                        NSLog("Converted container, but could not remove previous storage: %@", removal.stderr)
+                    }
+                }
+            }
         } catch {
             if providerWasChanged {
                 lock.withSafeSpaceLock {
@@ -2021,8 +2028,14 @@ final class SafeSpaceManager: @unchecked Sendable {
                 }
                 try? saveRecords()
             }
-            if targetWasCreated {
+            if targetWasCreated || !transferredItems.isEmpty {
                 _ = try? removeRuntimeContainer(target, force: true)
+            }
+            for item in transferredItems {
+                _ = try? runRuntime(target, ["volume", "rm", persistentVolumeName(target, item: item)])
+                if let archive = try? volumeArchiveURL(source, item: item) {
+                    try? FileManager.default.removeItem(at: archive)
+                }
             }
             if sourceWasRunning && sourceWasStopped {
                 _ = try? runRuntime(source, ["start", containerName(source.id)])
@@ -2087,14 +2100,9 @@ final class SafeSpaceManager: @unchecked Sendable {
             user.name == "workspace" ? user.workingDirectory : nil
         })
         for item in persistentData where !occupiedGuestPaths.contains(item.guestPath) {
-            let directory = try persistentDataDirectory(record, item: item)
-            try FileManager.default.createDirectory(
-                at: directory,
-                withIntermediateDirectories: true,
-                attributes: [.posixPermissions: 0o700]
-            )
+            try preparePersistentVolume(record, item: item)
             arguments.append(contentsOf: [
-                "--volume", "\(directory.path):\(item.guestPath)"
+                "--mount", try persistentMount(record, item: item) + ",target=" + item.guestPath
             ])
         }
         for variable in recipe.environment ?? [] {
@@ -2153,13 +2161,10 @@ final class SafeSpaceManager: @unchecked Sendable {
             $0.name == "workspace" ? $0.workingDirectory : nil
         })
         for item in persistentData where !occupiedGuestPaths.contains(item.guestPath) {
-            let directory = try persistentDataDirectory(record, item: item)
-            try FileManager.default.createDirectory(
-                at: directory,
-                withIntermediateDirectories: true,
-                attributes: [.posixPermissions: 0o700]
-            )
-            arguments.append(contentsOf: ["--volume", "\(directory.path):\(item.guestPath)"])
+            try preparePersistentVolume(record, item: item)
+            arguments.append(contentsOf: [
+                "--mount", try persistentMount(record, item: item) + ",target=" + item.guestPath
+            ])
         }
         for variable in recipe.environment ?? [] {
             arguments.append(contentsOf: ["--env", "\(variable.name)=\(variable.value)"])
@@ -2311,6 +2316,12 @@ final class SafeSpaceManager: @unchecked Sendable {
             let result = try removeRuntimeContainer(record, force: true)
             if result.status != 0 && !runtimeObjectIsMissing(result) {
                 try requireSuccess(result, action: "delete the container")
+            }
+            for item in try recipe(for: record).persistentData ?? [] {
+                let name = persistentVolumeName(record, item: item)
+                if try runRuntime(record, ["volume", "inspect", name]).status == 0 {
+                    try requireSuccess(try runRuntime(record, ["volume", "rm", name]), action: "delete persistent storage")
+                }
             }
         }
         lock.withSafeSpaceLock {
@@ -5400,6 +5411,83 @@ final class SafeSpaceManager: @unchecked Sendable {
         try safeSpaceDirectory(record.id)
             .appendingPathComponent("Persistent Data", isDirectory: true)
             .appendingPathComponent(item.id.uuidString.lowercased(), isDirectory: true)
+    }
+
+    private func persistentVolumeName(_ record: SafeSpaceRecord, item: SafeSpacePersistentData) -> String {
+        "outershell-\(record.id.uuidString.lowercased())-\(item.id.uuidString.lowercased())"
+    }
+
+    private func persistentStorageLocation(_ record: SafeSpaceRecord, item: SafeSpacePersistentData) throws -> String {
+        let legacy = try persistentDataDirectory(record, item: item)
+        return FileManager.default.fileExists(atPath: legacy.path) ? legacy.path : persistentVolumeName(record, item: item)
+    }
+
+    private func volumeArchiveURL(_ record: SafeSpaceRecord, item: SafeSpacePersistentData) throws -> URL {
+        try safeSpaceDirectory(record.id).appendingPathComponent("Volume Archives", isDirectory: true)
+            .appendingPathComponent(item.id.uuidString.lowercased() + ".tar")
+    }
+
+    private func persistentMount(_ record: SafeSpaceRecord, item: SafeSpacePersistentData) throws -> String {
+        let legacy = try persistentDataDirectory(record, item: item)
+        if FileManager.default.fileExists(atPath: legacy.path) {
+            return "type=bind,source=" + legacy.path
+        }
+        return "type=volume,source=" + persistentVolumeName(record, item: item)
+    }
+
+    private func transferPersistentVolume(_ record: SafeSpaceRecord, item: SafeSpacePersistentData,
+                                          archive: URL, restore: Bool) throws {
+        try FileManager.default.createDirectory(at: archive.deletingLastPathComponent(),
+                                                withIntermediateDirectories: true,
+                                                attributes: [.posixPermissions: 0o700])
+        var arguments = ["run", "--rm", "--user", "0"]
+        if runtimeProvider(for: record) == .docker {
+            arguments += ["--network", "none"]
+        }
+        arguments += [
+            "--mount", try persistentMount(record, item: item) + ",target=/data" + (restore ? "" : ",readonly"),
+            "--mount", "type=bind,source=\(archive.deletingLastPathComponent().path),target=/transfer" + (restore ? ",readonly" : ""),
+            "--entrypoint", "/bin/tar", "alpine:3.22"
+        ]
+        arguments += restore
+            ? ["-xpf", "/transfer/" + archive.lastPathComponent, "-C", "/data"]
+            : ["-cpf", "/transfer/" + archive.lastPathComponent, "-C", "/data", "."]
+        try requireSuccess(try runRuntime(record, arguments), action: restore ? "restore persistent data" : "export persistent data")
+    }
+
+    private func exportPersistentVolume(_ record: SafeSpaceRecord, item: SafeSpacePersistentData,
+                                        archive: URL) throws {
+        let pending = try volumeArchiveURL(record, item: item)
+        if FileManager.default.fileExists(atPath: pending.path) {
+            try FileManager.default.createDirectory(at: archive.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try FileManager.default.copyItem(at: pending, to: archive)
+        } else {
+            try transferPersistentVolume(record, item: item, archive: archive, restore: false)
+        }
+    }
+
+    private func preparePersistentVolume(_ record: SafeSpaceRecord, item: SafeSpacePersistentData) throws {
+        let legacy = try persistentDataDirectory(record, item: item)
+        if FileManager.default.fileExists(atPath: legacy.path) { return }
+        let name = persistentVolumeName(record, item: item)
+        let archive = try volumeArchiveURL(record, item: item)
+        let pending = FileManager.default.fileExists(atPath: archive.path)
+        let exists = try runRuntime(record, ["volume", "inspect", name]).status == 0
+        if exists && pending {
+            throw SafeSpaceManagerError.commandFailed("A volume already exists for pending imported data; refusing to overwrite it.")
+        }
+        if !exists {
+            try requireSuccess(try runRuntime(record, ["volume", "create", name]), action: "create persistent storage")
+            if pending {
+                do {
+                    try transferPersistentVolume(record, item: item, archive: archive, restore: true)
+                } catch {
+                    _ = try? runRuntime(record, ["volume", "rm", name])
+                    throw error
+                }
+                try FileManager.default.removeItem(at: archive)
+            }
+        }
     }
 
     private func createLegacyWorkspaceDirectory(for record: SafeSpaceRecord) throws {

@@ -23,6 +23,29 @@ have separate provider settings.
 These snippets are ordinary Dockerfile instructions. They can be used in Outer
 Shell, `docker build`, or any OCI builder that supports Dockerfile syntax.
 
+## Persistent storage and sharing
+
+New containers store Dockerfile `VOLUME` paths in named Linux volumes managed by
+Docker, Apple container, or WSLC. Rebuilding reuses those volumes. Deleting a
+container deletes its named volumes. Existing containers with host-directory
+storage continue using their existing data.
+
+Version 2 `.outershell-container` exports contain `manifest.orwv`, `Recipe/`,
+and, when persistent data is included, `Volume Archives/<volume-id>.tar`.
+Each inner tar preserves Linux ownership, permissions, symlinks, hard links,
+and filenames. The destination restores it inside a temporary Linux container
+into a new runtime volume; Windows never extracts those files onto NTFS.
+A failed restore retains the archive for retry and removes the incomplete volume.
+The restore helper can write only its own filesystem and the destination volume;
+the archive directory is mounted read-only.
+
+Older exports must be recreated with the current Outer Shell. Recipes and optional
+host-mounted folders are still host files and must be compatible with the
+destination filesystem. Persistent-volume archives do not have that limitation.
+Exports preserve files, not CPU architecture: software installed by the Dockerfile
+is rebuilt for the destination, while architecture-specific binaries stored in a
+persistent volume may need to be reinstalled.
+
 ## Choose a base image
 
 Outer Shell's prepared image is the shortest path:

@@ -843,6 +843,52 @@ def reconcile_image_volumes(container_id):
     save_recipe(container_id, recipe)
 
 
+def persistent_volume_name(container_id, item_id):
+    return "outershell-" + str(uuid.UUID(container_id)) + "-" + str(uuid.UUID(item_id))
+
+
+def volume_archive_path(container_id, item_id):
+    return container_directory(container_id) / "Volume Archives" / (str(uuid.UUID(item_id)) + ".tar")
+
+
+def persistent_mount(container_id, item_id):
+    legacy = persistent_data_directory(container_id, item_id)
+    if legacy.is_dir():
+        return f"type=bind,source={legacy}"
+    return "type=volume,source=" + persistent_volume_name(container_id, item_id)
+
+
+def transfer_persistent_volume(container_id, item_id, archive, *, restore=False):
+    archive.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    mount = persistent_mount(container_id, item_id)
+    arguments = ["run", "--rm", "--network", "none", "--user", "0",
+                 "--mount", mount + ",target=/data" + ("" if restore else ",readonly"),
+                 "--mount", f"type=bind,source={archive.parent},target=/transfer" + (",readonly" if restore else ""),
+                 "--entrypoint", "/bin/tar", "alpine:3.22"]
+    arguments += (["-xpf", "/transfer/" + archive.name, "-C", "/data"] if restore else
+                  ["-cpf", "/transfer/" + archive.name, "-C", "/data", "."])
+    docker(arguments, check=True)
+
+
+def prepare_persistent_volume(container_id, item_id):
+    if persistent_data_directory(container_id, item_id).is_dir():
+        return
+    name = persistent_volume_name(container_id, item_id)
+    archive = volume_archive_path(container_id, item_id)
+    exists = docker(["volume", "inspect", name]).returncode == 0
+    if exists and archive.exists():
+        raise RuntimeError("A volume already exists for pending imported data; refusing to overwrite it.")
+    if not exists:
+        docker(["volume", "create", name], check=True)
+        if archive.exists():
+            try:
+                transfer_persistent_volume(container_id, item_id, archive, restore=True)
+            except Exception:
+                docker(["volume", "rm", name])
+                raise
+            archive.unlink()
+
+
 def create_runtime_container(container_id):
     recipe = load_recipe(container_id)
     arguments = [
@@ -869,9 +915,8 @@ def create_runtime_container(container_id):
     for item in recipe.get("persistentData", []):
         if not item.get("isDeclared", True) or any(mount["guestPath"] == item["guestPath"] for mount in recipe.get("mounts", [])):
             continue
-        host = persistent_data_directory(container_id, item["id"])
-        host.mkdir(parents=True, exist_ok=True, mode=0o700)
-        arguments += ["--mount", f"type=bind,src={host},dst={item['guestPath']}"]
+        prepare_persistent_volume(container_id, item["id"])
+        arguments += ["--mount", persistent_mount(container_id, item["id"]) + ",target=" + item["guestPath"]]
     for variable in recipe.get("environment", []):
         arguments += ["--env", f"{variable['name']}={variable['value']}"]
     for port in recipe.get("publishedPorts", []):
@@ -999,6 +1044,10 @@ def operation_delete(request):
         owns_container = record_owns_container(record)
     if owns_container:
         remove_runtime_container(container_id)
+        for item in load_recipe(container_id).get("persistentData", []):
+            name = persistent_volume_name(container_id, item["id"])
+            if docker(["volume", "inspect", name]).returncode == 0:
+                docker(["volume", "rm", name], check=True)
         docker(["image", "rm", "--force", image_name(container_id)])
         registry_resource_remove(recipe_resource_key(container_id))
         shutil.rmtree(container_directory(container_id), ignore_errors=True)
@@ -1141,13 +1190,14 @@ def operation_prepare_share(request):
         output.add(shared_recipe_directory, arcname="Recipe", recursive=True)
         if include_persistent:
             for item in persistent_data:
-                source = persistent_data_directory(container_id, item["id"])
-                if source.exists():
-                    output.add(
-                        source,
-                        arcname="Persistent Data/" + item["id"].lower(),
-                        recursive=True,
-                    )
+                snapshot = root / "Volume Archives" / (str(uuid.UUID(item["id"])) + ".tar")
+                pending = volume_archive_path(container_id, item["id"])
+                if pending.exists():
+                    snapshot.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copyfile(pending, snapshot)
+                else:
+                    transfer_persistent_volume(container_id, item["id"], snapshot)
+                output.add(snapshot, arcname="Volume Archives/" + snapshot.name, recursive=False)
         if include_mounts:
             for mount in recipe.get("mounts", []):
                 source = pathlib.Path(mount.get("hostPath", ""))
@@ -1159,7 +1209,7 @@ def operation_prepare_share(request):
                 included_mounts.append(mount)
         included_ids = {value["id"] for value in included_mounts}
         manifest = {
-            "version": 1,
+            "version": 2,
             "name": record["name"],
             "cpus": record.get("cpus", 4),
             "memoryInGB": record.get("memoryInGB", 8),
@@ -1283,7 +1333,7 @@ def operation_finish_import(request):
         extracted_root = extracted.resolve()
         with tarfile.open(archive, "r|gz") as source:
             for member in source:
-                if member.issym() or member.islnk():
+                if not (member.isfile() or member.isdir()):
                     raise ValueError(
                         "The shared container contains symbolic or hard links, "
                         "which cannot be imported safely."
@@ -1293,7 +1343,7 @@ def operation_finish_import(request):
                     raise ValueError("The shared container contains unsafe paths.")
                 source.extract(member, extracted)
     manifest = offset_archive_decode((extracted / "manifest.orwv").read_bytes())
-    if manifest.get("version") != 1:
+    if manifest.get("version") != 2:
         raise ValueError("This shared container uses an unsupported format.")
     included_mounts = manifest.get("includedMounts", [])
     mount_directory_names = import_mount_directory_names(included_mounts)
@@ -1401,9 +1451,9 @@ def operation_finish_import(request):
         recipe.pop(key, None)
     recipe["hasUntrackedChanges"] = False
     save_recipe(container_id, recipe)
-    persistent = extracted / "Persistent Data"
+    persistent = extracted / "Volume Archives"
     if persistent.exists():
-        shutil.move(persistent, target / "Persistent Data")
+        shutil.move(persistent, target / "Volume Archives")
     with Records() as records:
         records.values.append(record)
         records.save()
@@ -2088,7 +2138,9 @@ def workspace_dictionary(record, overview=False):
             continue
         persistent.append({
             "id": item["id"],
-            "hostPath": str(persistent_data_directory(container_id, item["id"])),
+            "hostPath": (str(persistent_data_directory(container_id, item["id"]))
+                         if persistent_data_directory(container_id, item["id"]).is_dir()
+                         else persistent_volume_name(container_id, item["id"])),
             "guestPath": item["guestPath"],
         })
     value = {

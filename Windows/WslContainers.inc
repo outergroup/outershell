@@ -171,7 +171,7 @@ static bool create_container(Wsl *w, HttpRequest *request, const char **error) {
     ok = context && container_image_volumes(w, runtime, id, run_image);
     char *config = container_read(id, "configuration", container_empty_configuration);
     for (size_t i = 0; ok && i < sizeof(prefix) / sizeof(*prefix); i++) ok = container_argument(&args, prefix[i]);
-    ok = ok && container_persistent_arguments(id, config, &args) && container_argument(&args, run_image);
+    ok = ok && container_persistent_arguments(w, runtime, id, config, &args) && container_argument(&args, run_image);
     *error = "The container runtime could not create the container. Check the image name and the Outer Shell log.";
     ok = ok && capture_runtime(w, (const char *const *)args.values, &output, runtime);
     container_arguments_free(&args); free(config);

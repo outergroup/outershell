@@ -100,7 +100,7 @@ def check_mac_archive(archive):
  main="""do {
  let recipe = try OffsetArchive.decode(SafeSpaceRecipe.self, from: Data(contentsOf: URL(fileURLWithPath: CommandLine.arguments[1])))
  let manifest = try OffsetArchive.decode(SafeSpaceTransferManifest.self, from: Data(contentsOf: URL(fileURLWithPath: CommandLine.arguments[2])))
- guard recipe.version == 1 && manifest.version == 1 else { exit(2) }
+ guard recipe.version == 1 && manifest.version == 2 else { exit(2) }
  print("PASS actual macOS recipe/manifest decoder")
 } catch { print(error); exit(1) }
 """
@@ -157,7 +157,7 @@ try:
  # Generate the existing Unix archive format independently.
  memory=io.BytesIO()
  with tarfile.open(fileobj=memory,mode='w:gz') as tar:
-  values={'manifest.orwv':codec['offset_archive_encode']({'version':1,'name':'Unix import '+uuid.uuid4().hex,'cpus':2,'memoryInGB':2,'includedMounts':[],'omittedMounts':[]}),
+  values={'manifest.orwv':codec['offset_archive_encode']({'version':2,'name':'Unix import '+uuid.uuid4().hex,'cpus':2,'memoryInGB':2,'includedMounts':[],'omittedMounts':[]}),
           'Recipe/recipe.orwv':codec['offset_archive_encode']({'baseImage':'outershell/windows-test:1','mounts':[],'environment':[{'name':'FROM_UNIX','value':'yes'}],'publishedPorts':[]}),
           'Recipe/Dockerfile':b'FROM outershell/windows-test:1\nRUN echo unix > /from-unix\n'}
   for name,value in values.items():
@@ -191,10 +191,15 @@ try:
  mount={'id':mount_id,'name':'Source files','hostPath':'/source/on/unix','guestPath':'/shared-source','isReadOnly':True}
  recipe={'baseImage':'outershell/windows-test:1','mounts':[mount],'environment':[{'name':'UNICODE','value':'café 日本語'}],'publishedPorts':[],
          'persistentData':[{'id':data_id,'name':'Saved data','guestPath':'/saved','isDeclared':True}],'createdAt':123.5}
+ volume=io.BytesIO()
+ with tarfile.open(fileobj=volume,mode='w') as inner:
+  info=tarfile.TarInfo('saved.txt');info.size=len(b'persistent contents');info.mode=0o751
+  inner.addfile(info,io.BytesIO(b'persistent contents'))
+  info=tarfile.TarInfo('linux:name');info.type=tarfile.SYMTYPE;info.linkname='saved.txt';inner.addfile(info)
  with tarfile.open(fileobj=memory,mode='w:gz') as tar:
-  values={'manifest.orwv':codec['offset_archive_encode']({'version':1,'name':transfer_name,'cpus':2,'memoryInGB':2,'includedMounts':[mount],'omittedMounts':[]}),
-          'Recipe/recipe.orwv':codec['offset_archive_encode'](recipe), 'Recipe/Dockerfile':b'FROM outershell/windows-test:1\n',
-          f'Mounted Folders/{mount_id}/hello.txt':b'mounted contents',f'Persistent Data/{data_id}/saved.txt':b'persistent contents'}
+  values={'manifest.orwv':codec['offset_archive_encode']({'version':2,'name':transfer_name,'cpus':2,'memoryInGB':2,'includedMounts':[mount],'omittedMounts':[]}),
+          'Recipe/recipe.orwv':codec['offset_archive_encode'](recipe), 'Recipe/Dockerfile':b'FROM outershell/windows-test:1\nVOLUME /saved\n',
+          f'Mounted Folders/{mount_id}/hello.txt':b'mounted contents',f'Volume Archives/{data_id}.tar':volume.getvalue()}
   for name,value in values.items():
    info=tarfile.TarInfo(name);info.size=len(value);tar.addfile(info,io.BytesIO(value))
  upload=op('beginImport');binary(upload['transferID'],2,chunk=memory.getvalue())
@@ -207,14 +212,17 @@ try:
  header,archive=binary(share['transferID'],1)
  with tarfile.open(fileobj=io.BytesIO(archive),mode='r:gz') as tar:
   assert tar.extractfile(f'Mounted Folders/{mount_id}/hello.txt').read()==b'mounted contents'
-  assert tar.extractfile(f'Persistent Data/{data_id}/saved.txt').read()==b'persistent contents'
+  with tarfile.open(fileobj=io.BytesIO(tar.extractfile(f'Volume Archives/{data_id}.tar').read())) as inner:
+   assert inner.extractfile('./saved.txt').read()==b'persistent contents'
+   assert inner.getmember('./saved.txt').mode==0o751
+   assert inner.getmember('./linux:name').linkname=='saved.txt'
  print('PASS included folders, persistent data, Unicode, and Unix binary archive round trip',flush=True)
  for unsafe in ('../escape.txt','Recipe/linked','Recipe/hardlinked','Recipe/CON'):
   memory=io.BytesIO()
   with tarfile.open(fileobj=memory,mode='w:gz') as tar:
-   safe_values={'manifest.orwv':codec['offset_archive_encode']({'version':1,'name':'Unsafe archive test','cpus':2,'memoryInGB':2,'includedMounts':[],'omittedMounts':[]}),
+   safe_values={'manifest.orwv':codec['offset_archive_encode']({'version':2,'name':'Unsafe archive test','cpus':2,'memoryInGB':2,'includedMounts':[],'omittedMounts':[]}),
                 'Recipe/recipe.orwv':codec['offset_archive_encode']({'mounts':[],'environment':[],'publishedPorts':[]}),
-                'Recipe/Dockerfile':b'FROM outershell/windows-test:1\n','Recipe/source.txt':b'safe'}
+                'Recipe/Dockerfile':b'FROM outershell/windows-test:1\nVOLUME /saved\n','Recipe/source.txt':b'safe'}
    for safe_name,value in safe_values.items():
     safe_info=tarfile.TarInfo(safe_name);safe_info.size=len(value);tar.addfile(safe_info,io.BytesIO(value))
    info=tarfile.TarInfo(unsafe)

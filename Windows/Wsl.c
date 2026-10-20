@@ -1453,6 +1453,9 @@ void wsl_serve(Wsl *w, Connection *c, HttpRequest *r) {
             const char *args[] = {d->container == RUNTIME_DOCKER ? "rm" : "remove", "--force", d->runtime_id, NULL};
             ok = !*d->runtime_id || capture_runtime(w, args, &output, d->container);
             free(output.data);
+            char *config = container_read(d->id, "configuration", container_empty_configuration);
+            if (ok) ok = container_volumes_remove(w, d->container, d->id, config);
+            free(config);
             if (ok) {
                 EnterCriticalSection(&w->gate);
                 for (Endpoint *endpoint = w->endpoints; endpoint; endpoint = endpoint->next) {
