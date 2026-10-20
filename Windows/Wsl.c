@@ -458,13 +458,31 @@ static bool serve_guest_backends(Endpoint *endpoint, Connection *client);
 typedef struct {
     Child *process;
     Connection *client;
+    CRITICAL_SECTION input_gate;
 } Relay;
+static bool relay_send(Relay *relay, uint16_t type, const void *data, size_t length) {
+    EnterCriticalSection(&relay->input_gate);
+    bool ok = send_frame(relay->process, type, data, length);
+    LeaveCriticalSection(&relay->input_gate);
+    return ok;
+}
+static DWORD WINAPI relay_keepalive(void *context) {
+    Relay *relay = context;
+    HANDLE events[] = {relay->client->stop, relay->process->cancel};
+    while (WaitForMultipleObjects(2, events, FALSE, 15000) == WAIT_TIMEOUT) {
+        if (!relay_send(relay, 8, NULL, 0)) {
+            SetEvent(relay->process->cancel);
+            break;
+        }
+    }
+    return 0;
+}
 static DWORD WINAPI relay_output(void *context) {
     Relay *relay = context;
     StringBuilder frame = {0};
     uint16_t type;
     while (receive_frame(relay->process, &type, &frame)) {
-        if (type == 10)
+        if (type == 9 || type == 10)
             continue;
         if (type != 5 || !connection_write(relay->client, frame.data, frame.length))
             break;
@@ -487,24 +505,37 @@ static void relay_client_impl(Connection *client, void *context) {
     if (!bridge_start(endpoint->distribution, endpoint->socket, system, &p))
         return;
     client->cancel = p.cancel;
-    Relay relay = {&p, client};
+    bool unlimited_io_wait = client->unlimited_io_wait;
+    client->unlimited_io_wait = true;
+    p.input.unlimited_io_wait = p.output.unlimited_io_wait = true;
+    Relay relay = {.process = &p, .client = client};
+    InitializeCriticalSection(&relay.input_gate);
+    HANDLE keepalive = CreateThread(NULL, 0, relay_keepalive, &relay, 0, NULL);
+    if (!keepalive) SetEvent(p.cancel);
     HANDLE output = CreateThread(NULL, 0, relay_output, &relay, 0, NULL);
     if (output) {
         char buffer[32768];
         size_t length;
         while (connection_read_some(client, buffer, sizeof(buffer), &length)) {
-            if (!send_frame(&p, 5, buffer, length))
+            if (!relay_send(&relay, 5, buffer, length))
                 break;
         }
         if (WaitForSingleObject(p.cancel, 0) != WAIT_OBJECT_0) {
-            send_frame(&p, 6, NULL, 0);
+            relay_send(&relay, 6, NULL, 0);
             WaitForSingleObject(output, 1000);
         }
         SetEvent(p.cancel);
         WaitForSingleObject(output, INFINITE);
         CloseHandle(output);
     }
+    SetEvent(p.cancel);
+    if (keepalive) {
+        WaitForSingleObject(keepalive, INFINITE);
+        CloseHandle(keepalive);
+    }
+    DeleteCriticalSection(&relay.input_gate);
     client->cancel = NULL;
+    client->unlimited_io_wait = unlimited_io_wait;
     child_close(&p);
 }
 static void relay_client(Connection *client, void *context) {

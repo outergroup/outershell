@@ -331,7 +331,8 @@ static bool pipe_io(Connection *c, void *data, DWORD size, DWORD *count, bool wr
     BOOL ok = write ? WriteFile(c->pipe, data, size, count, &ov) : ReadFile(c->pipe, data, size, count, &ov);
     if (!ok && GetLastError() == ERROR_IO_PENDING) {
         HANDLE events[] = {c->stop, ov.hEvent, c->cancel};
-        DWORD wait = WaitForMultipleObjects(c->cancel ? 3 : 2, events, FALSE, 35000);
+        DWORD wait = WaitForMultipleObjects(c->cancel ? 3 : 2, events, FALSE,
+                                            c->unlimited_io_wait ? INFINITE : 35000);
         if (wait != WAIT_OBJECT_0 + 1)
             CancelIoEx(c->pipe, &ov);
         ok = GetOverlappedResult(c->pipe, &ov, count, TRUE) && wait == WAIT_OBJECT_0 + 1;

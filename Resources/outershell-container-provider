@@ -1767,7 +1767,7 @@ def authorize_container_socket(container_id, socket_path):
 
 def ensure_container_socket_bridge(container_id):
     installed = container_exec(container_id, [
-        "/bin/sh", "-c", "test -x /usr/local/bin/outer-socket-bridge",
+        "/usr/local/bin/outer-socket-bridge", "--version",
     ])
     if installed.returncode == 0:
         return
@@ -1801,6 +1801,9 @@ done
         "install -d -m 0755 /usr/local/bin && "
         f"install -m 0755 {temporary} /usr/local/bin/outer-socket-bridge && "
         f"rm -f {temporary}",
+    ], check=True)
+    container_exec(container_id, [
+        "/usr/local/bin/outer-socket-bridge", "--version",
     ], check=True)
 
 
@@ -2322,6 +2325,7 @@ class ContainerSocketBridge:
         self.streams = {}
         self.next_stream_id = 1
         self.closed = False
+        self.stopped = threading.Event()
         self.process = subprocess.Popen(
             [docker_path(), "exec", "--interactive", "--user", "root", container_name(container_id)]
             + container_environment("root")
@@ -2342,6 +2346,15 @@ class ContainerSocketBridge:
             self.close()
             raise
         threading.Thread(target=self.read_remote, daemon=True).start()
+        threading.Thread(target=self.keep_alive, daemon=True).start()
+
+    def keep_alive(self):
+        while not self.stopped.wait(15):
+            try:
+                self.send(FRAME_PING, 0)
+            except (OSError, ValueError):
+                self.close()
+                return
 
     def is_alive(self):
         with self.state_lock:
@@ -2472,6 +2485,7 @@ class ContainerSocketBridge:
             if self.closed:
                 return
             self.closed = True
+            self.stopped.set()
             streams = list(self.streams.values())
             self.streams.clear()
         for stream in streams:

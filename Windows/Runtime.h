@@ -14,6 +14,7 @@ typedef struct {
     unsigned char buffer[8192];
     size_t offset, length;
     bool responded;
+    bool unlimited_io_wait;
 } Connection;
 typedef void (*PipeHandler)(Connection *, void *);
 typedef struct {
