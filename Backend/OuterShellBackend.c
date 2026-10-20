@@ -173,6 +173,9 @@ typedef struct {
     int api_response_fd;
     bool streaming_container_upload;
     int container_upload_fd;
+    int container_download_fd;
+    uint64_t container_download_remaining;
+    size_t container_download_offset;
     uint64_t container_upload_offset;
     uint64_t container_upload_received;
     uint64_t container_upload_length;
@@ -2167,6 +2170,68 @@ static ContainerUploadDispatch begin_container_upload_if_ready(ReactorClient *cl
     return CONTAINER_UPLOAD_STREAMING;
 }
 
+static bool begin_container_download(ReactorClient *client, const char *target, bool send_body) {
+    const char *suffix = target + strlen("/api/container-downloads/");
+    char identifier[37];
+    if (strlen(suffix) < 38 || suffix[36] != '/') {
+        send_text_response(client->fd, 404, "not found\n");
+        return false;
+    }
+    memcpy(identifier, suffix, 36); identifier[36] = 0;
+    char upload_target[80];
+    snprintf(upload_target, sizeof(upload_target), "/api/container-transfers/%s", identifier);
+    const char *name = suffix + 37;
+    if (!container_transfer_id_from_target(upload_target) || !*name || strlen(name) > 240 ||
+        strspn(name, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.") != strlen(name)) {
+        send_text_response(client->fd, 404, "not found\n");
+        return false;
+    }
+    int root = open(g_container_transfers_directory, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    int directory = root < 0 ? -1 : openat(root, identifier, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (root >= 0) close(root);
+    int file = directory < 0 ? -1 : openat(directory, "container.outershell-container", O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (directory >= 0) close(directory);
+    struct stat status;
+    if (file < 0 || fstat(file, &status) != 0 || !S_ISREG(status.st_mode) || status.st_size < 0) {
+        if (file >= 0) close(file);
+        send_text_response(client->fd, 404, "The prepared container archive does not exist.\n");
+        return false;
+    }
+    int length = snprintf(client->request, client->request_capacity,
+        "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: %llu\r\n"
+        "Content-Disposition: attachment; filename=\"%s\"\r\nCache-Control: no-store\r\n"
+        "X-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n",
+        (unsigned long long)status.st_size, name);
+    if (length < 0 || (size_t)length >= client->request_capacity) { close(file); return false; }
+    client->length = (size_t)length;
+    client->container_download_offset = 0;
+    client->container_download_fd = file;
+    client->container_download_remaining = send_body ? (uint64_t)status.st_size : 0;
+    set_fd_nonblocking(client->fd, true);
+    return true;
+}
+
+static bool write_container_download(ReactorClient *client) {
+    if (client->container_download_offset == client->length) {
+        if (!client->container_download_remaining) return false;
+        size_t wanted = client->container_download_remaining < READ_BUFFER_SIZE
+            ? (size_t)client->container_download_remaining : READ_BUFFER_SIZE;
+        ssize_t count = read(client->container_download_fd, client->request, wanted);
+        if (count < 0 && errno == EINTR) return true;
+        if (count <= 0) return false;
+        client->length = (size_t)count;
+        client->container_download_offset = 0;
+        client->container_download_remaining -= (uint64_t)count;
+    }
+    ssize_t count = write(client->fd, client->request + client->container_download_offset,
+                          client->length - client->container_download_offset);
+    if (count < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) return true;
+    if (count <= 0) return false;
+    client->container_download_offset += (size_t)count;
+    client->last_activity_ms = monotonic_milliseconds();
+    return client->container_download_offset < client->length || client->container_download_remaining > 0;
+}
+
 static bool send_container_upload_offset(int fd, const char *target) {
     const char *transfer_id = container_transfer_id_from_target(target);
     if (!transfer_id) return false;
@@ -2390,6 +2455,14 @@ static bool process_http_client_request(ReactorClient *client, char *request, si
     if (query) {
         *query = '\0';
         query++;
+    }
+
+    if (strncmp(target, "/api/container-downloads/", strlen("/api/container-downloads/")) == 0) {
+        if (strcasecmp(method, "GET") != 0 && strcasecmp(method, "HEAD") != 0) {
+            send_text_response(fd, 405, "Unsupported method.\n");
+            return false;
+        }
+        return begin_container_download(client, target, strcasecmp(method, "HEAD") != 0);
     }
 
     if (strcasecmp(method, "HEAD") == 0 && send_container_upload_offset(fd, target)) {
@@ -2625,6 +2698,7 @@ static void close_reactor_client(ReactorClient *clients, size_t *client_count, s
     if (clients[index].container_upload_fd >= 0) {
         close(clients[index].container_upload_fd);
     }
+    if (clients[index].container_download_fd >= 0) close(clients[index].container_download_fd);
     free(clients[index].request);
     clients[index].request = NULL;
     if (index + 1 < *client_count) {
@@ -2653,6 +2727,7 @@ static void add_reactor_client(ReactorClient *clients, size_t *client_count, int
     client->fd = client_fd;
     client->api_response_fd = -1;
     client->container_upload_fd = -1;
+    client->container_download_fd = -1;
     client->is_api = is_api;
 #ifndef __APPLE__
     struct ucred credentials;
@@ -2805,7 +2880,7 @@ static void run_http_reactor(int listener) {
         poll_fds[0] = (struct pollfd){.fd = listener, .events = POLLIN, .revents = 0};
         for (size_t i = 0; i < polled_client_count; i++) {
             int poll_fd = clients[i].waiting_for_api_response ? clients[i].api_response_fd : clients[i].fd;
-            poll_fds[i + 1] = (struct pollfd){.fd = poll_fd, .events = POLLIN, .revents = 0};
+            poll_fds[i + 1] = (struct pollfd){.fd = poll_fd, .events = clients[i].container_download_fd >= 0 ? POLLOUT : POLLIN, .revents = 0};
         }
 
         int timeout_ms = 1000;
@@ -2835,6 +2910,14 @@ static void run_http_reactor(int listener) {
                 size_t index = i - 1;
                 short revents = poll_fds[index + 1].revents;
                 if (revents == 0) continue;
+
+                if (clients[index].container_download_fd >= 0) {
+                    if ((revents & (POLLERR | POLLHUP | POLLNVAL)) ||
+                        ((revents & POLLOUT) && !write_container_download(&clients[index]))) {
+                        close_reactor_client(clients, &client_count, index);
+                    }
+                    continue;
+                }
 
                 if (clients[index].waiting_for_api_response) {
                     if (revents & POLLIN) {
@@ -2894,7 +2977,7 @@ static void run_http_reactor(int listener) {
         for (size_t i = client_count; i > 0; i--) {
             size_t index = i - 1;
             if (clients[index].waiting_for_api_response) continue;
-            int64_t idle_timeout = clients[index].streaming_container_upload
+            int64_t idle_timeout = (clients[index].streaming_container_upload || clients[index].container_download_fd >= 0)
                 ? TRANSFER_IDLE_TIMEOUT_MS
                 : CLIENT_IDLE_TIMEOUT_MS;
             if (now - clients[index].last_activity_ms > idle_timeout) {
@@ -2907,6 +2990,8 @@ static void run_http_reactor(int listener) {
     for (size_t i = 0; i < client_count; i++) {
         close(clients[i].fd);
         if (clients[i].api_response_fd >= 0) close(clients[i].api_response_fd);
+        if (clients[i].container_download_fd >= 0) close(clients[i].container_download_fd);
+        if (clients[i].container_upload_fd >= 0) close(clients[i].container_upload_fd);
         free(clients[i].request);
     }
     free(clients);

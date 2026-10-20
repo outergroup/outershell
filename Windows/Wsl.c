@@ -1374,6 +1374,10 @@ void wsl_serve(Wsl *w, Connection *c, HttpRequest *r) {
         http_text(c, r, 503, "WSL discovery is unavailable.");
         return;
     }
+    if (!strncmp(r->path, "/api/container-downloads/", strlen("/api/container-downloads/"))) {
+        container_http_download(c, r);
+        return;
+    }
     if (!strncmp(r->path, "/api/container-transfers/", strlen("/api/container-transfers/"))) {
         container_http_upload(w, c, r);
         return;

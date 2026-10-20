@@ -31,7 +31,6 @@
     layoutError: "",
     safeSpaces: [],
     providers: [],
-    containerDownloadURL: null,
     loading: true,
     safeSpacesLoading: true,
     safeSpacesRefreshing: false,
@@ -2088,28 +2087,6 @@
     });
   }
 
-  function containerTransferRequest(transferID, offset, length) {
-    if (!/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(transferID)) throw new Error("Invalid container transfer identifier.");
-    const bytes = new Uint8Array(48);
-    const view = new DataView(bytes.buffer);
-    bytes.set([0x4f, 0x53, 0x43, 0x54]);
-    view.setUint16(4, 1, true); view.setUint16(6, 1, true);
-    bytes.set(transferID.replaceAll("-", "").match(/../g).map(value => parseInt(value, 16)), 8);
-    view.setBigUint64(24, BigInt(offset), true); view.setBigUint64(32, BigInt(length), true);
-    return bytes;
-  }
-
-  function decodeContainerTransfer(buffer, offset, total) {
-    if (buffer.byteLength < 40) throw new Error("Incomplete container transfer response.");
-    const reader = new PayloadReader(buffer);
-    if (reader.u32(0) !== 0x5443534f || reader.view.getUint16(4, true) !== 1) throw new Error("Invalid container transfer response.");
-    if (reader.view.getUint16(6, true)) throw new Error(reader.stringRef(32) || "Container download failed.");
-    const bytes = reader.bytesRef(24);
-    const next = Number(reader.u64(8));
-    if (Number(reader.u64(16)) !== total || next !== offset + bytes.length || next > total || (next < total && next <= offset)) throw new Error("Container download size changed or transfer made no progress.");
-    return { bytes, next };
-  }
-
   function openShareContainer(id) {
     const workspace = findSafeSpace(id);
     if (!workspace || !managedContainer(workspace)) return;
@@ -2118,7 +2095,7 @@
         <p>Create a portable archive of ${escapeHTML(workspace.name)} with its Dockerfile and build-context files.</p>
         <label class="container-check"><input name="persistent" type="checkbox">Include persistent data</label>
         <label class="container-check"><input name="mounts" type="checkbox">Include mounted folders from this server</label>
-        <p class="field-note">The archive includes configured environment values. Only include data you intend to share. Without a browser file picker, the download is assembled in browser memory.</p>
+        <p class="field-note">The archive includes configured environment values. Only include data you intend to share.</p>
         <p class="container-message" role="status"></p><div class="container-download"></div>
       </div><footer class="dialog-footer"><button type="button" data-action="close-dialog">Close</button><button class="primary-button" type="submit">Prepare archive</button></footer></form>`);
     const form = dialog.querySelector("form");
@@ -2129,47 +2106,22 @@
       const includePersistentData = form.elements.persistent.checked;
       const includeMountedFolders = form.elements.mounts.checked;
       button.disabled = true;
-      let writer;
       try {
-        if (typeof window.showSaveFilePicker === "function") {
-          const handle = await window.showSaveFilePicker({ suggestedName: `${workspace.name.replace(/[^a-zA-Z0-9_-]/g, "-") || "Container"}.outershell-container` });
-          writer = await handle.createWritable();
-        }
         message.textContent = "Preparing archive…";
         const result = await containerOperation("prepareShare", { workspaceID: id, includePersistentData, includeMountedFolders });
-        const total = Number(result.byteCount);
-        if (!Number.isSafeInteger(total) || total <= 0) throw new Error("Invalid shared container size.");
-        const parts = [];
-        let offset = 0;
-        while (offset < total) {
-          const response = await fetch("/api/safe-spaces", { method: "POST", headers: { "Content-Type": "application/octet-stream" }, body: containerTransferRequest(result.transferID, offset, 4 * 1024 * 1024) });
-          if (!response.ok) throw new Error(`Container download returned HTTP ${response.status}.`);
-          const chunk = decodeContainerTransfer(await response.arrayBuffer(), offset, total);
-          if (writer) await writer.write(chunk.bytes);
-          else parts.push(chunk.bytes);
-          offset = chunk.next;
-          message.textContent = `Downloading archive… ${Math.round(offset / total * 100)}%`;
-        }
-        if (writer) { await writer.close(); writer = null; message.textContent = "Container archive saved."; }
-        else {
-          const file = new File(parts, result.fileName || "Container.outershell-container", { type: "application/octet-stream" });
-          if (state.containerDownloadURL) URL.revokeObjectURL(state.containerDownloadURL);
-          state.containerDownloadURL = URL.createObjectURL(file);
-          const output = form.querySelector(".container-download");
-          output.replaceChildren();
-          const link = document.createElement("a"); link.href = state.containerDownloadURL; link.download = file.name; link.textContent = `Download ${file.name}`; output.append(link);
-          if (typeof navigator.canShare === "function" && navigator.canShare({ files: [file] })) {
-            const share = document.createElement("button"); share.type = "button"; share.textContent = "Share…";
-            share.addEventListener("click", async () => {
-              try { await navigator.share({ files: [file], title: workspace.name }); }
-              catch (error) { if (error.name !== "AbortError") message.textContent = error.message; }
-            });
-            output.append(share);
-          }
-          message.textContent = "Archive ready.";
-        }
+        if (!/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(result.transferID)) throw new Error("Invalid container transfer identifier.");
+        const extension = ".outershell-container";
+        const fileName = (result.fileName || "Container").replace(/[^a-zA-Z0-9._-]/g, "-");
+        const stem = fileName.endsWith(extension) ? fileName.slice(0, -extension.length) : fileName;
+        const name = (stem || "Container").slice(0, 240 - extension.length) + extension;
+        const link = document.createElement("a");
+        link.href = `/api/container-downloads/${result.transferID}/${name}`;
+        link.download = name;
+        link.textContent = `Download ${name}`;
+        form.querySelector(".container-download").replaceChildren(link);
+        message.textContent = "Archive ready.";
+        link.click();
       } catch (error) {
-        if (writer) { try { await writer.abort(); } catch {} }
         message.textContent = error.name === "AbortError" ? "Cancelled." : error.message;
       } finally { button.disabled = false; }
     });

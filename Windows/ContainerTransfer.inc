@@ -464,3 +464,47 @@ static void container_http_upload(Wsl *w, Connection *client, HttpRequest *reque
     }
     http_text(client, request, 400, "Invalid container upload request.");
 }
+
+static void container_http_download(Connection *client, HttpRequest *request) {
+    const char *suffix = request->path + strlen("/api/container-downloads/");
+    if (strcmp(request->method, "GET") && strcmp(request->method, "HEAD")) {
+        http_text(client, request, 405, "Unsupported method."); return;
+    }
+    if (strlen(suffix) < 38 || suffix[36] != '/') {
+        http_text(client, request, 404, "Not found."); return;
+    }
+    char id[37]; memcpy(id, suffix, 36); id[36] = 0;
+    const char *name = suffix + 37;
+    if (!container_uuid(id) || !*name || strlen(name) > 240 ||
+        strspn(name, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.") != strlen(name)) {
+        http_text(client, request, 404, "Not found."); return;
+    }
+    char *root = container_transfer_directory(id, false);
+    wchar_t *wide_root = root ? win_wide(root) : NULL;
+    DWORD attributes = wide_root ? GetFileAttributesW(wide_root) : INVALID_FILE_ATTRIBUTES;
+    free(wide_root);
+    char *path = root ? win_join(root, "container.outershell-container") : NULL;
+    wchar_t *wide = path ? win_wide(path) : NULL;
+    HANDLE file = wide && attributes != INVALID_FILE_ATTRIBUTES && !(attributes & FILE_ATTRIBUTE_REPARSE_POINT)
+        ? CreateFileW(wide, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, NULL)
+        : INVALID_HANDLE_VALUE;
+    free(wide); free(root); free(path);
+    LARGE_INTEGER size; BY_HANDLE_FILE_INFORMATION info;
+    if (file == INVALID_HANDLE_VALUE || !GetFileInformationByHandle(file, &info) ||
+        (info.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) ||
+        !GetFileSizeEx(file, &size) || size.QuadPart < 0) {
+        if (file != INVALID_HANDLE_VALUE) CloseHandle(file);
+        http_text(client, request, 404, "The prepared container archive does not exist."); return;
+    }
+    char disposition[280]; snprintf(disposition, sizeof(disposition), "attachment; filename=\"%s\"", name);
+    uint64_t remaining = (uint64_t)size.QuadPart;
+    if (http_header(client, 200, "application/octet-stream", remaining, disposition) && strcmp(request->method, "HEAD")) {
+        char buffer[65536];
+        while (remaining) {
+            DWORD count = 0, wanted = remaining < sizeof(buffer) ? (DWORD)remaining : (DWORD)sizeof(buffer);
+            if (!ReadFile(file, buffer, wanted, &count, NULL) || !count || !connection_write(client, buffer, count)) break;
+            remaining -= count;
+        }
+    }
+    CloseHandle(file);
+}
