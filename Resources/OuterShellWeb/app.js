@@ -691,7 +691,17 @@
     "Please install JupyterLab so I can write and run Python notebooks, and add it to Outer Shell."
   ];
 
+  function addContainer() {
+    return state.addWorkspace && state.addWorkspace.runtimeKind !== "wsl" ? state.addWorkspace : null;
+  }
+
   function agentConnection() {
+    const workspace = state.addWorkspace;
+    if (workspace) {
+      const terminal = containerCommands(workspace).find(command => command.id === "terminal");
+      const variant = terminal && containerCommandVariants(terminal)[0];
+      return { command: variant?.text || "", local: !variant?.name.startsWith("SSH"), workspace };
+    }
     const args = window.outerLoop?.sessionContext?.sshCommandArguments;
     if (Array.isArray(args) && args.length && args.every(arg => typeof arg === "string")) {
       return { command: args.map(shellQuotedArgument).join(" "), local: false };
@@ -700,10 +710,15 @@
   }
 
   function agentPrompt(request, connection = agentConnection()) {
-    const destination = connection.command ? `Connect to this server using:\n${connection.command}`
+    const destination = connection.workspace
+      ? `${connection.local ? "On the server, enter" : "Connect to"} ${connection.workspace.runtimeKind === "wsl" ? "the Linux environment" : "the container"} ${connection.workspace.name}${connection.command ? ` using:\n${connection.command}` : "."}`
+      : connection.command ? `Connect to this server using:\n${connection.command}`
       : connection.local ? "Work on this server, where Outer Shell is running."
       : "Work on the server running Outer Shell.";
-    return `${destination}\n\nRead https://outershell.org/api/ for Outer Shell integration instructions.\n\n${request}`;
+    const containerContext = connection.workspace && connection.workspace.runtimeKind !== "wsl"
+      ? "\n\nInstall and register apps inside this container. Read https://outershell.org/api/containers/ for instructions on publishing apps and preserving changes across rebuilds. Keep user data in persistent or mounted folders."
+      : "";
+    return `${destination}\n\nRead https://outershell.org/api/ for Outer Shell integration instructions.${containerContext}\n\n${request}`;
   }
 
   function openCodeItem() {
@@ -713,16 +728,21 @@
   function codingAgentHTML() {
     const connection = agentConnection();
     const prompt = agentPrompt("[Your request here]", connection);
+    const container = addContainer();
+    const openCode = container?.apps?.find(app => /opencode/i.test(app.serviceID) || /opencode/i.test(app.displayName));
+    const hosted = container
+      ? `<aside class="agent-hosted"><h2>Want a coding agent here?</h2><p>OpenCode runs inside this container. Use it from your phone or computer to install tools and build things.</p>${openCode ? `<a class="primary-button" href="${escapeHTML(safeSpaceAppNavigationURL(container, openCode))}" data-action="launch-safe-space-app" data-safe-space-id="${escapeHTML(container.id)}" data-service-id="${escapeHTML(openCode.serviceID)}" data-frontend-key="${escapeHTML(containerFrontendKey(openCode))}">Open OpenCode →</a>` : managedContainer(container) ? `<button class="primary-button" type="button" data-action="configure-container" data-safe-space-id="${escapeHTML(container.id)}">Set up OpenCode →</button><small>In the Dockerfile editor, choose Add OpenCode, then Save &amp; rebuild.</small>` : "<p>Ask your coding agent to install OpenCode in this container.</p>"}<small>Bring your model provider account or API key.</small></aside>`
+      : state.addWorkspace ? "" : `<aside class="agent-hosted"><h2>Want a coding agent here?</h2><p>OpenCode runs on this server. Use it from your phone or computer to install tools and build things.</p><div class="agent-actions"><button class="primary-button" data-action="setup-opencode" type="button">${openCodeItem() ? "Open OpenCode" : "Set up OpenCode"} <span aria-hidden="true">→</span></button><button class="secondary-button" data-action="setup-container-opencode" type="button">Set up in a container</button></div><small>Bring your model provider account or API key.</small></aside>`;
     return `<div class="coding-agent-panel">
-      <div class="customize-intro"><h3>Add something with a coding agent</h3><p>Notebooks, experiments, dashboards, your own apps. Tell a coding agent what you’d like to use here.</p></div>
+      <div class="customize-intro"><h3>${container ? "Edit your Dockerfile with a coding agent" : "Add something with a coding agent"}</h3><p>${container ? "Describe the tools and apps you want. Your coding agent can update the Dockerfile and apply changes in the running container, so they’re available now and survive a rebuild." : "Notebooks, experiments, dashboards, your own apps. Tell a coding agent what you’d like to use here."}</p></div>
       <div class="agent-options">
         <section class="agent-own agent-guide" aria-labelledby="own-agent-title"><h2 id="own-agent-title">Use your coding agent</h2><p>Paste these details into your agent, then add your request.</p>
           ${!connection.command && !connection.local ? '<p class="field-note">Outer Loop includes your SSH command here automatically.</p>' : ""}
-          <pre>${escapeHTML(prompt).replace("https://outershell.org/api/", '<a href="https://outershell.org/api/" target="_blank" rel="noopener noreferrer">https://outershell.org/api/</a>')}</pre>
+          <pre>${escapeHTML(prompt).replace(/https:\/\/outershell\.org\/api\/(?:containers\/)?/g, url => `<a href="${url}" target="_blank" rel="noopener noreferrer">${url}</a>`)}</pre>
           <button class="secondary-button" type="button" data-action="copy-agent-prompt">Copy prompt</button>
           <div class="customize-examples"><h2>A few things you could ask</h2>${agentExamples.map((example, index) => `<button type="button" data-action="example-prompt" data-example="${index}" aria-label="${escapeHTML(`Copy example: ${example}`)}"><span>${escapeHTML(example)}</span><span class="example-copy" aria-hidden="true">Copy</span></button>`).join("")}</div>
         </section>
-        <aside class="agent-hosted"><h2>Want a coding agent here?</h2><p>OpenCode runs on this server. Use it from your phone or computer to install tools and build things.</p><button class="primary-button" data-action="setup-opencode" type="button">${openCodeItem() ? "Open OpenCode" : "Set up OpenCode"} <span aria-hidden="true">→</span></button><button class="secondary-button" data-action="setup-container-opencode" type="button">Set up in a container</button><small>Bring your model provider account or API key.</small></aside>
+        ${hosted}
       </div>
     </div>`;
   }
@@ -889,7 +909,7 @@
       const addMore = workspace?.runtimeKind === "wsl"
         ? `<button class="overview-add-more" type="button" data-action="open-wsl-add" data-safe-space-id="${id}" data-scope="${group.id.endsWith(":root") ? "system" : "user"}" >Add more…</button>`
         : workspace
-        ? `<button class="overview-add-more" type="button" data-action="configure-container" data-safe-space-id="${id}" ${preparing || !managedContainer(workspace) ? "disabled" : ""} ${!managedContainer(workspace) ? 'title="This container is managed externally"' : ""}>Add more to Dockerfile…</button>`
+        ? `<button class="overview-add-more" type="button" data-action="open-container-add" data-safe-space-id="${id}" ${preparing ? "disabled" : ""}>Add more…</button>`
         : `<button class="overview-add-more" type="button" data-action="open-add" data-scope="${group.id === "root" ? "system" : "user"}">Add more…</button>`;
       return `<section class="overview-identity" data-group-id="${escapeHTML(group.id)}"><header class="overview-group-handle" tabindex="0" aria-label="Reorder ${escapeHTML(group.name)}${group.shield ? ", Administrator" : ""}. Hold and drag, or use arrow keys." title="Hold and drag to reorder" data-group-handle><div class="overview-group-heading"><h2>${escapeHTML(group.name)}</h2><p>${shield}${escapeHTML(group.note)}</p></div>${controls}</header><div class="overview-shortcuts" data-endpoint-area="pins">${pins.map(key => group.entries.find(entry => entry.key === key)).filter(Boolean).map(overviewShortcut).join("")}</div><div class="overview-list" data-endpoint-area="list">${listed.map(overviewEndpoint).join("") || `<p class="overview-empty">${state.loading || (workspace && state.safeSpacesLoading) ? "Loading…" : group.entries.length ? "" : "No registered endpoints."}</p>`}</div>${containerCommandsHTML(workspace)}${workspace?.buildProgress ? `<details class="container-build-progress"><summary>${escapeHTML(workspace.buildProgress.detail || workspace.buildProgress.phase)}</summary><pre>${escapeHTML(workspace.buildProgress.log || "")}</pre></details>` : ""}${addMore}</section>`;
     }).join("") + `<button class="overview-add-container" type="button" data-action="create-container"><span aria-hidden="true">+</span>Add container (beta)…</button><button class="overview-add-container" type="button" data-action="import-container">Import container…</button>`;
@@ -1508,6 +1528,8 @@
   }
 
   function openAddDialog(tab = state.addTab) {
+    const container = addContainer();
+    if ((container && !["agent", "dockerfile"].includes(tab)) || (tab === "dockerfile" && (!container || !managedContainer(container)))) tab = "agent";
     const windowsCommands = state.hostPlatform === "windows" && !state.addWorkspace;
     state.addTab = tab;
     const apps = (state.addWorkspace ? state.workspaceCatalog || [] : state.backends).filter(backend => backend.serviceID !== "org.outershell.OuterShell" && backend.isBundled && !backend.isMigration && backend.serviceScope === state.addScope)
@@ -1541,17 +1563,19 @@
       <footer class="dialog-footer"><button class="secondary-button" type="button" data-action="close-dialog">Cancel</button><button class="primary-button" type="submit">Create app</button></footer>
     </form>`;
     const codingAgent = codingAgentHTML();
+    const dockerfile = container ? `<div class="customize-intro"><h3>Edit your Dockerfile directly</h3><p>Write the Dockerfile changes yourself, or use the Coding agent option to help write them. Both approaches preserve your setup across rebuilds.</p><p class="dockerfile-details">The container editor also includes folder mounts, environment values, and runtime settings for ${escapeHTML(container.name)}.</p><div class="add-actions"><button class="primary-button" type="button" data-action="configure-container" data-safe-space-id="${escapeHTML(container.id)}">Edit container…</button></div></div>` : "";
     const categories = [
       ["agent", "Coding agent", '<path d="M21 11a8 8 0 0 1-8 8H7l-5 3V11a9 9 0 0 1 19 0Z"/><path d="m7 9 3 3-3 3m6 0h4"/>'],
+      ...(container && managedContainer(container) ? [["dockerfile", "Edit Dockerfile", '<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8Z"/><path d="M14 2v6h6M8 13h8M8 17h6"/>']] : []),
       ["catalog", "Outer Shell app catalog", '<rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/>'],
       ["bash", windowsCommands ? "Run commands" : "Run bash commands", '<rect x="2" y="3" width="20" height="18" rx="2"/><path d="m6 8 3 3-3 3m6 0h5"/>'],
       ["recipes", "Other recipes", '<rect x="2" y="3" width="20" height="18" rx="2"/><path d="M6 8h1m3 0h8M6 12h1m3 0h8M6 16h1m3 0h5"/>']
-    ].filter(([id]) => (!(state.addWorkspace || windowsCommands) || state.addScope !== "system" || id === "catalog" || id === "agent" || windowsCommands && id === "bash") && (!windowsCommands || id !== "recipes"));
+    ].filter(([id]) => (!container || id === "agent" || id === "dockerfile") && (!(state.addWorkspace || windowsCommands) || state.addScope !== "system" || id === "catalog" || id === "agent" || id === "dockerfile" || windowsCommands && id === "bash") && (!windowsCommands || id !== "recipes"));
     const dialog = openDialog(`
-      <header class="dialog-header"><div class="dialog-title-wrap"><h2 id="dialog-title">Add Apps${state.addWorkspace ? ` · ${escapeHTML(state.addWorkspace.name)} / ${state.addScope === "system" ? "root" : escapeHTML(state.addWorkspace.userName || "user")}` : ""}</h2></div><button class="dialog-close" type="button" data-action="close-dialog" aria-label="Close">×</button></header>
+      <header class="dialog-header"><div class="dialog-title-wrap"><h2 id="dialog-title">Add Apps${state.addWorkspace ? ` · ${escapeHTML(state.addWorkspace.name)}${container ? "" : ` / ${state.addScope === "system" ? "root" : escapeHTML(state.addWorkspace.userName || "user")}`}` : ""}</h2></div><button class="dialog-close" type="button" data-action="close-dialog" aria-label="Close">×</button></header>
       <div class="dialog-body">
         <nav class="add-categories" aria-label="Add app type">${categories.map(([id, title, paths]) => `<button class="add-category" type="button" data-action="add-tab" data-tab="${id}" aria-pressed="${tab === id}"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${paths}</svg><span>${title}</span></button>`).join("")}</nav>
-        <section class="add-content" aria-label="${categories.find(([id]) => id === tab)?.[1] || "Apps"}">${tab === "catalog" ? catalog : tab === "bash" ? bash : tab === "agent" ? codingAgent : '<div id="add-recipes" aria-live="polite">Loading recipes…</div>'}</section>
+        <section class="add-content" aria-label="${categories.find(([id]) => id === tab)?.[1] || "Apps"}">${tab === "dockerfile" ? dockerfile : tab === "catalog" ? catalog : tab === "bash" ? bash : tab === "agent" ? codingAgent : '<div id="add-recipes" aria-live="polite">Loading recipes…</div>'}</section>
       </div>`, "add-apps-dialog");
     if (tab === "bash") wireBashForm(dialog);
     if (tab === "recipes") loadAddRecipes(dialog);
@@ -2127,6 +2151,43 @@
     });
   }
 
+  function openDeleteContainer(id) {
+    const workspace = findSafeSpace(id);
+    if (!workspace || workspace.runtimeKind === "wsl" || containerPreparing(workspace)) return;
+    const managed = managedContainer(workspace);
+    const title = managed ? `Delete ${workspace.name}?` : `Remove ${workspace.name} from Outer Shell?`;
+    const detail = managed
+      ? state.hostPlatform === "windows"
+        ? "The container and its runtime-managed persistent data will be permanently deleted. Saved Dockerfiles and mounted folders will remain on the Windows server. This cannot be undone."
+        : "The container, its runtime-managed persistent data, and its Outer Shell configuration will be permanently deleted. Mounted folders will remain on the server. This cannot be undone."
+      : "Outer Shell will forget this registration. The externally managed container and all of its data will remain unchanged.";
+    const label = managed ? "Delete container" : "Remove registration";
+    const dialog = openDialog(`${containerDialogHeader(title)}
+      <form><div class="dialog-body"><p>${escapeHTML(detail)}</p><p class="form-message" role="status"></p></div>
+      <footer class="dialog-footer"><button class="secondary-button" type="button" data-action="close-dialog">Cancel</button><button class="danger-button" type="submit">${label}</button></footer></form>`);
+    const form = dialog.querySelector("form");
+    form.addEventListener("submit", async event => {
+      event.preventDefault();
+      const button = form.querySelector('[type="submit"]');
+      if (button.disabled) return;
+      const message = form.querySelector(".form-message");
+      button.disabled = true;
+      button.textContent = managed ? "Deleting…" : "Removing…";
+      message.textContent = "";
+      try {
+        await containerOperation("delete", { workspaceID: id });
+        if (dialog.isConnected) closeDialog();
+        toast(managed ? "Container deleted." : "Container registration removed.");
+        await refreshSafeSpaces({ quiet: true });
+      } catch (error) {
+        message.textContent = error.message || String(error);
+        button.disabled = false;
+        button.textContent = label;
+      }
+    });
+    dialog.querySelector('[data-action="close-dialog"]')?.focus();
+  }
+
   function openContainerMenu(id, serviceID, frontendKey, point = null, context = "endpoint") {
     const workspace = findSafeSpace(id);
     if (!workspace) return;
@@ -2146,7 +2207,8 @@
         <button class="context-menu-item" type="button" data-action="container-control" data-operation="${operation}" ${attributes} role="menuitem" ${preparing ? "disabled" : ""}>${contextMenuGlyph(running ? "■" : "▶")}<span>${preparing ? "Preparing…" : running ? "Stop" : "Start"}</span></button>
         ${app && workspace.runtimeKind === "wsl" ? `<button class="context-menu-item" type="button" data-action="uninstall-wsl-app" ${attributes} role="menuitem">${contextMenuGlyph("×")}<span>Uninstall</span></button>` : ""}
         ${app && url !== "#" ? `<button class="context-menu-item" type="button" data-action="copy-container-url" ${attributes} role="menuitem">${contextMenuGlyph("⧉")}<span>Copy URL</span></button>` : ""}
-      </section>`, point, `${name} actions`);
+      </section>
+      ${!app && workspace.runtimeKind !== "wsl" ? `<section class="context-menu-section"><button class="context-menu-item danger" type="button" data-action="delete-container" data-safe-space-id="${escapeHTML(id)}" role="menuitem" ${preparing ? "disabled" : ""}>${contextMenuGlyph("×")}<span>${managedContainer(workspace) ? "Delete container…" : "Remove from Outer Shell…"}</span></button></section>` : ""}`, point, `${name} actions`);
   }
 
   function openOuterShellAbout(key) {
@@ -2597,6 +2659,7 @@
     if (action === "import-container") { openContainerImport(); return; }
     if (action === "create-container") { openCreateContainer(); return; }
     if (action === "configure-container") { openContainerConfiguration(actionElement.dataset.safeSpaceId); return; }
+    if (action === "delete-container") { openDeleteContainer(actionElement.dataset.safeSpaceId); return; }
     if (action === "share-container") { openShareContainer(actionElement.dataset.safeSpaceId); return; }
     if (action === "edit-bookmark") { const bounds = actionElement.getBoundingClientRect(); openAppMenu(actionElement.dataset.appKey, { x: bounds.left, y: bounds.bottom + 4 }, menuContext(actionElement)); return; }
     if (action === "copy-url") {
@@ -2640,6 +2703,11 @@
       return;
     }
     if (action === "close-dialog") { closeDialog(); return; }
+    if (action === "open-container-add") {
+      const workspace = findSafeSpace(actionElement.dataset.safeSpaceId);
+      if (workspace) { state.addWorkspace = workspace; state.addScope = "user"; openAddDialog("agent"); }
+      return;
+    }
     if (action === "open-wsl-add") { const workspace = findSafeSpace(actionElement.dataset.safeSpaceId); if (workspace) await openWorkspaceAdd(workspace, actionElement.dataset.scope); return; }
     if (action === "open-add") { state.addWorkspace = null; state.addScope = actionElement.dataset.scope || (state.backends.some(backend => backend.serviceID === "org.outershell.OuterShell" && backend.serviceScope === "system") ? "system" : "user"); openAddDialog(); return; }
     if (action === "start-safe-space") {

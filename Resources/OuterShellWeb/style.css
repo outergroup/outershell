@@ -141,7 +141,13 @@ button:disabled { cursor: default; opacity: .58; }
   justify-content: center;
   gap: 6px;
   padding: 7px 13px;
+  min-height: 36px;
+  border: 1px solid var(--line-strong);
+  border-radius: 9px;
+  font: inherit;
   font-weight: 620;
+  text-decoration: none;
+  cursor: pointer;
 }
 
 .primary-button { border-color: transparent; color: white; background: var(--accent-strong); }
@@ -1129,10 +1135,12 @@ h1 { margin: 0; font-size: clamp(30px, 5vw, 45px); line-height: 1.05; letter-spa
 
 .coding-agent-panel { max-width: 100%; line-height: 1.6; }
 .coding-agent-panel p { color: var(--muted); }
-.coding-agent-panel a { color: #1683ff; }
+.coding-agent-panel a:not(.primary-button):not(.secondary-button) { color: #1683ff; }
 
 .customize-intro { max-width: 620px; }
 .customize-intro h3 { margin: 0 0 8px; font-size: 20px; }
+.add-actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 24px; }
+.customize-intro .dockerfile-details { margin-top: 12px; }
 .customize-intro p { color: var(--muted); font-size: 15px; margin: 0; }
 .coding-agent-panel h2 { margin: 0; font-size: 16px; font-weight: 600; }
 .customize-examples { margin-top: 24px; padding-top: 20px; border-top: 1px solid var(--line); }
@@ -1153,6 +1161,7 @@ h1 { margin: 0; font-size: clamp(30px, 5vw, 45px); line-height: 1.05; letter-spa
 .agent-own > p, .agent-hosted p { margin: 8px 0 16px; }
 .agent-own pre { margin: 0 0 12px; font-size: 13px; user-select: text; }
 .agent-hosted { padding: 20px; border: 1px solid var(--line); border-radius: 12px; background: var(--accent-soft); }
+.agent-actions { display: flex; flex-direction: column; align-items: flex-start; gap: 10px; }
 .agent-hosted small { display: block; margin-top: 12px; font-size: 12px; color: var(--muted); }
 .example-copy { color: var(--muted); font-size: 12px; flex-shrink: 0; }
 @media (max-width: 700px) {
