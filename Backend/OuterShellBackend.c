@@ -2506,6 +2506,13 @@ static bool process_http_client_request(ReactorClient *client, char *request, si
     } else if (strcmp(target, "/web/opencode-start.sh") == 0 || strcmp(target, "/web/outer-shell-skill.md") == 0 || strcmp(target, "/web/server-admin.md") == 0 || strcmp(target, "/web/opencode-start.ps1") == 0 || strcmp(target, "/web/opencode-container.Dockerfile") == 0 || strcmp(target, "/web/container-agent.md") == 0 || strcmp(target, "/web/container-outerctl.md") == 0) {
         send_versioned_web_asset(fd, target + 5, "text/plain; charset=utf-8", query,
                                  request, header_length, strcasecmp(method, "HEAD") != 0);
+    } else if (strcmp(target, "/web/icons/org.outershell.Files.png") == 0 ||
+               strcmp(target, "/web/icons/org.outershell.Plaintext.png") == 0 ||
+               strcmp(target, "/web/icons/org.outershell.Top.png") == 0 ||
+               strcmp(target, "/web/icons/opencode.svg") == 0) {
+        send_versioned_web_asset(fd, target + 5,
+                                 strstr(target, ".svg") ? "image/svg+xml" : "image/png", query,
+                                 request, header_length, strcasecmp(method, "HEAD") != 0);
     } else if (strcmp(target, "/web/favicon.png") == 0) {
         send_web_app_icon(fd, request, header_length, strcasecmp(method, "HEAD") != 0);
     } else {

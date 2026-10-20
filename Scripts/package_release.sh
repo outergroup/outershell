@@ -539,8 +539,10 @@ EOF
     mkdir -p "$app_install_root" "$tools_install_root" "$outershell_home/bin" "$log_dir"
     ditto "$payload/apps/$service_id/Outer Shell.app" "$app_install_root/Outer Shell.app"
     ditto "$payload/apps/$service_id/native-app-template" "$app_install_root/native-app-template"
-    install -m 0755 "$payload/tools/outershelld" "$outershelld_path"
-    install -m 0755 "$payload/tools/outerctl" "$outerctl_path"
+    install -m 0755 "$payload/tools/outershelld" "$tools_install_root/outershelld.new"
+    mv -f "$tools_install_root/outershelld.new" "$outershelld_path"
+    install -m 0755 "$payload/tools/outerctl" "$outershell_home/bin/outerctl.new"
+    mv -f "$outershell_home/bin/outerctl.new" "$outerctl_path"
     rm -rf "$payload_root"
     chmod 0755 "$app_install_root/Outer Shell.app/Contents/MacOS/Outer Shell"
     chmod 0755 "$outershelld_path"
@@ -631,6 +633,10 @@ EOF
         sleep 0.1
         attempts=$((attempts - 1))
     done
+    if [ "$attempts" -eq 0 ]; then
+        echo "Outer Shell did not start. Check $log_path." >&2
+        exit 1
+    fi
     OUTERSHELL_HOME="$outershell_home" "$outerctl_path" backend upsert --backend "$service_id" --name "$display_name" --launchd-plist "$plist_path" --outershell-owns true
     OUTERSHELL_HOME="$outershell_home" "$outerctl_path" app remove --backend "$service_id" --frontend-id "$service_id:main"
     OUTERSHELL_HOME="$outershell_home" "$outerctl_path" app upsert --backend "$service_id" --socket-path "$socket_path" --name "$display_name" --url "/" --icon-path "$icon_path"

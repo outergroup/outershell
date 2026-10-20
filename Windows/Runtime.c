@@ -111,9 +111,16 @@ static PSECURITY_DESCRIPTOR security_descriptor(bool directory) {
         return NULL;
     return sd;
 }
-bool win_secure_directory(const char *path) {
+static bool secure_directory(const char *path, bool public_read) {
     wchar_t *wide = win_wide(path);
-    PSECURITY_DESCRIPTOR sd = security_descriptor(true);
+    PSECURITY_DESCRIPTOR sd = NULL;
+    if (public_read) {
+        ConvertStringSecurityDescriptorToSecurityDescriptorA(
+            "O:SYD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;GRGX;;;AU)",
+            SDDL_REVISION_1, &sd, NULL);
+    } else {
+        sd = security_descriptor(true);
+    }
     if (!wide || !sd) {
         free(wide);
         LocalFree(sd);
@@ -146,6 +153,10 @@ bool win_secure_directory(const char *path) {
     LocalFree(sd);
     return ok;
 }
+bool win_secure_directory(const char *path) {
+    return secure_directory(path, false);
+}
+
 bool win_atomic_write(const char *path, const void *data, size_t length) {
     wchar_t *wide = win_wide(path);
     if (!wide)
@@ -970,5 +981,21 @@ bool win_set_pipe_activation(const char *pipe, const char *task) {
     if (ok) ok = win_atomic_write(path, updated.data, updated.length);
     if (lock != INVALID_HANDLE_VALUE) CloseHandle(lock);
     free(contents.data); free(updated.data); free(path);
+    return ok;
+}
+
+bool win_publish_endpoint_names(const char *publisher, const StringBuilder *names) {
+    if (names->length > 65536) return false;
+    char *sid = win_sid();
+    bool system = sid && !strcmp(sid, "S-1-5-18");
+    free(sid);
+    char *base = win_folder(system ? CSIDL_COMMON_APPDATA : CSIDL_LOCAL_APPDATA);
+    if (!base) return false;
+    char *parent = win_join(base, "OuterSSH");
+    char *directory = win_join(parent, "endpoints.d");
+    char *path = win_join(directory, publisher);
+    bool ok = secure_directory(parent, system) && secure_directory(directory, system) &&
+        win_atomic_write(path, names->data, names->length);
+    free(path); free(directory); free(parent); free(base);
     return ok;
 }

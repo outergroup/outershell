@@ -73,7 +73,7 @@ ref(layout + 16, 'Retired user group', 64)
 Path(sys.argv[1]).write_bytes(data)
 PYFIXTURE
 
-OUTERSHELL_HOME="$build_dir/home" "$build_dir/outershelld" \
+HOME="$build_dir/home" XDG_CONFIG_HOME="$build_dir/home/.config" OUTERSHELL_HOME="$build_dir/home" "$build_dir/outershelld" \
     --service-manager internal \
     --services-dir "$build_dir/home/services" \
     --api-socket-path "$api_socket" \
@@ -90,6 +90,16 @@ done
 outerctl() {
     OUTERSHELLD_API_SOCKET="$api_socket" "$build_dir/outerctl" "$@"
 }
+
+python3 - "$build_dir/home" <<'PYUPGRADE'
+from pathlib import Path
+import sys
+home = Path(sys.argv[1])
+base = home / ("Library/Application Support/org.outerssh" if sys.platform == "darwin" else ".config/outerssh")
+lines = (base / "endpoints.d/outershell").read_text().splitlines()
+assert lines[0] == "outerssh-endpoints-v2"
+assert ["tcp 127.0.0.1 8123", "", "Legacy app"] in [lines[i:i+3] for i in range(1, len(lines), 3)]
+PYUPGRADE
 
 outerctl app list --backend legacy.backend >"$build_dir/legacy.tsv"
 awk -F '\t' '
@@ -146,6 +156,39 @@ for number in 1 2 3; do
         --rank "$number" \
         --capabilities view,edit
 done
+
+outerctl app upsert --backend test.backend.1 --frontend-id test.app.1 --name "App 1" --socket-path /tmp/test-app-1.sock --path /app-1 --icon-path /icons/1.png
+python3 - "$build_dir/home" <<'PYNAMES'
+from pathlib import Path
+import sys
+home = Path(sys.argv[1])
+base = home / ("Library/Application Support/org.outerssh" if sys.platform == "darwin" else ".config/outerssh")
+lines = (base / "endpoints.d/outershell").read_text().splitlines()
+assert lines.pop(0) == "outerssh-endpoints-v2"
+assert len(lines) % 3 == 0
+records = [lines[i:i+3] for i in range(0, len(lines), 3)]
+assert any(r[0] == "unix /tmp/test-app-1.sock" and r[2] == "App 1" for r in records)
+assert any(r[0] == "tcp localhost 8002" and r[2] == "App 2" for r in records)
+assert not any(r[2] == "Legacy app" for r in records)
+PYNAMES
+outerctl app list --backend test.backend.1 >"$build_dir/before-external.tsv"
+outerctl app upsert --backend test.backend.1 --frontend-id test.app.1 \
+    --external-socket-path '\\.\pipe\wslc.test'
+outerctl app list --backend test.backend.1 >"$build_dir/after-external.tsv"
+python3 - "$build_dir/before-external.tsv" "$build_dir/after-external.tsv" <<'PYCHECK'
+import csv,sys
+with open(sys.argv[1]) as f: before=list(csv.DictReader(f,delimiter="\t"))[0]
+with open(sys.argv[2]) as f: after=list(csv.DictReader(f,delimiter="\t"))[0]
+assert after.pop("external_socket_path").replace("\\\\", "\\") == r"\\.\pipe\wslc.test"
+before.pop("external_socket_path")
+assert before == after, (before, after)
+PYCHECK
+if outerctl app upsert --backend test.backend.2 --frontend-id test.app.1 --external-socket-path /tmp/other; then
+    echo "Cross-backend endpoint update accepted" >&2; exit 1
+fi
+if outerctl app upsert --backend test.backend.1 --frontend-id test.app.1 --external-socket-path relative; then
+    echo "Relative external endpoint accepted" >&2; exit 1
+fi
 
 assert_three_rows() {
     resource="$1"

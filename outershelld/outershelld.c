@@ -324,7 +324,7 @@ static void outerssh_http_unix_allowlist_path(bool system_scope, char *out, size
         snprintf(out, out_size, "/etc/outerssh/http-unix.allow");
     } else {
         const char *config_home = getenv("XDG_CONFIG_HOME");
-        if (config_home && config_home[0]) {
+        if (config_home && config_home[0] == '/') {
             snprintf(out, out_size, "%s/outerssh/http-unix.allow", config_home);
         } else {
             snprintf(out, out_size, "%s/.config/outerssh/http-unix.allow", home_directory());
@@ -4601,10 +4601,70 @@ static uint64_t current_log_path_event_version(const char *raw_path) {
     return mix_u64(current_backends_event_version(), file_state_token(path));
 }
 
+#include "../Backend/EndpointNames.h"
+
+static void publish_endpoint_names(void) {
+    RegistryStore store;
+    char error[512] = "", path[PATH_MAX], directory[PATH_MAX], temporary[PATH_MAX];
+    if (!registry_store_open_user_readonly(&store, error, sizeof(error))) return;
+    bool system = direct_root_session_uses_system_scope();
+    outerssh_http_unix_allowlist_path(system, directory, sizeof(directory));
+    char *separator = strrchr(directory, '/');
+    if (!separator) { registry_store_free(&store); return; }
+    *separator = 0;
+    size_t used = strlen(directory);
+    snprintf(directory + used, sizeof(directory) - used, "/endpoints.d");
+    snprintf(path, sizeof(path), "%s/outershell", directory);
+    snprintf(temporary, sizeof(temporary), "%s/.outershell-XXXXXX", directory);
+    StringBuilder text = {0};
+    bool ok = sb_append(&text, "outerssh-endpoints-v2\n");
+    for (size_t i = 0; ok && i < store.frontend_count; i++) {
+        const RegistryFrontendRecord *app = &store.frontends[i];
+        if (app->socket_path && app->socket_path[0]) {
+            ok = endpoint_name_append(&text, "unix", app->socket_path, 0, "", app->display_name);
+        } else if (app->port > 0) {
+            const char *host = app->host && app->host[0] ? app->host : "localhost";
+            ok = endpoint_name_append(&text, "tcp", host, app->port, "", app->display_name);
+            if (!strcmp(host, "localhost") || !strcmp(host, "127.0.0.1") || !strcmp(host, "::1")) {
+                const char *aliases[] = {"localhost", "127.0.0.1", "::1"};
+                for (size_t j = 0; ok && j < 3; j++)
+                    if (strcmp(host, aliases[j])) ok = endpoint_name_append(&text, "tcp", aliases[j], app->port, "", app->display_name);
+            }
+        }
+    }
+    registry_store_free(&store);
+    if (ok && text.length <= 65536 && mkdir_p(directory)) {
+        if (system && chmod(directory, 0755) != 0) {
+            fprintf(stderr, "Could not make system endpoint names readable: %s\n", strerror(errno));
+            free(text.data);
+            return;
+        }
+        int fd = mkstemp(temporary);
+        if (fd >= 0) {
+            size_t offset = 0;
+            while (offset < text.length) {
+                ssize_t n = write(fd, text.data + offset, text.length - offset);
+                if (n < 0 && errno == EINTR) continue;
+                if (n <= 0) break;
+                offset += (size_t)n;
+            }
+            bool complete = offset == text.length;
+            if (fchmod(fd, system ? 0644 : 0600) != 0) complete = false;
+            if (close(fd) != 0) complete = false;
+            if (!complete || rename(temporary, path) != 0) {
+                fprintf(stderr, "Could not publish OuterSSH endpoint names: %s\n", strerror(errno));
+                unlink(temporary);
+            }
+        }
+    }
+    free(text.data);
+}
+
 static void mark_backend_event_changed(void) {
 #ifdef __APPLE__
     invalidate_launchd_status();
 #endif
+    publish_endpoint_names();
     publish_backend_event_changed();
 }
 
@@ -8085,6 +8145,12 @@ static bool remove_managed_outerservice(const char *service_id,
     return true;
 }
 
+static bool valid_external_socket_path(const char *path) {
+    return path && (path[0] == '/' ||
+        (strncmp(path, "\\\\.\\pipe\\", 9) == 0 && path[9] && !strchr(path + 9, '/') &&
+         !strchr(path + 9, '\r') && !strchr(path + 9, '\n')));
+}
+
 static int outershelld_handle_outerctl(int argc, char **argv, StringBuilder *stdout_buffer, StringBuilder *stderr_buffer) {
     if (argc < 3) {
         sb_append(stderr_buffer, "Usage: outerctl <resource> <action> [options]\n");
@@ -8542,6 +8608,20 @@ static int outershelld_handle_outerctl(int argc, char **argv, StringBuilder *std
         } else if (has_socket && frontend_host && frontend_host[0]) {
             snprintf(error, sizeof(error), "Specify --host only with TCP endpoints.");
             ok = false;
+        } else if (strcmp(action, "upsert") == 0 && external_socket_path &&
+                   (!display_name || !display_name[0]) && !has_socket && !has_port) {
+            RegistryFrontendRecord *record = registry_store_find_frontend(&database, stable_frontend_id);
+            if (!record || strcmp(record->service_id, backend) != 0) {
+                snprintf(error, sizeof(error), "App frontend not registered for this backend.");
+                ok = false;
+            } else if (!valid_external_socket_path(external_socket_path)) {
+                snprintf(error, sizeof(error), "Invalid external socket path.");
+                ok = false;
+            } else if (!record->external_socket_path || strcmp(record->external_socket_path, external_socket_path)) {
+                ok = registry_assign_string(&record->external_socket_path, external_socket_path);
+                changed = ok;
+                if (!ok) snprintf(error, sizeof(error), "Out of memory.");
+            }
         } else if (strcmp(action, "upsert") == 0) {
             if (!display_name || !display_name[0]) {
                 snprintf(error, sizeof(error), "Missing app display name.");
@@ -8607,7 +8687,7 @@ static int outershelld_handle_outerctl(int argc, char **argv, StringBuilder *std
                 snprintf(allowlist_socket_path, sizeof(allowlist_socket_path), "%s", socket_path);
             }
             if (ok && external_socket_path) {
-                if (external_socket_path[0] && external_socket_path[0] != '/') {
+                if (external_socket_path[0] && !valid_external_socket_path(external_socket_path)) {
                     snprintf(error, sizeof(error), "Invalid external socket path.");
                     ok = false;
                 } else {
@@ -14525,6 +14605,7 @@ static void run_api_reactor(int api_listener) {
     }
     size_t client_count = 0;
     g_snapshot_requested_ms = monotonic_milliseconds();
+    publish_endpoint_names();
     set_fd_nonblocking(api_listener, true);
     while (!g_shutdown_requested && !outer_service_manager_exit_requested(g_outer_service_manager)) {
         flush_ready_event_clients(clients, &client_count);

@@ -2,6 +2,7 @@
 #include "Wsl.h"
 #include "Icons.h"
 #include "NativeRegistry.c"
+#include "../Backend/EndpointNames.h"
 #include "../Backend/OuterShellLayout.h"
 #include <shlobj.h>
 
@@ -53,11 +54,29 @@ static bool store_open(ShellHost *s, RegistryStore *store, bool write) {
 }
 static bool store_close(ShellHost *s, RegistryStore *store, bool commit) {
     char error[1024] = "Registry save failed.";
-    if (registry_store_close(store, commit, error, sizeof(error)))
-        return true;
-    log_error(s, error);
-    return false;
+    StringBuilder names = {0};
+    bool ok = sb_append(&names, "outerssh-endpoints-v2\n");
+    for (size_t i = 0; ok && i < store->frontend_count; i++) {
+        const RegistryFrontendRecord *app = &store->frontends[i];
+        if (app->socket_path && app->socket_path[0]) {
+            ok = endpoint_name_append(&names, "pipe", app->socket_path, 0, "", app->display_name);
+        } else if (app->port > 0) {
+            const char *host = app->host && app->host[0] ? app->host : "localhost";
+            ok = endpoint_name_append(&names, "tcp", host, app->port, "", app->display_name);
+            if (!strcmp(host, "localhost") || !strcmp(host, "127.0.0.1") || !strcmp(host, "::1")) {
+                const char *aliases[] = {"localhost", "127.0.0.1", "::1"};
+                for (size_t j = 0; ok && j < 3; j++)
+                    if (strcmp(host, aliases[j])) ok = endpoint_name_append(&names, "tcp", aliases[j], app->port, "", app->display_name);
+            }
+        }
+    }
+    bool saved = registry_store_close(store, commit, error, sizeof(error));
+    if (!saved) log_error(s, error);
+    else if (!ok || !win_publish_endpoint_names("outershell", &names)) log_error(s, "Could not publish endpoint names.");
+    free(names.data);
+    return saved;
 }
+
 static bool update_allowlist(ShellHost *s) {
     RegistryStore store;
     if (!store_open(s, &store, false))

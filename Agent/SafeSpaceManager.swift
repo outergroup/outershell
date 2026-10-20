@@ -605,7 +605,8 @@ final class SafeSpaceManager: @unchecked Sendable {
             guard (try? runtimeState(record)) == "running" else { continue }
             let snapshots: [SafeSpaceAppSnapshot]
             do {
-                snapshots = try await appSnapshots(for: record)
+                snapshots = await publishExternalAppEndpoints(try await appSnapshots(for: record), for: record)
+                updateCachedApps(snapshots, for: record.id)
             } catch {
                 NSLog("Could not list menu bar apps for container %@: %@",
                       record.name,
@@ -629,6 +630,18 @@ final class SafeSpaceManager: @unchecked Sendable {
                                                         name: record.name,
                                                         apps: apps))
             ensureAppEventMonitor(for: record)
+        }
+        do {
+            try saveCachedApps()
+            let workspaces: [[String: Any]] = lock.withSafeSpaceLock {
+                currentRecords.map { record in
+                    ["name": record.name,
+                     "apps": (cachedApps[record.id] ?? []).map { appDictionary($0, running: false) }]
+                }
+            }
+            try publishEndpointNames(workspaces)
+        } catch {
+            NSLog("Could not publish container endpoint names: %@", error.localizedDescription)
         }
         return containers
     }
@@ -976,7 +989,42 @@ final class SafeSpaceManager: @unchecked Sendable {
             values.append(value)
         }
         try saveCachedApps()
+        do { try publishEndpointNames(values) }
+        catch { NSLog("Could not publish container endpoint names: %@", error.localizedDescription) }
         return values
+    }
+
+    private func publishEndpointNames(_ workspaces: [[String: Any]]) throws {
+        var lines = ["outerssh-endpoints-v2"]
+        for workspace in workspaces {
+            guard let container = workspace["name"] as? String,
+                  let apps = workspace["apps"] as? [[String: Any]] else { continue }
+            for app in apps {
+                let socket = app["externalSocketPath"] as? String ?? ""
+                let name = app["displayName"] as? String ?? app["serviceID"] as? String ?? ""
+                let fields = [container, name]
+                guard !name.isEmpty, fields.allSatisfy({ $0.utf8.count <= 256 &&
+                    !$0.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains) }) else { continue }
+                let endpoints: [String]
+                if let port = app["publishedPort"] as? Int, port > 0 && port <= 65535 {
+                    endpoints = ["localhost", "127.0.0.1", "::1"].map { "tcp \($0) \(port)" }
+                } else if socket.hasPrefix("/"), socket.utf8.count < 4090,
+                          !socket.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains) {
+                    endpoints = ["unix \(socket)"]
+                } else { continue }
+                for endpoint in endpoints { lines.append(contentsOf: [endpoint] + fields) }
+            }
+        }
+        let data = Data((lines.joined(separator: "\n") + "\n").utf8)
+        guard data.count <= 65536 else {
+            throw NSError(domain: "OuterShell.EndpointNames", code: 1,
+                          userInfo: [NSLocalizedDescriptionKey: "Endpoint names exceed the publication limit."])
+        }
+        let directory = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/org.outerssh/endpoints.d", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true,
+                                               attributes: [.posixPermissions: 0o700])
+        try data.write(to: directory.appendingPathComponent("outershell-containers"), options: .atomic)
     }
 
     private func overviewIconURL(_ data: Data) throws -> String {

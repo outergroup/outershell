@@ -23,7 +23,7 @@ import uuid
 
 
 PROVIDER_ID = "docker"
-DEFAULT_BASE_IMAGE = "outershell/container-base:17"
+DEFAULT_BASE_IMAGE = "outershell/container-base:18"
 FRAME_MAGIC = 0x3142524F
 FRAME_VERSION = 1
 FRAME_HELLO = 1
@@ -593,7 +593,7 @@ def docker_state(container_id):
 
 def default_dockerfile():
     return """# syntax=docker/dockerfile:1
-FROM outershell/container-base:17
+FROM outershell/container-base:18
 USER root
 WORKDIR /root
 """
@@ -1676,6 +1676,7 @@ def app_snapshots(container_id, recipe):
             "serviceID": service_id,
             "displayName": row.get("display_name", service_id),
             "socketPath": socket_path,
+            "externalSocketPath": row.get("external_socket_path", ""),
             "url": row.get("url", ""),
             "iconPath": row.get("icon_path", ""),
             "iconObservationToken": "",
@@ -2103,7 +2104,16 @@ def workspace_dictionary(record, overview=False):
             for app in discovered:
                 if app["isRunning"]:
                     try:
-                        app["externalSocketPath"] = ensure_relay(container_id, app["socketPath"])
+                        published = ensure_relay(container_id, app["socketPath"])
+                        if app.get("externalSocketPath") != published:
+                            container_exec(container_id, [
+                                "/usr/local/bin/outerctl", "app", "upsert",
+                                "--backend", app["serviceID"], "--frontend-id", app["frontendID"],
+                                "--name", app["displayName"], "--socket-path", app["socketPath"],
+                                "--url", app["url"], "--icon-path", app["iconPath"],
+                                "--external-socket-path", published,
+                            ], check=True)
+                        app["externalSocketPath"] = published
                     except Exception:
                         pass
             apps = discovered
@@ -2244,6 +2254,38 @@ def unavailable_workspace_dictionary(record, error):
     }
 
 
+def publish_endpoint_names(workspaces):
+    config_home = pathlib.Path(os.environ.get("XDG_CONFIG_HOME") or pathlib.Path.home() / ".config")
+    if not config_home.is_absolute():
+        config_home = pathlib.Path.home() / ".config"
+    configuration = config_home / "outerssh" / "endpoints.d"
+    configuration.mkdir(parents=True, exist_ok=True, mode=0o700)
+    lines = ["outerssh-endpoints-v2"]
+    for workspace in workspaces:
+        for app in workspace.get("apps", []):
+            socket = app.get("externalSocketPath")
+            port = app.get("publishedPort")
+            endpoints = ([f"tcp {host} {port}" for host in ("localhost", "127.0.0.1", "::1")] if port else
+                         [f"unix {socket}"] if socket else [])
+            fields = [workspace["name"], app.get("displayName") or app["serviceID"]]
+            if any(len(field.encode()) > 256 or any(ord(c) < 32 or 127 <= ord(c) < 160 for c in field) for field in fields):
+                continue
+            for endpoint in endpoints:
+                if len(endpoint.encode()) <= 4096 and not any(ord(c) < 32 for c in endpoint):
+                    lines.extend([endpoint, *fields])
+    data = ("\n".join(lines) + "\n").encode()
+    if len(data) > 65536:
+        raise ValueError("OuterSSH endpoint names exceed the publication limit")
+    temporary = configuration / f".outershell-containers-{os.getpid()}.tmp"
+    try:
+        with open(temporary, "xb") as output:
+            os.chmod(temporary, 0o600)
+            output.write(data)
+        os.replace(temporary, configuration / "outershell-containers")
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def list_workspaces(overview=False):
     with Records() as records:
         values = []
@@ -2266,6 +2308,10 @@ def list_workspaces(overview=False):
             changed = changed or before != after
         if changed:
             records.save()
+        try:
+            publish_endpoint_names(values)
+        except (OSError, ValueError) as error:
+            print(f"Could not publish OuterSSH endpoint names: {error}", file=sys.stderr)
         return values
 
 

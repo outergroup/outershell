@@ -1,5 +1,6 @@
 #include "Wsl.h"
 #include "Icons.h"
+#include "../Backend/EndpointNames.h"
 #include "../Backend/OuterShellLayout.h"
 #include <bcrypt.h>
 #include <shlobj.h>
@@ -22,7 +23,7 @@ struct Endpoint {
     Distribution *distribution;
     char *socket, *pipe;
     PipeServer *server;
-    bool enabled, system;
+    bool enabled, system, external_published;
 };
 struct Distribution {
     Distribution *next;
@@ -36,6 +37,7 @@ struct Distribution {
     unsigned cpus, memory_gb;
     char *runtime_id;
     StringBuilder apps;
+    StringBuilder endpoint_names;
     Child keepalive;
 };
 struct Wsl {
@@ -625,6 +627,21 @@ static StringBuilder copy_payload(StringBuilder source) {
         memcpy(copy.data, source.data, source.length);
     return copy;
 }
+static bool publish_external_endpoint(Endpoint *endpoint, const char *service, const char *frontend) {
+    if (endpoint->external_published) return true;
+    Distribution *d = endpoint->distribution;
+    const char *args[] = {"exec", "--user", "root", d->runtime_id, "/usr/bin/env",
+        "OUTERSHELLD_API_SOCKET=/run/user/0/outershelld-api", "/usr/local/bin/outerctl",
+        "app", "upsert", "--backend", service, "--frontend-id", frontend,
+        "--external-socket-path", endpoint->pipe, NULL};
+    StringBuilder output = {0};
+    bool ok = capture_runtime(d->owner, args, &output, d->container);
+    if (ok) endpoint->external_published = true;
+    else fprintf(stderr, "Could not publish external endpoint for %s: %.*s\n", service, (int)output.length, output.data ? output.data : "");
+    free(output.data);
+    return ok;
+}
+
 static bool rewrite_backends(Distribution *d, StringBuilder *response) {
     if (response->length < 12)
         return false;
@@ -847,6 +864,7 @@ static bool app_list(Distribution *d, StringBuilder *json) {
     for (Endpoint *e = d->owner->endpoints; e; e = e->next)
         if (e->distribution == d)
             e->enabled = false;
+    StringBuilder names = {0};
     append(json, "[");
     size_t added = 0;
     for (uint32_t i = 0; i < count; i++) {
@@ -869,6 +887,9 @@ static bool app_list(Distribution *d, StringBuilder *json) {
                  *url = string_reference(app, 8), *id = string_reference(app, 52);
             Endpoint *endpoint = socket[0] == '/' ? publish(d, socket, system) : NULL;
             if (endpoint) {
+                if (d->container) publish_external_endpoint(endpoint, service, id);
+                endpoint_name_append(&names, "pipe", endpoint->pipe, 0, d->name,
+                                     name);
                 if (added++)
                     append(json, ",");
                 append(json, "{");
@@ -915,6 +936,8 @@ static bool app_list(Distribution *d, StringBuilder *json) {
         free(service);
     }
     append(json, "]");
+    free(d->endpoint_names.data);
+    d->endpoint_names = names;
     LeaveCriticalSection(&d->owner->gate);
     free(response.data);
     return true;
@@ -1044,7 +1067,8 @@ static void discover_impl(Wsl *w) {
     publish_snapshot(w);
 }
 static void publish_snapshot(Wsl *w) {
-    StringBuilder snapshot = {0};
+    StringBuilder snapshot = {0}, names = {0};
+    append(&names, "outerssh-endpoints-v2\n");
     append(&snapshot, "{\"hostPlatform\":\"windows\",\"providers\":[");
     container_provider(w, &snapshot, RUNTIME_WSLC);
     append(&snapshot, ",");
@@ -1055,6 +1079,7 @@ static void publish_snapshot(Wsl *w) {
     for (Distribution *d = w->distributions; d; d = d->next) {
         if (!d->present)
             continue;
+        if (d->running && d->endpoint_names.data) bytes(&names, d->endpoint_names.data, d->endpoint_names.length);
         if (count++)
             append(&snapshot, ",");
         if (d->container) {
@@ -1096,6 +1121,9 @@ static void publish_snapshot(Wsl *w) {
         free(snapshot.data);
     WakeAllConditionVariable(&w->ready);
     LeaveCriticalSection(&w->gate);
+    if (!win_publish_endpoint_names("outershell-containers", &names))
+        fprintf(stderr, "Could not publish container endpoint names.\n");
+    free(names.data);
 }
 static void discover(Wsl *w) {
     EnterCriticalSection(&w->commands);

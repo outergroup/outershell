@@ -233,6 +233,18 @@ target a TCP host and port or a Unix socket. `--path` is the URL path opened
 inside the endpoint; `--url` is accepted as command-line convenience and is
 parsed into scheme, host, port, and path before the socket request is sent.
 
+Container hosts can publish the host-side endpoint without changing the app's
+name, icon, local socket, or other metadata:
+
+```bash
+outerctl app upsert --backend <service-id> --frontend-id <id> \
+  --external-socket-path <host-unix-socket-or-windows-named-pipe>
+```
+
+This requires an existing frontend belonging to that backend. File-opener
+responses use the external endpoint while the service continues listening on
+its original container socket.
+
 Socket message: `appUpsertRequest` (`messageType = 13`)
 
 ```text

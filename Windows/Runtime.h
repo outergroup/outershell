@@ -68,4 +68,6 @@ bool win_set_pipe_activation(const char *pipe, const char *task);
 
 void pipe_servers_wait_idle(HANDLE stop, DWORD timeout_ms);
 
+bool win_publish_endpoint_names(const char *publisher, const StringBuilder *names);
+
 #endif

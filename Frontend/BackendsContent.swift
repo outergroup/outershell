@@ -9373,10 +9373,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                   opensInNewWindow: Bool = false) {
         guard !isPerformingAction else { return }
         let displayName = app.displayName.isEmpty ? app.serviceID : app.displayName
-        let endpointUserName = app.userName ?? (app.socketPath.hasPrefix("/run/user/0/")
-            ? "root"
-            : "workspace")
-        let endpointDisplayName = "\(workspace.name) / \(endpointUserName) / \(displayName)"
         isPerformingAction = true
         backendError = displayedWorkspaceState(for: workspace) == "running"
             ? "Opening \(displayName)…"
@@ -9394,7 +9390,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             backendError = ""
             updateLayout()
             navigateToWorkspaceApp(workspaceAppNavigationURL(url, app: app),
-                                   displayName: endpointDisplayName,
                                    opensInNewTab: opensInNewTab,
                                    opensInNewWindow: opensInNewWindow)
             return
@@ -9412,7 +9407,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             backendError = ""
             updateLayout()
             navigateToWorkspaceApp(workspaceAppNavigationURL(url, app: app),
-                                   displayName: endpointDisplayName,
                                    opensInNewTab: opensInNewTab,
                                    opensInNewWindow: opensInNewWindow)
             return
@@ -9441,26 +9435,24 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             self.updateLayout()
             let navigationURL = self.workspaceAppNavigationURL(url, app: app)
             self.navigateToWorkspaceApp(navigationURL,
-                                        displayName: endpointDisplayName,
                                         opensInNewTab: opensInNewTab,
                                         opensInNewWindow: opensInNewWindow)
         })
     }
 
     private func navigateToWorkspaceApp(_ url: URL,
-                                        displayName: String,
                                         opensInNewTab: Bool,
                                         opensInNewWindow: Bool) {
         if opensInNewWindow {
             outerframeHost.openNewWindow(with: url,
-                                         displayString: displayName,
+                                         displayString: nil,
                                          preferredSize: nil)
         } else if opensInNewTab {
             outerframeHost.openNewTab(with: url,
-                                      displayString: displayName)
+                                      displayString: nil)
         } else {
             outerframeHost.navigate(to: url,
-                                    displayString: displayName)
+                                    displayString: nil)
         }
     }
 
@@ -9569,7 +9561,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                     if !didRecoverNetworking, self.recoverNetworkingIfNeeded(after: error) {
                         self.startAndOpenLauncherEndpoint(endpoint,
                                                           displayName: displayName,
-                                                          opensInNewTab: opensInNewTab,
+                                                     opensInNewTab: opensInNewTab,
                                                           opensInNewWindow: opensInNewWindow,
                                                           didRecoverNetworking: true)
                         return
@@ -9587,7 +9579,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 }
                 self.waitForLauncherEndpoint(endpoint,
                                              displayName: displayName,
-                                             opensInNewTab: opensInNewTab,
+                                        opensInNewTab: opensInNewTab,
                                              opensInNewWindow: opensInNewWindow,
                                              attempt: 0)
             }
@@ -9609,7 +9601,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 if let error, !didRecoverNetworking, self.recoverNetworkingIfNeeded(after: error) {
                     self.waitForLauncherEndpoint(endpoint,
                                                  displayName: displayName,
-                                                 opensInNewTab: opensInNewTab,
+                                            opensInNewTab: opensInNewTab,
                                                  opensInNewWindow: opensInNewWindow,
                                                  attempt: attempt,
                                                  didRecoverNetworking: true)
@@ -9635,7 +9627,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                         self.updateLayout()
                         self.navigateToLauncherEndpoint(nextEndpoint,
                                                         displayName: displayName,
-                                                        opensInNewTab: opensInNewTab,
+                                                   opensInNewTab: opensInNewTab,
                                                         opensInNewWindow: opensInNewWindow)
                         return
                     }
@@ -9648,7 +9640,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
                     self.waitForLauncherEndpoint(endpoint,
                                                  displayName: displayName,
-                                                 opensInNewTab: opensInNewTab,
+                                            opensInNewTab: opensInNewTab,
                                                  opensInNewWindow: opensInNewWindow,
                                                  attempt: attempt + 1)
                 }

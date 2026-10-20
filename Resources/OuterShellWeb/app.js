@@ -761,6 +761,182 @@
     ].join("\n");
   }
 
+  const containerAppCatalog = [
+    { id: "files", name: "Files", summary: "Browse and manage files in this container.", marker: "org.outershell.Files" },
+    { id: "plaintext", name: "Plaintext", summary: "Read and edit text files.", marker: "org.outershell.Plaintext" },
+    { id: "top", name: "Top", summary: "Inspect processes running in this container.", marker: "org.outershell.Top" },
+    { id: "opencode", name: "OpenCode", summary: "Use a coding agent inside this container.", marker: "/usr/local/bin/outershell-opencode" }
+  ];
+
+  async function containerAppFragment(id, allowAllActions = false) {
+    const app = containerAppCatalog.find(app => app.id === id);
+    if (!app) throw new Error("Unknown container app.");
+    if (id === "opencode") return openCodeContainerFragment(allowAllActions);
+    const template = `USER root
+RUN <<'OUTERSHELL_BUNDLED_APP'
+set -eu
+export DEBIAN_FRONTEND=noninteractive
+/usr/bin/apt-get update
+/usr/bin/apt-get install -y --no-install-recommends ca-certificates curl
+case "$(/usr/bin/uname -m)" in
+    aarch64|arm64) platform=linux-aarch64 ; architecture=aarch64 ;;
+    x86_64|amd64) platform=linux-x86_64 ; architecture=x86_64 ;;
+    *) /usr/bin/printf 'Unsupported architecture.\\n' >&2; exit 1 ;;
+esac
+archive=/tmp/__APP_NAME__.tar.gz
+/usr/bin/curl --fail --location --retry 4 --retry-delay 2 \\
+    --output "\${archive}" \\
+    "https://outershell.org/outer-shell/dev/apps/__APP_NAME__/\${platform}.tar.gz"
+/bin/rm -rf /var/lib/outershell/apps/__SERVICE_ID__
+/bin/mkdir -p /etc/outershell/apps.d /var/lib/outershell/apps/__SERVICE_ID__ "$(/usr/bin/dirname /var/lib/outershell/services/__SERVICE_ID__.outerservice)"
+/bin/tar -xzf "\${archive}" --strip-components=1 -C /var/lib/outershell/apps/__SERVICE_ID__
+/bin/chmod 0755 /var/lib/outershell/apps/__SERVICE_ID__/RemoteLinuxBinaries/\${architecture}/__APP_NAME__Backend
+/usr/bin/touch /var/lib/outershell/apps/__SERVICE_ID__/backend.log
+/bin/cat >/var/lib/outershell/services/__SERVICE_ID__.outerservice <<OUTERSHELL_SERVICE
+[Service]
+Format=1
+Name=__APP_NAME__
+Executable=/var/lib/outershell/apps/__SERVICE_ID__/RemoteLinuxBinaries/\${architecture}/__APP_NAME__Backend
+Argument=--label
+Argument=__SERVICE_ID__
+Argument=--socket-path
+Argument=/run/user/0/__SERVICE_ID__
+Argument=--bundles-dir
+Argument=/var/lib/outershell/apps/__SERVICE_ID__/bundles
+Argument=--icon-file
+Argument=/var/lib/outershell/apps/__SERVICE_ID__/app-icon.png
+WorkingDirectory=/var/lib/outershell/apps/__SERVICE_ID__
+Environment=HOME=/root
+Environment=USER=root
+Environment=LOGNAME=root
+Environment=OUTERSHELL_SERVICE_STATE_DIR=/var/lib/outershell/apps/__SERVICE_ID__
+Environment=OUTERSHELLD_API_SOCKET=/run/user/0/outershelld-api
+EnvironmentPolicy=clean
+Start=socket
+Restart=on-failure
+LogPath=/var/lib/outershell/apps/__SERVICE_ID__/backend.log
+
+[Socket.http]
+Type=unix
+Path=/run/user/0/__SERVICE_ID__
+Mode=0600
+Backlog=64
+OUTERSHELL_SERVICE
+/bin/cat >/etc/outershell/apps.d/__SERVICE_ID__.sh <<'OUTERSHELL_REGISTRATION'
+#!/bin/sh
+set -eu
+export HOME=/root USER=root LOGNAME=root XDG_RUNTIME_DIR=/run/user/0
+export OUTERSHELLD_API_SOCKET=/run/user/0/outershelld-api
+outerctl=/usr/local/bin/outerctl
+"\${outerctl}" backend upsert --backend __SERVICE_ID__ --name "__APP_NAME__" --service-file /var/lib/outershell/services/__SERVICE_ID__.outerservice --outershell-owns true
+"\${outerctl}" app upsert --backend __SERVICE_ID__ --frontend-id __SERVICE_ID__:main --socket-path /run/user/0/__SERVICE_ID__ --name "__APP_NAME__" --url / --icon-path /var/lib/outershell/apps/__SERVICE_ID__/app-icon.png
+"\${outerctl}" log add --backend __SERVICE_ID__ --path /var/lib/outershell/apps/__SERVICE_ID__/backend.log
+__OPENER__
+OUTERSHELL_REGISTRATION
+/bin/chmod 0755 /etc/outershell/apps.d/__SERVICE_ID__.sh
+/bin/rm -f "\${archive}"
+/bin/rm -rf /var/lib/apt/lists/*
+OUTERSHELL_BUNDLED_APP
+`;
+    return template.replaceAll("__APP_NAME__", app.name)
+      .replaceAll("__SERVICE_ID__", app.marker)
+      .replaceAll("__OPENER__", id === "plaintext" ? '"${outerctl}" opener upsert --backend org.outershell.Plaintext --content-type public.text --url-template \'?file={file}\' --rank 0 --capabilities view,edit' : "");
+  }
+
+  async function containerAppDraft(dockerfile, id) {
+    const app = containerAppCatalog.find(app => app.id === id);
+    if (!app) throw new Error("Unknown container app.");
+    if (containerAppIncluded(dockerfile, app)) {
+      return { dockerfile, message: `This Dockerfile already includes ${app.name}.` };
+    }
+    return {
+      dockerfile: dockerfile.trimEnd() + "\n\n" + await containerAppFragment(id),
+      message: `${app.name} added to this draft. Review the Dockerfile, then choose Save & rebuild to install it.`
+    };
+  }
+
+  function containerAppIncluded(dockerfile, app) {
+    const active = dockerfile.split("\n").filter(line => !line.trimStart().startsWith("#")).join("\n");
+    return active.includes(app.marker) || active.includes(`ghcr.io/outergroup/outershell-app-${app.id}:`);
+  }
+
+  async function openContainerAdd(workspace) {
+    state.addWorkspace = workspace;
+    state.addScope = "user";
+    state.containerCatalog = null;
+    openAddDialog("agent");
+    try {
+      const result = await safeSpaceRequest("listDetails");
+      if (state.addWorkspace !== workspace) return;
+      const current = result.workspaces?.find(value => value.id === workspace.id);
+      if (typeof current?.recipe?.containerfile !== "string") throw new Error("The container Dockerfile is not available yet.");
+      const original = current.recipe.containerfile;
+      state.containerCatalog = { id: workspace.id, original, dockerfile: original, selected: [], busy: false, message: "" };
+      if (state.addTab === "catalog") openAddDialog("catalog");
+    } catch (error) {
+      if (state.addWorkspace !== workspace) return;
+      state.containerCatalog = { id: workspace.id, error: error.message || String(error) };
+      if (state.addTab === "catalog") openAddDialog("catalog");
+    }
+  }
+
+  function containerCatalogHTML(container) {
+    const draft = state.containerCatalog;
+    if (!draft || draft.id !== container.id) return '<p role="status">Loading Dockerfile…</p>';
+    if (draft.error) return `<p role="alert">${escapeHTML(draft.error)}</p><button type="button" class="secondary-button" data-action="reload-container-catalog">Retry</button>`;
+    return `<p>Add the apps you want, then save and rebuild to install them. These setups require Debian or Ubuntu with Outer Shell support.</p><div class="add-catalog">${containerAppCatalog.map(app => {
+      const included = containerAppIncluded(draft.original, app);
+      const selected = draft.selected.includes(app.id);
+      return `<article class="add-catalog-app ${included || selected ? "installed" : ""}"><div class="app-icon has-image" aria-hidden="true"><img src="/web/icons/${app.id === "opencode" ? "opencode.svg" : `org.outershell.${app.name}.png`}" alt=""></div><h3>${app.name}</h3><p>${app.summary}</p>${included ? '<span class="catalog-installed">In Dockerfile</span>' : `<button class="secondary-button" type="button" data-action="add-container-app" data-catalog-id="${app.id}" aria-pressed="${selected}" ${draft.busy ? "disabled" : ""}>${selected ? "Added · Undo" : "Add to Dockerfile"}</button>`}</article>`;
+    }).join("")}</div>
+    <p class="form-message" role="status">${escapeHTML(draft.message || (draft.selected.length ? `${draft.selected.length} app${draft.selected.length === 1 ? "" : "s"} added. Changes are not saved yet.` : ""))}</p>
+    ${draft.selected.length ? `<details class="catalog-dockerfile"><summary>Review Dockerfile</summary><pre>${escapeHTML(draft.dockerfile)}</pre></details>` : ""}
+    <footer class="dialog-footer"><button class="secondary-button" type="button" data-action="close-dialog">Cancel</button><button class="primary-button" type="button" data-action="save-container-catalog" ${draft.busy || !draft.selected.length ? "disabled" : ""}>${draft.busy ? "Working…" : "Save &amp; rebuild"}</button></footer>`;
+  }
+
+  async function toggleContainerCatalogApp(id) {
+    const draft = state.containerCatalog;
+    const app = containerAppCatalog.find(app => app.id === id);
+    if (!draft || draft.error || draft.busy || !app || containerAppIncluded(draft.original, app)) return;
+    draft.busy = true;
+    draft.message = "";
+    openAddDialog("catalog");
+    try {
+      const selected = draft.selected.includes(id) ? draft.selected.filter(value => value !== id) : [...draft.selected, id];
+      let dockerfile = draft.original;
+      for (const selectedID of selected) dockerfile = (await containerAppDraft(dockerfile, selectedID)).dockerfile;
+      draft.selected = selected;
+      draft.dockerfile = dockerfile;
+    } catch (error) { draft.message = error.message || String(error); }
+    finally {
+      draft.busy = false;
+      if (state.containerCatalog === draft && state.addTab === "catalog") openAddDialog("catalog");
+    }
+  }
+
+  async function saveContainerCatalog() {
+    const draft = state.containerCatalog;
+    if (!draft || draft.error || draft.busy || !draft.selected.length) return;
+    draft.busy = true;
+    draft.message = "Saving…";
+    openAddDialog("catalog");
+    try {
+      const result = await safeSpaceRequest("listDetails");
+      const current = result.workspaces?.find(value => value.id === draft.id)?.recipe?.containerfile;
+      if (current !== draft.original) throw new Error("The Dockerfile changed elsewhere. Close this dialog and reopen the catalog to load the latest version.");
+      await containerOperation("updateDockerfile", { workspaceID: draft.id, command: draft.dockerfile, dockerfile: draft.dockerfile });
+      draft.original = draft.dockerfile;
+      draft.message = "Starting rebuild…";
+      await containerOperation("rebuildRecipe", { workspaceID: draft.id });
+      if (state.containerCatalog === draft) closeDialog();
+      await refreshSafeSpaces({ quiet: true });
+    } catch (error) { draft.message = error.message || String(error); }
+    finally {
+      draft.busy = false;
+      if (state.containerCatalog === draft && state.addTab === "catalog") openAddDialog("catalog");
+    }
+  }
+
   async function openCodeContainerFragment(allowAllActions = false) {
     const load = async name => {
       const response = await fetch(`/web/${name}`);
@@ -992,20 +1168,12 @@
   function safeSpaceAppNavigationURL(workspace, app) {
     const target = safeSpaceAppURL(app);
     if (target === "#") return target;
-    const name = app.displayName || app.serviceID || "App";
-    const user = app.userName || (String(app.socketPath || "").startsWith("/run/user/0/") ? "root" : "workspace");
-    const display = `${workspace.name || "Container"} / ${user} / ${name}`;
     if (window.outerLoopPageIconObservationSupported === true && !app.iconData && !app.iconURL && app.iconObservationToken) {
       const callback = new URL("/api/icon-observation", window.location.href);
       callback.search = new URLSearchParams({ token: app.iconObservationToken }).toString();
-      return `outerloop://observe-page-icon?${new URLSearchParams({ url: target, callback: callback.href, display }).toString().replace(/\+/g, "%20")}`;
+      return `outerloop://observe-page-icon?${new URLSearchParams({ url: target, callback: callback.href }).toString().replace(/\+/g, "%20")}`;
     }
-    if (window.outerLoopFriendlyNavigationSupported !== true) return target;
-    const parameters = [
-      `url=${encodeURIComponent(target)}`,
-      `display=${encodeURIComponent(display)}`
-    ].join("&");
-    return `outerloop://navigate?${parameters}`;
+    return target;
   }
 
   function safeSpaceAppIsReady(workspace, app) {
@@ -1478,6 +1646,7 @@
     unlockPageScroll();
     state.logSelection = null;
     state.addWorkspace = null;
+    state.containerCatalog = null;
     state.workspaceCatalog = [];
     state.recipes = [];
     restartEventWatch();
@@ -1529,7 +1698,7 @@
 
   function openAddDialog(tab = state.addTab) {
     const container = addContainer();
-    if ((container && !["agent", "dockerfile"].includes(tab)) || (tab === "dockerfile" && (!container || !managedContainer(container)))) tab = "agent";
+    if ((container && (!managedContainer(container) || !["agent", "catalog", "dockerfile"].includes(tab))) || (tab === "dockerfile" && (!container || !managedContainer(container)))) tab = "agent";
     const windowsCommands = state.hostPlatform === "windows" && !state.addWorkspace;
     state.addTab = tab;
     const apps = (state.addWorkspace ? state.workspaceCatalog || [] : state.backends).filter(backend => backend.serviceID !== "org.outershell.OuterShell" && backend.isBundled && !backend.isMigration && backend.serviceScope === state.addScope)
@@ -1547,7 +1716,7 @@
         <button class="secondary-button" type="button" data-action="setup-opencode">${openCodeItem() ? "Open OpenCode" : "Set up OpenCode"}</button>
       </article>` });
     }
-    const catalog = catalogEntries.length ? `<div class="add-catalog">${catalogEntries.sort((a, b) => a.name.localeCompare(b.name)).map(entry => entry.html).join("")}</div>` : `<p class="add-empty">No bundled apps are available for this account.</p>`;
+    const catalog = container ? containerCatalogHTML(container) : catalogEntries.length ? `<div class="add-catalog">${catalogEntries.sort((a, b) => a.name.localeCompare(b.name)).map(entry => entry.html).join("")}</div>` : `<p class="add-empty">No bundled apps are available for this account.</p>`;
     const bash = `<form id="bash-form">
       <div class="form-grid">
         <div class="field"><label for="bash-name">Display name</label><input id="bash-name" name="name" placeholder="My server" required></div>
@@ -1570,7 +1739,7 @@
       ["catalog", "Outer Shell app catalog", '<rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/>'],
       ["bash", windowsCommands ? "Run commands" : "Run bash commands", '<rect x="2" y="3" width="20" height="18" rx="2"/><path d="m6 8 3 3-3 3m6 0h5"/>'],
       ["recipes", "Other recipes", '<rect x="2" y="3" width="20" height="18" rx="2"/><path d="M6 8h1m3 0h8M6 12h1m3 0h8M6 16h1m3 0h5"/>']
-    ].filter(([id]) => (!container || id === "agent" || id === "dockerfile") && (!(state.addWorkspace || windowsCommands) || state.addScope !== "system" || id === "catalog" || id === "agent" || id === "dockerfile" || windowsCommands && id === "bash") && (!windowsCommands || id !== "recipes"));
+    ].filter(([id]) => (!container || id === "agent" || managedContainer(container) && (id === "dockerfile" || id === "catalog")) && (!(state.addWorkspace || windowsCommands) || state.addScope !== "system" || id === "catalog" || id === "agent" || id === "dockerfile" || windowsCommands && id === "bash") && (!windowsCommands || id !== "recipes"));
     const dialog = openDialog(`
       <header class="dialog-header"><div class="dialog-title-wrap"><h2 id="dialog-title">Add Apps${state.addWorkspace ? ` · ${escapeHTML(state.addWorkspace.name)}${container ? "" : ` / ${state.addScope === "system" ? "root" : escapeHTML(state.addWorkspace.userName || "user")}`}` : ""}</h2></div><button class="dialog-close" type="button" data-action="close-dialog" aria-label="Close">×</button></header>
       <div class="dialog-body">
@@ -2020,7 +2189,7 @@
     }
   }
 
-  async function openContainerConfiguration(id) {
+  async function openContainerConfiguration(id, catalogID = null) {
     let workspace = findSafeSpace(id);
     if (workspace && !workspace.recipe) {
       try {
@@ -2031,18 +2200,28 @@
     if (!workspace || !managedContainer(workspace)) return;
     const recipe = workspace.recipe;
     if (!recipe || typeof recipe.containerfile !== "string") { toast("The container configuration is not available yet.", true); return; }
+    const catalogApp = containerAppCatalog.find(app => app.id === catalogID);
+    let proposedDockerfile = recipe.containerfile;
+    let proposalMessage = "";
+    if (catalogApp) {
+      try {
+        const draft = await containerAppDraft(recipe.containerfile, catalogID);
+        proposedDockerfile = draft.dockerfile;
+        proposalMessage = draft.message;
+      } catch (error) { toast(error.message || String(error), true); return; }
+    }
     const infrastructure = (workspace.mounts || []).filter(mount => mount.isInfrastructure);
     const tabs = [["dockerfile", "Dockerfile"], ["mounts", "Folder mounts"], ["environment", "Environment"], ["ports", "Ports"], ["runtime", "Runtime"]];
     const dialog = openDialog(`${containerDialogHeader(`Edit ${workspace.name}`)}
       <form class="container-form" novalidate><div class="dialog-body">
         <label class="field">Name<input name="name" value="${escapeHTML(workspace.name)}" required></label>
         <div class="configuration-tabs" role="tablist" aria-label="Container configuration">${tabs.map(([key, label], index) => `<button type="button" role="tab" id="config-tab-${key}" aria-controls="config-panel-${key}" aria-selected="${index === 0}" data-config-tab="${key}">${label}</button>`).join("")}</div>
-        <section role="tabpanel" id="config-panel-dockerfile" aria-labelledby="config-tab-dockerfile" data-config-panel="dockerfile"><label class="field">Dockerfile<textarea name="dockerfile" class="dockerfile-editor" spellcheck="false" autocapitalize="off" autocorrect="off">${escapeHTML(recipe.containerfile)}</textarea></label><p class="field-note">Save stores the definition. Save &amp; rebuild applies it to the container.</p><label class="container-check"><input name="allowAllOpenCodeActions" type="checkbox">Allow all actions without asking</label><p class="field-note">Applies when adding OpenCode below, including access to folders mounted into this container.</p><button type="button" data-add-opencode>Add OpenCode</button><p class="field-note">Adds OpenCode and container instructions to this Dockerfile. Requires Debian or Ubuntu with Outer Shell support.</p></section>
+        <section role="tabpanel" id="config-panel-dockerfile" aria-labelledby="config-tab-dockerfile" data-config-panel="dockerfile"><label class="field">Dockerfile<textarea name="dockerfile" class="dockerfile-editor" spellcheck="false" autocapitalize="off" autocorrect="off">${escapeHTML(proposedDockerfile)}</textarea></label><p class="field-note">Save stores the definition. Save &amp; rebuild applies it to the container.</p><label class="container-check"><input name="allowAllOpenCodeActions" type="checkbox">Allow all actions without asking</label><p class="field-note">Applies when adding OpenCode below, including access to folders mounted into this container.</p><button type="button" data-add-opencode>Add OpenCode</button><p class="field-note">Adds OpenCode and container instructions to this Dockerfile. Requires Debian or Ubuntu with Outer Shell support.</p></section>
         <section role="tabpanel" id="config-panel-mounts" aria-labelledby="config-tab-mounts" data-config-panel="mounts" hidden><p class="field-note">Server folders are paths on the server running Outer Shell. They must already exist.</p><div data-rows="mounts">${(workspace.mounts || []).filter(mount => !mount.isInfrastructure).map(mount => configurationRow("mounts", mount)).join("")}</div><button type="button" data-add-row="mounts">Add folder mount</button>${infrastructure.length ? `<details class="managed-mounts"><summary>Managed mounts (${infrastructure.length})</summary>${infrastructure.map(mount => `<p><code>${escapeHTML(mount.hostPath)} → ${escapeHTML(mount.guestPath)}</code></p>`).join("")}</details>` : ""}</section>
         <section role="tabpanel" id="config-panel-environment" aria-labelledby="config-tab-environment" data-config-panel="environment" hidden><div data-rows="environment">${(recipe.environment || []).map(value => configurationRow("environment", value)).join("")}</div><button type="button" data-add-row="environment">Add variable</button></section>
         <section role="tabpanel" id="config-panel-ports" aria-labelledby="config-tab-ports" data-config-panel="ports" hidden><p class="field-note">Publish a container TCP port on this server.</p><div data-rows="ports">${(recipe.publishedPorts || []).map(value => configurationRow("ports", value)).join("")}</div><button type="button" data-add-row="ports">Add port</button></section>
         <section role="tabpanel" id="config-panel-runtime" aria-labelledby="config-tab-runtime" data-config-panel="runtime" hidden><p>${escapeHTML(safeSpaceRuntimeDescription(workspace))} · ${escapeHTML(workspace.cpus)} CPUs · ${escapeHTML(workspace.memoryInGB)} GB</p><label class="field">Runtime<select name="runtimeProviderID">${runtimeOptions(workspace.runtime?.providerID)}</select></label><p class="field-note">Changing runtime saves the configuration and rebuilds the container with the selected provider.</p><button type="submit" value="runtime">Save &amp; change runtime</button></section>
-        <p class="container-message" role="status">${recipe.needsRebuild ? "Saved changes need a rebuild." : ""}</p>
+        <p class="container-message" role="status">${escapeHTML(proposalMessage || (recipe.needsRebuild ? "Saved changes need a rebuild." : ""))}</p>
         <p class="field-note">Rebuilding restarts the container. Changes outside its Dockerfile, persistent data, and mounted folders are not retained.</p>
       </div><footer class="dialog-footer"><button type="button" data-action="close-dialog">Close</button><button type="submit" value="save">Save</button><button class="primary-button" type="submit" value="rebuild">Save &amp; rebuild</button></footer></form>`, "wide container-editor");
     const form = dialog.querySelector("form");
@@ -2105,7 +2284,11 @@
           message.textContent = "Rebuilding…";
           await containerOperation("rebuildRecipe", { workspaceID: id });
         }
-        message.textContent = action === "save" ? "Saved. Rebuild to apply configuration changes." : "Request completed. Build status appears under All endpoints.";
+        if (action === "save") message.textContent = "Saved. Rebuild to apply configuration changes.";
+        else {
+          if (dialog.isConnected) closeDialog();
+          await refreshSafeSpaces({ quiet: true });
+        }
       } catch (error) { message.textContent = `${saved ? "Some changes were saved. " : ""}${error.message}`; }
       finally { controls.forEach(control => { control.disabled = false; }); }
     });
@@ -2659,6 +2842,9 @@
     if (action === "import-container") { openContainerImport(); return; }
     if (action === "create-container") { openCreateContainer(); return; }
     if (action === "configure-container") { openContainerConfiguration(actionElement.dataset.safeSpaceId); return; }
+    if (action === "add-container-app") { await toggleContainerCatalogApp(actionElement.dataset.catalogId); return; }
+    if (action === "save-container-catalog") { await saveContainerCatalog(); return; }
+    if (action === "reload-container-catalog") { if (state.addWorkspace) await openContainerAdd(state.addWorkspace); return; }
     if (action === "delete-container") { openDeleteContainer(actionElement.dataset.safeSpaceId); return; }
     if (action === "share-container") { openShareContainer(actionElement.dataset.safeSpaceId); return; }
     if (action === "edit-bookmark") { const bounds = actionElement.getBoundingClientRect(); openAppMenu(actionElement.dataset.appKey, { x: bounds.left, y: bounds.bottom + 4 }, menuContext(actionElement)); return; }
@@ -2705,7 +2891,7 @@
     if (action === "close-dialog") { closeDialog(); return; }
     if (action === "open-container-add") {
       const workspace = findSafeSpace(actionElement.dataset.safeSpaceId);
-      if (workspace) { state.addWorkspace = workspace; state.addScope = "user"; openAddDialog("agent"); }
+      if (workspace) await openContainerAdd(workspace);
       return;
     }
     if (action === "open-wsl-add") { const workspace = findSafeSpace(actionElement.dataset.safeSpaceId); if (workspace) await openWorkspaceAdd(workspace, actionElement.dataset.scope); return; }
