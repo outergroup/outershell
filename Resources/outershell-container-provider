@@ -828,6 +828,21 @@ def remove_runtime_container(container_id):
     docker(["rm", "--force", container_name(container_id)])
 
 
+def reconcile_image_volumes(container_id):
+    metadata = json.loads(docker(["image", "inspect", image_name(container_id)], check=True).stdout)
+    volumes = (metadata[0].get("Config") or {}).get("Volumes") or {}
+    recipe = load_recipe(container_id)
+    items = recipe.setdefault("persistentData", [])
+    for path in sorted(volumes):
+        if not path.startswith("/") or path == "/" or any(c in path for c in ",\r\n"):
+            raise RuntimeError("Unsupported image volume path: " + path)
+        if not any(item["guestPath"] == path for item in items):
+            items.append({"id": str(uuid.uuid4()), "guestPath": path})
+    for item in items:
+        item["isDeclared"] = item["guestPath"] in volumes
+    save_recipe(container_id, recipe)
+
+
 def create_runtime_container(container_id):
     recipe = load_recipe(container_id)
     arguments = [
@@ -852,7 +867,7 @@ def create_runtime_container(container_id):
             option += ",readonly"
         arguments += ["--mount", option]
     for item in recipe.get("persistentData", []):
-        if not item.get("isDeclared", True):
+        if not item.get("isDeclared", True) or any(mount["guestPath"] == item["guestPath"] for mount in recipe.get("mounts", [])):
             continue
         host = persistent_data_directory(container_id, item["id"])
         host.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -890,6 +905,7 @@ def rebuild(container_id):
         build_image(context, image_name(container_id), log_path, container_id=container_id)
         set_build_progress(container_id, "replacing", "Replacing the container…",
                            log_path.read_text())
+        reconcile_image_volumes(container_id)
         remove_runtime_container(container_id)
         create_runtime_container(container_id)
         docker(["start", container_name(container_id)], check=True)
@@ -931,6 +947,9 @@ def operation_create(request):
     container_id = str(uuid.uuid4())
     name = request.get("name", "Container").strip() or "Container"
     base_image = request.get("baseImage") or DEFAULT_BASE_IMAGE
+    initial_dockerfile = request.get("dockerfile")
+    if initial_dockerfile is not None and (not isinstance(initial_dockerfile, str) or not initial_dockerfile.strip() or len(initial_dockerfile.encode()) > 1_000_000):
+        raise RuntimeError("Invalid initial Dockerfile.")
     now = time.time()
     record = {
         "id": container_id,
@@ -958,6 +977,8 @@ def operation_create(request):
     }
     container_directory(container_id).mkdir(parents=True, exist_ok=True, mode=0o700)
     write_initial_definition(container_id, base_image)
+    if initial_dockerfile is not None:
+        dockerfile_path(container_id).write_text(initial_dockerfile)
     with Records() as records:
         records.values.append(record)
         records.save()

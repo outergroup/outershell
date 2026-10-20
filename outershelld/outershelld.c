@@ -899,12 +899,11 @@ static bool query_value(const char *query, const char *name, char *dst, size_t d
         size_t pair_len = end ? (size_t)(end - cursor) : strlen(cursor);
         const char *equals = memchr(cursor, '=', pair_len);
         if (equals && (size_t)(equals - cursor) == name_len && strncmp(cursor, name, name_len) == 0) {
-            char encoded[PATH_MAX * 3];
             size_t value_len = pair_len - name_len - 1;
-            if (value_len >= sizeof(encoded)) value_len = sizeof(encoded) - 1;
-            memcpy(encoded, equals + 1, value_len);
-            encoded[value_len] = '\0';
+            char *encoded = strndup(equals + 1, value_len);
+            if (!encoded) return false;
             url_decode(dst, dst_size, encoded);
+            free(encoded);
             return true;
         }
         if (!end) break;
@@ -11539,7 +11538,7 @@ static void send_create_response(int fd, const char *query) {
     char recipe[128] = "";
     char display_name[512] = "";
     char service_id[256] = "";
-    char command[8192] = "";
+    char command[32768] = "";
     char working_directory[PATH_MAX];
     snprintf(working_directory, sizeof(working_directory), "%s", home_directory());
 

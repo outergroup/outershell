@@ -1,4 +1,5 @@
 #include "Wsl.h"
+#include "Icons.h"
 #include "../Backend/OuterShellLayout.h"
 #include <bcrypt.h>
 #include <shlobj.h>
@@ -886,13 +887,21 @@ static bool app_list(Distribution *d, StringBuilder *json) {
                 field(json, "userName", system ? "root" : d->user);
                 append(json, ",");
                 field(json, "serviceScope", system ? "system" : "user");
-                StringBuilder icon = reference(app, 32);
+                StringBuilder icon = reference(app, 32), discovered = {0};
+                char token[33] = "";
+                const char *identity[] = {"guest", d->id, service, id, system ? "root" : d->user, socket, url};
+                if (!icon.length) {
+                    icons_describe(identity, sizeof(identity) / sizeof(*identity), &discovered, token);
+                    icon = discovered;
+                }
                 if (icon.length && icon.length <= 512 * 1024 &&
                     !(read_uint32_le((unsigned char *)app.data + 60) & 2)) {
                     append(json, ",\"iconData\":");
                     json_base64(json, icon);
                 }
-                append(json, ",\"iconPath\":\"\",\"iconObservationToken\":\"\",\"publishedPort\":0,\"isRunning\":");
+                free(discovered.data);
+                append(json, ","); field(json, "iconObservationToken", token);
+                append(json, ",\"iconPath\":\"\",\"publishedPort\":0,\"isRunning\":");
                 append(json, (read_uint32_le((unsigned char *)app.data + 60) & 1)
                                  ? "true"
                                  : "false");
@@ -1543,3 +1552,5 @@ int wsl_inspect(void) {
     CloseHandle(stop);
     return result;
 }
+
+void wsl_refresh(Wsl *w) { if (w) SetEvent(w->refresh); }

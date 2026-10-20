@@ -1,5 +1,25 @@
 # Outer Shell Container Cookbook
 
+## OpenCode
+
+In the HTML home, choose **Add more… → Coding agent → Set up in a container**.
+The container form opens with **Install OpenCode** selected. This option is also
+available in the normal new-container form. For an existing Debian/Ubuntu
+container with Outer Shell support, open its Dockerfile editor and choose
+**Add OpenCode**, then **Save & rebuild**.
+
+OpenCode opens a saved **Container workspace** session in `/work`, with the
+Outer Shell skill and container instructions already loaded. Ask it to install
+Jupyter or TensorBoard, register the app with Outer Shell, and keep experiments
+in `/work`. It is instructed to update the mounted Dockerfile for durable changes
+and use `outerctl image add-app` for app registration. The app appears under that
+container on the home page. `/work` and OpenCode's configuration/session directory
+are persistent volumes, so rebuilding keeps your projects and agent state.
+
+Model-provider sign-in happens inside OpenCode. Host and container installations
+have separate provider settings.
+
+
 These snippets are ordinary Dockerfile instructions. They can be used in Outer
 Shell, `docker build`, or any OCI builder that supports Dockerfile syntax.
 
@@ -62,7 +82,7 @@ the container boundary, identify the mounted Dockerfile as the reproducible
 source of truth, and document how tools are published with `outerctl`.
 
 Copy the files from `ContainerAgentInstructions` into the Dockerfile build
-context, then include them in the image:
+context, following symlinks (for example, with `cp -L`), then include them in the image:
 
 ```dockerfile
 RUN mkdir -p /work /usr/local/share/outershell
@@ -71,7 +91,7 @@ COPY OUTERCTL.md /usr/local/share/outershell/OUTERCTL.md
 ```
 
 Use `/work` as the working directory for command-line tools that should act as
-container configuration assistants. Both tools receive the same contract,
+coding agents for container configuration. Both tools receive the same contract,
 while `OUTERCTL.md` remains available as detailed, versionable documentation.
 The instruction files direct root-capable tools to edit
 `/var/lib/outershell/project/Dockerfile`, which Outer Shell mounts from the

@@ -2398,6 +2398,16 @@ static bool process_http_client_request(ReactorClient *client, char *request, si
 
     uint16_t ui_route = ui_route_for_http_request(method, target);
     if (ui_route != OUTERSHELLD_UI_ROUTE_NONE) {
+        if (ui_route == OUTERSHELLD_UI_ROUTE_CREATE && body_length > 0) {
+            char *form = strndup(body, body_length);
+            if (!form) {
+                send_text_response(fd, 500, "out of memory\n");
+                return false;
+            }
+            bool pending = proxy_ui_request_to_api(client, ui_route, form, "", 0);
+            free(form);
+            return pending;
+        }
         return proxy_ui_request_to_api(client, ui_route, query, body, body_length);
     }
 
@@ -2419,6 +2429,9 @@ static bool process_http_client_request(ReactorClient *client, char *request, si
                                  request, header_length, strcasecmp(method, "HEAD") != 0);
     } else if (strcmp(target, "/web/app.js") == 0) {
         send_versioned_web_asset(fd, "app.js", "text/javascript; charset=utf-8", query,
+                                 request, header_length, strcasecmp(method, "HEAD") != 0);
+    } else if (strcmp(target, "/web/opencode-start.sh") == 0 || strcmp(target, "/web/outer-shell-skill.md") == 0 || strcmp(target, "/web/server-admin.md") == 0 || strcmp(target, "/web/opencode-start.ps1") == 0 || strcmp(target, "/web/opencode-container.Dockerfile") == 0 || strcmp(target, "/web/container-agent.md") == 0 || strcmp(target, "/web/container-outerctl.md") == 0) {
+        send_versioned_web_asset(fd, target + 5, "text/plain; charset=utf-8", query,
                                  request, header_length, strcasecmp(method, "HEAD") != 0);
     } else if (strcmp(target, "/web/favicon.png") == 0) {
         send_web_app_icon(fd, request, header_length, strcasecmp(method, "HEAD") != 0);

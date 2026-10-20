@@ -347,7 +347,14 @@ Outer Shell checks `/outer-shell/latest/windows-version.txt` when the homepage
 requests `/api/backends`, at most once per day. The attempt timestamp persists across
 restarts, including failed checks. There is no startup check or periodic timer; an
 untouched server makes no update requests. Explicit Check for Updates bypasses the
-automatic daily limit. The existing HTML and outerframe Check for Updates actions use the same
+automatic daily limit. Requests include `os=windows`, the native OS architecture
+(`x86`, `x86_64`, or `arm64`), the Windows major/minor/build version, installed
+`appVersion`, and `serviceManager=task-scheduler`. Automatic checks report the
+longest due `heartbeat` (`month` after 30 days, `week` after 7, otherwise `day`).
+A monthly attempt also satisfies the weekly and daily intervals; a weekly attempt
+also satisfies the daily interval. Manual checks and pre-install checks report
+`heartbeat=extra` without changing the automatic schedule. No user or machine
+identifier is included. The existing HTML and outerframe Check for Updates actions use the same
 version metadata and control responses as Unix. Windows release versions are three
 numeric components from `VERSION`; package generation uses that same version.
 The release packaging script emits the Windows version marker only when all three
@@ -364,7 +371,9 @@ reconnection. Existing registry data and command tasks remain in place. Elevated
 legacy service instances cannot invoke this per-user update path.
 
 The `OUTERSHELL_UPDATE_TESTS` CMake option builds `OuterShellUpdateFixture` for
-local signature rejection, version binding, and scheduled upgrade tests. Its local
+local signature rejection, version binding, and scheduled upgrade tests. Run
+`OuterShellUpdateFixture.exe reporting` to test query encoding, native platform
+metadata, and persisted heartbeat scheduling without making network requests. Its local
 payload injection is confined to the test binary; the production API accepts no
 custom download URL, executable path, publisher, or installer arguments.
 
@@ -432,3 +441,20 @@ read-only folder access, environment variables, published ports, stable rebuild
 identity, and failed-build recovery. `test_container_sharing.py` runs from a Mac
 or Linux client through the SSH bridge and verifies cross-runtime transfers,
 Unix archive compatibility, included data, and unsafe-archive rejection.
+
+### Discovered app icons
+
+Native and flattened WSL/container app entries without an icon include an
+endpoint-scoped token for `outerloop://observe-page-icon`. The existing HTML and
+outerframe clients send the discovered PNG to `POST /api/icon-observation`.
+The callback requires the normal origin authorization and an unpredictable token;
+it accepts at most 48 KiB and fully decodes a PNG of at most 4096 pixels per side.
+Icons are cached under the Windows user's `OuterShell/discovered-icons` directory,
+keyed by environment, app identity, and endpoint address. They survive restarts;
+tokens do not. Explicit app icons take precedence and saved discoveries are not
+overwritten. Guest icons are cached by the Windows host, without modifying the
+inner Linux registry. A successful callback refreshes the homepage and guest snapshot.
+
+Build with `-UpdateTests` and run `OuterShellIconTests.exe ..\app-icon.png` for
+cache/token/image validation. `test_host.py` also covers the named-pipe callback,
+origin enforcement, returned icon bytes, and persistence after restarting the host.

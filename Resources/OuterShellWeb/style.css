@@ -1127,7 +1127,38 @@ h1 { margin: 0; font-size: clamp(30px, 5vw, 45px); line-height: 1.05; letter-spa
 }
 
 
-.coding-agent-panel { max-width: 720px; line-height: 1.6; }
+.coding-agent-panel { max-width: 100%; line-height: 1.6; }
 .coding-agent-panel p { color: var(--muted); }
-.coding-agent-panel blockquote { white-space: pre-wrap; margin: 16px 0 24px; padding: 16px 20px; border-left: 3px solid #1683ff; background: var(--panel-solid); overflow-wrap: anywhere; user-select: text; }
 .coding-agent-panel a { color: #1683ff; }
+
+.customize-intro { max-width: 620px; }
+.customize-intro h3 { margin: 0 0 8px; font-size: 20px; }
+.customize-intro p { color: var(--muted); font-size: 15px; margin: 0; }
+.coding-agent-panel h2 { margin: 0; font-size: 16px; font-weight: 600; }
+.customize-examples { margin-top: 24px; padding-top: 20px; border-top: 1px solid var(--line); }
+.customize-examples h2 { font-size: 12px; color: var(--muted); margin-bottom: 8px; }
+.customize-examples button { display: flex; justify-content: space-between; gap: 16px; width: 100%; text-align: left; background: none; border: 0; border-radius: 8px; padding: 10px 0; cursor: pointer; font-size: 13px; }
+.customize-examples button:hover { color: var(--accent-strong); }
+.agent-guide label { display: block; font-weight: 600; margin: 16px 0 6px; }
+.agent-guide textarea, .agent-guide input { width: 100%; border: 1px solid var(--line-strong); border-radius: 8px; padding: 10px; background: var(--bg); color: var(--text); }
+.agent-guide pre { white-space: pre-wrap; overflow-wrap: anywhere; padding: 12px; background: var(--accent-soft); border-radius: 8px; }
+.agent-guide a { color: var(--accent-strong); }
+.assistant-steps { padding-left: 22px; margin: 0 0 24px; }
+.assistant-steps li { padding-left: 5px; margin: 0 0 18px; }
+.assistant-steps span { display: block; color: var(--muted); margin-top: 4px; }
+.agent-guide details { margin-top: 20px; }
+.agent-guide details input { max-width: 160px; }
+
+.agent-options { display: grid; grid-template-columns: minmax(0, 2fr) minmax(220px, 1fr); gap: 32px; margin-top: 24px; align-items: start; }
+.agent-own > p, .agent-hosted p { margin: 8px 0 16px; }
+.agent-own pre { margin: 0 0 12px; font-size: 13px; user-select: text; }
+.agent-hosted { padding: 20px; border: 1px solid var(--line); border-radius: 12px; background: var(--accent-soft); }
+.agent-hosted small { display: block; margin-top: 12px; font-size: 12px; color: var(--muted); }
+.example-copy { color: var(--muted); font-size: 12px; flex-shrink: 0; }
+@media (max-width: 700px) {
+  .agent-options { grid-template-columns: 1fr; gap: 24px; }
+}
+@media (min-width: 900px) {
+  .add-categories { grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin-bottom: 24px; }
+  .add-category { min-height: 70px; gap: 10px; padding: 12px; }
+}

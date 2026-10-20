@@ -101,12 +101,14 @@ static bool create_container(Wsl *w, HttpRequest *request, const char **error) {
     char *name = request_string(request, "name");
     char *provider = request_string(request, "runtimeProviderID");
     char *image = request_string(request, "baseImage");
+    char *dockerfile = request_string(request, "dockerfile");
     ContainerRuntime runtime = provider && !strcmp(provider, "docker") ? RUNTIME_DOCKER : RUNTIME_WSLC;
     unsigned cpus = container_number(request, "cpus", 4);
     unsigned memory = container_number(request, "memoryInGB", 8);
     bool ok = false;
     StringBuilder output = {0};
     *error = "Enter a container name, a valid image reference, and CPU/memory limits between 1 and 128.";
+    if (dockerfile && (!*dockerfile || strlen(dockerfile) > 1000000)) goto done;
     if (!valid_container_name(name) || !provider || (strcmp(provider, "wsl.container") && strcmp(provider, "docker")) ||
         !image || !*image || strlen(image) > 512 ||
         strspn(image, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-/:@") != strlen(image) ||
@@ -145,20 +147,41 @@ static bool create_container(Wsl *w, HttpRequest *request, const char **error) {
     *error = "Could not save the container definition.";
     if (!save_container_metadata(id, name, cpus, memory) || !container_definition_create(id, image)) goto done;
     char *context = container_recipe_directory(id);
+    char built_image[100];
+    const char *run_image = image;
+    if (dockerfile) {
+        if (!context || !container_write(id, "Dockerfile", dockerfile, strlen(dockerfile))) { free(context); goto done; }
+        snprintf(built_image, sizeof(built_image), "outershell/managed-%s:latest", id);
+        const char *build[] = {"build", "--progress", "plain", "--tag", built_image, context, NULL};
+        *error = "Could not build the container. Check the container build log.";
+        bool built = capture_runtime(w, build, &output, runtime);
+        if (output.data) container_write(id, "build.log", output.data, output.length);
+        free(output.data); output = (StringBuilder){0};
+        if (!built) { free(context); goto done; }
+        if (!container_write(id, "Dockerfile.realized", dockerfile, strlen(dockerfile))) { free(context); goto done; }
+        run_image = built_image;
+    }
     StringBuilder mount = {0};
     if (context) { append(&mount, "type=bind,source="); append(&mount, context); append(&mount, ",target=/var/lib/outershell/project"); }
     snprintf(cpu_text, sizeof(cpu_text), "%u", cpus);
     snprintf(memory_text, sizeof(memory_text), "%uG", memory);
-    const char *run[] = {"run", "--detach", "--name", runtime_name, "--cpus", cpu_text,
-                        "--memory", memory_text, "--mount", mount.data, image, NULL};
+    ContainerArguments args = {0};
+    const char *prefix[] = {"run", "--detach", "--name", runtime_name, "--cpus", cpu_text,
+                           "--memory", memory_text, "--mount", mount.data};
+    ok = context && container_image_volumes(w, runtime, id, run_image);
+    char *config = container_read(id, "configuration", container_empty_configuration);
+    for (size_t i = 0; ok && i < sizeof(prefix) / sizeof(*prefix); i++) ok = container_argument(&args, prefix[i]);
+    ok = ok && container_persistent_arguments(id, config, &args) && container_argument(&args, run_image);
     *error = "The container runtime could not create the container. Check the image name and the Outer Shell log.";
-    ok = context && capture_runtime(w, run, &output, runtime);
+    ok = ok && capture_runtime(w, (const char *const *)args.values, &output, runtime);
+    container_arguments_free(&args); free(config);
     free(context); free(mount.data);
 
 done:
     free(name);
     free(provider);
     free(image);
+    free(dockerfile);
     free(output.data);
     return ok;
 }

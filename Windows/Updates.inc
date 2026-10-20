@@ -71,9 +71,52 @@ done:
     if (session) WinHttpCloseHandle(session);
     return ok;
 }
-static bool update_check(char *error, size_t capacity) {
+static bool update_query_value(StringBuilder *out, const char *value) {
+    for (const unsigned char *p = (const unsigned char *)value; *p; p++) {
+        if ((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
+            (*p >= '0' && *p <= '9') || *p == '-' || *p == '_' || *p == '.' || *p == '~') {
+            if (!sb_append_n(out, (const char *)p, 1)) return false;
+        } else {
+            char encoded[4]; snprintf(encoded, sizeof(encoded), "%%%02X", *p);
+            if (!sb_append(out, encoded)) return false;
+        }
+    }
+    return true;
+}
+static bool update_query(StringBuilder *out, const char *heartbeat, const char *version,
+                         const char *os_version, const char *arch) {
+    return sb_append(out, "/outer-shell/latest/windows-version.txt?heartbeat=") &&
+        update_query_value(out, heartbeat) && sb_append(out, "&os=windows&osVersion=") &&
+        update_query_value(out, os_version) && sb_append(out, "&arch=") &&
+        update_query_value(out, arch) && sb_append(out, "&serviceManager=task-scheduler&appVersion=") &&
+        update_query_value(out, version);
+}
+static wchar_t *update_check_path(const char *heartbeat) {
+    USHORT process_machine = 0, native_machine = 0;
+    const char *arch = "unknown";
+    if (IsWow64Process2(GetCurrentProcess(), &process_machine, &native_machine)) {
+        arch = native_machine == IMAGE_FILE_MACHINE_ARM64 ? "arm64" :
+            native_machine == IMAGE_FILE_MACHINE_AMD64 ? "x86_64" :
+            native_machine == IMAGE_FILE_MACHINE_I386 ? "x86" : "unknown";
+    }
+    typedef LONG (WINAPI *VersionFunction)(OSVERSIONINFOW *);
+    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    VersionFunction get_version = ntdll ? (VersionFunction)GetProcAddress(ntdll, "RtlGetVersion") : NULL;
+    OSVERSIONINFOW info = {0}; info.dwOSVersionInfoSize = sizeof(info);
+    char os_version[64] = "unknown";
+    if (get_version && get_version(&info) == 0)
+        snprintf(os_version, sizeof(os_version), "%lu.%lu.%lu", info.dwMajorVersion, info.dwMinorVersion, info.dwBuildNumber);
+    StringBuilder path = {0};
+    bool ok = update_query(&path, heartbeat, OUTERSHELL_VERSION, os_version, arch);
+    wchar_t *wide = ok ? win_wide(path.data) : NULL;
+    free(path.data); return wide;
+}
+static bool update_check(const char *heartbeat, char *error, size_t capacity) {
     StringBuilder text = {0};
-    bool ok = update_fetch(L"/outer-shell/latest/windows-version.txt", INVALID_HANDLE_VALUE, &text, error, capacity);
+    wchar_t *path = update_check_path(heartbeat);
+    bool ok = path && update_fetch(path, INVALID_HANDLE_VALUE, &text, error, capacity);
+    free(path);
+    if (!ok && !error[0]) snprintf(error, capacity, "Could not prepare the update check.");
     if (ok) {
         while (text.length && isspace((unsigned char)text.data[text.length-1])) text.data[--text.length] = 0;
         ok = text.data && update_valid_version(text.data);
@@ -201,8 +244,8 @@ static StringBuilder update_control(const char *operation) {
     if (install && !busy) update_installing = true;
     LeaveCriticalSection(&update_gate);
     bool ok = false;
-    if (check) ok = update_check(error, sizeof(error));
-    else if (install && !busy) ok = update_check(error, sizeof(error));
+    if (check) ok = update_check("extra", error, sizeof(error));
+    else if (install && !busy) ok = update_check("extra", error, sizeof(error));
     else snprintf(error, sizeof(error), busy ? "An update is already running." : "This update operation is not supported.");
     EnterCriticalSection(&update_gate); snprintf(available, sizeof(available), "%s", update_version); LeaveCriticalSection(&update_gate);
     bool newer = update_newer(available, OUTERSHELL_VERSION);
@@ -214,36 +257,68 @@ static StringBuilder update_control(const char *operation) {
     payload_text(&result, 12, OUTERSHELL_VERSION); payload_text(&result, 20, available);
     return result;
 }
+static const char *update_heartbeats[] = {"day", "week", "month"};
+static const unsigned update_intervals[] = {1, 7, 30};
+static ULONGLONG update_now(void) {
+    FILETIME time; GetSystemTimeAsFileTime(&time);
+    ULARGE_INTEGER value; value.LowPart = time.dwLowDateTime; value.HighPart = time.dwHighDateTime;
+    return value.QuadPart;
+}
+static char *update_marker(const char *state, unsigned index) {
+    char name[64];
+    snprintf(name, sizeof(name), "last-update-check-%s", update_heartbeats[index]);
+    return win_join(state, name);
+}
+static int update_due_heartbeat(const char *state, ULONGLONG now) {
+    for (int i = 2; i >= 0; i--) {
+        char *path = update_marker(state, (unsigned)i);
+        wchar_t *wide = path ? win_wide(path) : NULL;
+        WIN32_FILE_ATTRIBUTE_DATA info;
+        bool exists = wide && GetFileAttributesExW(wide, GetFileExInfoStandard, &info);
+        ULARGE_INTEGER previous = {0};
+        if (exists) { previous.LowPart = info.ftLastWriteTime.dwLowDateTime; previous.HighPart = info.ftLastWriteTime.dwHighDateTime; }
+        free(wide); free(path);
+        if (!exists || (now >= previous.QuadPart && now - previous.QuadPart >=
+            (ULONGLONG)update_intervals[i] * 24 * 60 * 60 * 10000000)) return i;
+    }
+    return -1;
+}
+static bool update_mark_heartbeat(const char *state, unsigned index) {
+    bool ok = true;
+    for (unsigned i = 0; i <= index; i++) {
+        char *path = update_marker(state, i);
+        if (!path || !win_atomic_write(path, "", 0)) ok = false;
+        free(path);
+    }
+    return ok;
+}
+typedef struct { ShellHost *host; unsigned heartbeat; } UpdateMonitor;
 static DWORD WINAPI update_monitor(void *context) {
-    ShellHost *s = context;
+    UpdateMonitor *monitor = context;
+    ShellHost *s = monitor->host;
     char error[512] = "";
-    if (update_check(error, sizeof(error))) {
+    bool ok = update_mark_heartbeat(s->state, monitor->heartbeat) &&
+        update_check(update_heartbeats[monitor->heartbeat], error, sizeof(error));
+    free(monitor);
+    if (ok) {
         EnterCriticalSection(&s->gate); changed(s); LeaveCriticalSection(&s->gate);
     }
     return 0;
 }
 static void update_interacted(ShellHost *s) {
     if (s->service_name[0]) return;
-    char *path = win_join(s->state, "last-update-check");
-    wchar_t *wide = path ? win_wide(path) : NULL;
-    if (!wide) { free(path); return; }
     EnterCriticalSection(&update_gate);
     if (update_thread && WaitForSingleObject(update_thread, 0) == WAIT_OBJECT_0) {
         CloseHandle(update_thread); update_thread = NULL;
     }
-    WIN32_FILE_ATTRIBUTE_DATA info;
-    FILETIME now; GetSystemTimeAsFileTime(&now);
-    ULARGE_INTEGER current, previous;
-    current.LowPart = now.dwLowDateTime; current.HighPart = now.dwHighDateTime;
-    bool exists = GetFileAttributesExW(wide, GetFileExInfoStandard, &info) != 0;
-    previous.LowPart = exists ? info.ftLastWriteTime.dwLowDateTime : 0;
-    previous.HighPart = exists ? info.ftLastWriteTime.dwHighDateTime : 0;
-    bool due = !exists || (current.QuadPart >= previous.QuadPart &&
-        current.QuadPart - previous.QuadPart >= 24ULL * 60 * 60 * 10000000);
-    if (!update_thread && due && win_atomic_write(path, "", 0)) {
-        update_thread = CreateThread(NULL, 0, update_monitor, s, 0, NULL);
-        if (!update_thread) DeleteFileW(wide);
+    int due = update_thread ? -1 : update_due_heartbeat(s->state, update_now());
+    if (due >= 0) {
+        UpdateMonitor *monitor = malloc(sizeof(*monitor));
+        if (monitor) {
+            monitor->host = s; monitor->heartbeat = (unsigned)due;
+            update_thread = CreateThread(NULL, 0, update_monitor, monitor, 0, NULL);
+            if (!update_thread) free(monitor);
+        }
     }
     LeaveCriticalSection(&update_gate);
-    free(wide); free(path);
 }

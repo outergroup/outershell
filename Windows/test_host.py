@@ -115,6 +115,24 @@ with tempfile.TemporaryDirectory(prefix='outer-c-test-') as temporary:
         assert expected_icon.startswith(b'\x89PNG\r\n\x1a\n')
         assert request(pipe, '/web/favicon.png') == (200, expected_icon)
         assert request(pipe, '/web/favicon.png', method='HEAD') == (200, b'')
+        def shell_frontend():
+            status, snapshot = request(pipe, '/api/backends')
+            assert status == 200
+            for index in range(struct.unpack_from('<I', snapshot, 8)[0]):
+                backend = ref(snapshot, 12 + index * 8)
+                if ref(backend, 0) == b'org.outershell.OuterShell':
+                    return ref(ref(backend, 68), 4)
+            raise AssertionError('Missing Outer Shell frontend')
+        frontend = shell_frontend()
+        observation_token = ref(frontend, 64).decode()
+        assert len(observation_token) == 32 and not ref(frontend, 32)
+        callback = '/api/icon-observation?token=' + observation_token
+        assert request(pipe, callback)[0] == 405
+        assert request(pipe, '/api/icon-observation?token=invalid', expected_icon, 'POST')[0] == 403
+        assert request(pipe, callback, b'not a PNG', 'POST')[0] == 400
+        assert request(pipe, callback, expected_icon, 'POST', extra=b'Origin: http://evil.invalid\r\n')[0] == 403
+        assert request(pipe, callback, expected_icon, 'POST')[0] == 200
+        assert ref(shell_frontend(), 32) == expected_icon and not ref(shell_frontend(), 64)
         native_header = b'Outerframe-Accept: application/vnd.outerframe\r\n'
         status, descriptor = request(pipe, '/', extra=native_header)
         assert status == 200 and descriptor[:4] == b'OUTR'
@@ -188,6 +206,9 @@ with tempfile.TemporaryDirectory(prefix='outer-c-test-') as temporary:
         process = subprocess.Popen([str(exe), '--state', str(state)], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         children.append(process)
         assert request(pipe, '/api/layout') == (200, updated)
+        assert ref(shell_frontend(), 32) == expected_icon
+        assert request(pipe, callback, expected_icon, 'POST')[0] == 403
+        print('PASS icon callback HTTP methods, origin/token checks, discovery, and restart persistence')
         print('PASS native host: registry, web, layout CAS/persistence, framing, origin, Unicode Files, transfers, controls, concurrency, independent Files task')
     finally:
         sid = subprocess.check_output(['whoami','/user','/fo','csv','/nh'],text=True).strip().split(',')[-1].strip('"')

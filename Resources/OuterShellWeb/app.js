@@ -1,7 +1,7 @@
 (() => {
   "use strict";
 
-  document.documentElement.classList.toggle("outerloop-host", /(^|\.)outerlooplocal$/i.test(window.location.hostname));
+  document.documentElement.classList.toggle("outerloop-host", /(^|\.)outerloop\.localhost$/i.test(window.location.hostname));
 
   const decoder = new TextDecoder();
   const elements = {
@@ -41,7 +41,7 @@
     overviewVersion: 0n,
     busy: false,
     query: "",
-    addTab: "catalog",
+    addTab: "agent",
     addScope: "user",
     backendsVersion: 0n,
     logVersion: 0n,
@@ -556,7 +556,7 @@
   }
 
   function groupPinKeys(id, entries) {
-    return state.groupPins[id] ?? ["org.outershell.Files", "org.outershell.Top"].map(serviceID => entries.find(entry => entry.serviceID === serviceID)?.key).filter(Boolean);
+    return state.groupPins[id] ?? ["org.outershell.Files", "org.outershell.Top", "org.outershell.image.opencode"].map(serviceID => entries.find(entry => entry.serviceID === serviceID)?.key).filter(Boolean);
   }
 
   function pinMenuHTML(key, allowReorder = false) {
@@ -686,6 +686,177 @@
     });
   }
 
+  const agentExamples = [
+    "I already have [tool] installed. Please register it with Outer Shell.",
+    'Please run TensorBoard for my "experiment1" experiment and add it to Outer Shell.',
+    "Please install JupyterLab so I can write and run Python notebooks, and add it to Outer Shell."
+  ];
+
+  function agentConnection() {
+    const args = window.outerLoop?.sessionContext?.sshCommandArguments;
+    if (Array.isArray(args) && args.length && args.every(arg => typeof arg === "string")) {
+      return { command: args.map(shellQuotedArgument).join(" "), local: false };
+    }
+    return { command: "", local: Boolean(window.outerLoop?.sessionContext) };
+  }
+
+  function agentPrompt(request, connection = agentConnection()) {
+    const destination = connection.command ? `Connect to this server using:\n${connection.command}`
+      : connection.local ? "Work on this server, where Outer Shell is running."
+      : "Work on the server running Outer Shell.";
+    return `${destination}\n\nRead https://outershell.org/api/ for Outer Shell integration instructions.\n\n${request}`;
+  }
+
+  function openCodeItem() {
+    return launcherItems().find(item => (/opencode/i.test(item.backend.serviceID) || /opencode/i.test(item.displayName)) && item.primary?.backend.serviceScope !== "system");
+  }
+
+  function codingAgentHTML() {
+    const connection = agentConnection();
+    const prompt = agentPrompt("[Your request here]", connection);
+    return `<div class="coding-agent-panel">
+      <div class="customize-intro"><h3>Add something with a coding agent</h3><p>Notebooks, experiments, dashboards, your own apps. Tell a coding agent what you’d like to use here.</p></div>
+      <div class="agent-options">
+        <section class="agent-own agent-guide" aria-labelledby="own-agent-title"><h2 id="own-agent-title">Use your coding agent</h2><p>Paste these details into your agent, then add your request.</p>
+          ${!connection.command && !connection.local ? '<p class="field-note">Outer Loop includes your SSH command here automatically.</p>' : ""}
+          <pre>${escapeHTML(prompt).replace("https://outershell.org/api/", '<a href="https://outershell.org/api/" target="_blank" rel="noopener noreferrer">https://outershell.org/api/</a>')}</pre>
+          <button class="secondary-button" type="button" data-action="copy-agent-prompt">Copy prompt</button>
+          <div class="customize-examples"><h2>A few things you could ask</h2>${agentExamples.map((example, index) => `<button type="button" data-action="example-prompt" data-example="${index}" aria-label="${escapeHTML(`Copy example: ${example}`)}"><span>${escapeHTML(example)}</span><span class="example-copy" aria-hidden="true">Copy</span></button>`).join("")}</div>
+        </section>
+        <aside class="agent-hosted"><h2>Want a coding agent here?</h2><p>OpenCode runs on this server. Use it from your phone or computer to install tools and build things.</p><button class="primary-button" data-action="setup-opencode" type="button">${openCodeItem() ? "Open OpenCode" : "Set up OpenCode"} <span aria-hidden="true">→</span></button><button class="secondary-button" data-action="setup-container-opencode" type="button">Set up in a container</button><small>Bring your model provider account or API key.</small></aside>
+      </div>
+    </div>`;
+  }
+
+  function windowsOpenCodeCommand(script, port) {
+    const bytes = new TextEncoder().encode(script);
+    const encoded = btoa(Array.from(bytes, byte => String.fromCharCode(byte)).join(""));
+    const chunks = encoded.match(/.{1,1200}/g) || [];
+    return [
+      'set "OC_SCRIPT=%LOCALAPPDATA%\\outershell-opencode-start.ps1"',
+      ...chunks.map((chunk, index) => `${index ? ">>" : ">"} "%OC_SCRIPT%.b64" echo ${chunk}`),
+      `powershell.exe -NoProfile -Command "[IO.File]::WriteAllBytes($env:OC_SCRIPT,[Convert]::FromBase64String([IO.File]::ReadAllText($env:OC_SCRIPT+'.b64')))"`,
+      'if errorlevel 1 exit /b 1',
+      `powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%OC_SCRIPT%" -Port ${port}`,
+      'exit /b %errorlevel%'
+    ].join("\n");
+  }
+
+  async function openCodeContainerFragment(allowAllActions = false) {
+    const load = async name => {
+      const response = await fetch(`/web/${name}`);
+      if (!response.ok) throw new Error("Could not load the OpenCode container setup. Refresh Outer Shell and try again.");
+      return response.text();
+    };
+    const [template, instructions, reference, skill] = await Promise.all([
+      load("opencode-container.Dockerfile"), load("container-agent.md"), load("container-outerctl.md"), load("outer-shell-skill.md")
+    ]);
+    const encode = async text => {
+      const compressed = new Blob([text]).stream().pipeThrough(new CompressionStream("gzip"));
+      const bytes = new Uint8Array(await new Response(compressed).arrayBuffer());
+      return btoa(Array.from(bytes, byte => String.fromCharCode(byte)).join(""));
+    };
+    const encoded = await Promise.all([instructions, reference, skill].map(encode));
+    const config = { instructions: ["/usr/local/share/outershell/container-agent.md"] };
+    if (allowAllActions) config.permission = "allow";
+    return template.replace("__OPENCODE_CONFIG__", () => JSON.stringify(config))
+      .replace("__CONTAINER_AGENT__", () => encoded[0])
+      .replace("__CONTAINER_OUTERCTL__", () => encoded[1])
+      .replace("__OUTERSHELL_SKILL__", () => encoded[2]);
+  }
+
+  async function pinInstalledOpenCode(item) {
+    while (state.layoutSaving) await delay(50);
+    state.layoutAbort?.abort();
+    state.layoutSaving = true;
+    try {
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        const current = await fetchLayout();
+        const key = hostBookmarkKey(item);
+        const entries = registeredAddresses().filter(entry => endpointGroupID(entry) === "user");
+        const defaults = ["org.outershell.Files", "org.outershell.Top"].map(serviceID => entries.find(entry => entry.serviceID === serviceID)?.key).filter(Boolean);
+        const pins = current.layout.pins.user ?? defaults;
+        if (!pins.includes(key)) {
+          try {
+            const layout = { ...current.layout, pins: { ...current.layout.pins, user: [...pins, key] } };
+            const saved = await writeLayout(layout, current.revision);
+            applyLayout(saved.layout);
+            state.layoutRevision = saved.revision;
+            state.layoutReady = true;
+            return;
+          } catch (error) {
+            if (error.conflict && attempt < 2) continue;
+            throw error;
+          }
+        }
+        applyLayout(current.layout);
+        state.layoutRevision = current.revision;
+        state.layoutReady = true;
+        return;
+      }
+    } finally { state.layoutSaving = false; render(); }
+  }
+
+  async function openOpenCodeSetup() {
+    const existing = openCodeItem();
+    if (existing) { await launch(existing.identity); return; }
+    const windows = state.hostPlatform === "windows";
+    const dialog = openDialog(`<header class="dialog-header"><div class="dialog-title-wrap"><h2 id="dialog-title">Your coding agent, on this server</h2><p>Set up OpenCode</p></div><button class="dialog-close" type="button" data-action="close-dialog" aria-label="Close">×</button></header>
+      <div class="dialog-body agent-guide"><p><button class="secondary-button" type="button" data-opencode-container>Set up in a new container</button></p><p>Or install directly on this server:</p><ol class="assistant-steps"><li><strong>Install OpenCode</strong><span>Outer Shell downloads it and adds it to your apps. No terminal needed.</span></li><li><strong>Connect a model provider</strong><span>Sign in or add your API key in OpenCode. Your provider’s pricing applies.</span></li><li><strong>Ask for what you want</strong><span>OpenCode comes with instructions for adding apps to Outer Shell.</span></li></ol>
+      <details><summary>Connection settings</summary><label for="opencode-port">Port</label><input id="opencode-port" type="number" min="1024" max="65535" value="4096"><p class="field-note">Available only on this server and through your Outer Loop connection.</p></details>
+      <p class="form-message" role="status" aria-live="polite"></p></div>
+      <footer class="dialog-footer"><button class="secondary-button" type="button" data-action="agent-guide">Use my own agent</button><button class="primary-button" type="button" data-install-opencode>Install OpenCode</button></footer>`);
+    dialog.querySelector("[data-opencode-container]").addEventListener("click", () => openCreateContainer(true));
+    dialog.querySelector("[data-install-opencode]")?.addEventListener("click", async event => {
+      const button = event.currentTarget;
+      if (button.disabled) return;
+      const message = dialog.querySelector(".form-message");
+      const port = Number(dialog.querySelector("#opencode-port").value);
+      if (!Number.isInteger(port) || port < 1024 || port > 65535) { message.textContent = "Choose a port between 1024 and 65535."; return; }
+      button.disabled = true;
+      button.textContent = "Installing…";
+      message.textContent = "Downloading OpenCode and preparing your coding agent. This can take a few minutes. You can close this dialog; installation will continue.";
+      try {
+        const load = async path => { const response = await fetch(path); if (!response.ok) throw new Error("Could not load the OpenCode installer. Refresh Outer Shell and try again."); return response.text(); };
+        const [script, skill, admin] = await Promise.all([load(windows ? "/web/opencode-start.ps1" : "/web/opencode-start.sh"), load("/web/outer-shell-skill.md"), load("/web/server-admin.md")]);
+        const prepared = script.replace("__OUTERSHELL_SKILL__", () => skill.trimEnd()).replace("__OUTERSHELL_ADMIN__", () => admin.trimEnd());
+        const command = windows ? windowsOpenCodeCommand(prepared, port) : prepared;
+        if (new TextEncoder().encode(command).length >= (windows ? 262144 : 32768)) throw new Error("OpenCode installer exceeds the command size limit.");
+        const query = new URLSearchParams({ recipe: "command-port", name: "OpenCode", identifier: windows ? "opencode" : "org.outershell.OpenCode", command, workdir: "~", scope: "user", frontendTransport: "port", port: String(port) });
+        const { buffer } = await requestBuffer("/api/create", { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: query });
+        const result = decodeAction(buffer);
+        if (!result.ok) throw new Error(result.message || "Could not install OpenCode.");
+        let pinned = false;
+        for (let attempt = 0; attempt < 180; attempt += 1) {
+          await refreshBackends({ quiet: true });
+          const item = openCodeItem();
+          if (item && !pinned) {
+            await pinInstalledOpenCode(item);
+            pinned = true;
+          }
+          if (item?.primary && endpointRunning(item.primary) && /\/session\/ses_/.test(item.primary.frontend?.url || item.primary.frontend?.path || "")) {
+            if (!dialog.isConnected) { toast("OpenCode is ready. Open it from your apps."); return; }
+            message.textContent = "OpenCode is ready. Connect your model provider, then ask it to add your first app.";
+            button.disabled = false; button.textContent = "Open OpenCode";
+            button.replaceWith(Object.assign(document.createElement("button"), { type: "button", className: "primary-button", textContent: "Open OpenCode", onclick: () => launch(item.identity).catch(error => toast(error.message || String(error))) }));
+            return;
+          }
+          const failure = item?.primary && endpointFailure(item.primary, "OpenCode");
+          if (failure) throw new Error(`${failure} Open its app menu and check the logs for details.`);
+          await delay(2000);
+        }
+        throw new Error("OpenCode is still getting ready. Check its logs from the app menu, then open it when ready.");
+      } catch (error) {
+        message.textContent = error.message || String(error);
+        await refreshBackends({ quiet: true });
+        button.disabled = false; button.textContent = "Check OpenCode";
+        button.replaceWith(button.cloneNode(true));
+        const retry = dialog.querySelector("[data-install-opencode]");
+        retry?.addEventListener("click", () => { closeDialog(); openOpenCodeSetup().catch(error => toast(error.message || String(error))); });
+      }
+    });
+  }
+
   function renderOverview(entries) {
     if (state.groupDrag || state.endpointDrag) return;
     if (renderInitialLoading()) return;
@@ -722,7 +893,7 @@
         ? `<button class="overview-add-more" type="button" data-action="configure-container" data-safe-space-id="${id}" ${preparing || !managedContainer(workspace) ? "disabled" : ""} ${!managedContainer(workspace) ? 'title="This container is managed externally"' : ""}>Add more to Dockerfile…</button>`
         : `<button class="overview-add-more" type="button" data-action="open-add" data-scope="${group.id === "root" ? "system" : "user"}">Add more…</button>`;
       return `<section class="overview-identity" data-group-id="${escapeHTML(group.id)}"><header class="overview-group-handle" tabindex="0" aria-label="Reorder ${escapeHTML(group.name)}${group.shield ? ", Administrator" : ""}. Hold and drag, or use arrow keys." title="Hold and drag to reorder" data-group-handle><div class="overview-group-heading"><h2>${escapeHTML(group.name)}</h2><p>${shield}${escapeHTML(group.note)}</p></div>${controls}</header><div class="overview-shortcuts" data-endpoint-area="pins">${pins.map(key => group.entries.find(entry => entry.key === key)).filter(Boolean).map(overviewShortcut).join("")}</div><div class="overview-list" data-endpoint-area="list">${listed.map(overviewEndpoint).join("") || `<p class="overview-empty">${state.loading || (workspace && state.safeSpacesLoading) ? "Loading…" : group.entries.length ? "" : "No registered endpoints."}</p>`}</div>${containerCommandsHTML(workspace)}${workspace?.buildProgress ? `<details class="container-build-progress"><summary>${escapeHTML(workspace.buildProgress.detail || workspace.buildProgress.phase)}</summary><pre>${escapeHTML(workspace.buildProgress.log || "")}</pre></details>` : ""}${addMore}</section>`;
-    }).join("") + `<button class="overview-add-container" type="button" data-action="create-container"><span aria-hidden="true">+</span>Add container (beta)…</button>`;
+    }).join("") + `<button class="overview-add-container" type="button" data-action="create-container"><span aria-hidden="true">+</span>Add container (beta)…</button><button class="overview-add-container" type="button" data-action="import-container">Import container…</button>`;
     if (state.overviewMarkup !== markup) {
       elements.overview.innerHTML = markup;
       state.overviewMarkup = markup;
@@ -914,8 +1085,14 @@
       signal,
       body: JSON.stringify({ requestID, operation: operation === "listDetails" ? "list" : operation, ...values })
     });
+    if (!response.ok) {
+      const text = await response.text();
+      let detail = text.trim();
+      try { detail = JSON.parse(text).error || detail; } catch (_) {}
+      throw new Error(detail || `Outer Shell returned HTTP ${response.status}.`);
+    }
     const result = await response.json();
-    if (!response.ok || result.error) throw new Error(result.error || `Outer Shell returned HTTP ${response.status}.`);
+    if (result.error) throw new Error(result.error);
     if (!signal?.aborted && typeof result.hostPlatform === "string") state.hostPlatform = result.hostPlatform;
     if (!signal?.aborted && Array.isArray(result.providers)) state.providers = result.providers;
     return result;
@@ -1233,8 +1410,24 @@
     dialog.className = `dialog ${className}`.trim();
     if (dialog.classList.contains("context-menu")) backdrop.classList.add("context-menu-backdrop");
     dialog.innerHTML = bodyHTML;
+    let backdropPress = false;
+    let backdropRelease = false;
+    backdrop.addEventListener("pointerdown", event => {
+      backdropPress = event.target === backdrop;
+      backdropRelease = false;
+    });
+    backdrop.addEventListener("pointerup", event => {
+      backdropRelease = event.target === backdrop;
+    });
+    backdrop.addEventListener("pointercancel", () => {
+      backdropPress = false;
+      backdropRelease = false;
+    });
     backdrop.addEventListener("click", event => {
-      if (event.target === backdrop) closeDialog();
+      const dismiss = backdropPress && backdropRelease && event.target === backdrop;
+      backdropPress = false;
+      backdropRelease = false;
+      if (dismiss) closeDialog();
     });
     elements.dialogLayer.append(fragment);
     window.setTimeout(() => {
@@ -1320,14 +1513,20 @@
     state.addTab = tab;
     const apps = (state.addWorkspace ? state.workspaceCatalog || [] : state.backends).filter(backend => backend.serviceID !== "org.outershell.OuterShell" && backend.isBundled && !backend.isMigration && backend.serviceScope === state.addScope)
       .sort((a, b) => a.displayName.localeCompare(b.displayName));
-    const catalog = apps.length ? `<div class="add-catalog">${apps.map(backend => {
+    const catalogEntries = apps.map(backend => {
       const item = { backend, frontend: backend.frontends?.[0], displayName: backend.displayName };
-      const icon = iconHTML(item);
-      return `<article class="add-catalog-app ${backend.isInstalled ? "installed" : ""}">
-        ${icon}<h3>${escapeHTML(backend.displayName)}</h3>
+      return { name: backend.displayName, html: `<article class="add-catalog-app ${backend.isInstalled ? "installed" : ""}">
+        ${iconHTML(item)}<h3>${escapeHTML(backend.displayName)}</h3>
         ${backend.isInstalled ? '<span class="catalog-installed">Installed</span>' : `<button class="secondary-button" type="button" data-action="install" data-backend-key="${escapeHTML(backendKey(backend))}">${backend.serviceScope === "system" ? (state.hostPlatform === "windows" && !state.addWorkspace ? "Install as administrator" : "Install as root") : "Install"}</button>`}
-      </article>`;
-    }).join("")}</div>` : `<p class="add-empty">No bundled apps are available for this account.</p>`;
+      </article>` };
+    });
+    if (!state.addWorkspace && state.addScope !== "system") {
+      catalogEntries.push({ name: "OpenCode", html: `<article class="add-catalog-app">
+        <div class="app-icon" aria-hidden="true">&gt;_</div><h3>OpenCode</h3>
+        <button class="secondary-button" type="button" data-action="setup-opencode">${openCodeItem() ? "Open OpenCode" : "Set up OpenCode"}</button>
+      </article>` });
+    }
+    const catalog = catalogEntries.length ? `<div class="add-catalog">${catalogEntries.sort((a, b) => a.name.localeCompare(b.name)).map(entry => entry.html).join("")}</div>` : `<p class="add-empty">No bundled apps are available for this account.</p>`;
     const bash = `<form id="bash-form">
       <div class="form-grid">
         <div class="field"><label for="bash-name">Display name</label><input id="bash-name" name="name" placeholder="My server" required></div>
@@ -1342,32 +1541,10 @@
       <p id="bash-message" class="form-message" role="status"></p>
       <footer class="dialog-footer"><button class="secondary-button" type="button" data-action="close-dialog">Cancel</button><button class="primary-button" type="submit">Create app</button></footer>
     </form>`;
-    const sshArguments = window.outerLoop?.sessionContext?.sshCommandArguments;
-    const sshCommand = Array.isArray(sshArguments) && sshArguments.length && sshArguments.every(value => typeof value === "string")
-      ? sshArguments.map(shellQuotedArgument).join(" ") : null;
-    const connectionInstructions = sshCommand
-      ? `Connect to this server using:\n${sshCommand}`
-      : "Connect to this server over SSH using its host and account.";
-    const connectionHint = sshCommand
-      ? "Share the example request below, along with the Outer Shell API documentation."
-      : "Give it the SSH host and account you use for this server, plus the Outer Shell API documentation.";
-    const serviceDescription = state.backends.some(backend => (backend.serviceUnitPath || backend.serviceUnit || "").endsWith(".plist"))
-      ? "a launchd service on macOS"
-      : state.backends.some(backend => (backend.serviceUnit || "").endsWith(".service"))
-        ? "a systemd service on Linux" : "a background service";
-    const codingAgent = `<div class="coding-agent-panel">
-      <h3>Ask your coding agent</h3>
-      <p>Ask your coding agent to SSH to this server and install the app you want. ${connectionHint}</p>
-      <p>The agent should install the app and its dependencies, configure ${serviceDescription}, and use outerctl as the appropriate user to register the backend, app endpoint, and log files. Apps can use a loopback TCP port or a Unix socket.</p>
-      <h4>Example request</h4>
-      <blockquote>${escapeHTML(connectionInstructions)}
-
-Install &lt;app&gt;. Set it up as a service and register it with Outer Shell so I can open it and manage it here. Follow https://outershell.org/api/ for backend, app, and log registration, then verify that the app starts and responds.</blockquote>
-      <a href="https://outershell.org/api/" target="_blank" rel="noopener noreferrer">Outer Shell API documentation ↗</a>
-    </div>`;
+    const codingAgent = codingAgentHTML();
     const categories = [
+      ["agent", "Coding agent", '<path d="M21 11a8 8 0 0 1-8 8H7l-5 3V11a9 9 0 0 1 19 0Z"/><path d="m7 9 3 3-3 3m6 0h4"/>'],
       ["catalog", "Outer Shell app catalog", '<rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/>'],
-      ["agent", "Ask your coding agent", '<path d="M21 11a8 8 0 0 1-8 8H7l-5 3V11a9 9 0 0 1 19 0Z"/><path d="m7 9 3 3-3 3m6 0h4"/>'],
       ["bash", windowsCommands ? "Run commands" : "Run bash commands", '<rect x="2" y="3" width="20" height="18" rx="2"/><path d="m6 8 3 3-3 3m6 0h5"/>'],
       ["recipes", "Other recipes", '<rect x="2" y="3" width="20" height="18" rx="2"/><path d="M6 8h1m3 0h8M6 12h1m3 0h8M6 16h1m3 0h5"/>']
     ].filter(([id]) => (!(state.addWorkspace || windowsCommands) || state.addScope !== "system" || id === "catalog" || id === "agent" || windowsCommands && id === "bash") && (!windowsCommands || id !== "recipes"));
@@ -1604,21 +1781,142 @@ Install &lt;app&gt;. Set it up as a service and register it with Outer Shell so 
     }
   }
 
-  function openCreateContainer() {
+  async function uploadContainerArchive(file, transferID, onProgress, signal) {
+    if (!/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(transferID)) throw new Error("Invalid container transfer identifier.");
+    const endpoint = `/api/container-transfers/${transferID}`;
+    const headers = { "Upload-Protocol": "outershell-resumable-v1" };
+    const readOffset = response => {
+      const text = response.headers.get("Upload-Offset");
+      const offset = Number(text);
+      if (!text || !/^\d+$/.test(text) || !Number.isSafeInteger(offset) || offset < 0 || offset > file.size) throw new Error("Invalid container upload offset.");
+      return offset;
+    };
+    let offset = 0, failures = 0;
+    while (offset < file.size) {
+      signal.throwIfAborted();
+      try {
+        const head = await fetch(endpoint, { method: "HEAD", headers, cache: "no-store", signal });
+        if (!head.ok) throw new Error(`Could not resume container upload (HTTP ${head.status}).`);
+        offset = readOffset(head);
+        if (offset === file.size) break;
+        const end = Math.min(offset + 4 * 1024 * 1024, file.size);
+        const response = await fetch(endpoint, { method: "PATCH", headers: { ...headers, "Content-Type": "application/offset+octet-stream", "Upload-Offset": String(offset) }, body: file.slice(offset, end), signal });
+        if (response.status === 409) throw new Error("The upload offset changed. Retrying…");
+        if (!response.ok) throw new Error(`Could not upload container (HTTP ${response.status}).`);
+        const next = readOffset(response);
+        if (next <= offset || next > end) throw new Error("The container upload made no progress.");
+        offset = next;
+        failures = 0;
+        onProgress(Math.floor(offset / file.size * 100));
+      } catch (error) {
+        if (signal.aborted || ++failures > 3) throw error;
+      }
+    }
+  }
+
+  function openContainerImport(droppedFile) {
+    const provider = state.providers.find(runtimeCanCreate);
+    const dialog = openDialog(`${containerDialogHeader("Import container")}
+      <form class="container-form"><div class="dialog-body form-grid">
+        <label class="field full">Container file<input name="archive" type="file" accept=".outershell-container" ${droppedFile ? "" : "required"}></label>
+        <p class="field-note full" data-import-file>${droppedFile ? escapeHTML(droppedFile.name) : "Choose a .outershell-container file, or drop one onto Outer Shell."}</p>
+        <label class="field full">Runtime<select name="runtimeProviderID">${runtimeOptions(provider?.id)}</select></label>
+        <div class="full" data-import-mounts hidden><p>This archive includes mounted folders. Choose where to restore them on this server.</p><ul data-import-mount-list></ul><label class="field">Destination folder on this server<input name="mountDestinationRoot" spellcheck="false"></label></div>
+        <progress class="full" max="100" value="0" hidden></progress>
+        <p class="container-message full" role="status">${provider ? "" : "No container runtime is ready on this server."}</p>
+      </div><footer class="dialog-footer"><button type="button" data-action="close-dialog">Cancel</button><button class="primary-button" type="submit" ${provider ? "" : "disabled"}>Import</button></footer></form>`);
+    const form = dialog.querySelector("form");
+    const message = form.querySelector(".container-message");
+    const button = form.querySelector('[type="submit"]');
+    const progress = form.querySelector("progress");
+    const controller = new AbortController();
+    let file = droppedFile, transferID, uploaded = false, busy = false, finishing = false, completed = false;
+    const observer = new MutationObserver(() => {
+      if (dialog.isConnected) return;
+      observer.disconnect();
+      if (!finishing) controller.abort();
+      if (!busy && transferID && !completed) safeSpaceRequest("cancelImport", { transferID }).catch(() => {});
+    });
+    observer.observe(elements.dialogLayer, { childList: true });
+    form.elements.archive.addEventListener("change", () => {
+      file = form.elements.archive.files[0];
+      form.querySelector("[data-import-file]").textContent = file?.name || "Choose a .outershell-container file.";
+    });
+    form.addEventListener("submit", async event => {
+      event.preventDefault();
+      if (busy) return;
+      if (!file || !file.name.toLowerCase().endsWith(".outershell-container") || !file.size) { message.textContent = "Choose a nonempty .outershell-container file."; return; }
+      if (file.size > 8 * 1024 ** 3) { message.textContent = "Container archives must be no larger than 8 GB."; return; }
+      busy = true; button.disabled = true;
+      form.elements.archive.disabled = true;
+      form.elements.runtimeProviderID.disabled = true;
+      try {
+        if (!transferID) {
+          message.textContent = "Preparing upload…";
+          const result = await safeSpaceRequest("beginImport");
+          transferID = result.transferID;
+          if (!transferID) throw new Error("The server could not begin the import.");
+        }
+        if (!uploaded) {
+          progress.hidden = false;
+          await uploadContainerArchive(file, transferID, percent => {
+            progress.value = percent; message.textContent = `Uploading ${file.name}… ${percent}%`;
+          }, controller.signal);
+          uploaded = true;
+        }
+        controller.signal.throwIfAborted();
+        finishing = true;
+        message.textContent = "Importing container…";
+        const values = { transferID, runtimeProviderID: form.elements.runtimeProviderID.value };
+        if (form.elements.mountDestinationRoot.value.trim()) values.mountDestinationRoot = form.elements.mountDestinationRoot.value.trim();
+        const result = await safeSpaceRequest("finishImport", values);
+        finishing = false;
+        if (result.needsMountDestination) {
+          if (!dialog.isConnected) throw new Error("Import needs a destination for mounted folders. Drop the archive again to continue.");
+          form.querySelector("[data-import-mounts]").hidden = false;
+          form.querySelector("[data-import-mount-list]").innerHTML = (result.importMounts || []).map(mount => `<li>${escapeHTML(mount.name || mount.guestPath || "Mounted folder")}</li>`).join("");
+          form.elements.mountDestinationRoot.value = result.suggestedMountRoot || "";
+          form.elements.mountDestinationRoot.required = true;
+          message.textContent = "Choose a destination folder, then import. The archive is already uploaded.";
+          button.textContent = "Import with folders";
+          return;
+        }
+        completed = true;
+        if (dialog.isConnected) closeDialog();
+        toast(result.omittedMountCount ? `Container imported. ${result.omittedMountCount} folder mount(s) need to be reconnected.` : "Container imported. Its image is being built.");
+        await refreshSafeSpaces();
+      } catch (error) {
+        finishing = false;
+        if (dialog.isConnected) message.textContent = error.message || String(error);
+        else if (error.name !== "AbortError") toast(error.message || String(error), true);
+      } finally {
+        busy = false; button.disabled = false;
+        if (!dialog.isConnected && transferID && !completed) safeSpaceRequest("cancelImport", { transferID }).catch(() => {});
+      }
+    });
+  }
+
+  function openCreateContainer(includeOpenCode = false) {
     const provider = state.providers.find(runtimeCanCreate);
     const dialog = openDialog(`${containerDialogHeader("New container")}
       <form class="container-form"><div class="dialog-body form-grid">
-        <label class="field full">Name<input name="name" required autocomplete="off"></label>
+        <label class="field full">Name<input name="name" required autocomplete="off" value="${includeOpenCode ? "OpenCode workspace" : ""}"></label>
         <label class="field full">Runtime<select name="runtimeProviderID">${runtimeOptions(provider?.id)}</select></label>
         <label class="field full">Base image<input name="baseImage" value="${escapeHTML(provider?.defaultBaseImage || "")}" required spellcheck="false"></label>
         <label class="field">Max CPUs<input name="cpus" type="number" min="1" step="1" value="4" required></label>
         <label class="field">Max Memory (GB)<input name="memoryInGB" type="number" min="1" step="1" value="8" required></label>
+        <label class="container-check full"><input name="includeOpenCode" type="checkbox" ${includeOpenCode ? "checked" : ""}>Install OpenCode</label>
+        <div class="full" data-opencode-permissions ${includeOpenCode ? "" : "hidden"}><label class="container-check"><input name="allowAllOpenCodeActions" type="checkbox">Allow all actions without asking</label><p class="field-note">Applies to OpenCode in this container, including folders mounted into it.</p></div>
+        <p class="field-note full">OpenCode opens a workspace with instructions for adding apps to this container. Its workspace and model-provider settings persist across rebuilds. Requires a Debian or Ubuntu image with Outer Shell support.</p>
         <p class="field-note full">The container is built on this server. You can edit its Dockerfile and runtime configuration after creation.</p>
         <div class="runtime-guidance full">${runtimeGuidance()}</div>
         <button type="button" class="runtime-recheck">Check again</button>
         <p class="container-message full" role="status">${provider ? "" : "No container runtime is ready on this server."}</p>
       </div><footer class="dialog-footer"><button type="button" data-action="close-dialog">Cancel</button><button class="primary-button" type="submit" ${provider ? "" : "disabled"}>Create</button></footer></form>`);
     const form = dialog.querySelector("form");
+    form.elements.includeOpenCode.addEventListener("change", () => {
+      form.querySelector("[data-opencode-permissions]").hidden = !form.elements.includeOpenCode.checked;
+    });
     form.querySelector(".runtime-recheck").addEventListener("click", async event => {
       const button = event.currentTarget;
       button.disabled = true;
@@ -1645,7 +1943,10 @@ Install &lt;app&gt;. Set it up as a service and register it with Outer Shell so 
       const message = form.querySelector(".container-message");
       message.textContent = "Creating container…";
       try {
-        await containerOperation("create", { name: String(data.get("name")).trim(), runtimeProviderID: data.get("runtimeProviderID"), baseImage: String(data.get("baseImage")).trim(), cpus: Number(data.get("cpus")), memoryInGB: Number(data.get("memoryInGB")) });
+        const baseImage = String(data.get("baseImage")).trim();
+        if (!/^[a-zA-Z0-9][a-zA-Z0-9._/:@-]*$/.test(baseImage)) throw new Error("Enter a valid base image reference.");
+        const dockerfile = data.get("includeOpenCode") ? `# syntax=docker/dockerfile:1\nFROM ${baseImage}\n${await openCodeContainerFragment(data.get("allowAllOpenCodeActions") === "on")}` : undefined;
+        await containerOperation("create", { name: String(data.get("name")).trim(), runtimeProviderID: data.get("runtimeProviderID"), baseImage, dockerfile, cpus: Number(data.get("cpus")), memoryInGB: Number(data.get("memoryInGB")) });
         if (dialog.isConnected) closeDialog();
         toast("Container creation requested. Its status appears under All endpoints.");
       } catch (error) { message.textContent = error.message; button.disabled = false; }
@@ -1713,8 +2014,8 @@ Install &lt;app&gt;. Set it up as a service and register it with Outer Shell so 
       <form class="container-form" novalidate><div class="dialog-body">
         <label class="field">Name<input name="name" value="${escapeHTML(workspace.name)}" required></label>
         <div class="configuration-tabs" role="tablist" aria-label="Container configuration">${tabs.map(([key, label], index) => `<button type="button" role="tab" id="config-tab-${key}" aria-controls="config-panel-${key}" aria-selected="${index === 0}" data-config-tab="${key}">${label}</button>`).join("")}</div>
-        <section role="tabpanel" id="config-panel-dockerfile" aria-labelledby="config-tab-dockerfile" data-config-panel="dockerfile"><label class="field">Dockerfile<textarea name="dockerfile" class="dockerfile-editor" spellcheck="false" autocapitalize="off" autocorrect="off">${escapeHTML(recipe.containerfile)}</textarea></label><p class="field-note">Save stores the definition. Save &amp; rebuild applies it to the container.</p></section>
-        <section role="tabpanel" id="config-panel-mounts" aria-labelledby="config-tab-mounts" data-config-panel="mounts" hidden><p class="field-note">Server folders are paths on the machine running Outer Shell. They must already exist.</p><div data-rows="mounts">${(workspace.mounts || []).filter(mount => !mount.isInfrastructure).map(mount => configurationRow("mounts", mount)).join("")}</div><button type="button" data-add-row="mounts">Add folder mount</button>${infrastructure.length ? `<details class="managed-mounts"><summary>Managed mounts (${infrastructure.length})</summary>${infrastructure.map(mount => `<p><code>${escapeHTML(mount.hostPath)} → ${escapeHTML(mount.guestPath)}</code></p>`).join("")}</details>` : ""}</section>
+        <section role="tabpanel" id="config-panel-dockerfile" aria-labelledby="config-tab-dockerfile" data-config-panel="dockerfile"><label class="field">Dockerfile<textarea name="dockerfile" class="dockerfile-editor" spellcheck="false" autocapitalize="off" autocorrect="off">${escapeHTML(recipe.containerfile)}</textarea></label><p class="field-note">Save stores the definition. Save &amp; rebuild applies it to the container.</p><label class="container-check"><input name="allowAllOpenCodeActions" type="checkbox">Allow all actions without asking</label><p class="field-note">Applies when adding OpenCode below, including access to folders mounted into this container.</p><button type="button" data-add-opencode>Add OpenCode</button><p class="field-note">Adds OpenCode and container instructions to this Dockerfile. Requires Debian or Ubuntu with Outer Shell support.</p></section>
+        <section role="tabpanel" id="config-panel-mounts" aria-labelledby="config-tab-mounts" data-config-panel="mounts" hidden><p class="field-note">Server folders are paths on the server running Outer Shell. They must already exist.</p><div data-rows="mounts">${(workspace.mounts || []).filter(mount => !mount.isInfrastructure).map(mount => configurationRow("mounts", mount)).join("")}</div><button type="button" data-add-row="mounts">Add folder mount</button>${infrastructure.length ? `<details class="managed-mounts"><summary>Managed mounts (${infrastructure.length})</summary>${infrastructure.map(mount => `<p><code>${escapeHTML(mount.hostPath)} → ${escapeHTML(mount.guestPath)}</code></p>`).join("")}</details>` : ""}</section>
         <section role="tabpanel" id="config-panel-environment" aria-labelledby="config-tab-environment" data-config-panel="environment" hidden><div data-rows="environment">${(recipe.environment || []).map(value => configurationRow("environment", value)).join("")}</div><button type="button" data-add-row="environment">Add variable</button></section>
         <section role="tabpanel" id="config-panel-ports" aria-labelledby="config-tab-ports" data-config-panel="ports" hidden><p class="field-note">Publish a container TCP port on this server.</p><div data-rows="ports">${(recipe.publishedPorts || []).map(value => configurationRow("ports", value)).join("")}</div><button type="button" data-add-row="ports">Add port</button></section>
         <section role="tabpanel" id="config-panel-runtime" aria-labelledby="config-tab-runtime" data-config-panel="runtime" hidden><p>${escapeHTML(safeSpaceRuntimeDescription(workspace))} · ${escapeHTML(workspace.cpus)} CPUs · ${escapeHTML(workspace.memoryInGB)} GB</p><label class="field">Runtime<select name="runtimeProviderID">${runtimeOptions(workspace.runtime?.providerID)}</select></label><p class="field-note">Changing runtime saves the configuration and rebuilds the container with the selected provider.</p><button type="submit" value="runtime">Save &amp; change runtime</button></section>
@@ -1731,6 +2032,21 @@ Install &lt;app&gt;. Set it up as a service and register it with Outer Shell so 
       const add = event.target.closest("[data-add-row]");
       if (add) form.querySelector(`[data-rows="${add.dataset.addRow}"]`).insertAdjacentHTML("beforeend", configurationRow(add.dataset.addRow));
       event.target.closest("[data-remove-row]")?.closest("[data-row]").remove();
+    });
+    form.querySelector("[data-add-opencode]").addEventListener("click", async event => {
+      const button = event.currentTarget;
+      const message = form.querySelector(".container-message");
+      if (form.elements.dockerfile.value.includes("/usr/local/bin/outershell-opencode")) {
+        message.textContent = "This Dockerfile already includes OpenCode.";
+        return;
+      }
+      button.disabled = true;
+      try {
+        const fragment = await openCodeContainerFragment(form.elements.allowAllOpenCodeActions.checked);
+        form.elements.dockerfile.value = form.elements.dockerfile.value.trimEnd() + "\n\n" + fragment;
+        message.textContent = "OpenCode added. Choose Save & rebuild to install it.";
+      } catch (error) { message.textContent = error.message; }
+      finally { button.disabled = false; }
     });
     let savedDockerfile = recipe.containerfile;
     let savedName = workspace.name;
@@ -2009,18 +2325,20 @@ Install &lt;app&gt;. Set it up as a service and register it with Outer Shell so 
   }
 
   async function copyText(text) {
-    try {
-      await navigator.clipboard.writeText(text);
-      toast("Copied to the clipboard.");
-    } catch (_) {
-      const area = document.createElement("textarea");
-      area.value = text;
-      document.body.append(area);
-      area.select();
-      document.execCommand("copy");
-      area.remove();
-      toast("Copied to the clipboard.");
+    const area = document.createElement("textarea");
+    area.value = text;
+    area.style.cssText = "position:fixed;left:-9999px;top:0";
+    const focused = document.activeElement;
+    document.body.append(area);
+    area.select();
+    let copied = false;
+    try { copied = document.execCommand("copy"); } catch (_) {}
+    area.remove();
+    focused?.focus();
+    if (!copied) {
+      try { await navigator.clipboard.writeText(text); copied = true; } catch (_) {}
     }
+    toast(copied ? "Copied to the clipboard." : "Could not copy. Select the text and copy it manually.");
   }
 
   function openLogs(key, selectedIndex = 0) {
@@ -2317,8 +2635,14 @@ Install &lt;app&gt;. Set it up as a service and register it with Outer Shell so 
       event.preventDefault();
       return;
     }
+    if (action === "agent-guide") { openAddDialog("agent"); return; }
+    if (action === "copy-agent-prompt") { await copyText(agentPrompt("[Your request here]")); return; }
+    if (action === "example-prompt") { await copyText(agentExamples[Number(actionElement.dataset.example)] || agentExamples[2]); return; }
+    if (action === "setup-opencode") { try { await openOpenCodeSetup(); } catch (error) { toast(error.message || String(error)); } return; }
     if (action === "rename-endpoint") { const item = findItem(actionElement.dataset.appKey); if (item) openRenameEndpoint(item); return; }
     if (action === "show-container-command") { const bounds = actionElement.getBoundingClientRect(); openContainerCommand(actionElement.dataset.safeSpaceId, actionElement.dataset.commandId, { x: bounds.left, y: bounds.bottom }); return; }
+    if (action === "setup-container-opencode") { openCreateContainer(true); return; }
+    if (action === "import-container") { openContainerImport(); return; }
     if (action === "create-container") { openCreateContainer(); return; }
     if (action === "configure-container") { openContainerConfiguration(actionElement.dataset.safeSpaceId); return; }
     if (action === "share-container") { openShareContainer(actionElement.dataset.safeSpaceId); return; }
@@ -2445,6 +2769,22 @@ Install &lt;app&gt;. Set it up as a service and register it with Outer Shell so 
       const bounds = event.target.getBoundingClientRect();
       openAppMenu(identity, { x: bounds.left, y: bounds.bottom }, menuContext(event.target));
     }
+  });
+  document.addEventListener("dragover", event => {
+    if (Array.from(event.dataTransfer?.types || []).includes("Files")) {
+      event.preventDefault();
+      event.dataTransfer.dropEffect = "copy";
+    }
+  });
+  document.addEventListener("drop", event => {
+    const files = Array.from(event.dataTransfer?.files || []);
+    if (!files.length || event.target.closest('input[type="file"]')) return;
+    event.preventDefault();
+    if (files.length !== 1 || !files[0].name.toLowerCase().endsWith(".outershell-container")) {
+      toast("Drop one .outershell-container file to import it.", true);
+      return;
+    }
+    openContainerImport(files[0]);
   });
   window.addEventListener("beforeunload", suspendRefreshes);
   window.addEventListener("pagehide", () => { finishEndpointDrag(false); finishGroupDrag(false); suspendRefreshes(); });

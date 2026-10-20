@@ -1285,6 +1285,8 @@ final class SafeSpaceManager: @unchecked Sendable {
         let requestedBaseImage = try (request["baseImage"] as? String).map {
             try validatedBaseImage($0)
         }
+        let requestedDockerfile = request["dockerfile"] as? String
+        if let requestedDockerfile { try validateDockerfile(requestedDockerfile) }
         let requestedSupportInstall = request["installsOuterShellSupport"] as? Bool
         let id = UUID()
         let record = SafeSpaceRecord(id: id,
@@ -1297,6 +1299,20 @@ final class SafeSpaceManager: @unchecked Sendable {
                                      projectResourceKey: recipeResourceKey(id),
                                      ownsContainer: true)
         try createManagedDirectories(for: record)
+        if let requestedBaseImage {
+            try saveRecipe(
+                newRecipe(baseImage: requestedBaseImage,
+                          installsOuterShellSupport: requestedSupportInstall ??
+                              !usesBuiltInOuterShellImage(requestedBaseImage),
+                          hasUntrackedChanges: false),
+                for: record
+            )
+        } else {
+            _ = try recipe(for: record)
+        }
+        if let requestedDockerfile {
+            try requestedDockerfile.write(to: dockerfileURL(record.id), atomically: true, encoding: .utf8)
+        }
         lock.withSafeSpaceLock {
             records.append(record)
             transientStates[record.id] = "creating"
@@ -1305,17 +1321,6 @@ final class SafeSpaceManager: @unchecked Sendable {
         Task.detached(priority: .userInitiated) { [weak self] in
             guard let self else { return }
             do {
-                if let requestedBaseImage {
-                    try self.saveRecipe(
-                        self.newRecipe(baseImage: requestedBaseImage,
-                                       installsOuterShellSupport: requestedSupportInstall ??
-                                           !self.usesBuiltInOuterShellImage(requestedBaseImage),
-                                       hasUntrackedChanges: false),
-                        for: record
-                    )
-                } else {
-                    _ = try self.recipe(for: record)
-                }
                 let imageReference = self.recipeImageReference(record.id)
                 _ = try self.runContainerBuild(record,
                                                imageReference: imageReference)

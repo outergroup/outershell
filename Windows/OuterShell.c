@@ -1,5 +1,6 @@
 #include "Runtime.h"
 #include "Wsl.h"
+#include "Icons.h"
 #include "NativeRegistry.c"
 #include "../Backend/OuterShellLayout.h"
 #include <shlobj.h>
@@ -285,16 +286,22 @@ static StringBuilder backends(ShellHost *s) {
             payload_text(&app, 8, a->endpoint_kind == 3 ? a->path : a->url);
             payload_text(&app, 16, a->socket_path);
             payload_text(&app, 24, a->icon_path);
-            if (!strpbrk(b->service_id, "/\\:")) {
+            StringBuilder icon = {0};
+            if (a->icon_path[0]) win_read_file(a->icon_path, 1024 * 1024, &icon);
+            if (!icon.length && !strpbrk(b->service_id, "/\\:")) {
                 char name[512];
                 snprintf(name, sizeof(name), "icons/%s.png", b->service_id);
                 char *path = win_join(s->web, name);
-                StringBuilder icon = {0};
-                if (win_read_file(path, 1024 * 1024, &icon))
-                    payload_data(&app, 32, icon.data, icon.length);
-                free(icon.data);
+                win_read_file(path, 1024 * 1024, &icon);
                 free(path);
             }
+            char port[16], token[33]; snprintf(port, sizeof(port), "%d", a->port);
+            const char *identity[] = {"native", s->registry, b->service_id, a->frontend_id, a->host, port, a->socket_path, a->path, a->url};
+            if (!a->icon_path[0]) icons_describe(identity, sizeof(identity) / sizeof(*identity), &icon, token);
+            else token[0] = 0;
+            if (icon.length) payload_data(&app, 32, icon.data, icon.length);
+            payload_text(&app, 64, token);
+            free(icon.data);
             payload_u32(&app, 48, (uint32_t)a->port);
             payload_text(&app, 52, a->frontend_id);
             payload_u32(&app, 60,
@@ -513,6 +520,16 @@ static void serve_http(Connection *c, void *context) {
     int status = 200;
     if (!strcmp(r.path, "/api/backends"))
         body = backends(s);
+    else if (!strcmp(r.path, "/api/icon-observation")) {
+        char *token = http_query(&r, "token");
+        status = strcmp(r.method, "POST") ? 405 : icons_save(token, r.body.data, r.body.length);
+        free(token);
+        body = payload(28);
+        payload_u32(&body, 0, status == 200 ? 1 : 0);
+        payload_text(&body, 4, status == 200 ? "Discovered icon saved." :
+            status == 403 ? "Invalid icon observation token." : status == 400 ? "Icon must be a PNG no larger than 48 KiB and 4096 pixels per side." : "Could not save the observed icon.");
+        if (status == 200) { changed(s); wsl_refresh(s->wsl); }
+    }
     else if (!strcmp(r.path, "/api/layout"))
         body = layout(s, &r, &status);
     else if (!strcmp(r.path, "/api/events")) {
@@ -626,6 +643,7 @@ static bool shell_start(ShellHost *s) {
         if (!s->job || !SetInformationJobObject(s->job, JobObjectExtendedLimitInformation, &limits, sizeof(limits))) return false;
         if (!legacy_start_files(s)) return false;
     }
+    if (!icons_init(s->state)) return false;
     s->wsl = wsl_start(s->stop);
     if (s->wsl) wsl_version(s->wsl);
     char *api = win_pipe("org.outershell.outershelld"), *http = win_pipe(shell_id);

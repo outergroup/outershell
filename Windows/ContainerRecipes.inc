@@ -195,6 +195,82 @@ static bool container_persistent_arguments(const char *id, const char *config, C
 
 static const char *container_empty_configuration = "{\"mounts\":[],\"environment\":[],\"publishedPorts\":[]}";
 
+static bool container_has_guest_path(const char *array, const char *guest) {
+    if (!array || array[0] != '[') return false;
+    const unsigned char *p = (const unsigned char *)array + 1, *end = p + strlen(array) - 1;
+    while (p < end) {
+        layout_json_space(&p, end); if (p == end || *p == ']') break;
+        const unsigned char *start = p;
+        if (!layout_json_value(&p, end, 0)) return false;
+        char *path = container_string((const char *)start, (size_t)(p - start), "guestPath");
+        bool match = path && !strcmp(path, guest); free(path);
+        if (match) return true;
+        layout_json_space(&p, end); if (p < end && *p == ',') p++;
+    }
+    return false;
+}
+
+static bool container_image_volumes(Wsl *w, ContainerRuntime runtime, const char *id, const char *image) {
+    const char *inspect[] = {"image", "inspect", image, NULL};
+    StringBuilder output = {0}, items = {0}, updated = {0};
+    bool ok = capture_runtime(w, inspect, &output, runtime);
+    char *object = output.data ? strchr(output.data, '{') : NULL;
+    char *image_config = object ? container_json_field(object, "Config") : NULL;
+    char *volumes = image_config ? container_json_field(image_config, "Volumes") : NULL;
+    char *config = container_read(id, "configuration", container_empty_configuration);
+    char *previous = container_json_field(config, "persistentData");
+    char *mounts = container_json_field(config, "mounts");
+    append(&items, "[");
+    ok = ok && image_config != NULL;
+    if (ok && volumes && volumes[0] == '{') {
+        const unsigned char *p = (const unsigned char *)volumes + 1, *end = p + strlen(volumes) - 1;
+        while (ok && p < end) {
+            layout_json_space(&p, end); if (p == end || *p == '}') break;
+            const unsigned char *start = p;
+            ok = layout_json_string(&p, end);
+            if (!ok) break;
+            StringBuilder wrapper = {0}; append(&wrapper, "{\"path\":"); bytes(&wrapper, start, (size_t)(p - start)); append(&wrapper, "}");
+            char *guest = container_string(wrapper.data, wrapper.length, "path"); free(wrapper.data);
+            ok = guest && guest[0] == '/' && guest[1] && !strpbrk(guest, ",\r\n\"");
+            if (ok && !container_has_guest_path(mounts, guest)) {
+                char item_id[37];
+                ok = container_identity(runtime, guest, item_id);
+                if (ok && previous) {
+                    const unsigned char *q = (const unsigned char *)previous + 1, *limit = q + strlen(previous) - 1;
+                    while (q < limit) {
+                        layout_json_space(&q, limit); if (q == limit || *q == ']') break;
+                        const unsigned char *entry = q;
+                        if (!layout_json_value(&q, limit, 0)) { ok = false; break; }
+                        char *path = container_string((const char *)entry, (size_t)(q - entry), "guestPath");
+                        char *old_id = container_string((const char *)entry, (size_t)(q - entry), "id");
+                        if (path && !strcmp(path, guest) && container_uuid(old_id)) strcpy_s(item_id, sizeof(item_id), old_id);
+                        free(path); free(old_id);
+                        layout_json_space(&q, limit); if (q < limit && *q == ',') q++;
+                    }
+                }
+                if (ok) {
+                    if (items.length > 1) append(&items, ",");
+                    append(&items, "{"); field(&items, "id", item_id); append(&items, ","); field(&items, "guestPath", guest); append(&items, "}");
+                }
+            }
+            free(guest);
+            layout_json_space(&p, end);
+            ok = ok && p < end && *p++ == ':' && layout_json_value(&p, end, 0);
+            layout_json_space(&p, end); if (p < end && *p == ',') p++;
+        }
+    }
+    append(&items, "]"); append(&updated, "{");
+    const char *fields[] = {"mounts", "environment", "publishedPorts"};
+    for (size_t i = 0; i < sizeof(fields) / sizeof(*fields); i++) {
+        char *value = container_json_field(config, fields[i]);
+        if (i) append(&updated, ","); json_string(&updated, fields[i]); append(&updated, ":"); append(&updated, value ? value : "[]"); free(value);
+    }
+    append(&updated, ",\"persistentData\":"); append(&updated, items.data); append(&updated, "}");
+    ok = ok && container_write(id, "configuration", updated.data, updated.length);
+    free(output.data); free(items.data); free(updated.data); free(image_config); free(volumes); free(config); free(previous); free(mounts);
+    return ok;
+}
+
 static bool container_definition_create(const char *id, const char *image) {
     StringBuilder dockerfile = {0}; append(&dockerfile, "FROM "); append(&dockerfile, image); append(&dockerfile, "\n");
     bool ok = container_write(id, "Dockerfile", dockerfile.data, dockerfile.length) &&
@@ -312,6 +388,11 @@ static DWORD WINAPI container_rebuild_thread(void *context) {
         error = "The image build failed. The existing container was retained. See the container runtime log.";
         ok = capture_runtime(w, build, &output, d->container);
         if (output.data) container_write(d->id, "build.log", output.data, output.length);
+    }
+    if (ok) {
+        error = "Could not prepare persistent image volumes.";
+        ok = container_image_volumes(w, d->container, d->id, image);
+        free(config); config = container_read(d->id, "configuration", container_empty_configuration);
     }
     bool created = false, stopped = false;
     char candidate[65] = {0};

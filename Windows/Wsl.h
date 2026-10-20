@@ -4,6 +4,7 @@
 typedef struct Wsl Wsl;
 int wsl_inspect(void);
 Wsl *wsl_start(HANDLE stop);
+void wsl_refresh(Wsl *wsl);
 void wsl_stop(Wsl *wsl);
 uint64_t wsl_version(Wsl *wsl);
 void wsl_serve(Wsl *wsl, Connection *connection, HttpRequest *request);
