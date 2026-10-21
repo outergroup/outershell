@@ -3744,7 +3744,7 @@ final class SafeSpaceManager: @unchecked Sendable {
         var error = [CChar](repeating: 0, count: 2048)
         guard outerShellRegistryCopyContainers(&pointer, &count, &error, error.count) != 0 else {
             throw SafeSpaceManagerError.commandFailed(
-                String(cString: error)
+                String(decoding: error.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }, as: UTF8.self)
             )
         }
         defer { outerShellRegistryFreeContainers(pointer, count) }
@@ -3816,7 +3816,7 @@ final class SafeSpaceManager: @unchecked Sendable {
             outerShellRegistryRemoveContainer($0, &error, error.count)
         }
         guard removed != 0 else {
-            throw SafeSpaceManagerError.commandFailed(String(cString: error))
+            throw SafeSpaceManagerError.commandFailed(String(decoding: error.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }, as: UTF8.self))
         }
     }
 
@@ -3859,7 +3859,7 @@ final class SafeSpaceManager: @unchecked Sendable {
             }
         }
         guard saved != 0 else {
-            throw SafeSpaceManagerError.commandFailed(String(cString: error))
+            throw SafeSpaceManagerError.commandFailed(String(decoding: error.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }, as: UTF8.self))
         }
     }
 
