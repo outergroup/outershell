@@ -299,7 +299,7 @@ static void container_provider(Wsl *w, StringBuilder *json, ContainerRuntime run
     append(json, w->containers_available[runtime] ? "true" : "false");
     append(json, ",\"isolationName\":\"Linux containers\",\"capabilities\":{"
                  "\"supportsApps\":true,\"supportsShell\":true,\"supportsRecipes\":true,"
-                 "\"supportsMounts\":true,\"supportsLiveMounts\":false},\"status\":");
+                 "\"supportsMounts\":true,\"supportsLiveMounts\":false,\"supportsStorageCleanup\":true},\"status\":");
     json_string(json, w->containers_available[runtime] ? "ready" : "unavailable");
     append(json, ",\"detail\":");
     json_string(json, w->containers_available[runtime] ? "Ready." : runtime == RUNTIME_DOCKER ?

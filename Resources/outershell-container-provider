@@ -418,6 +418,7 @@ def capabilities():
         "supportsLiveMounts": True,
         "supportsMounts": True,
         "supportsRecipes": True,
+        "supportsStorageCleanup": True,
     }
 
 
@@ -785,7 +786,7 @@ def set_build_progress(container_id, phase, detail, log="", instruction=None,
 
 
 def build_image(context, tag, log_path, *, container_id=None, base_build=False):
-    command = [docker_path(), "build", "--progress", "plain", "--tag", tag, str(context)]
+    command = [docker_path(), "build", "--label", "org.outershell.managed=true", "--progress", "plain", "--tag", tag, str(context)]
     with open(log_path, "w", buffering=1) as log_file:
         process = subprocess.Popen(
             command,
@@ -934,6 +935,116 @@ def mark_realized(container_id):
     save_recipe(container_id, recipe)
 
 
+_storage_gate = threading.RLock()
+
+
+def storage_operation(function):
+    def perform(*args, **kwargs):
+        with _storage_gate:
+            provider_root().mkdir(parents=True, exist_ok=True, mode=0o700)
+            with open(provider_root() / "image-storage.lock", "a+") as lock_file:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+                return function(*args, **kwargs)
+    return perform
+
+
+def storage_image_owned(reference):
+    for prefix in ("outershell/container-", "outershell/safe-space-"):
+        if reference.startswith(prefix) and reference.endswith(":recipe"):
+            try:
+                uuid.UUID(reference[len(prefix):-len(":recipe")])
+                return True
+            except ValueError:
+                return False
+    prefix = "outershell/container-base:"
+    if reference.startswith(prefix):
+        version = reference[len(prefix):]
+        return version.isdecimal() and int(version) < int(DEFAULT_BASE_IMAGE.rsplit(":", 1)[1])
+    return False
+
+
+def storage_inventory(excluding=None):
+    identifiers = docker(["image", "ls", "--all", "--quiet", "--no-trunc"], check=True).stdout.split()
+    images = []
+    for identifier in sorted(set(identifiers)):
+        values = json.loads(docker(["image", "inspect", identifier], check=True).stdout)
+        if not isinstance(values, list) or len(values) != 1 or not isinstance(values[0].get("Id"), str):
+            raise ValueError("Docker returned invalid image metadata.")
+        images.extend(values)
+    protected = {DEFAULT_BASE_IMAGE}
+    files = []
+    with Records() as records:
+        for record in records.values:
+            if record["id"] == excluding or not record_owns_container(record):
+                continue
+            protected.add(image_name(record["id"]))
+            recipe = load_recipe(record["id"])
+            protected.add(recipe.get("baseImage", DEFAULT_BASE_IMAGE))
+            files.append(dockerfile_path(record["id"]).read_text())
+            files.append(recipe.get("realizedDockerfile", ""))
+    identifiers = docker(["ps", "--all", "--quiet", "--no-trunc"], check=True).stdout.split()
+    for identifier in identifiers:
+        values = json.loads(docker(["inspect", identifier], check=True).stdout)
+        if not isinstance(values, list) or len(values) != 1 or not isinstance(values[0].get("Image"), str):
+            raise ValueError("Docker returned invalid container metadata.")
+        protected.add(values[0]["Image"])
+    # Unresolved build arguments can reference any local image.
+    if any("escape=`" in text.replace(" ", "").lower() for text in files) or any("$" in line and (line.lstrip().upper().startswith(("FROM", "COPY")) or "from=" in line)
+           for text in files for line in text.replace("\\\n", " ").splitlines()):
+        return []
+    for image in images:
+        tags = image.get("RepoTags") or []
+        digests = image.get("RepoDigests") or []
+        references = [image["Id"]] + tags + digests + [digest.rsplit("@", 1)[-1] for digest in digests]
+        if any(reference in protected or any(reference in text for text in files) for reference in references):
+            protected.add(image["Id"])
+    candidates = []
+    for image in images:
+        if image["Id"] in protected:
+            continue
+        tags = [tag for tag in image.get("RepoTags") or [] if tag != "<none>:<none>"]
+        references = [tag for tag in tags if storage_image_owned(tag)]
+        if not tags and (image.get("Config", {}).get("Labels") or {}).get("org.outershell.managed") == "true":
+            references = [image["Id"]]
+        for reference in references:
+            candidates.append({"reference": reference, "imageBytes": image.get("Size", 0)})
+    return sorted(candidates, key=lambda image: image["reference"])
+
+
+def remove_owned_image(container_id):
+    reference = image_name(container_id)
+    if any(image["reference"] == reference for image in storage_inventory(excluding=container_id)):
+        docker(["image", "rm", reference], check=True)
+
+
+@storage_operation
+def operation_storage(request):
+    if request.get("runtimeProviderID", PROVIDER_ID) != PROVIDER_ID:
+        raise ValueError("Only Docker storage is available on this server.")
+    operation = request["operation"]
+    deleted, failures = [], []
+    if operation == "cleanContainerBuildCache":
+        docker(["builder", "prune", "--force", "--filter", "until=168h", "--keep-storage", "10GB"], check=True)
+    elif operation == "cleanContainerStorage":
+        selected = request.get("images")
+        if not isinstance(selected, list) or any(not isinstance(value, str) for value in selected):
+            raise ValueError("Select images to remove.")
+        candidates = {image["reference"] for image in storage_inventory()}
+        if not set(selected).issubset(candidates):
+            raise ValueError("Image references changed. Refresh storage before cleaning up.")
+        for reference in sorted(set(selected)):
+            try:
+                if reference not in {image["reference"] for image in storage_inventory()}:
+                    raise ValueError("Image is now in use.")
+                docker(["image", "rm", reference], check=True)
+                deleted.append(reference)
+            except (RuntimeError, ValueError, OSError) as error:
+                failures.append(reference + ": " + str(error))
+    return {"storage": {"images": storage_inventory(), "deleted": deleted, "failures": failures,
+                        "supportsBuildCacheCleanup": True}}
+
+
+@storage_operation
 def rebuild(container_id):
     log_path = runtime_directory(container_id) / "build.log"
     runtime_directory(container_id).mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -1037,6 +1148,7 @@ def operation_rename(request):
         records.save()
 
 
+@storage_operation
 def operation_delete(request):
     container_id = canonical_container_id(request["workspaceID"])
     with Records() as records:
@@ -1048,7 +1160,7 @@ def operation_delete(request):
             name = persistent_volume_name(container_id, item["id"])
             if docker(["volume", "inspect", name]).returncode == 0:
                 docker(["volume", "rm", name], check=True)
-        docker(["image", "rm", "--force", image_name(container_id)])
+        remove_owned_image(container_id)
         registry_resource_remove(recipe_resource_key(container_id))
         shutil.rmtree(container_directory(container_id), ignore_errors=True)
     registry_container_remove(container_id)
@@ -2342,6 +2454,8 @@ def handle_request(request):
         elif operation == "checkRuntimes":
             global _docker_readiness_cache
             _docker_readiness_cache = None
+        elif operation in ("containerStorage", "cleanContainerStorage", "cleanContainerBuildCache"):
+            extra = operation_storage(request)
         elif operation == "create":
             operation_create(request)
         elif operation == "rename":

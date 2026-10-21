@@ -82,3 +82,190 @@ enum ContainerRuntime {
         return (process.terminationStatus, String(decoding: try Data(contentsOf: output), as: UTF8.self))
     }
 }
+
+struct ContainerImageStorage {
+    struct Image {
+        let reference: String
+        let digests: Set<String>
+        let snapshotDigests: Set<String>
+        var isOwnedDangling = false
+        var sizeInBytes: Int64? = nil
+    }
+
+    static func dockerImages(from data: Data) throws -> [Image] {
+        guard let values = try JSONSerialization.jsonObject(with: data) as? [[String: Any]], !values.isEmpty else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+        return try values.flatMap { value -> [Image] in
+            guard let id = value["Id"] as? String, let config = value["Config"] as? [String: Any] else {
+                throw CocoaError(.fileReadCorruptFile)
+            }
+            let tags = (value["RepoTags"] as? [String] ?? []).filter { $0 != "<none>:<none>" }
+            let labels = config["Labels"] as? [String: String] ?? [:]
+            let repositoryDigests = value["RepoDigests"] as? [String] ?? []
+            let digests = Set(repositoryDigests + repositoryDigests.compactMap { $0.split(separator: "@").last.map(String.init) } + [id])
+            return (tags.isEmpty ? [id] : tags).map { reference in
+                Image(reference: reference, digests: digests, snapshotDigests: [],
+                      isOwnedDangling: tags.isEmpty && labels["org.outershell.managed"] == "true",
+                      sizeInBytes: (value["Size"] as? NSNumber)?.int64Value)
+            }
+        }
+    }
+
+    static func images(from data: Data) throws -> [Image] {
+        guard let values = try JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+        return try values.map { value in
+            guard let configuration = value["configuration"] as? [String: Any],
+                  let reference = configuration["name"] as? String,
+                  let descriptor = configuration["descriptor"] as? [String: Any],
+                  let digest = descriptor["digest"] as? String,
+                  let variants = value["variants"] as? [[String: Any]] else {
+                throw CocoaError(.fileReadCorruptFile)
+            }
+            let snapshots = try Set(variants.map { variant -> String in
+                guard let digest = variant["digest"] as? String else {
+                    throw CocoaError(.fileReadCorruptFile)
+                }
+                return digest
+            })
+            return Image(reference: reference, digests: snapshots.union([digest]), snapshotDigests: snapshots)
+        }
+    }
+
+    static func containerReferences(from data: Data) throws -> Set<String> {
+        guard let containers = try JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+        var references = Set<String>()
+        for container in containers {
+            guard let configuration = container["configuration"] as? [String: Any],
+                  let image = configuration["image"] as? [String: Any],
+                  let reference = image["reference"] as? String,
+                  let descriptor = image["descriptor"] as? [String: Any],
+                  let digest = descriptor["digest"] as? String else {
+                throw CocoaError(.fileReadCorruptFile)
+            }
+            references.formUnion([reference, digest])
+        }
+        return references
+    }
+
+    static func candidates(images: [Image], protected: Set<String>, dockerfiles: [String],
+                           currentBase: String, workspacePrefix: String) -> [Image] {
+        let newestWorkspace = images.compactMap { image -> (Int, String)? in
+            guard image.reference.hasPrefix(workspacePrefix),
+                  let version = Int(image.reference.dropFirst(workspacePrefix.count)) else { return nil }
+            return (version, image.reference)
+        }.max { $0.0 < $1.0 }?.1
+        var keep = protected.union([currentBase])
+        if let newestWorkspace { keep.insert(newestWorkspace) }
+        if dockerfiles.contains(where: { text in
+            text.replacingOccurrences(of: "\r\n", with: "\n").replacingOccurrences(of: "\\\n", with: " ").split(separator: "\n").contains { line in
+                let instruction = line.trimmingCharacters(in: .whitespaces).uppercased()
+                let command = instruction.split(whereSeparator: \.isWhitespace).first
+                return (command == "FROM" || (command == "COPY" && instruction.contains("--FROM=")) ||
+                    (instruction.contains("--MOUNT=") && instruction.contains("FROM=")) ||
+                    instruction.contains("ESCAPE=`")) && text.contains("$") &&
+                    (line.contains("$") || instruction.contains("ESCAPE=`"))
+            }
+        }) { return [] }
+        for image in images where dockerfiles.contains(where: { text in
+            text.contains(image.reference) || image.digests.contains(where: { text.contains($0) })
+        }) {
+            keep.insert(image.reference)
+        }
+        for image in images where keep.contains(image.reference) || !keep.isDisjoint(with: image.digests) {
+            keep.formUnion(image.digests)
+        }
+        return images.filter { image in
+            guard !keep.contains(image.reference), keep.isDisjoint(with: image.digests) else { return false }
+            if image.isOwnedDangling { return true }
+            if image.reference.hasPrefix(workspacePrefix) {
+                return Int(image.reference.dropFirst(workspacePrefix.count)) != nil
+            }
+            if image.reference.hasPrefix("outershell/container-base:") {
+                guard let version = Int(image.reference.dropFirst("outershell/container-base:".count)),
+                      let current = currentBase.split(separator: ":").last.flatMap({ Int($0) }) else { return false }
+                return version < current
+            }
+            let prefix = "outershell/safe-space-"
+            guard image.reference.hasPrefix(prefix), image.reference.hasSuffix(":recipe") else { return false }
+            return UUID(uuidString: String(image.reference.dropFirst(prefix.count).dropLast(":recipe".count))) != nil
+        }.sorted { $0.reference < $1.reference }
+    }
+
+    enum CleanupError: LocalizedError {
+        case referencesChanged
+        var errorDescription: String? {
+            "Image references changed. Refresh storage before cleaning up."
+        }
+    }
+
+    static func deleteSelected(_ references: [String], candidates: () throws -> [Image],
+                               delete: (String) throws -> Void) throws -> (deleted: [String], failures: [String]) {
+        guard Set(references).isSubset(of: Set(try candidates().map(\.reference))) else {
+            throw CleanupError.referencesChanged
+        }
+        var deleted: [String] = []
+        var failures: [String] = []
+        for reference in Set(references).sorted() {
+            do {
+                guard try candidates().contains(where: { $0.reference == reference }) else {
+                    failures.append("\(reference): now in use")
+                    continue
+                }
+                try delete(reference)
+                deleted.append(reference)
+            } catch {
+                failures.append("\(reference): \(error.localizedDescription)")
+            }
+        }
+        return (deleted, failures)
+    }
+
+    static func orphanSnapshotBytes(root: URL) throws -> Int64 {
+        let state = try Data(contentsOf: root.appendingPathComponent("state.json"))
+        guard let images = try JSONSerialization.jsonObject(with: state) as? [String: [String: Any]] else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+        var retained = Set<String>()
+        for descriptor in images.values {
+            guard let digest = descriptor["digest"] as? String else { throw CocoaError(.fileReadCorruptFile) }
+            let name = digest.replacingOccurrences(of: "sha256:", with: "")
+            guard name.count == 64, name.allSatisfy({ $0.isHexDigit }) else { throw CocoaError(.fileReadCorruptFile) }
+            let data = try Data(contentsOf: root.appendingPathComponent("content/blobs/sha256/\(name)"))
+            guard let index = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                throw CocoaError(.fileReadCorruptFile)
+            }
+            let manifests = index["manifests"] as? [[String: Any]] ?? [descriptor]
+            for manifest in manifests {
+                guard let digest = manifest["digest"] as? String else { throw CocoaError(.fileReadCorruptFile) }
+                retained.insert(digest.replacingOccurrences(of: "sha256:", with: ""))
+            }
+        }
+        let directories = try FileManager.default.contentsOfDirectory(
+            at: root.appendingPathComponent("snapshots"), includingPropertiesForKeys: nil)
+        return try directories.reduce(0) { total, directory in
+            guard directory.lastPathComponent.count == 64, !retained.contains(directory.lastPathComponent) else { return total }
+            let file = directory.appendingPathComponent("snapshot")
+            guard FileManager.default.fileExists(atPath: file.path) else { return total }
+            let values = try file.resourceValues(forKeys: [.totalFileAllocatedSizeKey, .fileAllocatedSizeKey])
+            return total + Int64(values.totalFileAllocatedSize ?? values.fileAllocatedSize ?? 0)
+        }
+    }
+
+    static func allocatedSnapshotBytes(for image: Image, root: URL) throws -> Int64 {
+        try image.snapshotDigests.reduce(0) { total, digest in
+            let name = digest.replacingOccurrences(of: "sha256:", with: "")
+            guard name.count == 64, name.allSatisfy({ $0.isHexDigit }) else {
+                throw CocoaError(.fileReadCorruptFile)
+            }
+            let file = root.appendingPathComponent("snapshots/\(name)/snapshot")
+            guard FileManager.default.fileExists(atPath: file.path) else { return total }
+            let values = try file.resourceValues(forKeys: [.totalFileAllocatedSizeKey, .fileAllocatedSizeKey])
+            return total + Int64(values.totalFileAllocatedSize ?? values.fileAllocatedSize ?? 0)
+        }
+    }
+}

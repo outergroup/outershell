@@ -16687,6 +16687,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 items.append(OuterframeContextMenuItem(id: id, title: "\(provider.name) setup instructions…", isEnabled: true, systemImageName: "book"))
             }
         }
+        if providers.contains(where: { ($0.id == "apple.container" || $0.id == "docker") && $0.isAvailable == true }) {
+            pendingSafeSpaceProviderMenuSelections[menuID]?["storage"] = "storage"
+            items.append(OuterframeContextMenuItem(id: "storage", title: "Container storage…", isEnabled: true, systemImageName: "externaldrive"))
+        }
         pendingSafeSpaceProviderMenuSelections[menuID]?["check"] = "check"
         items.append(OuterframeContextMenuItem(id: "check", title: "Check runtimes again", isEnabled: true, systemImageName: "arrow.clockwise"))
         outerframeHost.showContextMenu(menuID: menuID, items: items, at: point)
@@ -20627,7 +20631,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         }
         if let providers = pendingSafeSpaceProviderMenuSelections.removeValue(forKey: menuID),
            let providerID = providers[itemID] {
-            if itemID == "check" {
+            if itemID == "storage", let base = outerframeHost.pluginBaseURL(),
+               let url = URL(string: "/container-storage", relativeTo: base)?.absoluteURL {
+                outerframeHost.openNewTab(with: url, displayString: nil)
+            } else if itemID == "check" {
                 sendWorkspaceRequest(operation: "checkRuntimes")
             } else if itemID.hasPrefix("setup:"), let url = URL(string: providerID), url.scheme == "https" {
                 outerframeHost.openURLExternally(url)

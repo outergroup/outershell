@@ -1088,7 +1088,7 @@ OUTERSHELL_BUNDLED_APP
         ? `<button class="overview-add-more" type="button" data-action="open-container-add" data-safe-space-id="${id}" ${preparing ? "disabled" : ""}>Add more…</button>`
         : `<button class="overview-add-more" type="button" data-action="open-add" data-scope="${group.id === "root" ? "system" : "user"}">Add more…</button>`;
       return `<section class="overview-identity" data-group-id="${escapeHTML(group.id)}"><header class="overview-group-handle" tabindex="0" aria-label="Reorder ${escapeHTML(group.name)}${group.shield ? ", Administrator" : ""}. Hold and drag, or use arrow keys." title="Hold and drag to reorder" data-group-handle><div class="overview-group-heading"><h2>${escapeHTML(group.name)}</h2><p>${shield}${escapeHTML(group.note)}</p></div>${controls}</header><div class="overview-shortcuts" data-endpoint-area="pins">${pins.map(key => group.entries.find(entry => entry.key === key)).filter(Boolean).map(overviewShortcut).join("")}</div><div class="overview-list" data-endpoint-area="list">${listed.map(overviewEndpoint).join("") || `<p class="overview-empty">${state.loading || (workspace && state.safeSpacesLoading) ? "Loading…" : group.entries.length ? "" : "No registered endpoints."}</p>`}</div>${containerCommandsHTML(workspace)}${workspace?.buildProgress ? `<details class="container-build-progress"><summary>${escapeHTML(workspace.buildProgress.detail || workspace.buildProgress.phase)}</summary><pre>${escapeHTML(workspace.buildProgress.log || "")}</pre></details>` : ""}${addMore}</section>`;
-    }).join("") + `<button class="overview-add-container" type="button" data-action="create-container"><span aria-hidden="true">+</span>Add container (beta)…</button><button class="overview-add-container" type="button" data-action="import-container">Import container…</button>`;
+    }).join("") + `<button class="overview-add-container" type="button" data-action="create-container"><span aria-hidden="true">+</span>Add container (beta)…</button><button class="overview-add-container" type="button" data-action="import-container">Import container…</button>${state.providers.some(provider => provider.capabilities?.supportsStorageCleanup) ? `<button class="overview-add-container" type="button" data-action="container-storage">Container storage…</button>` : ""}`;
     if (state.overviewMarkup !== markup) {
       elements.overview.innerHTML = markup;
       state.overviewMarkup = markup;
@@ -2334,6 +2334,74 @@ OUTERSHELL_BUNDLED_APP
     });
   }
 
+  async function openContainerStorage() {
+    const providers = state.providers.filter(provider => provider.capabilities?.supportsStorageCleanup);
+    const dialog = openDialog(`${containerDialogHeader("Container storage")}
+      <form><div class="dialog-body"><label class="field">Runtime<select name="runtimeProviderID">${providers.map(provider => `<option value="${escapeHTML(provider.id)}">${escapeHTML(provider.name)}</option>`).join("")}</select></label>
+      <p>Choose obsolete Outer Shell images to remove. Containers, persistent data, and mounted folders are preserved. Apple container also cleans orphaned snapshots.</p>
+      <p class="field-note">Image sizes are estimates; shared layers and disk blocks can reduce the space recovered. Unrelated images are retained.</p>
+      <div data-storage-images></div><p class="container-message" role="status">Inspecting storage…</p>
+      <section data-build-cache hidden><p>Docker build cache is shared with other projects on this engine. This separate action removes eligible cache older than 7 days, with a 10 GB retention setting. Future builds may take longer.</p><button type="button" data-clean-build-cache disabled>Clean old build cache</button></section></div>
+      <footer class="dialog-footer"><button type="button" data-action="close-dialog">Close</button><button type="submit" class="primary-button" disabled>Clean selected images</button></footer></form>`);
+    const form = dialog.querySelector("form");
+    const message = form.querySelector(".container-message");
+    const button = form.querySelector('[type="submit"]');
+    const cacheButton = form.querySelector('[data-clean-build-cache]');
+    const runtime = form.elements.runtimeProviderID;
+    const list = form.querySelector("[data-storage-images]");
+    let images = [], busy = false, cacheSupported = false;
+    const setBusy = value => {
+      busy = value;
+      runtime.disabled = value;
+      button.disabled = value;
+      cacheButton.disabled = value || !cacheSupported;
+    };
+    const renderStorage = storage => {
+      images = storage.images || [];
+      cacheSupported = storage.supportsBuildCacheCleanup === true;
+      form.querySelector('[data-build-cache]').hidden = !cacheSupported;
+      const orphanEstimate = Number.isFinite(storage.orphanSnapshotBytes)
+        ? `<p>Orphaned snapshots: <strong>${(storage.orphanSnapshotBytes / 1073741824).toFixed(2)} GiB</strong> estimated.</p>` : "";
+      list.innerHTML = orphanEstimate + images.map((image, index) => {
+        const bytes = image.snapshotBytes ?? image.imageBytes;
+        return `<label class="container-check"><input type="checkbox" name="image" value="${index}"><span>${escapeHTML(image.reference)}${Number.isFinite(bytes) ? ` — ${(bytes / 1073741824).toFixed(2)} GiB` : ""}</span></label>`;
+      }).join("");
+      message.textContent = (storage.failures || []).join("\n") || "Only selected images will be removed. Apple container also removes orphaned cache data.";
+    };
+    const load = async () => {
+      setBusy(true); list.innerHTML = "";
+      message.textContent = "Inspecting storage…";
+      let ready = false;
+      try {
+        const result = await safeSpaceRequest("containerStorage", { runtimeProviderID: runtime.value });
+        if (!dialog.isConnected) return;
+        renderStorage(result.storage); ready = true;
+      } catch (error) { message.textContent = error.message || String(error); }
+      finally {
+        setBusy(false);
+        button.disabled = !ready;
+        cacheButton.disabled = !ready || !cacheSupported;
+      }
+    };
+    const clean = async buildCache => {
+      if (busy || (buildCache ? cacheButton.disabled : button.disabled)) return;
+      const selected = Array.from(form.querySelectorAll('input[name="image"]:checked'), input => images[Number(input.value)].reference);
+      setBusy(true); message.textContent = "Cleaning storage…";
+      try {
+        const result = await safeSpaceRequest(buildCache ? "cleanContainerBuildCache" : "cleanContainerStorage", { runtimeProviderID: runtime.value, images: buildCache ? [] : selected });
+        if (dialog.isConnected) {
+          renderStorage(result.storage);
+          if (!result.storage.failures?.length) message.textContent = buildCache ? "Old build-cache cleanup completed." : `Cleanup completed. Removed ${result.storage.deleted.length} selected image(s).`;
+        }
+      } catch (error) { message.textContent = error.message || String(error); }
+      finally { setBusy(false); }
+    };
+    form.addEventListener("submit", event => { event.preventDefault(); return clean(false); });
+    cacheButton.addEventListener("click", () => clean(true));
+    runtime.addEventListener("change", load);
+    await load();
+  }
+
   function openDeleteContainer(id) {
     const workspace = findSafeSpace(id);
     if (!workspace || workspace.runtimeKind === "wsl" || containerPreparing(workspace)) return;
@@ -2839,6 +2907,7 @@ OUTERSHELL_BUNDLED_APP
     if (action === "rename-endpoint") { const item = findItem(actionElement.dataset.appKey); if (item) openRenameEndpoint(item); return; }
     if (action === "show-container-command") { const bounds = actionElement.getBoundingClientRect(); openContainerCommand(actionElement.dataset.safeSpaceId, actionElement.dataset.commandId, { x: bounds.left, y: bounds.bottom }); return; }
     if (action === "setup-container-opencode") { openCreateContainer(true); return; }
+    if (action === "container-storage") { await openContainerStorage(); return; }
     if (action === "import-container") { openContainerImport(); return; }
     if (action === "create-container") { openCreateContainer(); return; }
     if (action === "configure-container") { openContainerConfiguration(actionElement.dataset.safeSpaceId); return; }
@@ -3004,5 +3073,9 @@ OUTERSHELL_BUNDLED_APP
     state.showInitialLoading = true;
     render();
   }, 400);
-  Promise.all([refreshLayout(), refreshBackends(), refreshSafeSpaces()]).then(watchEvents);
+  Promise.all([refreshLayout(), refreshBackends(), refreshSafeSpaces()]).then(() => {
+    watchEvents();
+    if (window.location.pathname === "/container-storage" &&
+        state.providers.some(provider => provider.capabilities?.supportsStorageCleanup)) openContainerStorage();
+  });
 })();

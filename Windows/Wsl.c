@@ -312,7 +312,7 @@ static bool capture_runtime(Wsl *w, const char *const *arguments, StringBuilder 
     if (!child_start_runtime(w, arguments, &p, container))
         return false;
     ULONGLONG deadline = GetTickCount64() +
-        ((container == RUNTIME_TAR || (container && (!strcmp(arguments[0], "build") || !strcmp(arguments[0], "run")))) ? 600000 : 30000);
+        ((container == RUNTIME_TAR || (container && (!strcmp(arguments[0], "build") || !strcmp(arguments[0], "run") || !strcmp(arguments[0], "builder")))) ? 600000 : 30000);
     bool ok = true;
     for (;;) {
         DWORD available = 0;
@@ -969,6 +969,7 @@ static bool contains_line(const char *list, const char *name) {
 }
 #include "WslContainers.inc"
 #include "ContainerTransfer.inc"
+#include "ContainerStorage.inc"
 
 static void discover_impl(Wsl *w) {
     StringBuilder running = {0};
@@ -1433,6 +1434,12 @@ void wsl_serve(Wsl *w, Connection *c, HttpRequest *r) {
     }
     EnterCriticalSection(&w->commands);
     locked = true;
+    if (!strcmp(operation, "containerStorage") || !strcmp(operation, "cleanContainerStorage") || !strcmp(operation, "cleanContainerBuildCache")) {
+        StringBuilder extra = {0};
+        if (storage_request(w, r, operation, &extra)) container_extra_response(w, c, r, extra.data);
+        else http_text(c, r, 400, "Storage inventory changed or cleanup failed. Refresh storage and check the runtime log before retrying.");
+        free(extra.data); LeaveCriticalSection(&w->commands); free(operation); free(id); return;
+    }
     if (!strcmp(operation, "beginImport") || !strcmp(operation, "cancelImport") || !strcmp(operation, "finishImport")) {
         container_transfer_operation(w, c, r, operation);
         LeaveCriticalSection(&w->commands); free(operation); free(id); return;
@@ -1485,9 +1492,15 @@ void wsl_serve(Wsl *w, Connection *c, HttpRequest *r) {
             const char *args[] = {d->container == RUNTIME_DOCKER ? "rm" : "remove", "--force", d->runtime_id, NULL};
             ok = !*d->runtime_id || capture_runtime(w, args, &output, d->container);
             free(output.data);
+            if (ok) {
+                EnterCriticalSection(&w->gate);
+                free(d->runtime_id); d->runtime_id = win_strdup(""); d->running = false;
+                LeaveCriticalSection(&w->gate);
+            }
             char *config = container_read(d->id, "configuration", container_empty_configuration);
             if (ok) ok = container_volumes_remove(w, d->container, d->id, config);
             free(config);
+            if (ok) ok = storage_remove_recipe(d);
             if (ok) {
                 EnterCriticalSection(&w->gate);
                 for (Endpoint *endpoint = w->endpoints; endpoint; endpoint = endpoint->next) {
@@ -1505,7 +1518,7 @@ void wsl_serve(Wsl *w, Connection *c, HttpRequest *r) {
                 d->present = false;
             }
         }
-        error = "Only containers created by Outer Shell can be deleted here.";
+        error = d->managed ? "Container deletion or recipe image cleanup failed. The registration was retained; check the runtime log and retry." : "Only containers created by Outer Shell can be deleted here.";
     } else if (d->container && (!strcmp(operation, "start") || !strcmp(operation, "stop") ||
                          !strcmp(operation, "restart"))) {
         StringBuilder output = {0};

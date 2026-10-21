@@ -2490,6 +2490,8 @@ static bool process_http_client_request(ReactorClient *client, char *request, si
         send_text_response(fd, 404, "not found\n");
     } else if (strcmp(target, "/api/native-app-template") == 0) {
         send_native_app_template_archive(fd);
+    } else if (strcmp(target, "/container-storage") == 0) {
+        send_web_index(fd, request, header_length, strcasecmp(method, "HEAD") != 0);
     } else if (is_navigator_route(target)) {
         if (!g_web_only && (strcmp(target, "/backends.outer") == 0 || request_accepts_outerframe(request, header_length))) {
             send_outer_descriptor(fd, request, header_length,

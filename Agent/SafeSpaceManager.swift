@@ -350,7 +350,9 @@ final class SafeSpaceManager: @unchecked Sendable {
 
     private let lock = NSLock()
     private let containerSystemRecoveryLock = NSLock()
-    private let containerBaseImageLock = NSLock()
+    private let containerBaseImageLock = NSRecursiveLock()
+    private let imageCleanupQueue = DispatchQueue(label: "org.outershell.image-cleanup")
+    private var imageCleanupWork: DispatchWorkItem?
     private var records: [SafeSpaceRecord] = []
     private var cachedApps: [UUID: [SafeSpaceCachedApp]] = [:]
     private var publishedForwards: [String: SafeSpaceSocketRelayForward] = [:]
@@ -686,6 +688,13 @@ final class SafeSpaceManager: @unchecked Sendable {
         switch operation {
         case "list":
             break
+        case "containerStorage", "cleanContainerStorage", "cleanContainerBuildCache":
+            let provider = request["runtimeProviderID"] as? String ?? "apple.container"
+            if provider == "docker" { return try dockerStorage(request: request, operation: operation) }
+            guard provider == "apple.container", operation != "cleanContainerBuildCache" else {
+                throw SafeSpaceManagerError.unsupportedProvider
+            }
+            return try containerStorage(request: request, clean: operation == "cleanContainerStorage")
         case "checkRuntimes":
             _ = runtimeReadiness(refresh: true)
         case "create":
@@ -802,7 +811,8 @@ final class SafeSpaceManager: @unchecked Sendable {
                     "supportsShell": true,
                     "supportsLiveMounts": false,
                     "supportsMounts": true,
-                    "supportsRecipes": true
+                    "supportsRecipes": true,
+                    "supportsStorageCleanup": true
                 ]
             ],
             [
@@ -819,7 +829,8 @@ final class SafeSpaceManager: @unchecked Sendable {
                     "supportsShell": true,
                     "supportsLiveMounts": true,
                     "supportsMounts": true,
-                    "supportsRecipes": true
+                    "supportsRecipes": true,
+                    "supportsStorageCleanup": true
                 ]
             ]
         ]
@@ -2094,12 +2105,15 @@ final class SafeSpaceManager: @unchecked Sendable {
 
     private func createRuntimeContainer(_ record: SafeSpaceRecord,
                                         imageReference: String) throws {
+        containerBaseImageLock.lock()
+        defer { containerBaseImageLock.unlock() }
         _ = lock.withSafeSpaceLock {
             cachedTerminalShells.removeValue(forKey: record.id)
         }
         switch runtimeProvider(for: record) {
         case .appleContainer:
             try createAppleContainer(record, imageReference: imageReference)
+            scheduleAppleImageCleanup()
         case .docker:
             try createDockerContainer(record, imageReference: imageReference)
         }
@@ -2357,6 +2371,179 @@ final class SafeSpaceManager: @unchecked Sendable {
         )
     }
 
+    private func dockerStorageCandidates(excluding id: UUID? = nil) throws -> [ContainerImageStorage.Image] {
+        let listing = try runDocker(["image", "ls", "--all", "--quiet", "--no-trunc"])
+        try requireSuccess(listing, action: "list Docker images")
+        var images: [ContainerImageStorage.Image] = []
+        for identifier in Set(listing.stdout.split(whereSeparator: \.isWhitespace).map(String.init)).sorted() {
+            let result = try runDocker(["image", "inspect", identifier])
+            try requireSuccess(result, action: "inspect Docker images")
+            images += try ContainerImageStorage.dockerImages(from: Data(result.stdout.utf8))
+        }
+        var protected: Set<String> = [rootContainerBaseImage]
+        var files: [String] = []
+        for record in try loadRecords() where record.id != id && recordOwnsContainer(record) {
+            if runtimeProvider(for: record) == .docker { protected.insert(recipeImageReference(record.id)) }
+            let value = try recipe(for: record)
+            protected.insert(value.baseImage)
+            if let realized = value.realizedBaseImage { protected.insert(realized) }
+            files.append(try dockerfileContents(for: record))
+            if let realized = value.realizedDockerfileContents { files.append(realized) }
+        }
+        let containers = try runDocker(["ps", "--all", "--quiet", "--no-trunc"])
+        try requireSuccess(containers, action: "list Docker containers")
+        for identifier in containers.stdout.split(whereSeparator: \.isWhitespace) {
+            let result = try runDocker(["inspect", String(identifier)])
+            try requireSuccess(result, action: "inspect Docker container image references")
+            guard let values = try JSONSerialization.jsonObject(with: Data(result.stdout.utf8)) as? [[String: Any]],
+                  values.count == 1, let digest = values.first?["Image"] as? String else {
+                throw CocoaError(.fileReadCorruptFile)
+            }
+            protected.insert(digest)
+        }
+        return ContainerImageStorage.candidates(images: images, protected: protected, dockerfiles: files,
+            currentBase: rootContainerBaseImage, workspacePrefix: "outerloop/workspace-\(getuid()):")
+    }
+
+    private func dockerStorage(request: [String: Any], operation: String) throws -> [String: Any] {
+        containerBaseImageLock.lock()
+        defer { containerBaseImageLock.unlock() }
+        guard !lock.withSafeSpaceLock({ transientStates.values.contains { ["creating", "rebuilding", "starting"].contains($0) } }) else {
+            throw SafeSpaceManagerError.commandFailed("Wait for container builds to finish, then try cleanup again.")
+        }
+        var deleted: [String] = []
+        var failures: [String] = []
+        if operation == "cleanContainerBuildCache" {
+            try requireSuccess(try runDocker(["builder", "prune", "--force", "--filter", "until=168h", "--keep-storage", "10GB"]), action: "clean old Docker build cache")
+        } else if operation == "cleanContainerStorage" {
+            guard let selected = request["images"] as? [String] else { throw SafeSpaceManagerError.invalidRequest }
+            let result = try ContainerImageStorage.deleteSelected(selected, candidates: {
+                try self.dockerStorageCandidates()
+            }, delete: { reference in
+                try self.requireSuccess(try self.runDocker(["image", "rm", reference]), action: "remove an unused Docker image")
+            })
+            deleted = result.deleted
+            failures = result.failures
+        }
+        return ["storage": ["images": try dockerStorageCandidates().map { image -> [String: Any] in
+            var value: [String: Any] = ["reference": image.reference]
+            if let bytes = image.sizeInBytes { value["imageBytes"] = bytes }
+            return value
+        }, "deleted": deleted, "failures": failures, "supportsBuildCacheCleanup": true]]
+    }
+
+    private func appleStorageProtection(excluding id: UUID? = nil) throws -> (Set<String>, [String]) {
+        var protected = Set<String>()
+        var dockerfiles: [String] = []
+        for record in try loadRecords() where record.id != id && recordOwnsContainer(record) {
+            if runtimeProvider(for: record) == .appleContainer {
+                protected.insert(recipeImageReference(record.id))
+            }
+            let value = try recipe(for: record)
+            protected.insert(value.baseImage)
+            if let realized = value.realizedBaseImage { protected.insert(realized) }
+            dockerfiles.append(try dockerfileContents(for: record))
+            if let realized = value.realizedDockerfileContents { dockerfiles.append(realized) }
+        }
+        let containers = try runContainer(["list", "--all", "--format", "json"])
+        try requireSuccess(containers, action: "inspect containers before image cleanup")
+        protected.formUnion(try ContainerImageStorage.containerReferences(from: Data(containers.stdout.utf8)))
+        return (protected, dockerfiles)
+    }
+
+    private func appleStorageImages() throws -> [ContainerImageStorage.Image] {
+        let result = try runContainer(["image", "list", "--format", "json"])
+        try requireSuccess(result, action: "inspect images before cleanup")
+        return try ContainerImageStorage.images(from: Data(result.stdout.utf8))
+    }
+
+    private func appleStorageCandidates(excluding id: UUID? = nil) throws -> [ContainerImageStorage.Image] {
+        let (protected, dockerfiles) = try appleStorageProtection(excluding: id)
+        return ContainerImageStorage.candidates(
+            images: try appleStorageImages(), protected: protected, dockerfiles: dockerfiles,
+            currentBase: rootContainerBaseImage, workspacePrefix: "outerloop/workspace-\(getuid()):"
+        )
+    }
+
+    private func containerStorage(request: [String: Any], clean: Bool) throws -> [String: Any] {
+        containerBaseImageLock.lock()
+        defer { containerBaseImageLock.unlock() }
+        guard !lock.withSafeSpaceLock({ transientStates.values.contains { ["creating", "rebuilding", "starting"].contains($0) } }) else {
+            throw SafeSpaceManagerError.commandFailed("Wait for container builds to finish, then try cleanup again.")
+        }
+        var deleted: [String] = []
+        var failures: [String] = []
+        if clean {
+            guard let requested = request["images"] as? [String] else { throw SafeSpaceManagerError.invalidRequest }
+            let result = try ContainerImageStorage.deleteSelected(requested, candidates: {
+                try self.appleStorageCandidates()
+            }, delete: { reference in
+                try self.requireSuccess(try self.runContainer(["image", "delete", reference]), action: "delete an unused image")
+            })
+            deleted = result.deleted
+            failures = result.failures
+            do { try pruneAppleImageCache() }
+            catch { failures.append(error.localizedDescription) }
+        }
+        let root = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/com.apple.container")
+        let candidates = try appleStorageCandidates().map { image -> [String: Any] in
+            var value: [String: Any] = ["reference": image.reference]
+            if let bytes = try? ContainerImageStorage.allocatedSnapshotBytes(for: image, root: root) {
+                value["snapshotBytes"] = bytes
+            }
+            return value
+        }
+        var storage: [String: Any] = ["images": candidates, "deleted": deleted, "failures": failures]
+        if let bytes = try? ContainerImageStorage.orphanSnapshotBytes(root: root) {
+            storage["orphanSnapshotBytes"] = bytes
+        }
+        return ["storage": storage]
+    }
+
+    private func pruneAppleImageCache() throws {
+        let images = try appleStorageImages()
+        guard images.allSatisfy({ !$0.reference.contains("@") && $0.reference.split(separator: "/").last?.contains(":") == true }) else {
+            throw SafeSpaceManagerError.commandFailed("Cache cleanup skipped because untagged images may still be needed. Review them using the container CLI.")
+        }
+        try requireSuccess(try runContainer(["image", "prune"]), action: "clean unused image snapshots")
+    }
+
+    private func scheduleAppleImageCleanup() {
+        lock.withSafeSpaceLock {
+            imageCleanupWork?.cancel()
+            let work = DispatchWorkItem { [weak self] in
+                guard let self else { return }
+                self.containerBaseImageLock.lock()
+                defer { self.containerBaseImageLock.unlock() }
+                if self.lock.withSafeSpaceLock({ self.transientStates.values.contains { ["creating", "rebuilding", "starting"].contains($0) } }) {
+                    self.scheduleAppleImageCleanup()
+                    return
+                }
+                do { try self.pruneAppleImageCache() }
+                catch { NSLog("Container image cache cleanup failed: %@", error.localizedDescription) }
+            }
+            imageCleanupWork = work
+            imageCleanupQueue.asyncAfter(deadline: .now() + 30, execute: work)
+        }
+    }
+
+    private func removeOwnedRecipeImage(_ record: SafeSpaceRecord) throws {
+        containerBaseImageLock.lock()
+        defer { containerBaseImageLock.unlock() }
+        let reference = recipeImageReference(record.id)
+        if runtimeProvider(for: record) == .docker {
+            if try dockerStorageCandidates(excluding: record.id).contains(where: { $0.reference == reference }) {
+                try requireSuccess(try runDocker(["image", "rm", reference]), action: "delete the container recipe image")
+            }
+            return
+        }
+        if try appleStorageCandidates(excluding: record.id).contains(where: { $0.reference == reference }) {
+            try requireSuccess(try runContainer(["image", "delete", reference]), action: "delete the container recipe image")
+        }
+        scheduleAppleImageCleanup()
+    }
+
     private func delete(_ record: SafeSpaceRecord) async throws {
         cancelAppEventMonitor(for: record.id)
         closePublishedForwards(record.id)
@@ -2371,6 +2558,9 @@ final class SafeSpaceManager: @unchecked Sendable {
                     try requireSuccess(try runRuntime(record, ["volume", "rm", name]), action: "delete persistent storage")
                 }
             }
+        }
+        if recordOwnsContainer(record) {
+            try removeOwnedRecipeImage(record)
         }
         lock.withSafeSpaceLock {
             records.removeAll { $0.id == record.id }
@@ -6167,6 +6357,11 @@ final class SafeSpaceManager: @unchecked Sendable {
             detail: "Preparing the build context",
             for: record.id
         )
+        containerBaseImageLock.lock()
+        defer {
+            containerBaseImageLock.unlock()
+            if runtimeProvider(for: record) == .appleContainer { scheduleAppleImageCleanup() }
+        }
         let value = normalizedRecipe(try recipe(for: record))
         if value.baseImage == rootContainerBaseImage {
             _ = try rootContainerBaseReference(
@@ -6387,7 +6582,9 @@ final class SafeSpaceManager: @unchecked Sendable {
             throw SafeSpaceManagerError.unsupportedProvider
         }
         return try runCommand(executable: executable.path,
-                              arguments: arguments,
+                              arguments: arguments.first == "build"
+                ? ["build", "--label", "org.outershell.managed=true"] + arguments.dropFirst()
+                : arguments,
                               environment: dockerEnvironment(executable: executable),
                               currentDirectoryURL: currentDirectoryURL,
                               progress: progress)
