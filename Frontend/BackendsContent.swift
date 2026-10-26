@@ -5249,7 +5249,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                   left: left + inset, top: y - inset, width: contentWidth - inset * 2,
                                   size: 12, weight: .semibold, color: .controlAccentColor) - 12
         y = renderCodingAgentText(
-            "\(connectionInstructions)\n\nInstall <app>. Set it up as a service and register it with Outer Shell so I can open it and manage it here. Follow https://outershell.org/api/ for backend, app, and log registration, then verify that the app starts and responds.",
+            "\(connectionInstructions)\n\nInstall <app>. Set it up as a service and register it with Outer Shell so I can open it and manage it here. Follow https://outershell.org/api/ for backend, app, and log registration, then verify that the app starts and responds. Make each registered app open ready to use; for private per-user apps that support URL-token authentication, include the app's launch token in the registered URL, keep TCP authentication enabled, and verify the link with a fresh session.",
             identifier: "agent-example", left: left + inset, top: y,
             width: contentWidth - inset * 2, size: 14
         ) - inset

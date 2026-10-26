@@ -33,7 +33,7 @@ console.log("PASS: missing/unsupported/stopped/ready runtime UI, setup guidance,
   const message = { textContent: "" };
   const guidance = { innerHTML: "" };
   const form = {
-    elements: { runtimeProviderID: { value: "", innerHTML: "" }, baseImage: { value: "" }, name: { value: "My project" } },
+    elements: { includeOpenCode: { checked: false, addEventListener() {} }, runtimeProviderID: { value: "", innerHTML: "" }, baseImage: { value: "" }, name: { value: "My project" } },
     querySelector(selector) { return ({ ".runtime-recheck": recheck, ".container-message": message, ".runtime-guidance": guidance, '[type="submit"]': submit })[selector]; },
     addEventListener() {},
   };

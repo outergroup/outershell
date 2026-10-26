@@ -39,7 +39,7 @@ build_socket_bridge() {
     if [[ "${OUTER_SHELL_LINUX_LIBC:-}" == musl ]]; then
         link_flags+=(-static)
     fi
-    cc -std=gnu17 -O2 -Wall -Wextra "${link_flags[@]}" \
+    cc -std=gnu17 -O2 -Wall -Wextra ${link_flags[@]+"${link_flags[@]}"} \
         -o "${output}" \
         "${SOCKET_BRIDGE_SOURCE}"
     if command -v strip >/dev/null 2>&1; then

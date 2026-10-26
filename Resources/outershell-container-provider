@@ -1665,29 +1665,31 @@ printf '%s\n' /bin/sh'''
     return candidate
 
 
-def declared_app_tcp_ports(container_id):
+def declared_app_tcp_endpoints(container_id):
     command = r'''for path in /opt/outershell/image-apps/*/start; do
     [ -f "${path}" ] || continue
     service=${path%/start}
     service=${service##*/}
     port=$(/usr/bin/awk -F= '$1 == "port" && $2 ~ /^[0-9]+$/ { print $2; exit }' "${path}")
-    [ -n "${port}" ] && /usr/bin/printf '%s\t%s\n' "${service}" "${port}"
+    socket=$(/usr/bin/awk '$0 ~ /^socket=/ { print substr($0, 8); exit }' "${path}")
+    [ -n "${port}" ] && /usr/bin/printf '%s\t%s\t%s\n' "${service}" "${port}" "${socket}"
 done'''
     result = container_exec(container_id, ["/bin/sh", "-c", command])
     if result.returncode != 0:
         return {}
-    ports = {}
+    endpoints = {}
     for line in result.stdout.splitlines():
         fields = line.split("\t")
-        if len(fields) != 2:
+        if len(fields) != 3:
             continue
         try:
             port = int(fields[1])
+            sockets = shlex.split(fields[2])
         except ValueError:
             continue
-        if 1 <= port <= 65535:
-            ports[fields[0]] = port
-    return ports
+        if 1 <= port <= 65535 and len(sockets) == 1 and sockets[0].startswith("/"):
+            endpoints[fields[0]] = {"port": port, "socketPath": sockets[0]}
+    return endpoints
 
 
 def runtime_published_ports(container_id):
@@ -1758,7 +1760,7 @@ def app_snapshots(container_id, recipe):
         running_service_ids = container_running_service_ids(container_id)
     except (OSError, RuntimeError):
         running_service_ids = None
-    declared_ports = declared_app_tcp_ports(container_id)
+    declared_endpoints = declared_app_tcp_endpoints(container_id)
     published_ports = runtime_published_ports(container_id)
     published_ports.update({
         int(value["containerPort"]): int(value["hostPort"])
@@ -1775,6 +1777,11 @@ def app_snapshots(container_id, recipe):
         row = dict(zip(headers, fields))
         service_id = row.get("service_id", "")
         socket_path = row.get("socket_path", "")
+        declared = declared_endpoints.get(service_id, {})
+        if not socket_path and row.get("endpoint_kind") == "1" and row.get("scheme") == "1":
+            if (row.get("host") in ("localhost", "127.0.0.1", "::1") and
+                    row.get("port") == str(declared.get("port"))):
+                socket_path = declared.get("socketPath", "")
         if not service_id or not socket_path:
             continue
         is_running = service_id in running_service_ids if running_service_ids is not None else False
@@ -1793,7 +1800,7 @@ def app_snapshots(container_id, recipe):
             "iconPath": row.get("icon_path", ""),
             "iconObservationToken": "",
             "isRunning": is_running,
-            "publishedPort": published_ports.get(declared_ports.get(service_id), 0),
+            "publishedPort": published_ports.get(declared.get("port"), 0),
         }
         icon_data = copy_icon(container_id, app["iconPath"], "app-" + service_id)
         if icon_data:
@@ -2221,8 +2228,6 @@ def workspace_dictionary(record, overview=False):
                             container_exec(container_id, [
                                 "/usr/local/bin/outerctl", "app", "upsert",
                                 "--backend", app["serviceID"], "--frontend-id", app["frontendID"],
-                                "--name", app["displayName"], "--socket-path", app["socketPath"],
-                                "--url", app["url"], "--icon-path", app["iconPath"],
                                 "--external-socket-path", published,
                             ], check=True)
                         app["externalSocketPath"] = published

@@ -11,10 +11,12 @@ const record = (scope, installed) => ({
 });
 const state = { addTab: "catalog", addScope: "user", backends: [record("user", false), record("system", true)] };
 const context = {
+  addContainer: () => null, openCodeItem: () => null, codingAgentHTML: () => "",
   state, window: {}, escapeHTML: String, iconHTML: () => "", backendKey: b => b.serviceScope,
   openDialog: value => { html = value; }, closeDialog() {}, toast() {},
   findBackend: scope => state.backends.find(b => b.serviceScope === scope),
   control: async (backend, operation) => { calls.push([backend.serviceScope, operation]); return { ok: true }; },
+  refreshSafeSpaces: async () => {}, showOperationFailure: (_, error) => { throw error; },
   refreshBackends: async () => {}
 };
 vm.createContext(context);

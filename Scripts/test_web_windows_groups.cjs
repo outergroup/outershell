@@ -3,7 +3,7 @@ const fs = require("node:fs");
 const vm = require("node:vm");
 const path = require("node:path");
 const source = fs.readFileSync(path.join(__dirname, "../Resources/OuterShellWeb/app.js"), "utf8");
-const state = { hostPlatform: "windows", safeSpaces: [], groupOrder: [], endpointOrder: {} };
+const state = { hostPlatform: "windows", providers: [], safeSpaces: [], groupOrder: [], endpointOrder: {} };
 const elements = { overview: { innerHTML: "" } };
 const context = {
   state, elements, window: { outerLoop: { sessionContext: { username: "test-user" } } },

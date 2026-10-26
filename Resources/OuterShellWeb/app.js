@@ -718,7 +718,7 @@
     const containerContext = connection.workspace && connection.workspace.runtimeKind !== "wsl"
       ? "\n\nInstall and register apps inside this container. Read https://outershell.org/api/containers/ for instructions on publishing apps and preserving changes across rebuilds. Keep user data in persistent or mounted folders."
       : "";
-    return `${destination}\n\nRead https://outershell.org/api/ for Outer Shell integration instructions.${containerContext}\n\n${request}`;
+    return `${destination}\n\nRead https://outershell.org/api/ for Outer Shell integration instructions. Make each registered app open ready to use; for private per-user apps that support URL-token authentication, include the app's launch token in the registered URL, keep TCP authentication enabled, and verify the link with a fresh session.${containerContext}\n\n${request}`;
   }
 
   function openCodeItem() {
