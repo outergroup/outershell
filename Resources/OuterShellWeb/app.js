@@ -1663,6 +1663,8 @@ OUTERSHELL_BUNDLED_APP
   function closeDialog() {
     elements.dialogLayer.replaceChildren();
     unlockPageScroll();
+    window.clearTimeout(state.logSelection?.timer);
+    state.logSelection?.controller?.abort();
     state.logSelection = null;
     state.addWorkspace = null;
     state.containerCatalog = null;
@@ -2482,6 +2484,7 @@ OUTERSHELL_BUNDLED_APP
         ${app ? pinMenuHTML(containerBookmarkKey(workspace, app), context === "shortcut") + renameEndpointMenuHTML(findItem(containerBookmarkKey(workspace, app))) : ""}
         ${app ? `<a class="context-menu-item" href="${escapeHTML(url)}" data-action="launch-safe-space-app" ${attributes} role="menuitem">${contextMenuGlyph("↗")}<span>Open</span></a>` : `<p class="container-details">${escapeHTML(safeSpaceRuntimeDescription(workspace))}</p>`}
         <button class="context-menu-item" type="button" data-action="container-control" data-operation="${operation}" ${attributes} role="menuitem" ${preparing ? "disabled" : ""}>${contextMenuGlyph(running ? "■" : "▶")}<span>${preparing ? "Preparing…" : running ? "Stop" : "Start"}</span></button>
+        ${app ? `<button class="context-menu-item" type="button" data-action="container-logs" ${attributes} role="menuitem" ${preparing ? "disabled" : ""}>${contextMenuGlyph("≡")}<span>View Logs</span></button>` : ""}
         ${app && workspace.runtimeKind === "wsl" ? `<button class="context-menu-item" type="button" data-action="uninstall-wsl-app" ${attributes} role="menuitem">${contextMenuGlyph("×")}<span>Uninstall</span></button>` : ""}
         ${app && url !== "#" ? `<button class="context-menu-item" type="button" data-action="copy-container-url" ${attributes} role="menuitem">${contextMenuGlyph("⧉")}<span>Copy URL</span></button>` : ""}
       </section>
@@ -2632,6 +2635,72 @@ OUTERSHELL_BUNDLED_APP
     toast(copied ? "Copied to the clipboard." : "Could not copy. Select the text and copy it manually.");
   }
 
+  function openContainerLogs(workspaceID, serviceID, frontendKey) {
+    const workspace = findSafeSpace(workspaceID);
+    const app = workspace && findSafeSpaceApp(workspace, serviceID, frontendKey);
+    if (!app) return;
+    const dialog = openDialog(`
+      ${containerDialogHeader(`${app.displayName || serviceID} logs`)}
+      <div class="log-toolbar">
+        <select id="log-select" aria-label="Log file"><option>Loading…</option></select>
+        <span id="log-meta" class="log-meta">Loading…</span>
+        <button class="secondary-button" type="button" data-action="refresh-log">Refresh</button>
+      </div>
+      <pre id="log-output" class="log-output">Loading logs…</pre>`, "log-dialog");
+    state.logSelection = { workspaceID, serviceID, index: 0, dialog };
+    restartEventWatch();
+    fetchSelectedLog();
+  }
+
+  function decodeContainerLog(result, serviceID) {
+    if (!result) throw new Error("The container returned no log response.");
+    if (result.backendsPayload !== undefined) {
+      const bytes = value => Uint8Array.from(atob(value), character => character.charCodeAt(0));
+      const backend = decodeBackends(bytes(result.backendsPayload)).backends.find(value => value.serviceID === serviceID);
+      if (!backend) throw new Error("This app is no longer registered in the container.");
+      return { logFiles: backend.logFiles, log: decodeLog(bytes(result.logPayload)) };
+    }
+    return { logFiles: result.path ? [{ path: result.path }] : [], log: { ...result, truncated: result.isTruncated } };
+  }
+
+  async function fetchContainerLog(selection) {
+    if (selection.loading || !selection.dialog.isConnected) return;
+    selection.loading = true;
+    window.clearTimeout(selection.timer);
+    const index = selection.index;
+    const controller = new AbortController();
+    selection.controller = controller;
+    const timeout = startRefreshTimeout(controller);
+    const output = selection.dialog.querySelector("#log-output");
+    const meta = selection.dialog.querySelector("#log-meta");
+    try {
+      const result = await safeSpaceRequest("appLogs", { workspaceID: selection.workspaceID, serviceID: selection.serviceID, logIndex: index }, controller.signal);
+      if (state.logSelection !== selection || !selection.dialog.isConnected || selection.index !== index) return;
+      const { logFiles, log } = decodeContainerLog(result.appLog, selection.serviceID);
+      const select = selection.dialog.querySelector("#log-select");
+      const options = logFiles.map((file, i) => `<option value="${i}">${escapeHTML(file.displayName || file.path)}</option>`).join("") || '<option>No registered log file</option>';
+      if (select.innerHTML !== options) select.innerHTML = options;
+      select.value = String(index);
+      select.disabled = !logFiles.length;
+      const atBottom = output.scrollHeight - output.scrollTop - output.clientHeight < 90;
+      const text = logFiles.length ? log.error || log.contents || "No logs yet." : "No registered log file.";
+      if (output.textContent !== text) output.textContent = text;
+      meta.textContent = `${log.path || "No registered log"}${log.truncated ? " · showing latest output" : ""} · ${formatBytes(log.fileSize)}`;
+      if (atBottom) output.scrollTop = output.scrollHeight;
+    } catch (error) {
+      if (state.logSelection === selection && selection.dialog.isConnected && selection.index === index) {
+        output.textContent = error.message || String(error);
+        meta.textContent = "Could not read logs";
+      }
+    } finally {
+      window.clearTimeout(timeout);
+      selection.loading = false;
+      if (state.logSelection === selection && selection.dialog.isConnected) {
+        selection.timer = window.setTimeout(() => fetchContainerLog(selection), selection.index === index ? 2000 : 0);
+      }
+    }
+  }
+
   function openLogs(key, selectedIndex = 0) {
     const backend = findBackend(key);
     if (!backend) return;
@@ -2659,6 +2728,7 @@ OUTERSHELL_BUNDLED_APP
   async function fetchSelectedLog() {
     const selection = state.logSelection;
     if (!selection) return;
+    if (selection.workspaceID) { await fetchContainerLog(selection); return; }
     const backend = findBackend(selection.backendKey);
     if (!backend) return;
     const output = elements.dialogLayer.querySelector("#log-output");
@@ -3053,6 +3123,7 @@ OUTERSHELL_BUNDLED_APP
       finally { actionElement.disabled = false; }
       return;
     }
+    if (action === "container-logs") { openContainerLogs(actionElement.dataset.safeSpaceId, actionElement.dataset.serviceId, actionElement.dataset.frontendKey); return; }
     if (action === "logs") { openLogs(actionElement.dataset.backendKey); return; }
     if (action === "refresh-log") { await fetchSelectedLog(); }
   });

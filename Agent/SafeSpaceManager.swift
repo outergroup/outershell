@@ -2818,24 +2818,27 @@ final class SafeSpaceManager: @unchecked Sendable {
 
     private func appLog(_ request: [String: Any]) async throws -> [String: Any] {
         let selected = try record(from: request)
-        guard let serviceID = request["serviceID"] as? String else {
+        guard let serviceID = request["serviceID"] as? String, !serviceID.isEmpty else {
             throw SafeSpaceManagerError.invalidRequest
         }
-        let identity = try runtimeIdentity(for: selected)
-        let command = "/bin/cat \(identity.appsDirectory)/\(shellQuoted(serviceID))/backend.log 2>/dev/null || true"
-        let result = try runRuntime(selected, [
-            "exec", "--user", identity.user, containerName(selected.id),
-            "/bin/sh", "-c", command
-        ])
-        try requireSuccess(result, action: "read the container app log")
-        let contents = result.stdout
+        let index = request["logIndex"] as? Int ?? 0
+        guard index >= 0 else { throw SafeSpaceManagerError.invalidRequest }
+        let backends = try await safeSpaceUIAPIRequest(
+            record: selected, route: 1, query: "", body: Data()
+        )
+        guard backends.status == 200 else {
+            throw SafeSpaceManagerError.commandFailed("Could not list the container's registered logs.")
+        }
+        let query = "serviceID=\(formEncoded(serviceID))&logIndex=\(index)&bytes=524288"
+        let log = try await safeSpaceUIAPIRequest(
+            record: selected, route: 2, query: query, body: Data()
+        )
+        guard log.status == 200 else {
+            throw SafeSpaceManagerError.commandFailed("Could not read the container app log.")
+        }
         return [
-            "path": "\(serviceID) backend log",
-            "contents": contents,
-            "isTruncated": false,
-            "fileSize": contents.utf8.count,
-            "modified": Date().timeIntervalSince1970,
-            "error": ""
+            "backendsPayload": backends.body.base64EncodedString(),
+            "logPayload": log.body.base64EncodedString()
         ]
     }
 

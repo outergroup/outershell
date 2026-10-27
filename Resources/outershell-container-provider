@@ -1963,21 +1963,26 @@ def referenced_bytes(value, offset):
 
 
 def operation_app_logs(request):
+    service_id = request.get("serviceID")
+    index = request.get("logIndex", 0)
+    if not isinstance(service_id, str) or not service_id:
+        raise ValueError("A service ID is required.")
+    if type(index) is not int or index < 0:
+        raise ValueError("Log index must be a nonnegative integer.")
     container_id = request["workspaceID"]
-    service_id = request.get("serviceID", "")
-    path = f"/var/lib/outershell/apps/{service_id}/backend.log"
-    result = container_exec(container_id, ["/usr/bin/tail", "-c", "1048576", path])
-    contents = result.stdout if result.returncode == 0 else ""
-    return {
-        "appLog": {
-            "path": path,
-            "contents": contents,
-            "isTruncated": len(contents.encode()) >= 1024 * 1024,
-            "fileSize": len(contents.encode()),
-            "modified": time.time(),
-            "error": "" if result.returncode == 0 else (result.stderr or result.stdout).strip(),
-        }
-    }
+    status, backends = container_ui_api_request(container_id, 1)
+    if status != 200:
+        raise RuntimeError("Could not list the container's registered logs.")
+    query = urllib.parse.urlencode({
+        "serviceID": service_id, "logIndex": index, "bytes": 512 * 1024,
+    }).encode()
+    status, log = container_ui_api_request(container_id, 2, query)
+    if status != 200:
+        raise RuntimeError("Could not read the container app log.")
+    return {"appLog": {
+        "backendsPayload": base64.b64encode(backends).decode(),
+        "logPayload": base64.b64encode(log).decode(),
+    }}
 
 
 def authorize_host_socket(path):
@@ -2514,7 +2519,7 @@ def response(request_id, extra=None, error=None, include_state=True, overview=Fa
 def handle_request(request):
     operation = request.get("operation")
     request_id = request.get("requestID") or str(uuid.uuid4())
-    include_state = operation != "publishSocket"
+    include_state = operation not in ("publishSocket", "appLogs")
     try:
         if "workspaceID" in request:
             request["workspaceID"] = canonical_container_id(request["workspaceID"])
