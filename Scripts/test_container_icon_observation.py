@@ -66,3 +66,30 @@ Records.values[0]["cachedApps"][0]["iconPath"] = "/explicit.png"
 assert store(request) == 200
 assert Records.saves == 1
 print("PASS: token identity, refresh persistence, explicit icon precedence, callback storage, invalid token/payload")
+
+update = provider["update_cached_apps"]
+encode = provider["offset_archive_encode"]
+decode = provider["offset_archive_decode"]
+learned = base64.b64encode(png).decode()
+record = {"cachedApps": [dict(endpoint, observedIconData=learned)]}
+update(record, [])
+assert record["cachedApps"] == []
+record = decode(encode(record))
+update(record, [endpoint.copy()])
+assert record["cachedApps"][0]["iconData"] == learned
+
+second = dict(endpoint, serviceID="second", frontendID="second-web")
+record["cachedApps"].append(dict(second, observedIconData="second-icon"))
+update(record, [endpoint.copy()])
+assert len(record["cachedApps"]) == 1
+record = decode(encode(record))
+update(record, [endpoint.copy(), second.copy()])
+assert [app["iconData"] for app in record["cachedApps"]] == [learned, "second-icon"]
+update(record, [dict(endpoint, url="/different"), dict(second, iconPath="/declared.png", iconData="declared")])
+assert "iconData" not in record["cachedApps"][0]
+assert record["cachedApps"][1]["iconData"] == "declared"
+other_container = {}
+update(other_container, [endpoint.copy()])
+assert "iconData" not in other_container["cachedApps"][0]
+assert Records.values[0].get("observedIcons")
+print("PASS: learned icons survive empty/partial discovery and persistence; removed apps stay absent; endpoint and container isolation; declared icon precedence")
