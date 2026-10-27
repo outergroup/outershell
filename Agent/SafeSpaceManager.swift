@@ -74,8 +74,8 @@ private func outerShellRegistryFreeContainers(
 
 private let outerShellRegistryContainerOwnedFlag: UInt32 = 0x01
 
-private let currentSafeSpaceRecipeVersion = 13
-private let rootContainerBaseImage = "outershell/container-base:12"
+private let currentSafeSpaceRecipeVersion = 14
+private let rootContainerBaseImage = "outershell/container-base:15"
 private let bundledAppOCIImageVersion = "4"
 private let containerTransferMagic = Data([0x4f, 0x53, 0x43, 0x54])
 private let containerTransferVersion: UInt16 = 1
@@ -411,7 +411,83 @@ final class SafeSpaceManager: @unchecked Sendable {
         }
     }
 
+    private func environmentDiscoveryResponse() -> Data {
+        var rows: [[String]] = []
+        var errorMessage = ""
+        do {
+            try refreshRecords()
+            let registered = lock.withSafeSpaceLock { records }
+            for record in registered {
+                let provider = runtimeProvider(for: record)
+                var row = [record.id.uuidString.lowercased(), record.name, provider.rawValue,
+                           "", "unavailable", "", "", "", containerName(record.id)]
+                do {
+                    switch provider {
+                    case .docker:
+                        let host = ProcessInfo.processInfo.environment["DOCKER_HOST"]
+                        if let host, !host.isEmpty,
+                           ProcessInfo.processInfo.environment["DOCKER_CONTEXT"]?.isEmpty != false {
+                            row[6] = host
+                        } else {
+                            let context = try runDocker(["context", "inspect", "--format", "{{.Endpoints.docker.Host}}"])
+                            try requireSuccess(context, action: "resolve the Docker endpoint")
+                            row[6] = context.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+                        }
+                        let result = try runDocker(["container", "inspect", "--format",
+                                                    "{{.Id}}\t{{.State.Status}}\t{{.Config.Image}}", "--", row[8]])
+                        if result.status != 0 && dockerObjectIsMissing(result) { row[4] = "absent" }
+                        try requireSuccess(result, action: "inspect the registered container")
+                        let fields = result.stdout.trimmingCharacters(in: .newlines).components(separatedBy: "\t")
+                        guard fields.count == 3, !fields[0].isEmpty else {
+                            throw SafeSpaceManagerError.commandFailed("Docker returned invalid container identity/state.")
+                        }
+                        row[3] = fields[0]; row[4] = fields[1]; row[5] = fields[2]
+                    case .appleContainer:
+                        row[4] = try runtimeState(record, recoverRuntime: false)
+                        if row[4] != "absent" { row[3] = row[8] }
+                    }
+                } catch {
+                    row[7] = error.localizedDescription
+                }
+                rows.append(row)
+            }
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+        func encode(_ rows: [[String]], error: String) -> Data? {
+            guard rows.count <= (16 * 1024 * 1024 - 48) / 72 else { return nil }
+            let variable = 48 + rows.count * 72
+            var result = Data(repeating: 0, count: variable)
+            func put(_ value: UInt32, at offset: Int) {
+                var littleEndian = value.littleEndian
+                withUnsafeBytes(of: &littleEndian) { result.replaceSubrange(offset..<(offset + 4), with: $0) }
+            }
+            func reference(_ value: String, at offset: Int) -> Bool {
+                let bytes = Data(value.utf8)
+                guard !bytes.contains(0), result.count + bytes.count <= 16 * 1024 * 1024 else { return false }
+                put(UInt32(result.count), at: offset); put(UInt32(bytes.count), at: offset + 4)
+                result.append(bytes)
+                return true
+            }
+            put(0x4445534f, at: 0); put(1, at: 4); put(UInt32(rows.count), at: 12)
+            put(72, at: 16); put(48, at: 20); put(UInt32(variable), at: 24)
+            put(error.isEmpty ? 0 : 1, at: 28)
+            guard reference(error, at: 32) else { return nil }
+            for (index, row) in rows.enumerated() {
+                for (field, value) in row.enumerated() {
+                    guard reference(value, at: 48 + index * 72 + field * 8) else { return nil }
+                }
+            }
+            put(UInt32(result.count), at: 8)
+            return result
+        }
+        return encode(rows, error: errorMessage) ?? encode([], error: "Environment response exceeds limits.") ?? Data()
+    }
+
     func handle(_ data: Data) async -> (status: Int, data: Data) {
+        if data == Data([0x4f, 0x53, 0x45, 0x44, 1, 0, 0, 0]) {
+            return (200, environmentDiscoveryResponse())
+        }
         if data.count >= containerTransferMagic.count,
            data.prefix(containerTransferMagic.count) == containerTransferMagic {
             return handleContainerTransfer(data)
@@ -3691,10 +3767,19 @@ final class SafeSpaceManager: @unchecked Sendable {
         return value
     }
 
-    private func runtimeState(_ record: SafeSpaceRecord) throws -> String {
+    private func runtimeState(_ record: SafeSpaceRecord, recoverRuntime: Bool = true) throws -> String {
         switch runtimeProvider(for: record) {
         case .appleContainer:
-            let result = try runContainer(["list", "--all", "--format", "json"])
+            let arguments = ["list", "--all", "--format", "json"]
+            let result: (status: Int32, stdout: String, stderr: String)
+            if recoverRuntime {
+                result = try runContainer(arguments)
+            } else {
+                guard let executable = runtimeExecutableURL(for: .appleContainer) else {
+                    throw SafeSpaceManagerError.unsupportedProvider
+                }
+                result = try runCommand(executable: executable.path, arguments: arguments)
+            }
             try requireSuccess(result, action: "inspect containers")
             guard let data = result.stdout.data(using: .utf8),
                   let values = try JSONSerialization.jsonObject(with: data) as? [[String: Any]]
@@ -5440,6 +5525,9 @@ final class SafeSpaceManager: @unchecked Sendable {
         test -x "${source_directory}/outershelld"
         test -x "${source_directory}/outerctl"
         test -x "${source_directory}/outer-socket-bridge"
+        test -x "${source_directory}/outer-files-helper"
+        test -x "${source_directory}/outer-plaintext-helper"
+        test -x "${source_directory}/outer-top-helper"
         /bin/mkdir -p /usr/local/bin /run/user/0 /var/lib/outershell/services \
             /var/lib/outershell/apps /etc/outershell/apps.d /root/.config/outerssh \
             /root/.local/share/jupyter /root/.cache
@@ -5447,9 +5535,12 @@ final class SafeSpaceManager: @unchecked Sendable {
         /bin/cp "${source_directory}/outerctl" /usr/local/bin/outerctl
         /bin/cp "${source_directory}/outer-socket-bridge" \
             /usr/local/bin/outer-socket-bridge
+        /bin/cp "${source_directory}/outer-files-helper" /usr/local/bin/outer-files-helper
+        /bin/cp "${source_directory}/outer-plaintext-helper" /usr/local/bin/outer-plaintext-helper
+        /bin/cp "${source_directory}/outer-top-helper" /usr/local/bin/outer-top-helper
         /bin/cp /tmp/outershell-bootstrap/outershell-container-init \
             /usr/local/bin/outershell-container-init
-        /bin/chmod 0755 /usr/local/bin/outershelld /usr/local/bin/outerctl \
+        /bin/chmod 0755 /usr/local/bin/outer-files-helper /usr/local/bin/outer-plaintext-helper /usr/local/bin/outer-top-helper /usr/local/bin/outershelld /usr/local/bin/outerctl \
             /usr/local/bin/outer-socket-bridge \
             /usr/local/bin/outershell-container-init
         /bin/chmod 0700 /run/user/0 /root/.config/outerssh

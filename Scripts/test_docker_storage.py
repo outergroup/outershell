@@ -67,9 +67,11 @@ class StorageTests(unittest.TestCase):
         (self.root/'Dockerfile').write_text('ARG BASE\nFROM ${BASE}')
         self.assertEqual(self.candidates(), [])
         Records.values=[]
-        self.images[0]['RepoTags']=['outershell/container-base:18']
+        self.images[0]['RepoTags']=['outershell/container-base:20']
+        self.assertEqual(self.candidates(), ['outershell/container-base:20'])
+        self.images[0]['RepoTags']=['outershell/container-base:21']
         self.assertEqual(self.candidates(), [])
-        self.images[0]['RepoTags']=['outershell/container-base:19']
+        self.images[0]['RepoTags']=['outershell/container-base:22']
         self.assertEqual(self.candidates(), [])
     def test_dangling_requires_label(self):
         self.images[0]['RepoTags']=[]

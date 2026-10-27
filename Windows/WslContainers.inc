@@ -114,7 +114,7 @@ static bool create_container(Wsl *w, HttpRequest *request, const char **error) {
         strspn(image, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-/:@") != strlen(image) ||
         !cpus || cpus > 128 || !memory || memory > 128)
         goto done;
-    if (!strcmp(image, "outershell/container-base:18")) {
+    if (!strcmp(image, "outershell/container-base:21")) {
         const char *inspect[] = {"image", "inspect", image, NULL};
         if (!capture_runtime(w, inspect, &output, runtime)) {
             free(output.data);
@@ -308,7 +308,7 @@ static void container_provider(Wsl *w, StringBuilder *json, ContainerRuntime run
     append(json, ",\"setupURL\":");
     json_string(json, runtime == RUNTIME_DOCKER ? "https://docs.docker.com/desktop/setup/install/windows-install/" :
                 "https://learn.microsoft.com/windows/wsl/wsl-container");
-    append(json, ",\"defaultBaseImage\":\"outershell/container-base:18\"}");
+    append(json, ",\"defaultBaseImage\":\"outershell/container-base:21\"}");
 }
 
 static void container_snapshot(Distribution *d, StringBuilder *json) {

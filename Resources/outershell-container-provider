@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import base64
+import concurrent.futures
 import fcntl
 import hashlib
 import json
@@ -23,7 +24,7 @@ import uuid
 
 
 PROVIDER_ID = "docker"
-DEFAULT_BASE_IMAGE = "outershell/container-base:18"
+DEFAULT_BASE_IMAGE = "outershell/container-base:21"
 FRAME_MAGIC = 0x3142524F
 FRAME_VERSION = 1
 FRAME_HELLO = 1
@@ -594,7 +595,7 @@ def docker_state(container_id):
 
 def default_dockerfile():
     return """# syntax=docker/dockerfile:1
-FROM outershell/container-base:18
+FROM outershell/container-base:21
 USER root
 WORKDIR /root
 """
@@ -727,10 +728,16 @@ source_directory="/tmp/outershell-bootstrap/bin/$libc/$architecture"
 test -x "$source_directory/outershelld"
 test -x "$source_directory/outerctl"
 test -x "$source_directory/outer-socket-bridge"
+test -x "$source_directory/outer-files-helper"
+test -x "$source_directory/outer-plaintext-helper"
+test -x "$source_directory/outer-top-helper"
 install -d -m 0755 /usr/local/bin /etc/outershell/apps.d /var/lib/outershell/services /var/lib/outershell/apps /run/user/0
 install -m 0755 "$source_directory/outershelld" /usr/local/bin/outershelld
 install -m 0755 "$source_directory/outerctl" /usr/local/bin/outerctl
 install -m 0755 "$source_directory/outer-socket-bridge" /usr/local/bin/outer-socket-bridge
+install -m 0755 "$source_directory/outer-files-helper" /usr/local/bin/outer-files-helper
+install -m 0755 "$source_directory/outer-plaintext-helper" /usr/local/bin/outer-plaintext-helper
+install -m 0755 "$source_directory/outer-top-helper" /usr/local/bin/outer-top-helper
 install -m 0755 /tmp/outershell-bootstrap/outershell-container-init /usr/local/bin/outershell-container-init
 """)
     os.chmod(install_script, 0o755)
@@ -2857,12 +2864,61 @@ def run_relay(container_id, inner_path, published_path):
                 pass
 
 
+def environment_discovery_response():
+    rows = []
+    error = ""
+    try:
+        records = registry_container_list()
+        def resolve(record):
+            fields = [record["id"], record["name"], record["runtimeProviderID"], "", "unavailable", "", "", "", record["runtimeName"]]
+            try:
+                if record["runtimeProviderID"] != "docker":
+                    raise RuntimeError("This provider cannot resolve the registered runtime.")
+                fields[6] = docker_host()
+                result = subprocess.run(docker_cli_prefix() + [
+                    "container", "inspect", "--format", "{{.Id}}\t{{.State.Status}}\t{{.Config.Image}}", "--", record["runtimeName"]
+                ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=4)
+                if result.returncode:
+                    detail = result.stderr.strip()
+                    if "no such" in detail.lower() or "not found" in detail.lower():
+                        fields[4] = "absent"
+                    raise RuntimeError(detail or "Container inspection failed.")
+                values = result.stdout.rstrip("\n").split("\t")
+                if len(values) != 3 or not values[0]:
+                    raise RuntimeError("Docker returned invalid container identity/state.")
+                fields[3], fields[4], fields[5] = values
+            except Exception as exception:
+                fields[7] = str(exception)
+            return fields
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+            rows = list(executor.map(resolve, records))
+    except Exception as exception:
+        error = str(exception)
+    variable = 48 + 72 * len(rows)
+    output = bytearray(variable)
+    struct.pack_into("<4s7I", output, 0, b"OSED", 1, 0, len(rows), 72, 48, variable, bool(error))
+    def reference(offset, value):
+        data = value.encode("utf-8")
+        if b"\0" in data or len(output) + len(data) > 16 * 1024 * 1024:
+            raise ValueError("Environment response exceeds limits or contains NUL.")
+        struct.pack_into("<II", output, offset, len(output), len(data))
+        output.extend(data)
+    reference(32, error)
+    for index, fields in enumerate(rows):
+        for field, value in enumerate(fields):
+            reference(48 + index * 72 + field * 8, value)
+    struct.pack_into("<I", output, 8, len(output))
+    return bytes(output)
+
 def main():
     if len(sys.argv) < 2:
         return 2
     if sys.argv[1] == "request":
         try:
             raw_request = sys.stdin.buffer.read()
+            if raw_request == b"OSED\x01\0\0\0":
+                sys.stdout.buffer.write(environment_discovery_response())
+                return 0
             if raw_request.startswith(b"OSCI"):
                 try:
                     status = store_observed_icon(raw_request)

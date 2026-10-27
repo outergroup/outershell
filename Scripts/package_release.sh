@@ -60,6 +60,9 @@ for libc in glibc musl; do
         require_file "${RUN_ROOT}/container-bootstrap/bin/${libc}/${arch}/outershelld"
         require_file "${RUN_ROOT}/container-bootstrap/bin/${libc}/${arch}/outerctl"
         require_file "${RUN_ROOT}/container-bootstrap/bin/${libc}/${arch}/outer-socket-bridge"
+        require_file "${RUN_ROOT}/container-bootstrap/bin/${libc}/${arch}/outer-files-helper"
+        require_file "${RUN_ROOT}/container-bootstrap/bin/${libc}/${arch}/outer-plaintext-helper"
+        require_file "${RUN_ROOT}/container-bootstrap/bin/${libc}/${arch}/outer-top-helper"
     done
 done
 for arch in aarch64 x86_64; do

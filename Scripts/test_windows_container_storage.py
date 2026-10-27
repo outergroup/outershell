@@ -104,7 +104,7 @@ int main(void) {
     r=req("{\"runtimeProviderID\":\"wsl.container\",\"images\":[\"" REF "\"]}");
     assert(!storage_request(&w,&r,"cleanContainerBuildCache",&extra));assert(caches==1);free(extra.data);extra=(StringBuilder){0};
     assert(storage_request(&w,&r,"cleanContainerStorage",&extra));assert(removed==2);free(extra.data);
-    assert(!storage_owned_reference("outershell/container-base:18"));assert(!storage_owned_reference("outershell/container-base:19"));
+    assert(storage_owned_reference("outershell/container-base:18"));assert(storage_owned_reference("outershell/container-base:20"));assert(!storage_owned_reference("outershell/container-base:21"));assert(!storage_owned_reference("outershell/container-base:22"));
     assert(storage_owned_reference("outershell/container-base:17"));assert(!storage_owned_reference("outershell/managed-invalid:latest"));
     Distribution d={&w,RUNTIME_DOCKER,ID};removal_ok=false;assert(!storage_remove_recipe(&d));
     puts("PASS: Windows Docker/WSLC inventories, namespaces, saved references, aliases, malformed inventories, revalidation, failure reporting, non-forced deletion, and bounded Docker cache cleanup");

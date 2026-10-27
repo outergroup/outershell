@@ -664,7 +664,8 @@ static bool copy_directory_tree(const char *source,
                 break;
             }
         } else if (S_ISREG(st.st_mode)) {
-            if (!copy_file(source_path, destination_path, file_mode, error, error_size)) {
+            mode_t resource_mode = file_mode | (st.st_mode & ((file_mode & 0444) >> 2));
+            if (!copy_file(source_path, destination_path, resource_mode, error, error_size)) {
                 ok = false;
                 break;
             }
@@ -1091,6 +1092,7 @@ typedef struct {
     bool waiting_for_snapshot;
     bool provider_snapshot;
     bool provider_icon_observation;
+    bool provider_environment_query;
     uint64_t snapshot_generation;
     pid_t provider_pid;
     int provider_output_fd;
@@ -12661,6 +12663,8 @@ static bool container_snapshot_valid(const StringBuilder *body) {
     return workspaces;
 }
 
+static void api_send_command_response(int fd, int status, StringBuilder *stdout_buffer, StringBuilder *stderr_buffer);
+
 static bool collect_provider_response(ReactorClient *client) {
     if (!client->provider_output_closed) {
         char buffer[8192];
@@ -12698,6 +12702,18 @@ static bool collect_provider_response(ReactorClient *client) {
     client->provider_pid = 0;
     response.content_kind = UI_API_CONTENT_BINARY;
     response.body = client->provider_output;
+    if (client->provider_environment_query) {
+        if (response.status == 200 && response.body.length >= 48 && !memcmp(response.body.data, "OSED", 4)) {
+            api_send_frame(client->fd, &response.body);
+        } else {
+            StringBuilder error = {0};
+            sb_append(&error, "The container provider could not resolve registered environments.");
+            api_send_command_response(client->fd, 1, &(StringBuilder){0}, &error);
+            free(error.data);
+        }
+        return true;
+    }
+
     if (client->provider_icon_observation) {
         int status = 500;
         if (response.status == 200 && response.body.length == 3) {
@@ -14208,6 +14224,18 @@ static bool process_api_client_request(ReactorClient *client, char *request, siz
     const unsigned char *message = (const unsigned char *)request + 4;
     size_t message_length = n - 4;
     uint16_t message_type = read_uint16_le(message);
+    if (message_type == OUTERSHELLD_API_CONTAINER_ENVIRONMENTS_REQUEST) {
+        const unsigned char query[] = {'O', 'S', 'E', 'D', 1, 0, 0, 0};
+        if (message_length == 2 && start_provider_request(client, (const char *)query, sizeof(query))) {
+            client->provider_environment_query = true;
+            return true;
+        }
+        StringBuilder error = {0};
+        sb_append(&error, "The registered container provider is unavailable.");
+        api_send_command_response(client->fd, 1, &(StringBuilder){0}, &error);
+        free(error.data);
+        return false;
+    }
     if (api_message_is_registry_list_request(message_type)) {
         return process_api_registry_list_request(client, message, message_length);
     }
