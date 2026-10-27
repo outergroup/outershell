@@ -452,6 +452,7 @@
     if (state.layoutFetching || state.layoutSaving || state.groupDrag || state.endpointDrag || state.suspended || state.stopped) return;
     state.layoutFetching = true;
     const controller = new AbortController();
+    const timeout = startRefreshTimeout(controller);
     state.layoutAbort = controller;
     try {
       const result = await fetchLayout(controller.signal);
@@ -467,7 +468,10 @@
       state.layoutError = "";
       updateStatus();
     } catch (error) { if (state.layoutAbort === controller) reportRefreshFailure("layoutError", error, true); }
-    finally { if (state.layoutAbort === controller) { state.layoutAbort = null; state.layoutFetching = false; } }
+    finally {
+      window.clearTimeout(timeout);
+      if (state.layoutAbort === controller) { state.layoutAbort = null; state.layoutFetching = false; }
+    }
   }
 
   function saveLayout(layout) {
@@ -1288,6 +1292,7 @@ OUTERSHELL_BUNDLED_APP
   async function refreshSafeSpaces({ quiet = false } = {}) {
     if (state.stopped || state.suspended || state.safeSpacesRefreshing) return;
     const controller = new AbortController();
+    const timeout = startRefreshTimeout(controller);
     state.refreshAbort.safeSpacesError = controller;
     state.safeSpacesRefreshing = true;
     if (!quiet) {
@@ -1304,6 +1309,7 @@ OUTERSHELL_BUNDLED_APP
     } catch (error) {
       if (state.refreshAbort.safeSpacesError === controller) reportRefreshFailure("safeSpacesError", error, quiet);
     } finally {
+      window.clearTimeout(timeout);
       if (state.refreshAbort.safeSpacesError !== controller) return;
       delete state.refreshAbort.safeSpacesError;
       state.safeSpacesRefreshing = false;
@@ -1369,6 +1375,7 @@ OUTERSHELL_BUNDLED_APP
   async function refreshBackends({ quiet = false } = {}) {
     if (state.stopped || state.suspended || state.refreshAbort.backendError) return;
     const controller = new AbortController();
+    const timeout = startRefreshTimeout(controller);
     state.refreshAbort.backendError = controller;
     if (!quiet) {
       state.loading = true;
@@ -1386,11 +1393,18 @@ OUTERSHELL_BUNDLED_APP
     } catch (error) {
       if (state.refreshAbort.backendError === controller) reportRefreshFailure("backendError", error, quiet);
     } finally {
+      window.clearTimeout(timeout);
       if (state.refreshAbort.backendError !== controller) return;
       delete state.refreshAbort.backendError;
       state.loading = false;
       if (!state.stopped) render();
     }
+  }
+
+  function startRefreshTimeout(controller, milliseconds = 15000) {
+    return window.setTimeout(() => {
+      controller.abort(new DOMException("Outer Shell did not respond in time.", "TimeoutError"));
+    }, milliseconds);
   }
 
   function clearRefreshFailure(key) {
@@ -1400,6 +1414,11 @@ OUTERSHELL_BUNDLED_APP
 
   function reportRefreshFailure(key, error) {
     if (state.stopped || state.suspended || document.hidden || error.name === "AbortError" || state.refreshErrorTimers[key]) return;
+    if (error.name === "TimeoutError") {
+      state[key] = "Outer Shell is not responding. Reconnecting…";
+      updateStatus();
+      return;
+    }
     state.refreshErrorTimers[key] = window.setTimeout(() => {
       delete state.refreshErrorTimers[key];
       if (state.stopped || state.suspended || document.hidden) return;
@@ -2182,6 +2201,8 @@ OUTERSHELL_BUNDLED_APP
       if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(variable.name) || names.has(variable.name) || variable.value.includes("\0")) throw new Error("Environment names must be unique shell identifiers.");
       names.add(variable.name);
     }
+    if (value.networkMode !== undefined && !["bridge", "host"].includes(value.networkMode)) throw new Error("Choose isolated or host networking.");
+    if (value.networkMode === "host" && value.publishedPorts.length) throw new Error("Host networking uses server ports directly. Remove published port mappings first.");
     const ports = new Set();
     for (const port of value.publishedPorts) {
       if (![port.hostPort, port.containerPort].every(number => Number.isInteger(number) && number >= 1 && number <= 65535) || ports.has(port.hostPort)) throw new Error("Ports must be between 1 and 65535, with no repeated server ports.");
@@ -2211,7 +2232,7 @@ OUTERSHELL_BUNDLED_APP
       } catch (error) { toast(error.message || String(error), true); return; }
     }
     const infrastructure = (workspace.mounts || []).filter(mount => mount.isInfrastructure);
-    const tabs = [["dockerfile", "Dockerfile"], ["mounts", "Folder mounts"], ["environment", "Environment"], ["ports", "Ports"], ["runtime", "Runtime"]];
+    const tabs = [["dockerfile", "Dockerfile"], ["mounts", "Folder mounts"], ["environment", "Environment"], ["ports", "Network"], ["runtime", "Runtime"]];
     const dialog = openDialog(`${containerDialogHeader(`Edit ${workspace.name}`)}
       <form class="container-form" novalidate><div class="dialog-body">
         <label class="field">Name<input name="name" value="${escapeHTML(workspace.name)}" required></label>
@@ -2219,8 +2240,8 @@ OUTERSHELL_BUNDLED_APP
         <section role="tabpanel" id="config-panel-dockerfile" aria-labelledby="config-tab-dockerfile" data-config-panel="dockerfile"><label class="field">Dockerfile<textarea name="dockerfile" class="dockerfile-editor" spellcheck="false" autocapitalize="off" autocorrect="off">${escapeHTML(proposedDockerfile)}</textarea></label><p class="field-note">Save stores the definition. Save &amp; rebuild applies it to the container.</p><label class="container-check"><input name="allowAllOpenCodeActions" type="checkbox">Allow all actions without asking</label><p class="field-note">Applies when adding OpenCode below, including access to folders mounted into this container.</p><button type="button" data-add-opencode>Add OpenCode</button><p class="field-note">Adds OpenCode and container instructions to this Dockerfile. Requires Debian or Ubuntu with Outer Shell support.</p></section>
         <section role="tabpanel" id="config-panel-mounts" aria-labelledby="config-tab-mounts" data-config-panel="mounts" hidden><p class="field-note">Server folders are paths on the server running Outer Shell. They must already exist.</p><div data-rows="mounts">${(workspace.mounts || []).filter(mount => !mount.isInfrastructure).map(mount => configurationRow("mounts", mount)).join("")}</div><button type="button" data-add-row="mounts">Add folder mount</button>${infrastructure.length ? `<details class="managed-mounts"><summary>Managed mounts (${infrastructure.length})</summary>${infrastructure.map(mount => `<p><code>${escapeHTML(mount.hostPath)} → ${escapeHTML(mount.guestPath)}</code></p>`).join("")}</details>` : ""}</section>
         <section role="tabpanel" id="config-panel-environment" aria-labelledby="config-tab-environment" data-config-panel="environment" hidden><div data-rows="environment">${(recipe.environment || []).map(value => configurationRow("environment", value)).join("")}</div><button type="button" data-add-row="environment">Add variable</button></section>
-        <section role="tabpanel" id="config-panel-ports" aria-labelledby="config-tab-ports" data-config-panel="ports" hidden><p class="field-note">Publish a container TCP port on this server.</p><div data-rows="ports">${(recipe.publishedPorts || []).map(value => configurationRow("ports", value)).join("")}</div><button type="button" data-add-row="ports">Add port</button></section>
-        <section role="tabpanel" id="config-panel-runtime" aria-labelledby="config-tab-runtime" data-config-panel="runtime" hidden><p>${escapeHTML(safeSpaceRuntimeDescription(workspace))} · ${escapeHTML(workspace.cpus)} CPUs · ${escapeHTML(workspace.memoryInGB)} GB</p><label class="field">Runtime<select name="runtimeProviderID">${runtimeOptions(workspace.runtime?.providerID)}</select></label><p class="field-note">Changing runtime saves the configuration and rebuilds the container with the selected provider.</p><button type="submit" value="runtime">Save &amp; change runtime</button></section>
+        <section role="tabpanel" id="config-panel-ports" aria-labelledby="config-tab-ports" data-config-panel="ports" hidden>${recipe.supportsRuntimeSettings ? `<label class="field">Network mode<select name="networkMode"><option value="bridge" ${recipe.networkMode !== "host" ? "selected" : ""}>Isolated network</option><option value="host" ${recipe.networkMode === "host" ? "selected" : ""}>Host network</option></select></label><p class="field-note">Host networking shares the server’s network for LAN device discovery. Apps listen directly on server ports and may be reachable from other devices. Port mappings are not used.</p>` : ""}<p class="field-note">Publish a container TCP port on this server when using an isolated network.</p><div data-rows="ports">${(recipe.publishedPorts || []).map(value => configurationRow("ports", value)).join("")}</div><button type="button" data-add-row="ports">Add port</button></section>
+        <section role="tabpanel" id="config-panel-runtime" aria-labelledby="config-tab-runtime" data-config-panel="runtime" hidden><p>${escapeHTML(safeSpaceRuntimeDescription(workspace))} · ${escapeHTML(workspace.cpus)} CPUs · ${escapeHTML(workspace.memoryInGB)} GB</p><label class="field">Runtime<select name="runtimeProviderID">${runtimeOptions(workspace.runtime?.providerID)}</select></label>${recipe.supportsRuntimeSettings ? `<label class="container-check"><input name="useInit" type="checkbox" ${recipe.useInit !== false ? "checked" : ""}>Use Docker’s init process</label><p class="field-note">Turn this off for images that provide their own init process, such as Home Assistant and Homebridge.</p><label class="container-check"><input name="restartUnlessStopped" type="checkbox" ${recipe.restartPolicy === "unless-stopped" ? "checked" : ""}>Restart automatically unless manually stopped</label>` : ""}<p class="field-note">Changing runtime saves the configuration and rebuilds the container with the selected provider.</p><button type="submit" value="runtime">Save &amp; change runtime</button></section>
         <p class="container-message" role="status">${escapeHTML(proposalMessage || (recipe.needsRebuild ? "Saved changes need a rebuild." : ""))}</p>
         <p class="field-note">Rebuilding restarts the container. Changes outside its Dockerfile, persistent data, and mounted folders are not retained.</p>
       </div><footer class="dialog-footer"><button type="button" data-action="close-dialog">Close</button><button type="submit" value="save">Save</button><button class="primary-button" type="submit" value="rebuild">Save &amp; rebuild</button></footer></form>`, "wide container-editor");
@@ -2258,6 +2279,11 @@ OUTERSHELL_BUNDLED_APP
       const action = event.submitter?.value || "save";
       const message = form.querySelector(".container-message");
       const values = { workspaceID: id, dockerfile: form.elements.dockerfile.value, mounts: configurationValues(form, "mounts"), environment: configurationValues(form, "environment"), publishedPorts: configurationValues(form, "ports") };
+      if (recipe.supportsRuntimeSettings) {
+        values.networkMode = form.elements.networkMode.value;
+        values.useInit = form.elements.useInit.checked;
+        values.restartPolicy = form.elements.restartUnlessStopped.checked ? "unless-stopped" : "no";
+      }
       const name = form.elements.name.value.trim();
       try { if (!name) throw new Error("Enter a container name."); validateConfiguration(values); }
       catch (error) { message.textContent = error.message; return; }
@@ -2669,6 +2695,7 @@ OUTERSHELL_BUNDLED_APP
     while (!state.stopped) {
       if (state.suspended) { await delay(1000); continue; }
       const controller = new AbortController();
+      const timeout = startRefreshTimeout(controller, 45000);
       state.eventAbort = controller;
       const query = new URLSearchParams({
         sinceBackends: state.backendsVersion.toString(),
@@ -2702,6 +2729,8 @@ OUTERSHELL_BUNDLED_APP
         if (state.backendError || state.refreshErrorTimers.backendError) await refreshBackends({ quiet: true });
       } catch (error) {
         if (error.name !== "AbortError") await delay(1200);
+      } finally {
+        window.clearTimeout(timeout);
       }
     }
   }

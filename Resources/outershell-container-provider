@@ -607,6 +607,10 @@ def default_recipe():
         "persistentData": [],
         "environment": [],
         "publishedPorts": [],
+        "networkMode": "bridge",
+        "useInit": True,
+        "restartPolicy": "no",
+        "realizedRuntimeSettings": None,
         "realizedDockerfile": None,
         "realizedMounts": None,
         "realizedEnvironment": None,
@@ -622,7 +626,23 @@ def load_recipe(container_id):
     return value
 
 
+def runtime_settings(recipe):
+    mode = recipe.get("networkMode", "bridge")
+    use_init = recipe.get("useInit", True)
+    restart = recipe.get("restartPolicy", "no")
+    if mode not in ("bridge", "host"):
+        raise ValueError("Network mode must be bridge or host.")
+    if not isinstance(use_init, bool):
+        raise ValueError("Use init must be a boolean.")
+    if restart not in ("no", "unless-stopped"):
+        raise ValueError("Restart policy must be no or unless-stopped.")
+    if mode == "host" and recipe.get("publishedPorts"):
+        raise ValueError("Host networking uses server ports directly; remove published port mappings.")
+    return {"networkMode": mode, "useInit": use_init, "restartPolicy": restart}
+
+
 def save_recipe(container_id, value):
+    runtime_settings(value)
     directory = recipe_directory(container_id)
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
     registry_resource_set(recipe_resource_key(container_id), value)
@@ -892,11 +912,14 @@ def prepare_persistent_volume(container_id, item_id):
 
 def create_runtime_container(container_id):
     recipe = load_recipe(container_id)
+    settings = runtime_settings(recipe)
     arguments = [
         "create", "--name", container_name(container_id),
-        "--init",
         "--label", "org.outershell.container-id=" + container_id,
     ]
+    if settings["useInit"]:
+        arguments.append("--init")
+    arguments += ["--network", settings["networkMode"], "--restart", settings["restartPolicy"]]
     with Records() as records:
         record = find_record(records.values, container_id)
         cpus = record.get("cpus", 4)
@@ -932,6 +955,7 @@ def mark_realized(container_id):
     recipe["realizedMounts"] = recipe.get("mounts", [])
     recipe["realizedEnvironment"] = recipe.get("environment", [])
     recipe["realizedPublishedPorts"] = recipe.get("publishedPorts", [])
+    recipe["realizedRuntimeSettings"] = runtime_settings(recipe)
     save_recipe(container_id, recipe)
 
 
@@ -1097,6 +1121,7 @@ def start_container(container_id):
 
 
 def operation_create(request):
+    settings = runtime_settings(request)
     status, detail = docker_readiness()
     if status != "ready":
         raise RuntimeError(detail)
@@ -1133,6 +1158,10 @@ def operation_create(request):
     }
     container_directory(container_id).mkdir(parents=True, exist_ok=True, mode=0o700)
     write_initial_definition(container_id, base_image)
+    if any(key in request for key in settings):
+        recipe = load_recipe(container_id)
+        recipe.update(settings)
+        save_recipe(container_id, recipe)
     if initial_dockerfile is not None:
         dockerfile_path(container_id).write_text(initial_dockerfile)
     with Records() as records:
@@ -1197,6 +1226,9 @@ def operation_update_configuration(request):
     recipe["mounts"] = request.get("mounts") or []
     recipe["environment"] = request.get("environment") or []
     recipe["publishedPorts"] = request.get("publishedPorts") or []
+    for key in ("networkMode", "useInit", "restartPolicy"):
+        if key in request:
+            recipe[key] = request[key]
     save_recipe(container_id, recipe)
 
 
@@ -1559,7 +1591,7 @@ def operation_finish_import(request):
         imported_mounts.append(imported)
     recipe["mounts"] = imported_mounts
     for key in ["realizedMounts", "realizedDockerfile", "realizedDockerfileContents",
-                "realizedEnvironment", "realizedPublishedPorts"]:
+                "realizedEnvironment", "realizedPublishedPorts", "realizedRuntimeSettings"]:
         recipe.pop(key, None)
     recipe["hasUntrackedChanges"] = False
     save_recipe(container_id, recipe)
@@ -2144,6 +2176,7 @@ def recipe_dictionary(record, recipe):
         or recipe.get("realizedMounts") != recipe.get("mounts", [])
         or recipe.get("realizedEnvironment") != recipe.get("environment", [])
         or recipe.get("realizedPublishedPorts") != recipe.get("publishedPorts", [])
+        or (recipe.get("realizedRuntimeSettings") or runtime_settings({})) != runtime_settings(recipe)
     )
     return {
         "baseImage": recipe.get("baseImage", DEFAULT_BASE_IMAGE),
@@ -2174,6 +2207,8 @@ def recipe_dictionary(record, recipe):
         "workingDirectory": "/",
         "environment": recipe.get("environment", []),
         "publishedPorts": recipe.get("publishedPorts", []),
+        "supportsRuntimeSettings": True,
+        **runtime_settings(recipe),
     }
 
 

@@ -1,0 +1,14 @@
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const vm = require('node:vm');
+const source = fs.readFileSync('Resources/OuterShellWeb/app.js', 'utf8');
+const context = {};
+vm.createContext(context);
+vm.runInContext(source.slice(source.indexOf('  function validateConfiguration('), source.indexOf('  async function openContainerConfiguration(')), context);
+const base = () => ({dockerfile: 'FROM test', mounts: [], environment: [], publishedPorts: []});
+context.validateConfiguration(base());
+context.validateConfiguration({...base(), networkMode: 'host'});
+assert.throws(() => context.validateConfiguration({...base(), networkMode: 'host', publishedPorts: [{hostPort: 8123, containerPort: 8123}]}), /Remove published port/);
+context.validateConfiguration({...base(), networkMode: 'bridge', publishedPorts: [{hostPort: 8123, containerPort: 8123}]});
+assert.throws(() => context.validateConfiguration({...base(), networkMode: 'invalid'}), /Choose isolated/);
+console.log('PASS: host networking rejects port mappings; existing isolated-network configuration stays valid');

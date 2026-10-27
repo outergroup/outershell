@@ -1090,6 +1090,7 @@ typedef struct {
     int api_response_fd;
     bool waiting_for_snapshot;
     bool provider_snapshot;
+    bool provider_icon_observation;
     uint64_t snapshot_generation;
     pid_t provider_pid;
     int provider_output_fd;
@@ -4944,6 +4945,21 @@ static void send_icon_observation_response(int fd,
     send_action_response(fd, 200, true, "Discovered icon saved.");
 }
 
+static int validate_container_icon(const char *token, const char *body, size_t body_length) {
+    if (strlen(token) != 32 || strspn(token, "0123456789abcdef") != 32) return 403;
+    if (!body || !body_length || body_length > 48u * 1024u) return 400;
+    char path[] = "/tmp/outershell-observed-icon-XXXXXX";
+    int fd = mkstemp(path);
+    size_t width = 0, height = 0;
+    char error[256] = "";
+    bool valid = fd >= 0 && queue_all(fd, body, body_length);
+    if (fd >= 0 && close(fd) != 0) valid = false;
+    valid = valid && outer_shell_png_dimensions(path, &width, &height, error, sizeof(error)) &&
+            width > 0 && height > 0 && width <= 4096 && height <= 4096;
+    unlink(path);
+    return valid ? 200 : 400;
+}
+
 static void send_safe_space_icon_observation_response(int fd,
                                                       const char *query,
                                                       const char *body,
@@ -4961,23 +4977,12 @@ static void send_safe_space_icon_observation_response(int fd,
     if (g_safe_space_icon_observation_callback) {
         status = g_safe_space_icon_observation_callback(token, (const unsigned char *)body, body_length);
     } else {
-        if (strlen(token) != 32 || strspn(token, "0123456789abcdef") != 32) {
-            send_action_response(fd, 403, false, "Invalid icon observation token.");
+        status = validate_container_icon(token, body, body_length);
+        if (status != 200) {
+            send_action_response(fd, status, false, "Invalid icon observation token or PNG.");
             return;
         }
-        char path[] = "/tmp/outershell-observed-icon-XXXXXX";
-        int icon_fd = mkstemp(path);
-        size_t width = 0, height = 0;
-        char error[256] = "";
-        bool valid = icon_fd >= 0 && queue_all(icon_fd, body, body_length);
-        if (icon_fd >= 0 && close(icon_fd) != 0) valid = false;
-        valid = valid && outer_shell_png_dimensions(path, &width, &height, error, sizeof(error)) &&
-                width > 0 && height > 0 && width <= 4096 && height <= 4096;
-        unlink(path);
-        if (!valid) {
-            send_action_response(fd, 400, false, "The observed icon is not a valid PNG of a supported size.");
-            return;
-        }
+        status = 500;
         StringBuilder request = {0}, output = {0};
         int exit_status = -1;
         if (sb_append_n(&request, "OSCI", 4) && sb_append_n(&request, token, 32) &&
@@ -12693,6 +12698,27 @@ static bool collect_provider_response(ReactorClient *client) {
     client->provider_pid = 0;
     response.content_kind = UI_API_CONTENT_BINARY;
     response.body = client->provider_output;
+    if (client->provider_icon_observation) {
+        int status = 500;
+        if (response.status == 200 && response.body.length == 3) {
+            if (!memcmp(response.body.data, "200", 3)) status = 200;
+            else if (!memcmp(response.body.data, "403", 3)) status = 403;
+            else if (!memcmp(response.body.data, "400", 3)) status = 400;
+        }
+        memset(&response.body, 0, sizeof(response.body));
+        UiApiResponse *previous_capture = g_captured_ui_response;
+        g_captured_ui_response = &response;
+        send_action_response(-1, status, status == 200,
+                             status == 200 ? "Discovered icon saved." : "Could not save the discovered icon.");
+        g_captured_ui_response = previous_capture;
+        if (status == 200) {
+            g_snapshot_generation++;
+            g_snapshot_refresh_ms = 0;
+        }
+        api_send_ui_response(client->fd, &response);
+        ui_api_response_free(&response);
+        return true;
+    }
     if (client->provider_snapshot) {
         if (client->snapshot_generation == g_snapshot_generation) {
             g_snapshot_refresh_failed = response.status != 200 || !container_snapshot_valid(&response.body);
@@ -12762,6 +12788,33 @@ static bool process_api_ui_request(ReactorClient *client, const unsigned char *m
             return true;
         }
         ui_api_set_text_response(&response, 503, "Could not start the container provider.\n");
+    } else if (!g_safe_space_icon_observation_callback && !g_safe_space_request_callback &&
+               (route == OUTERSHELLD_UI_ROUTE_ICON_OBSERVATION ||
+                route == OUTERSHELLD_UI_ROUTE_SAFE_SPACE_ICON_OBSERVATION)) {
+        char token[64] = "";
+        bool has_token = query_value(query ? query : "", "token", token, sizeof(token));
+        if (route == OUTERSHELLD_UI_ROUTE_ICON_OBSERVATION && icon_observation_capability_for_token(token)) {
+            process_ui_route_request(route, query ? query : "", (const char *)body, body_length, &response);
+        } else {
+            int status = has_token ? validate_container_icon(token, (const char *)body, body_length) : 400;
+            StringBuilder request = {0};
+            if (status == 200) {
+                if (sb_append_n(&request, "OSCI", 4) && sb_append_n(&request, token, 32) &&
+                    sb_append_n(&request, (const char *)body, body_length) &&
+                    start_provider_request(client, request.data, request.length)) {
+                    client->provider_icon_observation = true;
+                    free(request.data);
+                    free(query);
+                    return true;
+                }
+                status = 503;
+            }
+            free(request.data);
+            UiApiResponse *previous_capture = g_captured_ui_response;
+            g_captured_ui_response = &response;
+            send_action_response(-1, status, false, "Could not save the discovered icon.");
+            g_captured_ui_response = previous_capture;
+        }
     } else {
         process_ui_route_request(route, query ? query : "", (const char *)body, body_length, &response);
     }
