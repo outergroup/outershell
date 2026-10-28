@@ -21,6 +21,7 @@ OUTERCTL_IMAGE_ROOT="${native_root}" "${test_root}/outerctl" image add-app \
 
 native_service="${native_root}/var/lib/outershell/services/org.outershell.image.jupyter-work.outerservice"
 native_registration="${native_root}/etc/outershell/apps.d/org.outershell.image.jupyter-work.sh"
+grep -Fx 'Start=manual' "${native_service}"
 grep -Fx 'Executable=/opt/venvs/default/bin/jupyter-lab' "${native_service}"
 grep -Fx 'Argument=--ServerApp.sock=/run/user/0/org.outershell.image.jupyter-work' "${native_service}"
 grep -F -- "--url '/lab'" "${native_registration}"
@@ -37,6 +38,7 @@ OUTERCTL_IMAGE_ROOT="${tcp_root}" "${test_root}/outerctl" image add-app \
 tcp_service="${tcp_root}/var/lib/outershell/services/org.outershell.image.rstudio.outerservice"
 tcp_wrapper="${tcp_root}/opt/outershell/image-apps/org.outershell.image.rstudio/start"
 grep -Fx 'Executable=/opt/outershell/image-apps/org.outershell.image.rstudio/start' "${tcp_service}"
+grep -Fx 'Start=manual' "${tcp_service}"
 grep -F 'port=8787' "${tcp_wrapper}"
 grep -F 'UNIX-LISTEN:"${socket}"' "${tcp_wrapper}"
 /bin/bash -n "${tcp_wrapper}"
@@ -81,6 +83,16 @@ if OUTERCTL_IMAGE_ROOT="${command_root}" "${test_root}/outerctl" image add-comma
     --icon-path /icons/missing.png \
     -- /bin/sh >/dev/null 2>&1; then
     echo "error: missing command icon was accepted" >&2
+    exit 1
+fi
+
+
+OUTERCTL_IMAGE_ROOT="${test_root}/eager" "${test_root}/outerctl" image add-app \
+    --id background --name Background --tcp-port 8080 --start eager -- /bin/true
+grep -Fx 'Start=eager' "${test_root}/eager/var/lib/outershell/services/org.outershell.image.background.outerservice"
+if OUTERCTL_IMAGE_ROOT="${test_root}/invalid-start" "${test_root}/outerctl" image add-app \
+    --id invalid --name Invalid --tcp-port 8080 --start invalid -- /bin/true; then
+    echo 'error: invalid startup mode accepted' >&2
     exit 1
 fi
 

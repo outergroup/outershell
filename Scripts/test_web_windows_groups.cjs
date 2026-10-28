@@ -6,7 +6,7 @@ const source = fs.readFileSync(path.join(__dirname, "../Resources/OuterShellWeb/
 const state = { hostPlatform: "windows", providers: [], safeSpaces: [], groupOrder: [], endpointOrder: {} };
 const elements = { overview: { innerHTML: "" } };
 const context = {
-  state, elements, window: { outerLoop: { sessionContext: { username: "test-user" } } },
+  state, elements, document: { createElement: () => ({ set innerHTML(value) { this.content = value; } }) }, window: { outerLoop: { sessionContext: { username: "test-user" } } },
   renderInitialLoading: () => false, escapeHTML: String,
   groupPinKeys: () => [], overviewEndpoint: entry => entry.key,
   overviewShortcut: entry => entry.key, containerCommandsHTML: () => "",
@@ -15,6 +15,7 @@ const context = {
 };
 vm.createContext(context);
 vm.runInContext(source.slice(source.indexOf("  function renderOverview(entries)"), source.indexOf("  function saveGroupOrder(")), context);
+context.updateOverviewChildren = (parent, markup) => { parent.innerHTML = markup; };
 const entries = [
   { key: "ordinary-app", item: { backend: { serviceScope: "user" } } },
   { key: "custom-privileged-app", item: { backend: { serviceScope: "system" } } }

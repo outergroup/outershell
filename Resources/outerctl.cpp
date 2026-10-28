@@ -1254,6 +1254,7 @@ bool tryOuterctlApi(const CommandRequest &request, int &exitStatus, Buffer &erro
 }
 
 struct ImageAppRequest {
+    const char *startMode = "manual";
     const char *id = "";
     const char *displayName = "";
     const char *url = "/";
@@ -1273,6 +1274,7 @@ void printImageAddAppUsage(FILE *stream) {
         "  --working-directory PATH   Service working directory (default: /root)\n"
         "  --socket-argument OPTION   Append OPTION=<unix socket path> to the command\n"
         "  --tcp-port PORT            Relay this loopback TCP port through a Unix socket\n"
+        "  --start manual|eager       Start when opened or at container boot (default: manual)\n"
         "  --icon-path PATH           Icon path inside the image\n",
         stream
     );
@@ -1345,6 +1347,12 @@ bool parseImageAddAppRequest(int argc,
             request.iconPath = value;
         } else if (parseImageOption(index, argc, argv, "--root", value)) {
             request.root = value;
+        } else if (parseImageOption(index, argc, argv, "--start", value)) {
+            if (strcmp(value, "manual") != 0 && strcmp(value, "eager") != 0) {
+                assignCString(errorMessage, "--start must be manual or eager.");
+                return false;
+            }
+            request.startMode = value;
         } else if (parseImageOption(index, argc, argv, "--tcp-port", value)) {
             if (!parseUInt32(value, 65535, request.tcpPort) || request.tcpPort == 0) {
                 assignCString(errorMessage, "Invalid --tcp-port value.");
@@ -1561,12 +1569,13 @@ bool writeImageAppService(int argc,
                      "Environment=XDG_RUNTIME_DIR=/run/user/0\n"
                      "Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n"
                      "EnvironmentPolicy=clean\n"
-                     "Start=eager\n"
+                     "Start=%s\n"
                      "Restart=on-failure\n"
                      "RestartDelayMilliseconds=1000\n"
                      "StopTimeoutMilliseconds=10000\n"
                      "LogPath=%s\n",
                      request.workingDirectory,
+                     request.startMode,
                      logPath) >= 0;
     }
     return ok && finishImageFile(file, destination, 0644);

@@ -37,6 +37,9 @@
     backendError: "",
     safeSpacesError: "",
     safeSpaceBusy: new Set(),
+    appLaunches: new Map(),
+    endpointControls: new Map(),
+    safeSpacesRevision: 0,
     overviewVersion: 0n,
     busy: false,
     query: "",
@@ -391,7 +394,14 @@
   }
 
   function findSafeSpaceApp(workspace, serviceID, frontendKey = "") {
-    return workspace?.apps?.find(app => app.serviceID === serviceID && (!frontendKey || containerFrontendKey(app) === frontendKey));
+    const apps = workspace?.apps?.filter(app => app.serviceID === serviceID) || [];
+    if (!frontendKey) return apps[0];
+    let identity;
+    try { identity = JSON.parse(frontendKey); } catch (_) {}
+    if (Array.isArray(identity) && typeof identity[0] === "string" && identity[0]) {
+      return apps.find(app => app.frontendID === identity[0]);
+    }
+    return apps.find(app => containerFrontendKey(app) === frontendKey);
   }
 
   function containerBookmarkKey(workspace, app) {
@@ -544,6 +554,21 @@
       : `data-action="launch-safe-space-app" data-safe-space-id="${escapeHTML(entry.workspace.id)}" data-service-id="${escapeHTML(entry.app.serviceID)}" data-frontend-key="${escapeHTML(containerFrontendKey(entry.app))}"`;
   }
 
+  function appLaunchFeedback(entry) {
+    if (!entry.workspace) return "";
+    const launch = state.appLaunches.get(`${entry.workspace.id}\u001f${entry.app.serviceID}`);
+    if (!launch?.showLogs) return "";
+    return `<span class="app-launch-feedback"><button type="button" class="app-launch-logs" data-action="container-logs" data-safe-space-id="${escapeHTML(entry.workspace.id)}" data-service-id="${escapeHTML(entry.app.serviceID)}" data-frontend-key="${escapeHTML(containerFrontendKey(entry.app))}">View logs</button></span>`;
+  }
+
+  function overviewStatus(entry) {
+    const key = entry.workspace ? `container:${entry.workspace.id}\u001f${entry.app.serviceID}` : `host:${backendKey(entry.item.backend)}`;
+    const operation = state.endpointControls.get(key);
+    const launching = entry.workspace && state.appLaunches.has(`${entry.workspace.id}\u001f${entry.app.serviceID}`);
+    if (operation || launching) return `<span class="address-status app-launch-spinner${operation === "Stopping" ? " is-stopping" : ""}" role="status" aria-label="${operation || "Starting"}"></span>`;
+    return `<span class="address-status${entry.failure ? " is-failed" : entry.running ? " is-running" : ""}" aria-label="${entry.failure ? "Unavailable" : entry.running ? "Running" : "Not running"}"></span>`;
+  }
+
   function overviewEndpoint(entry) {
     const target = entry.item ? navigationURL(entry.item.frontend) : safeSpaceAppNavigationURL(entry.workspace, entry.app);
     const isThisPage = entry.serviceID === "org.outershell.OuterShell" && entry.item?.backend.serviceScope !== "system" && !entry.workspace;
@@ -551,7 +576,7 @@
     const menu = entry.item
       ? `data-action="edit-bookmark" data-app-key="${escapeHTML(entry.item.identity)}"`
       : `data-action="edit-container-bookmark" data-safe-space-id="${escapeHTML(entry.workspace.id)}" data-service-id="${escapeHTML(entry.app.serviceID)}" data-frontend-key="${escapeHTML(containerFrontendKey(entry.app))}"`;
-    return `<div class="overview-row" data-endpoint-key="${escapeHTML(entry.key)}"><a href="${escapeHTML(target)}" ${overviewLaunchAttributes(entry)} ${entry.item ? "" : `data-app-key="${escapeHTML(entry.key)}"`}><span class="address-status${entry.failure ? " is-failed" : entry.running ? " is-running" : ""}" aria-label="${entry.failure ? "Unavailable" : entry.running ? "Running" : "Not running"}"></span>${icon}<span>${escapeHTML(entry.name)}${entry.failure ? " — Unavailable" : ""}${isThisPage ? ' <small class="this-page-label">This page</small>' : ""}</span></a><button class="endpoint-menu" type="button" ${menu} aria-label="Actions for ${escapeHTML(entry.name)}" aria-haspopup="dialog">•••</button></div>`;
+    return `<div class="overview-row" data-endpoint-key="${escapeHTML(entry.key)}"><a href="${escapeHTML(target)}" ${overviewLaunchAttributes(entry)} ${entry.item ? "" : `data-app-key="${escapeHTML(entry.key)}"`}>${overviewStatus(entry)}${icon}<span>${escapeHTML(entry.name)}${entry.failure ? " — Unavailable" : ""}${isThisPage ? ' <small class="this-page-label">This page</small>' : ""}</span></a>${appLaunchFeedback(entry)}<button class="endpoint-menu" type="button" ${menu} aria-label="Actions for ${escapeHTML(entry.name)}" aria-haspopup="dialog">•••</button></div>`;
   }
 
   function endpointGroupID(entry) {
@@ -615,7 +640,7 @@
     const icon = listIconHTML(item);
     const target = entry.item ? navigationURL(entry.item.frontend) : safeSpaceAppNavigationURL(entry.workspace, entry.app);
     const identity = entry.item?.identity || entry.key;
-    return `<div class="overview-shortcut-wrap" data-endpoint-key="${escapeHTML(entry.key)}"><a class="overview-shortcut" href="${escapeHTML(target)}" ${overviewLaunchAttributes(entry)} ${entry.item ? "" : `data-app-key="${escapeHTML(identity)}"`}>${icon}<span class="shortcut-title"><span class="address-status${entry.failure ? " is-failed" : entry.running ? " is-running" : ""}" aria-label="${entry.failure ? "Unavailable" : entry.running ? "Running" : "Not running"}"></span>${escapeHTML(entry.name)}${entry.failure ? " — Unavailable" : ""}</span></a></div>`;
+    return `<div class="overview-shortcut-wrap" data-endpoint-key="${escapeHTML(entry.key)}"><a class="overview-shortcut" href="${escapeHTML(target)}" ${overviewLaunchAttributes(entry)} ${entry.item ? "" : `data-app-key="${escapeHTML(identity)}"`}>${icon}<span class="shortcut-title">${overviewStatus(entry)}${escapeHTML(entry.name)}${entry.failure ? " — Unavailable" : ""}</span></a>${appLaunchFeedback(entry)}</div>`;
   }
 
   function renderInitialLoading() {
@@ -1092,10 +1117,52 @@ OUTERSHELL_BUNDLED_APP
         ? `<button class="overview-add-more" type="button" data-action="open-container-add" data-safe-space-id="${id}" ${preparing ? "disabled" : ""}>Add more…</button>`
         : `<button class="overview-add-more" type="button" data-action="open-add" data-scope="${group.id === "root" ? "system" : "user"}">Add more…</button>`;
       return `<section class="overview-identity" data-group-id="${escapeHTML(group.id)}"><div class="overview-apps"><header class="overview-group-handle" tabindex="0" aria-label="Reorder ${escapeHTML(group.name)}${group.shield ? ", Administrator" : ""}. Hold and drag, or use arrow keys." title="Hold and drag to reorder" data-group-handle><div class="overview-group-heading"><h2>${escapeHTML(group.name)}</h2><p>${shield}${escapeHTML(group.note)}</p></div>${controls}</header><div class="overview-shortcuts" data-endpoint-area="pins">${pins.map(key => group.entries.find(entry => entry.key === key)).filter(Boolean).map(overviewShortcut).join("")}</div><div class="overview-list" data-endpoint-area="list">${listed.map(overviewEndpoint).join("") || `<p class="overview-empty">${state.loading || (workspace && state.safeSpacesLoading) ? "Loading…" : group.entries.length ? "" : "No registered endpoints."}</p>`}</div>${workspace?.buildProgress ? `<details class="container-build-progress"><summary>${escapeHTML(workspace.buildProgress.detail || workspace.buildProgress.phase)}</summary><pre>${escapeHTML(workspace.buildProgress.log || "")}</pre></details>` : ""}</div><div class="overview-tools">${containerCommandsHTML(workspace)}</div><footer class="overview-footer">${addMore}</footer></section>`;
-    }).join("") + `<button class="overview-add-container" type="button" data-action="create-container"><span aria-hidden="true">+</span>Add container (beta)…</button><button class="overview-add-container" type="button" data-action="import-container">Import container…</button>${state.providers.some(provider => provider.capabilities?.supportsStorageCleanup) ? `<button class="overview-add-container" type="button" data-action="container-storage">Container storage…</button>` : ""}`;
+    }).join("") + `<button class="overview-add-container" type="button" data-action="manage-containers"><span aria-hidden="true">+</span>Manage containers</button>`;
     if (state.overviewMarkup !== markup) {
-      elements.overview.innerHTML = markup;
+      const template = document.createElement("template");
+      template.innerHTML = markup;
+      updateOverviewChildren(elements.overview, template.content);
       state.overviewMarkup = markup;
+    }
+  }
+
+  function overviewNodeKey(node) {
+    if (node.nodeType !== 1) return "";
+    if (node.hasAttribute("data-group-id")) return `group:${node.dataset.groupId}`;
+    if (node.hasAttribute("data-endpoint-key")) return `endpoint:${node.dataset.endpointKey}`;
+    return "";
+  }
+
+  function updateOverviewChildren(parent, source) {
+    const keyed = new Map(Array.from(parent.childNodes, node => [overviewNodeKey(node), node]).filter(([key]) => key));
+    let cursor = parent.firstChild;
+    for (const next of source.childNodes) {
+      const key = overviewNodeKey(next);
+      let current = key ? keyed.get(key) : cursor;
+      if (!current || current.nodeType !== next.nodeType || current.nodeName !== next.nodeName || overviewNodeKey(current) !== key) {
+        current = next.cloneNode(true);
+        parent.insertBefore(current, cursor);
+      } else {
+        if (current !== cursor) parent.insertBefore(current, cursor);
+        if (current.nodeType === 1) {
+          for (const attribute of Array.from(current.attributes)) {
+            if (current.nodeName === "DETAILS" && attribute.name === "open") continue;
+            if (!next.hasAttribute(attribute.name)) current.removeAttribute(attribute.name);
+          }
+          for (const attribute of next.attributes) {
+            if (current.getAttribute(attribute.name) !== attribute.value) current.setAttribute(attribute.name, attribute.value);
+          }
+          updateOverviewChildren(current, next);
+        } else if (current.nodeValue !== next.nodeValue) {
+          current.nodeValue = next.nodeValue;
+        }
+      }
+      cursor = current.nextSibling;
+    }
+    while (cursor) {
+      const next = cursor.nextSibling;
+      cursor.remove();
+      cursor = next;
     }
   }
 
@@ -1291,6 +1358,7 @@ OUTERSHELL_BUNDLED_APP
 
   async function refreshSafeSpaces({ quiet = false } = {}) {
     if (state.stopped || state.suspended || state.safeSpacesRefreshing) return;
+    const revision = state.safeSpacesRevision;
     const controller = new AbortController();
     const timeout = startRefreshTimeout(controller);
     state.refreshAbort.safeSpacesError = controller;
@@ -1301,7 +1369,7 @@ OUTERSHELL_BUNDLED_APP
     }
     try {
       const result = await safeSpaceRequest("list", {}, controller.signal);
-      if (state.refreshAbort.safeSpacesError !== controller) return;
+      if (state.refreshAbort.safeSpacesError !== controller || revision !== state.safeSpacesRevision) return;
       state.safeSpaces = Array.isArray(result.workspaces) ? result.workspaces : [];
       state.safeSpacesReady = true;
       clearRefreshFailure("safeSpacesError");
@@ -1323,14 +1391,25 @@ OUTERSHELL_BUNDLED_APP
   }
 
   async function waitForSafeSpaceApp(workspaceID, serviceID, frontendKey) {
-    for (let attempt = 0; attempt < 40; attempt += 1) {
-      await refreshSafeSpaces({ quiet: true });
-      const workspace = findSafeSpace(workspaceID);
+    const deadline = performance.now() + 120000;
+    while (performance.now() < deadline) {
+      const controller = new AbortController();
+      const timeout = startRefreshTimeout(controller, Math.min(15000, deadline - performance.now()));
+      let result;
+      try {
+        result = await safeSpaceRequest("list", {}, controller.signal);
+      } finally {
+        window.clearTimeout(timeout);
+      }
+      const workspace = (result.workspaces || []).find(value => value.id === workspaceID);
       const app = findSafeSpaceApp(workspace, serviceID, frontendKey);
       if (workspace && app && safeSpaceAppIsReady(workspace, app)) return { workspace, app };
-      await delay(250);
+      if (workspace && ["error", "unavailable"].includes(safeSpaceState(workspace))) {
+        throw new Error("The container is unavailable. Check its status and the app’s logs.");
+      }
+      await delay(Math.min(750, Math.max(0, deadline - performance.now())));
     }
-    throw new Error("The app started, but its address is not ready yet.");
+    throw new Error("The app is still not ready after two minutes. Check its logs for startup errors, then try opening it again.");
   }
 
   async function startSafeSpace(workspaceID) {
@@ -1346,6 +1425,8 @@ OUTERSHELL_BUNDLED_APP
   }
 
   async function launchSafeSpaceApp(workspaceID, serviceID, frontendKey) {
+    const key = `${workspaceID}\u001f${serviceID}`;
+    if (state.appLaunches.has(key)) return;
     let workspace = findSafeSpace(workspaceID);
     let app = findSafeSpaceApp(workspace, serviceID, frontendKey);
     if (!workspace || !app) throw new Error("The selected container app no longer exists.");
@@ -1353,7 +1434,12 @@ OUTERSHELL_BUNDLED_APP
       window.location.assign(safeSpaceAppNavigationURL(workspace, app));
       return;
     }
-    const key = `${workspaceID}\u001f${serviceID}`;
+    const launch = { showLogs: false };
+    state.appLaunches.set(key, launch);
+    const logTimer = window.setTimeout(() => {
+      launch.showLogs = true;
+      renderSafeSpaces();
+    }, 1000);
     state.safeSpaceBusy.add(key);
     renderSafeSpaces();
     try {
@@ -1367,6 +1453,8 @@ OUTERSHELL_BUNDLED_APP
       const ready = await waitForSafeSpaceApp(workspaceID, serviceID, frontendKey);
       window.location.assign(safeSpaceAppNavigationURL(ready.workspace, ready.app));
     } finally {
+      window.clearTimeout(logTimer);
+      state.appLaunches.delete(key);
       state.safeSpaceBusy.delete(key);
       renderSafeSpaces();
     }
@@ -1963,6 +2051,15 @@ OUTERSHELL_BUNDLED_APP
     return `<header class="dialog-header"><h2 id="dialog-title">${escapeHTML(title)}</h2><button class="dialog-close" type="button" data-action="close-dialog" aria-label="Close">×</button></header>`;
   }
 
+  function openManageContainers() {
+    openDialog(`${containerDialogHeader("Manage containers")}
+      <div class="dialog-body container-management-actions">
+        <button type="button" data-action="create-container"><span><strong>Add container…</strong><small>Create a new container for your apps.</small></span><span aria-hidden="true">›</span></button>
+        <button type="button" data-action="import-container"><span><strong>Import container…</strong><small>Restore a container from a saved file.</small></span><span aria-hidden="true">›</span></button>
+        ${state.providers.some(provider => provider.capabilities?.supportsStorageCleanup) ? `<button type="button" data-action="container-storage"><span><strong>Manage storage…</strong><small>Review and clean up unused images and build cache.</small></span><span aria-hidden="true">›</span></button>` : ""}
+      </div>`, "container-management-dialog");
+  }
+
   function runtimeCanCreate(provider) {
     return provider.isAvailable === true || (provider.id === "apple.container" && provider.status === "stopped");
   }
@@ -2214,24 +2311,35 @@ OUTERSHELL_BUNDLED_APP
 
   async function openContainerConfiguration(id, catalogID = null) {
     let workspace = findSafeSpace(id);
-    if (workspace && !workspace.recipe) {
-      try {
-        const result = await safeSpaceRequest("listDetails");
-        workspace = result.workspaces?.find(value => value.id === id);
-      } catch (error) { toast(error.message, true); return; }
-    }
     if (!workspace || !managedContainer(workspace)) return;
-    const recipe = workspace.recipe;
-    if (!recipe || typeof recipe.containerfile !== "string") { toast("The container configuration is not available yet.", true); return; }
-    const catalogApp = containerAppCatalog.find(app => app.id === catalogID);
-    let proposedDockerfile = recipe.containerfile;
+    const loadingDialog = openDialog(`${containerDialogHeader(`Edit ${workspace.name}`)}<div class="dialog-body"><p role="status">Loading configuration…</p></div>`, "wide container-editor");
+    let recipe;
+    let proposedDockerfile;
     let proposalMessage = "";
-    if (catalogApp) {
-      try {
+    try {
+      const result = await safeSpaceRequest("listDetails", { workspaceID: id, configurationOnly: true });
+      if (!loadingDialog.isConnected) return;
+      const configuration = result.workspaces?.find(value => value.id === id);
+      if (!configuration || !managedContainer(configuration)) throw new Error("The container configuration is not available yet.");
+      workspace = { ...workspace, ...configuration };
+      recipe = workspace.recipe;
+      if (typeof recipe?.containerfile !== "string") throw new Error("The container configuration is not available yet.");
+      proposedDockerfile = recipe.containerfile;
+      if (containerAppCatalog.some(app => app.id === catalogID)) {
         const draft = await containerAppDraft(recipe.containerfile, catalogID);
+        if (!loadingDialog.isConnected) return;
         proposedDockerfile = draft.dockerfile;
         proposalMessage = draft.message;
-      } catch (error) { toast(error.message || String(error), true); return; }
+      }
+    } catch (error) {
+      if (!loadingDialog.isConnected) return;
+      loadingDialog.querySelector('[role="status"]').textContent = error.message || String(error);
+      const retry = document.createElement("button");
+      retry.type = "button";
+      retry.textContent = "Retry";
+      retry.addEventListener("click", () => openContainerConfiguration(id, catalogID));
+      loadingDialog.querySelector(".dialog-body").append(retry);
+      return;
     }
     const infrastructure = (workspace.mounts || []).filter(mount => mount.isInfrastructure);
     const tabs = [["dockerfile", "Dockerfile"], ["mounts", "Folder mounts"], ["environment", "Environment"], ["ports", "Network"], ["runtime", "Runtime"]];
@@ -2542,6 +2650,14 @@ OUTERSHELL_BUNDLED_APP
   async function checkOuterShellUpdate(key, button) {
     const backend = findBackend(key);
     if (!backend) return;
+    if (["start", "stop", "restart"].includes(operation)) {
+      await performEndpointControl(`host:${key}`, operation, async () => {
+        const result = await control(backend, operation);
+        if (!result.ok) throw new Error(result.message || "The action failed.");
+        await refreshBackends({ quiet: true });
+      });
+      return;
+    }
     button.disabled = true;
     const label = button.querySelector(":scope > span:not(.context-menu-glyph)") || button;
     const original = label.textContent;
@@ -2591,6 +2707,44 @@ OUTERSHELL_BUNDLED_APP
     openDialog(`<header class="dialog-header"><h2 id="dialog-title">${escapeHTML(title)}</h2></header>
       <div class="dialog-body"><pre class="operation-error" role="alert">${escapeHTML(error.message || String(error))}</pre></div>
       <footer class="dialog-footer"><button type="button" data-action="close-dialog">Close</button></footer>`);
+  }
+
+  async function waitForStoppedContainerApp(workspaceID, serviceID, frontendKey) {
+    const deadline = performance.now() + 120000;
+    while (performance.now() < deadline) {
+      const controller = new AbortController();
+      const timeout = startRefreshTimeout(controller, Math.min(15000, deadline - performance.now()));
+      let result;
+      try {
+        result = await safeSpaceRequest("list", {}, controller.signal);
+      } finally {
+        window.clearTimeout(timeout);
+      }
+      const workspace = result.workspaces?.find(value => value.id === workspaceID);
+      const app = findSafeSpaceApp(workspace, serviceID, frontendKey);
+      if (workspace && app?.isRunning === false) {
+        state.safeSpacesRevision += 1;
+        state.safeSpaces = result.workspaces;
+        return;
+      }
+      await delay(Math.min(500, Math.max(0, deadline - performance.now())));
+    }
+    throw new Error("The app has not reported that it stopped. Check its logs and try again.");
+  }
+
+  async function performEndpointControl(key, operation, run) {
+    if (state.endpointControls.has(key)) return;
+    state.endpointControls.set(key, operation.startsWith("stop") ? "Stopping" : operation.startsWith("restart") ? "Restarting" : "Starting");
+    closeDialog();
+    renderSafeSpaces();
+    try {
+      await run();
+    } catch (error) {
+      toast(error.message || String(error), true);
+    } finally {
+      state.endpointControls.delete(key);
+      renderSafeSpaces();
+    }
   }
 
   async function performControl(key, operation, button) {
@@ -2672,13 +2826,18 @@ OUTERSHELL_BUNDLED_APP
     fetchSelectedLog();
   }
 
-  function decodeContainerLog(result, serviceID) {
+  function decodeContainerLog(result, serviceID, knownLogFiles) {
     if (!result) throw new Error("The container returned no log response.");
-    if (result.backendsPayload !== undefined) {
+    if (result.logPayload !== undefined) {
       const bytes = value => Uint8Array.from(atob(value), character => character.charCodeAt(0));
-      const backend = decodeBackends(bytes(result.backendsPayload)).backends.find(value => value.serviceID === serviceID);
-      if (!backend) throw new Error("This app is no longer registered in the container.");
-      return { logFiles: backend.logFiles, log: decodeLog(bytes(result.logPayload)) };
+      let logFiles = knownLogFiles;
+      if (result.backendsPayload !== undefined) {
+        const backend = decodeBackends(bytes(result.backendsPayload)).backends.find(value => value.serviceID === serviceID);
+        if (!backend) throw new Error("This app is no longer registered in the container.");
+        logFiles = backend.logFiles;
+      }
+      if (!logFiles) throw new Error("The container returned no log metadata.");
+      return { logFiles, log: decodeLog(bytes(result.logPayload)) };
     }
     return { logFiles: result.path ? [{ path: result.path }] : [], log: { ...result, truncated: result.isTruncated } };
   }
@@ -2694,9 +2853,10 @@ OUTERSHELL_BUNDLED_APP
     const output = selection.dialog.querySelector("#log-output");
     const meta = selection.dialog.querySelector("#log-meta");
     try {
-      const result = await safeSpaceRequest("appLogs", { workspaceID: selection.workspaceID, serviceID: selection.serviceID, logIndex: index }, controller.signal);
+      const result = await safeSpaceRequest("appLogs", { workspaceID: selection.workspaceID, serviceID: selection.serviceID, logIndex: index, includeWorkspaceSnapshot: false, includeBackends: !selection.logFiles }, controller.signal);
       if (state.logSelection !== selection || !selection.dialog.isConnected || selection.index !== index) return;
-      const { logFiles, log } = decodeContainerLog(result.appLog, selection.serviceID);
+      const { logFiles, log } = decodeContainerLog(result.appLog, selection.serviceID, selection.logFiles);
+      selection.logFiles = logFiles;
       const select = selection.dialog.querySelector("#log-select");
       const options = logFiles.map((file, i) => `<option value="${i}">${escapeHTML(file.displayName || file.path)}</option>`).join("") || '<option>No registered log file</option>';
       if (select.innerHTML !== options) select.innerHTML = options;
@@ -3026,6 +3186,7 @@ OUTERSHELL_BUNDLED_APP
     if (action === "rename-endpoint") { const item = findItem(actionElement.dataset.appKey); if (item) openRenameEndpoint(item); return; }
     if (action === "show-container-command") { const bounds = actionElement.getBoundingClientRect(); openContainerCommand(actionElement.dataset.safeSpaceId, actionElement.dataset.commandId, { x: bounds.left, y: bounds.bottom }); return; }
     if (action === "setup-container-opencode") { openCreateContainer(true); return; }
+    if (action === "manage-containers") { openManageContainers(); return; }
     if (action === "container-storage") { await openContainerStorage(); return; }
     if (action === "import-container") { openContainerImport(); return; }
     if (action === "create-container") { openCreateContainer(); return; }
@@ -3066,14 +3227,18 @@ OUTERSHELL_BUNDLED_APP
       return;
     }
     if (action === "container-control") {
-      actionElement.disabled = true;
-      try {
-        const workspace = findSafeSpace(actionElement.dataset.safeSpaceId);
-        const app = findSafeSpaceApp(workspace, actionElement.dataset.serviceId, actionElement.dataset.frontendKey);
-        await safeSpaceRequest(actionElement.dataset.operation, { workspaceID: actionElement.dataset.safeSpaceId, serviceID: actionElement.dataset.serviceId, serviceScope: app?.serviceScope });
-        closeDialog();
-        await refreshSafeSpaces({ quiet: true });
-      } catch (error) { toast(error.message || String(error), true); actionElement.disabled = false; }
+      const { safeSpaceId: workspaceID, serviceId: serviceID, frontendKey, operation } = actionElement.dataset;
+      const workspace = findSafeSpace(workspaceID);
+      const app = findSafeSpaceApp(workspace, serviceID, frontendKey);
+      await performEndpointControl(`container:${workspaceID}\u001f${serviceID || ""}`, operation, async () => {
+        const result = await safeSpaceRequest(operation, { workspaceID, serviceID, serviceScope: app?.serviceScope });
+        if (operation === "stopApp") {
+          await waitForStoppedContainerApp(workspaceID, serviceID, frontendKey);
+        } else {
+          if (Array.isArray(result.workspaces)) state.safeSpaces = result.workspaces;
+          await refreshSafeSpaces({ quiet: true });
+        }
+      });
       return;
     }
     if (action === "close-dialog") { closeDialog(); return; }
@@ -3090,6 +3255,10 @@ OUTERSHELL_BUNDLED_APP
       return;
     }
     if (action === "launch-safe-space-app") {
+      if (state.endpointControls.has(`container:${actionElement.dataset.safeSpaceId}\u001f${actionElement.dataset.serviceId}`)) {
+        event.preventDefault();
+        return;
+      }
       const workspace = findSafeSpace(actionElement.dataset.safeSpaceId);
       const app = findSafeSpaceApp(workspace, actionElement.dataset.serviceId, actionElement.dataset.frontendKey);
       if (workspace && app && safeSpaceAppIsReady(workspace, app)) return;

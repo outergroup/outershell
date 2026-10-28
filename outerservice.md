@@ -106,3 +106,5 @@ That form writes a small `bash` and `socat` adapter which publishes the app on a
 Unix socket when the container starts.
 
 The internal manager is intentionally not used on a working launchd/systemd host. The same registry remains compatible across all three managers.
+
+Image apps default to `Start=manual`: they are registered at container boot and start when opened through Outer Shell. Use `outerctl image add-app --start eager` for an app that should start with the container. Rebuild existing images to regenerate their service definitions with the new default.

@@ -3303,10 +3303,6 @@ static void invalidate_launchd_status(void) {
     pthread_mutex_lock(&g_launchd_status_mutex);
     g_launchd_status_generation++;
     g_launchd_status_refresh_ms = 0;
-    for (LaunchdStatusEntry *entry = g_launchd_status_entries; entry; entry = entry->next) {
-        if (strcmp(entry->status, "suspended after failures"))
-            snprintf(entry->status, sizeof(entry->status), "unknown");
-    }
     pthread_mutex_unlock(&g_launchd_status_mutex);
 }
 
@@ -3673,9 +3669,9 @@ static bool run_launchd_operation(const char *label,
             entry->last_suspend_attempt_ms = 0;
         }
         pthread_mutex_unlock(&g_launchd_status_mutex);
-        invalidate_launchd_status();
     }
     bool ok = run_launchd_operation_unlocked(label, plist_path, operation, message, message_size);
+    invalidate_launchd_status();
     pthread_mutex_unlock(&g_launchd_control_mutex);
     return ok;
 }
@@ -3750,6 +3746,7 @@ static bool run_launchd_operation_privileged(const char *label,
 
     int exit_status = -1;
     bool ok = run_sudo_shell(command, sudo_password, message, message_size, &exit_status);
+    if (ok) invalidate_launchd_status();
     if (!ok && sudo_failure_needs_password(message, exit_status)) {
         if (needs_password) *needs_password = true;
         snprintf(message, message_size, "Administrator password required.");
@@ -4698,9 +4695,6 @@ static void publish_endpoint_names(void) {
 }
 
 static void mark_backend_event_changed(void) {
-#ifdef __APPLE__
-    invalidate_launchd_status();
-#endif
     publish_endpoint_names();
     publish_backend_event_changed();
 }

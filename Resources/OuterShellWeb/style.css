@@ -1178,3 +1178,24 @@ h1 { margin: 0; font-size: clamp(30px, 5vw, 45px); line-height: 1.05; letter-spa
 
 .catalog-dockerfile { margin-top: 16px; }
 .catalog-dockerfile pre { max-height: 320px; overflow: auto; padding: 12px; background: var(--accent-soft); border-radius: 8px; white-space: pre-wrap; overflow-wrap: anywhere; }
+
+.container-management-dialog { width: min(480px, 100%); }
+.container-management-actions { display: grid; gap: 10px; }
+.container-management-actions > button { display: flex; align-items: center; justify-content: space-between; gap: 16px; width: 100%; padding: 16px; text-align: left; border: 1px solid var(--line); border-radius: 10px; background: transparent; }
+.container-management-actions strong { display: block; font-size: 14px; font-weight: 600; }
+.container-management-actions small { display: block; margin-top: 5px; color: var(--muted); font-size: 12px; line-height: 1.5; }
+.container-management-actions > button > span:last-child { color: var(--muted); font-size: 24px; }
+@media (hover: hover) {
+  .container-management-actions > button:hover { background: var(--accent-soft); border-color: var(--line-strong); }
+}
+
+.app-launch-feedback { display: flex; flex-wrap: wrap; align-items: center; justify-content: center; gap: 4px 8px; flex: 0 1 auto; color: var(--muted); font-size: 11px; }
+.address-status.app-launch-spinner { position: relative; background: transparent; }
+.address-status.app-launch-spinner::after { content: ""; position: absolute; left: 50%; top: 50%; width: 9px; height: 9px; box-sizing: border-box; border: 1.5px solid var(--line); border-top-color: var(--accent); border-radius: 50%; transform: translate(-50%, -50%); animation: app-launch-spin .8s linear infinite; }
+.shortcut-title .address-status.app-launch-spinner { position: absolute; }
+.app-launch-logs { box-sizing: border-box; min-height: 20px; height: 20px; padding: 0 5px; border-radius: 4px; font: inherit; line-height: 16px; white-space: nowrap; }
+.overview-shortcut-wrap > .app-launch-feedback { margin-top: 2px; }
+@keyframes app-launch-spin { from { transform: translate(-50%, -50%) rotate(0deg); } to { transform: translate(-50%, -50%) rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .app-launch-spinner::after { animation: none; } }
+
+.address-status.app-launch-spinner.is-stopping::after { animation-direction: reverse; }

@@ -1,0 +1,74 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Overview rendering regression test</title>
+<pre id="result">Running…</pre>
+<div id="overview"></div>
+<script type="module">
+const result = document.querySelector("#result");
+try {
+  const source = await (await fetch("../Resources/OuterShellWeb/app.js")).text();
+  const state = { hostPlatform: "macos", providers: [], safeSpaces: [], groupOrder: [], endpointOrder: {} };
+  const elements = { overview: document.querySelector("#overview") };
+  const assert = (condition, message) => { if (!condition) throw new Error(message); };
+  const render = new Function("state", "elements", `
+    const renderInitialLoading = () => false;
+    const escapeHTML = value => String(value).replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll('"', "&quot;");
+    const groupPinKeys = () => [];
+    const overviewShortcut = overviewEndpoint;
+    const containerCommandsHTML = () => "";
+    const containerPreparing = workspace => workspace.state === "rebuilding";
+    const safeSpaceState = workspace => workspace.state;
+    const safeSpaceIsRunning = workspace => workspace.state === "running";
+    ${source.slice(source.indexOf("  function renderOverview(entries)"), source.indexOf("  function saveGroupOrder("))}
+    function overviewEndpoint(entry) {
+      return '<div data-endpoint-key="' + entry.key + '"><a href="#' + entry.key + '"><span class="address-status' + (entry.running ? ' is-running' : '') + '"></span>' + entry.key + '</a></div>';
+    }
+    return renderOverview;
+  `)(state, elements);
+  const building = { id: "building", name: "Building", state: "rebuilding", buildProgress: { phase: "Building", log: "Step 1" } };
+  const other = { id: "other", name: "Other", state: "running" };
+  state.safeSpaces = [building, other];
+  const entries = [
+    { key: "host", item: { backend: { serviceScope: "user" } }, running: true },
+    { key: "root", item: { backend: { serviceScope: "system" } }, running: true },
+    { key: "building-app", workspace: building, running: false },
+    { key: "other-app", workspace: other, running: true }
+  ];
+  render(entries);
+  const dots = Array.from(elements.overview.querySelectorAll(".address-status"));
+  const hostLink = elements.overview.querySelector('[data-endpoint-key="host"] a');
+  hostLink.focus();
+  const details = elements.overview.querySelector("details");
+  details.open = true;
+  const observer = new MutationObserver(() => {});
+  observer.observe(elements.overview.querySelector('[data-group-id="user"]'), { subtree: true, attributes: true, childList: true, characterData: true });
+  for (let i = 2; i <= 5; i++) {
+    building.buildProgress.log = `Step ${i}`;
+    render(entries);
+    assert(dots.every((dot, index) => dot === elements.overview.querySelectorAll(".address-status")[index]), "Progress replaced endpoint dots");
+    assert(document.activeElement === hostLink, "Progress lost keyboard focus");
+    assert(details.open && details.isConnected, "Progress closed build details");
+    assert(details.querySelector("pre").textContent === `Step ${i}`, "Build log did not update");
+  }
+  assert(observer.takeRecords().length === 0, "Unrelated card was mutated");
+  observer.disconnect();
+  entries[3].running = false;
+  render(entries);
+  assert(dots[3].isConnected && !dots[3].classList.contains("is-running"), "Real running-state change did not update in place");
+  state.groupOrder = ["container:other", "user", "root", "container:building"];
+  render(entries);
+  assert(elements.overview.firstElementChild.dataset.groupId === "container:other", "Group reorder failed");
+  assert(dots.every(dot => dot.isConnected), "Group reorder replaced endpoint dots");
+  state.safeSpaces = [other];
+  render(entries.filter(entry => entry.workspace !== building));
+  assert(!elements.overview.querySelector('[data-group-id="container:building"]'), "Removed container remains");
+  assert(dots[0].isConnected && dots[3].isConnected, "Removal replaced unrelated endpoints");
+  state.safeSpaces.push(building);
+  render(entries);
+  assert(elements.overview.querySelector('[data-group-id="container:building"]'), "Added container missing");
+  result.textContent = "PASS: rebuild progress preserves dots, focus, expanded logs and unrelated cards; running-state changes, reorder, removal and insertion work.";
+} catch (error) {
+  result.textContent = `FAIL: ${error.stack}`;
+  throw error;
+}
+</script>

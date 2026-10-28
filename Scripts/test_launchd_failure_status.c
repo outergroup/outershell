@@ -17,6 +17,31 @@ static void check_status(LaunchdStatusEntry *entry, const char *fixture, const c
 
 int main(int argc, char **argv) {
     assert(argc == 2);
+    setenv("OUTERSHELL_HOME", argv[1], 1);
+    LaunchdStatusEntry cached_root = {0}, cached_user = {0}, cached_stopped = {0}, cached_suspended = {0};
+    strcpy(cached_root.status, "running");
+    strcpy(cached_user.status, "running");
+    strcpy(cached_stopped.status, "stopped");
+    strcpy(cached_suspended.status, "suspended after failures");
+    cached_root.next = &cached_user;
+    cached_user.next = &cached_stopped;
+    cached_stopped.next = &cached_suspended;
+    g_launchd_status_entries = &cached_root;
+    g_launchd_status_refresh_ms = 123;
+    uint64_t generation = g_launchd_status_generation;
+    mark_backend_event_changed();
+    assert(g_launchd_status_generation == generation);
+    assert(g_launchd_status_refresh_ms == 123);
+    assert(strcmp(cached_root.status, "running") == 0);
+    assert(strcmp(cached_user.status, "running") == 0);
+    invalidate_launchd_status();
+    assert(g_launchd_status_generation == generation + 1);
+    assert(g_launchd_status_refresh_ms == 0);
+    assert(strcmp(cached_root.status, "running") == 0);
+    assert(strcmp(cached_user.status, "running") == 0);
+    assert(strcmp(cached_stopped.status, "stopped") == 0);
+    assert(strcmp(cached_suspended.status, "suspended after failures") == 0);
+    g_launchd_status_entries = NULL;
     StringBuilder plist = {0};
     assert(make_bundled_launchd_plist("org.outershell.Test", "/tmp/backend", "", "",
         "/launchd/user/org.outershell.Test", 0600, "/tmp", "/tmp/api", "/tmp/log", "", &plist));
@@ -66,7 +91,7 @@ int main(int argc, char **argv) {
     check_status(&entry, fixture, text, "socket unavailable");
     g_launchd_status_entries = &entry;
     invalidate_launchd_status();
-    assert(strcmp(entry.status, "unknown") == 0);
+    assert(strcmp(entry.status, "socket unavailable") == 0);
     g_launchd_status_entries = NULL;
     setenv("OUTERSHELL_HOME", argv[1], 1);
     entry.can_suspend = true;

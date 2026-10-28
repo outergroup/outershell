@@ -501,9 +501,23 @@ final class SafeSpaceManager: @unchecked Sendable {
                 throw SafeSpaceManagerError.invalidRequest
             }
             requestID = request["requestID"] as? String ?? UUID().uuidString
+            if operation == "list", request["configurationOnly"] as? Bool == true {
+                try refreshRecords()
+                let selected = try record(from: request)
+                let body: [String: Any] = [
+                    "requestID": requestID,
+                    "workspaces": [try configurationDictionary(for: selected)]
+                ]
+                return (200, try JSONSerialization.data(withJSONObject: body))
+            }
             let extra = try await perform(operation: operation, request: request)
             if operationChangesMenuBarState(operation) {
                 notifyOuterShellSafeSpacesChanged()
+            }
+            if operation == "appLogs", request["includeWorkspaceSnapshot"] as? Bool == false {
+                var body = extra
+                body["requestID"] = requestID
+                return (200, try JSONSerialization.data(withJSONObject: body))
             }
             return (200, try await response(requestID: requestID, extra: extra, overview: request["overview"] as? Bool == true))
         } catch {
@@ -914,6 +928,59 @@ final class SafeSpaceManager: @unchecked Sendable {
         ]
     }
 
+    private func configurationDictionary(for record: SafeSpaceRecord) throws -> [String: Any] {
+        guard recordOwnsContainer(record) else { throw SafeSpaceManagerError.invalidRequest }
+        let recipe = try recipe(for: record)
+        return [
+            "id": record.id.uuidString,
+            "name": record.name,
+            "cpus": record.cpus,
+            "memoryInGB": record.memoryInGB,
+            "ownsContainer": true,
+            "managementKind": "managed",
+            "runtime": try runtimeDictionary(for: record),
+            "recipe": try recipeDictionary(for: record),
+            "mounts": try configurationMounts(for: record, recipe: recipe)
+        ]
+    }
+
+    private func configurationMounts(for record: SafeSpaceRecord,
+                                     recipe: SafeSpaceRecipe) throws -> [[String: Any]] {
+        let base = try safeSpaceDirectory(record.id)
+        var mounts: [[String: Any]] = [[
+            "id": UUID(uuid: (0, 0, 0, 0, 0, 0, 0x40, 0, 0x80, 0, 0, 0, 0, 0, 0, 2)).uuidString,
+            "name": "Container project",
+            "hostPath": try recipeDirectory(record.id).path,
+            "guestPath": "/var/lib/outershell/project",
+            "isReadOnly": false,
+            "isInfrastructure": true,
+            "isRecipeMount": true
+        ]]
+        for user in recipe.users ?? [] where user.name == "workspace" {
+            mounts.append([
+                "id": UUID(uuid: (0, 0, 0, 0, 0, 0, 0x40, 0, 0x80, 0, 0, 0, 0, 0, 0, 1)).uuidString,
+                "name": "Workspace",
+                "hostPath": base.appendingPathComponent("Workspace").path,
+                "guestPath": user.workingDirectory,
+                "isReadOnly": false,
+                "isInfrastructure": true,
+                "isRecipeMount": false
+            ])
+        }
+        mounts.append(contentsOf: (recipe.mounts ?? []).map {
+            [
+                "id": $0.id.uuidString,
+                "name": $0.name,
+                "hostPath": $0.hostPath,
+                "guestPath": $0.guestPath,
+                "isReadOnly": $0.isReadOnly,
+                "isInfrastructure": false,
+                "isRecipeMount": false
+            ] as [String: Any]
+        })
+        return mounts
+    }
+
     private func safeSpaceDictionaries(overview: Bool = false) async throws -> [[String: Any]] {
         try refreshRecords()
         let currentRecords = lock.withSafeSpaceLock { records }
@@ -991,38 +1058,7 @@ final class SafeSpaceManager: @unchecked Sendable {
             var persistentData: [[String: Any]] = []
             if ownsContainer && !overview {
                 let recipe = try recipe(for: record)
-                let base = try safeSpaceDirectory(record.id)
-                mounts = [[
-                    "id": UUID(uuid: (0, 0, 0, 0, 0, 0, 0x40, 0, 0x80, 0, 0, 0, 0, 0, 0, 2)).uuidString,
-                    "name": "Container project",
-                    "hostPath": try recipeDirectory(record.id).path,
-                    "guestPath": "/var/lib/outershell/project",
-                    "isReadOnly": false,
-                    "isInfrastructure": true,
-                    "isRecipeMount": true
-                ]]
-                for user in recipe.users ?? [] where user.name == "workspace" {
-                    mounts.append([
-                        "id": UUID(uuid: (0, 0, 0, 0, 0, 0, 0x40, 0, 0x80, 0, 0, 0, 0, 0, 0, 1)).uuidString,
-                        "name": "Workspace",
-                        "hostPath": base.appendingPathComponent("Workspace").path,
-                        "guestPath": user.workingDirectory,
-                        "isReadOnly": false,
-                        "isInfrastructure": true,
-                        "isRecipeMount": false
-                    ])
-                }
-                mounts.append(contentsOf: (recipe.mounts ?? []).map {
-                    [
-                        "id": $0.id.uuidString,
-                        "name": $0.name,
-                        "hostPath": $0.hostPath,
-                        "guestPath": $0.guestPath,
-                        "isReadOnly": $0.isReadOnly,
-                        "isInfrastructure": false,
-                        "isRecipeMount": false
-                    ] as [String: Any]
-                })
+                mounts = try configurationMounts(for: record, recipe: recipe)
                 persistentData = try (recipe.persistentData ?? [])
                     .filter(\.isDeclared)
                     .sorted {
@@ -2901,11 +2937,15 @@ final class SafeSpaceManager: @unchecked Sendable {
         }
         let index = request["logIndex"] as? Int ?? 0
         guard index >= 0 else { throw SafeSpaceManagerError.invalidRequest }
-        let backends = try await safeSpaceUIAPIRequest(
-            record: selected, route: 1, query: "", body: Data()
-        )
-        guard backends.status == 200 else {
-            throw SafeSpaceManagerError.commandFailed("Could not list the container's registered logs.")
+        var result: [String: Any] = [:]
+        if request["includeBackends"] as? Bool != false {
+            let backends = try await safeSpaceUIAPIRequest(
+                record: selected, route: 1, query: "", body: Data()
+            )
+            guard backends.status == 200 else {
+                throw SafeSpaceManagerError.commandFailed("Could not list the container's registered logs.")
+            }
+            result["backendsPayload"] = backends.body.base64EncodedString()
         }
         let query = "serviceID=\(formEncoded(serviceID))&logIndex=\(index)&bytes=524288"
         let log = try await safeSpaceUIAPIRequest(
@@ -2914,10 +2954,8 @@ final class SafeSpaceManager: @unchecked Sendable {
         guard log.status == 200 else {
             throw SafeSpaceManagerError.commandFailed("Could not read the container app log.")
         }
-        return [
-            "backendsPayload": backends.body.base64EncodedString(),
-            "logPayload": log.body.base64EncodedString()
-        ]
+        result["logPayload"] = log.body.base64EncodedString()
+        return result
     }
 
     private func updateDockerfile(_ request: [String: Any]) throws -> [String: Any] {
@@ -4799,7 +4837,7 @@ final class SafeSpaceManager: @unchecked Sendable {
         Environment=LOGNAME=root
         Environment=XDG_RUNTIME_DIR=/run/user/0
         EnvironmentPolicy=clean
-        Start=eager
+        Start=manual
         Restart=on-failure
         RestartDelayMilliseconds=1000
         LogPath=\(appDirectory)/backend.log
@@ -4953,7 +4991,7 @@ final class SafeSpaceManager: @unchecked Sendable {
         Environment=XDG_RUNTIME_DIR=/run/user/0
         Environment=OUTERSHELL_SERVICE_STATE_DIR=\(appDirectory)
         EnvironmentPolicy=clean
-        Start=eager
+        Start=manual
         Restart=on-failure
         RestartDelayMilliseconds=1000
         StopTimeoutMilliseconds=10000
@@ -5003,7 +5041,7 @@ final class SafeSpaceManager: @unchecked Sendable {
         Environment=LOGNAME=root
         Environment=XDG_RUNTIME_DIR=/run/user/0
         EnvironmentPolicy=clean
-        Start=eager
+        Start=manual
         Restart=on-failure
         RestartDelayMilliseconds=1000
         LogPath=\(appDirectory)/backend.log

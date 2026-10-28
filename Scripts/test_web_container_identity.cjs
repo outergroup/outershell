@@ -1,0 +1,18 @@
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
+const vm = require('node:vm');
+const source = fs.readFileSync(path.join(__dirname, '../Resources/OuterShellWeb/app.js'), 'utf8');
+const context = {};
+vm.createContext(context);
+vm.runInContext(source.slice(source.indexOf('  function containerFrontendKey('), source.indexOf('  function containerBookmarkKey(')), context);
+const old = { serviceID: 'jupyter', frontendID: 'jupyter:main', socketPath: '/old/socket', url: '/lab' };
+const key = context.containerFrontendKey(old);
+const ready = { ...old, socketPath: '/new/socket', url: 'http+unix://%2Fnew%2Fsocket/lab', isRunning: true };
+const other = { ...ready, frontendID: 'jupyter:other' };
+assert.notEqual(context.containerFrontendKey(ready), key);
+assert.equal(context.findSafeSpaceApp({ apps: [other, ready] }, 'jupyter', key), ready);
+assert.equal(context.findSafeSpaceApp({ apps: [other] }, 'jupyter', key), undefined);
+assert.equal(context.findSafeSpaceApp({ apps: [{ ...ready, serviceID: 'different' }] }, 'jupyter', key), undefined);
+assert.equal(context.findSafeSpaceApp({ apps: [ready] }, 'jupyter', 'invalid'), undefined);
+console.log('PASS: startup follows frontend ID across address changes without selecting a sibling frontend');
