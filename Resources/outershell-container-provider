@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import pathlib
+import re
 import selectors
 import shlex
 import shutil
@@ -1048,14 +1049,49 @@ def remove_owned_image(container_id):
         docker(["image", "rm", reference], check=True)
 
 
+def docker_storage_bytes(value):
+    match = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)\s*(B|kB|KB|MB|GB|TB|KiB|MiB|GiB|TiB)(?:\s+\([^)]*\))?", str(value).strip())
+    if not match:
+        raise ValueError("Docker returned an unrecognized storage size.")
+    units = {"B": 1, "kB": 1000, "KB": 1000, "MB": 1000**2, "GB": 1000**3, "TB": 1000**4,
+             "KiB": 1024, "MiB": 1024**2, "GiB": 1024**3, "TiB": 1024**4}
+    return round(float(match[1]) * units[match[2]])
+
+
+def docker_build_cache_usage():
+    try:
+        result = docker(["system", "df", "--format", "{{json .}}"], check=True)
+        for line in result.stdout.splitlines():
+            row = json.loads(line)
+            if row.get("Type") == "Build Cache":
+                return {"totalBytes": docker_storage_bytes(row["Size"]),
+                        "reclaimableBytes": docker_storage_bytes(row["Reclaimable"])}
+        raise ValueError("Docker did not report build-cache usage.")
+    except (RuntimeError, ValueError, KeyError, OSError, subprocess.TimeoutExpired) as error:
+        return {"error": str(error)}
+
+
 @storage_operation
 def operation_storage(request):
     if request.get("runtimeProviderID", PROVIDER_ID) != PROVIDER_ID:
         raise ValueError("Only Docker storage is available on this server.")
     operation = request["operation"]
     deleted, failures = [], []
+    cleanup = None
     if operation == "cleanContainerBuildCache":
-        docker(["builder", "prune", "--force", "--filter", "until=168h", "--keep-storage", "10GB"], check=True)
+        mode = request.get("buildCacheMode", "old")
+        if mode not in ("old", "all-unused"):
+            raise ValueError("Choose old cache or all unused build cache.")
+        arguments = ["builder", "prune", "--force"]
+        arguments += ["--all"] if mode == "all-unused" else ["--filter", "until=168h", "--keep-storage", "10GB"]
+        result = docker(arguments, check=True)
+        cleanup = {"mode": mode}
+        for line in result.stdout.splitlines():
+            if line.strip().startswith("Total reclaimed space:"):
+                try:
+                    cleanup["reclaimedBytes"] = docker_storage_bytes(line.split(":", 1)[1])
+                except ValueError:
+                    pass
     elif operation == "cleanContainerStorage":
         selected = request.get("images")
         if not isinstance(selected, list) or any(not isinstance(value, str) for value in selected):
@@ -1072,7 +1108,10 @@ def operation_storage(request):
             except (RuntimeError, ValueError, OSError) as error:
                 failures.append(reference + ": " + str(error))
     return {"storage": {"images": storage_inventory(), "deleted": deleted, "failures": failures,
-                        "supportsBuildCacheCleanup": True}}
+                        "supportsBuildCacheCleanup": True, "supportsAllUnusedBuildCacheCleanup": True,
+                        "engine": {"name": "Docker for this server user", "endpoint": docker_host(),
+                                   "scope": "Only this engine is included. Other users’ Docker engines and the host-root Docker daemon are outside this view."},
+                        "buildCache": docker_build_cache_usage(), "buildCacheCleanup": cleanup}}
 
 
 @storage_operation

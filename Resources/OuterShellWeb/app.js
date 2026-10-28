@@ -1091,7 +1091,7 @@ OUTERSHELL_BUNDLED_APP
         : workspace
         ? `<button class="overview-add-more" type="button" data-action="open-container-add" data-safe-space-id="${id}" ${preparing ? "disabled" : ""}>Add more…</button>`
         : `<button class="overview-add-more" type="button" data-action="open-add" data-scope="${group.id === "root" ? "system" : "user"}">Add more…</button>`;
-      return `<section class="overview-identity" data-group-id="${escapeHTML(group.id)}"><header class="overview-group-handle" tabindex="0" aria-label="Reorder ${escapeHTML(group.name)}${group.shield ? ", Administrator" : ""}. Hold and drag, or use arrow keys." title="Hold and drag to reorder" data-group-handle><div class="overview-group-heading"><h2>${escapeHTML(group.name)}</h2><p>${shield}${escapeHTML(group.note)}</p></div>${controls}</header><div class="overview-shortcuts" data-endpoint-area="pins">${pins.map(key => group.entries.find(entry => entry.key === key)).filter(Boolean).map(overviewShortcut).join("")}</div><div class="overview-list" data-endpoint-area="list">${listed.map(overviewEndpoint).join("") || `<p class="overview-empty">${state.loading || (workspace && state.safeSpacesLoading) ? "Loading…" : group.entries.length ? "" : "No registered endpoints."}</p>`}</div>${containerCommandsHTML(workspace)}${workspace?.buildProgress ? `<details class="container-build-progress"><summary>${escapeHTML(workspace.buildProgress.detail || workspace.buildProgress.phase)}</summary><pre>${escapeHTML(workspace.buildProgress.log || "")}</pre></details>` : ""}${addMore}</section>`;
+      return `<section class="overview-identity" data-group-id="${escapeHTML(group.id)}"><div class="overview-apps"><header class="overview-group-handle" tabindex="0" aria-label="Reorder ${escapeHTML(group.name)}${group.shield ? ", Administrator" : ""}. Hold and drag, or use arrow keys." title="Hold and drag to reorder" data-group-handle><div class="overview-group-heading"><h2>${escapeHTML(group.name)}</h2><p>${shield}${escapeHTML(group.note)}</p></div>${controls}</header><div class="overview-shortcuts" data-endpoint-area="pins">${pins.map(key => group.entries.find(entry => entry.key === key)).filter(Boolean).map(overviewShortcut).join("")}</div><div class="overview-list" data-endpoint-area="list">${listed.map(overviewEndpoint).join("") || `<p class="overview-empty">${state.loading || (workspace && state.safeSpacesLoading) ? "Loading…" : group.entries.length ? "" : "No registered endpoints."}</p>`}</div>${workspace?.buildProgress ? `<details class="container-build-progress"><summary>${escapeHTML(workspace.buildProgress.detail || workspace.buildProgress.phase)}</summary><pre>${escapeHTML(workspace.buildProgress.log || "")}</pre></details>` : ""}</div><div class="overview-tools">${containerCommandsHTML(workspace)}</div><footer class="overview-footer">${addMore}</footer></section>`;
     }).join("") + `<button class="overview-add-container" type="button" data-action="create-container"><span aria-hidden="true">+</span>Add container (beta)…</button><button class="overview-add-container" type="button" data-action="import-container">Import container…</button>${state.providers.some(provider => provider.capabilities?.supportsStorageCleanup) ? `<button class="overview-add-container" type="button" data-action="container-storage">Container storage…</button>` : ""}`;
     if (state.overviewMarkup !== markup) {
       elements.overview.innerHTML = markup;
@@ -2368,25 +2368,38 @@ OUTERSHELL_BUNDLED_APP
       <form><div class="dialog-body"><label class="field">Runtime<select name="runtimeProviderID">${providers.map(provider => `<option value="${escapeHTML(provider.id)}">${escapeHTML(provider.name)}</option>`).join("")}</select></label>
       <p>Choose obsolete Outer Shell images to remove. Containers, persistent data, and mounted folders are preserved. Apple container also cleans orphaned snapshots.</p>
       <p class="field-note">Image sizes are estimates; shared layers and disk blocks can reduce the space recovered. Unrelated images are retained.</p>
-      <div data-storage-images></div><p class="container-message" role="status">Inspecting storage…</p>
-      <section data-build-cache hidden><p>Docker build cache is shared with other projects on this engine. This separate action removes eligible cache older than 7 days, with a 10 GB retention setting. Future builds may take longer.</p><button type="button" data-clean-build-cache disabled>Clean old build cache</button></section></div>
+      <p data-storage-engine class="field-note"></p><div data-storage-images></div><p class="container-message" role="status">Inspecting storage…</p>
+      <section data-build-cache hidden><h3>Build cache</h3><p data-cache-usage></p><p>Cache is shared with other projects on this engine. Cleaning it preserves containers, images, and persistent data, but future builds may take longer. Reclaimable space is an estimate, not a promise of disk space recovered.</p><p>Old-cache cleanup targets cache older than 7 days with a 10 GB retention setting. All-unused cleanup has no age or retention limit.</p><button type="button" data-clean-build-cache disabled>Clean old build cache</button> <button type="button" data-clean-all-build-cache hidden disabled>Remove all unused build cache</button></section></div>
       <footer class="dialog-footer"><button type="button" data-action="close-dialog">Close</button><button type="submit" class="primary-button" disabled>Clean selected images</button></footer></form>`);
     const form = dialog.querySelector("form");
     const message = form.querySelector(".container-message");
     const button = form.querySelector('[type="submit"]');
     const cacheButton = form.querySelector('[data-clean-build-cache]');
+    const allCacheButton = form.querySelector('[data-clean-all-build-cache]');
     const runtime = form.elements.runtimeProviderID;
     const list = form.querySelector("[data-storage-images]");
-    let images = [], busy = false, cacheSupported = false;
+    let images = [], busy = false, cacheSupported = false, allCacheSupported = false;
+    const storageSize = bytes => `${(bytes / 1073741824).toFixed(2)} GiB`;
     const setBusy = value => {
       busy = value;
       runtime.disabled = value;
       button.disabled = value;
       cacheButton.disabled = value || !cacheSupported;
+      allCacheButton.disabled = value || !allCacheSupported;
     };
     const renderStorage = storage => {
       images = storage.images || [];
       cacheSupported = storage.supportsBuildCacheCleanup === true;
+      allCacheSupported = storage.supportsAllUnusedBuildCacheCleanup === true;
+      allCacheButton.hidden = !allCacheSupported;
+      const engine = storage.engine;
+      form.querySelector('[data-storage-engine]').textContent = engine
+        ? `${engine.name} · ${engine.endpoint}. ${engine.scope}`
+        : "Storage applies only to the selected runtime; other engines are not included.";
+      const cache = storage.buildCache;
+      form.querySelector('[data-cache-usage]').textContent = Number.isFinite(cache?.totalBytes) && Number.isFinite(cache?.reclaimableBytes)
+        ? `${storageSize(cache.totalBytes)} used · ${storageSize(cache.reclaimableBytes)} reclaimable (Docker estimates).`
+        : `Build-cache usage unavailable.${cache?.error ? " " + cache.error : ""}`;
       form.querySelector('[data-build-cache]').hidden = !cacheSupported;
       const orphanEstimate = Number.isFinite(storage.orphanSnapshotBytes)
         ? `<p>Orphaned snapshots: <strong>${(storage.orphanSnapshotBytes / 1073741824).toFixed(2)} GiB</strong> estimated.</p>` : "";
@@ -2409,23 +2422,30 @@ OUTERSHELL_BUNDLED_APP
         setBusy(false);
         button.disabled = !ready;
         cacheButton.disabled = !ready || !cacheSupported;
+        allCacheButton.disabled = !ready || !allCacheSupported;
       }
     };
     const clean = async buildCache => {
-      if (busy || (buildCache ? cacheButton.disabled : button.disabled)) return;
+      if (busy || (buildCache === "all-unused" ? allCacheButton.disabled : buildCache ? cacheButton.disabled : button.disabled)) return;
       const selected = Array.from(form.querySelectorAll('input[name="image"]:checked'), input => images[Number(input.value)].reference);
       setBusy(true); message.textContent = "Cleaning storage…";
       try {
-        const result = await safeSpaceRequest(buildCache ? "cleanContainerBuildCache" : "cleanContainerStorage", { runtimeProviderID: runtime.value, images: buildCache ? [] : selected });
+        const result = await safeSpaceRequest(buildCache ? "cleanContainerBuildCache" : "cleanContainerStorage", { runtimeProviderID: runtime.value, images: buildCache ? [] : selected, ...(buildCache ? { buildCacheMode: buildCache } : {}) });
         if (dialog.isConnected) {
           renderStorage(result.storage);
-          if (!result.storage.failures?.length) message.textContent = buildCache ? "Old build-cache cleanup completed." : `Cleanup completed. Removed ${result.storage.deleted.length} selected image(s).`;
+          if (!result.storage.failures?.length) {
+            const recovered = result.storage.buildCacheCleanup?.reclaimedBytes;
+            message.textContent = buildCache
+              ? `${buildCache === "old" ? "Old" : "All unused"} build-cache cleanup completed. ${Number.isFinite(recovered) ? `Docker reports ${storageSize(recovered)} reclaimed.` : "Docker did not report how much space was reclaimed."}`
+              : `Cleanup completed. Removed ${result.storage.deleted.length} selected image(s).`;
+          }
         }
       } catch (error) { message.textContent = error.message || String(error); }
       finally { setBusy(false); }
     };
     form.addEventListener("submit", event => { event.preventDefault(); return clean(false); });
-    cacheButton.addEventListener("click", () => clean(true));
+    cacheButton.addEventListener("click", () => clean("old"));
+    allCacheButton.addEventListener("click", () => clean("all-unused"));
     runtime.addEventListener("change", load);
     await load();
   }

@@ -86,3 +86,18 @@ python3 Scripts/test_windows_container_storage.py
 The Windows test compiles the actual C inventory and cleanup command paths with
 mock runtimes and filesystem enumeration. Native Windows compilation and live
 Docker Desktop/WSLC validation remain separate platform checks.
+
+### Linux Docker cache details
+
+The Linux provider reports build-cache usage and reclaimable bytes from Docker's
+storage summary, with an explicit unavailable state when inspection fails. These
+are rounded estimates; shared layers mean they are not a free-space guarantee.
+The dialog identifies the selected engine socket and explains that other users'
+engines and the host-root daemon are outside its scope.
+
+In addition to the existing old-cache policy, **Remove all unused build cache**
+runs `docker builder prune --force --all`, without age or retention limits. Both
+cache actions are separate from image deletion, and the response reports Docker's
+reclaimed-space result plus refreshed usage. Missing reclaimed-space output is
+shown as unavailable, never as zero. No cleanup runs merely by opening the dialog.
+The additional action is capability-gated for providers that implement it.

@@ -43,7 +43,8 @@ class StorageTests(unittest.TestCase):
             self.assertNotIn('--force', args)
             if self.fail_remove: raise RuntimeError('image in use')
             self.images=[]; output=''
-        elif args[:2]==['builder','prune']: output='cleaned'
+        elif args[:2]==['builder','prune']: output='Total reclaimed space: 1.25GB\n'
+        elif args[:2]==['system','df']: output=json.dumps({'Type':'Build Cache','Size':'24.85GB','Reclaimable':'13.26GB'})
         else: self.fail('Unexpected command '+str(args))
         return subprocess.CompletedProcess(args, 0, output, '')
     def candidates(self): return [item['reference'] for item in g['storage_inventory']()]
@@ -89,6 +90,32 @@ class StorageTests(unittest.TestCase):
         self.assertFalse(any(call[0]=='builder' for call in self.calls))
         g['operation_storage']({'operation':'cleanContainerBuildCache'})
         self.assertIn(['builder','prune','--force','--filter','until=168h','--keep-storage','10GB'],self.calls)
+    def test_cache_inventory_and_modes(self):
+        storage = g['operation_storage']({'operation':'containerStorage'})['storage']
+        self.assertEqual(storage['buildCache'], {'totalBytes':24850000000, 'reclaimableBytes':13260000000})
+        self.assertIn('host-root', storage['engine']['scope'])
+        self.assertTrue(storage['supportsAllUnusedBuildCacheCleanup'])
+        storage = g['operation_storage']({'operation':'cleanContainerBuildCache','buildCacheMode':'all-unused'})['storage']
+        self.assertIn(['builder','prune','--force','--all'], self.calls)
+        self.assertEqual(storage['buildCacheCleanup']['reclaimedBytes'],1250000000)
+        self.assertFalse(any(call[:2] == ['image','rm'] for call in self.calls))
+        self.calls.clear()
+        with self.assertRaises(ValueError):
+            g['operation_storage']({'operation':'cleanContainerBuildCache','buildCacheMode':'typo'})
+        self.assertEqual(self.calls, [])
+    def test_cache_units_and_unavailable_estimates(self):
+        for value, expected in [('0B',0),('54.9MB (42%)',54900000),('2.5 GiB',2684354560),('12kB',12000)]:
+            self.assertEqual(g['docker_storage_bytes'](value),expected)
+        with self.assertRaises(ValueError): g['docker_storage_bytes']('unknown')
+        real = self.docker
+        def unavailable(args, **kwargs):
+            if args[:2] == ['system','df']: raise RuntimeError('Disk usage unavailable')
+            return real(args, **kwargs)
+        with patch.dict(g, docker=unavailable):
+            storage = g['operation_storage']({'operation':'containerStorage'})['storage']
+        self.assertEqual(storage['buildCache'], {'error':'Disk usage unavailable'})
+        self.assertEqual(len(storage['images']),1)
+
     def test_delete_failure_retains_registration(self):
         Records.values=[{'id':ID,'ownsContainer':True}]
         removed=[]

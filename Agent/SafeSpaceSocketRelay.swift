@@ -864,10 +864,20 @@ final class SafeSpaceSocketRelayForward: @unchecked Sendable {
         self.acceptSource.dispatchSource.setEventHandler { [weak self] in
             self?.acceptConnections()
         }
+        let publishedSocketIdentity: (device: dev_t, inode: ino_t)? = publishedSocketPath.flatMap { path in
+            var info = stat()
+            guard lstat(path, &info) == 0 else { return nil }
+            return (info.st_dev, info.st_ino)
+        }
         self.acceptSource.dispatchSource.setCancelHandler {
             Darwin.close(listenSock)
-            if let publishedSocketPath {
-                unlink(publishedSocketPath)
+            if let publishedSocketPath, let publishedSocketIdentity {
+                var info = stat()
+                if lstat(publishedSocketPath, &info) == 0,
+                   info.st_dev == publishedSocketIdentity.device,
+                   info.st_ino == publishedSocketIdentity.inode {
+                    unlink(publishedSocketPath)
+                }
             }
         }
         self.acceptSource.safeResume()

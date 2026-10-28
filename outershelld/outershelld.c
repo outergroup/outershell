@@ -1259,9 +1259,17 @@ static const BundledAppDefinition kBundledApps[] = {
         .source_name = NULL,
         .socket_name = "org.outershell.Firehose",
         .socket_activated = true,
+#ifdef __APPLE__
+        .supports_root = false,
+#else
         .supports_root = true,
+#endif
+#ifdef __APPLE__
+        .root_only = false,
+#else
         .root_only = true,
-        .supports_macos = false,
+#endif
+        .supports_macos = true,
         .version = "1"
     },
     {
@@ -1277,9 +1285,13 @@ static const BundledAppDefinition kBundledApps[] = {
         .source_name = "ProfileBackend.c",
         .socket_name = "org.outershell.Profile",
         .socket_activated = true,
+#ifdef __APPLE__
+        .supports_root = false,
+#else
         .supports_root = true,
+#endif
         .root_only = false,
-        .supports_macos = false,
+        .supports_macos = true,
         .version = "1"
     }
 };
@@ -6635,6 +6647,23 @@ static bool ensure_root_helper_installed(const char *sudo_password, bool *needs_
             quoted_system_daemon_log,
             quoted_system_daemon_log,
             quoted_system_daemon_plist);
+    fprintf(script,
+            "root_support_error=$(mktemp)\n"
+            "root_support_attempt=0\n"
+            "until OUTERSHELL_HOME=%s OUTERSHELLD_API_SOCKET=%s %s backend list >/dev/null 2>\"$root_support_error\"; do\n"
+            "  root_support_attempt=$((root_support_attempt + 1))\n"
+            "  if [ \"$root_support_attempt\" -ge 50 ]; then\n"
+            "    echo 'The root Outer Shell API did not become ready.' >&2\n"
+            "    cat \"$root_support_error\" >&2\n"
+            "    rm -f \"$root_support_error\"\n"
+            "    exit 1\n"
+            "  fi\n"
+            "  sleep 0.1\n"
+            "done\n"
+            "rm -f \"$root_support_error\"\n",
+            quoted_system_root,
+            quoted_system_api_socket,
+            quoted_system_outerctl);
 #endif
     fclose(script);
     chmod(script_template, 0700);

@@ -75,7 +75,7 @@ private func outerShellRegistryFreeContainers(
 private let outerShellRegistryContainerOwnedFlag: UInt32 = 0x01
 
 private let currentSafeSpaceRecipeVersion = 14
-private let rootContainerBaseImage = "outershell/container-base:15"
+private let rootContainerBaseImage = "outershell/container-base:17"
 private let bundledAppOCIImageVersion = "4"
 private let containerTransferMagic = Data([0x4f, 0x53, 0x43, 0x54])
 private let containerTransferVersion: UInt16 = 1
@@ -356,6 +356,8 @@ final class SafeSpaceManager: @unchecked Sendable {
     private var records: [SafeSpaceRecord] = []
     private var cachedApps: [UUID: [SafeSpaceCachedApp]] = [:]
     private var publishedForwards: [String: SafeSpaceSocketRelayForward] = [:]
+    private let recipeFileLock = NSRecursiveLock()
+    private var socketPublications: [String: Task<String, Error>] = [:]
     private var transientStates: [UUID: String] = [:]
     private var buildProgress: [UUID: SafeSpaceBuildProgress] = [:]
     private var appIconFetchesInProgress: Set<String> = []
@@ -3187,8 +3189,23 @@ final class SafeSpaceManager: @unchecked Sendable {
         guard normalized.hasPrefix("/run/user/") else {
             throw SafeSpaceManagerError.invalidRequest
         }
-        try ensureContainerSocketBridge(record)
         let key = "\(record.id.uuidString.lowercased())\n\(normalized)"
+        let publication = lock.withSafeSpaceLock { () -> Task<String, Error> in
+            if let existing = socketPublications[key] { return existing }
+            let task = Task { [self] in
+                defer { lock.withSafeSpaceLock { socketPublications[key] = nil } }
+                return try await createPublishedSocket(in: record, socketPath: normalized, key: key)
+            }
+            socketPublications[key] = task
+            return task
+        }
+        return try await publication.value
+    }
+
+    private func createPublishedSocket(in record: SafeSpaceRecord,
+                                       socketPath normalized: String,
+                                       key: String) async throws -> String {
+        try ensureContainerSocketBridge(record)
         if let existing = lock.withSafeSpaceLock({ publishedForwards[key] }),
            !existing.isClosed,
            let path = existing.publishedSocketPath {
@@ -3973,6 +3990,8 @@ final class SafeSpaceManager: @unchecked Sendable {
     }
 
     private func recipe(for record: SafeSpaceRecord) throws -> SafeSpaceRecipe {
+        recipeFileLock.lock()
+        defer { recipeFileLock.unlock() }
         if let data = try RegistryResourceStore.data(for: recipeResourceKey(record.id)) {
             var value = try OffsetArchive.decode(SafeSpaceRecipe.self, from: data)
             let storedVersion = value.version
@@ -4041,6 +4060,8 @@ final class SafeSpaceManager: @unchecked Sendable {
 
     private func saveRecipe(_ value: SafeSpaceRecipe,
                             for record: SafeSpaceRecord) throws {
+        recipeFileLock.lock()
+        defer { recipeFileLock.unlock() }
         let directory = try recipeDirectory(record.id)
         let normalizedValue = normalizedRecipe(value)
         try FileManager.default.createDirectory(at: directory,
@@ -5528,6 +5549,8 @@ final class SafeSpaceManager: @unchecked Sendable {
         test -x "${source_directory}/outer-files-helper"
         test -x "${source_directory}/outer-plaintext-helper"
         test -x "${source_directory}/outer-top-helper"
+        test -x "${source_directory}/outer-profile-helper"
+        test -x "${source_directory}/outer-firehose-helper"
         /bin/mkdir -p /usr/local/bin /run/user/0 /var/lib/outershell/services \
             /var/lib/outershell/apps /etc/outershell/apps.d /root/.config/outerssh \
             /root/.local/share/jupyter /root/.cache
@@ -5538,9 +5561,11 @@ final class SafeSpaceManager: @unchecked Sendable {
         /bin/cp "${source_directory}/outer-files-helper" /usr/local/bin/outer-files-helper
         /bin/cp "${source_directory}/outer-plaintext-helper" /usr/local/bin/outer-plaintext-helper
         /bin/cp "${source_directory}/outer-top-helper" /usr/local/bin/outer-top-helper
+        /bin/cp "${source_directory}/outer-profile-helper" /usr/local/bin/outer-profile-helper
+        /bin/cp "${source_directory}/outer-firehose-helper" /usr/local/bin/outer-firehose-helper
         /bin/cp /tmp/outershell-bootstrap/outershell-container-init \
             /usr/local/bin/outershell-container-init
-        /bin/chmod 0755 /usr/local/bin/outer-files-helper /usr/local/bin/outer-plaintext-helper /usr/local/bin/outer-top-helper /usr/local/bin/outershelld /usr/local/bin/outerctl \
+        /bin/chmod 0755 /usr/local/bin/outer-files-helper /usr/local/bin/outer-plaintext-helper /usr/local/bin/outer-top-helper /usr/local/bin/outer-profile-helper /usr/local/bin/outer-firehose-helper /usr/local/bin/outershelld /usr/local/bin/outerctl \
             /usr/local/bin/outer-socket-bridge \
             /usr/local/bin/outershell-container-init
         /bin/chmod 0700 /run/user/0 /root/.config/outerssh

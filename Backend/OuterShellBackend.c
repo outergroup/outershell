@@ -259,7 +259,7 @@ static const BundledAppDefinition kBundledApps[] = {
         .bundle_prefix = "FirehoseContent",
         .icon_name = "app-icon.png",
         .source_name = NULL,
-        .supports_macos = false
+        .supports_macos = true
     },
     {
         .service_id = "org.outershell.Profile",
@@ -269,7 +269,7 @@ static const BundledAppDefinition kBundledApps[] = {
         .bundle_prefix = "ProfileContent",
         .icon_name = "app-icon.png",
         .source_name = "ProfileBackend.c",
-        .supports_macos = false
+        .supports_macos = true
     }
 };
 
