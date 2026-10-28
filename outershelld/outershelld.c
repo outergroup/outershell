@@ -2698,6 +2698,26 @@ static bool registry_store_only_contains_backend(const RegistryStore *store, con
 static size_t collect_systemd_status_scope_via_systemctl(const char *scope,
                                                          SystemdStatusEntry *entries,
                                                          size_t capacity) {
+    if (g_internal_service_manager) return 0;
+#ifdef __APPLE__
+    return 0;
+#else
+    char manager_path[PATH_MAX];
+    bool system_scope = scope && strcmp(scope, "system") == 0;
+    if (system_scope) {
+        snprintf(manager_path, sizeof(manager_path), "/run/systemd/system");
+    } else {
+        const char *runtime_directory = getenv("XDG_RUNTIME_DIR");
+        if (runtime_directory && runtime_directory[0]) {
+            snprintf(manager_path, sizeof(manager_path), "%s/systemd/private", runtime_directory);
+        } else {
+            snprintf(manager_path, sizeof(manager_path), "/run/user/%lu/systemd/private", (unsigned long)geteuid());
+        }
+    }
+    struct stat manager_status;
+    if (stat(manager_path, &manager_status) != 0 ||
+        (system_scope ? !S_ISDIR(manager_status.st_mode) : !S_ISSOCK(manager_status.st_mode))) return 0;
+#endif
     const char *scope_argument = (scope && strcmp(scope, "system") == 0) ? "--system" : "--user";
     char command[256];
     snprintf(command,
@@ -3111,6 +3131,7 @@ static void start_systemd_status_watcher(void) {
 #endif
 
 static void refresh_systemd_status_cache_if_needed(void) {
+    if (g_internal_service_manager) return;
 #ifndef __APPLE__
     bool poll_user = !direct_root_session_uses_system_scope() && !systemd_status_scope_is_watched("user");
     bool poll_system = !systemd_status_scope_is_watched("system");
@@ -3200,6 +3221,7 @@ static void systemd_status(const char *unit_name, const char *scope, char *out, 
 
 static uint64_t systemd_status_state_token(void) {
     uint64_t token = 1;
+    if (g_internal_service_manager) return token;
 #ifndef __APPLE__
     refresh_systemd_status_cache_if_needed();
     pthread_mutex_lock(&g_systemd_status_cache_mutex);
