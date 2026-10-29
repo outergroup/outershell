@@ -6,7 +6,7 @@ const root = process.argv[2] || process.cwd();
 const source = fs.readFileSync(path.join(root, "Resources/OuterShellWeb/app.js"), "utf8");
 const functions = source.slice(source.indexOf("  const agentExamples ="), source.indexOf("  function renderOverview(entries)"));
 const quote = source.slice(source.indexOf("  function shellQuotedArgument("), source.indexOf("  function containerCommandVariants("));
-const context = { state: {}, window: {}, launcherItems: () => [], TextEncoder, btoa };
+const context = { state: {}, window: { location: { hostname: "localhost" } }, launcherItems: () => [], TextEncoder, btoa };
 vm.createContext(context); vm.runInContext(quote + functions, context);
 context.window.outerLoop = {sessionContext: {sshCommandArguments: ["ssh", "-p", "2222", "-i", "/keys/my key", "me@host"]}};
 assert.equal(context.agentConnection().command, "ssh -p 2222 -i '/keys/my key' me@host");
@@ -15,18 +15,26 @@ assert.match(prompt, /ssh -p 2222/); assert.match(prompt, /https:\/\/outershell.
 vm.runInContext(source.slice(source.indexOf("  function containerCommands("), source.indexOf("  function containerCommandsHTML(")) + source.slice(source.indexOf("  function containerCommandVariants("), source.indexOf("  function openContainerCommand(")), context);
 context.state.addWorkspace = {id: "test", name: "Experiment container", runtimeKind: "docker", shellCommand: "docker exec -it 'my container' /bin/sh"};
 const containerPrompt = context.agentPrompt("Install Jupyter.");
-assert.equal(context.agentConnection().command, context.containerCommandVariants(context.containerCommands(context.state.addWorkspace)[0])[0].text);
-assert.match(containerPrompt, /Connect to the container Experiment container/);
-assert.match(containerPrompt, /ssh -t -p 2222/);
+assert.equal(context.agentConnection().command, "ssh -p 2222 -i '/keys/my key' me@host");
+assert.match(containerPrompt, /docker exec 'my container' \/bin\/sh -lc '<command>'/);
+assert.doesNotMatch(containerPrompt, /ssh -t|exec -it|COLORTERM/);
+assert.match(containerPrompt, /Run commands inside the “Experiment container” container/);
+assert.match(containerPrompt, /ssh -p 2222/);
 assert.match(containerPrompt, /Install and register apps inside this container/);
 assert.match(containerPrompt, /https:\/\/outershell\.org\/api\/containers\//);
 context.window.outerLoop.sessionContext.sshCommandArguments = [];
-assert.match(context.agentPrompt("Do work."), /On the server, enter the container/);
+assert.match(context.agentPrompt("Do work."), /Run commands inside the “Experiment container” container/);
 assert.match(context.agentPrompt("Do work."), /docker exec/);
 context.state.addWorkspace = null;
-assert.match(context.agentPrompt("Do work."), /Work on this server/);
+assert.match(context.agentPrompt("Do work."), /^Read https:/);
 context.window.outerLoop = undefined;
 assert.equal(context.agentConnection().local, false);
+for (const hostname of ["localhost", "127.0.0.1", "[::1]", "app.unix.outerssh.localhost", "app.outerloop.localhost"]) {
+  context.window.location.hostname = hostname;
+  assert.match(context.agentPrompt("Do work."), /^Read https:/);
+}
+context.window.location.hostname = "remote.example.com";
+assert.match(context.agentPrompt("Do work."), /^Read https:/);
 assert.doesNotMatch(context.agentPrompt("Do work."), /\[your SSH command\]/);
 assert(!source.includes('id="agent-ssh"'));
 context.launcherItems = () => [{identity: "installed", displayName: "My assistant", backend: {serviceID: "org.outershell.OpenCode"}, primary: {backend: {serviceScope: "user"}}}];
@@ -60,7 +68,7 @@ vm.runInContext(source.slice(source.indexOf("  function openAddDialog("), source
 context.state.addWorkspace = {id: "test", name: "Experiment container", runtimeKind: "wslContainer", shellCommand: "container-shell", apps: []};
 context.openAddDialog("agent");
 assert.match(context.html, /Edit Dockerfile/);
-assert.match(context.html, /data-tab="catalog"/);
+assert.doesNotMatch(context.html, /data-tab="catalog"/);
 assert.match(context.html, /data-action="configure-container"/);
 assert.doesNotMatch(context.html, /data-action="setup-opencode"|data-tab="bash"/);
 context.openAddDialog("dockerfile");
@@ -79,8 +87,25 @@ assert.doesNotMatch(context.html, /data-tab="dockerfile"/);
 console.log("PASS: container SSH reuse, local container command, scoped actions, Dockerfile navigation, installed OpenCode link, host navigation");
 
 context.state.addWorkspace = {id: "container", name: "Test", runtimeKind: "docker"};
-context.state.containerCatalog = {id: "container", original: "FROM ubuntu:24.04", dockerfile: "FROM ubuntu:24.04", selected: []};
-context.openAddDialog("catalog");
-for (const id of ["files", "plaintext", "top", "opencode"]) assert(context.html.includes(`data-catalog-id="${id}"`));
-assert.match(context.html, /save and rebuild to install/);
-assert.doesNotMatch(context.html, /data-action="install"/);
+for (const runtimeKind of ["docker", "appleContainer", "wslContainer"]) {
+  context.state.addWorkspace = {id: "container", name: "Test", runtimeKind};
+  context.openAddDialog("catalog");
+  assert.equal(context.state.addTab, "agent");
+  assert.doesNotMatch(context.html, /data-tab="catalog"|data-catalog-id=|data-action="install"/);
+  assert.match(context.html, /Set up OpenCode/);
+  assert.match(context.html, /data-tab="dockerfile"/);
+  context.state.addWorkspace.ownsContainer = false;
+  context.openAddDialog("catalog");
+  assert.doesNotMatch(context.html, /data-tab="catalog"|data-tab="dockerfile"/);
+}
+
+for (const runtime of ["docker", "container"]) {
+  const shellCommand = 'TERM=${TERM:-xterm-256color} COLORTERM=${COLORTERM:-truecolor} COLORFGBG=${COLORFGBG:-} '
+    + runtime + " --host unix:///run/docker.sock exec -it --env TERM --env COLORTERM --env COLORFGBG 'my container' /bin/bash";
+  const workspace = { name: "My Websites", runtimeKind: runtime, shellCommand };
+  assert.equal(context.agentContainerCommand(workspace), runtime + " --host unix:///run/docker.sock exec 'my container' /bin/bash -lc '<command>'");
+  assert.equal(context.containerCommands(workspace)[0].text, shellCommand);
+}
+assert.equal(context.agentContainerCommand({ runtimeKind: "wsl", shellCommand: "wsl -d Ubuntu" }), "wsl -d Ubuntu");
+assert.equal(context.agentContainerCommand({ runtimeKind: "docker" }), "");
+console.log("PASS: agent commands preserve runtime options and shell without terminal settings; terminal commands unchanged");

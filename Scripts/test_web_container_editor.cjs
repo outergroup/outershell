@@ -13,7 +13,7 @@ function setup() {
     findSafeSpace: () => ({id: 'selected', name: 'Selected', ownsContainer: true}),
     managedContainer: value => value.ownsContainer !== false,
     containerDialogHeader: title => title,
-    containerAppCatalog: [], escapeHTML: String,
+    escapeHTML: String,
     safeSpaceRuntimeDescription: () => 'Apple container', runtimeOptions: () => '',
     document: {createElement: node},
     safeSpaceRequest: (operation, values) => { requests.push({operation, values}); return response; },

@@ -51,6 +51,10 @@ daemon built from the same checkout. This reads and changes the local registry.
 
 ## OpenCode in containers
 
+Container “Add more…” offers Coding agent and, for managed containers, Edit Dockerfile.
+The Outer Shell app catalog is available at the host level; its apps can work with containers from there.
+OpenCode is the only bundled app setup offered inside containers.
+
 The HTML coding-agent card offers “Set up in a container”, opening the existing
 container form with “Install OpenCode” selected. The same checkbox is available
 when creating a container normally. Existing containers have an “Add OpenCode”
