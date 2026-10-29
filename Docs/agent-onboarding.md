@@ -17,14 +17,14 @@ it is installed. New installations are pinned to the user’s home group as soon
 as they are registered, preserving existing pins and layout changes from other devices.
 
 “Set up OpenCode” uses the existing command-port service recipe. It downloads
-OpenCode 1.19.3 from the official anomalyco/opencode GitHub release, checks the
-pinned SHA-256 digest, and runs its web UI on loopback (default port 4096).
+the latest compatible stable OpenCode release from anomalyco/opencode on GitHub, checks the
+release asset’s SHA-256 digest, and runs its web UI on loopback (default port 4096).
 macOS and Linux ARM64/x86-64 are supported, including musl Linux. Windows x64 and ARM64 use a checksummed standalone
 executable launched through the existing scheduled-task command recipe. Native Outerframe onboarding is not
 changed by this HTML iteration.
 
 The installer and skill are served from Resources/OuterShellWeb. The binary is
-kept at ~/.local/share/outershell-opencode/1.19.3/opencode on Unix and %LOCALAPPDATA%/outershell-opencode/1.19.3/opencode.exe on Windows.
+kept at ~/.local/share/outershell-opencode/<initial-version>/opencode on Unix and %LOCALAPPDATA%/outershell-opencode/<initial-version>/opencode.exe on Windows.
 The launcher creates ~/server-admin (USERPROFILE/server-admin on Windows), writes
 workspace instructions if absent, and installs the outer-shell skill before starting
 OpenCode. When git is available it initializes an empty repository. It creates and
@@ -41,7 +41,7 @@ encoded-value truncation. Both backend and daemon must be updated together.
 
 Verify with Scripts/test_web_agent_onboarding.cjs, Scripts/test_create_query.c,
 and a real install through the HTML UI. The C test is compiled like the existing
-Scripts/test_launchd_failure_status.c. Changing the pinned OpenCode version also
+Scripts/test_launchd_failure_status.c. Changing the supported OpenCode major version also
 requires updating every platform asset digest in opencode-start.sh and opencode-start.ps1. Windows commands embed UTF-8
 PowerShell as base64 chunks to stay below cmd.exe’s per-line limit.
 
@@ -51,7 +51,7 @@ daemon built from the same checkout. This reads and changes the local registry.
 
 ## OpenCode in containers
 
-Container “Add more…” offers Coding agent and, for managed containers, Edit Dockerfile.
+Each container has one bottom “Manage…” button. It opens container details and lifecycle actions, plus Edit and Share for managed containers. Edit opens directly to the Dockerfile editor, with coding agent instructions in a neighboring tab. Switching tabs preserves unsaved configuration edits.
 The Outer Shell app catalog is available at the host level; its apps can work with containers from there.
 OpenCode is the only bundled app setup offered inside containers.
 
@@ -84,3 +84,29 @@ Run `Scripts/test_web_opencode_container.cjs` and
 regressions. Runtime verification should include creating an OpenCode container,
 checking its skill and explicit session URL, then rebuilding with a marker in
 `/work` and confirming both the marker and saved session survive.
+
+### OpenCode releases and updates
+
+New host installs and generated container Dockerfiles resolve the newest stable
+OpenCode 1 release through GitHub's release API. OpenCode 2 requires a separate
+integration review. Release lookup errors and missing SHA-256 asset digests stop
+setup; there is no fallback to an old bundled version. The generated launcher or
+Dockerfile saves the selected version and checksums, so restarts and rebuilds do
+not silently upgrade.
+
+For an existing host installation, **Update OpenCode…** resolves a release and
+provides checksum-verified update commands. Stop OpenCode from its app menu, run
+the commands on the host as the same user (PowerShell on Windows), then start it
+again. The updater replaces the binary at the launcher's existing path, preserving
+sessions and settings. It refuses ambiguous installations with multiple binaries.
+Container updates belong in the container's Dockerfile; rebuilding an unchanged
+Dockerfile deliberately retains its recorded release.
+
+OpenCode host update checks run when a running installation first appears, on
+launch/focus/return to the page, and while the page remains visible. Health is
+rechecked at most every five minutes; release results are reused for 24 hours.
+The Unix HTML backend shares release responses between clients and coalesces
+concurrent requests. Browser storage also retains the selected release across
+reloads. Network failures are silent and retried after an hour. Stopped apps
+are never started by a check. A newer compatible release adds a tile badge and
+an “Update to VERSION…” app-menu action; onboarding has no update button.

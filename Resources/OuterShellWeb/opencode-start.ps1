@@ -1,22 +1,31 @@
 param([ValidateRange(1024,65535)][int]$Port = 4096)
+& {
+$mode = '__OPENCODE_MODE__'
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
-$version = '1.19.3'
+$version = '__OPENCODE_VERSION__'
 $root = Join-Path $env:LOCALAPPDATA 'outershell-opencode'
 $config = if ($env:XDG_CONFIG_HOME) { Join-Path $env:XDG_CONFIG_HOME 'opencode' } else { Join-Path $env:USERPROFILE '.config\opencode' }
 $workspace = Join-Path $env:USERPROFILE 'server-admin'
 $utf8 = New-Object System.Text.UTF8Encoding($false)
 New-Item -ItemType Directory -Force $root, "$config\skills\outer-shell", $workspace | Out-Null
+if ($mode -ne 'update') {
 $listener = New-Object Net.Sockets.TcpListener([Net.IPAddress]::Loopback, $Port)
 try { $listener.Start() } finally { $listener.Stop() }
+}
 $arch = [Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
 switch ($arch) {
-    'X64' { $asset='opencode-windows-x64-baseline.zip'; $digest='0d59113484bfe8d6dc146fc981f5c33faa8318303c183711b7a9387060b289e8' }
-    'Arm64' { $asset='opencode-windows-arm64.zip'; $digest='c1b9daf18c97564b2d171703279621f7edc3613e70750d796ef78db87257ad89' }
+    'X64' { $asset='opencode-windows-x64-baseline.zip'; $digest='__OPENCODE_SHA256_opencode-windows-x64-baseline.zip__' }
+    'Arm64' { $asset='opencode-windows-arm64.zip'; $digest='__OPENCODE_SHA256_opencode-windows-arm64.zip__' }
     default { throw "OpenCode requires 64-bit Windows (x64 or ARM64). Found $arch." }
 }
 $binary = "$root\$version\opencode.exe"
-if (!(Test-Path $binary)) {
+if ($mode -eq 'update') {
+    $binaries = @(Get-ChildItem -LiteralPath $root -Directory | ForEach-Object { Join-Path $_.FullName 'opencode.exe' } | Where-Object { Test-Path -LiteralPath $_ })
+    if ($binaries.Count -ne 1) { throw 'Expected one Outer Shell OpenCode installation. Select the installation to update manually.' }
+    $binary = $binaries[0]
+}
+if ($mode -eq 'update' -or !(Test-Path $binary)) {
     $stage = Join-Path $root ([Guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory $stage | Out-Null
     try {
@@ -26,9 +35,13 @@ if (!(Test-Path $binary)) {
         Expand-Archive "$stage\download.zip" "$stage\unpacked"
         & "$stage\unpacked\opencode.exe" --version
         if ($LASTEXITCODE) { throw 'OpenCode could not run on this server.' }
-        New-Item -ItemType Directory -Force "$root\$version" | Out-Null
-        Move-Item "$stage\unpacked\opencode.exe" $binary
+        New-Item -ItemType Directory -Force (Split-Path $binary) | Out-Null
+        Move-Item -Force "$stage\unpacked\opencode.exe" $binary
     } finally { Remove-Item $stage -Recurse -Force }
+}
+if ($mode -eq 'update') {
+    Write-Output "OpenCode $version installed. Start OpenCode from its app menu."
+    return
 }
 if (!(Test-Path "$config\skills\outer-shell\SKILL.md")) {
     [IO.File]::WriteAllText("$config\skills\outer-shell\SKILL.md", @'
@@ -107,4 +120,6 @@ try {
 } finally {
     if (!$server.HasExited) { Stop-Process -Id $server.Id -Force }
     $server.Dispose()
+}
+
 }

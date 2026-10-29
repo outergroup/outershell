@@ -288,12 +288,14 @@ void OuterShellBackendRequestShutdown(void) {
 static const char *http_status_text(int status) {
     switch (status) {
     case 200: return "OK";
+    case 202: return "Accepted";
     case 204: return "No Content";
     case 400: return "Bad Request";
     case 401: return "Unauthorized";
     case 409: return "Conflict";
     case 404: return "Not Found";
     case 500: return "Internal Server Error";
+    case 503: return "Service Unavailable";
     default: return "Error";
     }
 }
@@ -320,6 +322,87 @@ static void send_response(int fd, int status, const char *status_text, const cha
 
 static void send_text_response(int fd, int status, const char *message) {
     send_response(fd, status, http_status_text(status), "text/plain; charset=utf-8", message, strlen(message));
+}
+
+static bool query_value(const char *query, const char *name, char *dst, size_t dst_size);
+
+typedef struct {
+    char *body;
+    size_t capacity;
+    char url[160];
+    bool fetching;
+    bool valid;
+    int64_t next_check;
+    int ttl_seconds;
+} OpenCodeCheck;
+
+static pthread_mutex_t g_opencode_check_mutex = PTHREAD_MUTEX_INITIALIZER;
+static OpenCodeCheck g_opencode_releases[10];
+static OpenCodeCheck g_opencode_health[16];
+
+static void *fetch_opencode_check(void *argument) {
+    OpenCodeCheck *check = argument;
+    char *body = malloc(check->capacity);
+    char error[256] = "";
+    bool ok = body && outer_shell_fetch_url_text(check->url, body, check->capacity, error, sizeof(error));
+    pthread_mutex_lock(&g_opencode_check_mutex);
+    free(check->body);
+    check->body = ok ? body : NULL;
+    if (!ok) free(body);
+    check->valid = ok;
+    check->next_check = api_monotonic_milliseconds() + (int64_t)(ok ? check->ttl_seconds : 60) * 1000;
+    check->fetching = false;
+    pthread_mutex_unlock(&g_opencode_check_mutex);
+    return NULL;
+}
+
+static void send_opencode_check(int fd, bool releases, const char *query) {
+    char value[16];
+    if (!query_value(query, releases ? "page" : "port", value, sizeof(value)) || !value[0] ||
+        strspn(value, "0123456789") != strlen(value)) {
+        send_text_response(fd, 400, "Invalid OpenCode check parameter.");
+        return;
+    }
+    unsigned long number = strtoul(value, NULL, 10);
+    if (number < 1 || number > (releases ? 10 : 65535)) {
+        send_text_response(fd, 400, "Invalid OpenCode check parameter.");
+        return;
+    }
+    char url[160];
+    if (releases) snprintf(url, sizeof(url), "https://api.github.com/repos/anomalyco/opencode/releases?per_page=30&page=%lu", number);
+    else snprintf(url, sizeof(url), "http://127.0.0.1:%lu/global/health", number);
+    pthread_mutex_lock(&g_opencode_check_mutex);
+    OpenCodeCheck *check = releases ? &g_opencode_releases[number - 1] : NULL;
+    if (!releases) {
+        for (size_t i = 0; i < 16; i++) {
+            if (!strcmp(g_opencode_health[i].url, url)) { check = &g_opencode_health[i]; break; }
+        }
+        if (!check) {
+            for (size_t i = 0; i < 16; i++) {
+                if (!g_opencode_health[i].fetching && g_opencode_health[i].next_check <= api_monotonic_milliseconds()) {
+                    check = &g_opencode_health[i]; break;
+                }
+            }
+        }
+    }
+    if (!check) {
+        pthread_mutex_unlock(&g_opencode_check_mutex);
+        send_text_response(fd, 503, "OpenCode checks are busy.");
+        return;
+    }
+    if (!check->fetching && check->next_check <= api_monotonic_milliseconds()) {
+        snprintf(check->url, sizeof(check->url), "%s", url);
+        check->capacity = releases ? 8 * 1024 * 1024 : 4096;
+        check->ttl_seconds = releases ? 24 * 60 * 60 : 60;
+        check->fetching = true;
+        pthread_t worker;
+        if (pthread_create(&worker, NULL, fetch_opencode_check, check) == 0) pthread_detach(worker);
+        else { check->fetching = false; check->valid = false; check->next_check = api_monotonic_milliseconds() + 60000; }
+    }
+    if (check->fetching) send_text_response(fd, 202, "Checking OpenCode.");
+    else if (check->valid) send_response(fd, 200, "OK", "application/json", check->body, strlen(check->body));
+    else send_text_response(fd, 503, "Could not check OpenCode. Try again later.");
+    pthread_mutex_unlock(&g_opencode_check_mutex);
 }
 
 static void send_container_upload_response(int fd, int status, uint64_t offset) {
@@ -2488,6 +2571,8 @@ static bool process_http_client_request(ReactorClient *client, char *request, si
         dispatch_native_app_project_creation(fd, query, body, body_length);
     } else if (strcasecmp(method, "POST") == 0) {
         send_text_response(fd, 404, "not found\n");
+    } else if (strcmp(target, "/api/opencode-releases") == 0 || strcmp(target, "/api/opencode-health") == 0) {
+        send_opencode_check(fd, strcmp(target, "/api/opencode-releases") == 0, query);
     } else if (strcmp(target, "/api/native-app-template") == 0) {
         send_native_app_template_archive(fd);
     } else if (strcmp(target, "/container-storage") == 0) {

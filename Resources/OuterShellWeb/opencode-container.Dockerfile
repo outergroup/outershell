@@ -2,26 +2,26 @@ USER root
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git bash socat unzip && rm -rf /var/lib/apt/lists/*
 RUN <<'OPENCODE_INSTALL'
 set -eu
-version=1.19.3
+version=__OPENCODE_VERSION__
 app_root=/opt/outershell-opencode
 config_root="${XDG_CONFIG_HOME:-$HOME/.config}/opencode"
 mkdir -p "$app_root" "$config_root/skills/outer-shell"
 case "$(uname -s)-$(uname -m)" in
-    Darwin-arm64) asset=opencode-darwin-arm64.zip; checksum=c2d0fecd27acf6e08be02c1f5d384614d07495587766bcc4a6bff3971749bb64 ;;
-    Darwin-x86_64) asset=opencode-darwin-x64-baseline.zip; checksum=03f8c32f81a2c35429afedfb8f63978af32329febcebf800d52486f6ba568151 ;;
-    Linux-aarch64) asset=opencode-linux-arm64.tar.gz; checksum=7900818a6a98881edbbadab4b7525940eff3b9750040c200481f9f56cacee405 ;;
-    Linux-x86_64) asset=opencode-linux-x64-baseline.tar.gz; checksum=531cff2441129c30f0edd5878af494108ad07f5feb46d7ee29a2a5b830a5765d ;;
+    Darwin-arm64) asset=opencode-darwin-arm64.zip; checksum=__OPENCODE_SHA256_opencode-darwin-arm64.zip__ ;;
+    Darwin-x86_64) asset=opencode-darwin-x64-baseline.zip; checksum=__OPENCODE_SHA256_opencode-darwin-x64-baseline.zip__ ;;
+    Linux-aarch64) asset=opencode-linux-arm64.tar.gz; checksum=__OPENCODE_SHA256_opencode-linux-arm64.tar.gz__ ;;
+    Linux-x86_64) asset=opencode-linux-x64-baseline.tar.gz; checksum=__OPENCODE_SHA256_opencode-linux-x64-baseline.tar.gz__ ;;
     *) echo "This OpenCode installer supports macOS and Linux on ARM64 or x86-64." >&2; exit 1 ;;
 esac
 if [ "$(uname -s)" = Linux ] && ls /lib/ld-musl-*.so.1 >/dev/null 2>&1; then
     case "$(uname -m)" in
-        aarch64) asset=opencode-linux-arm64-musl.tar.gz; checksum=39c9ff1ea47fd59752613079f97bef40a2d14c30bc6bb5772a91d9d708e2d0b3 ;;
-        x86_64) asset=opencode-linux-x64-baseline-musl.tar.gz; checksum=738506562666cc67e3512f04ecac50c0bae833c5bf44e1a59c99e5827a851778 ;;
+        aarch64) asset=opencode-linux-arm64-musl.tar.gz; checksum=__OPENCODE_SHA256_opencode-linux-arm64-musl.tar.gz__ ;;
+        x86_64) asset=opencode-linux-x64-baseline-musl.tar.gz; checksum=__OPENCODE_SHA256_opencode-linux-x64-baseline-musl.tar.gz__ ;;
     esac
 fi
 binary="$app_root/$version/opencode"
 if [ ! -x "$binary" ]; then
-    echo "Downloading OpenCode $version…"
+    echo "Downloading OpenCode ${version}…"
     stage=$(mktemp -d "$app_root/download.XXXXXX")
     trap 'rm -rf "$stage"' EXIT
     curl --fail --location --retry 2 --connect-timeout 20 --max-time 600 "https://github.com/anomalyco/opencode/releases/download/v$version/$asset" -o "$stage/$asset"

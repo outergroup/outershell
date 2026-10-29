@@ -576,7 +576,7 @@
     const menu = entry.item
       ? `data-action="edit-bookmark" data-app-key="${escapeHTML(entry.item.identity)}"`
       : `data-action="edit-container-bookmark" data-safe-space-id="${escapeHTML(entry.workspace.id)}" data-service-id="${escapeHTML(entry.app.serviceID)}" data-frontend-key="${escapeHTML(containerFrontendKey(entry.app))}"`;
-    return `<div class="overview-row" data-endpoint-key="${escapeHTML(entry.key)}"><a href="${escapeHTML(target)}" ${overviewLaunchAttributes(entry)} ${entry.item ? "" : `data-app-key="${escapeHTML(entry.key)}"`}>${overviewStatus(entry)}${icon}<span>${escapeHTML(entry.name)}${entry.failure ? " — Unavailable" : ""}${isThisPage ? ' <small class="this-page-label">This page</small>' : ""}</span></a>${appLaunchFeedback(entry)}<button class="endpoint-menu" type="button" ${menu} aria-label="Actions for ${escapeHTML(entry.name)}" aria-haspopup="dialog">•••</button></div>`;
+    return `<div class="overview-row" data-endpoint-key="${escapeHTML(entry.key)}"><a href="${escapeHTML(target)}" ${overviewLaunchAttributes(entry)} ${entry.item ? "" : `data-app-key="${escapeHTML(entry.key)}"`}>${overviewStatus(entry)}${icon}<span>${escapeHTML(entry.name)}${entry.failure ? " — Unavailable" : ""}${isThisPage ? ' <small class="this-page-label">This page</small>' : ""}</span></a>${appLaunchFeedback(entry)}${openCodeUpdateBadge(entry.item)}<button class="endpoint-menu" type="button" ${menu} aria-label="Actions for ${escapeHTML(entry.name)}" aria-haspopup="dialog">•••</button></div>`;
   }
 
   function endpointGroupID(entry) {
@@ -640,7 +640,7 @@
     const icon = listIconHTML(item);
     const target = entry.item ? navigationURL(entry.item.frontend) : safeSpaceAppNavigationURL(entry.workspace, entry.app);
     const identity = entry.item?.identity || entry.key;
-    return `<div class="overview-shortcut-wrap" data-endpoint-key="${escapeHTML(entry.key)}"><a class="overview-shortcut" href="${escapeHTML(target)}" ${overviewLaunchAttributes(entry)} ${entry.item ? "" : `data-app-key="${escapeHTML(identity)}"`}>${icon}<span class="shortcut-title">${overviewStatus(entry)}${escapeHTML(entry.name)}${entry.failure ? " — Unavailable" : ""}</span></a>${appLaunchFeedback(entry)}</div>`;
+    return `<div class="overview-shortcut-wrap" data-endpoint-key="${escapeHTML(entry.key)}"><a class="overview-shortcut" href="${escapeHTML(target)}" ${overviewLaunchAttributes(entry)} ${entry.item ? "" : `data-app-key="${escapeHTML(identity)}"`}>${icon}<span class="shortcut-title">${overviewStatus(entry)}${escapeHTML(entry.name)}${entry.failure ? " — Unavailable" : ""}</span></a>${appLaunchFeedback(entry)}${openCodeUpdateBadge(entry.item)}</div>`;
   }
 
   function renderInitialLoading() {
@@ -741,7 +741,12 @@
     return { command, local: !command && Boolean(workspace || window.outerLoop?.sessionContext), workspace };
   }
 
-  function agentPrompt(request, connection = agentConnection()) {
+  function agentPrompt(request, connection = agentConnection(), scope = "container") {
+    if (scope === "server" && connection.workspace) {
+      const workspace = connection.workspace;
+      const connect = connection.command ? `Connect to the host using:\n${connection.command}\n\n` : "";
+      return `${connect}Work on the host running Outer Shell to configure the “${workspace.name}” container (ID: ${workspace.id}). This task may require host access beyond the container.\n\nRead https://outershell.org/api/ and https://outershell.org/api/containers/ for Outer Shell integration instructions. Use Outer Shell's configuration API for host folder mounts, environment variables, network settings, and rebuilds. Read the existing configuration first and preserve unrelated settings. Host folders must exist before mounting them. Apply runtime configuration changes through Outer Shell. Keep credentials out of the Dockerfile and image.\n\nFor work inside the container, run:\n${agentContainerCommand(workspace) || "Use the container's shell."}\n\nKeep durable app installs and registrations in the Dockerfile and build context, and keep user data in persistent or mounted folders. For private per-user apps that support URL-token authentication, include the launch token in the registered URL, keep TCP authentication enabled, and verify the link with a fresh session.\n\n${request}`;
+    }
     const destinations = [];
     if (connection.command) destinations.push(`Connect to this server using:\n${connection.command}`);
     if (connection.workspace) {
@@ -754,30 +759,71 @@
     }
     const destination = destinations.join("\n\n");
     const containerContext = connection.workspace && connection.workspace.runtimeKind !== "wsl"
-      ? "\n\nInstall and register apps inside this container. Read https://outershell.org/api/containers/ for instructions on publishing apps and preserving changes across rebuilds. Keep user data in persistent or mounted folders."
+      ? "\n\nInstall and register apps inside this container. Read https://outershell.org/api/containers/ for instructions on publishing apps and preserving changes across rebuilds. Keep user data in persistent or mounted folders. Work only inside this container and its existing mounts. Do not change host mounts or invoke the host container engine from inside the container. If host configuration is needed, ask the user to use Folder mounts or a whole-server coding agent."
       : "";
     return `${destination ? `${destination}\n\n` : ""}Read https://outershell.org/api/ for Outer Shell integration instructions. Make each registered app open ready to use; for private per-user apps that support URL-token authentication, include the app's launch token in the registered URL, keep TCP authentication enabled, and verify the link with a fresh session.${containerContext}\n\n${request}`;
+  }
+
+  function openCodePromptURL(target, prompt) {
+    const url = new URL(target, window.location.href);
+    if (url.protocol === "outerloop:" && url.hostname === "observe-page-icon") {
+      url.searchParams.set("url", openCodePromptURL(url.searchParams.get("url"), prompt));
+      return url.href;
+    }
+    const session = url.pathname.match(/^(.*\/session)(?:\/[^/]*)?\/?$/);
+    if (!session) throw new Error("OpenCode's registered URL does not identify its workspace. Run OpenCode setup again.");
+    url.pathname = session[1];
+    url.hash = "";
+    url.searchParams.set("prompt", prompt);
+    return url.href;
+  }
+
+  function openCodeLaunchPrompt(scope) {
+    const connection = agentConnection();
+    if (scope === "container" && connection.workspace) {
+      return `You are running inside the “${connection.workspace.name}” container.\n\nRead https://outershell.org/api/containers/ and /usr/local/share/outershell/container-agent.md for instructions. Keep durable installs and app registrations in the Dockerfile and build context. Use existing mounted folders or persistent volumes for user data. Do not change host mounts or invoke the host container engine.\n\n[Your request here]`;
+    }
+    if (connection.workspace) {
+      const workspace = connection.workspace;
+      return `Help me update the “${workspace.name}” container in Outer Shell (ID: ${workspace.id}).\n\nRead https://outershell.org/api/containers/ for container configuration instructions. Inspect its current configuration and preserve unrelated settings. Use Outer Shell to manage folder mounts, environment variables, networking, and rebuilds. Keep durable installs and app registrations in the Dockerfile and build context, and user data in persistent or mounted folders.\n\nWhen practical, apply changes to the running container and make the equivalent changes in the Dockerfile or build context, so they’re usable immediately and survive a rebuild. Rebuild only when necessary; explain when a change requires one.\n\n[Your request here]`;
+    }
+    return "Help me set up or update an app in Outer Shell.\n\nFollow the installed Outer Shell integration instructions and make the app open ready to use.\n\n[Your request here]";
   }
 
   function openCodeItem() {
     return launcherItems().find(item => (/opencode/i.test(item.backend.serviceID) || /opencode/i.test(item.displayName)) && item.primary?.backend.serviceScope !== "system");
   }
 
-  function codingAgentHTML() {
+  function codingAgentHTML(scope = null, editing = false) {
+    if (addContainer() && !scope) {
+      return `<div class="agent-scope-picker">
+        <div data-agent-choices>
+          <div class="agent-choice-cards">
+            <button class="agent-choice-card" type="button" data-action="agent-scope" data-agent-scope="container" aria-controls="agent-panel-container"><span class="agent-choice-label">Sandboxed</span><strong>Inside container</strong><span>Install tools and change files inside this container and its existing mounted folders.</span><span class="agent-choice-detail">To add host folders or change container settings, choose Whole server.</span><span class="agent-choice-continue">Work inside container <span aria-hidden="true">→</span></span></button>
+            <button class="agent-choice-card" type="button" data-action="agent-scope" data-agent-scope="server" aria-controls="agent-panel-server"><span class="agent-choice-label">Privileged</span><strong>Whole server</strong><span>Configure folder mounts, networking, environment variables, and rebuilds from the host.</span><span class="agent-choice-detail">Runs as your host user, with access beyond this container.</span><span class="agent-choice-continue">Work on whole server <span aria-hidden="true">→</span></span></button>
+          </div>
+        </div>
+        <div class="agent-scope-summary" data-agent-selection hidden><strong data-agent-selection-label tabindex="-1"></strong><button class="secondary-button" type="button" data-action="agent-scope-change">Change access</button></div>
+        <section id="agent-panel-container" aria-label="Inside container · Sandboxed" data-agent-panel="container" hidden>${codingAgentHTML("container", editing)}</section>
+        <section id="agent-panel-server" aria-label="Whole server · Privileged" data-agent-panel="server" hidden>${codingAgentHTML("server", editing)}</section>
+      </div>`;
+    }
     const connection = agentConnection();
-    const prompt = agentPrompt("[Your request here]", connection);
+    const prompt = agentPrompt("[Your request here]", connection, scope || "container");
     const container = addContainer();
     const openCode = container?.apps?.find(app => /opencode/i.test(app.serviceID) || /opencode/i.test(app.displayName));
-    const hosted = container
-      ? `<aside class="agent-hosted"><h2>Want a coding agent here?</h2><p>OpenCode runs inside this container. Use it from your phone or computer to install tools and build things.</p>${openCode ? `<a class="primary-button" href="${escapeHTML(safeSpaceAppNavigationURL(container, openCode))}" data-action="launch-safe-space-app" data-safe-space-id="${escapeHTML(container.id)}" data-service-id="${escapeHTML(openCode.serviceID)}" data-frontend-key="${escapeHTML(containerFrontendKey(openCode))}">Open OpenCode →</a>` : managedContainer(container) ? `<button class="primary-button" type="button" data-action="configure-container" data-safe-space-id="${escapeHTML(container.id)}">Set up OpenCode →</button><small>In the Dockerfile editor, choose Add OpenCode, then Save &amp; rebuild.</small>` : "<p>Ask your coding agent to install OpenCode in this container.</p>"}<small>Bring your model provider account or API key.</small></aside>`
-      : state.addWorkspace ? "" : `<aside class="agent-hosted"><h2>Want a coding agent here?</h2><p>OpenCode runs on this server. Use it from your phone or computer to install tools and build things.</p><div class="agent-actions"><button class="primary-button" data-action="setup-opencode" type="button">${openCodeItem() ? "Open OpenCode" : "Set up OpenCode"} <span aria-hidden="true">→</span></button><button class="secondary-button" data-action="setup-container-opencode" type="button">Set up in a container</button></div><small>Bring your model provider account or API key.</small></aside>`;
+    const hosted = container && scope === "server"
+      ? `<aside class="agent-hosted"><h2>OpenCode on this server</h2><p>OpenCode runs as your user on the host, outside the container. It can configure folder mounts and container runtime settings with your user’s permissions.</p><div class="agent-actions"><button class="primary-button" data-action="setup-opencode" data-agent-scope="server" type="button">${openCodeItem() ? "Open OpenCode" : "Set up OpenCode"} <span aria-hidden="true">→</span></button></div><small>Bring your model provider account or API key. Runs as your user, not as root.</small></aside>`
+      : container
+      ? `<aside class="agent-hosted"><h2>Want a coding agent here?</h2><p>OpenCode runs inside this container. Use it from your phone or computer to install tools and build things.</p>${openCode ? `<a class="primary-button" href="${escapeHTML(safeSpaceAppNavigationURL(container, openCode))}" data-action="launch-safe-space-app" data-safe-space-id="${escapeHTML(container.id)}" data-service-id="${escapeHTML(openCode.serviceID)}" data-frontend-key="${escapeHTML(containerFrontendKey(openCode))}" data-agent-scope="container">Open OpenCode →</a>` : managedContainer(container) ? `${editing ? `<label class="container-check"><input name="allowAllOpenCodeActions" type="checkbox">Allow all actions without asking</label><p class="field-note">Applies to OpenCode in this container, including folders mounted into it.</p><button class="primary-button" type="button" data-add-opencode>Add OpenCode</button><p class="field-note">Adds OpenCode and container instructions to the Dockerfile. Choose Save &amp; rebuild to install it. Requires Debian or Ubuntu with Outer Shell support.</p>` : `<button class="primary-button" type="button" data-action="configure-container" data-safe-space-id="${escapeHTML(container.id)}">Set up OpenCode →</button><small>In the Coding agent tab, choose Add OpenCode, then Save &amp; rebuild.</small>`}` : "<p>Ask your coding agent to install OpenCode in this container.</p>"}<small>Bring your model provider account or API key.</small></aside>`
+      : state.addWorkspace ? "" : `<aside class="agent-hosted"><h2>Want a coding agent here?</h2><p>OpenCode runs on this server. Use it from your phone or computer to install tools and build things.</p><div class="agent-actions"><button class="primary-button" data-action="setup-opencode" data-agent-scope="server" type="button">${openCodeItem() ? "Open OpenCode" : "Set up OpenCode"} <span aria-hidden="true">→</span></button><button class="secondary-button" data-action="setup-container-opencode" type="button">Set up in a container</button></div><small>Bring your model provider account or API key.</small></aside>`;
     return `<div class="coding-agent-panel">
-      <div class="customize-intro"><h3>${container ? "Edit your Dockerfile with a coding agent" : "Add something with a coding agent"}</h3><p>${container ? "Describe the tools and apps you want. Your coding agent can update the Dockerfile and apply changes in the running container, so they’re available now and survive a rebuild." : "Notebooks, experiments, dashboards, your own apps. Tell a coding agent what you’d like to use here."}</p></div>
+      <div class="customize-intro"><h3>${container ? scope === "server" ? "Configure the container from the host" : "Work inside the container" : "Add something with a coding agent"}</h3><p>${container ? scope === "server" ? "Set up folder mounts, environment variables, networking, and rebuilds with an agent that can access the host." : "Run your agent inside the container to limit its access to the container and existing mounts. Describe the tools and apps you want. Your coding agent can update the Dockerfile and apply changes in the running container, so they’re available now and survive a rebuild." : "Notebooks, experiments, dashboards, your own apps. Tell a coding agent what you’d like to use here."}</p></div>
       <div class="agent-options">
-        <section class="agent-own agent-guide" aria-labelledby="own-agent-title"><h2 id="own-agent-title">Use your coding agent</h2><p>Paste these details into your agent, then add your request.</p>
+        <section class="agent-own agent-guide" aria-labelledby="own-agent-title-${scope || "host"}"><h2 id="own-agent-title-${scope || "host"}">Use your coding agent</h2><p>Paste these details into your agent, then add your request.</p>
           ${!connection.command && !connection.local ? '<p class="field-note">Outer Loop includes your SSH command here automatically.</p>' : ""}
           <pre>${escapeHTML(prompt).replace(/https:\/\/outershell\.org\/api\/(?:containers\/)?/g, url => `<a href="${url}" target="_blank" rel="noopener noreferrer">${url}</a>`)}</pre>
-          <button class="secondary-button" type="button" data-action="copy-agent-prompt">Copy prompt</button>
+          <button class="secondary-button" type="button" data-action="copy-agent-prompt" data-agent-scope="${scope || "container"}">Copy prompt</button>
           <div class="customize-examples"><h2>A few things you could ask</h2>${agentExamples.map((example, index) => `<button type="button" data-action="example-prompt" data-example="${index}" aria-label="${escapeHTML(`Copy example: ${example}`)}"><span>${escapeHTML(example)}</span><span class="example-copy" aria-hidden="true">Copy</span></button>`).join("")}</div>
         </section>
         ${hosted}
@@ -805,14 +851,143 @@
     openAddDialog("agent");
   }
 
+  const openCodeUpdates = { version: "", latest: "", identity: "", checking: false, nextCheck: 0 };
+  const openCodeReleaseCacheKey = "outershell-opencode-release-v1";
+
+  async function openCodeCheckJSON(path) {
+    for (let attempt = 0; attempt < 30; attempt += 1) {
+      const response = await fetch(path, { signal: AbortSignal.timeout(10000) });
+      if (response.status === 202) { await delay(2000); continue; }
+      if (response.status === 404 && path.startsWith("/api/opencode-releases?page=")) {
+        const page = Number(new URL(path, window.location.href).searchParams.get("page"));
+        if (!Number.isInteger(page) || page < 1 || page > 10) throw new Error("Invalid release page.");
+        const fallback = await fetch(`https://api.github.com/repos/anomalyco/opencode/releases?per_page=30&page=${page}`, { signal: AbortSignal.timeout(20000) });
+        if (!fallback.ok) throw new Error(`Could not check OpenCode releases (HTTP ${fallback.status}).`);
+        return fallback.json();
+      }
+      if (!response.ok) throw new Error(`Could not check OpenCode (HTTP ${response.status}).`);
+      return response.json();
+    }
+    throw new Error("OpenCode update check timed out.");
+  }
+
+  function newerOpenCodeVersion(latest, current) {
+    if (!/^1\.\d+\.\d+$/.test(latest) || !/^1\.\d+\.\d+$/.test(current)) return false;
+    const left = latest.split(".").map(Number), right = current.split(".").map(Number);
+    return left[1] > right[1] || (left[1] === right[1] && left[2] > right[2]);
+  }
+
+  function openCodeUpdateVersion(item) {
+    return item?.identity === openCodeUpdates.identity && item?.primary && endpointRunning(item.primary) &&
+      newerOpenCodeVersion(openCodeUpdates.latest, openCodeUpdates.version) ? openCodeUpdates.latest : "";
+  }
+
+  function openCodeUpdateBadge(item) {
+    const version = openCodeUpdateVersion(item);
+    return version ? `<small class="app-update-badge" title="OpenCode ${escapeHTML(version)} is available">Update available</small>` : "";
+  }
+
+  async function checkOpenCodeUpdates() {
+    if (document.hidden || state.stopped || openCodeUpdates.checking) return;
+    const item = openCodeItem();
+    if (!item?.primary || !endpointRunning(item.primary)) {
+      const hadVersion = openCodeUpdates.version;
+      openCodeUpdates.version = ""; openCodeUpdates.nextCheck = 0;
+      if (hadVersion) render();
+      return;
+    }
+    if (item.identity !== openCodeUpdates.identity) {
+      openCodeUpdates.identity = item.identity; openCodeUpdates.version = ""; openCodeUpdates.nextCheck = 0;
+    }
+    if (Date.now() < openCodeUpdates.nextCheck) return;
+    openCodeUpdates.checking = true;
+    const identity = item.identity;
+    try {
+      const port = Number(item.primary.frontend.port || new URL(item.primary.frontend.url).port);
+      if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error("No OpenCode port is registered.");
+      const health = await openCodeCheckJSON(`/api/opencode-health?port=${port}`);
+      if (!health.healthy || !/^1\.\d+\.\d+$/.test(health.version)) throw new Error("OpenCode version unavailable.");
+      openCodeUpdates.version = health.version;
+      let cached;
+      try { cached = JSON.parse(localStorage.getItem(openCodeReleaseCacheKey)); } catch (_) {}
+      if (!cached || !/^1\.\d+\.\d+$/.test(cached.version) || !Number.isFinite(cached.checkedAt) ||
+          Date.now() - cached.checkedAt >= 86400000 || cached.checkedAt > Date.now()) {
+        const release = await resolveOpenCodeRelease();
+        cached = { version: release.tag_name.slice(1), checkedAt: Date.now() };
+        try { localStorage.setItem(openCodeReleaseCacheKey, JSON.stringify(cached)); } catch (_) {}
+      }
+      openCodeUpdates.latest = cached.version;
+      openCodeUpdates.nextCheck = Math.min(Date.now() + 300000, cached.checkedAt + 86400000);
+    } catch (_) {
+      openCodeUpdates.version = "";
+      openCodeUpdates.nextCheck = Date.now() + 3600000;
+    } finally {
+      openCodeUpdates.checking = false;
+      if (openCodeItem()?.identity !== identity) { openCodeUpdates.version = ""; openCodeUpdates.nextCheck = 0; }
+      render();
+    }
+  }
+
+  async function resolveOpenCodeRelease() {
+    for (let page = 1; page <= 10; page += 1) {
+      const releases = await openCodeCheckJSON(`/api/opencode-releases?page=${page}`);
+      if (!Array.isArray(releases)) throw new Error("Invalid OpenCode release response.");
+      const compatible = releases.filter(release => !release.draft && !release.prerelease && /^v1\.\d+\.\d+$/.test(release.tag_name));
+      compatible.sort((a, b) => {
+        const left = a.tag_name.slice(1).split(".").map(Number);
+        const right = b.tag_name.slice(1).split(".").map(Number);
+        return right[1] - left[1] || right[2] - left[2];
+      });
+      if (compatible.length) return compatible[0];
+      if (releases.length < 30) break;
+    }
+    throw new Error("Could not find a stable OpenCode 1 release compatible with Outer Shell.");
+  }
+
+  function prepareOpenCodeRelease(template, release) {
+    if (release.draft || release.prerelease || !/^v1\.\d+\.\d+$/.test(release.tag_name)) throw new Error("Unsupported OpenCode release.");
+    return template.replaceAll("__OPENCODE_VERSION__", release.tag_name.slice(1))
+      .replace(/__OPENCODE_SHA256_([\w.-]+)__/g, (_, name) => {
+        const asset = release.assets?.find(asset => asset.name === name);
+        if (!/^sha256:[a-f0-9]{64}$/.test(asset?.digest || "")) throw new Error(`OpenCode ${release.tag_name} has no verified download for ${name}.`);
+        return asset.digest.slice(7);
+      });
+  }
+
+  function openCodeUpdateCommand(template, release, windows) {
+    const boundary = template.indexOf(windows ? 'if (!(Test-Path "$config\\skills\\outer-shell\\SKILL.md"))' : 'if [ ! -e "$config_root/skills/outer-shell/SKILL.md" ]');
+    if (boundary < 0) throw new Error("Invalid OpenCode updater template.");
+    const update = template.slice(0, boundary).replace(/^param\([^\n]+\)\n/, "");
+    return (windows ? "" : "(\n") + prepareOpenCodeRelease(update, release).replace("__OPENCODE_MODE__", "update") + (windows ? "\n}\n" : "\n)\n");
+  }
+
+  async function openOpenCodeUpdate() {
+    const windows = state.hostPlatform === "windows";
+    const dialog = openDialog(`<header class="dialog-header"><div class="dialog-title-wrap"><h2 id="dialog-title">Update OpenCode</h2><p>Checking the latest compatible release…</p></div><button class="dialog-close" type="button" data-action="close-dialog" aria-label="Close">×</button></header><div class="dialog-body agent-guide"><p>This updates the host installation. Stop OpenCode from its app menu, run these commands on the host as your user, then start OpenCode again. Sessions and provider settings are preserved.</p><p class="form-message" role="status"></p><pre class="command-block" hidden></pre></div><footer class="dialog-footer"><button class="primary-button" type="button" data-copy-update disabled>Copy update commands</button></footer>`);
+    try {
+      const [release, response] = await Promise.all([resolveOpenCodeRelease(), fetch(windows ? "/web/opencode-start.ps1" : "/web/opencode-start.sh")]);
+      if (!response.ok) throw new Error("Could not load the OpenCode updater.");
+      const command = openCodeUpdateCommand(await response.text(), release, windows);
+      if (!dialog.isConnected) return;
+      dialog.querySelector(".dialog-title-wrap p").textContent = `OpenCode ${release.tag_name.slice(1)}`;
+      dialog.querySelector(".form-message").textContent = windows ? "Run in PowerShell on the host." : "Run in a terminal on the host.";
+      const preview = dialog.querySelector("pre");
+      preview.textContent = command; preview.hidden = false;
+      const copy = dialog.querySelector("[data-copy-update]");
+      copy.disabled = false; copy.addEventListener("click", () => copyText(command));
+    } catch (error) {
+      dialog.querySelector(".form-message").textContent = error.message || String(error);
+    }
+  }
+
   async function openCodeContainerFragment(allowAllActions = false) {
     const load = async name => {
       const response = await fetch(`/web/${name}`);
       if (!response.ok) throw new Error("Could not load the OpenCode container setup. Refresh Outer Shell and try again.");
       return response.text();
     };
-    const [template, instructions, reference, skill] = await Promise.all([
-      load("opencode-container.Dockerfile"), load("container-agent.md"), load("container-outerctl.md"), load("outer-shell-skill.md")
+    const [template, instructions, reference, skill, release] = await Promise.all([
+      load("opencode-container.Dockerfile"), load("container-agent.md"), load("container-outerctl.md"), load("outer-shell-skill.md"), resolveOpenCodeRelease()
     ]);
     const encode = async text => {
       const compressed = new Blob([text]).stream().pipeThrough(new CompressionStream("gzip"));
@@ -822,7 +997,7 @@
     const encoded = await Promise.all([instructions, reference, skill].map(encode));
     const config = { instructions: ["/usr/local/share/outershell/container-agent.md"] };
     if (allowAllActions) config.permission = "allow";
-    return template.replace("__OPENCODE_CONFIG__", () => JSON.stringify(config))
+    return prepareOpenCodeRelease(template, release).replace("__OPENCODE_CONFIG__", () => JSON.stringify(config))
       .replace("__CONTAINER_AGENT__", () => encoded[0])
       .replace("__CONTAINER_OUTERCTL__", () => encoded[1])
       .replace("__OUTERSHELL_SKILL__", () => encoded[2]);
@@ -860,9 +1035,9 @@
     } finally { state.layoutSaving = false; render(); }
   }
 
-  async function openOpenCodeSetup() {
+  async function openOpenCodeSetup(prompt = openCodeLaunchPrompt("server")) {
     const existing = openCodeItem();
-    if (existing) { await launch(existing.identity); return; }
+    if (existing) { await launch(existing.identity, "primary", false, { prompt, host: true }); return; }
     const windows = state.hostPlatform === "windows";
     const dialog = openDialog(`<header class="dialog-header"><div class="dialog-title-wrap"><h2 id="dialog-title">Your coding agent, on this server</h2><p>Set up OpenCode</p></div><button class="dialog-close" type="button" data-action="close-dialog" aria-label="Close">×</button></header>
       <div class="dialog-body agent-guide"><p><button class="secondary-button" type="button" data-opencode-container>Set up in a new container</button></p><p>Or install directly on this server:</p><ol class="assistant-steps"><li><strong>Install OpenCode</strong><span>Outer Shell downloads it and adds it to your apps. No terminal needed.</span></li><li><strong>Connect a model provider</strong><span>Sign in or add your API key in OpenCode. Your provider’s pricing applies.</span></li><li><strong>Ask for what you want</strong><span>OpenCode comes with instructions for adding apps to Outer Shell.</span></li></ol>
@@ -881,8 +1056,8 @@
       message.textContent = "Downloading OpenCode and preparing your coding agent. This can take a few minutes. You can close this dialog; installation will continue.";
       try {
         const load = async path => { const response = await fetch(path); if (!response.ok) throw new Error("Could not load the OpenCode installer. Refresh Outer Shell and try again."); return response.text(); };
-        const [script, skill, admin] = await Promise.all([load(windows ? "/web/opencode-start.ps1" : "/web/opencode-start.sh"), load("/web/outer-shell-skill.md"), load("/web/server-admin.md")]);
-        const prepared = script.replace("__OUTERSHELL_SKILL__", () => skill.trimEnd()).replace("__OUTERSHELL_ADMIN__", () => admin.trimEnd());
+        const [script, skill, admin, release] = await Promise.all([load(windows ? "/web/opencode-start.ps1" : "/web/opencode-start.sh"), load("/web/outer-shell-skill.md"), load("/web/server-admin.md"), resolveOpenCodeRelease()]);
+        const prepared = prepareOpenCodeRelease(script, release).replace("__OPENCODE_MODE__", "install").replace("__OUTERSHELL_SKILL__", () => skill.trimEnd()).replace("__OUTERSHELL_ADMIN__", () => admin.trimEnd());
         const command = windows ? windowsOpenCodeCommand(prepared, port) : prepared;
         if (new TextEncoder().encode(command).length >= (windows ? 262144 : 32768)) throw new Error("OpenCode installer exceeds the command size limit.");
         const query = new URLSearchParams({ recipe: "command-port", name: "OpenCode", identifier: windows ? "opencode" : "org.outershell.OpenCode", command, workdir: "~", scope: "user", frontendTransport: "port", port: String(port) });
@@ -901,7 +1076,7 @@
             if (!dialog.isConnected) { toast("OpenCode is ready. Open it from your apps."); return; }
             message.textContent = "OpenCode is ready. Connect your model provider, then ask it to add your first app.";
             button.disabled = false; button.textContent = "Open OpenCode";
-            button.replaceWith(Object.assign(document.createElement("button"), { type: "button", className: "primary-button", textContent: "Open OpenCode", onclick: () => launch(item.identity).catch(error => toast(error.message || String(error))) }));
+            button.replaceWith(Object.assign(document.createElement("button"), { type: "button", className: "primary-button", textContent: "Open OpenCode", onclick: () => launch(item.identity, "primary", false, { prompt, host: true }).catch(error => toast(error.message || String(error))) }));
             return;
           }
           const failure = item?.primary && endpointFailure(item.primary, "OpenCode");
@@ -915,7 +1090,7 @@
         button.disabled = false; button.textContent = "Check OpenCode";
         button.replaceWith(button.cloneNode(true));
         const retry = dialog.querySelector("[data-install-opencode]");
-        retry?.addEventListener("click", () => { closeDialog(); openOpenCodeSetup().catch(error => toast(error.message || String(error))); });
+        retry?.addEventListener("click", () => { closeDialog(); openOpenCodeSetup(prompt).catch(error => toast(error.message || String(error))); });
       }
     });
   }
@@ -949,11 +1124,11 @@
       const order = state.endpointOrder[group.id] || [];
       const ranks = new Map(order.map((key, index) => [key, index]));
       const listed = group.entries.filter(entry => !pins.includes(entry.key)).sort((a, b) => (ranks.get(a.key) ?? Infinity) - (ranks.get(b.key) ?? Infinity));
-      const controls = workspace ? `<div class="overview-controls">${!safeSpaceIsRunning(workspace) ? `<button type="button" data-action="start-safe-space" data-safe-space-id="${id}" ${preparing ? "disabled" : ""}>${preparing ? "Starting…" : "Start"}</button>` : ""}<button type="button" data-action="edit-container" data-safe-space-id="${id}" aria-label="Manage ${escapeHTML(group.name)}">Manage…</button></div>` : "";
+      const controls = workspace?.runtimeKind === "wsl" ? `<div class="overview-controls">${!safeSpaceIsRunning(workspace) ? `<button type="button" data-action="start-safe-space" data-safe-space-id="${id}" ${preparing ? "disabled" : ""}>${preparing ? "Starting…" : "Start"}</button>` : ""}<button type="button" data-action="edit-container" data-safe-space-id="${id}" aria-label="Manage ${escapeHTML(group.name)}">Manage…</button></div>` : "";
       const addMore = workspace?.runtimeKind === "wsl"
         ? `<button class="overview-add-more" type="button" data-action="open-wsl-add" data-safe-space-id="${id}" data-scope="${group.id.endsWith(":root") ? "system" : "user"}" >Add more…</button>`
         : workspace
-        ? `<button class="overview-add-more" type="button" data-action="open-container-add" data-safe-space-id="${id}" ${preparing ? "disabled" : ""}>Add more…</button>`
+        ? `<button class="overview-add-more" type="button" data-action="manage-container" data-safe-space-id="${id}" aria-label="Manage ${escapeHTML(group.name)}">Manage…</button>`
         : `<button class="overview-add-more" type="button" data-action="open-add" data-scope="${group.id === "root" ? "system" : "user"}">Add more…</button>`;
       return `<section class="overview-identity" data-group-id="${escapeHTML(group.id)}"><div class="overview-apps"><header class="overview-group-handle" tabindex="0" aria-label="Reorder ${escapeHTML(group.name)}${group.shield ? ", Administrator" : ""}. Hold and drag, or use arrow keys." title="Hold and drag to reorder" data-group-handle><div class="overview-group-heading"><h2>${escapeHTML(group.name)}</h2><p>${shield}${escapeHTML(group.note)}</p></div>${controls}</header><div class="overview-shortcuts" data-endpoint-area="pins">${pins.map(key => group.entries.find(entry => entry.key === key)).filter(Boolean).map(overviewShortcut).join("")}</div><div class="overview-list" data-endpoint-area="list">${listed.map(overviewEndpoint).join("") || `<p class="overview-empty">${state.loading || (workspace && state.safeSpacesLoading) ? "Loading…" : group.entries.length ? "" : "No registered endpoints."}</p>`}</div>${workspace?.buildProgress ? `<details class="container-build-progress"><summary>${escapeHTML(workspace.buildProgress.detail || workspace.buildProgress.phase)}</summary><pre>${escapeHTML(workspace.buildProgress.log || "")}</pre></details>` : ""}</div><div class="overview-tools">${containerCommandsHTML(workspace)}</div><footer class="overview-footer">${addMore}</footer></section>`;
     }).join("") + `<button class="overview-add-container" type="button" data-action="manage-containers"><span aria-hidden="true">+</span>Manage containers</button>`;
@@ -1263,14 +1438,14 @@
     }
   }
 
-  async function launchSafeSpaceApp(workspaceID, serviceID, frontendKey) {
+  async function launchSafeSpaceApp(workspaceID, serviceID, frontendKey, prompt = null) {
     const key = `${workspaceID}\u001f${serviceID}`;
     if (state.appLaunches.has(key)) return;
     let workspace = findSafeSpace(workspaceID);
     let app = findSafeSpaceApp(workspace, serviceID, frontendKey);
     if (!workspace || !app) throw new Error("The selected container app no longer exists.");
     if (safeSpaceAppIsReady(workspace, app)) {
-      window.location.assign(safeSpaceAppNavigationURL(workspace, app));
+      window.location.assign(prompt ? openCodePromptURL(safeSpaceAppURL(app), prompt) : safeSpaceAppNavigationURL(workspace, app));
       return;
     }
     const launch = { showLogs: false };
@@ -1290,7 +1465,7 @@
       }
       if (app.isRunning !== true) await safeSpaceRequest("startApp", { workspaceID, serviceID, serviceScope: app.serviceScope });
       const ready = await waitForSafeSpaceApp(workspaceID, serviceID, frontendKey);
-      window.location.assign(safeSpaceAppNavigationURL(ready.workspace, ready.app));
+      window.location.assign(prompt ? openCodePromptURL(safeSpaceAppURL(ready.app), prompt) : safeSpaceAppNavigationURL(ready.workspace, ready.app));
     } finally {
       window.clearTimeout(logTimer);
       state.appLaunches.delete(key);
@@ -1314,6 +1489,7 @@
       const result = decodeBackends(buffer);
       state.backends = result.backends;
       state.backendsReady = true;
+      void checkOpenCodeUpdates();
       clearRefreshFailure("backendError");
       state.backendError = result.error;
       updateStatus();
@@ -1480,7 +1656,8 @@
       </div>`);
   }
 
-  async function launch(identity, scope = "primary", retry = false) {
+  async function launch(identity, scope = "primary", retry = false, options = {}) {
+    if (identity === openCodeItem()?.identity) void checkOpenCodeUpdates();
     let item = findItem(identity);
     if (!item) return;
     let endpoint = item[scope];
@@ -1491,7 +1668,7 @@
     }
     if (!endpointReady(endpoint)) {
       toast(`Starting ${item.displayName}…`);
-      const action = await control(endpoint.backend, "start");
+      const action = await control(endpoint.backend, "start", {}, true, options.host ? null : state.addWorkspace);
       if (!action.ok) throw new Error(action.message || `Could not start ${item.displayName}.`);
       for (let attempt = 0; attempt < 30; attempt += 1) {
         await delay(500);
@@ -1506,7 +1683,7 @@
       }
     }
     if (!endpoint || !endpointReady(endpoint)) throw new Error(`Timed out waiting for ${item?.displayName || "the app"}.`);
-    window.location.assign(navigationURL(endpoint.frontend));
+    window.location.assign(options.prompt ? openCodePromptURL(navigationURL(endpoint.frontend), options.prompt) : navigationURL(endpoint.frontend));
   }
 
   const delay = milliseconds => new Promise(resolve => window.setTimeout(resolve, milliseconds));
@@ -1532,6 +1709,29 @@
       return control(backend, operation, { ...values, sudoPassword: password }, false, workspace);
     }
     return result;
+  }
+
+  let containerFocusTimer;
+
+  function syncContainerEditorViewport(revealField = false) {
+    const viewport = window.visualViewport;
+    const height = viewport?.height || window.innerHeight;
+    const style = document.documentElement.style;
+    style.setProperty("--container-viewport-height", `${height}px`);
+    style.setProperty("--container-viewport-top", `${viewport?.offsetTop || 0}px`);
+    style.setProperty("--container-bottom-clearance", window.innerHeight - height > 120 ? "0px" : "var(--outerloop-overlay-clearance)");
+    if (!revealField || !window.matchMedia("(any-pointer: coarse), (max-width: 680px), (max-height: 600px)").matches) return;
+    window.clearTimeout(containerFocusTimer);
+    containerFocusTimer = window.setTimeout(() => {
+      const field = document.activeElement;
+      const editor = field?.closest(".container-editor");
+      if (!editor || !field.matches("input:not([type=checkbox]), textarea, select")) return;
+      const bounds = field.getBoundingClientRect();
+      const frame = editor.getBoundingClientRect();
+      const top = frame.top + 12, bottom = frame.bottom - 12;
+      if (bounds.top < top) editor.scrollTop += bounds.top - top;
+      else if (bounds.bottom > bottom) editor.scrollTop += Math.min(bounds.bottom - bottom, bounds.top - top);
+    }, 120);
   }
 
   function openDialog(bodyHTML, className = "") {
@@ -1682,13 +1882,13 @@
     const dockerfile = container ? `<div class="customize-intro"><h3>Edit your Dockerfile directly</h3><p>Write the Dockerfile changes yourself, or use the Coding agent option to help write them. Both approaches preserve your setup across rebuilds.</p><p class="dockerfile-details">The container editor also includes folder mounts, environment values, and runtime settings for ${escapeHTML(container.name)}.</p><div class="add-actions"><button class="primary-button" type="button" data-action="configure-container" data-safe-space-id="${escapeHTML(container.id)}">Edit container…</button></div></div>` : "";
     const categories = [
       ["agent", "Coding agent", '<path d="M21 11a8 8 0 0 1-8 8H7l-5 3V11a9 9 0 0 1 19 0Z"/><path d="m7 9 3 3-3 3m6 0h4"/>'],
-      ...(container && managedContainer(container) ? [["dockerfile", "Edit Dockerfile", '<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8Z"/><path d="M14 2v6h6M8 13h8M8 17h6"/>']] : []),
+      ...(container && managedContainer(container) ? [["dockerfile", "Manual", '<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8Z"/><path d="M14 2v6h6M8 13h8M8 17h6"/>']] : []),
       ["catalog", "Outer Shell app catalog", '<rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/>'],
       ["bash", windowsCommands ? "Run commands" : "Run bash commands", '<rect x="2" y="3" width="20" height="18" rx="2"/><path d="m6 8 3 3-3 3m6 0h5"/>'],
       ["recipes", "Other recipes", '<rect x="2" y="3" width="20" height="18" rx="2"/><path d="M6 8h1m3 0h8M6 12h1m3 0h8M6 16h1m3 0h5"/>']
     ].filter(([id]) => (!container || id === "agent" || managedContainer(container) && id === "dockerfile") && (!(state.addWorkspace || windowsCommands) || state.addScope !== "system" || id === "catalog" || id === "agent" || id === "dockerfile" || windowsCommands && id === "bash") && (!windowsCommands || id !== "recipes"));
     const dialog = openDialog(`
-      <header class="dialog-header"><div class="dialog-title-wrap"><h2 id="dialog-title">Add Apps${state.addWorkspace ? ` · ${escapeHTML(state.addWorkspace.name)}${container ? "" : ` / ${state.addScope === "system" ? "root" : escapeHTML(state.addWorkspace.userName || "user")}`}` : ""}</h2></div><button class="dialog-close" type="button" data-action="close-dialog" aria-label="Close">×</button></header>
+      <header class="dialog-header"><div class="dialog-title-wrap">${container ? `<button class="container-back" type="button" data-action="manage-container" data-safe-space-id="${escapeHTML(container.id)}">‹ Manage</button>` : ""}<h2 id="dialog-title">${container ? "Edit container" : "Add Apps"}${state.addWorkspace ? ` · ${escapeHTML(state.addWorkspace.name)}${container ? "" : ` / ${state.addScope === "system" ? "root" : escapeHTML(state.addWorkspace.userName || "user")}`}` : ""}</h2></div><button class="dialog-close" type="button" data-action="close-dialog" aria-label="Close">×</button></header>
       <div class="dialog-body">
         <nav class="add-categories" aria-label="Add app type">${categories.map(([id, title, paths]) => `<button class="add-category" type="button" data-action="add-tab" data-tab="${id}" aria-pressed="${tab === id}"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${paths}</svg><span>${title}</span></button>`).join("")}</nav>
         <section class="add-content" aria-label="${categories.find(([id]) => id === tab)?.[1] || "Apps"}">${tab === "dockerfile" ? dockerfile : tab === "catalog" ? catalog : tab === "bash" ? bash : tab === "agent" ? codingAgent : '<div id="add-recipes" aria-live="polite">Loading recipes…</div>'}</section>
@@ -1859,6 +2059,8 @@
       renameEndpointMenuHTML(item),
       `<button class="context-menu-item" type="button" data-action="copy-url" data-app-key="${escapeHTML(item.identity)}" role="menuitem">${contextMenuGlyph("⧉")}<span>Copy URL</span></button>`
     ];
+    const updateVersion = openCodeUpdateVersion(item);
+    if (updateVersion) management.push(`<button class="context-menu-item" type="button" data-action="update-opencode" role="menuitem">${contextMenuGlyph("↻")}<span>Update to ${escapeHTML(updateVersion)}…</span></button>`);
     const isOuterShell = backend.serviceID === "org.outershell.OuterShell" && backend.serviceScope !== "system";
     if (isOuterShell) {
       const key = escapeHTML(backendKey(backend));
@@ -1887,6 +2089,47 @@
 
   function containerDialogHeader(title) {
     return `<header class="dialog-header"><h2 id="dialog-title">${escapeHTML(title)}</h2><button class="dialog-close" type="button" data-action="close-dialog" aria-label="Close">×</button></header>`;
+  }
+
+  function containerManagementDetails(workspace) {
+    const rows = [
+      ["Status", safeSpaceState(workspace)],
+      ["Image", workspace.recipe?.baseImage],
+      ["Runtime", safeSpaceRuntimeDescription(workspace)],
+      ["Resources", workspace.cpus && workspace.memoryInGB ? `${workspace.cpus} CPUs · ${workspace.memoryInGB} GB memory` : ""]
+    ].filter(([, value]) => value);
+    return `<dl class="container-management-details">${rows.map(([label, value]) => `<div><dt>${label}</dt><dd>${escapeHTML(value)}</dd></div>`).join("")}</dl>`;
+  }
+
+  async function openContainerManagement(id) {
+    const workspace = findSafeSpace(id);
+    if (!workspace) return;
+    state.addWorkspace = null;
+    const managed = managedContainer(workspace);
+    const preparing = containerPreparing(workspace);
+    const running = safeSpaceIsRunning(workspace);
+    const attributes = `data-safe-space-id="${escapeHTML(id)}"`;
+    const dialog = openDialog(`${containerDialogHeader(`Container: ${workspace.name}`)}
+      <div class="dialog-body">
+        <div data-container-details>${containerManagementDetails(workspace)}</div>
+        <div class="container-management-actions">
+          <button type="button" data-action="${managed ? "configure-container" : "open-container-add"}" ${attributes} ${preparing ? "disabled" : ""}><span><strong>Edit…</strong><small>${managed ? "Use a coding agent or edit the container configuration manually." : "Use a coding agent to work inside this container."}</small></span><span aria-hidden="true">›</span></button>
+          ${managed ? `<button type="button" data-action="share-container" ${attributes} ${preparing ? "disabled" : ""}><span><strong>Share…</strong><small>Export this container to use on another machine.</small></span><span aria-hidden="true">›</span></button>` : ""}
+        </div>
+        <div class="container-lifecycle-actions">
+          <button type="button" data-action="container-control" data-operation="${running ? "stop" : "start"}" ${attributes} ${preparing ? "disabled" : ""}>${preparing ? "Preparing…" : running ? "Stop" : "Start"}</button>
+          <button class="danger" type="button" data-action="delete-container" ${attributes} ${preparing ? "disabled" : ""}>${managed ? "Delete…" : "Remove from Outer Shell…"}</button>
+        </div>
+        <p class="form-message" data-management-message role="status"></p>
+      </div>`, "container-management-dialog");
+    try {
+      const result = await safeSpaceRequest("listDetails", { workspaceID: id, configurationOnly: true });
+      if (!dialog.isConnected) return;
+      const current = result.workspaces?.find(value => value.id === id);
+      if (current) dialog.querySelector("[data-container-details]").innerHTML = containerManagementDetails({ ...workspace, ...current });
+    } catch (error) {
+      if (dialog.isConnected) dialog.querySelector("[data-management-message]").textContent = error.message || String(error);
+    }
   }
 
   function openManageContainers() {
@@ -2101,11 +2344,241 @@
     });
   }
 
+  function configureDockerfileZoom(form) {
+    const editor = form.elements.dockerfile;
+    const smaller = form.querySelector("[data-dockerfile-smaller]");
+    const larger = form.querySelector("[data-dockerfile-larger]");
+    const reset = form.querySelector("[data-dockerfile-reset]");
+    const key = "outershell.dockerfileTextScale", minimum = .25, maximum = 3;
+    let scale = 1, frame = null, pending = null, saveTimer = null, touchPinch = null, gesturePinch = null;
+    try {
+      const stored = Number(localStorage.getItem(key));
+      if (Number.isFinite(stored) && stored >= minimum && stored <= maximum) scale = stored;
+    } catch (_) {}
+    const persist = () => { try { localStorage.setItem(key, String(scale)); } catch (_) {} };
+    const apply = (value, x, y) => {
+      if (!Number.isFinite(value)) return;
+      const next = Math.max(minimum, Math.min(maximum, value));
+      const bounds = editor.getBoundingClientRect();
+      const anchorX = Number.isFinite(x) ? x - bounds.left : 0;
+      const anchorY = Number.isFinite(y) ? y - bounds.top : 0;
+      const left = (editor.scrollLeft + anchorX) * next / scale - anchorX;
+      const top = (editor.scrollTop + anchorY) * next / scale - anchorY;
+      scale = next;
+      editor.style.setProperty("--dockerfile-text-scale", String(scale));
+      editor.scrollLeft = left; editor.scrollTop = top;
+      reset.textContent = `${Math.round(scale * 100)}%`;
+      reset.setAttribute("aria-label", `Text size ${Math.round(scale * 100)}%. Reset to 100%.`);
+      smaller.disabled = scale <= minimum; larger.disabled = scale >= maximum;
+    };
+    const flush = () => {
+      if (frame !== null) cancelAnimationFrame(frame);
+      frame = null;
+      if (pending) { const value = pending; pending = null; apply(value.scale, value.x, value.y); }
+    };
+    const queue = (value, x, y) => {
+      pending = { scale: value, x, y };
+      if (frame === null) frame = requestAnimationFrame(flush);
+    };
+    const step = amount => { flush(); apply(Math.round((scale + amount) * 100) / 100); persist(); };
+    smaller.addEventListener("click", () => step(-.1));
+    larger.addEventListener("click", () => step(.1));
+    reset.addEventListener("click", () => { flush(); apply(1); persist(); });
+    for (const button of [smaller, larger, reset]) button.addEventListener("pointerdown", event => {
+      if (document.activeElement === editor) event.preventDefault();
+    });
+    const available = () => editor.isConnected && !editor.disabled && !document.querySelector("dialog:modal");
+    editor.addEventListener("wheel", event => {
+      if (!event.ctrlKey || !available()) return;
+      event.preventDefault();
+      if (touchPinch || gesturePinch) return;
+      const delta = event.deltaY * (event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? window.innerHeight : 1);
+      queue((pending?.scale ?? scale) * Math.exp(-delta * .01), event.clientX, event.clientY);
+      clearTimeout(saveTimer); saveTimer = setTimeout(() => { flush(); persist(); }, 150);
+    }, { passive: false });
+    const touches = event => {
+      const [a, b] = event.touches;
+      return { distance: Math.max(1, Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY)), x: (a.clientX + b.clientX) / 2, y: (a.clientY + b.clientY) / 2 };
+    };
+    editor.addEventListener("touchstart", event => {
+      if (event.touches.length !== 2 || !available()) return;
+      event.preventDefault(); flush();
+      touchPinch = { distance: touches(event).distance, scale }; gesturePinch = null;
+    }, { passive: false });
+    editor.addEventListener("touchmove", event => {
+      if (!touchPinch) return;
+      event.preventDefault();
+      if (event.touches.length === 2) {
+        const point = touches(event);
+        queue(touchPinch.scale * point.distance / touchPinch.distance, point.x, point.y);
+      }
+    }, { passive: false });
+    for (const name of ["touchend", "touchcancel"]) editor.addEventListener(name, event => {
+      if (!touchPinch) return;
+      event.preventDefault();
+      if (event.touches.length < 2) { touchPinch = null; flush(); persist(); }
+    }, { passive: false });
+    editor.addEventListener("gesturestart", event => {
+      if (!available()) return;
+      event.preventDefault(); flush();
+      if (!touchPinch) gesturePinch = { scale };
+    }, { passive: false });
+    editor.addEventListener("gesturechange", event => {
+      if (!touchPinch && !gesturePinch) return;
+      event.preventDefault();
+      if (gesturePinch && Number.isFinite(event.scale)) queue(gesturePinch.scale * event.scale, event.clientX, event.clientY);
+    }, { passive: false });
+    editor.addEventListener("gestureend", event => {
+      if (!touchPinch && !gesturePinch) return;
+      event.preventDefault();
+      if (gesturePinch) { gesturePinch = null; flush(); persist(); }
+    }, { passive: false });
+    apply(scale);
+  }
+
+  function mountDisplayName(hostPath, guestPath) {
+    const path = String(hostPath || "").trim() || String(guestPath || "").trim();
+    return path.split("/").filter(Boolean).pop() || (path.startsWith("/") ? "/" : "Folder mount");
+  }
+
+  async function readHostFolders(path, signal) {
+    const query = new URLSearchParams({ path: path || "~", directoriesOnly: "1" });
+    const response = await fetch(`/api/file-picker?${query}`, { cache: "no-store", signal });
+    if (!response.ok) throw new Error((await response.text()).trim() || "Could not open this folder.");
+    const reader = new PayloadReader(await response.arrayBuffer());
+    const folders = [];
+    const count = reader.u32(16);
+    reader.require(20, count * 8);
+    for (let index = 0; index < count; index += 1) {
+      const entry = reader.child(20 + index * 8);
+      const flags = entry.u32(16);
+      if ((flags & 1) && !(flags & 2)) folders.push({ name: entry.stringRef(0), path: entry.stringRef(8) });
+    }
+    return { path: reader.stringRef(0), parent: reader.stringRef(8), folders };
+  }
+
+  function hostFolderBreadcrumbs(path) {
+    if (!path.startsWith("/")) return [{ name: path, path }];
+    const segments = [{ name: "/", path: "/" }];
+    let parent = "";
+    for (const name of path.split("/").filter(Boolean)) {
+      parent += "/" + name;
+      segments.push({ name, path: parent });
+    }
+    return segments;
+  }
+
+  function chooseHostFolder(initialPath) {
+    return new Promise(resolve => {
+      const picker = document.createElement("dialog");
+      picker.className = "host-folder-picker";
+      picker.setAttribute("aria-labelledby", "host-folder-picker-title");
+      picker.innerHTML = `<header class="dialog-header"><div><h2 id="host-folder-picker-title" tabindex="-1" autofocus>Choose a server folder</h2><p class="field-note">Browse folders on the connected server.</p></div></header><div class="host-folder-browser"><nav class="host-folder-breadcrumbs" data-folder-breadcrumbs aria-label="Folder path"></nav><details class="host-folder-direct"><summary>Go to folder…</summary><div class="host-folder-location"><label class="field">Folder path<input data-folder-path spellcheck="false" autocomplete="off"></label><button type="button" data-folder-go>Go</button></div></details><p class="field-note" data-folder-status role="status"></p><div class="host-folder-list" data-folder-list></div></div><footer class="dialog-footer"><button type="button" data-folder-cancel>Cancel</button><button class="primary-button" type="button" data-folder-select disabled>Choose this folder</button></footer>`;
+      const pathInput = picker.querySelector("[data-folder-path]");
+      const list = picker.querySelector("[data-folder-list]");
+      const status = picker.querySelector("[data-folder-status]");
+      const select = picker.querySelector("[data-folder-select]");
+      const breadcrumbs = picker.querySelector("[data-folder-breadcrumbs]");
+      let current = null, selected = "", controller = null;
+      const load = async path => {
+        controller?.abort();
+        const request = new AbortController();
+        controller = request;
+        const restoreFocus = breadcrumbs.contains(document.activeElement);
+        select.disabled = true;
+        list.replaceChildren(); status.textContent = "Loading folders…";
+        try {
+          const result = await readHostFolders(path, request.signal);
+          if (request.signal.aborted || !picker.isConnected) return;
+          current = result; pathInput.value = result.path;
+          const segments = hostFolderBreadcrumbs(result.path);
+          breadcrumbs.replaceChildren(...segments.flatMap((segment, index) => {
+            const button = document.createElement("button");
+            button.type = "button"; button.textContent = segment.name; button.title = segment.path;
+            button.setAttribute("aria-label", segment.path === "/" ? "Root folder" : segment.path);
+            if (index === segments.length - 1) button.setAttribute("aria-current", "location");
+            button.addEventListener("click", () => { if (index !== segments.length - 1) void load(segment.path); });
+            if (!index) return [button];
+            const separator = document.createElement("span");
+            separator.className = "host-folder-separator"; separator.textContent = "›"; separator.setAttribute("aria-hidden", "true");
+            return [separator, button];
+          }));
+          requestAnimationFrame(() => {
+            if (request.signal.aborted || !picker.isConnected) return;
+            breadcrumbs.scrollLeft = breadcrumbs.scrollWidth;
+            if (restoreFocus) breadcrumbs.lastElementChild?.focus({ preventScroll: true });
+          });
+          status.textContent = result.folders.length ? "Open a folder below, or choose the current folder." : "No subfolders. You can choose this folder.";
+          for (const folder of result.folders) {
+            const button = document.createElement("button");
+            button.type = "button"; button.className = "host-folder-entry";
+            button.textContent = folder.name;
+            button.addEventListener("click", () => { void load(folder.path); });
+            list.append(button);
+          }
+          select.disabled = false;
+        } catch (error) {
+          if (!request.signal.aborted && picker.isConnected) status.textContent = error.message || String(error);
+        }
+      };
+      picker.querySelector("[data-folder-go]").addEventListener("click", () => { void load(pathInput.value); });
+      pathInput.addEventListener("input", () => { select.disabled = true; });
+      pathInput.addEventListener("keydown", event => {
+        if (event.key === "Enter") { event.preventDefault(); void load(pathInput.value); }
+      });
+      breadcrumbs.addEventListener("keydown", event => {
+        if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+        const buttons = [...breadcrumbs.querySelectorAll("button")];
+        const index = buttons.indexOf(event.target);
+        if (index < 0) return;
+        event.preventDefault(); event.stopPropagation();
+        const next = event.key === "Home" ? 0 : event.key === "End" ? buttons.length - 1 : Math.max(0, Math.min(buttons.length - 1, index + (event.key === "ArrowRight" ? 1 : -1)));
+        buttons[next].focus({ preventScroll: true });
+        buttons[next].scrollIntoView({ block: "nearest", inline: "nearest" });
+      });
+      select.addEventListener("click", () => { if (!select.disabled && current) { selected = current.path; picker.close(); } });
+      picker.querySelector("[data-folder-cancel]").addEventListener("click", () => picker.close());
+      picker.addEventListener("keydown", event => { if (event.key === "Escape") event.stopPropagation(); });
+      picker.addEventListener("close", () => { controller?.abort(); picker.remove(); resolve(selected); }, { once: true });
+      document.body.append(picker);
+      picker.showModal();
+      void load(initialPath);
+    });
+  }
+
+  async function chooseMountFolder(button, form) {
+    if (form.dataset.choosingMountFolder) return;
+    const row = button.closest('[data-row="mounts"]');
+    const input = row.querySelector('[data-column="hostPath"]');
+    form.dataset.choosingMountFolder = "true";
+    button.focus({ preventScroll: true });
+    button.disabled = true;
+    try {
+      const result = agentConnection().local
+        ? await safeSpaceRequest("chooseFolder")
+        : { selectedFolderPath: await chooseHostFolder(input.value) };
+      if (!row.isConnected || !form.isConnected) return;
+      if (result.selectedFolderPath) {
+        input.value = result.selectedFolderPath;
+        form.querySelector(".container-message").textContent = "";
+      }
+    } catch (error) {
+      if (form.isConnected) form.querySelector(".container-message").textContent = error.message || String(error);
+    } finally {
+      delete form.dataset.choosingMountFolder;
+      button.disabled = false;
+      if (button.isConnected && form.isConnected) button.focus({ preventScroll: true });
+    }
+  }
+
   function configurationRow(kind, value = {}) {
     const input = (name, label, content, type = "text") => `<label class="field">${label}<input data-column="${name}" type="${type}" value="${escapeHTML(content ?? "")}" ${type === "number" ? 'min="1" max="65535" step="1"' : 'spellcheck="false"'}></label>`;
     let fields;
     if (kind === "mounts") {
-      fields = input("name", "Name", value.name) + input("hostPath", "Server folder", value.hostPath) + input("guestPath", "Container path", value.guestPath) + `<label class="container-check"><input data-column="isReadOnly" type="checkbox" ${value.isReadOnly ? "checked" : ""}>Read only</label>`;
+      return `<div class="mount-card" data-row="mounts" data-id="${escapeHTML(value.id || makeRequestID())}">
+        <div class="mount-paths"><div class="mount-source">${input("hostPath", agentConnection().local ? "On this computer" : "On server", value.hostPath)}${`<button class="mount-browse" type="button" data-pick-mount-folder aria-label="${agentConnection().local ? "Choose folder on this computer" : "Choose folder on server"}" title="Choose folder"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M3 7V5a2 2 0 0 1 2-2h5l2 3h7a2 2 0 0 1 2 2v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7Z"/><path d="M8 13h8m-4-4v8"/></svg></button>`}</div><span class="mount-path-arrow" aria-hidden="true">→</span>${input("guestPath", "In container", value.guestPath)}</div>
+        <div class="mount-controls"><label class="mount-access"><input data-column="isReadOnly" type="checkbox" ${value.isReadOnly ? "checked" : ""}>Read only</label><button class="mount-remove" type="button" data-remove-row aria-label="Remove folder mount" title="Remove folder mount"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13M10 10v7m4-7v7"/></svg></button></div>
+      </div>`;
     } else if (kind === "environment") {
       fields = input("name", "Name", value.name) + input("value", "Value", value.value);
     } else {
@@ -2120,6 +2593,7 @@
       row.querySelectorAll("[data-column]").forEach(input => {
         value[input.dataset.column] = input.type === "checkbox" ? input.checked : input.type === "number" ? Number(input.value) : input.value;
       });
+      if (kind === "mounts") value.name = mountDisplayName(value.hostPath, value.guestPath);
       return value;
     });
   }
@@ -2170,32 +2644,43 @@
       loadingDialog.querySelector(".dialog-body").append(retry);
       return;
     }
+    state.addWorkspace = workspace;
+    const codingAgent = codingAgentHTML(null, true);
     const infrastructure = (workspace.mounts || []).filter(mount => mount.isInfrastructure);
-    const tabs = [["dockerfile", "Dockerfile"], ["mounts", "Folder mounts"], ["environment", "Environment"], ["ports", "Network"], ["runtime", "Runtime"]];
+    const tabs = [["dockerfile", "Dockerfile"], ["agent", "Coding agent"], ["mounts", "Folder mounts"], ["environment", "Environment"], ["ports", "Network"], ["runtime", "Runtime"]];
     const dialog = openDialog(`${containerDialogHeader(`Container: ${workspace.name}`)}
       <form class="container-form" novalidate><div class="dialog-body">
         <label class="field">Name<input name="name" value="${escapeHTML(workspace.name)}" required></label>
         <div class="configuration-tabs" role="tablist" aria-label="Container configuration">${tabs.map(([key, label], index) => `<button type="button" role="tab" id="config-tab-${key}" aria-controls="config-panel-${key}" aria-selected="${index === 0}" data-config-tab="${key}">${label}</button>`).join("")}</div>
-        <section role="tabpanel" id="config-panel-dockerfile" aria-labelledby="config-tab-dockerfile" data-config-panel="dockerfile"><label class="field">Dockerfile<textarea name="dockerfile" class="dockerfile-editor" spellcheck="false" autocapitalize="off" autocorrect="off">${escapeHTML(recipe.containerfile)}</textarea></label><p class="field-note">Save stores the definition. Save &amp; rebuild applies it to the container.</p><label class="container-check"><input name="allowAllOpenCodeActions" type="checkbox">Allow all actions without asking</label><p class="field-note">Applies when adding OpenCode below, including access to folders mounted into this container.</p><button type="button" data-add-opencode>Add OpenCode</button><p class="field-note">Adds OpenCode and container instructions to this Dockerfile. Requires Debian or Ubuntu with Outer Shell support.</p></section>
-        <section role="tabpanel" id="config-panel-mounts" aria-labelledby="config-tab-mounts" data-config-panel="mounts" hidden><p class="field-note">Server folders are paths on the server running Outer Shell. They must already exist.</p><div data-rows="mounts">${(workspace.mounts || []).filter(mount => !mount.isInfrastructure).map(mount => configurationRow("mounts", mount)).join("")}</div><button type="button" data-add-row="mounts">Add folder mount</button>${infrastructure.length ? `<details class="managed-mounts"><summary>Managed mounts (${infrastructure.length})</summary>${infrastructure.map(mount => `<p><code>${escapeHTML(mount.hostPath)} → ${escapeHTML(mount.guestPath)}</code></p>`).join("")}</details>` : ""}</section>
+        <div class="configuration-content">
+        <section role="tabpanel" id="config-panel-dockerfile" aria-labelledby="config-tab-dockerfile" data-config-panel="dockerfile"><div class="dockerfile-toolbar"><label for="container-dockerfile">Dockerfile</label><div class="dockerfile-zoom" role="group" aria-label="Dockerfile text size"><span>Pinch to resize text</span><button type="button" data-dockerfile-smaller aria-label="Smaller Dockerfile text">A−</button><button type="button" data-dockerfile-reset title="Reset text size">100%</button><button type="button" data-dockerfile-larger aria-label="Larger Dockerfile text">A+</button></div></div><div class="field"><textarea id="container-dockerfile" name="dockerfile" class="dockerfile-editor" spellcheck="false" autocapitalize="off" autocorrect="off">${escapeHTML(recipe.containerfile)}</textarea></div></section>
+        <section role="tabpanel" id="config-panel-agent" aria-labelledby="config-tab-agent" data-config-panel="agent" hidden>${codingAgent}</section>
+        <section role="tabpanel" id="config-panel-mounts" aria-labelledby="config-tab-mounts" data-config-panel="mounts" hidden><div class="mounts-heading"><div><h3>Folder mounts</h3><p>${agentConnection().local ? "Share a folder with this container." : "Make an existing server folder available inside this container."}</p></div><button class="secondary-button" type="button" data-add-row="mounts"><span aria-hidden="true">＋</span> Add folder mount</button></div><div class="mount-list" data-rows="mounts">${(workspace.mounts || []).filter(mount => !mount.isInfrastructure).map(mount => configurationRow("mounts", mount)).join("")}</div><p class="mount-empty">No folder mounts yet. Add a folder to share files with this container.</p>${infrastructure.length ? `<details class="managed-mounts"><summary>Managed by Outer Shell <span>(${infrastructure.length})</span></summary><p>These folders support the container and are managed automatically.</p><div class="managed-mount-list">${infrastructure.map(mount => `<div><code>${escapeHTML(mount.hostPath)}</code><span aria-hidden="true">→</span><code>${escapeHTML(mount.guestPath)}</code></div>`).join("")}</div></details>` : ""}</section>
         <section role="tabpanel" id="config-panel-environment" aria-labelledby="config-tab-environment" data-config-panel="environment" hidden><div data-rows="environment">${(recipe.environment || []).map(value => configurationRow("environment", value)).join("")}</div><button type="button" data-add-row="environment">Add variable</button></section>
         <section role="tabpanel" id="config-panel-ports" aria-labelledby="config-tab-ports" data-config-panel="ports" hidden>${recipe.supportsRuntimeSettings ? `<label class="field">Network mode<select name="networkMode"><option value="bridge" ${recipe.networkMode !== "host" ? "selected" : ""}>Isolated network</option><option value="host" ${recipe.networkMode === "host" ? "selected" : ""}>Host network</option></select></label><p class="field-note">Host networking shares the server’s network for LAN device discovery. Apps listen directly on server ports and may be reachable from other devices. Port mappings are not used.</p>` : ""}<p class="field-note">Publish a container TCP port on this server when using an isolated network.</p><div data-rows="ports">${(recipe.publishedPorts || []).map(value => configurationRow("ports", value)).join("")}</div><button type="button" data-add-row="ports">Add port</button></section>
         <section role="tabpanel" id="config-panel-runtime" aria-labelledby="config-tab-runtime" data-config-panel="runtime" hidden><p>${escapeHTML(safeSpaceRuntimeDescription(workspace))} · ${escapeHTML(workspace.cpus)} CPUs · ${escapeHTML(workspace.memoryInGB)} GB</p><label class="field">Runtime<select name="runtimeProviderID">${runtimeOptions(workspace.runtime?.providerID)}</select></label>${recipe.supportsRuntimeSettings ? `<label class="container-check"><input name="useInit" type="checkbox" ${recipe.useInit !== false ? "checked" : ""}>Use Docker’s init process</label><p class="field-note">Turn this off for images that provide their own init process, such as Home Assistant and Homebridge.</p><label class="container-check"><input name="restartUnlessStopped" type="checkbox" ${recipe.restartPolicy === "unless-stopped" ? "checked" : ""}>Restart automatically unless manually stopped</label>` : ""}<p class="field-note">Changing runtime saves the configuration and rebuilds the container with the selected provider.</p><button type="submit" value="runtime">Save &amp; change runtime</button></section>
         <p class="container-message" role="status">${escapeHTML(recipe.needsRebuild ? "Saved changes need a rebuild." : "")}</p>
-        <p class="field-note">Rebuilding restarts the container. Changes outside its Dockerfile, persistent data, and mounted folders are not retained.</p>
-      </div><footer class="dialog-footer"><button type="button" data-action="close-dialog">Close</button><button type="submit" value="save">Save</button><button class="primary-button" type="submit" value="rebuild">Save &amp; rebuild</button></footer></form>`, "wide container-editor");
+        </div>
+      </div><footer class="dialog-footer"><p class="field-note container-rebuild-note">Rebuilding restarts the container. Changes outside its Dockerfile, persistent data, and mounted folders are not retained.</p><button type="button" data-action="close-dialog">Close</button><button type="submit" value="save">Save</button><button class="primary-button" type="submit" value="rebuild">Save &amp; rebuild</button></footer></form>`, "wide container-editor");
     const form = dialog.querySelector("form");
+    configureDockerfileZoom(form);
     form.addEventListener("click", event => {
       const tab = event.target.closest("[data-config-tab]");
       if (tab) {
-        form.querySelectorAll("[data-config-tab]").forEach(button => button.setAttribute("aria-selected", String(button === tab)));
+        form.querySelectorAll('[role="tab"][data-config-tab]').forEach(button => button.setAttribute("aria-selected", String(button.dataset.configTab === tab.dataset.configTab)));
         form.querySelectorAll("[data-config-panel]").forEach(panel => { panel.hidden = panel.dataset.configPanel !== tab.dataset.configTab; });
       }
+      const browse = event.target.closest("[data-pick-mount-folder]");
+      if (browse) { void chooseMountFolder(browse, form); return; }
       const add = event.target.closest("[data-add-row]");
-      if (add) form.querySelector(`[data-rows="${add.dataset.addRow}"]`).insertAdjacentHTML("beforeend", configurationRow(add.dataset.addRow));
+      if (add) {
+        const rows = form.querySelector(`[data-rows="${add.dataset.addRow}"]`);
+        rows.insertAdjacentHTML("beforeend", configurationRow(add.dataset.addRow));
+        if (add.dataset.addRow === "mounts") rows.lastElementChild.querySelector('[data-column="hostPath"]').focus();
+      }
       event.target.closest("[data-remove-row]")?.closest("[data-row]").remove();
     });
-    form.querySelector("[data-add-opencode]").addEventListener("click", async event => {
+    form.querySelector("[data-add-opencode]")?.addEventListener("click", async event => {
       const button = event.currentTarget;
       const message = form.querySelector(".container-message");
       if (form.elements.dockerfile.value.includes("/usr/local/bin/outershell-opencode")) {
@@ -3009,12 +3494,30 @@
       return;
     }
     if (action === "agent-guide") { openAddDialog("agent"); return; }
-    if (action === "copy-agent-prompt") { await copyText(agentPrompt("[Your request here]")); return; }
+    if (action === "agent-scope" || action === "agent-scope-change") {
+      const picker = actionElement.closest(".agent-scope-picker");
+      const scope = action === "agent-scope" ? actionElement.dataset.agentScope : "";
+      picker.querySelector("[data-agent-choices]").hidden = Boolean(scope);
+      picker.querySelector("[data-agent-selection]").hidden = !scope;
+      picker.querySelectorAll("[data-agent-panel]").forEach(panel => { panel.hidden = panel.dataset.agentPanel !== scope; });
+      if (scope) {
+        picker.dataset.selectedScope = scope;
+        const label = picker.querySelector("[data-agent-selection-label]");
+        label.textContent = scope === "container" ? "Inside container · Sandboxed" : "Whole server · Privileged";
+        label.focus({ preventScroll: true });
+      } else {
+        picker.querySelector(`[data-action="agent-scope"][data-agent-scope="${picker.dataset.selectedScope || "container"}"]`).focus({ preventScroll: true });
+      }
+      return;
+    }
+    if (action === "copy-agent-prompt") { await copyText(agentPrompt("[Your request here]", agentConnection(), actionElement.dataset.agentScope)); return; }
     if (action === "example-prompt") { await copyText(agentExamples[Number(actionElement.dataset.example)] || agentExamples[2]); return; }
+    if (action === "update-opencode") { await openOpenCodeUpdate(); return; }
     if (action === "setup-opencode") { try { await openOpenCodeSetup(); } catch (error) { toast(error.message || String(error)); } return; }
     if (action === "rename-endpoint") { const item = findItem(actionElement.dataset.appKey); if (item) openRenameEndpoint(item); return; }
     if (action === "show-container-command") { const bounds = actionElement.getBoundingClientRect(); openContainerCommand(actionElement.dataset.safeSpaceId, actionElement.dataset.commandId, { x: bounds.left, y: bounds.bottom }); return; }
     if (action === "setup-container-opencode") { openCreateContainer(true); return; }
+    if (action === "manage-container") { await openContainerManagement(actionElement.dataset.safeSpaceId); return; }
     if (action === "manage-containers") { openManageContainers(); return; }
     if (action === "container-storage") { await openContainerStorage(); return; }
     if (action === "import-container") { openContainerImport(); return; }
@@ -3087,9 +3590,9 @@
       }
       const workspace = findSafeSpace(actionElement.dataset.safeSpaceId);
       const app = findSafeSpaceApp(workspace, actionElement.dataset.serviceId, actionElement.dataset.frontendKey);
-      if (workspace && app && safeSpaceAppIsReady(workspace, app)) return;
+      if (workspace && app && safeSpaceAppIsReady(workspace, app) && !actionElement.dataset.agentScope) return;
       event.preventDefault();
-      try { await launchSafeSpaceApp(actionElement.dataset.safeSpaceId, actionElement.dataset.serviceId, actionElement.dataset.frontendKey); }
+      try { await launchSafeSpaceApp(actionElement.dataset.safeSpaceId, actionElement.dataset.serviceId, actionElement.dataset.frontendKey, actionElement.dataset.agentScope ? openCodeLaunchPrompt(actionElement.dataset.agentScope) : null); }
       catch (error) { toast(error.message || String(error), true); }
       return;
     }
@@ -3104,6 +3607,7 @@
       return;
     }
     if (action === "launch-endpoint") {
+      if (actionElement.dataset.appKey === openCodeItem()?.identity) void checkOpenCodeUpdates();
       if (Date.now() < state.suppressLaunchUntil && !actionElement.closest(".context-menu")) {
         event.preventDefault();
         return;
@@ -3117,6 +3621,7 @@
       return;
     }
     if (action === "launch") {
+      if (actionElement.dataset.appKey === openCodeItem()?.identity) void checkOpenCodeUpdates();
       if (Date.now() < state.suppressLaunchUntil && !actionElement.closest(".context-menu")) {
         event.preventDefault();
         return;
@@ -3176,13 +3681,27 @@
     }
     openContainerImport(files[0]);
   });
+  for (const name of ["gesturestart", "gesturechange", "gestureend"]) document.addEventListener(name, event => event.preventDefault(), { passive: false });
+  for (const name of ["touchstart", "touchmove"]) document.addEventListener(name, event => {
+    if (event.touches.length > 1) event.preventDefault();
+  }, { passive: false });
+  document.addEventListener("wheel", event => { if (event.ctrlKey) event.preventDefault(); }, { passive: false });
+  window.visualViewport?.addEventListener("resize", () => syncContainerEditorViewport(true));
+  window.visualViewport?.addEventListener("scroll", () => syncContainerEditorViewport());
+  window.addEventListener("resize", () => syncContainerEditorViewport(true));
+  document.addEventListener("focusin", event => {
+    if (event.target.closest(".container-editor")) syncContainerEditorViewport(true);
+  });
+  syncContainerEditorViewport();
+  window.setInterval(() => { void checkOpenCodeUpdates(); }, 60000);
+  window.addEventListener("focus", () => { void checkOpenCodeUpdates(); });
   window.addEventListener("beforeunload", suspendRefreshes);
   window.addEventListener("pagehide", () => { finishEndpointDrag(false); finishGroupDrag(false); suspendRefreshes(); });
   window.addEventListener("pageshow", resumeRefreshes);
   window.addEventListener("online", () => { suspendRefreshes(); resumeRefreshes(); });
   document.addEventListener("visibilitychange", () => {
     if (document.hidden) { finishEndpointDrag(false); finishGroupDrag(false); suspendRefreshes(); }
-    else resumeRefreshes();
+    else { resumeRefreshes(); void checkOpenCodeUpdates(); }
   });
   state.initialLoadingTimer = window.setTimeout(() => {
     state.showInitialLoading = true;

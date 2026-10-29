@@ -6,12 +6,17 @@ const zlib = require('node:zlib');
 const root = process.argv[2] || process.cwd();
 const web = path.join(root, 'Resources/OuterShellWeb');
 const source = fs.readFileSync(path.join(web, 'app.js'), 'utf8');
-const context = {Blob, Response, CompressionStream, Uint8Array, btoa,
-  fetch: async url => ({ok:true,text:async()=>fs.readFileSync(path.join(web,url.slice(5)), 'utf8')})};
+const template = fs.readFileSync(path.join(web, 'opencode-container.Dockerfile'), 'utf8');
+const assets = [...template.matchAll(/__OPENCODE_SHA256_([\w.-]+)__/g)].map(match => ({name:match[1],digest:'sha256:'+'a'.repeat(64)}));
+const release = {tag_name:'v1.99.0',assets};
+const context = {Blob, Response, CompressionStream, Uint8Array, btoa, AbortSignal,
+  fetch: async url => url.startsWith('/api/') ? {ok:true,json:async()=>[release]} : {ok:true,text:async()=>fs.readFileSync(path.join(web,url.slice(5)), 'utf8')}};
 vm.createContext(context);
-vm.runInContext(source.slice(source.indexOf('  async function openCodeContainerFragment('), source.indexOf('  async function pinInstalledOpenCode(')), context);
+vm.runInContext(source.slice(source.indexOf('  const openCodeUpdates ='), source.indexOf('  async function pinInstalledOpenCode(')), context);
 (async()=>{
   const fragment = await context.openCodeContainerFragment();
+  assert.match(fragment, /version=1.99.0/);
+  assert(!fragment.includes('__OPENCODE_'));
   const configOf = text => JSON.parse(text.match(/export OPENCODE_CONFIG_CONTENT='([^']+)'/)[1]);
   assert.deepEqual(configOf(fragment), {instructions: ["/usr/local/share/outershell/container-agent.md"]});
   const allowed = await context.openCodeContainerFragment(true);

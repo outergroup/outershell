@@ -1,0 +1,29 @@
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const vm = require('node:vm');
+const source = fs.readFileSync('Resources/OuterShellWeb/app.js', 'utf8');
+function element() {
+  const events = {};
+  return {events, disabled:false, addEventListener:(name,fn)=>events[name]=fn, setAttribute(){}};
+}
+const editor = {...element(),isConnected:true,scrollTop:100,scrollLeft:20,value:'FROM debian\n',getBoundingClientRect:()=>({left:0,top:0}),style:{setProperty:(key,value)=>editor.scale=Number(value)}};
+const smaller=element(),larger=element(),reset=element();
+const form={elements:{dockerfile:editor},querySelector:selector=>selector.includes('smaller')?smaller:selector.includes('larger')?larger:reset};
+let stored=null, frame=null, timer=null;
+const context={document:{activeElement:editor,querySelector:()=>null},window:{innerHeight:800},localStorage:{getItem:()=>stored,setItem:(key,value)=>stored=value},requestAnimationFrame:fn=>{frame=fn;return 1;},cancelAnimationFrame:()=>{frame=null;},setTimeout:fn=>{timer=fn;return 1;},clearTimeout:()=>{timer=null;}};
+vm.createContext(context);vm.runInContext(source.slice(source.indexOf('  function configureDockerfileZoom('),source.indexOf('  function mountDisplayName(')),context);
+const event = extra => ({preventDefault(){this.prevented=true;},...extra});
+const flush = () => {if(frame){const fn=frame;frame=null;fn();}};
+const points = distance => [{clientX:0,clientY:0},{clientX:distance,clientY:0}];
+context.configureDockerfileZoom(form);
+assert.equal(reset.textContent,'100%');
+const normal=event({ctrlKey:false,deltaY:20});editor.events.wheel(normal);assert(!normal.prevented);
+editor.events.touchstart(event({touches:points(100)}));editor.events.touchmove(event({touches:points(150)}));flush();assert.equal(editor.scale,1.5);
+editor.events.gesturestart(event({scale:1}));editor.events.gesturechange(event({scale:2}));flush();assert.equal(editor.scale,1.5);
+editor.events.touchend(event({touches:[]}));assert.equal(stored,'1.5');assert.equal(editor.value,'FROM debian\n');
+reset.events.click();assert.equal(editor.scale,1);
+editor.events.gesturestart(event({scale:1}));editor.events.gesturechange(event({scale:10}));flush();editor.events.gestureend(event({}));assert.equal(editor.scale,3);assert(larger.disabled);
+editor.events.gesturestart(event({scale:1}));editor.events.gesturechange(event({scale:.001}));flush();editor.events.gestureend(event({}));assert.equal(editor.scale,.25);assert(smaller.disabled);
+reset.events.click();const wheel=event({ctrlKey:true,deltaY:-10,deltaMode:0,clientX:20,clientY:30});editor.events.wheel(wheel);flush();assert(wheel.prevented);assert(editor.scale>1);timer();assert.equal(Number(stored),editor.scale);
+const pointer=event({});smaller.events.pointerdown(pointer);assert(pointer.prevented);
+console.log('PASS: touch and Safari pinch, duplicate gesture suppression, trackpad zoom, normal scrolling, bounds, reset, persistence, unchanged text');

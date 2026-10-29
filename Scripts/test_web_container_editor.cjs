@@ -13,7 +13,10 @@ function setup() {
     findSafeSpace: () => ({id: 'selected', name: 'Selected', ownsContainer: true}),
     managedContainer: value => value.ownsContainer !== false,
     containerDialogHeader: title => title,
-    escapeHTML: String,
+    escapeHTML: String, state: {},
+    configureDockerfileZoom: () => {},
+    agentConnection: () => ({local: true}),
+    codingAgentHTML: (scope, editing) => editing ? '<button type="button" data-add-opencode>Add OpenCode</button>' : "",
     safeSpaceRuntimeDescription: () => 'Apple container', runtimeOptions: () => '',
     document: {createElement: node},
     safeSpaceRequest: (operation, values) => { requests.push({operation, values}); return response; },
@@ -42,6 +45,10 @@ function setup() {
   assert.equal(ready.dialogs.length, 2);
   assert.match(ready.dialogs[1].markup, /Fresh name/);
   assert.match(ready.dialogs[1].markup, /FROM fresh/);
+  assert.match(ready.dialogs[1].markup, /aria-selected="true" data-config-tab="dockerfile"/);
+  assert.match(ready.dialogs[1].markup, /data-config-panel="agent" hidden/);
+  assert.match(ready.dialogs[1].markup, /data-config-panel="agent" hidden><button type="button" data-add-opencode>Add OpenCode/);
+  assert.doesNotMatch(ready.dialogs[1].markup, /data-action="configure-container"/);
   const closed = setup();
   const abandoned = closed.context.openContainerConfiguration('selected');
   closed.dialogs[0].isConnected = false;
