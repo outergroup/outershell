@@ -10,7 +10,7 @@ const editor = {...element(),isConnected:true,scrollTop:100,scrollLeft:20,value:
 const smaller=element(),larger=element(),reset=element();
 const form={elements:{dockerfile:editor},querySelector:selector=>selector.includes('smaller')?smaller:selector.includes('larger')?larger:reset};
 let stored=null, frame=null, timer=null;
-const context={document:{activeElement:editor,querySelector:()=>null},window:{innerHeight:800},localStorage:{getItem:()=>stored,setItem:(key,value)=>stored=value},requestAnimationFrame:fn=>{frame=fn;return 1;},cancelAnimationFrame:()=>{frame=null;},setTimeout:fn=>{timer=fn;return 1;},clearTimeout:()=>{timer=null;}};
+const context={document:{activeElement:editor,querySelector:()=>null},window:{innerHeight:800,matchMedia:()=>({matches:false})},localStorage:{getItem:()=>stored,setItem:(key,value)=>stored=value},requestAnimationFrame:fn=>{frame=fn;return 1;},cancelAnimationFrame:()=>{frame=null;},setTimeout:fn=>{timer=fn;return 1;},clearTimeout:()=>{timer=null;}};
 vm.createContext(context);vm.runInContext(source.slice(source.indexOf('  function configureDockerfileZoom('),source.indexOf('  function mountDisplayName(')),context);
 const event = extra => ({preventDefault(){this.prevented=true;},...extra});
 const flush = () => {if(frame){const fn=frame;frame=null;fn();}};
@@ -26,4 +26,6 @@ editor.events.gesturestart(event({scale:1}));editor.events.gesturechange(event({
 editor.events.gesturestart(event({scale:1}));editor.events.gesturechange(event({scale:.001}));flush();editor.events.gestureend(event({}));assert.equal(editor.scale,.25);assert(smaller.disabled);
 reset.events.click();const wheel=event({ctrlKey:true,deltaY:-10,deltaMode:0,clientX:20,clientY:30});editor.events.wheel(wheel);flush();assert(wheel.prevented);assert(editor.scale>1);timer();assert.equal(Number(stored),editor.scale);
 const pointer=event({});smaller.events.pointerdown(pointer);assert(pointer.prevented);
+stored=null;context.window.matchMedia=()=>({matches:true});context.configureDockerfileZoom(form);assert.equal(editor.scale,.5);assert.equal(reset.textContent,'50%');
+stored='1.25';context.configureDockerfileZoom(form);assert.equal(editor.scale,1.25);
 console.log('PASS: touch and Safari pinch, duplicate gesture suppression, trackpad zoom, normal scrolling, bounds, reset, persistence, unchanged text');

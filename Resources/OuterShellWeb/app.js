@@ -594,8 +594,9 @@
     const id = endpointGroupID(entry);
     const keys = groupPinKeys(id, entries.filter(entry => endpointGroupID(entry) === id));
     const index = keys.indexOf(key);
-    const button = (action, label) => `<button class="context-menu-item" type="button" data-action="${action}" data-endpoint-key="${escapeHTML(key)}" role="menuitem">${contextMenuGlyph(action === "toggle-group-pin" ? "◇" : action === "move-pin-earlier" ? "↑" : "↓")}<span>${label}</span></button>`;
-    return button("toggle-group-pin", index < 0 ? "Pin to top" : "Unpin from top") + (allowReorder && index > 0 ? button("move-pin-earlier", "Move shortcut earlier") : "") + (allowReorder && index >= 0 && index < keys.length - 1 ? button("move-pin-later", "Move shortcut later") : "");
+    const pinIcon = `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M9 3h6v6l3 4v2H6v-2l3-4V3ZM12 15v7"/>${index >= 0 ? '<path d="m3 3 18 18"/>' : ""}</svg>`;
+    const button = (action, label) => `<button class="context-menu-item" type="button" data-action="${action}" data-endpoint-key="${escapeHTML(key)}" role="menuitem">${contextMenuGlyph(action === "toggle-group-pin" ? pinIcon : action === "move-pin-earlier" ? "↑" : "↓")}<span>${label}</span></button>`;
+    return button("toggle-group-pin", index < 0 ? "Pin" : "Unpin") + (allowReorder && index > 0 ? button("move-pin-earlier", "Move earlier") : "") + (allowReorder && index >= 0 && index < keys.length - 1 ? button("move-pin-later", "Move later") : "");
   }
 
   function changeGroupPin(key, action) {
@@ -1279,7 +1280,7 @@
 
   function openRenameEndpoint(item) {
     const key = hostBookmarkKey(item);
-    const dialog = openDialog(`${containerDialogHeader("Rename endpoint")}<form><div class="dialog-body"><label class="field">Name<input name="name" required value="${escapeHTML(item.displayName)}" autocomplete="off"></label><p class="field-note">Saved on this server. Used in endpoint lists and pinned shortcuts.</p><p class="container-message" role="status"></p></div><footer class="dialog-footer"><button type="button" data-action="close-dialog">Cancel</button><button type="submit" class="primary-button">Rename</button></footer></form>`);
+    const dialog = openDialog(`${containerDialogHeader("Rename endpoint")}<form><div class="dialog-body"><label class="field">Name<input name="name" required value="${escapeHTML(item.displayName)}" autocomplete="off"></label><p class="field-note">Saved on this server. Used wherever this endpoint appears.</p><p class="container-message" role="status"></p></div><footer class="dialog-footer"><button type="button" data-action="close-dialog">Cancel</button><button type="submit" class="primary-button">Rename</button></footer></form>`);
     const form = dialog.querySelector("form");
     form.elements.name.select();
     form.addEventListener("submit", event => {
@@ -1302,7 +1303,6 @@
     state.addWorkspace = workspace;
     state.addScope = scope;
     state.workspaceCatalog = [];
-    state.recipes = [];
     try {
       const { buffer } = await requestBuffer(workspaceAPIPath("/api/backends?web=1"));
       if (state.addWorkspace !== workspace) return;
@@ -1795,7 +1795,6 @@
     state.logSelection = null;
     state.addWorkspace = null;
     state.workspaceCatalog = [];
-    state.recipes = [];
     restartEventWatch();
   }
 
@@ -1845,6 +1844,7 @@
 
   function openAddDialog(tab = state.addTab) {
     const container = addContainer();
+    if (!["agent", "catalog", "bash", "dockerfile"].includes(tab)) tab = "agent";
     if ((container && (!managedContainer(container) || !["agent", "dockerfile"].includes(tab))) || (tab === "dockerfile" && (!container || !managedContainer(container)))) tab = "agent";
     const windowsCommands = state.hostPlatform === "windows" && !state.addWorkspace;
     state.addTab = tab;
@@ -1858,21 +1858,22 @@
       </article>` };
     });
     if (!state.addWorkspace && state.addScope !== "system") {
-      catalogEntries.push({ name: "OpenCode", html: `<article class="add-catalog-app">
-        <div class="app-icon" aria-hidden="true">&gt;_</div><h3>OpenCode</h3>
-        <button class="secondary-button" type="button" data-action="setup-opencode">${openCodeItem() ? "Open OpenCode" : "Set up OpenCode"}</button>
+      const installed = Boolean(openCodeItem());
+      catalogEntries.push({ name: "OpenCode", html: `<article class="add-catalog-app ${installed ? "installed" : ""}">
+        <span class="app-icon has-image" aria-hidden="true"><img src="/web/icons/opencode.svg" alt=""></span><h3>OpenCode</h3>
+        ${installed ? '<span class="catalog-installed">Installed</span>' : '<button class="secondary-button" type="button" data-action="setup-opencode">Install</button>'}
       </article>` });
     }
     const catalog = catalogEntries.length ? `<div class="add-catalog">${catalogEntries.sort((a, b) => a.name.localeCompare(b.name)).map(entry => entry.html).join("")}</div>` : `<p class="add-empty">No bundled apps are available for this account.</p>`;
     const bash = `<form id="bash-form">
       <div class="form-grid">
         <div class="field"><label for="bash-name">Display name</label><input id="bash-name" name="name" placeholder="My server" required></div>
-        <div class="field"><label for="bash-id">Identifier</label><input id="bash-id" class="mono" name="identifier" placeholder="my-server" required><span class="field-note">Used for the service and files.</span></div>
+        <div class="field"><label for="bash-id">Identifier</label><input id="bash-id" class="mono" name="identifier" placeholder="my-server" aria-describedby="bash-id-help" required><span id="bash-id-help" class="field-note">Names the app’s service and files.</span></div>
         <div class="field full"><label for="bash-command">${windowsCommands ? "Command Prompt commands (cmd.exe)" : "Bash commands"}</label><textarea id="bash-command" name="command" placeholder="${windowsCommands ? "cd /d C:\\dev\\my-app&#10;npm start" : "cd ~/dev/my-app&#10;npm start"}" required></textarea></div>
         <div class="field"><label for="bash-transport">Connection</label><select id="bash-transport" name="frontendTransport"><option value="port">TCP port</option>${windowsCommands ? '<option value="namedPipe">Named pipe</option>' : '<option value="unixSocket">Unix socket</option>'}</select></div>
         <div class="field" data-transport="port"><label for="bash-port">Port</label><input id="bash-port" class="mono" name="port" inputmode="numeric" placeholder="4000" required></div>
         <div class="field" data-transport="${windowsCommands ? "namedPipe" : "unixSocket"}" hidden><label for="bash-socket">${windowsCommands ? "Named pipe path" : "Socket path"}</label><input id="bash-socket" class="mono" name="socketPath" placeholder="${windowsCommands ? String.raw`\\.\pipe\my-app` : "/run/user/1000/my-app.sock"}"></div>
-        <div class="field full" ${windowsCommands ? "hidden" : ""}><label for="bash-icon">Icon path <span class="field-note">(optional)</span></label><input id="bash-icon" class="mono" name="iconPath" placeholder="~/Pictures/my-app.png"></div>
+        <div class="field full" ${windowsCommands ? "hidden" : ""}><label for="bash-icon">Icon path <span class="field-note">(optional, otherwise Outer Loop will try to fetch it)</span></label><input id="bash-icon" class="mono" name="iconPath" placeholder="~/Pictures/my-app.png"></div>
       </div>
       ${windowsCommands ? "<p>Outer Shell starts these commands as your signed-in user. The command script must keep running until your server exits. For example, use <code>python server.py</code>, not <code>start python server.py</code>. Configure the server to listen on this port or named pipe.</p>" : ""}
       <p id="bash-message" class="form-message" role="status"></p>
@@ -1885,76 +1886,14 @@
       ...(container && managedContainer(container) ? [["dockerfile", "Manual", '<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8Z"/><path d="M14 2v6h6M8 13h8M8 17h6"/>']] : []),
       ["catalog", "Outer Shell app catalog", '<rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/>'],
       ["bash", windowsCommands ? "Run commands" : "Run bash commands", '<rect x="2" y="3" width="20" height="18" rx="2"/><path d="m6 8 3 3-3 3m6 0h5"/>'],
-      ["recipes", "Other recipes", '<rect x="2" y="3" width="20" height="18" rx="2"/><path d="M6 8h1m3 0h8M6 12h1m3 0h8M6 16h1m3 0h5"/>']
-    ].filter(([id]) => (!container || id === "agent" || managedContainer(container) && id === "dockerfile") && (!(state.addWorkspace || windowsCommands) || state.addScope !== "system" || id === "catalog" || id === "agent" || id === "dockerfile" || windowsCommands && id === "bash") && (!windowsCommands || id !== "recipes"));
+    ].filter(([id]) => (!container || id === "agent" || managedContainer(container) && id === "dockerfile") && (!(state.addWorkspace || windowsCommands) || state.addScope !== "system" || id === "catalog" || id === "agent" || id === "dockerfile" || windowsCommands && id === "bash"));
     const dialog = openDialog(`
       <header class="dialog-header"><div class="dialog-title-wrap">${container ? `<button class="container-back" type="button" data-action="manage-container" data-safe-space-id="${escapeHTML(container.id)}">‹ Manage</button>` : ""}<h2 id="dialog-title">${container ? "Edit container" : "Add Apps"}${state.addWorkspace ? ` · ${escapeHTML(state.addWorkspace.name)}${container ? "" : ` / ${state.addScope === "system" ? "root" : escapeHTML(state.addWorkspace.userName || "user")}`}` : ""}</h2></div><button class="dialog-close" type="button" data-action="close-dialog" aria-label="Close">×</button></header>
       <div class="dialog-body">
         <nav class="add-categories" aria-label="Add app type">${categories.map(([id, title, paths]) => `<button class="add-category" type="button" data-action="add-tab" data-tab="${id}" aria-pressed="${tab === id}"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${paths}</svg><span>${title}</span></button>`).join("")}</nav>
-        <section class="add-content" aria-label="${categories.find(([id]) => id === tab)?.[1] || "Apps"}">${tab === "dockerfile" ? dockerfile : tab === "catalog" ? catalog : tab === "bash" ? bash : tab === "agent" ? codingAgent : '<div id="add-recipes" aria-live="polite">Loading recipes…</div>'}</section>
+        <section class="add-content" aria-label="${categories.find(([id]) => id === tab)?.[1] || "Apps"}">${tab === "dockerfile" ? dockerfile : tab === "catalog" ? catalog : tab === "bash" ? bash : codingAgent}</section>
       </div>`, "add-apps-dialog");
     if (tab === "bash") wireBashForm(dialog);
-    if (tab === "recipes") loadAddRecipes(dialog);
-  }
-
-  async function loadAddRecipes(dialog) {
-    const host = dialog.querySelector("#add-recipes");
-    try {
-      const { buffer } = await requestBuffer("/api/recipes");
-      if (!dialog.isConnected) return;
-      const recipes = new PayloadReader(buffer).child(8).payloadArray().map(reader => ({
-        id: reader.stringRef(0), name: reader.stringRef(8), summary: reader.stringRef(16),
-        fields: reader.child(24).payloadArray().map(field => ({
-          key: field.stringRef(0), label: field.stringRef(8), value: field.stringRef(16),
-          type: field.stringRef(24), placeholder: field.stringRef(32),
-          choices: field.child(48).payloadArray().map(choice => ({ title: choice.stringRef(0), value: choice.stringRef(8) }))
-        }))
-      })).filter(recipe => ["jupyter", "jupyter-uv"].includes(recipe.id));
-      if (!recipes.length) { host.textContent = "No other recipes are available on this server."; return; }
-      host.innerHTML = `<div class="recipe-choices">${recipes.map((recipe, index) => `<button type="button" class="recipe-choice" data-recipe-index="${index}" aria-pressed="${index === 0}">${escapeHTML(recipe.name)}</button>`).join("")}</div><div class="recipe-editor"></div>`;
-      const selectRecipe = index => {
-        const recipe = recipes[index];
-        host.querySelectorAll("[data-recipe-index]").forEach(button => button.setAttribute("aria-pressed", String(Number(button.dataset.recipeIndex) === index)));
-        host.querySelector(".recipe-editor").innerHTML = `<p class="recipe-summary">${escapeHTML(recipe.summary)}</p><form id="recipe-form"><div class="form-grid">${recipe.fields.map(field => {
-          const id = `recipe-${field.key}`;
-          const input = field.type === "choice"
-            ? `<select id="${escapeHTML(id)}" name="${escapeHTML(field.key)}">${field.choices.map(choice => `<option value="${escapeHTML(choice.value)}" ${choice.value === field.value ? "selected" : ""}>${escapeHTML(choice.title)}</option>`).join("")}</select>`
-            : `<input id="${escapeHTML(id)}" name="${escapeHTML(field.key)}" value="${escapeHTML(field.value)}" placeholder="${escapeHTML(field.placeholder)}" ${["name", "identifier", "python", "workdir", "projectDir"].includes(field.key) ? "required" : ""}>`;
-          return `<div class="field" ${field.key === "port" ? 'data-recipe-port' : ""}><label for="${escapeHTML(id)}">${escapeHTML(field.label)}</label>${input}</div>`;
-        }).join("")}</div><p class="form-message" role="status"></p><footer class="dialog-footer"><button class="secondary-button" type="button" data-action="close-dialog">Cancel</button><button class="primary-button" type="submit">Create app</button></footer></form>`;
-        const form = host.querySelector("form");
-        const transport = form.elements.namedItem("frontendTransport");
-        const updateTransport = () => {
-          const port = form.querySelector("[data-recipe-port]");
-          if (port) { port.hidden = transport.value !== "port"; port.querySelector("input").disabled = port.hidden; }
-        };
-        transport?.addEventListener("change", updateTransport);
-        if (transport) updateTransport();
-        form.addEventListener("submit", async event => {
-          event.preventDefault();
-          const button = form.querySelector('[type="submit"]');
-          const message = form.querySelector(".form-message");
-          button.disabled = true; button.textContent = "Creating…"; message.textContent = "";
-          try {
-            const query = new URLSearchParams(new FormData(form)); query.set("recipe", recipe.id);
-            const { buffer } = await requestBuffer(`/api/create?${query}`, { method: "POST" }, true);
-            const result = decodeAction(buffer);
-            if (!result.ok) throw new Error(result.message || "Could not create the app.");
-            if (dialog.isConnected) closeDialog();
-            toast(result.message || `Created ${recipe.name}.`);
-            await refreshBackends({ quiet: true });
-          } catch (error) { message.textContent = error.message || String(error); button.disabled = false; button.textContent = "Create app"; }
-        });
-      };
-      host.querySelectorAll("[data-recipe-index]").forEach(button => button.addEventListener("click", () => selectRecipe(Number(button.dataset.recipeIndex))));
-      selectRecipe(0);
-    } catch (error) {
-      if (!dialog.isConnected) return;
-      host.textContent = error.message || "Could not load recipes.";
-      const retry = document.createElement("button"); retry.type = "button"; retry.className = "secondary-button"; retry.textContent = "Retry";
-      retry.addEventListener("click", () => { host.textContent = "Loading recipes…"; loadAddRecipes(dialog); });
-      host.append(retry);
-    }
   }
 
   function wireBashForm(dialog) {
@@ -2018,7 +1957,7 @@
     return `<span class="context-menu-glyph" aria-hidden="true">${value}</span>`;
   }
 
-  function endpointContextMenuHTML(item, scope, title) {
+  function endpointContextMenuHTML(item, scope) {
     const endpoint = item[scope];
     if (!endpoint) return "";
     const backend = endpoint.backend;
@@ -2026,13 +1965,12 @@
     const showControl = backend.canControl && (running || !endpointReady(endpoint));
     const key = escapeHTML(backendKey(backend));
     const script = String(backend.scriptPath || "").trim();
-    return `<section class="context-menu-section">
-      <h3>${escapeHTML(title)}</h3>
+    return `
       <a class="context-menu-item" href="${escapeHTML(navigationURL(endpoint.frontend))}" data-action="launch-endpoint" data-app-key="${escapeHTML(item.identity)}" data-app-scope="${scope}" role="menuitem">${contextMenuGlyph("↗")}<span>Open</span></a>
       ${showControl ? `<button class="context-menu-item" type="button" data-action="control" data-operation="${running ? "stop" : "start"}" data-backend-key="${key}" role="menuitem">${contextMenuGlyph(running ? "■" : "▶")}<span>${running ? "Stop" : endpointFailure(endpoint, item.displayName) ? "Retry" : "Start"}</span></button>` : ""}
       ${backend.logFiles.length ? `<button class="context-menu-item" type="button" data-action="logs" data-backend-key="${key}" role="menuitem">${contextMenuGlyph("≡")}<span>View Logs</span></button>` : ""}
       ${script ? `<button class="context-menu-item" type="button" data-action="copy-script" data-script="${escapeHTML(script)}" role="menuitem">${contextMenuGlyph("⧉")}<span>Copy Script Path</span></button>` : ""}
-    </section>`;
+    `;
   }
 
   function showContextMenu(contents, point = null, label = "Actions") {
@@ -2053,7 +1991,7 @@
     if (!item) return;
     if (item.workspace) { openContainerMenu(item.workspace.id, item.app.serviceID, containerFrontendKey(item.app), point, context); return; }
     const backend = item.backend;
-    const sections = [endpointContextMenuHTML(item, "primary", backend.serviceScope === "system" ? "Root" : "User")];
+    const sections = [endpointContextMenuHTML(item, "primary")];
     const management = [
       pinMenuHTML(hostBookmarkKey(item), context === "shortcut"),
       renameEndpointMenuHTML(item),
@@ -2075,8 +2013,8 @@
     if (isOuterShell || backend.canUninstall) {
       management.push(`<button class="context-menu-item danger" type="button" data-action="${isOuterShell ? "uninstall-outer-shell" : "uninstall"}" data-backend-key="${escapeHTML(backendKey(backend))}" role="menuitem">${contextMenuGlyph("−")}<span>Uninstall</span></button>`);
     }
-    if (management.length) sections.push(`<section class="context-menu-section context-menu-management">${management.join("")}</section>`);
-    showContextMenu(`<div class="context-menu-app-heading">${launcherIconHTML(item)}<strong>${escapeHTML(item.displayName)}</strong></div>${sections.filter(Boolean).join("")}`, point, `${item.displayName} actions`);
+    sections.push(...management);
+    showContextMenu(`<div class="context-menu-app-heading">${launcherIconHTML(item)}<strong>${escapeHTML(item.displayName)}</strong></div><section class="context-menu-section">${sections.filter(Boolean).join("")}</section>`, point, `${item.displayName} actions`);
   }
 
   function managedContainer(workspace) {
@@ -2350,7 +2288,8 @@
     const larger = form.querySelector("[data-dockerfile-larger]");
     const reset = form.querySelector("[data-dockerfile-reset]");
     const key = "outershell.dockerfileTextScale", minimum = .25, maximum = 3;
-    let scale = 1, frame = null, pending = null, saveTimer = null, touchPinch = null, gesturePinch = null;
+    let scale = window.matchMedia("(any-pointer: coarse)").matches ? .5 : 1;
+    let frame = null, pending = null, saveTimer = null, touchPinch = null, gesturePinch = null;
     try {
       const stored = Number(localStorage.getItem(key));
       if (Number.isFinite(stored) && stored >= minimum && stored <= maximum) scale = stored;
@@ -3460,16 +3399,31 @@
     }
   });
   elements.add.addEventListener("click", () => openAddDialog());
-  document.body.addEventListener("contextmenu", event => {
-    const identity = itemIdentityFromTarget(event.target);
+  function handleAppContextMenu(event) {
+    let target = event.target;
+    const backdrop = elements.dialogLayer.querySelector(".context-menu-backdrop");
+    const replacingMenu = Boolean(backdrop);
+    if (backdrop) {
+      event.preventDefault();
+      if (target.closest?.(".context-menu")) return;
+      const visibility = backdrop.style.visibility;
+      backdrop.style.visibility = "hidden";
+      try { target = document.elementFromPoint(event.clientX, event.clientY); }
+      finally { backdrop.style.visibility = visibility; }
+    }
+    const identity = itemIdentityFromTarget(target);
+    const context = identity ? menuContext(target) : "endpoint";
+    if (replacingMenu) closeDialog();
     if (!identity) return;
     event.preventDefault();
     cancelLongPress();
     finishEndpointDrag(false);
     clearPressFeedback();
-    if (Date.now() < state.suppressLaunchUntil && elements.dialogLayer.childElementCount) return;
-    if (identity) openAppMenu(identity, { x: event.clientX, y: event.clientY }, menuContext(event.target));
-  });
+    if (!replacingMenu && Date.now() < state.suppressLaunchUntil && elements.dialogLayer.childElementCount) return;
+    openAppMenu(identity, { x: event.clientX, y: event.clientY }, context);
+  }
+
+  document.body.addEventListener("contextmenu", handleAppContextMenu);
   document.body.addEventListener("pointerdown", beginLongPress);
   document.body.addEventListener("pointerdown", beginPressFeedback);
   document.body.addEventListener("dragstart", event => {

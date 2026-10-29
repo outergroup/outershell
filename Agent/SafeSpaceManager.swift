@@ -345,6 +345,32 @@ enum SafeSpaceManagerError: Error, LocalizedError {
     }
 }
 
+private struct SafeSpaceEndpointPublicationFailures {
+    private struct Failure {
+        let firstObserved: TimeInterval
+        var reportedMessage: String?
+    }
+
+    private var failures: [String: Failure] = [:]
+
+    mutating func record(_ message: String, for key: String,
+                         now: TimeInterval = ProcessInfo.processInfo.systemUptime) -> Bool {
+        var failure = failures[key] ?? Failure(firstObserved: now)
+        let shouldReport = now - failure.firstObserved >= 30 && failure.reportedMessage != message
+        if shouldReport { failure.reportedMessage = message }
+        failures[key] = failure
+        return shouldReport
+    }
+
+    mutating func recover(_ key: String) -> Bool {
+        failures.removeValue(forKey: key)?.reportedMessage != nil
+    }
+
+    mutating func retain(_ keys: Set<String>, prefix: String) {
+        failures = failures.filter { !$0.key.hasPrefix(prefix) || keys.contains($0.key) }
+    }
+}
+
 final class SafeSpaceManager: @unchecked Sendable {
     static let shared = SafeSpaceManager()
 
@@ -357,6 +383,7 @@ final class SafeSpaceManager: @unchecked Sendable {
     private var cachedApps: [UUID: [SafeSpaceCachedApp]] = [:]
     private var publishedForwards: [String: SafeSpaceSocketRelayForward] = [:]
     private let recipeFileLock = NSRecursiveLock()
+    private var endpointPublicationFailures = SafeSpaceEndpointPublicationFailures()
     private var socketPublications: [String: Task<String, Error>] = [:]
     private var transientStates: [UUID: String] = [:]
     private var buildProgress: [UUID: SafeSpaceBuildProgress] = [:]
@@ -3488,10 +3515,16 @@ final class SafeSpaceManager: @unchecked Sendable {
         _ snapshots: [SafeSpaceAppSnapshot],
         for record: SafeSpaceRecord
     ) async -> [SafeSpaceAppSnapshot] {
+        let prefix = "\(record.id.uuidString.lowercased())\n"
+        let activeKeys = Set(snapshots.filter { $0.isRunning && $0.publishedPort == nil }
+            .map { prefix + $0.socketPath })
+        lock.withSafeSpaceLock {
+            endpointPublicationFailures.retain(activeKeys, prefix: prefix)
+        }
         var result: [SafeSpaceAppSnapshot] = []
         result.reserveCapacity(snapshots.count)
         for snapshot in snapshots {
-            if snapshot.publishedPort != nil {
+            if !snapshot.isRunning || snapshot.publishedPort != nil {
                 result.append(snapshot)
                 continue
             }
@@ -3507,6 +3540,13 @@ final class SafeSpaceManager: @unchecked Sendable {
                                                   externalSocketPath: publishedPath,
                                                   in: record)
                 }
+                let recovered = lock.withSafeSpaceLock {
+                    endpointPublicationFailures.recover(prefix + snapshot.socketPath)
+                }
+                if recovered {
+                    NSLog("Published app endpoint %@ in container %@ after recovery",
+                          snapshot.serviceID, record.name)
+                }
                 result.append(SafeSpaceAppSnapshot(
                     frontendID: snapshot.frontendID,
                     serviceID: snapshot.serviceID,
@@ -3519,10 +3559,16 @@ final class SafeSpaceManager: @unchecked Sendable {
                     publishedPort: snapshot.publishedPort
                 ))
             } catch {
-                NSLog("Could not publish app endpoint %@ in container %@: %@",
-                      snapshot.serviceID,
-                      record.name,
-                      error.localizedDescription)
+                let shouldReport = lock.withSafeSpaceLock {
+                    endpointPublicationFailures.record(error.localizedDescription,
+                                                       for: prefix + snapshot.socketPath)
+                }
+                if shouldReport {
+                    NSLog("Could not publish app endpoint %@ in container %@: %@",
+                          snapshot.serviceID,
+                          record.name,
+                          error.localizedDescription)
+                }
                 result.append(snapshot)
             }
         }
@@ -6013,6 +6059,7 @@ final class SafeSpaceManager: @unchecked Sendable {
     private func closePublishedForwards(_ id: UUID) {
         let prefix = "\(id.uuidString.lowercased())\n"
         let removed = lock.withSafeSpaceLock { () -> [SafeSpaceSocketRelayForward] in
+            endpointPublicationFailures.retain([], prefix: prefix)
             let values = publishedForwards.compactMap {
                 $0.key.hasPrefix(prefix) ? $0.value : nil
             }
