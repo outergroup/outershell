@@ -2169,6 +2169,11 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         case .windowActiveUpdate(let isActive):
             guard windowIsActive != isActive else { return }
             windowIsActive = isActive
+            if !isActive {
+                createInputController.breakUndoCoalescing()
+                workspaceRenameInputController.breakUndoCoalescing()
+                passwordInputController.breakUndoCoalescing()
+            }
             updateWindowActiveAppearance()
 
         case .selectionToPasteboardCopyRequest(let requestID):
@@ -2510,6 +2515,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func dismissCreateOverlay(removeGeneratedProjectStaging: Bool = true) {
+        createInputController.resetUndoHistory()
         if removeGeneratedProjectStaging {
             discardGeneratedNativeProject()
         } else {
@@ -10201,6 +10207,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                           let response = try? ActionResponse.decodeBinary(data) {
                         self.createMessage = response.message
                         if response.ok {
+                            self.createInputController.resetUndoHistory()
                             self.createValues.removeAll()
                             self.applyRecipeDefaults(overwrite: true)
                             self.pendingFilePicker = nil
@@ -10271,6 +10278,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                           let response = try? ActionResponse.decodeBinary(data) {
                     self.createMessage = response.message
                     if response.ok {
+                        self.createInputController.resetUndoHistory()
                         self.createValues.removeAll()
                         self.ensureBashDefaults()
                         self.pendingFilePicker = nil
@@ -10746,39 +10754,30 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                   hasReplacementRange: Bool = false,
                                   replacementLocation: UInt64 = 0,
                                   replacementLength: UInt64 = 0) {
-        guard mode == .create, !text.isEmpty else { return }
+        guard mode == .create else { return }
         if !createInputController.isFocused {
             focusActiveCreateField()
         }
-        if hasReplacementRange {
-            createInputController.setCursorPosition(Int(replacementLocation), modifySelection: false)
-            let end = Int(replacementLocation + replacementLength)
-            createInputController.setCursorPosition(end, modifySelection: true)
-        }
+
         let cleaned = activeCreateFieldKey == "bashCommands" ? cleanBashCommandText(text) : cleanSingleLineText(text)
-        guard !cleaned.isEmpty else { return }
-        createInputController.insertText(cleaned)
+        createInputController.insertText(cleaned, replacementRange: hasReplacementRange
+            ? Int(replacementLocation)..<Int(replacementLocation + replacementLength) : nil)
     }
 
     private func insertWorkspaceRenameText(_ text: String,
                                            hasReplacementRange: Bool = false,
                                            replacementLocation: UInt64 = 0,
                                            replacementLength: UInt64 = 0) {
-        guard isWorkspaceNamePromptVisible, !text.isEmpty else { return }
+        guard isWorkspaceNamePromptVisible else { return }
         if !workspaceRenameInputController.isFocused {
             focusWorkspaceRenameField()
         }
-        if hasReplacementRange {
-            workspaceRenameInputController.setCursorPosition(Int(replacementLocation),
-                                                             modifySelection: false)
-            let end = Int(replacementLocation + replacementLength)
-            workspaceRenameInputController.setCursorPosition(end, modifySelection: true)
-        }
+
         let cleaned = isDockerfileFragmentPrompt
             ? cleanBashCommandText(text)
             : cleanSingleLineText(text)
-        guard !cleaned.isEmpty else { return }
-        workspaceRenameInputController.insertText(cleaned)
+        workspaceRenameInputController.insertText(cleaned, replacementRange: hasReplacementRange
+            ? Int(replacementLocation)..<Int(replacementLocation + replacementLength) : nil)
     }
 
     private func workspaceRenameReplacementRange(hasReplacementRange: Bool,
@@ -10894,9 +10893,13 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         blurCreateField()
         blurPasswordField()
         isSynchronizingWorkspaceRenameInput = true
-        if workspaceRenameInputController.text != workspaceRenameName {
-            workspaceRenameInputController.setText(workspaceRenameName)
+        let historyKey: String
+        if let workspace = pendingDockerfileWorkspace, !isRenamingContainerConfiguration {
+            historyKey = "configuration:\(workspace.id):\(containerConfigurationTab)"
+        } else {
+            historyKey = "prompt"
         }
+        workspaceRenameInputController.setText(workspaceRenameName, historyKey: historyKey)
         workspaceRenameInputController.allowsNewlines =
             pendingRecipeCommandWorkspace != nil || pendingRecipeEditStep != nil ||
             (pendingDockerfileWorkspace != nil && !isRenamingContainerConfiguration)
@@ -10952,6 +10955,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func blurPasswordField() {
+        passwordInputController.resetUndoHistory()
         passwordInputController.blur()
         updateInputMode()
         updateEditingAndPasteboardState()
@@ -10967,7 +10971,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         isSynchronizingCreateInput = true
         createInputController.allowsNewlines = key == "bashCommands"
         createInputController.visualLineWidth = createFieldLayouts[key]?.multiline == true ? createFieldLayouts[key]?.textFrame.width : nil
-        createInputController.setText(value)
+        createInputController.setText(value, historyKey: key)
         createInputController.focus(selectAll: selectAll)
         if let cursorPosition {
             createInputController.setCursorPosition(cursorPosition, modifySelection: false)
@@ -11187,7 +11191,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         }
 
         if passwordInputController.isFocused {
-            var enabledCommands: OuterframeEditCommandSet = []
+            var enabledCommands = passwordInputController.enabledEditCommands(in: requestedCommands.intersection([.undo, .redo]))
             if requestedCommands.contains(.paste) {
                 enabledCommands.insert(.paste)
             }
@@ -11930,7 +11934,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 $0.typeIdentifier == NSPasteboard.PasteboardType.string.rawValue
             }),
                let stringValue = String(data: representation.data, encoding: .utf8) {
-                workspaceRenameInputController.insertText(
+                workspaceRenameInputController.pasteText(
                     isDockerfileFragmentPrompt
                         ? cleanBashCommandText(stringValue)
                         : cleanSingleLineText(stringValue)
@@ -11945,7 +11949,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                    options: [.documentType: NSAttributedString.DocumentType.rtf],
                    documentAttributes: nil
                ) {
-                workspaceRenameInputController.insertText(
+                workspaceRenameInputController.pasteText(
                     isDockerfileFragmentPrompt
                         ? cleanBashCommandText(attributed.string)
                         : cleanSingleLineText(attributed.string)
@@ -11961,14 +11965,14 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         for item in items {
             if let representation = item.representations.first(where: { $0.typeIdentifier == NSPasteboard.PasteboardType.string.rawValue }),
                let stringValue = String(data: representation.data, encoding: .utf8) {
-                createInputController.insertText(cleanTextForActiveCreateField(stringValue))
+                createInputController.pasteText(cleanTextForActiveCreateField(stringValue))
                 return true
             }
             if let representation = item.representations.first(where: { $0.typeIdentifier == NSPasteboard.PasteboardType.rtf.rawValue }),
                let attributed = try? NSAttributedString(data: representation.data,
                                                         options: [.documentType: NSAttributedString.DocumentType.rtf],
                                                         documentAttributes: nil) {
-                createInputController.insertText(cleanTextForActiveCreateField(attributed.string))
+                createInputController.pasteText(cleanTextForActiveCreateField(attributed.string))
                 return true
             }
         }
@@ -11984,14 +11988,14 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         for item in items {
             if let representation = item.representations.first(where: { $0.typeIdentifier == NSPasteboard.PasteboardType.string.rawValue }),
                let stringValue = String(data: representation.data, encoding: .utf8) {
-                passwordInputController.insertText(cleanSingleLineText(stringValue))
+                passwordInputController.pasteText(cleanSingleLineText(stringValue))
                 return true
             }
             if let representation = item.representations.first(where: { $0.typeIdentifier == NSPasteboard.PasteboardType.rtf.rawValue }),
                let attributed = try? NSAttributedString(data: representation.data,
                                                         options: [.documentType: NSAttributedString.DocumentType.rtf],
                                                         documentAttributes: nil) {
-                passwordInputController.insertText(cleanSingleLineText(attributed.string))
+                passwordInputController.pasteText(cleanSingleLineText(attributed.string))
                 return true
             }
         }
@@ -16742,6 +16746,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func showRecipeCommandPrompt(for workspace: LocalWorkspaceRecord) {
+        workspaceRenameInputController.resetUndoHistory()
         workspaceNamePromptDismissesPanel = true
         isShowingWorkspacePanel = true
         isCreatingWorkspace = false
@@ -16777,6 +16782,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             sendWorkspaceRequest(operation: "list", includeDetails: true)
             return
         }
+        workspaceRenameInputController.resetUndoHistory()
         workspaceNamePromptDismissesPanel = true
         isShowingWorkspacePanel = true
         isCreatingWorkspace = false
@@ -16944,6 +16950,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
     @discardableResult
     private func saveContainerConfigurationDockerfile() -> Bool {
+        workspaceRenameInputController.breakUndoCoalescing()
         guard let workspace = pendingDockerfileWorkspace,
               !isPerformingWorkspaceOperation else {
             return false
@@ -17311,6 +17318,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func showRecipeBaseImagePrompt(for workspace: LocalWorkspaceRecord) {
+        workspaceRenameInputController.resetUndoHistory()
         guard let recipe = workspace.recipe else { return }
         workspaceNamePromptDismissesPanel = true
         isShowingWorkspacePanel = true
@@ -17359,6 +17367,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func showRecipeUserPrompt(for workspace: LocalWorkspaceRecord) {
+        workspaceRenameInputController.resetUndoHistory()
         workspaceNamePromptDismissesPanel = true
         isShowingWorkspacePanel = true
         isCreatingWorkspace = false
@@ -17384,6 +17393,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         for workspace: LocalWorkspaceRecord,
         step: LocalWorkspaceRecord.Recipe.Step
     ) {
+        workspaceRenameInputController.resetUndoHistory()
         guard step.isEditable else { return }
         workspaceNamePromptDismissesPanel = true
         isShowingWorkspacePanel = true
@@ -17410,6 +17420,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         for workspace: LocalWorkspaceRecord,
         userID: UUID?
     ) {
+        workspaceRenameInputController.resetUndoHistory()
         workspaceNamePromptDismissesPanel = true
         isShowingWorkspacePanel = true
         isCreatingWorkspace = false
@@ -17441,6 +17452,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         for workspace: LocalWorkspaceRecord,
         script: LocalWorkspaceRecord.Recipe.ScriptFile
     ) {
+        workspaceRenameInputController.resetUndoHistory()
         showRecipeScriptCreationPrompt(
             for: workspace,
             userID: UUID(uuidString: script.userID)
@@ -17479,6 +17491,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
     private func showSafeSpaceAppPrompt(for workspace: LocalWorkspaceRecord,
                                         kind: String) {
+        workspaceRenameInputController.resetUndoHistory()
         workspaceNamePromptDismissesPanel = true
         isShowingWorkspacePanel = true
         isCreatingWorkspace = false
@@ -17509,6 +17522,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func showWorkspaceRename(_ workspace: LocalWorkspaceRecord) {
+        workspaceRenameInputController.resetUndoHistory()
         isAddingWindowsContainerFolder = false
         isShowingWorkspacePanel = true
         isCreatingWorkspace = false
@@ -17527,6 +17541,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private func showContainerConfigurationRename(
         _ workspace: LocalWorkspaceRecord
     ) {
+        workspaceRenameInputController.resetUndoHistory()
         guard isContainerConfigurationEditorVisible else { return }
         if workspaceRenameInputController.isFocused {
             switch containerConfigurationTab {

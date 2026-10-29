@@ -1688,7 +1688,9 @@ public struct OuterframeEditCommandSet: OptionSet, Sendable {
     public static let find = OuterframeEditCommandSet(rawValue: 1 << 4)
     public static let findNext = OuterframeEditCommandSet(rawValue: 1 << 5)
     public static let findPrevious = OuterframeEditCommandSet(rawValue: 1 << 6)
-    public static let standard: OuterframeEditCommandSet = [.copy, .cut, .paste, .selectAll, .find, .findNext, .findPrevious]
+    public static let undo = OuterframeEditCommandSet(rawValue: 1 << 7)
+    public static let redo = OuterframeEditCommandSet(rawValue: 1 << 8)
+    public static let standard: OuterframeEditCommandSet = [.copy, .cut, .paste, .selectAll, .find, .findNext, .findPrevious, .undo, .redo]
 }
 
 public enum OuterframeContextMenuItemAction: UInt8, Sendable {
