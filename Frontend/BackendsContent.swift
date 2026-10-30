@@ -26,36 +26,18 @@ private struct EndpointIconDiskCache: Sendable {
         }
     }
 
-    private static let rendition = "96px-v1-"
+    private static let rendition = "96px-srgb-v2-"
 
     func image(for url: URL) -> CGImage? {
-        if let data = data(for: url, rendition: Self.rendition),
-           let source = CGImageSourceCreateWithData(data as CFData, nil),
-           let image = CGImageSourceCreateImageAtIndex(source, 0,
-                [kCGImageSourceShouldCacheImmediately: true] as CFDictionary) {
-            return image
+        if let data = data(for: url, rendition: Self.rendition) {
+            return normalizedIconCGImage(data)
         }
         guard let original = data(for: url) else { return nil }
         return storeImage(original, for: url)
     }
 
     func storeImage(_ data: Data, for url: URL) -> CGImage? {
-        guard let source = CGImageSourceCreateWithData(data as CFData, nil),
-              let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
-              let width = properties[kCGImagePropertyPixelWidth] as? Int,
-              let height = properties[kCGImagePropertyPixelHeight] as? Int else { return nil }
-        if max(width, height) <= 96 {
-            guard let image = CGImageSourceCreateImageAtIndex(source, 0,
-                [kCGImageSourceShouldCacheImmediately: true] as CFDictionary) else { return nil }
-            store(data, for: url, rendition: Self.rendition)
-            return image
-        }
-        guard let image = CGImageSourceCreateThumbnailAtIndex(source, 0, [
-            kCGImageSourceCreateThumbnailFromImageAlways: true,
-            kCGImageSourceCreateThumbnailWithTransform: true,
-            kCGImageSourceThumbnailMaxPixelSize: 96,
-            kCGImageSourceShouldCacheImmediately: true
-        ] as CFDictionary) else { return nil }
+        guard let image = normalizedIconCGImage(data) else { return nil }
         let encoded = NSMutableData()
         if let destination = CGImageDestinationCreateWithData(encoded, "public.png" as CFString, 1, nil) {
             CGImageDestinationAddImage(destination, image, nil)
@@ -194,13 +176,76 @@ private struct FrontendRecord {
 
 }
 
-private func decodedIconCGImage(_ data: Data) -> CGImage? {
-    guard !data.isEmpty,
-          let source = CGImageSourceCreateWithData(data as CFData, nil) else {
-        return nil
+private func normalizedIconCGImage(_ data: Data) -> CGImage? {
+    guard !data.isEmpty, let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) else { return nil }
+    let bitmap: CGImage?
+    if let source = CGImageSourceCreateWithData(data as CFData, nil) {
+        bitmap = CGImageSourceCreateThumbnailAtIndex(source, 0, [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: 96,
+            kCGImageSourceShouldCacheImmediately: true
+        ] as CFDictionary)
+    } else {
+        bitmap = nil
     }
-    let options = [kCGImageSourceShouldCacheImmediately: true] as CFDictionary
-    return CGImageSourceCreateImageAtIndex(source, 0, options)
+    let vector = bitmap == nil ? NSImage(data: data) : nil
+    let size = bitmap.map { CGSize(width: $0.width, height: $0.height) } ?? vector?.size ?? .zero
+    guard size.width > 0, size.height > 0, size.width.isFinite, size.height.isFinite else { return nil }
+    let scale = min(96 / max(size.width, size.height), 1)
+    let width = max(1, Int((size.width * scale).rounded()))
+    let height = max(1, Int((size.height * scale).rounded()))
+    guard let context = CGContext(data: nil, width: width, height: height,
+                                  bitsPerComponent: 8, bytesPerRow: width * 4,
+                                  space: colorSpace,
+                                  bitmapInfo: CGBitmapInfo.byteOrder32Little.rawValue |
+                                    CGImageAlphaInfo.premultipliedFirst.rawValue) else { return nil }
+    let rect = CGRect(x: 0, y: 0, width: width, height: height)
+    context.interpolationQuality = .high
+    if let bitmap {
+        context.draw(bitmap, in: rect)
+    } else if let vector {
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = NSGraphicsContext(cgContext: context, flipped: false)
+        vector.draw(in: rect, from: .zero, operation: .copy, fraction: 1)
+        NSGraphicsContext.restoreGraphicsState()
+    }
+    return context.makeImage()
+}
+
+private final class EmbeddedIconCache: @unchecked Sendable {
+    static let shared = EmbeddedIconCache()
+    private let lock = NSLock()
+    private let images = NSCache<NSString, CGImage>()
+    private var diskCache: EndpointIconDiskCache?
+
+    private init() {
+        images.totalCostLimit = 8 * 1024 * 1024
+    }
+
+    func configure(directory: URL?) {
+        lock.lock()
+        defer { lock.unlock() }
+        diskCache = directory.map { EndpointIconDiskCache(directory: $0) }
+    }
+
+    func image(for data: Data) -> CGImage? {
+        guard !data.isEmpty else { return nil }
+        let digest = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+        lock.lock()
+        defer { lock.unlock() }
+        let key = digest as NSString
+        if let image = images.object(forKey: key) { return image }
+        guard let url = URL(string: "outershell-icon://embedded/" + digest) else { return nil }
+        guard let image = diskCache?.image(for: url) ?? diskCache?.storeImage(data, for: url)
+                ?? normalizedIconCGImage(data) else { return nil }
+        images.setObject(image, forKey: key, cost: image.bytesPerRow * image.height)
+        return image
+    }
+}
+
+private func decodedIconCGImage(_ data: Data) -> CGImage? {
+    EmbeddedIconCache.shared.image(for: data)
 }
 
 private struct LogFileRecord: Decodable {
@@ -2484,6 +2529,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         endpointIconDiskCache = outerframeHost.stagedFileDirectoryURL.map {
             EndpointIconDiskCache(directory: $0.appendingPathComponent("cache/OuterShellIcons", isDirectory: true))
         }
+        EmbeddedIconCache.shared.configure(directory: endpointIconDiskCache?.directory)
         let iconConfiguration = URLSessionConfiguration.ephemeral
         iconConfiguration.urlCache = nil
         iconConfiguration.timeoutIntervalForRequest = 20
@@ -5478,7 +5524,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             defer { self.openCodeIconLoading = false }
             do {
                 let data = try await self.openCodeData("/web/icons/opencode.svg")
-                if let image = NSImage(data: data) { self.openCodeIcon = self.cgImage(for: image) }
+                self.openCodeIcon = decodedIconCGImage(data)
                 self.updateLayout()
             } catch {
                 self.openCodeIconRetryAfter = Date().addingTimeInterval(300)
