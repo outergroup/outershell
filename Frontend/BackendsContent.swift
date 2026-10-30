@@ -26,11 +26,28 @@ private struct EndpointIconDiskCache: Sendable {
         }
     }
 
-    private static let rendition = "96px-srgb-v2-"
+    private static let rendition = "96px-srgb-bgra-v3-"
+    private static let bitmapMagic = Data([0x4f, 0x53, 0x49, 0x43, 1, 0, 0, 0])
+
+    private static func bitmapImage(_ data: Data) -> CGImage? {
+        guard data.count >= 12, data.prefix(8) == bitmapMagic else { return nil }
+        let width = Int(data[8]) | Int(data[9]) << 8
+        let height = Int(data[10]) | Int(data[11]) << 8
+        guard (1...96).contains(width), (1...96).contains(height),
+              data.count == 12 + width * height * 4,
+              let colorSpace = CGColorSpace(name: CGColorSpace.sRGB),
+              let provider = CGDataProvider(data: data.subdata(in: 12..<data.count) as CFData) else { return nil }
+        return CGImage(width: width, height: height, bitsPerComponent: 8, bitsPerPixel: 32,
+                       bytesPerRow: width * 4, space: colorSpace,
+                       bitmapInfo: CGBitmapInfo(rawValue: CGBitmapInfo.byteOrder32Little.rawValue |
+                                                CGImageAlphaInfo.premultipliedFirst.rawValue),
+                       provider: provider, decode: nil, shouldInterpolate: true, intent: .defaultIntent)
+    }
 
     func image(for url: URL) -> CGImage? {
-        if let data = data(for: url, rendition: Self.rendition) {
-            return normalizedIconCGImage(data)
+        if let data = data(for: url, rendition: Self.rendition),
+           let image = Self.bitmapImage(data) {
+            return image
         }
         guard let original = data(for: url) else { return nil }
         return storeImage(original, for: url)
@@ -38,14 +55,16 @@ private struct EndpointIconDiskCache: Sendable {
 
     func storeImage(_ data: Data, for url: URL) -> CGImage? {
         guard let image = normalizedIconCGImage(data) else { return nil }
-        let encoded = NSMutableData()
-        if let destination = CGImageDestinationCreateWithData(encoded, "public.png" as CFString, 1, nil) {
-            CGImageDestinationAddImage(destination, image, nil)
-            if CGImageDestinationFinalize(destination) {
-                store(encoded as Data, for: url, rendition: Self.rendition)
-            } else {
-                print("Outer Shell: Cannot encode resized icon.")
+        if let pixels = image.dataProvider?.data {
+            var encoded = Self.bitmapMagic
+            encoded.append(contentsOf: [UInt8(image.width & 0xff), UInt8(image.width >> 8),
+                                        UInt8(image.height & 0xff), UInt8(image.height >> 8)])
+            let bytes = pixels as Data
+            for row in 0..<image.height {
+                let start = row * image.bytesPerRow
+                encoded.append(bytes.subdata(in: start..<(start + image.width * 4)))
             }
+            store(encoded, for: url, rendition: Self.rendition)
         }
         return image
     }

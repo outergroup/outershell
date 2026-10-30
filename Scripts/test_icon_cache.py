@@ -41,6 +41,26 @@ autoreleasepool {
     let disk = EndpointIconDiskCache(directory: directory).image(for: url)!
     precondition(disk.width == 96 && disk.height == 48 && disk.colorSpace?.name == CGColorSpace.sRGB)
     precondition(disk.dataProvider?.data as Data? == first.dataProvider?.data as Data?)
+    let diskCache = EndpointIconDiskCache(directory: directory)
+    let cacheFiles = try! FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
+    let bitmapFile = cacheFiles.first { $0.lastPathComponent.hasPrefix("96px-srgb-bgra-v3-") }!
+    let raw = try! Data(contentsOf: bitmapFile)
+    precondition(raw.count == 12 + 96 * 48 * 4)
+    let diskStart = CFAbsoluteTimeGetCurrent()
+    for _ in 0..<100 { precondition(diskCache.image(for: url)?.width == 96) }
+    let diskTime = (CFAbsoluteTimeGetCurrent() - diskStart) / 100
+    var badMagic = raw; badMagic[0] = 0
+    var badVersion = raw; badVersion[4] = 255
+    var zeroWidth = raw; zeroWidth[8] = 0
+    var largeHeight = raw; largeHeight[11] = 255
+    for invalid in [Data(raw.prefix(8)), Data(raw.dropLast()), raw + Data([0]), badMagic, badVersion, zeroWidth, largeHeight] {
+        try! invalid.write(to: bitmapFile)
+        precondition(diskCache.image(for: url) == nil)
+    }
+    diskCache.store(data, for: url)
+    precondition(diskCache.image(for: url)?.width == 96)
+    precondition(try! Data(contentsOf: bitmapFile) == raw)
+    print(String(format: "Raw disk cache hit average %.3f ms", diskTime * 1000))
     let svg = try! Data(contentsOf: URL(fileURLWithPath: CommandLine.arguments[2]))
     let icon = decodedIconCGImage(svg)!
     precondition(icon.width == 96 && icon.height == 96)
@@ -48,7 +68,7 @@ autoreleasepool {
     precondition(decodedIconCGImage(svg) === icon)
     precondition(decodedIconCGImage(Data()) == nil)
     precondition(decodedIconCGImage(Data("invalid image".utf8)) == nil)
-    print("PASS resized P3/alpha PNG, normalized disk roundtrip, identical memory-cache hits, OpenCode SVG, invalid input")
+    print("PASS resized P3/alpha PNG, raw bitmap roundtrip and corruption recovery, identical memory-cache hits, OpenCode SVG, invalid input")
     print(String(format: "PNG cold %.3f ms; warm average %.3f ms", cold * 1000, warm * 1000))
 }
 '''
