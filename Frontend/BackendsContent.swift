@@ -696,14 +696,14 @@ private struct LocalWorkspaceRecord: Decodable, Equatable {
     let ownsContainer: Bool?
     let runtimeName: String?
     let supportsLiveMounts: Bool?
-    let runtime: Runtime?
+    var runtime: Runtime?
     let capabilities: Capabilities?
     let shellCommand: String
     let apps: [LocalWorkspaceAppRecord]
     let commands: [LocalWorkspaceCommandRecord]?
-    let mounts: [Mount]?
+    var mounts: [Mount]?
     let persistentData: [PersistentData]?
-    let recipe: Recipe?
+    var recipe: Recipe?
     let outerShellSupport: OuterShellSupport?
     let buildProgress: BuildProgress?
 
@@ -17317,6 +17317,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         let detail: String
         let items: [OuterframeContextMenuItem]
     }
+    private var loadingContainerConfigurationID: UUID?
     private var managementPanel: ManagementPanel?
     private let managementOverlayLayer = CALayer()
     private var managementActions: [(frame: CGRect, id: String, title: String)] = []
@@ -17332,6 +17333,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func dismissManagementPanel() {
+        if loadingContainerConfigurationID != nil {
+            loadingContainerConfigurationID = nil
+            selectedRecipeSafeSpaceID = nil
+        }
         if let panel = managementPanel {
             pendingWorkspaceOverviewMenuActions.removeValue(forKey: panel.id)
             pendingSafeSpaceProviderMenuSelections.removeValue(forKey: panel.id)
@@ -17515,13 +17520,82 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         updateLayout()
     }
 
+    private func loadContainerConfiguration(for workspace: LocalWorkspaceRecord) {
+        guard loadingContainerConfigurationID == nil else { return }
+        let requestID = UUID()
+        loadingContainerConfigurationID = requestID
+        showManagementPanel(id: requestID, title: "Container: \(workspace.name)",
+                            detail: "Loading configuration…", items: [])
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                guard let endpoint = self.safeSpacesEndpoint, let session = self.urlSession else {
+                    throw NSError(domain: "OuterShell", code: 1, userInfo: [
+                        NSLocalizedDescriptionKey: "Outer Shell's container service is unavailable."
+                    ])
+                }
+                var request = URLRequest(url: endpoint)
+                request.httpMethod = "POST"
+                request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                request.httpBody = try JSONSerialization.data(withJSONObject: [
+                    "requestID": requestID.uuidString,
+                    "operation": "list",
+                    "workspaceID": workspace.id.uuidString,
+                    "configurationOnly": true
+                ])
+                let (data, response) = try await session.data(for: request)
+                struct ConfigurationResponse: Decodable {
+                    struct Configuration: Decodable {
+                        let id: UUID
+                        let recipe: LocalWorkspaceRecord.Recipe
+                        let mounts: [LocalWorkspaceRecord.Mount]
+                        let runtime: LocalWorkspaceRecord.Runtime?
+                    }
+                    let workspaces: [Configuration]
+                    let error: String?
+                }
+                let result = try JSONDecoder().decode(ConfigurationResponse.self, from: data)
+                guard (response as? HTTPURLResponse).map({ (200..<300).contains($0.statusCode) }) != false,
+                      result.error == nil,
+                      let configuration = result.workspaces.first(where: { $0.id == workspace.id }) else {
+                    throw NSError(domain: "OuterShell", code: 1, userInfo: [
+                        NSLocalizedDescriptionKey: result.error ?? "The container configuration is not available yet."
+                    ])
+                }
+                guard self.loadingContainerConfigurationID == requestID,
+                      self.selectedRecipeSafeSpaceID == workspace.id else { return }
+                self.loadingContainerConfigurationID = nil
+                self.managementPanel = nil
+                var updated = self.localWorkspaces.first(where: { $0.id == workspace.id }) ?? workspace
+                updated.recipe = configuration.recipe
+                updated.mounts = configuration.mounts
+                updated.runtime = configuration.runtime
+                if let index = self.localWorkspaces.firstIndex(where: { $0.id == workspace.id }) {
+                    self.localWorkspaces[index] = updated
+                }
+                self.beginContainerConfigurationEditor(for: updated)
+                self.updateLayout()
+            } catch {
+                guard self.loadingContainerConfigurationID == requestID else { return }
+                self.loadingContainerConfigurationID = nil
+                self.selectedRecipeSafeSpaceID = nil
+                self.showManagementPanel(id: requestID, title: "Container: \(workspace.name)",
+                                         detail: error.localizedDescription, items: [])
+            }
+        }
+    }
+
     private func beginContainerConfigurationEditor(
         for workspace: LocalWorkspaceRecord
     ) {
         guard let recipe = workspace.recipe else {
             selectedRecipeSafeSpaceID = workspace.id
-            sendWorkspaceRequest(operation: "list", includeDetails: true)
+            loadContainerConfiguration(for: workspace)
             return
+        }
+        if loadingContainerConfigurationID != nil {
+            loadingContainerConfigurationID = nil
+            managementPanel = nil
         }
         editorInputController.resetUndoHistory()
         workspaceNamePromptDismissesPanel = true
@@ -17595,6 +17669,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func endContainerConfigurationEditor() {
+        if loadingContainerConfigurationID != nil {
+            loadingContainerConfigurationID = nil
+            managementPanel = nil
+        }
         isAddingWindowsContainerFolder = false
         guard pendingDockerfileWorkspace != nil else { return }
         blurEditorInput()
