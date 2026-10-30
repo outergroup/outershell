@@ -241,29 +241,17 @@ private struct EventResponse {
     let logVersion: UInt64
 }
 
-private struct RecipesResponse: Decodable {
-    let pythonSuggestions: [String]
-    let recipes: [RecipeRecord]
-}
-
-private struct RecipeRecord: Decodable {
-    let identifier: String
-    let displayName: String
-    let summary: String
-    let fields: [RecipeFieldRecord]
-}
-
-private struct RecipeFieldRecord: Decodable {
+private struct CreateFieldRecord: Decodable {
     let key: String
     let label: String
     let defaultValue: String
     let fieldType: String
     let placeholder: String
     let suggestions: [String]
-    let choices: [RecipeChoiceRecord]
+    let choices: [CreateChoiceRecord]
 }
 
-private struct RecipeChoiceRecord: Decodable {
+private struct CreateChoiceRecord: Decodable {
     let title: String
     let value: String
 }
@@ -468,42 +456,6 @@ private extension EventResponse {
                              timedOut: (flags & 0x04) != 0,
                              backendsVersion: try reader.uint64(at: 8),
                              logVersion: try reader.uint64(at: 16))
-    }
-}
-
-private extension RecipesResponse {
-    static func decodeBinary(_ data: Data) throws -> RecipesResponse {
-        let reader = BinaryPayloadReader(data: data)
-        return RecipesResponse(pythonSuggestions: try reader.child(at: 0).stringArray(),
-                               recipes: try reader.child(at: 8).payloadArray().map(RecipeRecord.decodeBinary))
-    }
-}
-
-private extension RecipeRecord {
-    static func decodeBinary(_ reader: BinaryPayloadReader) throws -> RecipeRecord {
-        RecipeRecord(identifier: try reader.stringRef(at: 0),
-                     displayName: try reader.stringRef(at: 8),
-                     summary: try reader.stringRef(at: 16),
-                     fields: try reader.child(at: 24).payloadArray().map(RecipeFieldRecord.decodeBinary))
-    }
-}
-
-private extension RecipeFieldRecord {
-    static func decodeBinary(_ reader: BinaryPayloadReader) throws -> RecipeFieldRecord {
-        RecipeFieldRecord(key: try reader.stringRef(at: 0),
-                          label: try reader.stringRef(at: 8),
-                          defaultValue: try reader.stringRef(at: 16),
-                          fieldType: try reader.stringRef(at: 24),
-                          placeholder: try reader.stringRef(at: 32),
-                          suggestions: try reader.child(at: 40).stringArray(),
-                          choices: try reader.child(at: 48).payloadArray().map(RecipeChoiceRecord.decodeBinary))
-    }
-}
-
-private extension RecipeChoiceRecord {
-    static func decodeBinary(_ reader: BinaryPayloadReader) throws -> RecipeChoiceRecord {
-        RecipeChoiceRecord(title: try reader.stringRef(at: 0),
-                           value: try reader.stringRef(at: 8))
     }
 }
 
@@ -1076,6 +1028,7 @@ private enum BaseImageTemplate {
 }
 
 private enum ContainerConfigurationTab {
+    case codingAgent
     case dockerfile
     case mounts
     case environment
@@ -1086,8 +1039,8 @@ private enum ContainerConfigurationTab {
 private struct ContainerConfigurationMountDraft: Equatable {
     let id: UUID
     let name: String
-    let hostPath: String
-    let guestPath: String
+    var hostPath: String
+    var guestPath: String
     var isReadOnly: Bool
     let isInfrastructure: Bool
 }
@@ -1292,7 +1245,6 @@ private enum CreateSection: String {
     case codingAgent
     case bashCommands
     case nativeApp
-    case otherRecipes
 }
 
 private enum PendingButtonAction {
@@ -1317,7 +1269,6 @@ private enum PendingButtonAction {
     case aboutDismiss
     case passwordCancel
     case passwordSubmit
-    case recipe(String)
     case createSection(CreateSection)
     case perform(() -> Void)
     case performAtPoint((CGPoint) -> Void)
@@ -1364,6 +1315,242 @@ private enum NativeProjectSelectionState {
 private enum FilePickerMode {
     case chooseDirectory
     case chooseFile
+}
+
+private final class DockerfileTextLayout {
+    struct Line {
+        let text: String
+        let start: Int
+        let end: Int
+        let shaped: CTLine
+        let ascent: CGFloat
+        let width: CGFloat
+    }
+
+    let text: String
+    let lines: [Line]
+    let width: CGFloat
+
+    init(text: String) {
+        self.text = text
+        let font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+        var lines: [Line] = []
+        var start = 0
+        var width: CGFloat = 0
+        for part in text.split(separator: "\n", omittingEmptySubsequences: false) {
+            let value = String(part)
+            let shaped = CTLineCreateWithAttributedString(NSAttributedString(string: value, attributes: [
+                .font: font,
+                NSAttributedString.Key(kCTForegroundColorFromContextAttributeName as String): true
+            ]))
+            var ascent: CGFloat = 0
+            let lineWidth = CGFloat(CTLineGetTypographicBounds(shaped, &ascent, nil, nil))
+            width = max(width, lineWidth)
+            let end = start + value.count
+            lines.append(Line(text: value, start: start, end: end, shaped: shaped, ascent: ascent, width: lineWidth))
+            start = end + 1
+        }
+        self.lines = lines
+        self.width = width
+    }
+
+    private var cachedCaretPosition: Int?
+    private var cachedCaret: (row: Int, offset: CGFloat) = (0, 0)
+
+    func caret(at position: Int) -> (row: Int, offset: CGFloat) {
+        if cachedCaretPosition == position { return cachedCaret }
+        var lower = 0
+        var upper = lines.count
+        while lower < upper {
+            let middle = (lower + upper) / 2
+            if lines[middle].start <= position { lower = middle + 1 } else { upper = middle }
+        }
+        let row = max(lower - 1, 0)
+        guard lines.indices.contains(row) else { return (0, 0) }
+        let line = lines[row]
+        let character = min(max(position - line.start, 0), line.end - line.start)
+        let index = line.text.index(line.text.startIndex, offsetBy: character)
+        let utf16Index = line.text[..<index].utf16.count
+        var secondary: CGFloat = 0
+        let primary = CTLineGetOffsetForStringIndex(line.shaped, utf16Index, &secondary)
+        let offset = max(primary, secondary)
+        cachedCaretPosition = position
+        cachedCaret = (row, offset.isFinite ? max(offset, 0) : 0)
+        return cachedCaret
+    }
+
+    func visibleRows(top: CGFloat, height: CGFloat, scale: CGFloat) -> Range<Int> {
+        let lineHeight = 16 * scale
+        let first = min(max(Int(floor((top - height) / lineHeight)), 0), lines.count)
+        let end = min(max(Int(ceil(top / lineHeight)), first), lines.count)
+        return first..<end
+    }
+}
+
+private final class DockerfileTextTileLayer: CALayer {
+    var line: DockerfileTextLayout.Line?
+    var textScale: CGFloat = 1
+    var horizontalOffset: CGFloat = 0
+    var textColor = CGColor(gray: 0, alpha: 1)
+
+    override init() {
+        super.init()
+        contentsScale = 2
+    }
+
+    override init(layer: Any) {
+        super.init(layer: layer)
+        if let layer = layer as? DockerfileTextTileLayer {
+            line = layer.line
+            textScale = layer.textScale
+            horizontalOffset = layer.horizontalOffset
+            textColor = layer.textColor
+        }
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+    }
+
+    override func action(forKey event: String) -> CAAction? { nil }
+
+    override func draw(in context: CGContext) {
+        guard let line else { return }
+        context.saveGState()
+        context.clip(to: bounds)
+        context.setFillColor(textColor)
+        context.textMatrix = .identity
+        context.translateBy(x: -horizontalOffset, y: bounds.height - line.ascent * textScale)
+        context.scaleBy(x: textScale, y: textScale)
+        context.textPosition = .zero
+        CTLineDraw(line.shaped, context)
+        context.restoreGState()
+    }
+}
+
+private final class DockerfileTextViewportLayer: CALayer {
+    struct TileKey: Hashable {
+        let row: Int
+        let column: Int
+    }
+
+    var textLayout: DockerfileTextLayout?
+    var textOrigin = CGPoint.zero
+    var textScale: CGFloat = 1
+    var textColor = CGColor(gray: 0, alpha: 1)
+    var sourceHighlight: Range<Int>?
+    var highlightColor = CGColor(gray: 0.5, alpha: 0.13)
+    private(set) var tiles: [TileKey: DockerfileTextTileLayer] = [:]
+    private var highlightedRows: [Int: CALayer] = [:]
+    private var renderedLayout: DockerfileTextLayout?
+    private var renderedScale: CGFloat = 0
+    private var renderedContentsScale: CGFloat = 0
+    private var renderedColor: CGColor?
+    private let tileWidth: CGFloat = 512
+
+    override init() {
+        super.init()
+        contentsScale = 2
+        masksToBounds = true
+    }
+
+    override init(layer: Any) {
+        super.init(layer: layer)
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+    }
+
+    override func action(forKey event: String) -> CAAction? { nil }
+
+    func discardTiles() {
+        for tile in tiles.values {
+            tile.removeFromSuperlayer()
+            tile.contents = nil
+        }
+        tiles.removeAll()
+        for highlight in highlightedRows.values { highlight.removeFromSuperlayer() }
+        highlightedRows.removeAll()
+        renderedLayout = nil
+    }
+
+    override func layoutSublayers() {
+        super.layoutSublayers()
+        updateVisibleTiles()
+    }
+
+    func updateVisibleTiles() {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        defer { CATransaction.commit() }
+        guard let textLayout, bounds.width > 0, bounds.height > 0 else {
+            discardTiles()
+            return
+        }
+        if renderedLayout !== textLayout || renderedScale != textScale ||
+            renderedContentsScale != contentsScale || renderedColor != textColor {
+            discardTiles()
+            renderedLayout = textLayout
+            renderedScale = textScale
+            renderedContentsScale = contentsScale
+            renderedColor = textColor
+        }
+        let lineHeight = 16 * textScale
+        let visible = textLayout.visibleRows(top: textOrigin.y, height: bounds.height, scale: textScale)
+        let rows = max(visible.lowerBound - 2, 0)..<min(visible.upperBound + 2, textLayout.lines.count)
+        let firstColumn = max(Int(floor(-textOrigin.x / tileWidth)) - 1, 0)
+        let lastColumn = max(Int(floor((bounds.width - textOrigin.x) / tileWidth)) + 1, firstColumn)
+        var required: Set<TileKey> = []
+        var requiredHighlights: Set<Int> = []
+        for row in rows {
+            let line = textLayout.lines[row]
+            let bottom = textOrigin.y - CGFloat(row + 1) * lineHeight
+            if let sourceHighlight, line.end > sourceHighlight.lowerBound, line.start < sourceHighlight.upperBound {
+                requiredHighlights.insert(row)
+                let highlight = highlightedRows[row] ?? CALayer()
+                highlight.frame = CGRect(x: 0, y: bottom, width: bounds.width, height: lineHeight)
+                highlight.backgroundColor = highlightColor
+                if highlightedRows[row] == nil {
+                    insertSublayer(highlight, at: 0)
+                    highlightedRows[row] = highlight
+                }
+            }
+            let width = line.width * textScale + 4
+            guard !line.text.isEmpty else { continue }
+            for column in firstColumn...lastColumn {
+                let offset = CGFloat(column) * tileWidth
+                guard offset < width else { continue }
+                let key = TileKey(row: row, column: column)
+                required.insert(key)
+                let tile: DockerfileTextTileLayer
+                if let cached = tiles[key] {
+                    tile = cached
+                } else {
+                    tile = DockerfileTextTileLayer()
+                    tile.line = line
+                    tile.textScale = textScale
+                    tile.horizontalOffset = offset
+                    tile.textColor = textColor
+                    tile.contentsScale = contentsScale
+                    tiles[key] = tile
+                    addSublayer(tile)
+                    tile.setNeedsDisplay()
+                }
+                tile.frame = CGRect(x: textOrigin.x + offset, y: bottom,
+                                    width: min(tileWidth, width - offset), height: lineHeight)
+            }
+        }
+        for key in Array(tiles.keys) where !required.contains(key) {
+            if let tile = tiles.removeValue(forKey: key) {
+                tile.removeFromSuperlayer()
+                tile.contents = nil
+            }
+        }
+        for row in Array(highlightedRows.keys) where !requiredHighlights.contains(row) {
+            highlightedRows.removeValue(forKey: row)?.removeFromSuperlayer()
+        }
+    }
 }
 
 private final class LogTextFragmentLayer: CALayer {
@@ -1476,7 +1663,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private var logsEndpoint: URL?
     private var controlEndpoint: URL?
     private var createEndpoint: URL?
-    private var recipesEndpoint: URL?
     private var filePickerEndpoint: URL?
     private var eventsEndpoint: URL?
     private var nativeAppProjectEndpoint: URL?
@@ -1492,6 +1678,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private var didRegisterLayer = false
 
     private var backends: [BackendRecord] = []
+    private var launchingEndpoints: Set<String> = []
+    private var stoppingEndpoints: Set<String> = []
     private var backendError = ""
     private var selectedServiceID: String?
     private var selectedLog: LogSelection?
@@ -1500,14 +1688,11 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private var logError = ""
     private var isLoadingBackends = false
     private var isLoadingLog = false
-    private var isLoadingRecipes = false
     private var isPerformingAction = false
     private var lastBackendsResponseData: Data?
     private var backendsRefreshGeneration = 0
     private var mode: BackendsViewMode = .apps
-    private var recipes: [RecipeRecord] = []
-    private var selectedRecipeID = "command-port"
-    private var selectedCreateSection: CreateSection = .appCatalog
+    private var selectedCreateSection: CreateSection = .codingAgent
     private var createValues: [String: String] = [:]
     private var activeCreateFieldKey: String?
     private static let createFieldInputID = UUID()
@@ -1615,14 +1800,14 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private var workspaceRefreshGeneration = 0
     private var containerBuildProgressRefreshGeneration = 0
     private var containerConfigurationRebuildWorkspaceID: UUID?
-    private static let workspaceRenameInputID = UUID()
+    private static let editorInputID = UUID()
     private static let workspaceRenamePasteboardTypes = [
         NSPasteboard.PasteboardType.string.rawValue,
         NSPasteboard.PasteboardType.rtf.rawValue
     ]
-    private lazy var workspaceRenameInputController: SingleLineTextInputController<BackendsHandler> = {
+    private lazy var editorInputController: SingleLineTextInputController<BackendsHandler> = {
         let controller = SingleLineTextInputController<BackendsHandler>(
-            identifier: Self.workspaceRenameInputID,
+            identifier: Self.editorInputID,
             acceptedPasteboardTypeIdentifiers: Self.workspaceRenamePasteboardTypes
         )
         controller.delegate = self
@@ -1642,7 +1827,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private var isEditingCreationBaseImage = false
     private var workspaceNamePromptDismissesPanel = false
     private var workspaceRenameName = ""
-    private var isSynchronizingWorkspaceRenameInput = false
+    private var isSynchronizingEditorInput = false
     private var pendingSharedContainerImport: PendingSharedContainerImport?
     private var selectedRecipeSafeSpaceID: UUID?
     private var pendingRecipeCommandWorkspace: LocalWorkspaceRecord?
@@ -1680,6 +1865,27 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         ports: String,
         mounts: [ContainerConfigurationMountDraft]
     )?
+    private var containerConfigurationHorizontalScroll: CGFloat = 0
+    private var containerConfigurationTextWidth: CGFloat = 0
+    private let dockerfileTextSurface = DockerfileTextViewportLayer()
+    private var dockerfileTextLayout: DockerfileTextLayout?
+
+    private func cachedDockerfileLayout(for text: String) -> DockerfileTextLayout {
+        if let dockerfileTextLayout, dockerfileTextLayout.text == text { return dockerfileTextLayout }
+        let layout = DockerfileTextLayout(text: text)
+        dockerfileTextLayout = layout
+        return layout
+    }
+
+    private func updateDockerfileTextSurface() {
+        guard usesUnwrappedDockerfile, dockerfileTextSurface.superlayer != nil else { return }
+        dockerfileTextSurface.textOrigin = CGPoint(
+            x: 12 - containerConfigurationHorizontalScroll,
+            y: dockerfileTextSurface.bounds.height - 10 + containerConfigurationTextScroll)
+        dockerfileTextSurface.textScale = dockerfileTextScale
+        dockerfileTextSurface.setNeedsLayout()
+    }
+
     private var containerConfigurationTextScroll: CGFloat = 0
     private var containerConfigurationMountScroll: CGFloat = 0
     private var containerConfigurationRenderedTextScroll: CGFloat = 0
@@ -1696,7 +1902,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private var containerConfigurationBuildErrorCopyConfirmationID: UUID?
 
     private var isWorkspaceNamePromptVisible: Bool {
-        isCreatingWorkspace || pendingWorkspaceRename != nil ||
+        pendingEndpointRename != nil || isCreatingWorkspace || pendingWorkspaceRename != nil ||
             pendingRecipeCommandWorkspace != nil || pendingRecipeUserWorkspace != nil ||
             pendingDockerfileWorkspace != nil ||
             pendingRecipeBaseImageWorkspace != nil ||
@@ -1849,7 +2055,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
     private var codingAgentTextFrames: [(frame: CGRect, text: String)] = []
     private var createSectionFrames: [(frame: CGRect, section: CreateSection)] = []
-    private var recipeFrames: [(frame: CGRect, recipeID: String)] = []
     private var bundledAppInstallFrames: [(frame: CGRect, backend: BackendRecord)] = []
     private var createFieldFrames: [(frame: CGRect, key: String)] = []
     private var createFieldLayouts: [String: CreateFieldLayout] = [:]
@@ -1952,8 +2157,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private var dockerfileSelectionRange: NSRange?
     private var dockerfileDragAnchorOffset: Int?
     private var workspaceRenamePanelFrame = CGRect.zero
-    private var workspaceRenameFieldFrame = CGRect.zero
-    private var workspaceRenameTextFrame = CGRect.zero
+    private var editorInputFieldFrame = CGRect.zero
+    private var editorInputTextFrame = CGRect.zero
     private var workspaceRenameCancelFrame = CGRect.zero
     private var workspaceRenameConfirmFrame = CGRect.zero
     private var workspaceCreationBaseImageFrame = CGRect.zero
@@ -2069,8 +2274,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 self.updateLayout()
             }
             fetchBackends()
-            if mode == .create { fetchRecipes(); fetchWorkspaceCatalog() }
+            if mode == .create { fetchWorkspaceCatalog() }
             startEventWatch()
+            scheduleOpenCodeChecks()
             if workspaceContextID == nil {
                 sendWorkspaceRequest(operation: "list")
             }
@@ -2097,6 +2303,12 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 handleMouseDown(at: point, modifierFlags: modifierFlags, clickCount: clickCount)
             }
 
+        case .magnification(_, let magnification, let location, _):
+            if isContainerConfigurationEditorVisible, containerConfigurationTab == .dockerfile, containerConfigurationContentFrame.contains(location) {
+                scheduleDockerfileMagnification(magnification)
+            }
+        case .magnificationEnded:
+            break
         case .mouseDragged(let point, let modifierFlags):
             handleMouseDragged(to: point, modifierFlags: modifierFlags)
 
@@ -2162,7 +2374,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             if !isFocused {
                 blurCreateField()
                 blurPasswordField()
-                blurWorkspaceRenameField()
+                blurEditorInput()
             }
             updateEditingAndPasteboardState()
 
@@ -2171,10 +2383,11 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             windowIsActive = isActive
             if !isActive {
                 createInputController.breakUndoCoalescing()
-                workspaceRenameInputController.breakUndoCoalescing()
+                editorInputController.breakUndoCoalescing()
                 passwordInputController.breakUndoCoalescing()
             }
             updateWindowActiveAppearance()
+            if isActive { checkOpenCodeUpdates() }
 
         case .selectionToPasteboardCopyRequest(let requestID):
             outerframeHost.sendCopySelectedPasteboardResponse(requestID: requestID,
@@ -2257,7 +2470,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             logsEndpoint = URL(string: "/api/logs", relativeTo: base)?.absoluteURL
             controlEndpoint = URL(string: "/api/control", relativeTo: base)?.absoluteURL
             createEndpoint = URL(string: "/api/create", relativeTo: base)?.absoluteURL
-            recipesEndpoint = URL(string: "/api/recipes", relativeTo: base)?.absoluteURL
             filePickerEndpoint = URL(string: "/api/file-picker", relativeTo: base)?.absoluteURL
             eventsEndpoint = URL(string: "/api/events", relativeTo: base)?.absoluteURL
             nativeAppProjectEndpoint = URL(string: "/api/native-app-projects", relativeTo: base)?.absoluteURL
@@ -2391,22 +2603,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         return components.url
     }
 
-    private func urlForRecipeSafeSpace(_ workspaceID: UUID?) -> URL? {
-        guard let url = outerframeHost.pluginURL(),
-              var components = URLComponents(url: url, resolvingAgainstBaseURL: false) else {
-            return nil
-        }
-        var queryItems = components.queryItems ?? []
-        queryItems.removeAll { $0.name == "view" }
-        if let workspaceID {
-            components.path = "/safe-spaces/\(workspaceID.uuidString.lowercased())"
-        } else {
-            components.path = "/"
-        }
-        components.queryItems = queryItems.isEmpty ? nil : queryItems
-        return components.url
-    }
-
     private func navigateToMode(_ nextMode: BackendsViewMode, pushHistory: Bool) {
         guard nextMode != mode else { return }
         if let url = urlForMode(nextMode) {
@@ -2419,14 +2615,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         applyMode(nextMode)
     }
 
-    private func navigateToRecipeSafeSpace(_ workspaceID: UUID?, pushHistory: Bool) {
+    private func navigateToRecipeSafeSpace(_ workspaceID: UUID?) {
         guard selectedRecipeSafeSpaceID != workspaceID || mode != .apps else { return }
-        if let url = urlForRecipeSafeSpace(workspaceID) {
-            if pushHistory {
-                outerframeHost.pushHistoryEntry(url: url)
-            } else {
-                outerframeHost.replaceHistoryEntry(url: url)
-            }
+        if mode != .apps, let url = urlForMode(.apps) {
+            outerframeHost.replaceHistoryEntry(url: url)
         }
         selectedRecipeSafeSpaceID = workspaceID
         safeSpaceRecipeMessage = ""
@@ -2463,23 +2655,15 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func returnFromRecipeSafeSpace() {
-        if outerframeHost.canGoBackInHistory() {
-            selectedRecipeSafeSpaceID = nil
-            endContainerConfigurationEditor()
-            outerframeHost.goBackInHistory()
-        } else {
-            navigateToRecipeSafeSpace(nil, pushHistory: false)
-        }
+        navigateToRecipeSafeSpace(nil)
     }
 
     private func applyMode(_ nextMode: BackendsViewMode) {
-        if nextMode == .create && recipes.isEmpty { fetchRecipes() }
         let previousMode = mode
         if mode == .create && nextMode != .create {
             catalogWorkspaceID = nil
             catalogWorkspace = nil
             workspaceCatalogBackends = []
-            recipes = []
             blurCreateField()
             discardGeneratedNativeProject()
         }
@@ -2690,7 +2874,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                                                                   scrollOffsetOrigin: .bottom)
         filePickerScrollbar.delegate = filePickerScrollbarDelegate
         filePickerScrollbarController = filePickerScrollbar
-        createLayer.addSublayer(filePickerOverlayLayer)
+        rootLayer.addSublayer(filePickerOverlayLayer)
 
         titleLayer.string = ""
         privilegedAppsHeaderLayer.string = "PRIVILEGED APPS"
@@ -2773,7 +2957,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 statusSelectionLayer.frame = statusLayer.frame
 
                 let contentHeight = contentLayer.bounds.height
-                outerframeHost.sendTextInputGeometryUpdate(nil)
+                queueTextInputGeometryUpdate(nil)
                 appsLayer.isHidden = false
                 dividerLayer.isHidden = selectedServiceID == nil
                 logHeaderLayer.isHidden = selectedServiceID == nil
@@ -2795,17 +2979,15 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 if mode == .create {
                     renderCreateForm()
                 }
-                if mode == .create {
-                    renderFilePickerIfNeeded(width: createLayer.bounds.width,
-                                             height: createLayer.bounds.height)
-                }
                 updateStatusText()
                 renderInstallPromptIfNeeded(width: width, height: height)
                 renderUpdatePromptIfNeeded(width: width, height: height)
                 renderAboutPromptIfNeeded(width: width, height: height)
                 renderPasswordPromptIfNeeded(width: width, height: height)
                 renderWorkspacePanelIfNeeded(width: width, height: height)
+                renderFilePickerIfNeeded(width: width, height: height)
                 renderCopyConfirmationIfNeeded(width: width, height: height)
+                renderManagementPanel(width: width, height: height)
                 notifyAccessibilityLayoutChanged()
             }
             if inCurrentTransaction {
@@ -3053,9 +3235,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                 contentSpace: .create,
                                 selectionLayer: block.selectionLayer)
         }
+        codingAgentActions = codingAgentActions.map { ($0.frame.offsetBy(dx: 0, dy: deltaY), $0.title, $0.action) }
         codingAgentTextFrames = codingAgentTextFrames.map { ($0.frame.offsetBy(dx: 0, dy: deltaY), $0.text) }
         createSectionFrames = createSectionFrames.map { ($0.frame.offsetBy(dx: 0, dy: deltaY), $0.section) }
-        recipeFrames = recipeFrames.map { ($0.frame.offsetBy(dx: 0, dy: deltaY), $0.recipeID) }
         bundledAppInstallFrames = bundledAppInstallFrames.map { ($0.frame.offsetBy(dx: 0, dy: deltaY), $0.backend) }
         createFieldFrames = createFieldFrames.map { ($0.frame.offsetBy(dx: 0, dy: deltaY), $0.key) }
         createFieldLayouts = Dictionary(uniqueKeysWithValues: createFieldLayouts.map { key, layout in
@@ -3437,7 +3619,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                          width: 22,
                                          height: 22)
                 let remove = makeSymbolButtonLayer(
-                    symbolName: "minus.circle",
+                    symbolName: "trash",
                     accessibilityTitle: "Remove \(fragment.displayName)"
                 )
                 remove.frame = removeFrame
@@ -3996,6 +4178,15 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         groups.sort {
             (overviewLayout.groups.firstIndex(of: $0.id) ?? Int.max) < (overviewLayout.groups.firstIndex(of: $1.id) ?? Int.max)
         }
+        let innerWidth = max(cardWidth - 32, 1)
+        let pinColumns = max(1, Int(innerWidth / 96))
+        let dimensions = groups.map { group -> (apps: CGFloat, commands: CGFloat) in
+            let pinCount = group.items.filter(isAppProminent).count
+            let listCount = group.items.count - pinCount
+            let pins: CGFloat = pinCount == 0 ? 0 : CGFloat((pinCount + pinColumns - 1) / pinColumns) * 100 + 12
+            let commandCount = (group.workspace?.commandLaunchers.count ?? 0) + ((group.workspace?.shellCommand.isEmpty ?? true) ? 0 : 1)
+            return (pins + max(CGFloat(listCount) * 38, 28), commandCount == 0 ? 0 : 38 + CGFloat(commandCount) * 38)
+        }
         for (index, group) in groups.enumerated() {
             let column = index % columns
             let innerWidth = max(cardWidth - 32, 1)
@@ -4006,10 +4197,12 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             let commands = group.workspace?.commandLaunchers ?? []
             let hasTerminal = !(group.workspace?.shellCommand.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
             let commandCount = commands.count + (hasTerminal ? 1 : 0)
-            let commandsHeight: CGFloat = commandCount == 0 ? 0 : 38 + CGFloat(commandCount) * 38
-            let listHeight = max(CGFloat(listed.count) * 38, 28)
-            let canAddApps = group.workspace?.runtimeKind == "wsl" || (group.workspace?.capabilities?.supportsRecipes ?? true)
-            let cardHeight = 80 + pinHeight + listHeight + commandsHeight + (canAddApps ? 62 : 16)
+            let canAddApps = true
+            let rowStart = (index / columns) * columns
+            let rowDimensions = dimensions[rowStart..<min(rowStart + columns, dimensions.count)]
+            let appsHeight = rowDimensions.map(\.apps).max() ?? 0
+            let rowCommandsHeight = rowDimensions.map(\.commands).max() ?? 0
+            let cardHeight = 80 + appsHeight + rowCommandsHeight + 62
             let frame = CGRect(x: horizontalInset + CGFloat(column) * (cardWidth + gap),
                                y: tops[column] - cardHeight, width: cardWidth, height: cardHeight)
             let card = CALayer()
@@ -4021,7 +4214,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             card.borderColor = resolvedCGColor(.separatorColor)
             addAppsSublayer(card)
             overviewGroupFrames.append((frame, CGRect(x: frame.minX, y: frame.maxY - 70, width: frame.width, height: 70), group.id))
-            let titleWidth = max(innerWidth - (group.workspace == nil ? 0 : 88), 1)
+            let titleWidth = innerWidth
             let heading = makeTextLayer(size: 18, weight: .semibold, color: .labelColor)
             heading.string = group.name
             heading.frame = CGRect(x: frame.minX + 16, y: frame.maxY - 41, width: titleWidth, height: 24)
@@ -4044,9 +4237,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             addAppsSublayer(note)
             if let workspace = group.workspace {
                 workspaceOverviewRowFrames.append((frame, workspace))
-                let manage = CGRect(x: frame.maxX - 96, y: frame.maxY - 51, width: 80, height: 28)
-                renderOverviewButton("Manage…", frame: manage)
-                workspaceOverviewActionFrames.append((manage, workspace, "menu"))
+
             }
             var top = frame.maxY - 80
             let pinTop = top
@@ -4076,6 +4267,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 top -= 28
             }
             overviewDropFrames.append((CGRect(x: frame.minX + 8, y: top, width: cardWidth - 16, height: listTop - top), group.id, .moreApps))
+            top = frame.maxY - 80 - appsHeight
             if let workspace = group.workspace, commandCount > 0 {
                 let label = makeTextLayer(size: 12, weight: .medium, color: .secondaryLabelColor)
                 label.string = "Command line tools"
@@ -4098,10 +4290,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             }
             if canAddApps {
                 let add = CGRect(x: frame.minX + 16, y: frame.minY + 16,
-                                 width: min(innerWidth, group.workspace == nil || group.workspace?.runtimeKind == "wsl" ? 106 : 204), height: 28)
-                renderOverviewButton(group.workspace == nil || group.workspace?.runtimeKind == "wsl" ? "Add more…" : "Add more to Dockerfile…", frame: add)
+                                 width: min(innerWidth, 106), height: 28)
+                renderOverviewButton(group.workspace == nil || group.workspace?.runtimeKind == "wsl" ? "Add more…" : "Manage…", frame: add)
                 if let workspace = group.workspace, workspace.runtimeKind != "wsl" {
-                    workspaceOverviewActionFrames.append((add, workspace, "editContainer"))
+                    workspaceOverviewActionFrames.append((add, workspace, "menu"))
                 } else {
                     overviewAddFrames.append(add)
                 }
@@ -4110,7 +4302,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         }
         if workspaceContextID == nil && workspaceOverviewAvailable {
             let column = groups.count % columns
-            let frame = CGRect(x: horizontalInset + CGFloat(column) * (cardWidth + gap), y: tops[column] - 90, width: cardWidth, height: 90)
+            let lastRow = dimensions.suffix(groups.count % columns)
+            let height: CGFloat = column == 0 ? 90 : 80 + (lastRow.map(\.apps).max() ?? 0) + (lastRow.map(\.commands).max() ?? 0) + 62
+            let frame = CGRect(x: horizontalInset + CGFloat(column) * (cardWidth + gap), y: tops[column] - height, width: cardWidth, height: height)
             workspaceOverviewCreateFrame = frame
             renderAddContainerCard(frame: frame)
             tops[column] = frame.minY - gap
@@ -4272,6 +4466,42 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         addAppsSublayer(text)
     }
 
+    private func launchKey(_ endpoint: AppLauncherEndpoint) -> String {
+        endpoint.backend.serviceScope + ":" + endpoint.backend.serviceID + ":" + endpoint.frontend.id
+    }
+
+    private func isLaunching(_ item: AppLauncherItem) -> Bool {
+        if let context = item.containerContext {
+            return launchingEndpoints.contains(context.container.id.uuidString + ":" + context.app.serviceID + ":" + context.app.frontendID)
+        }
+        return launchingEndpoints.contains(launchKey(item.primaryEndpoint))
+    }
+
+    private func isStopping(_ item: AppLauncherItem) -> Bool {
+        if let context = item.containerContext {
+            return stoppingEndpoints.contains(context.container.id.uuidString + ":" + context.app.serviceID + ":" + context.app.frontendID)
+        }
+        return stoppingEndpoints.contains(launchKey(item.primaryEndpoint))
+    }
+
+    private func addLaunchSpinner(at point: CGPoint, stopping: Bool = false) {
+        let spinner = CAShapeLayer()
+        spinner.frame = CGRect(x: point.x - 7, y: point.y - 7, width: 14, height: 14)
+        spinner.path = CGPath(ellipseIn: CGRect(x: 2, y: 2, width: 10, height: 10), transform: nil)
+        spinner.fillColor = nil
+        spinner.strokeColor = resolvedCGColor(.controlAccentColor)
+        spinner.lineWidth = 2
+        spinner.strokeEnd = 0.72
+        spinner.lineCap = .round
+        let rotation = CABasicAnimation(keyPath: "transform.rotation.z")
+        rotation.fromValue = 0
+        rotation.toValue = (stopping ? 1 : -1) * Double.pi * 2
+        rotation.duration = 0.8
+        rotation.repeatCount = .infinity
+        spinner.add(rotation, forKey: "launch")
+        addAppsSublayer(spinner)
+    }
+
     private func renderOverviewEndpoint(_ item: AppLauncherItem, frame: CGRect, pinned: Bool,
                                          separator: Bool, visibleIconKeys: inout Set<String>,
                                          visibleTextKeys: inout Set<String>) {
@@ -4286,6 +4516,12 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                           image: launcherIconImage(for: item), symbolName: launcherIconSymbolName(for: item),
                           symbolColor: appIconTintColor(for: item.backend), title: title)
         visibleIconKeys.insert(item.iconKey)
+        if item.backend.serviceID == hostOpenCodeItem?.backend.serviceID, availableOpenCodeVersion != nil {
+            let badge = CALayer()
+            badge.contents = symbolCGImage(named: "arrow.down.circle.fill", pointSize: 14, color: .systemOrange)
+            badge.frame = CGRect(x: iconFrame.maxX - 7, y: iconFrame.maxY - 7, width: 14, height: 14)
+            addAppsSublayer(badge)
+        }
         let isThisPage = item.backend.isBackendsSelf && item.backend.serviceScope == "user"
         let textFrame = pinned
             ? CGRect(x: frame.minX + 12, y: frame.minY + 8, width: frame.width - 24, height: 32)
@@ -4294,13 +4530,16 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                           title: title, fontSize: 13, weight: .regular,
                           alignment: pinned ? .center : .left, isWrapped: pinned)
         visibleTextKeys.insert(item.iconKey)
-        if failed || endpointIsRunning(item.primaryEndpoint) {
+        let titleWidth = (title as NSString).size(withAttributes: [.font: NSFont.systemFont(ofSize: 13)]).width
+        let statusX = pinned ? max(frame.minX + 2, frame.midX - min(titleWidth, textFrame.width) / 2 - 11) : frame.minX
+        let statusCenter = CGPoint(x: statusX + 2.5, y: pinned ? textFrame.maxY - 8.5 : frame.midY)
+        if isLaunching(item) || isStopping(item) {
+            addLaunchSpinner(at: statusCenter, stopping: isStopping(item))
+        } else if failed || endpointIsRunning(item.primaryEndpoint) {
             let dot = CALayer()
             dot.backgroundColor = resolvedCGColor(failed ? .systemRed : .systemGreen)
             dot.cornerRadius = 2.5
-            let titleWidth = (title as NSString).size(withAttributes: [.font: NSFont.systemFont(ofSize: 13)]).width
-            let x = pinned ? max(frame.minX + 2, frame.midX - min(titleWidth, textFrame.width) / 2 - 11) : frame.minX
-            dot.frame = CGRect(x: x, y: pinned ? textFrame.maxY - 11 : frame.midY - 2.5, width: 5, height: 5)
+            dot.frame = CGRect(x: statusCenter.x - 2.5, y: statusCenter.y - 2.5, width: 5, height: 5)
             addAppsSublayer(dot)
         }
         if !pinned {
@@ -4453,7 +4692,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                   weight: .medium,
                                   color: .labelColor,
                                   italic: true)
-        title.string = "Add container (beta)"
+        title.string = "Manage containers…"
         title.frame = CGRect(x: iconFrame.maxX + 12,
                              y: addWorkspaceMessage.isEmpty ? floor((frame.height - 20) / 2) : 51,
                              width: max(frame.width - iconFrame.maxX - 28, 1),
@@ -4788,7 +5027,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         if operation == "menu" {
             showWorkspaceOverviewActionsMenu(for: workspace, at: point)
         } else if operation == "editContainer" {
-            navigateToRecipeSafeSpace(workspace.id, pushHistory: true)
+            navigateToRecipeSafeSpace(workspace.id)
         } else if operation == "copyShell" {
             showWorkspaceShellCommandMenu(workspace, at: point)
         } else if operation.hasPrefix("copyCommand:"),
@@ -5121,15 +5360,14 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                           width: CGFloat) -> CGFloat {
         let gap: CGFloat = 12
         let cardHeight: CGFloat = 72
-        let columns: CGFloat = width >= 960 ? 5 : (width >= 520 ? 2 : 1)
+        let columns: CGFloat = width >= 900 ? 4 : (width >= 520 ? 2 : 1)
         let cardWidth = floor((width - gap * (columns - 1)) / columns)
         let sections: [(CreateSection, String, String)] = [
+            (.codingAgent, "Coding agent", "bubble.left.and.bubble.right"),
             (.appCatalog, "Outer Shell app catalog", "square.grid.2x2"),
-            (.codingAgent, "Ask your coding agent", "bubble.left.and.bubble.right"),
             (.bashCommands, commandSectionTitle, "terminal"),
-            (.nativeApp, "New App", "hammer"),
-            (.otherRecipes, "Other recipes", "list.bullet.rectangle")
-        ].filter { (catalogScope != "system" || (!isWindowsHost && catalogWorkspaceID == nil) || $0.0 == .appCatalog || $0.0 == .codingAgent || (isWindowsCommandHost && $0.0 == .bashCommands)) && (!isWindowsCommandHost || $0.0 != .nativeApp && $0.0 != .otherRecipes) }
+            (.nativeApp, "New App", "hammer")
+        ].filter { (catalogScope != "system" || (!isWindowsHost && catalogWorkspaceID == nil) || $0.0 == .appCatalog || $0.0 == .codingAgent || (isWindowsCommandHost && $0.0 == .bashCommands)) && (!isWindowsCommandHost || $0.0 != .nativeApp) }
 
         var x = left
         var y = top - cardHeight
@@ -5216,56 +5454,511 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         return frame.minY
     }
 
-    private func renderCodingAgentSection(left: CGFloat, top: CGFloat, width: CGFloat) -> CGFloat {
-        let serviceDescription: String
-        if backends.contains(where: { $0.serviceUnitPath?.hasSuffix(".plist") == true || $0.serviceUnit.hasSuffix(".plist") }) {
-            serviceDescription = "a launchd service on macOS"
-        } else if backends.contains(where: { $0.serviceUnit.hasSuffix(".service") }) {
-            serviceDescription = "a systemd service on Linux"
-        } else {
-            serviceDescription = "a background service"
+    private var openCodeIcon: CGImage?
+    private var openCodeIconLoading = false
+    private var openCodeIconRetryAfter = Date.distantPast
+    private var openCodeChecksScheduled = false
+
+    private func scheduleOpenCodeChecks() {
+        guard !openCodeChecksScheduled else { return }
+        openCodeChecksScheduled = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 60) { [weak self] in
+            guard let self else { return }
+            self.openCodeChecksScheduled = false
+            self.checkOpenCodeUpdates()
+            self.scheduleOpenCodeChecks()
         }
-        let connectionInstructions = serverSSHCommand.map { "Connect to this server using:\n\($0)" }
-            ?? "Connect to this server over SSH using its host and account."
-        let connectionHint = serverSSHCommand == nil
-            ? "Share the SSH host and account, along with the Outer Shell API documentation."
-            : "Share the example request below, along with the Outer Shell API documentation."
-        let contentWidth = min(width, 740)
-        var y = renderCodingAgentText("Let your agent handle the setup", identifier: "agent-heading",
-                                      left: left, top: top, width: contentWidth,
-                                      size: 22, weight: .semibold) - 10
-        y = renderCodingAgentText(
-            """
-            Ask your coding agent to SSH to this server and install the app you want. \(connectionHint)
+    }
 
-            Your agent should install the dependencies, configure \(serviceDescription), and use outerctl as the appropriate user to register the backend, app endpoint, and logs. Apps can use a loopback TCP port or a Unix socket.
-            """,
-            identifier: "agent-instructions", left: left, top: y, width: contentWidth, size: 14
-        ) - 28
+    private func loadOpenCodeIcon() {
+        guard openCodeIcon == nil, !openCodeIconLoading, Date() >= openCodeIconRetryAfter else { return }
+        openCodeIconLoading = true
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { self.openCodeIconLoading = false }
+            do {
+                let data = try await self.openCodeData("/web/icons/opencode.svg")
+                if let image = NSImage(data: data) { self.openCodeIcon = self.cgImage(for: image) }
+                self.updateLayout()
+            } catch {
+                self.openCodeIconRetryAfter = Date().addingTimeInterval(300)
+                NSLog("Could not load OpenCode icon: %@", error.localizedDescription)
+            }
+        }
+    }
 
-        let cardTop = y
-        let card = CALayer()
-        card.cornerRadius = 10
-        card.borderWidth = 1
-        card.borderColor = resolvedCGColor(NSColor.controlAccentColor.withAlphaComponent(0.25))
-        card.backgroundColor = resolvedCGColor(NSColor.controlAccentColor.withAlphaComponent(0.06))
-        addCreateFormSublayer(card)
-        let inset: CGFloat = 20
-        y = renderCodingAgentText("Example request", identifier: "agent-example-heading",
-                                  left: left + inset, top: y - inset, width: contentWidth - inset * 2,
-                                  size: 12, weight: .semibold, color: .controlAccentColor) - 12
-        y = renderCodingAgentText(
-            "\(connectionInstructions)\n\nInstall <app>. Set it up as a service and register it with Outer Shell so I can open it and manage it here. Follow https://outershell.org/api/ for backend, app, and log registration, then verify that the app starts and responds. Make each registered app open ready to use; for private per-user apps that support URL-token authentication, include the app's launch token in the registered URL, keep TCP authentication enabled, and verify the link with a fresh session.",
-            identifier: "agent-example", left: left + inset, top: y,
-            width: contentWidth - inset * 2, size: 14
-        ) - inset
-        card.frame = CGRect(x: left, y: y, width: contentWidth, height: cardTop - y)
+    private struct OpenCodeRelease: Decodable {
+        struct Asset: Decodable { let name: String; let digest: String? }
+        let tag_name: String
+        let draft: Bool
+        let prerelease: Bool
+        let assets: [Asset]
+    }
+    private var openCodePrompt: String?
+    private var openCodeRelease: OpenCodeRelease?
+    private var openCodeReleaseChecked: Date?
+    private var openCodeHealthChecked: Date?
+    private var checkingOpenCode = false
+    private var openCodeVersion: String?
+    private var openCodeUpdateCommand = ""
 
-        codingAgentDocumentationFrame = CGRect(x: left, y: y - 60, width: min(width, 260), height: 36)
-        let button = makeButtonLayer(title: "Outer Shell API documentation", emphasized: false)
-        button.frame = codingAgentDocumentationFrame
-        addCreateFormSublayer(button)
-        return codingAgentDocumentationFrame.minY - 24
+    private var hostOpenCodeItem: AppLauncherItem? {
+        appLauncherItems(from: backends).first {
+            $0.backend.serviceScope != "system" &&
+                ($0.backend.serviceID.lowercased().contains("opencode") || $0.displayName.lowercased() == "opencode")
+        }
+    }
+
+    private var availableOpenCodeVersion: String? {
+        guard let current = openCodeVersion, let release = openCodeRelease else { return nil }
+        let latest = String(release.tag_name.dropFirst())
+        return latest.compare(current, options: .numeric) == .orderedDescending ? latest : nil
+    }
+
+    private func openCodeData(_ path: String) async throws -> Data {
+        guard let base = outerframeHost.pluginBaseURL(), let url = URL(string: path, relativeTo: base)?.absoluteURL, let urlSession else {
+            throw ContainerConfigurationInputError(message: "Outer Shell is unavailable.")
+        }
+        for _ in 0..<40 {
+            var request = URLRequest(url: url)
+            request.cachePolicy = .reloadIgnoringLocalCacheData
+            let (data, response) = try await urlSession.data(for: request)
+            guard let response = response as? HTTPURLResponse else {
+                throw ContainerConfigurationInputError(message: "Outer Shell returned an invalid response.")
+            }
+            if response.statusCode == 202 {
+                try await Task.sleep(nanoseconds: 500_000_000)
+                continue
+            }
+            guard response.statusCode == 200 else {
+                throw ContainerConfigurationInputError(message: "Could not load OpenCode setup (HTTP \(response.statusCode)).")
+            }
+            return data
+        }
+        throw ContainerConfigurationInputError(message: "OpenCode update check timed out.")
+    }
+
+    private func latestOpenCodeRelease() async throws -> OpenCodeRelease {
+        if let release = openCodeRelease, let checked = openCodeReleaseChecked, Date().timeIntervalSince(checked) < 86_400 { return release }
+        for page in 1...10 {
+            let data = try await openCodeData("/api/opencode-releases?page=\(page)")
+            let releases = try JSONDecoder().decode([OpenCodeRelease].self, from: data)
+            let compatible = releases.filter { !$0.draft && !$0.prerelease && $0.tag_name.range(of: "^v1\\.[0-9]+\\.[0-9]+$", options: .regularExpression) != nil }
+            if let release = compatible.sorted(by: { $0.tag_name.compare($1.tag_name, options: .numeric) == .orderedDescending }).first {
+                openCodeRelease = release
+                openCodeReleaseChecked = Date()
+                return release
+            }
+            if releases.count < 30 { break }
+        }
+        throw ContainerConfigurationInputError(message: "No compatible stable OpenCode release was found.")
+    }
+
+    private func prepareOpenCodeTemplate(_ template: String, release: OpenCodeRelease) throws -> String {
+        var result = template.replacingOccurrences(of: "__OPENCODE_VERSION__", with: String(release.tag_name.dropFirst()))
+        let pattern = try NSRegularExpression(pattern: "__OPENCODE_SHA256_([A-Za-z0-9_.-]+)__")
+        let matches = pattern.matches(in: result, range: NSRange(result.startIndex..., in: result))
+        for match in matches.reversed() {
+            let name = (result as NSString).substring(with: match.range(at: 1))
+            guard let digest = release.assets.first(where: { $0.name == name })?.digest,
+                  digest.range(of: "^sha256:[a-f0-9]{64}$", options: .regularExpression) != nil,
+                  let range = Range(match.range, in: result) else {
+                throw ContainerConfigurationInputError(message: "OpenCode \(release.tag_name) has no verified download for \(name).")
+            }
+            result.replaceSubrange(range, with: digest.dropFirst(7))
+        }
+        return result
+    }
+
+    private func openCodeText(_ path: String) async throws -> String {
+        let data = try await openCodeData("/web/" + path)
+        guard let text = String(data: data, encoding: .utf8) else {
+            throw ContainerConfigurationInputError(message: "The OpenCode template is invalid.")
+        }
+        return text
+    }
+
+    private func addOpenCodeToDockerfile() {
+        guard !codingAgentBusy, let workspace = pendingDockerfileWorkspace else { return }
+        codingAgentBusy = true
+        codingAgentMessage = "Checking the latest compatible OpenCode release…"
+        let allowAll = allowAllOpenCodeActions
+        updateLayout()
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { self.codingAgentBusy = false; self.updateLayout() }
+            do {
+                let release = try await self.latestOpenCodeRelease()
+                let template = try await self.openCodeText("opencode-container.Dockerfile")
+                var fragment = try self.prepareOpenCodeTemplate(template, release: release)
+                for (placeholder, path) in [("__CONTAINER_AGENT__", "container-agent.md"), ("__CONTAINER_OUTERCTL__", "container-outerctl.md"), ("__OUTERSHELL_SKILL__", "outer-shell-skill.md")] {
+                    let text = try await self.openCodeText(path)
+                    fragment = fragment.replacingOccurrences(of: placeholder, with: Data(text.utf8).base64EncodedString())
+                }
+                fragment = fragment.replacingOccurrences(of: "| base64 -d | gzip -d", with: "| base64 -d")
+                var configuration: [String: Any] = ["instructions": ["/usr/local/share/outershell/container-agent.md"]]
+                if allowAll { configuration["permission"] = "allow" }
+                let config = try JSONSerialization.data(withJSONObject: configuration, options: [.sortedKeys, .withoutEscapingSlashes])
+                fragment = fragment.replacingOccurrences(of: "__OPENCODE_CONFIG__", with: String(decoding: config, as: UTF8.self))
+                guard self.pendingDockerfileWorkspace?.id == workspace.id else { return }
+                self.containerConfigurationDockerfile += "\n\n" + fragment
+                self.codingAgentMessage = "OpenCode \(release.tag_name.dropFirst()) added to the Dockerfile. Save and rebuild to install it."
+                self.selectContainerConfigurationTab(.dockerfile)
+            } catch {
+                self.codingAgentMessage = error.localizedDescription
+            }
+        }
+    }
+
+    private func installHostOpenCode() {
+        guard !codingAgentBusy else { return }
+        codingAgentBusy = true
+        codingAgentMessage = "Downloading OpenCode and preparing your coding agent. This can take a few minutes."
+        updateLayout()
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { self.codingAgentBusy = false; self.updateLayout() }
+            do {
+                let release = try await self.latestOpenCodeRelease()
+                let template = try await self.openCodeText(self.isWindowsHost ? "opencode-start.ps1" : "opencode-start.sh")
+                let skill = try await self.openCodeText("outer-shell-skill.md")
+                let admin = try await self.openCodeText("server-admin.md")
+                let script = try self.prepareOpenCodeTemplate(template, release: release)
+                    .replacingOccurrences(of: "__OPENCODE_MODE__", with: "install")
+                    .replacingOccurrences(of: "__OUTERSHELL_SKILL__", with: skill.trimmingCharacters(in: .newlines))
+                    .replacingOccurrences(of: "__OUTERSHELL_ADMIN__", with: admin.trimmingCharacters(in: .newlines))
+                let command: String
+                if self.isWindowsHost {
+                    let encoded = Array(Data(script.utf8).base64EncodedString())
+                    var lines = ["@echo off", "set \"OC_SCRIPT=%LOCALAPPDATA%\\outershell-opencode-start.ps1\""]
+                    for offset in stride(from: 0, to: encoded.count, by: 1200) {
+                        let chunk = String(encoded[offset..<min(offset + 1200, encoded.count)])
+                        lines.append("\(offset == 0 ? ">" : ">>") \"%OC_SCRIPT%.b64\" echo \(chunk)")
+                    }
+                    lines.append("powershell.exe -NoProfile -Command \"[IO.File]::WriteAllBytes($env:OC_SCRIPT,[Convert]::FromBase64String([IO.File]::ReadAllText($env:OC_SCRIPT+'.b64')))\"")
+                    lines.append("if errorlevel 1 exit /b 1")
+                    lines.append("powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"%OC_SCRIPT%\" -Port 4096")
+                    lines.append("exit /b %errorlevel%")
+                    command = lines.joined(separator: "\r\n")
+                } else { command = script }
+                guard command.utf8.count < (self.isWindowsHost ? 262_144 : 32_768), let endpoint = self.createEndpoint, let session = self.urlSession else {
+                    throw ContainerConfigurationInputError(message: "The OpenCode installer is unavailable or exceeds the command size limit.")
+                }
+                var form = URLComponents()
+                form.queryItems = [URLQueryItem(name: "recipe", value: "command-port"), URLQueryItem(name: "name", value: "OpenCode"), URLQueryItem(name: "identifier", value: self.isWindowsHost ? "opencode" : "org.outershell.OpenCode"), URLQueryItem(name: "command", value: command), URLQueryItem(name: "workdir", value: "~"), URLQueryItem(name: "scope", value: "user"), URLQueryItem(name: "frontendTransport", value: "port"), URLQueryItem(name: "port", value: "4096")]
+                var request = URLRequest(url: endpoint)
+                request.httpMethod = "POST"
+                request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+                request.httpBody = form.percentEncodedQuery?.replacingOccurrences(of: "+", with: "%2B").data(using: .utf8)
+                let (data, _) = try await session.data(for: request)
+                let response = try ActionResponse.decodeBinary(data)
+                guard response.ok else { throw ContainerConfigurationInputError(message: response.message) }
+                for _ in 0..<180 {
+                    self.fetchBackends()
+                    if let item = self.hostOpenCodeItem {
+                        if !self.isAppProminent(item) { self.moveOverviewItem(item, pinned: true) }
+                        if self.endpointIsRunning(item.primaryEndpoint), item.frontend.url.contains("/session/ses_") {
+                            self.codingAgentMessage = "OpenCode is ready. Connect your model provider, then ask it to add your first app."
+                            return
+                        }
+                        if let failure = self.launcherFailureMessage(item.primaryEndpoint, displayName: "OpenCode") {
+                            throw ContainerConfigurationInputError(message: failure)
+                        }
+                    }
+                    try await Task.sleep(nanoseconds: 2_000_000_000)
+                }
+                self.codingAgentMessage = "OpenCode is still preparing. Check its logs from the app menu."
+            } catch { self.codingAgentMessage = error.localizedDescription }
+        }
+    }
+
+    private func openCodeNavigationURL(_ url: URL, serviceID: String) -> URL {
+        guard serviceID.lowercased().contains("opencode"), let prompt = openCodePrompt else { return url }
+        openCodePrompt = nil
+        guard var components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              let range = components.path.range(of: "/session(?:/[^/]*)?$", options: .regularExpression) else { return url }
+        components.path = String(components.path[..<range.lowerBound]) + "/session"
+        components.fragment = nil
+        components.queryItems = (components.queryItems ?? []).filter { $0.name != "prompt" } + [URLQueryItem(name: "prompt", value: prompt)]
+        return components.url ?? url
+    }
+
+    private func checkOpenCodeUpdates() {
+        guard !checkingOpenCode, let item = hostOpenCodeItem, endpointIsRunning(item.primaryEndpoint), item.frontend.port > 0,
+              openCodeHealthChecked.map({ Date().timeIntervalSince($0) >= 300 }) ?? true else { return }
+        checkingOpenCode = true
+        openCodeHealthChecked = Date()
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { self.checkingOpenCode = false; self.updateLayout() }
+            do {
+                struct Health: Decodable { let healthy: Bool; let version: String }
+                let data = try await self.openCodeData("/api/opencode-health?port=\(item.frontend.port)")
+                let health = try JSONDecoder().decode(Health.self, from: data)
+                guard health.healthy else { return }
+                self.openCodeVersion = health.version
+                _ = try await self.latestOpenCodeRelease()
+            } catch {
+                self.openCodeHealthChecked = Date().addingTimeInterval(3_300)
+            }
+        }
+    }
+
+    private func showOpenCodeUpdate() {
+        selectedCreateSection = .codingAgent
+        codingAgentMessage = "Checking the latest compatible OpenCode release…"
+        navigateToMode(.create, pushHistory: true)
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                let release = try await self.latestOpenCodeRelease()
+                let template = try await self.openCodeText(self.isWindowsHost ? "opencode-start.ps1" : "opencode-start.sh")
+                let boundary = self.isWindowsHost ? "if (!(Test-Path \"$config\\skills\\outer-shell\\SKILL.md\"))" : "if [ ! -e \"$config_root/skills/outer-shell/SKILL.md\" ]"
+                guard let range = template.range(of: boundary) else { throw ContainerConfigurationInputError(message: "Invalid OpenCode updater template.") }
+                let prefix = String(template[..<range.lowerBound]).replacingOccurrences(of: "^param\\([^\\n]+\\)\\n", with: "", options: .regularExpression)
+                self.openCodeUpdateCommand = try self.prepareOpenCodeTemplate(prefix, release: release).replacingOccurrences(of: "__OPENCODE_MODE__", with: "update")
+                self.openCodeUpdateCommand = self.isWindowsHost ? self.openCodeUpdateCommand + "\n}\n" : "(\n" + self.openCodeUpdateCommand + "\n)\n"
+                self.codingAgentMessage = "OpenCode \(release.tag_name.dropFirst()) is available. Stop OpenCode from its app menu, run the update commands on the host as your user, then start it again. Sessions and provider settings are preserved."
+            } catch { self.codingAgentMessage = error.localizedDescription }
+            self.updateLayout()
+        }
+    }
+
+    private var pendingMountPathEdit: (id: UUID, field: String)?
+    private var pendingEndpointRename: AppLauncherItem?
+
+    private func editMountPath(_ id: UUID, field: String) {
+        guard let workspace = pendingDockerfileWorkspace,
+              let mount = containerConfigurationMounts.first(where: { $0.id == id }) else { return }
+        showContainerConfigurationRename(workspace)
+        pendingMountPathEdit = (id, field)
+        workspaceRenameName = field == "host" ? mount.hostPath : mount.guestPath
+        focusEditorInput(selectAll: true)
+        updateLayout()
+    }
+
+    private func overviewMenuItems(for item: AppLauncherItem) -> [OuterframeContextMenuItem] {
+        let group = overviewGroupID(for: item)
+        let pinned = isAppProminent(item)
+        let items = (item.containerContext.map { appLauncherItems(in: $0.container) } ?? appLauncherItems()).filter { overviewGroupID(for: $0) == group && isAppProminent($0) == pinned }
+        let ordered = overviewOrderedItems(items, group: group, pinned: pinned)
+        var result: [OuterframeContextMenuItem] = []
+        if let index = ordered.firstIndex(where: { $0.identityKey == item.identityKey }) {
+            if index > 0 { result.append(OuterframeContextMenuItem(id: "moveEarlier", title: "Move earlier", isEnabled: true, systemImageName: "arrow.up")) }
+            if index + 1 < ordered.count { result.append(OuterframeContextMenuItem(id: "moveLater", title: "Move later", isEnabled: true, systemImageName: "arrow.down")) }
+        }
+        result.append(OuterframeContextMenuItem(id: "renameEndpoint", title: "Rename endpoint…", isEnabled: true, systemImageName: "pencil"))
+        result.append(OuterframeContextMenuItem(id: "copyEndpointURL", title: "Copy URL", isEnabled: true, systemImageName: "doc.on.doc"))
+        return result
+    }
+
+    private func performOverviewMenuAction(_ item: AppLauncherItem, operation: String) -> Bool {
+        if operation == "renameEndpoint" {
+            pendingEndpointRename = item
+            isShowingWorkspacePanel = true
+            workspaceNamePromptDismissesPanel = true
+            workspaceRenameName = overviewTitle(for: item)
+            focusEditorInput(selectAll: true)
+            updateLayout()
+            return true
+        }
+        if operation == "copyEndpointURL" {
+            if let context = item.containerContext {
+                let app = context.app
+                let path = pathAndQuery(fromFrontendURL: app.url, socketPath: app.socketPath)
+                if app.publishedPort > 0 {
+                    copyTextToPasteboard("http://127.0.0.1:\(app.publishedPort)\(path)")
+                } else if let socket = app.externalSocketPath, !socket.isEmpty {
+                    let scheme = socket.hasPrefix("\\\\.\\pipe\\") ? "http+pipe" : "http+unix"
+                    copyTextToPasteboard("\(scheme)://\(percentEncodedSocketPath(socket))\(path)")
+                } else {
+                    backendError = "Open this app once before copying its published URL."
+                    updateLayout()
+                }
+            } else if let url = frontendNavigationURL(item.frontend) {
+                copyTextToPasteboard(url.absoluteString)
+            }
+            return true
+        }
+        guard operation == "moveEarlier" || operation == "moveLater" else { return false }
+        let group = overviewGroupID(for: item)
+        let pinned = isAppProminent(item)
+        let items = (item.containerContext.map { appLauncherItems(in: $0.container) } ?? appLauncherItems()).filter { overviewGroupID(for: $0) == group && isAppProminent($0) == pinned }
+        var ordered = overviewOrderedItems(items, group: group, pinned: pinned)
+        let offset = operation == "moveEarlier" ? -1 : 1
+        if let index = ordered.firstIndex(where: { $0.identityKey == item.identityKey }), ordered.indices.contains(index + offset) {
+            ordered.swapAt(index, index + offset)
+            var layout = overviewLayout
+            if pinned { layout.pins[group] = ordered.map(overviewKey) }
+            else { layout.order[group] = ordered.map(overviewKey) }
+            saveOverviewLayout(layout)
+        }
+        return true
+    }
+
+    private var codingAgentScope: String?
+    private var codingAgentScroll: CGFloat = 0
+    private var codingAgentContentHeight: CGFloat = 0
+    private var allowAllOpenCodeActions = false
+    private var codingAgentBusy = false
+    private var codingAgentMessage = ""
+    private var codingAgentActions: [(frame: CGRect, title: String, action: () -> Void)] = []
+    private var codingAgentTabFrame = CGRect.zero
+
+    private func agentInstructions(workspace: LocalWorkspaceRecord?, scope: String, hosted: Bool) -> String {
+        var parts: [String] = []
+        if !hosted, let command = serverSSHCommand { parts.append("Connect using:\n" + command) }
+        if let workspace {
+            if scope == "container" {
+                if hosted {
+                    parts.append("You are running inside the “\(workspace.name)” container.")
+                } else {
+                    parts.append("Run commands inside the “\(workspace.name)” container using:\n\(workspace.runtimeKind == "apple.container" ? "container" : "docker") exec outershell-container-\(workspace.id.uuidString.lowercased()) /bin/bash -lc '<command>'")
+                }
+                parts.append("Read https://outershell.org/api/containers/ and /usr/local/share/outershell/container-agent.md for instructions. Keep durable installs and app registrations in the Dockerfile and build context. Use existing mounted folders or persistent volumes for user data. Work only inside the container and its existing mounts. Do not change host mounts or invoke the host container engine from inside the container. For host configuration, ask the user to use Folder mounts or a whole-server coding agent.")
+            } else {
+                parts.append("Help me update the “\(workspace.name)” container in Outer Shell (ID: \(workspace.id.uuidString.lowercased())).")
+                parts.append("Read https://outershell.org/api/containers/ for container configuration instructions. Inspect its current configuration and preserve unrelated settings. Use Outer Shell to manage folder mounts, environment variables, networking, and rebuilds. Keep durable installs and app registrations in the Dockerfile and build context, and user data in persistent or mounted folders.")
+            }
+            parts.append("When practical, apply changes to the running container and make the equivalent changes in the Dockerfile or build context, so they’re usable immediately and survive a rebuild. Rebuild only when necessary; explain when a change requires one.")
+        }
+        parts.append("Read https://outershell.org/api/ for Outer Shell integration instructions. Make each registered app open ready to use; for private per-user apps that support URL-token authentication, include the app’s launch token in the registered URL, keep TCP authentication enabled, and verify the link with a fresh session.")
+        parts.append("[Your request here]")
+        return parts.joined(separator: "\n\n")
+    }
+
+    @discardableResult
+    private func agentText(_ text: String, in layer: CALayer, left: CGFloat, top: CGFloat,
+                           width: CGFloat, size: CGFloat = 13, heading: Bool = false) -> CGFloat {
+        let font = NSFont.systemFont(ofSize: size, weight: heading ? .semibold : .regular)
+        let lines = dockerfileWrappedLines(text, width: max(width, 1), font: font)
+        let lineHeight = ceil(size * 1.5)
+        for (index, line) in lines.enumerated() {
+            let label = makeTextLayer(size: size, weight: heading ? .semibold : .regular,
+                                      color: heading ? .labelColor : .secondaryLabelColor)
+            label.string = line.text
+            label.frame = CGRect(x: left, y: top - CGFloat(index + 1) * lineHeight, width: width, height: lineHeight)
+            layer.addSublayer(label)
+        }
+        return top - CGFloat(lines.count) * lineHeight
+    }
+
+    private func agentButton(_ title: String, in layer: CALayer, frame: CGRect,
+                             emphasized: Bool = false, action: @escaping () -> Void) {
+        let button = makeButtonLayer(title: title, emphasized: emphasized)
+        button.frame = frame
+        layer.addSublayer(button)
+        let rootFrame = rootLayer.convert(frame, from: layer)
+        let clip = isContainerConfigurationEditorVisible ? containerConfigurationContentFrame : rootLayer.bounds
+        if clip.contains(rootFrame) {
+            codingAgentActions.append((rootFrame, title, action))
+        }
+    }
+
+    private func renderAgentGuide(in layer: CALayer, frame: CGRect,
+                                   workspace: LocalWorkspaceRecord?, scope: String?) -> CGFloat {
+        var y = frame.maxY
+        let width = frame.width
+        if let workspace, scope == nil {
+            y = agentText("Where should your coding agent work?", in: layer, left: frame.minX, top: y, width: width, size: 20, heading: true) - 12
+            y = agentText("Choose the access your agent needs before continuing.", in: layer, left: frame.minX, top: y, width: width) - 24
+            let columns: CGFloat = width >= 640 ? 2 : 1
+            let cardWidth = (width - (columns - 1) * 16) / columns
+            for (index, choice) in [("container", "Inside container · Sandboxed", "Work inside this container and its existing mounts. Install tools and apps with limited access."), ("server", "Whole server · Privileged", "Run as your user on the host. Configure mounted folders, networking, and container runtime settings.")].enumerated() {
+                let card = CALayer()
+                card.frame = CGRect(x: frame.minX + (columns == 2 ? CGFloat(index) * (cardWidth + 16) : 0), y: y - 172 - (columns == 1 ? CGFloat(index) * 188 : 0), width: cardWidth, height: 172)
+                card.cornerRadius = 12
+                card.borderWidth = 1
+                card.borderColor = resolvedCGColor(.separatorColor)
+                card.backgroundColor = resolvedCGColor(.controlBackgroundColor)
+                layer.addSublayer(card)
+                let textY = agentText(choice.1, in: card, left: 18, top: 152, width: cardWidth - 36, size: 15, heading: true) - 12
+                agentText(choice.2, in: card, left: 18, top: textY, width: cardWidth - 36)
+                let rootFrame = rootLayer.convert(card.frame, from: layer)
+                codingAgentActions.append((rootFrame, choice.1, { [weak self] in
+                    self?.codingAgentScope = choice.0
+                    self?.codingAgentScroll = 0
+                    self?.codingAgentMessage = ""
+                    self?.updateLayout()
+                }))
+            }
+            _ = workspace
+            return y - (columns == 2 ? 172 : 360)
+        }
+        let scope = scope ?? "server"
+        if workspace != nil {
+            y = agentText(scope == "container" ? "Inside container · Sandboxed" : "Whole server · Privileged", in: layer, left: frame.minX, top: y, width: width, size: 19, heading: true) - 12
+            agentButton("Change access…", in: layer, frame: CGRect(x: frame.minX, y: y - 32, width: 150, height: 32)) { [weak self] in
+                self?.codingAgentScope = nil
+                self?.codingAgentScroll = 0
+                self?.updateLayout()
+            }
+            y -= 52
+        } else {
+            y = agentText("Let your agent handle the setup", in: layer, left: frame.minX, top: y, width: width, size: 22, heading: true) - 16
+        }
+        let explanation = scope == "container"
+            ? "Your agent can install tools and apps inside this container and update its Dockerfile. Changes to host folders and runtime settings require host access."
+            : workspace == nil ? "Describe what you want to build or install. Use OpenCode here, or copy the instructions into your own coding agent."
+            : "OpenCode runs as your user on the host, outside the container. It can configure folder mounts and runtime settings with your user’s permissions."
+        y = agentText(explanation, in: layer, left: frame.minX, top: y, width: width) - 20
+        let existing = scope == "container" ? workspace.flatMap { space in appLauncherItems(in: space).first { $0.displayName.lowercased().contains("opencode") } } : hostOpenCodeItem
+        let title = codingAgentBusy ? "Preparing OpenCode…" : existing == nil ? (scope == "container" ? "Add OpenCode" : "Install OpenCode") : "Open OpenCode"
+        if scope == "container", existing == nil {
+            agentButton((allowAllOpenCodeActions ? "☑ " : "☐ ") + "Allow all actions without asking", in: layer, frame: CGRect(x: frame.minX, y: y - 32, width: min(width, 310), height: 32)) { [weak self] in
+                self?.allowAllOpenCodeActions.toggle()
+                self?.updateLayout()
+            }
+            y -= 44
+            y = agentText("Applies to OpenCode in this container, including mounted folders. Adds the setup to the Dockerfile; save and rebuild to install. Requires Debian or Ubuntu with Outer Shell support.", in: layer, left: frame.minX, top: y, width: width, size: 11) - 16
+        }
+        agentButton(title, in: layer, frame: CGRect(x: frame.minX, y: y - 34, width: 190, height: 34), emphasized: true) { [weak self] in
+            guard let self, !self.codingAgentBusy else { return }
+            if let existing {
+                self.openCodePrompt = self.agentInstructions(workspace: workspace, scope: scope, hosted: true)
+                self.openLauncherItem(existing, opensInNewTab: true)
+            } else if scope == "container" {
+                self.addOpenCodeToDockerfile()
+            } else {
+                self.installHostOpenCode()
+            }
+        }
+        y -= 48
+        y = agentText("Bring your model provider account or API key.", in: layer, left: frame.minX, top: y, width: width, size: 11) - 18
+        if !codingAgentMessage.isEmpty {
+            y = agentText(codingAgentMessage, in: layer, left: frame.minX, top: y, width: width) - 18
+        }
+        if !openCodeUpdateCommand.isEmpty && workspace == nil {
+            agentButton("Copy update commands", in: layer, frame: CGRect(x: frame.minX, y: y - 32, width: 200, height: 32)) { [weak self] in
+                guard let self else { return }
+                self.copyTextToPasteboard(self.openCodeUpdateCommand)
+            }
+            y -= 48
+        }
+        y = agentText("Use your own coding agent", in: layer, left: frame.minX, top: y, width: width, size: 15, heading: true) - 12
+        let prompt = agentInstructions(workspace: workspace, scope: scope, hosted: false)
+        agentButton("Copy instructions", in: layer, frame: CGRect(x: frame.minX, y: y - 32, width: 160, height: 32)) { [weak self] in
+            self?.copyTextToPasteboard(prompt)
+        }
+        y -= 48
+        y = agentText(prompt, in: layer, left: frame.minX, top: y, width: width, size: 12)
+        return y - 20
+    }
+
+    private func renderContainerAgent(in frame: CGRect) {
+        editorInputFieldFrame = .zero
+        editorInputTextFrame = .zero
+        let clip = CALayer()
+        clip.frame = frame
+        clip.masksToBounds = true
+        workspacePanelLayer.addSublayer(clip)
+        let bottom = renderAgentGuide(in: clip, frame: CGRect(x: 0, y: codingAgentScroll, width: frame.width, height: frame.height), workspace: pendingDockerfileWorkspace, scope: codingAgentScope)
+        codingAgentContentHeight = frame.height + codingAgentScroll - bottom
+    }
+
+    private func renderCodingAgentSection(left: CGFloat, top: CGFloat, width: CGFloat) -> CGFloat {
+        codingAgentActions.removeAll()
+        return renderAgentGuide(in: createFormContentLayer, frame: CGRect(x: left, y: 0, width: width, height: top), workspace: nil, scope: "server")
     }
 
     private func renderCreateEmptyMessage(_ message: String,
@@ -5278,128 +5971,53 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         addCreateFormSublayer(empty)
     }
 
-    private func renderBashCommandsSection(left: CGFloat,
-                                           top: CGFloat,
-                                           width: CGFloat) -> CGFloat {
+    private func renderBashCommandsSection(left: CGFloat, top: CGFloat, width: CGFloat) -> CGFloat {
         ensureBashDefaults()
-
-        let detailWidth = min(width, 680)
-        let detailLeft = left
-        let transportWidth: CGFloat = min(260, detailWidth)
-        var y = top - 18
-
-        let help = makeTextLayer(size: 12, weight: .regular, color: .secondaryLabelColor)
-        help.string = isWindowsCommandHost ? "Outer Shell starts these commands as your signed-in user. The command script must keep running until your server exits. For example, use ‘python server.py’, not ‘start python server.py’. Configure the server to listen on the port or named pipe below." : "Run a script that launches a web app on some port or socket"
-        let helpHeight: CGFloat = isWindowsCommandHost ? 54 : 18
-        help.isWrapped = isWindowsCommandHost
-        help.frame = CGRect(x: detailLeft, y: y - helpHeight + 18, width: detailWidth, height: helpHeight)
-        addCreateFormSublayer(help)
-        y -= 40 + helpHeight
-
-        addCreateField(RecipeFieldRecord(key: "bashDisplayName",
-                                         label: "Display Name",
-                                         defaultValue: "",
-                                         fieldType: "text",
-                                         placeholder: "My App",
-                                         suggestions: [],
-                                         choices: []),
-                       value: createValues["bashDisplayName", default: ""],
-                       frame: CGRect(x: detailLeft, y: y, width: detailWidth, height: 46))
-        y -= 26
-
-        addCreateTextArea(key: "bashCommands",
-                          label: commandEditorLabel,
-                          placeholder: "Paste commands here",
-                          frame: CGRect(x: detailLeft, y: y - 132, width: detailWidth, height: 132))
-        y -= 194
-
-        let transportField = RecipeFieldRecord(key: "bashFrontendTransport",
-                                                label: "Connection",
-                                                defaultValue: "port",
-                                                fieldType: "choice",
-                                                placeholder: "",
-                                                suggestions: [],
-                                               choices: [
-                                                    RecipeChoiceRecord(title: "Port", value: "port"),
-                                                    RecipeChoiceRecord(title: isWindowsCommandHost ? "Named pipe" : "Unix Socket", value: isWindowsCommandHost ? "namedPipe" : "unixSocket")
-                                                ])
-        addCreateChoiceField(transportField, frame: CGRect(x: detailLeft, y: y, width: transportWidth, height: 50))
-        let endpointFieldX = detailLeft + transportWidth + 18
-        let endpointFieldWidth = max(detailWidth - transportWidth - 18, 180)
-
+        let twoColumns = width >= 600
+        let gap: CGFloat = 18
+        let columnWidth = twoColumns ? (width - gap) / 2 : width
+        var y = top
+        func field(_ key: String, _ label: String, _ placeholder: String, x: CGFloat, y: CGFloat, width: CGFloat, monospaced: Bool = false) {
+            addCreateField(CreateFieldRecord(key: key, label: label, defaultValue: "", fieldType: "text", placeholder: placeholder, suggestions: [], choices: []), value: createValues[key, default: ""], frame: CGRect(x: x, y: y, width: width, height: 50), monospaced: monospaced)
+        }
+        y -= 50
+        field("bashDisplayName", "Display name", "My app", x: left, y: y, width: columnWidth)
+        if !twoColumns { y -= 72 }
+        field("bashIdentifier", "Identifier", "my-app", x: twoColumns ? left + columnWidth + gap : left, y: y, width: columnWidth, monospaced: true)
+        let note = makeTextLayer(size: 10, weight: .regular, color: .secondaryLabelColor)
+        note.string = "Names the app’s service and files."
+        note.frame = CGRect(x: twoColumns ? left + columnWidth + gap : left, y: y - 21, width: columnWidth, height: 16)
+        addCreateFormSublayer(note)
+        y -= 220
+        addCreateTextArea(key: "bashCommands", label: commandEditorLabel, placeholder: isWindowsCommandHost ? "python server.py" : "cd ~/dev/my-app\nnpm start", frame: CGRect(x: left, y: y, width: width, height: 184))
+        y -= 72
+        let connection = CreateFieldRecord(key: "bashFrontendTransport", label: "Connection", defaultValue: "port", fieldType: "choice", placeholder: "", suggestions: [], choices: [CreateChoiceRecord(title: "TCP port", value: "port"), CreateChoiceRecord(title: isWindowsCommandHost ? "Named pipe" : "Unix socket", value: isWindowsCommandHost ? "namedPipe" : "unixSocket")])
+        addCreateChoiceField(connection, frame: CGRect(x: left, y: y, width: columnWidth, height: 50))
+        if !twoColumns { y -= 72 }
+        let endpointX = twoColumns ? left + columnWidth + gap : left
         if ["unixSocket", "namedPipe"].contains(createValues["bashFrontendTransport", default: "port"]) {
-            addCreateField(RecipeFieldRecord(key: "bashSocketPath",
-                                             label: isWindowsCommandHost ? "Named pipe path" : "Socket Path",
-                                             defaultValue: "",
-                                             fieldType: "text",
-                                             placeholder: isWindowsCommandHost ? commandPipePlaceholder : "/tmp/my-service.sock",
-                                             suggestions: [],
-                                             choices: []),
-                           value: createValues["bashSocketPath", default: ""],
-                           frame: CGRect(x: endpointFieldX, y: y, width: endpointFieldWidth, height: 46),
-                           monospaced: true)
+            field("bashSocketPath", isWindowsCommandHost ? "Named pipe path" : "Socket path", isWindowsCommandHost ? commandPipePlaceholder : "/tmp/my-app.sock", x: endpointX, y: y, width: columnWidth, monospaced: true)
         } else {
-            addCreateField(RecipeFieldRecord(key: "bashPort",
-                                             label: "Port",
-                                             defaultValue: "",
-                                             fieldType: "text",
-                                             placeholder: "4000",
-                                             suggestions: [],
-                                             choices: []),
-                           value: createValues["bashPort", default: ""],
-                           frame: CGRect(x: endpointFieldX, y: y, width: min(endpointFieldWidth, 180), height: 46),
-                           monospaced: true)
+            field("bashPort", "Port", "4000", x: endpointX, y: y, width: columnWidth, monospaced: true)
         }
         y -= 72
-
         if !isWindowsCommandHost {
-            let iconButtonWidth: CGFloat = 70
-            addCreateField(RecipeFieldRecord(key: "bashIconPath",
-                                             label: "Icon Path",
-                                             defaultValue: "",
-                                             fieldType: "text",
-                                             placeholder: "Optional",
-                                             suggestions: [],
-                                             choices: []),
-                           value: createValues["bashIconPath", default: ""],
-                           frame: CGRect(x: detailLeft, y: y, width: max(detailWidth - iconButtonWidth - 10, 160), height: 46),
-                           monospaced: true)
-            bashIconSelectFrame = CGRect(x: detailLeft + max(detailWidth - iconButtonWidth, 160),
-                                         y: y,
-                                         width: iconButtonWidth,
-                                         height: 30)
-            let iconSelect = makeButtonLayer(title: "Select", emphasized: false)
-            iconSelect.frame = bashIconSelectFrame
-            addCreateFormSublayer(iconSelect)
-            y -= 72
+            field("bashIconPath", "Icon path (optional, otherwise Outer Loop will try to fetch it)", "~/Pictures/my-app.png", x: left, y: y, width: max(width - 80, 1), monospaced: true)
+            bashIconSelectFrame = CGRect(x: left + width - 70, y: y, width: 70, height: 30)
+            let button = makeButtonLayer(title: "Choose…", emphasized: false)
+            button.frame = bashIconSelectFrame
+            addCreateFormSublayer(button)
+            y -= 60
         }
-
-        addCreateField(RecipeFieldRecord(key: "bashIdentifier",
-                                         label: "ID",
-                                         defaultValue: "",
-                                         fieldType: "text",
-                                         placeholder: "my-app",
-                                         suggestions: [],
-                                         choices: []),
-                       value: createValues["bashIdentifier", default: ""],
-                       frame: CGRect(x: detailLeft, y: y, width: detailWidth, height: 46),
-                       monospaced: true)
-        y -= 58
-
-        createButtonFrame = CGRect(x: detailLeft, y: y, width: 76, height: 30)
-        let save = makeButtonLayer(title: isPerformingAction ? "Saving..." : "Save", emphasized: true)
-        save.frame = createButtonFrame
-        addCreateFormSublayer(save)
-
+        createButtonFrame = CGRect(x: left + max(width - 120, 0), y: y, width: 120, height: 32)
+        let submit = makeButtonLayer(title: isPerformingAction ? "Creating…" : "Create app", emphasized: true)
+        submit.frame = createButtonFrame
+        addCreateFormSublayer(submit)
         if !createMessage.isEmpty {
-            addCreateMessageLayer(frame: CGRect(x: detailLeft + 88,
-                                                y: y + 6,
-                                                width: max(detailWidth - 88, 1),
-                                                height: 18),
-                                  color: createMessage.hasPrefix("Created") ? .secondaryLabelColor : .systemRed)
+            addCreateMessageLayer(frame: CGRect(x: left, y: y - 34, width: width, height: 22), color: .systemRed)
+            y -= 34
         }
-
-        return y - 26
+        return y - 24
     }
 
     private func renderNativeAppSection(left: CGFloat,
@@ -5417,7 +6035,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         addCreateFormSublayer(help)
         y -= 58
 
-        addCreateField(RecipeFieldRecord(key: "nativeAppName",
+        addCreateField(CreateFieldRecord(key: "nativeAppName",
                                          label: "Name",
                                          defaultValue: "",
                                          fieldType: "text",
@@ -5444,15 +6062,15 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         y -= 72
 
         if createValues["nativeTargetMacOS", default: "true"] == "true" {
-            let frontendLanguageField = RecipeFieldRecord(key: "nativeFrontendLanguage",
+            let frontendLanguageField = CreateFieldRecord(key: "nativeFrontendLanguage",
                                                           label: "macOS Language",
                                                           defaultValue: "swift",
                                                           fieldType: "choice",
                                                           placeholder: "",
                                                           suggestions: [],
                                                           choices: [
-                                                            RecipeChoiceRecord(title: "Swift", value: "swift"),
-                                                            RecipeChoiceRecord(title: "Objective-C", value: "objc")
+                                                            CreateChoiceRecord(title: "Swift", value: "swift"),
+                                                            CreateChoiceRecord(title: "Objective-C", value: "objc")
                                                           ])
             addCreateChoiceField(frontendLanguageField, frame: CGRect(x: detailLeft,
                                                                       y: y,
@@ -5461,15 +6079,15 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             y -= 72
         }
 
-        let backendLanguageField = RecipeFieldRecord(key: "nativeBackendLanguage",
+        let backendLanguageField = CreateFieldRecord(key: "nativeBackendLanguage",
                                                      label: "Backend",
                                                      defaultValue: "go",
                                                      fieldType: "choice",
                                                      placeholder: "",
                                                      suggestions: [],
                                                      choices: [
-                                                        RecipeChoiceRecord(title: "Go", value: "go"),
-                                                        RecipeChoiceRecord(title: "C", value: "c")
+                                                        CreateChoiceRecord(title: "Go", value: "go"),
+                                                        CreateChoiceRecord(title: "C", value: "c")
                                                      ])
         addCreateChoiceField(backendLanguageField, frame: CGRect(x: detailLeft,
                                                                  y: y,
@@ -5477,15 +6095,15 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                                                  height: 50))
         y -= 72
 
-        let isolationField = RecipeFieldRecord(key: "nativeIsolationMode",
+        let isolationField = CreateFieldRecord(key: "nativeIsolationMode",
                                                label: "Server Isolation",
                                                defaultValue: "container",
                                                fieldType: "choice",
                                                placeholder: "",
                                                suggestions: [],
                                                choices: [
-                                                RecipeChoiceRecord(title: "Containerized", value: "container"),
-                                                RecipeChoiceRecord(title: "Full Host Access", value: "host")
+                                                CreateChoiceRecord(title: "Containerized", value: "container"),
+                                                CreateChoiceRecord(title: "Full Host Access", value: "host")
                                                ])
         addCreateChoiceField(isolationField, frame: CGRect(x: detailLeft,
                                                            y: y,
@@ -5493,7 +6111,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                                            height: 50))
         y -= 72
 
-        addCreateField(RecipeFieldRecord(key: "nativeProjectRoot",
+        addCreateField(CreateFieldRecord(key: "nativeProjectRoot",
                                          label: "Project Location",
                                          defaultValue: "~/outerframe-apps",
                                          fieldType: "directory",
@@ -5505,7 +6123,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                        monospaced: true)
         y -= 72
 
-        addCreateField(RecipeFieldRecord(key: "nativeProjectFolder",
+        addCreateField(CreateFieldRecord(key: "nativeProjectFolder",
                                          label: "Project Folder",
                                          defaultValue: "",
                                          fieldType: "text",
@@ -5517,7 +6135,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                        monospaced: true)
         y -= 72
 
-        addCreateField(RecipeFieldRecord(key: "nativeAppID",
+        addCreateField(CreateFieldRecord(key: "nativeAppID",
                                          label: "App ID",
                                          defaultValue: "",
                                          fieldType: "text",
@@ -5529,7 +6147,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                        monospaced: true)
         y -= 72
 
-        addCreateField(RecipeFieldRecord(key: "nativeSocketFilename",
+        addCreateField(CreateFieldRecord(key: "nativeSocketFilename",
                                          label: "Socket Filename",
                                          defaultValue: "",
                                          fieldType: "text",
@@ -5755,16 +6373,42 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         var x = left
         var y = top - itemHeight
 
-        for (index, app) in apps.enumerated() {
-            if index == 0 {
-                x = startX
-            } else if index.isMultiple(of: columns) {
-                x = startX
-                y -= itemHeight + itemGap
-            }
+        var entries = apps.map { (name: $0.backend.displayName, app: Optional($0)) }
+        if catalogWorkspaceID == nil && catalogScope != "system" {
+            entries.append((name: "OpenCode", app: nil))
+            loadOpenCodeIcon()
+        }
+        entries.sort { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+        for (index, entry) in entries.enumerated() {
+            x = startX + CGFloat(index % columns) * (itemWidth + itemGap)
+            y = top - itemHeight - CGFloat(index / columns) * (itemHeight + itemGap)
             let frame = CGRect(x: x, y: y, width: itemWidth, height: itemHeight)
-            renderAddableAppTile(app.backend, isInstalled: app.isInstalled, frame: frame)
-            x += itemWidth + itemGap
+            if let app = entry.app {
+                renderAddableAppTile(app.backend, isInstalled: app.isInstalled, frame: frame)
+            } else {
+                let installed = hostOpenCodeItem != nil
+                let icon = CALayer()
+                icon.frame = CGRect(x: frame.midX - 23, y: frame.maxY - 56, width: 46, height: 46)
+                icon.contentsGravity = .resizeAspect
+                icon.contents = openCodeIcon ?? hostOpenCodeItem.flatMap { launcherIconImage(for: $0) }
+                icon.opacity = installed ? 0.62 : 1
+                addCreateFormSublayer(icon)
+                let name = makeTextLayer(size: 12, weight: .medium, color: installed ? .secondaryLabelColor : .labelColor, alignment: .center)
+                name.string = "OpenCode"
+                name.frame = CGRect(x: frame.minX, y: frame.minY + 20, width: frame.width, height: 28)
+                addCreateFormSublayer(name)
+                let status = makeTextLayer(size: 10, weight: .medium, color: .secondaryLabelColor, alignment: .center)
+                status.string = installed ? "Installed" : "Install"
+                status.frame = CGRect(x: frame.minX, y: frame.minY + 3, width: frame.width, height: 14)
+                addCreateFormSublayer(status)
+                if !installed {
+                    codingAgentActions.append((rootLayer.convert(frame, from: createFormContentLayer), "Install OpenCode", { [weak self] in
+                        self?.selectedCreateSection = .codingAgent
+                        self?.createScroll = 0
+                        self?.updateLayout()
+                    }))
+                }
+            }
         }
 
         return y - 34
@@ -6562,7 +7206,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
     private func renderFilePickerIfNeeded(width: CGFloat, height: CGFloat) {
         filePickerOverlayLayer.removeFromSuperlayer()
-        createLayer.addSublayer(filePickerOverlayLayer)
+        rootLayer.addSublayer(filePickerOverlayLayer)
         filePickerOverlayLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
         filePickerEntryFrames.removeAll()
         filePickerBreadcrumbSegmentFrames.removeAll()
@@ -7368,7 +8012,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         codingAgentTextFrames.removeAll()
         codingAgentTextBlocks.removeAll()
         createSectionFrames.removeAll()
-        recipeFrames.removeAll()
+        codingAgentActions.removeAll()
         bundledAppInstallFrames.removeAll()
         createFieldFrames.removeAll()
         createFieldLayouts.removeAll()
@@ -7491,101 +8135,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             }
             sendCreateFieldTextInputGeometryUpdate()
             return
-        case .otherRecipes:
-            break
-        }
-
-        let visibleRecipes = otherRecipeRecords()
-        if visibleRecipes.isEmpty {
-            let empty = makeTextLayer(size: 13, weight: .regular, color: .secondaryLabelColor)
-            empty.string = isLoadingRecipes ? "Loading recipes..." : "No recipes loaded."
-            empty.frame = CGRect(x: left, y: contentTop, width: pageWidth, height: 20)
-            addCreateFormSublayer(empty)
-            createContentBottom = contentTop
-            if clampCreateScrollUsingRenderedContent() {
-                renderCreateForm()
-            }
-            return
-        }
-
-        let usesTwoPaneLayout = pageWidth >= 760
-        let paneGap: CGFloat = 22
-        let selectorWidth: CGFloat = usesTwoPaneLayout ? min(300, floor(pageWidth * 0.34)) : pageWidth
-        let detailLeft = usesTwoPaneLayout ? left + selectorWidth + paneGap : left
-        let detailWidth = usesTwoPaneLayout ? pageWidth - selectorWidth - paneGap : pageWidth
-
-        let cardHeight: CGFloat = 58
-        let listTop = contentTop
-        var cardY = listTop - cardHeight
-        let cardWidth = selectorWidth
-        let selectedVisibleRecipe = selectedRecipe()
-        for recipe in visibleRecipes {
-            let frame = CGRect(x: left, y: cardY, width: cardWidth, height: cardHeight)
-            recipeFrames.append((frame, recipe.identifier))
-            let selected = recipe.identifier == selectedVisibleRecipe?.identifier
-            let card = CALayer()
-            card.frame = frame
-            card.cornerRadius = 7
-            card.borderWidth = selected ? 1.5 : 1
-            card.borderColor = selected ? resolvedCGColor(.controlAccentColor) : resolvedCGColor(.separatorColor)
-            card.backgroundColor = selected ? resolvedCGColor(NSColor.controlAccentColor.withAlphaComponent(0.12)) : resolvedCGColor(NSColor.controlBackgroundColor.withAlphaComponent(0.45))
-            addCreateFormSublayer(card)
-
-            let name = makeTextLayer(size: 12, weight: .semibold, color: .labelColor)
-            name.string = recipe.displayName
-            name.frame = CGRect(x: 11, y: 33, width: cardWidth - 22, height: 16)
-            card.addSublayer(name)
-            let summary = makeTextLayer(size: 10, weight: .regular, color: .secondaryLabelColor)
-            summary.string = recipe.summary
-            summary.frame = CGRect(x: 11, y: 12, width: cardWidth - 22, height: 14)
-            card.addSublayer(summary)
-            cardY -= cardHeight + 10
-        }
-        let recipeListBottom = cardY + cardHeight + 10
-
-        guard let recipe = selectedVisibleRecipe else { return }
-        let summary = makeTextLayer(size: 12, weight: .regular, color: .secondaryLabelColor)
-        summary.string = recipe.summary
-        let formTop = usesTwoPaneLayout ? listTop - 18 : recipeListBottom - 34
-        summary.frame = CGRect(x: detailLeft, y: formTop, width: detailWidth, height: 18)
-        addCreateFormSublayer(summary)
-
-        var y = formTop - 58
-        for field in visibleCreateFields(for: recipe) {
-            if field.fieldType == "choice" {
-                addCreateChoiceField(field, frame: CGRect(x: detailLeft, y: y, width: detailWidth, height: 50))
-                y -= 62
-            } else {
-                addCreateField(field,
-                               value: createValue(for: field),
-                               frame: CGRect(x: detailLeft, y: y, width: detailWidth, height: 46),
-                               monospaced: field.key == "command" || field.key == "executablePath" || field.key == "python")
-                y -= field.suggestions.isEmpty ? 62 : 84
-            }
-        }
-
-        createButtonFrame = CGRect(x: detailLeft, y: y + 14, width: 96, height: 30)
-        cancelCreateFrame = .zero
-        let createButton = makeButtonLayer(title: isPerformingAction ? "Creating..." : "Create", emphasized: true)
-        createButton.frame = createButtonFrame
-        addCreateFormSublayer(createButton)
-
-        if !createMessage.isEmpty {
-            addCreateMessageLayer(frame: CGRect(x: detailLeft,
-                                                y: y - 26,
-                                                width: detailWidth,
-                                                height: 18),
-                                  color: createMessage.hasPrefix("Created") ? .secondaryLabelColor : .systemRed)
-        }
-        let formBottom = !createMessage.isEmpty ? y - 26 : y + 14
-        createContentBottom = min(recipeListBottom, formBottom)
-        sendCreateFieldTextInputGeometryUpdate()
-        if clampCreateScrollUsingRenderedContent() {
-            renderCreateForm()
         }
     }
 
-    private func addCreateField(_ field: RecipeFieldRecord,
+    private func addCreateField(_ field: CreateFieldRecord,
                                 value: String,
                                 frame: CGRect,
                                 monospaced: Bool = false) {
@@ -7779,7 +8332,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         }
     }
 
-    private func addCreateChoiceField(_ field: RecipeFieldRecord, frame: CGRect) {
+    private func addCreateChoiceField(_ field: CreateFieldRecord, frame: CGRect) {
         let labelLayer = makeTextLayer(size: 11, weight: .medium, color: .secondaryLabelColor)
         labelLayer.string = field.label
         labelLayer.frame = CGRect(x: frame.minX, y: frame.maxY - 16, width: frame.width, height: 14)
@@ -7854,7 +8407,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         case .press, .focus, .setValue:
             accessibilityFocusedIdentifier = identifier
             if action == .focus && node.role == .button {
-                blurWorkspaceRenameField()
+                blurEditorInput()
                 blurCreateField()
                 blurPasswordField()
                 break
@@ -7863,8 +8416,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             handleMouseUp(at: point, modifierFlags: [])
             if action == .setValue {
                 if isWorkspaceNamePromptVisible {
-                    focusWorkspaceRenameField(selectAll: true)
-                    if value.isEmpty { workspaceRenameInputController.deleteBackward() }
+                    focusEditorInput(selectAll: true)
+                    if value.isEmpty { editorInputController.deleteBackward() }
                     insertWorkspaceRenameText(value, hasReplacementRange: false, replacementLocation: 0, replacementLength: 0)
                 } else if pendingPasswordAction != nil {
                     passwordInputController.selectAll()
@@ -7901,8 +8454,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             }
         case .setSelectedTextRange:
             guard let target = accessibilityTextTargets[identifier] else { return }
-            let controller = target == "workspace" ? workspaceRenameInputController : createInputController
-            if target == "workspace" { focusWorkspaceRenameField() }
+            let controller = target == "workspace" ? editorInputController : createInputController
+            if target == "workspace" { focusEditorInput() }
             else { focusCreateField(target) }
             let parts = value.split(separator: ":", omittingEmptySubsequences: false)
             guard parts.count == 2, let location = Int(parts[0]), let length = Int(parts[1]),
@@ -7929,7 +8482,12 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         var nextIdentifier: UInt32 = 1
         var children: [OuterframeAccessibilityNode] = []
 
-        if isShowingWorkspacePanel {
+        if managementPanel != nil {
+            children = accessibilityVisibleText(in: managementOverlayLayer, nextIdentifier: &nextIdentifier)
+            children += managementActions.map { accessibilityNode(nextIdentifier: &nextIdentifier, role: .button, frame: $0.frame, label: $0.title) }
+        } else if pendingFilePicker != nil {
+            children = buildFilePickerAccessibilityNodes(nextIdentifier: &nextIdentifier)
+        } else if isShowingWorkspacePanel {
             children = buildWorkspaceAccessibilityNodes(nextIdentifier: &nextIdentifier)
         } else if pendingAboutBackend != nil {
             children = accessibilityVisibleText(in: aboutOverlayLayer, nextIdentifier: &nextIdentifier)
@@ -7989,14 +8547,14 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         if let textTarget {
             accessibilityTextTargets[identifier] = textTarget
             supported.insert(.setSelectedTextRange)
-            let controller = textTarget == "workspace" ? workspaceRenameInputController : createInputController
+            let controller = textTarget == "workspace" ? editorInputController : createInputController
             if controller.isFocused && (textTarget == "workspace" || activeCreateFieldKey == textTarget) {
                 let selection = controller.selectionRange ?? controller.cursorPosition..<controller.cursorPosition
                 let start = utf16Offset(forCharacterIndex: selection.lowerBound, in: controller.text)
                 selectedRange = NSRange(location: start, length: utf16Offset(forCharacterIndex: selection.upperBound, in: controller.text) - start)
             }
         }
-        let textHasFocus = workspaceRenameInputController.isFocused || createInputController.isFocused || passwordInputController.isFocused
+        let textHasFocus = editorInputController.isFocused || createInputController.isFocused || passwordInputController.isFocused
         let node = OuterframeAccessibilityNode(identifier: identifier,
                                            role: role,
                                            frame: frame,
@@ -8023,7 +8581,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         let layout: CreateFieldLayout
         let sourceLayer: CALayer
         if target == "workspace" {
-            layout = CreateFieldLayout(fieldFrame: workspaceRenameFieldFrame, textFrame: workspaceRenameTextFrame,
+            layout = CreateFieldLayout(fieldFrame: editorInputFieldFrame, textFrame: editorInputTextFrame,
                                        key: target, monospaced: isDockerfileFragmentPrompt, multiline: isDockerfileFragmentPrompt)
             sourceLayer = rootLayer
         } else {
@@ -8128,7 +8686,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private func buildWorkspaceAccessibilityNodes(nextIdentifier: inout UInt32) -> [OuterframeAccessibilityNode] {
         var controls: [(CGRect, String)] = []
         var fieldLabel: String?
-        var fieldFrame = workspaceRenameFieldFrame
+        var fieldFrame = editorInputFieldFrame
         var dialogFrame = workspacePanelFrame
         var title = "Container"
         if containerConfigurationBuildError != nil {
@@ -8147,17 +8705,19 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             title = "Delete container"
             controls = [(workspaceDeleteConfirmFrame, "Delete container"), (workspaceDeleteCancelFrame, "Cancel")]
         } else if isContainerConfigurationEditorVisible && !isRenamingContainerConfiguration {
-            title = "Edit \(pendingDockerfileWorkspace?.name ?? "container")"
+            title = "Container: \(pendingDockerfileWorkspace?.name ?? "container")"
             controls = [(workspaceCloseFrame, "Close container editor"),
                         (containerConfigurationRenameFrame, "Rename container"),
                         (containerConfigurationDockerfileTabFrame, "Dockerfile"),
+                        (codingAgentTabFrame, "Coding agent"),
                         (containerConfigurationMountsTabFrame, "Folder mounts"),
                         (containerConfigurationEnvironmentTabFrame, "Environment"),
-                        (containerConfigurationPortsTabFrame, "Ports"),
+                        (containerConfigurationPortsTabFrame, "Network"),
                         (containerConfigurationRuntimeTabFrame, "Runtime"),
                         (containerConfigurationSaveFrame, "Save"),
+                        (dockerfileZoomFrame, "Dockerfile text size"),
                         (containerConfigurationDiscardFrame, "Discard changes"),
-                        (containerConfigurationRebuildFrame, "Rebuild container")]
+                        (containerConfigurationRebuildFrame, "Save & rebuild")]
             switch containerConfigurationTab {
             case .dockerfile, .environment, .ports:
                 fieldLabel = containerConfigurationTab == .dockerfile ? "Dockerfile contents" : containerConfigurationTab == .environment ? "Environment variables" : "Port mappings"
@@ -8167,15 +8727,27 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 }
             case .mounts:
                 controls.append((containerConfigurationAddMountFrame, "Add folder mount"))
-                controls += containerConfigurationMountActionFrames.map { ($0.frame, "\($0.action) mount \($0.id)") }
+                controls += containerConfigurationMountActionFrames.map { action in
+                    let mount = containerConfigurationMounts.first { $0.id == action.id }
+                    let label: String
+                    switch action.action {
+                    case "host": label = "Edit folder: " + (mount?.hostPath ?? "")
+                    case "guest": label = "Edit container path: " + (mount?.guestPath ?? "")
+                    case "toggleReadOnly": label = (mount?.isReadOnly == true ? "Read only" : "Read and write") + ": " + (mount?.guestPath ?? "")
+                    default: label = "Remove mount: " + (mount?.guestPath ?? "")
+                    }
+                    return (action.frame, label)
+                }
+            case .codingAgent:
+                controls += codingAgentActions.map { ($0.frame, $0.title) }
             case .runtime:
                 controls.append((containerConfigurationChangeRuntimeFrame, "Change runtime"))
             }
         } else if isWorkspaceNamePromptVisible {
             title = isCreatingWorkspace ? "Add container" : "Container settings"
             dialogFrame = workspaceRenamePanelFrame
-            fieldLabel = isAddingWindowsContainerFolder ? "Windows server folder" : isCreatingWorkspace && !isEditingCreationBaseImage ? "Container name" : pendingWorkspaceRename != nil ? "Container name" : "Value"
-            controls = [(workspaceRenameCancelFrame, "Cancel"), (workspaceRenameConfirmFrame, isAddingWindowsContainerFolder ? "Mount" : isCreatingWorkspace ? (isEditingCreationBaseImage ? "Done" : "Create") : pendingWorkspaceRename != nil ? "Rename" : "Save"),
+            fieldLabel = pendingMountPathEdit != nil ? "Folder path" : pendingEndpointRename != nil ? "Endpoint name" : isAddingWindowsContainerFolder ? "Windows server folder" : isCreatingWorkspace && !isEditingCreationBaseImage ? "Container name" : pendingWorkspaceRename != nil ? "Container name" : "Value"
+            controls = [(workspaceRenameCancelFrame, "Cancel"), (workspaceRenameConfirmFrame, pendingMountPathEdit != nil ? "Save" : isAddingWindowsContainerFolder ? "Mount" : isCreatingWorkspace ? (isEditingCreationBaseImage ? "Done" : "Create") : pendingWorkspaceRename != nil ? "Rename" : "Save"),
                         (workspaceCreationBaseImageFrame, "Choose base image"), (workspaceOuterShellBaseImageFrame, "Outer Shell base image"),
                         (workspaceCustomBaseImageFrame, "Custom base image with support"), (workspaceCustomAsIsFrame, "Custom base image unchanged")]
         } else {
@@ -8185,15 +8757,16 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         for (frame, label) in controls where !frame.isEmpty {
             let selectedTab = isContainerConfigurationEditorVisible &&
                 ((label == "Dockerfile" && containerConfigurationTab == .dockerfile) ||
+                 (label == "Coding agent" && containerConfigurationTab == .codingAgent) ||
                  (label == "Folder mounts" && containerConfigurationTab == .mounts) ||
                  (label == "Environment" && containerConfigurationTab == .environment) ||
-                 (label == "Ports" && containerConfigurationTab == .ports) ||
+                 (label == "Network" && containerConfigurationTab == .ports) ||
                  (label == "Runtime" && containerConfigurationTab == .runtime))
             nodes.append(accessibilityNode(nextIdentifier: &nextIdentifier, role: .button, frame: frame, label: label, value: selectedTab ? "Selected" : nil))
         }
         if let fieldLabel, !fieldFrame.isEmpty {
             nodes.append(accessibilityNode(nextIdentifier: &nextIdentifier, role: isDockerfileFragmentPrompt ? .textArea : .textField, frame: fieldFrame, label: fieldLabel,
-                                           value: workspaceRenameName, actions: isContainerConfigurationEditorVisible && !isRenamingContainerConfiguration ? [.press, .focus, .setValue, .scrollUp, .scrollDown] : [.press, .focus, .setValue], isFocused: workspaceRenameInputController.isFocused, textTarget: "workspace"))
+                                           value: workspaceRenameName, actions: isContainerConfigurationEditorVisible && !isRenamingContainerConfiguration ? [.press, .focus, .setValue, .scrollUp, .scrollDown] : [.press, .focus, .setValue], isFocused: editorInputController.isFocused, textTarget: "workspace"))
         }
         let interactiveFrames = nodes.map(\.frame)
         let visibleLayer = workspacePanelLayer.sublayers?.last(where: {
@@ -8266,7 +8839,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 from: contentLayer,
                 clippedBy: cardClipFrame
             ) else { continue }
-            let status = endpointIsRunning(card.item.primaryEndpoint) ? "Running" : "Not running"
+            let status = isStopping(card.item) ? "Stopping…" : isLaunching(card.item) ? "Opening…" : endpointIsRunning(card.item.primaryEndpoint) ? "Running" : "Not running"
             nodes.append(accessibilityNode(nextIdentifier: &nextIdentifier,
                                            role: .button,
                                            frame: frame,
@@ -8306,7 +8879,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             }
         }
         if let frame = accessibilityFrame(workspaceOverviewCreateFrame, from: appsScrollContentLayer, clippedBy: clipFrame) {
-            nodes.append(accessibilityNode(nextIdentifier: &nextIdentifier, role: .button, frame: frame, label: "Add container (beta)…"))
+            nodes.append(accessibilityNode(nextIdentifier: &nextIdentifier, role: .button, frame: frame, label: "Manage containers…"))
         }
         if let frame = accessibilityFrame(addAppFrame, from: appsScrollContentLayer, clippedBy: clipFrame) {
             nodes.append(accessibilityNode(nextIdentifier: &nextIdentifier,
@@ -8415,6 +8988,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                            value: selectedCreateSection == section.section ? "Selected" : nil))
         }
 
+        for action in codingAgentActions {
+            nodes.append(accessibilityNode(nextIdentifier: &nextIdentifier, role: .button, frame: action.frame, label: action.title))
+        }
         for app in bundledAppInstallFrames {
             guard let frame = accessibilityFrame(app.frame, from: createLayer, clippedBy: clipFrame) else { continue }
             nodes.append(accessibilityNode(nextIdentifier: &nextIdentifier,
@@ -8423,16 +8999,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                            label: "Install \(app.backend.displayName)"))
         }
 
-        for recipe in recipeFrames {
-            guard let frame = accessibilityFrame(recipe.frame, from: createLayer, clippedBy: clipFrame),
-                  let record = recipes.first(where: { $0.identifier == recipe.recipeID }) else { continue }
-            nodes.append(accessibilityNode(nextIdentifier: &nextIdentifier,
-                                           role: .button,
-                                           frame: frame,
-                                           label: record.displayName,
-                                           value: selectedRecipeID == recipe.recipeID ? "Selected" : nil,
-                                           hint: record.summary))
-        }
 
         for field in createFieldFrames {
             guard let frame = accessibilityFrame(field.frame, from: createLayer, clippedBy: clipFrame) else { continue }
@@ -8652,15 +9218,13 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private func createSectionAccessibilityLabel(_ section: CreateSection) -> String {
         switch section {
         case .codingAgent:
-            return "Ask your coding agent"
+            return "Coding agent"
         case .appCatalog:
             return "Outer Shell app catalog"
         case .bashCommands:
             return commandSectionTitle
         case .nativeApp:
             return "New App"
-        case .otherRecipes:
-            return "Other recipes"
         }
     }
 
@@ -8671,7 +9235,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             "bashFrontendTransport": ("Connection", ""),
             "bashSocketPath": (isWindowsCommandHost ? "Named pipe path" : "Socket Path", isWindowsCommandHost ? commandPipePlaceholder : "/tmp/my-service.sock"),
             "bashPort": ("Port", "4000"),
-            "bashIconPath": ("Icon Path", "Optional"),
+            "bashIconPath": ("Icon path", "Optional, otherwise Outer Loop will try to fetch it"),
             "bashIdentifier": ("ID", "my-app")
         ]
         if let description = bashLabels[key] {
@@ -8691,9 +9255,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         ]
         if let description = nativeLabels[key] {
             return (description.0, createValues[key], description.1.isEmpty ? nil : description.1)
-        }
-        if let field = selectedRecipe()?.fields.first(where: { $0.key == key }) {
-            return (field.label, createValue(for: field), field.placeholder.isEmpty ? nil : field.placeholder)
         }
         return (key, createValues[key], nil)
     }
@@ -8747,7 +9308,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         if key == "nativeTargetMacOS" {
             return "macOS"
         }
-        return selectedRecipe()?.fields.first(where: { $0.key == key })?.choices.first(where: { $0.value == value })?.title ?? value
+        return value
     }
 
     private func createValue(forCreateKey key: String) -> String {
@@ -8765,9 +9326,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         }
         if key == "nativeTargetHTML" || key == "nativeTargetMacOS" {
             return createValues[key, default: "true"]
-        }
-        if let field = selectedRecipe()?.fields.first(where: { $0.key == key }) {
-            return createValue(for: field)
         }
         return createValues[key, default: ""]
     }
@@ -8878,6 +9436,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                     self.lastBackendsResponseData = data
                     self.backendError = response.error
                     self.backends = response.backends
+                    self.checkOpenCodeUpdates()
                     self.fetchEndpointIcons()
                     if let path = self.backends.first(where: { $0.serviceScope == "user" && $0.serviceUnitPath != nil })?.serviceUnitPath {
                         let components = path.split(separator: "/")
@@ -8932,47 +9491,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         scheduleLayoutUpdate()
     }
 
-    private func fetchRecipes(didRecoverNetworking: Bool = false) {
-        guard !isLoadingRecipes, let recipesEndpoint = workspaceAPIEndpoint(recipesEndpoint), let urlSession else { return }
-        isLoadingRecipes = true
-        urlSession.dataTask(with: recipesEndpoint) { [weak self] data, _, error in
-            Task { @MainActor in
-                guard let self else { return }
-                self.isLoadingRecipes = false
-                if let error {
-                    if !didRecoverNetworking, self.recoverNetworkingIfNeeded(after: error) {
-                        self.fetchRecipes(didRecoverNetworking: true)
-                        return
-                    }
-                    if self.mode == .create {
-                        self.scheduleLayoutUpdate()
-                    }
-                    return
-                }
-                guard let data else {
-                    if self.mode == .create {
-                        self.scheduleLayoutUpdate()
-                    }
-                    return
-                }
-                do {
-                    let response = try RecipesResponse.decodeBinary(data)
-                    self.recipes = response.recipes
-                    if !self.recipes.contains(where: { $0.identifier == self.selectedRecipeID }) {
-                        self.selectedRecipeID = self.recipes.first?.identifier ?? "command-port"
-                    }
-                    self.applyRecipeDefaults(overwrite: false)
-                    if self.mode == .create {
-                        self.scheduleLayoutUpdate()
-                    }
-                } catch {
-                    if self.mode == .create {
-                        self.scheduleLayoutUpdate()
-                    }
-                }
-            }
-        }.resume()
-    }
 
     private func fetchSelectedLog(quiet: Bool = false, scrollToBottom: Bool = false, didRecoverNetworking: Bool = false) {
         if let context = selectedContainerLogContext {
@@ -9064,7 +9582,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         let actionWorkspaceID = workspaceID ?? catalogWorkspaceID
         guard !isPerformingAction, let controlEndpoint = workspaceAPIEndpoint(controlEndpoint, workspaceID: actionWorkspaceID), let urlSession else { return }
         isPerformingAction = true
-        backendError = actionProgressText(operation: operation, backend: backend)
+        let stopKeys = Set(backend.frontends.map { backend.serviceScope + ":" + backend.serviceID + ":" + $0.id })
+        if operation == "stop" { stoppingEndpoints.formUnion(stopKeys) }
+        backendError = operation == "stop" ? "" : actionProgressText(operation: operation, backend: backend)
         if sudoPassword != nil {
             blurPasswordField()
             pendingPasswordAction = nil
@@ -9081,6 +9601,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         ]
         guard let url = components?.url else {
             isPerformingAction = false
+            stoppingEndpoints.subtract(stopKeys)
             backendError = "Could not build control request."
             updateLayout()
             return
@@ -9095,6 +9616,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             Task { @MainActor in
                 guard let self else { return }
                 self.isPerformingAction = false
+                self.stoppingEndpoints.subtract(stopKeys)
                 var actionCompleted = false
                 if let error {
                     if !didRecoverNetworking, self.recoverNetworkingIfNeeded(after: error) {
@@ -9173,22 +9695,37 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
     private func controlContainerApp(_ context: ContainerAppLauncherContext,
                                      operation: String) {
-        let action: String
-        switch operation {
-        case "startApp":
-            action = "Starting"
-        case "stopApp":
-            action = "Stopping"
-        case "restartApp":
-            action = "Restarting"
-        default:
-            return
+        let key = context.container.id.uuidString + ":" + context.app.serviceID + ":" + context.app.frontendID
+        guard !launchingEndpoints.contains(key), !stoppingEndpoints.contains(key) else { return }
+        if operation == "stopApp" { stoppingEndpoints.insert(key) }
+        else { launchingEndpoints.insert(key) }
+        backendError = ""
+        updateLayout()
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer {
+                self.stoppingEndpoints.remove(key)
+                self.launchingEndpoints.remove(key)
+                self.sendWorkspaceRequest(operation: "list")
+                self.updateLayout()
+            }
+            do {
+                try await self.containerLaunchRequest(operation, workspaceID: context.container.id, app: context.app)
+                let deadline = ProcessInfo.processInfo.systemUptime + 30
+                while ProcessInfo.processInfo.systemUptime < deadline {
+                    let data = try await self.openCodeData("/api/container-snapshot")
+                    let response = try LocalWorkspaceHostResponse.decode(data, snapshotRequestID: UUID())
+                    if let workspace = response.workspaces.first(where: { $0.id == context.container.id }),
+                       let app = workspace.apps.first(where: { $0.serviceID == context.app.serviceID && $0.frontendID == context.app.frontendID }),
+                       app.isRunning == (operation != "stopApp") {
+                        if let index = self.localWorkspaces.firstIndex(where: { $0.id == workspace.id }) { self.localWorkspaces[index] = workspace }
+                        return
+                    }
+                    try await Task.sleep(nanoseconds: 500_000_000)
+                }
+                throw ContainerConfigurationInputError(message: "The app has not finished changing state. Check its logs and try again.")
+            } catch { self.backendError = error.localizedDescription }
         }
-        workspacePanelMessage = "\(action) \(context.app.displayName)…"
-        sendWorkspaceRequest(operation: operation,
-                             workspaceID: context.container.id,
-                             serviceID: context.app.serviceID,
-                             serviceScope: context.app.serviceScope)
     }
 
     private func scheduleBackendsRefreshes() {
@@ -9302,17 +9839,18 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                   ) else {
                 return
             }
+            let targetURL = self.openCodeNavigationURL(url, serviceID: endpoint.backend.serviceID)
             let pipeDisplayName = endpoint.frontend.socketPath.hasPrefix("\\\\.\\pipe\\wsl.")
                 ? "WSL / \(endpoint.backend.serviceScope == "system" ? "root" : self.overviewUsername) / \(displayName)"
                 : nil
             if opensInNewWindow {
-                self.outerframeHost.openNewWindow(with: url,
+                self.outerframeHost.openNewWindow(with: targetURL,
                                                   displayString: pipeDisplayName ?? displayName,
                                                   preferredSize: nil)
             } else if opensInNewTab {
-                self.outerframeHost.openNewTab(with: url, displayString: pipeDisplayName ?? displayName)
+                self.outerframeHost.openNewTab(with: targetURL, displayString: pipeDisplayName ?? displayName)
             } else {
-                self.outerframeHost.navigate(to: url, displayString: pipeDisplayName)
+                self.outerframeHost.navigate(to: targetURL, displayString: pipeDisplayName)
             }
         }
 
@@ -9373,29 +9911,91 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         }.resume()
     }
 
+    private func containerLaunchRequest(_ operation: String, workspaceID: UUID, app: LocalWorkspaceAppRecord?) async throws {
+        guard let endpoint = safeSpacesEndpoint, let session = safeSpaceOperationSession else {
+            throw ContainerConfigurationInputError(message: "Outer Shell’s container service is unavailable.")
+        }
+        var values: [String: Any] = ["requestID": UUID().uuidString, "operation": operation, "workspaceID": workspaceID.uuidString]
+        if let app {
+            values["serviceID"] = app.serviceID
+            if let scope = app.serviceScope { values["serviceScope"] = scope }
+        }
+        var request = URLRequest(url: endpoint)
+        request.httpMethod = "POST"
+        request.httpBody = try JSONSerialization.data(withJSONObject: values)
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        let (data, response) = try await session.data(for: request)
+        let result = try LocalWorkspaceHostResponse.decode(data)
+        if let error = result.error, !error.isEmpty { throw ContainerConfigurationInputError(message: error) }
+        guard (response as? HTTPURLResponse)?.statusCode == 200 else {
+            throw ContainerConfigurationInputError(message: "Could not start the container app.")
+        }
+    }
+
+    private func prepareAndOpenWorkspaceApp(_ app: LocalWorkspaceAppRecord, in workspace: LocalWorkspaceRecord,
+                                            opensInNewTab: Bool, opensInNewWindow: Bool) {
+        let key = workspace.id.uuidString + ":" + app.serviceID + ":" + app.frontendID
+        guard launchingEndpoints.insert(key).inserted else { return }
+        backendError = ""
+        updateLayout()
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                if self.displayedWorkspaceState(for: workspace) != "running" {
+                    try await self.containerLaunchRequest("start", workspaceID: workspace.id, app: nil)
+                }
+                if !app.isRunning {
+                    try await self.containerLaunchRequest("startApp", workspaceID: workspace.id, app: app)
+                }
+                let deadline = ProcessInfo.processInfo.systemUptime + 120
+                while ProcessInfo.processInfo.systemUptime < deadline {
+                    let data = try await self.openCodeData("/api/container-snapshot")
+                    let response = try LocalWorkspaceHostResponse.decode(data, snapshotRequestID: UUID())
+                    if let current = response.workspaces.first(where: { $0.id == workspace.id }),
+                       let ready = current.apps.first(where: { $0.serviceID == app.serviceID && $0.frontendID == app.frontendID }),
+                       self.displayedWorkspaceState(for: current) == "running", ready.isRunning,
+                       ready.publishedPort > 0 || ready.externalSocketPath?.isEmpty == false {
+                        self.launchingEndpoints.remove(key)
+                        self.openWorkspaceApp(ready, in: current, opensInNewTab: opensInNewTab, opensInNewWindow: opensInNewWindow)
+                        return
+                    }
+                    try await Task.sleep(nanoseconds: 750_000_000)
+                }
+                throw ContainerConfigurationInputError(message: "The app is still not ready after two minutes. Check its logs for startup errors, then try again.")
+            } catch {
+                self.launchingEndpoints.remove(key)
+                self.backendError = error.localizedDescription
+                self.updateLayout()
+            }
+        }
+    }
+
     private func openWorkspaceApp(_ app: LocalWorkspaceAppRecord,
                                   in workspace: LocalWorkspaceRecord,
                                   opensInNewTab: Bool,
                                   opensInNewWindow: Bool = false) {
-        guard !isPerformingAction else { return }
+        if !app.isRunning || displayedWorkspaceState(for: workspace) != "running" {
+            prepareAndOpenWorkspaceApp(app, in: workspace, opensInNewTab: opensInNewTab, opensInNewWindow: opensInNewWindow)
+            return
+        }
+        let key = workspace.id.uuidString + ":" + app.serviceID + ":" + app.frontendID
+        guard !launchingEndpoints.contains(key) else { return }
         let displayName = app.displayName.isEmpty ? app.serviceID : app.displayName
-        isPerformingAction = true
-        backendError = displayedWorkspaceState(for: workspace) == "running"
-            ? "Opening \(displayName)…"
-            : "Starting container \(workspace.name) and opening \(displayName)…"
+        launchingEndpoints.insert(key)
+        backendError = ""
         updateLayout()
         if let pipe = app.externalSocketPath, pipe.hasPrefix("\\\\.\\pipe\\") {
             let path = pathAndQuery(fromFrontendURL: app.url, socketPath: app.socketPath)
             guard let url = URL(string: "http+pipe://\(percentEncodedSocketPath(pipe))\(path)") else {
-                isPerformingAction = false
+                launchingEndpoints.remove(key)
                 backendError = "The app returned an invalid named pipe address."
                 updateLayout()
                 return
             }
-            isPerformingAction = false
+            launchingEndpoints.remove(key)
             backendError = ""
             updateLayout()
-            navigateToWorkspaceApp(workspaceAppNavigationURL(url, app: app),
+            navigateToWorkspaceApp(workspaceAppNavigationURL(openCodeNavigationURL(url, serviceID: app.serviceID), app: app),
                                    opensInNewTab: opensInNewTab,
                                    opensInNewWindow: opensInNewWindow)
             return
@@ -9404,15 +10004,15 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             let path = pathAndQuery(fromFrontendURL: app.url,
                                     socketPath: app.socketPath)
             guard let url = URL(string: "http://127.0.0.1:\(app.publishedPort)\(path)") else {
-                isPerformingAction = false
+                launchingEndpoints.remove(key)
                 backendError = "The app returned an invalid published port address."
                 updateLayout()
                 return
             }
-            isPerformingAction = false
+            launchingEndpoints.remove(key)
             backendError = ""
             updateLayout()
-            navigateToWorkspaceApp(workspaceAppNavigationURL(url, app: app),
+            navigateToWorkspaceApp(workspaceAppNavigationURL(openCodeNavigationURL(url, serviceID: app.serviceID), app: app),
                                    opensInNewTab: opensInNewTab,
                                    opensInNewWindow: opensInNewWindow)
             return
@@ -9421,7 +10021,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                         workspaceID: workspace.id,
                                         completion: { [weak self] publishedSocketPath, publicationError in
             guard let self else { return }
-            self.isPerformingAction = false
+            self.launchingEndpoints.remove(key)
             guard let publishedSocketPath else {
                 self.backendError = publicationError ??
                     "Could not open \(displayName) in \(workspace.name)."
@@ -9439,7 +10039,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             }
             self.backendError = ""
             self.updateLayout()
-            let navigationURL = self.workspaceAppNavigationURL(url, app: app)
+            let navigationURL = self.workspaceAppNavigationURL(self.openCodeNavigationURL(url, serviceID: app.serviceID), app: app)
             self.navigateToWorkspaceApp(navigationURL,
                                         opensInNewTab: opensInNewTab,
                                         opensInNewWindow: opensInNewWindow)
@@ -9540,9 +10140,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                               opensInNewTab: Bool,
                                               opensInNewWindow: Bool,
                                               didRecoverNetworking: Bool = false) {
-        guard !isPerformingAction, let controlEndpoint = workspaceAPIEndpoint(controlEndpoint), let urlSession else { return }
-        isPerformingAction = true
-        backendError = "Starting \(displayName)..."
+        guard !launchingEndpoints.contains(launchKey(endpoint)), let controlEndpoint = workspaceAPIEndpoint(controlEndpoint), let urlSession else { return }
+        launchingEndpoints.insert(launchKey(endpoint))
+        backendError = ""
         updateLayout()
 
         var components = URLComponents(url: controlEndpoint, resolvingAgainstBaseURL: false)
@@ -9552,7 +10152,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             URLQueryItem(name: "operation", value: "start")
         ]
         guard let url = components?.url else {
-            isPerformingAction = false
+            launchingEndpoints.remove(launchKey(endpoint))
             backendError = "Could not build frontend URL."
             updateLayout()
             return
@@ -9562,8 +10162,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         urlSession.dataTask(with: request) { [weak self] data, _, error in
             Task { @MainActor in
                 guard let self else { return }
-                self.isPerformingAction = false
                 if let error {
+                    self.launchingEndpoints.remove(self.launchKey(endpoint))
                     if !didRecoverNetworking, self.recoverNetworkingIfNeeded(after: error) {
                         self.startAndOpenLauncherEndpoint(endpoint,
                                                           displayName: displayName,
@@ -9579,6 +10179,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 if let data,
                    let response = try? ActionResponse.decodeBinary(data),
                    !response.ok {
+                    self.launchingEndpoints.remove(self.launchKey(endpoint))
                     self.backendError = response.message
                     self.updateLayout()
                     return
@@ -9598,8 +10199,12 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                          opensInNewWindow: Bool,
                                          attempt: Int,
                                          didRecoverNetworking: Bool = false) {
-        guard let backendsEndpoint, let urlSession else { return }
-        backendError = "Waiting for \(displayName)..."
+        guard let backendsEndpoint, let urlSession else {
+            launchingEndpoints.remove(launchKey(endpoint))
+            updateLayout()
+            return
+        }
+        backendError = ""
         updateLayout()
         urlSession.dataTask(with: backendsEndpoint) { [weak self] data, _, error in
             Task { @MainActor in
@@ -9616,10 +10221,12 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 if let data,
                    let response = try? BackendsResponse.decodeBinary(data) {
                     self.backends = response.backends
+                    self.checkOpenCodeUpdates()
                     if let failedEndpoint = self.findLauncherEndpoint(serviceID: endpoint.backend.serviceID,
                                                                        serviceScope: endpoint.backend.serviceScope,
                                                                        frontendID: endpoint.frontend.id),
                        let failure = self.launcherFailureMessage(failedEndpoint, displayName: displayName) {
+                        self.launchingEndpoints.remove(self.launchKey(endpoint))
                         self.backendError = failure
                         self.showLogs(for: failedEndpoint.backend)
                         return
@@ -9629,6 +10236,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                                                     frontendID: endpoint.frontend.id),
                        self.launcherNavigationURL(nextEndpoint) != nil,
                        self.endpointIsReadyToOpen(nextEndpoint) {
+                        self.launchingEndpoints.remove(self.launchKey(endpoint))
                         self.backendError = ""
                         self.updateLayout()
                         self.navigateToLauncherEndpoint(nextEndpoint,
@@ -9639,7 +10247,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                     }
                 }
                 guard attempt < 30 else {
-                    self.backendError = "Timed out waiting for \(displayName)."
+                    self.launchingEndpoints.remove(self.launchKey(endpoint))
+                        self.backendError = "Timed out waiting for \(displayName)."
                     self.updateLayout()
                     return
                 }
@@ -9720,6 +10329,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func performAppMenuAction(_ item: AppLauncherItem, operation: String) {
+        if performOverviewMenuAction(item, operation: operation) { return }
+        if operation == "updateOpenCode" { showOpenCodeUpdate(); return }
         if operation == "alwaysShow" {
             moveOverviewItem(item, pinned: true)
             return
@@ -9851,23 +10462,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             submitNativeAppForm()
             return
         }
-        guard !isPerformingAction, let createEndpoint = workspaceAPIEndpoint(createEndpoint), let urlSession else { return }
-        guard let recipe = selectedRecipe() else {
-            createMessage = "Choose a recipe."
-            updateLayout()
-            return
-        }
-        let missing = visibleCreateFields(for: recipe).first { field in
-            let value = createValue(for: field).trimmingCharacters(in: .whitespacesAndNewlines)
-            if field.key == "port" { return false }
-            return value.isEmpty && field.defaultValue.isEmpty
-        }
-        if let missing {
-            createMessage = "\(missing.label) is required."
-            updateLayout()
-            return
-        }
-        performCreateRequest(recipe: recipe, createEndpoint: createEndpoint, urlSession: urlSession)
     }
 
     private func submitBashCommandsForm() {
@@ -10165,62 +10759,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         }
     }
 
-    private func performCreateRequest(recipe: RecipeRecord,
-                                      createEndpoint: URL,
-                                      urlSession: URLSession,
-                                      didRecoverNetworking: Bool = false) {
-        isPerformingAction = true
-        createMessage = "Creating..."
-        updateLayout()
-        var components = URLComponents(url: createEndpoint, resolvingAgainstBaseURL: false)
-        var queryItems = [URLQueryItem(name: "recipe", value: recipe.identifier)]
-        for field in recipe.fields {
-            if isCreateFieldHidden(field, in: recipe) {
-                continue
-            }
-            queryItems.append(URLQueryItem(name: field.key, value: createValue(for: field).trimmingCharacters(in: .whitespacesAndNewlines)))
-        }
-        components?.queryItems = queryItems
-        guard let url = components?.url else {
-            isPerformingAction = false
-            createMessage = "Could not build create request."
-            updateLayout()
-            return
-        }
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        urlSession.dataTask(with: request) { [weak self] data, _, error in
-            Task { @MainActor in
-                guard let self else { return }
-                self.isPerformingAction = false
-                if let error {
-                    if !didRecoverNetworking, self.recoverNetworkingIfNeeded(after: error),
-                       let urlSession = self.urlSession {
-                        self.performCreateRequest(recipe: recipe,
-                                                  createEndpoint: createEndpoint,
-                                                  urlSession: urlSession,
-                                                  didRecoverNetworking: true)
-                        return
-                    }
-                    self.createMessage = error.localizedDescription
-                } else if let data,
-                          let response = try? ActionResponse.decodeBinary(data) {
-                        self.createMessage = response.message
-                        if response.ok {
-                            self.createInputController.resetUndoHistory()
-                            self.createValues.removeAll()
-                            self.applyRecipeDefaults(overwrite: true)
-                            self.pendingFilePicker = nil
-                            self.navigateToMode(.apps, pushHistory: false)
-                            self.fetchBackends()
-                        }
-                } else {
-                    self.createMessage = "Create request failed."
-                }
-                self.updateColors()
-            }
-        }.resume()
-    }
 
     private func performBashCreateRequest(didRecoverNetworking: Bool = false) {
         guard !isPerformingAction, let createEndpoint = workspaceAPIEndpoint(createEndpoint), let urlSession else { return }
@@ -10313,7 +10851,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
     private func showDirectoryPicker(for key: String) {
         blurCreateField()
-        let currentDirectory = createValues[key] ?? selectedRecipe()?.fields.first(where: { $0.key == key })?.defaultValue ?? "~"
+        let currentDirectory = createValues[key] ?? "~"
         let directory = currentDirectory.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "~" : currentDirectory
         filePickerScroll = 0
         filePickerSelectedIndex = nil
@@ -10330,7 +10868,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func fetchFilePickerDirectory(path: String, didRecoverNetworking: Bool = false) {
-        guard let filePickerEndpoint = workspaceAPIEndpoint(filePickerEndpoint), let urlSession else { return }
+        guard let filePickerEndpoint = pendingFilePicker?.targetFieldKey == "containerMount" ? filePickerEndpoint : workspaceAPIEndpoint(filePickerEndpoint), let urlSession else { return }
         if pendingFilePicker != nil {
             pendingFilePicker?.directory = path
             pendingFilePicker?.entries = []
@@ -10411,6 +10949,14 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         filePickerScroll = 0
         filePickerSelectedIndex = nil
         resetFilePickerTypeahead()
+        if targetFieldKey == "containerMount" {
+            if let path = createValues.removeValue(forKey: targetFieldKey) {
+                appendSelectedContainerConfigurationFolder(path)
+                persistContainerRuntimeConfiguration()
+            }
+            updateLayout()
+            return
+        }
         focusCreateField(targetFieldKey, cursorPosition: createValues[targetFieldKey, default: ""].count)
         createMessage = ""
         updateLayout()
@@ -10550,21 +11096,21 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
     func textInputControllerDidChangeState() {
         if isWorkspaceNamePromptVisible,
-           workspaceRenameInputController.isFocused,
-           !isSynchronizingWorkspaceRenameInput {
-            workspaceRenameName = workspaceRenameInputController.text
+           editorInputController.isFocused,
+           !isSynchronizingEditorInput {
+            workspaceRenameName = editorInputController.text
             if isContainerConfigurationEditorVisible &&
                 !isRenamingContainerConfiguration {
                 switch containerConfigurationTab {
                 case .dockerfile:
-                    containerConfigurationDockerfile = workspaceRenameInputController.text
+                    containerConfigurationDockerfile = editorInputController.text
                 case .environment:
-                    containerConfigurationEnvironment = workspaceRenameInputController.text
+                    containerConfigurationEnvironment = editorInputController.text
                     scheduleContainerConfigurationEnvironmentSave()
                 case .ports:
-                    containerConfigurationPorts = workspaceRenameInputController.text
+                    containerConfigurationPorts = editorInputController.text
                     scheduleContainerConfigurationEnvironmentSave()
-                case .mounts, .runtime:
+                case .mounts, .runtime, .codingAgent:
                     break
                 }
             }
@@ -10572,6 +11118,14 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             updateInputMode()
             updateEditingAndPasteboardState()
             updateLayout()
+            if usesUnwrappedDockerfile, let caret = editorInputCaretRect() {
+                let visible = containerConfigurationTextVisibleFrame
+                if caret.maxX > visible.maxX {
+                    scrollContainerConfigurationHorizontally(to: containerConfigurationHorizontalScroll + caret.maxX - visible.maxX)
+                } else if caret.minX < visible.minX {
+                    scrollContainerConfigurationHorizontally(to: max(containerConfigurationHorizontalScroll + caret.minX - visible.minX, 0))
+                }
+            }
             return
         }
 
@@ -10723,12 +11277,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             updateLayout()
             return
         }
-        let fields = selectedRecipe().map { visibleCreateFields(for: $0).filter { $0.fieldType != "choice" } } ?? []
-        guard !fields.isEmpty else { return }
-        let currentKey = activeCreateFieldKey ?? fields[0].key
-        let index = fields.firstIndex(where: { $0.key == currentKey }) ?? 0
-        focusCreateField(fields[(index + 1) % fields.count].key)
-        updateLayout()
     }
 
     private func retreatCreateField() {
@@ -10742,12 +11290,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             updateLayout()
             return
         }
-        let fields = selectedRecipe().map { visibleCreateFields(for: $0).filter { $0.fieldType != "choice" } } ?? []
-        guard !fields.isEmpty else { return }
-        let currentKey = activeCreateFieldKey ?? fields[0].key
-        let index = fields.firstIndex(where: { $0.key == currentKey }) ?? 0
-        focusCreateField(fields[(index + fields.count - 1) % fields.count].key)
-        updateLayout()
     }
 
     private func insertCreateText(_ text: String,
@@ -10769,14 +11311,14 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                            replacementLocation: UInt64 = 0,
                                            replacementLength: UInt64 = 0) {
         guard isWorkspaceNamePromptVisible else { return }
-        if !workspaceRenameInputController.isFocused {
-            focusWorkspaceRenameField()
+        if !editorInputController.isFocused {
+            focusEditorInput()
         }
 
         let cleaned = isDockerfileFragmentPrompt
             ? cleanBashCommandText(text)
             : cleanSingleLineText(text)
-        workspaceRenameInputController.insertText(cleaned, replacementRange: hasReplacementRange
+        editorInputController.insertText(cleaned, replacementRange: hasReplacementRange
             ? Int(replacementLocation)..<Int(replacementLocation + replacementLength) : nil)
     }
 
@@ -10784,9 +11326,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                                  replacementLocation: Int,
                                                  replacementLength: Int) -> Range<Int>? {
         guard hasReplacementRange else { return nil }
-        let start = min(max(replacementLocation, 0), workspaceRenameInputController.text.count)
+        let start = min(max(replacementLocation, 0), editorInputController.text.count)
         let end = min(max(start + replacementLength, start),
-                      workspaceRenameInputController.text.count)
+                      editorInputController.text.count)
         return start..<end
     }
 
@@ -10815,13 +11357,13 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                      replacementLocation: Int,
                                      replacementLength: Int) {
         if isWorkspaceNamePromptVisible {
-            if !workspaceRenameInputController.isFocused {
-                focusWorkspaceRenameField()
+            if !editorInputController.isFocused {
+                focusEditorInput()
             }
             let cleaned = isDockerfileFragmentPrompt
                 ? cleanBashCommandText(text)
                 : cleanSingleLineText(text)
-            workspaceRenameInputController.setMarkedText(
+            editorInputController.setMarkedText(
                 cleaned,
                 selectedLocation: min(selectedLocation, cleaned.count),
                 selectedLength: selectedLength,
@@ -10861,8 +11403,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func handleUnmarkText() {
-        if isWorkspaceNamePromptVisible, workspaceRenameInputController.isFocused {
-            workspaceRenameInputController.unmarkText()
+        if isWorkspaceNamePromptVisible, editorInputController.isFocused {
+            editorInputController.unmarkText()
             return
         }
         if pendingPasswordAction != nil, passwordInputController.isFocused {
@@ -10887,43 +11429,43 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         }
     }
 
-    private func focusWorkspaceRenameField(selectAll: Bool = false,
+    private func focusEditorInput(selectAll: Bool = false,
                                            cursorPosition: Int? = nil) {
         guard isWorkspaceNamePromptVisible else { return }
         blurCreateField()
         blurPasswordField()
-        isSynchronizingWorkspaceRenameInput = true
+        isSynchronizingEditorInput = true
         let historyKey: String
         if let workspace = pendingDockerfileWorkspace, !isRenamingContainerConfiguration {
             historyKey = "configuration:\(workspace.id):\(containerConfigurationTab)"
         } else {
             historyKey = "prompt"
         }
-        workspaceRenameInputController.setText(workspaceRenameName, historyKey: historyKey)
-        workspaceRenameInputController.allowsNewlines =
+        editorInputController.setText(workspaceRenameName, historyKey: historyKey)
+        editorInputController.allowsNewlines =
             pendingRecipeCommandWorkspace != nil || pendingRecipeEditStep != nil ||
             (pendingDockerfileWorkspace != nil && !isRenamingContainerConfiguration)
-        workspaceRenameInputController.visualLineWidth =
-            workspaceRenameInputController.allowsNewlines
-                ? max(workspaceRenameTextFrame.width, 280)
+        editorInputController.visualLineWidth =
+            editorInputController.allowsNewlines && !usesUnwrappedDockerfile
+                ? max(editorInputTextFrame.width, 280)
                 : nil
-        workspaceRenameInputController.focus(selectAll: selectAll)
+        editorInputController.focus(selectAll: selectAll)
         if let cursorPosition {
-            workspaceRenameInputController.setCursorPosition(cursorPosition,
+            editorInputController.setCursorPosition(cursorPosition,
                                                              modifySelection: false)
         }
-        isSynchronizingWorkspaceRenameInput = false
+        isSynchronizingEditorInput = false
         updateInputMode()
         updateEditingAndPasteboardState()
-        sendWorkspaceRenameTextInputGeometryUpdate()
+        updateEditorTextInputGeometry()
     }
 
-    private func blurWorkspaceRenameField() {
-        workspaceRenameInputController.blur()
+    private func blurEditorInput() {
+        editorInputController.blur()
         updateInputMode()
         updateEditingAndPasteboardState()
         if !createInputController.isFocused && !passwordInputController.isFocused {
-            outerframeHost.sendTextInputGeometryUpdate(nil)
+            queueTextInputGeometryUpdate(nil)
         }
     }
 
@@ -10931,9 +11473,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         guard pendingFilePicker == nil else { return }
         let firstVisibleKey = selectedCreateSection == .bashCommands || selectedCreateSection == .nativeApp
             ? visibleLocalCreateFieldKeys().first
-            : selectedRecipe().flatMap { recipe in
-                visibleCreateFields(for: recipe).first(where: { $0.fieldType != "choice" })?.key
-            }
+            : nil
         let key = activeCreateFieldKey ?? firstVisibleKey
         guard let key else { return }
         focusCreateField(key, selectAll: selectAll)
@@ -10960,14 +11500,14 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         updateInputMode()
         updateEditingAndPasteboardState()
         if !createInputController.isFocused {
-            outerframeHost.sendTextInputGeometryUpdate(nil)
+            queueTextInputGeometryUpdate(nil)
         }
     }
 
     private func focusCreateField(_ key: String, selectAll: Bool = false, cursorPosition: Int? = nil) {
         blurPasswordField()
         activeCreateFieldKey = key
-        let value = createValues[key] ?? selectedRecipe()?.fields.first(where: { $0.key == key })?.defaultValue ?? ""
+        let value = createValues[key] ?? ""
         isSynchronizingCreateInput = true
         createInputController.allowsNewlines = key == "bashCommands"
         createInputController.visualLineWidth = createFieldLayouts[key]?.multiline == true ? createFieldLayouts[key]?.textFrame.width : nil
@@ -10988,7 +11528,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         createInputController.blur()
         updateInputMode()
         updateEditingAndPasteboardState()
-        outerframeHost.sendTextInputGeometryUpdate(nil)
+        queueTextInputGeometryUpdate(nil)
     }
 
     private func handleTextCommand(_ command: String) {
@@ -10996,7 +11536,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             if command == "cancelOperation" {
                 dismissWorkspaceRename()
             } else {
-                workspaceRenameInputController.performCommand(command)
+                editorInputController.performCommand(command)
             }
             return
         }
@@ -11039,16 +11579,16 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 return
             }
         }
-        if isWorkspaceNamePromptVisible, workspaceRenameInputController.isFocused {
+        if isWorkspaceNamePromptVisible, editorInputController.isFocused {
             if command == "cancelOperation" {
                 dismissWorkspaceRename()
                 return
             }
             if command == "insertTab", isDockerfileFragmentPrompt {
-                workspaceRenameInputController.insertText("    ")
+                editorInputController.insertText("    ")
                 return
             }
-            workspaceRenameInputController.performCommand(command)
+            editorInputController.performCommand(command)
             return
         }
 
@@ -11105,11 +11645,11 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func handleTextInputFocus(fieldID: UUID, hasFocus: Bool) {
-        if fieldID == Self.workspaceRenameInputID {
+        if fieldID == Self.editorInputID {
             if hasFocus {
-                focusWorkspaceRenameField()
+                focusEditorInput()
             } else {
-                blurWorkspaceRenameField()
+                blurEditorInput()
                 updateLayout()
             }
             return
@@ -11135,9 +11675,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func handleSetCursorPosition(fieldID: UUID, position: Int, modifySelection: Bool) {
-        if fieldID == Self.workspaceRenameInputID {
-            focusWorkspaceRenameField()
-            workspaceRenameInputController.setCursorPosition(
+        if fieldID == Self.editorInputID {
+            focusEditorInput()
+            editorInputController.setCursorPosition(
                 position,
                 modifySelection: modifySelection
             )
@@ -11158,7 +11698,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private func updateInputMode() {
         let textInputIsFocused = createInputController.isFocused ||
             passwordInputController.isFocused ||
-            workspaceRenameInputController.isFocused
+            editorInputController.isFocused
         if textInputIsFocused, isContainerConfigurationEditorVisible {
             outerframeHost.setInputMode([.textInput, .rawKeys])
         } else {
@@ -11167,7 +11707,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func updateEditingAndPasteboardState() {
-        if workspaceRenameInputController.isFocused {
+        if editorInputController.isFocused {
             outerframeHost.setAcceptedPasteboardPasteTypes(Self.workspaceRenamePasteboardTypes)
             return
         }
@@ -11186,8 +11726,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func enabledEditCommands(in requestedCommands: OuterframeEditCommandSet) -> OuterframeEditCommandSet {
-        if workspaceRenameInputController.isFocused {
-            return workspaceRenameInputController.enabledEditCommands(in: requestedCommands)
+        if editorInputController.isFocused {
+            return editorInputController.enabledEditCommands(in: requestedCommands)
         }
 
         if passwordInputController.isFocused {
@@ -11222,8 +11762,52 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         return enabledCommands
     }
 
+    private var pendingDockerfileTextScale: CGFloat?
+    private var dockerfileZoomUpdateScheduled = false
+    private var dockerfileTextScale: CGFloat = 1
+    private var pendingTextZoomMenus: Set<UUID> = []
+    private var dockerfileZoomFrame = CGRect.zero
+    private var editorTextScale: CGFloat {
+        isContainerConfigurationEditorVisible && containerConfigurationTab == .dockerfile && !isRenamingContainerConfiguration ? dockerfileTextScale : 1
+    }
+    private var usesUnwrappedDockerfile: Bool {
+        isContainerConfigurationEditorVisible && containerConfigurationTab == .dockerfile && !isRenamingContainerConfiguration
+    }
+    private var editorLineHeight: CGFloat { 16 * editorTextScale }
+
+    private func scheduleDockerfileMagnification(_ magnification: CGFloat) {
+        guard magnification.isFinite else { return }
+        let scale = pendingDockerfileTextScale ?? dockerfileTextScale
+        pendingDockerfileTextScale = min(max(scale * (1 + magnification), 0.25), 3)
+        guard !dockerfileZoomUpdateScheduled else { return }
+        dockerfileZoomUpdateScheduled = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0 / 60.0) { [weak self] in
+            guard let self else { return }
+            self.dockerfileZoomUpdateScheduled = false
+            guard let scale = self.pendingDockerfileTextScale else { return }
+            self.pendingDockerfileTextScale = nil
+            guard self.isContainerConfigurationEditorVisible,
+                  self.containerConfigurationTab == .dockerfile else { return }
+            self.resizeDockerfileText(scale)
+        }
+    }
+
+    private func resizeDockerfileText(_ scale: CGFloat) {
+        pendingDockerfileTextScale = nil
+        guard scale.isFinite else { return }
+        let nextScale = min(max(scale, 0.25), 3)
+        guard nextScale != dockerfileTextScale else { return }
+        containerConfigurationHorizontalScroll *= nextScale / dockerfileTextScale
+        containerConfigurationTextScroll *= nextScale / dockerfileTextScale
+        dockerfileTextScale = nextScale
+        containerConfigurationTextFragmentsText = ""
+        withoutImplicitAnimations {
+            renderWorkspacePanelIfNeeded(width: max(currentSize.width, 1), height: max(currentSize.height, 1))
+        }
+    }
+
     private func createInputFont(monospaced: Bool) -> NSFont {
-        monospaced ? NSFont.monospacedSystemFont(ofSize: 12, weight: .regular) : NSFont.systemFont(ofSize: 12, weight: .regular)
+        monospaced ? NSFont.monospacedSystemFont(ofSize: 12 * editorTextScale, weight: .regular) : NSFont.systemFont(ofSize: 12, weight: .regular)
     }
 
     private func makeCreateFieldLine(for text: String, monospaced: Bool) -> CTLine {
@@ -11246,7 +11830,13 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func createTextAreaLineFragments(text: String, layout: CreateFieldLayout) -> [CreateTextLineFragment] {
-        let lineHeight: CGFloat = 16
+        let lineHeight = editorLineHeight
+        if usesUnwrappedDockerfile && ["containerConfiguration", "dockerfileFragment"].contains(layout.key) {
+            return cachedDockerfileLayout(for: text).lines.enumerated().map { index, line in
+                CreateTextLineFragment(text: line.text, start: line.start, end: line.end,
+                    y: layout.textFrame.maxY - CGFloat(index + 1) * lineHeight)
+            }
+        }
         var fragments: [CreateTextLineFragment] = []
 
         var start = 0
@@ -11335,12 +11925,12 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
     private func characterIndexForCreateField(key: String, at point: CGPoint) -> Int {
         guard let layout = createFieldLayouts[key] else { return 0 }
-        let text = createValues[key] ?? selectedRecipe()?.fields.first(where: { $0.key == key })?.defaultValue ?? ""
+        let text = createValues[key] ?? ""
         guard !text.isEmpty, layout.textFrame.width > 0 else { return 0 }
 
         if layout.multiline {
             let fragments = createTextAreaLineFragments(text: text, layout: layout)
-            let lineHeight: CGFloat = 16
+            let lineHeight = editorLineHeight
             let row = max(0, min(Int(floor((layout.textFrame.maxY - point.y) / lineHeight)), fragments.count - 1))
             let fragment = fragments[row]
             let localX = max(0, min(point.x - layout.textFrame.minX, layout.textFrame.width))
@@ -11368,11 +11958,11 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         return characterIndex(forUTF16: utf16Index, in: bulletString)
     }
 
-    private func characterIndexForWorkspaceRenameField(at point: CGPoint) -> Int {
-        let text = workspaceRenameInputController.text
+    private func characterIndexForEditorInput(at point: CGPoint) -> Int {
+        let text = editorInputController.text
         if isDockerfileFragmentPrompt {
-            let layout = CreateFieldLayout(fieldFrame: workspaceRenameFieldFrame,
-                                           textFrame: workspaceRenameTextFrame,
+            let layout = CreateFieldLayout(fieldFrame: editorInputFieldFrame,
+                                           textFrame: editorInputTextFrame,
                                            key: "dockerfileFragment",
                                            monospaced: true,
                                            multiline: true)
@@ -11383,18 +11973,18 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 ? containerConfigurationTextFragments
                 : createTextAreaLineFragments(text: text, layout: layout)
             guard !fragments.isEmpty else { return 0 }
-            let lineHeight: CGFloat = 16
+            let lineHeight = editorLineHeight
             let row = max(0, min(
-                Int(floor((workspaceRenameTextFrame.maxY - point.y) / lineHeight)),
+                Int(floor((editorInputTextFrame.maxY - point.y) / lineHeight)),
                 fragments.count - 1
             ))
             let fragment = fragments[row]
-            if point.y > workspaceRenameTextFrame.maxY { return 0 }
-            let textBottom = workspaceRenameTextFrame.maxY -
+            if point.y > editorInputTextFrame.maxY { return 0 }
+            let textBottom = editorInputTextFrame.maxY -
                 CGFloat(fragments.count) * lineHeight
             if point.y < textBottom { return text.count }
-            let localX = max(0, min(point.x - workspaceRenameTextFrame.minX,
-                                    workspaceRenameTextFrame.width))
+            let localX = max(0, min(point.x - editorInputTextFrame.minX,
+                                    editorInputTextFrame.width))
             guard !fragment.text.isEmpty else { return fragment.start }
             let line = makeCreateFieldLine(for: fragment.text, monospaced: true)
             let utf16Index = CTLineGetStringIndexForPosition(
@@ -11404,9 +11994,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             return fragment.start + characterIndex(forUTF16: utf16Index,
                                                      in: fragment.text)
         }
-        let localX = max(0, min(point.x - workspaceRenameTextFrame.minX,
-                                workspaceRenameTextFrame.width))
-        guard !text.isEmpty, workspaceRenameTextFrame.width > 0 else { return 0 }
+        let localX = max(0, min(point.x - editorInputTextFrame.minX,
+                                editorInputTextFrame.width))
+        guard !text.isEmpty, editorInputTextFrame.width > 0 else { return 0 }
         let line = makeWorkspaceNameFieldLine(for: text)
         let utf16Index = CTLineGetStringIndexForPosition(line, CGPoint(x: localX, y: 0))
         if utf16Index == kCFNotFound { return text.count }
@@ -11499,7 +12089,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
               !createInputController.hasSelection,
               let key = activeCreateFieldKey,
               let layout = createFieldLayouts[key] else {
-            outerframeHost.sendTextInputGeometryUpdate(nil)
+            queueTextInputGeometryUpdate(nil)
             return
         }
         let line = createInputController.text.isEmpty ? nil : makeCreateFieldLine(for: createInputController.text, monospaced: layout.monospaced)
@@ -11511,7 +12101,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                                                        y: topLeftY,
                                                                        width: cursorFrame.width,
                                                                        height: cursorFrame.height))
-        outerframeHost.sendTextInputGeometryUpdate(geometry)
+        queueTextInputGeometryUpdate(geometry)
     }
 
     private func passwordFieldCursorRect() -> CGRect? {
@@ -11549,7 +12139,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         guard windowIsActive,
               let cursorFrame = passwordFieldCursorRect() else {
             if !createInputController.isFocused {
-                outerframeHost.sendTextInputGeometryUpdate(nil)
+                queueTextInputGeometryUpdate(nil)
             }
             return
         }
@@ -11559,34 +12149,40 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                                                        y: topLeftY,
                                                                        width: cursorFrame.width,
                                                                        height: cursorFrame.height))
-        outerframeHost.sendTextInputGeometryUpdate(geometry)
+        queueTextInputGeometryUpdate(geometry)
     }
 
-    private func workspaceRenameFieldCursorRect() -> CGRect? {
+    private func editorInputCaretRect() -> CGRect? {
         guard isWorkspaceNamePromptVisible,
-              workspaceRenameInputController.isFocused,
-              !workspaceRenameInputController.hasSelection,
-              !workspaceRenameFieldFrame.isEmpty,
-              !workspaceRenameTextFrame.isEmpty else {
+              editorInputController.isFocused,
+              !editorInputController.hasSelection,
+              !editorInputFieldFrame.isEmpty,
+              !editorInputTextFrame.isEmpty else {
             return nil
         }
 
-        let text = workspaceRenameInputController.text
+        let text = editorInputController.text
+        if usesUnwrappedDockerfile {
+            let caret = cachedDockerfileLayout(for: text).caret(at: editorInputController.cursorPosition)
+            return CGRect(x: editorInputTextFrame.minX + caret.offset * dockerfileTextScale,
+                          y: editorInputTextFrame.maxY - CGFloat(caret.row + 1) * editorLineHeight - 1,
+                          width: 1, height: editorLineHeight + 2)
+        }
         if isDockerfileFragmentPrompt {
-            let layout = CreateFieldLayout(fieldFrame: workspaceRenameFieldFrame,
-                                           textFrame: workspaceRenameTextFrame,
+            let layout = CreateFieldLayout(fieldFrame: editorInputFieldFrame,
+                                           textFrame: editorInputTextFrame,
                                            key: "dockerfileFragment",
                                            monospaced: true,
                                            multiline: true)
             let fragments = createTextAreaLineFragments(text: text, layout: layout)
-            let cursorPosition = workspaceRenameInputController.cursorPosition
+            let cursorPosition = editorInputController.cursorPosition
             guard let fragment = fragments.first(where: {
                 cursorPosition >= $0.start && cursorPosition <= $0.end
             }) ?? fragments.last else {
-                return CGRect(x: workspaceRenameTextFrame.minX,
-                              y: workspaceRenameTextFrame.maxY - 16,
+                return CGRect(x: editorInputTextFrame.minX,
+                              y: editorInputTextFrame.maxY - editorLineHeight,
                               width: 1,
-                              height: 18)
+                              height: editorLineHeight + 2)
             }
             let offset: CGFloat
             if fragment.text.isEmpty {
@@ -11597,62 +12193,84 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                     line: line,
                     text: fragment.text,
                     index: cursorPosition - fragment.start,
-                    maxWidth: workspaceRenameTextFrame.width
+                    maxWidth: editorInputTextFrame.width
                 )
             }
-            return CGRect(x: workspaceRenameTextFrame.minX + offset,
+            return CGRect(x: editorInputTextFrame.minX + offset,
                           y: fragment.y - 1,
                           width: 1,
-                          height: 18)
+                          height: editorLineHeight + 2)
         }
-        let maxWidth = max(workspaceRenameTextFrame.width, 0)
+        let maxWidth = max(editorInputTextFrame.width, 0)
         let offset: CGFloat
         if !text.isEmpty && maxWidth > 0 {
             let line = makeWorkspaceNameFieldLine(for: text)
             offset = offsetForCreateFieldCharacter(
                 line: line,
                 text: text,
-                index: workspaceRenameInputController.cursorPosition,
+                index: editorInputController.cursorPosition,
                 maxWidth: maxWidth
             )
         } else {
             offset = 0
         }
         let cursorWidth: CGFloat = 1
-        let proposedX = min(max(workspaceRenameTextFrame.minX + offset,
-                                workspaceRenameTextFrame.minX),
-                            workspaceRenameTextFrame.maxX)
-        let maxCursorX = workspaceRenameFieldFrame.maxX - 2 - cursorWidth
+        let proposedX = min(max(editorInputTextFrame.minX + offset,
+                                editorInputTextFrame.minX),
+                            editorInputTextFrame.maxX)
+        let maxCursorX = editorInputFieldFrame.maxX - 2 - cursorWidth
         return CGRect(
-            x: max(workspaceRenameTextFrame.minX, min(proposedX, maxCursorX)),
-            y: workspaceRenameTextFrame.minY - 1,
+            x: max(editorInputTextFrame.minX, min(proposedX, maxCursorX)),
+            y: editorInputTextFrame.minY - 1,
             width: cursorWidth,
-            height: workspaceRenameTextFrame.height + 2
+            height: editorInputTextFrame.height + 2
         )
     }
 
-    private func sendWorkspaceRenameTextInputGeometryUpdate() {
+    private func updateEditorTextInputGeometry() {
         guard windowIsActive,
-              let cursorFrame = workspaceRenameFieldCursorRect() else {
+              let cursorFrame = editorInputCaretRect() else {
             if !createInputController.isFocused && !passwordInputController.isFocused {
-                outerframeHost.sendTextInputGeometryUpdate(nil)
+                queueTextInputGeometryUpdate(nil)
             }
             return
         }
         let topLeftY = rootLayer.bounds.height - cursorFrame.minY - cursorFrame.height
         let geometry = OuterframeContentTextInputGeometry(
-            fieldID: Self.workspaceRenameInputID,
+            fieldID: Self.editorInputID,
             rect: CGRect(x: cursorFrame.minX,
                          y: topLeftY,
                          width: cursorFrame.width,
                          height: cursorFrame.height)
         )
-        outerframeHost.sendTextInputGeometryUpdate(geometry)
+        queueTextInputGeometryUpdate(geometry)
+    }
+
+    private var textInputGeometryUpdateScheduled = false
+    private var pendingTextInputGeometry: OuterframeContentTextInputGeometry?
+    private var lastSentTextInputGeometry: OuterframeContentTextInputGeometry?
+    private var hasSentTextInputGeometry = false
+
+    private func queueTextInputGeometryUpdate(_ geometry: OuterframeContentTextInputGeometry?) {
+        pendingTextInputGeometry = geometry
+        guard !textInputGeometryUpdateScheduled else { return }
+        textInputGeometryUpdateScheduled = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0 / 60.0) { [weak self] in
+            guard let self else { return }
+            self.textInputGeometryUpdateScheduled = false
+            let geometry = self.pendingTextInputGeometry
+            guard !self.hasSentTextInputGeometry ||
+                    geometry?.fieldID != self.lastSentTextInputGeometry?.fieldID ||
+                    geometry?.rect != self.lastSentTextInputGeometry?.rect else { return }
+            self.hasSentTextInputGeometry = true
+            self.lastSentTextInputGeometry = geometry
+            self.outerframeHost.sendTextInputGeometryUpdate(geometry)
+        }
     }
 
     private func sendFocusedTextInputGeometryUpdate() {
-        if workspaceRenameInputController.isFocused {
-            sendWorkspaceRenameTextInputGeometryUpdate()
+        if editorInputController.isFocused {
+            updateEditorTextInputGeometry()
         } else if passwordInputController.isFocused {
             sendPasswordFieldTextInputGeometryUpdate()
         } else {
@@ -11661,8 +12279,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func pasteboardItemsForCopy() -> [OuterframeContentPasteboardItem] {
-        if workspaceRenameInputController.isFocused,
-           let selectedText = workspaceRenameInputController.selectedTextContent(),
+        if editorInputController.isFocused,
+           let selectedText = editorInputController.selectedTextContent(),
            !selectedText.isEmpty {
             return [
                 OuterframeContentPasteboardItem(representations: [
@@ -11886,8 +12504,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func pasteboardItemsForCut() -> [OuterframeContentPasteboardItem] {
-        if workspaceRenameInputController.isFocused,
-           let selectedText = workspaceRenameInputController.cutSelectedTextContent(),
+        if editorInputController.isFocused,
+           let selectedText = editorInputController.cutSelectedTextContent(),
            !selectedText.isEmpty {
             return [
                 OuterframeContentPasteboardItem(representations: [
@@ -11913,7 +12531,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func handlePasteboardItemsForPaste(_ items: [OuterframeContentPasteboardItem]) {
-        if isWorkspaceNamePromptVisible, workspaceRenameInputController.isFocused {
+        if isWorkspaceNamePromptVisible, editorInputController.isFocused {
             _ = insertPasteboardItemsIntoWorkspaceRenameField(items)
             return
         }
@@ -11934,7 +12552,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 $0.typeIdentifier == NSPasteboard.PasteboardType.string.rawValue
             }),
                let stringValue = String(data: representation.data, encoding: .utf8) {
-                workspaceRenameInputController.pasteText(
+                editorInputController.pasteText(
                     isDockerfileFragmentPrompt
                         ? cleanBashCommandText(stringValue)
                         : cleanSingleLineText(stringValue)
@@ -11949,7 +12567,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                    options: [.documentType: NSAttributedString.DocumentType.rtf],
                    documentAttributes: nil
                ) {
-                workspaceRenameInputController.pasteText(
+                editorInputController.pasteText(
                     isDockerfileFragmentPrompt
                         ? cleanBashCommandText(attributed.string)
                         : cleanSingleLineText(attributed.string)
@@ -12446,6 +13064,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             setDockerfileSelection(fragmentID: nil, range: nil)
             blurCreateField()
             selectedCreateSection = section
+            createScroll = 0
             if section == .bashCommands {
                 ensureBashDefaults()
             } else if section == .nativeApp {
@@ -12488,12 +13107,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             dismissPasswordPrompt()
         case .passwordSubmit:
             submitPasswordPrompt()
-        case .recipe(let recipeID):
-            blurCreateField()
-            selectedRecipeID = recipeID
-            applyRecipeDefaults(overwrite: true)
-            createMessage = ""
-            updateLayout()
         case .perform(let action):
             action()
         case .performAtPoint(let action):
@@ -12578,27 +13191,27 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         switch pendingTextSelectionDrag.target {
         case .workspaceName:
             guard isWorkspaceNamePromptVisible,
-                  workspaceRenameInputController.isFocused else {
+                  editorInputController.isFocused else {
                 self.pendingTextSelectionDrag = nil
                 return false
             }
-            let index = characterIndexForWorkspaceRenameField(at: point)
+            let index = characterIndexForEditorInput(at: point)
             if isContainerConfigurationEditorVisible &&
                 !isRenamingContainerConfiguration {
-                let hadSelection = workspaceRenameInputController.hasSelection
-                workspaceRenameInputController.setCursorPosition(
+                let hadSelection = editorInputController.hasSelection
+                editorInputController.setCursorPosition(
                     index,
                     modifySelection: true,
                     notifyDelegate: false
                 )
                 updateContainerConfigurationSelectionLayers()
-                if hadSelection != workspaceRenameInputController.hasSelection {
-                    sendWorkspaceRenameTextInputGeometryUpdate()
+                if hadSelection != editorInputController.hasSelection {
+                    updateEditorTextInputGeometry()
                     updateEditingAndPasteboardState()
                 }
             } else {
-                workspaceRenameInputController.setCursorPosition(index, modifySelection: true)
-                sendWorkspaceRenameTextInputGeometryUpdate()
+                editorInputController.setCursorPosition(index, modifySelection: true)
+                updateEditorTextInputGeometry()
                 updateLayout()
             }
             return true
@@ -12741,7 +13354,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                         setCursorIfNeeded(.arrow)
                     }
                 } else if isRenamingContainerConfiguration {
-                    if workspaceRenameFieldFrame.contains(point) {
+                    if editorInputFieldFrame.contains(point) {
                         setCursorIfNeeded(.iBeam)
                     } else {
                         let isInteractive = workspaceRenameCancelFrame.contains(point) ||
@@ -12763,7 +13376,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                     containerConfigurationCookbookFrame.contains(point) ||
                     containerConfigurationCopyPathFrame.contains(point) {
                     setCursorIfNeeded(.pointingHand)
-                } else if workspaceRenameFieldFrame.contains(point) &&
+                } else if editorInputFieldFrame.contains(point) &&
                             !containerConfigurationEditorToolbarFrame.contains(point) {
                     setCursorIfNeeded(.iBeam)
                 } else {
@@ -12802,7 +13415,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 return
             }
             if isWorkspaceNamePromptVisible {
-                let isInteractive = workspaceRenameFieldFrame.contains(point) ||
+                let isInteractive = editorInputFieldFrame.contains(point) ||
                     workspaceCreationBaseImageFrame.contains(point) ||
                     workspaceOuterShellBaseImageFrame.contains(point) ||
                     workspaceCustomBaseImageFrame.contains(point) ||
@@ -12810,7 +13423,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                     workspaceRenameCancelFrame.contains(point) ||
                     workspaceRenameConfirmFrame.contains(point)
                 setCursorIfNeeded(
-                    workspaceRenameFieldFrame.contains(point) &&
+                    editorInputFieldFrame.contains(point) &&
                         (!isBaseImageChoicePrompt || baseImageTemplate != .outerShell)
                         ? .iBeam
                         : (isInteractive ? .pointingHand : .arrow)
@@ -12835,7 +13448,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             }
             return
         }
-        if pendingFilePicker != nil, mode == .create {
+        if pendingFilePicker != nil {
             let contentPoint = contentLayer.convert(point, from: rootLayer)
             let createPoint = createLayer.convert(contentPoint, from: contentLayer)
             if filePickerSaveFrame.contains(createPoint) ||
@@ -12870,7 +13483,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             isOverDirectorySelect = isInCreateContent && createDirectorySelectFrames.contains { $0.frame.contains(createPoint) }
             isOverAppTile = createDismissFrame.contains(createPoint) ||
                             (isInCreateContent && (createSectionFrames.contains { $0.frame.contains(createPoint) } ||
-                                                   recipeFrames.contains { $0.frame.contains(createPoint) } ||
                                                    codingAgentDocumentationFrame.contains(createPoint) ||
                                                    createButtonFrame.contains(createPoint) ||
                                                    bashIconSelectFrame.contains(createPoint) ||
@@ -12928,6 +13540,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private func handleRightMouseDown(at point: CGPoint,
                                       modifierFlags: NSEvent.ModifierFlags,
                                       clickCount: Int) {
+        guard managementPanel == nil else { return }
         _ = modifierFlags
         _ = clickCount
         if handleStatusRightMouseDown(at: point) {
@@ -12959,14 +13572,14 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 return
             }
             guard isWorkspaceNamePromptVisible,
-                  workspaceRenameFieldFrame.contains(point),
+                  editorInputFieldFrame.contains(point),
                   !containerConfigurationEditorToolbarFrame.contains(point) else {
                 return
             }
-            let index = characterIndexForWorkspaceRenameField(at: point)
-            focusWorkspaceRenameField()
-            if workspaceRenameInputController.selectionRange?.contains(index) != true {
-                workspaceRenameInputController.setCursorPosition(index, modifySelection: false)
+            let index = characterIndexForEditorInput(at: point)
+            focusEditorInput()
+            if editorInputController.selectionRange?.contains(index) != true {
+                editorInputController.setCursorPosition(index, modifySelection: false)
             }
             updateEditingAndPasteboardState()
             showWorkspaceNameFieldContextMenu(at: point)
@@ -12991,7 +13604,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             return
         }
 
-        if pendingFilePicker != nil, mode == .create { return }
+        if pendingFilePicker != nil { return }
 
         let contentPoint = contentLayer.convert(point, from: rootLayer)
         if mode == .apps {
@@ -13071,7 +13684,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func showWorkspaceNameFieldContextMenu(at point: CGPoint) {
-        let selectedText = workspaceRenameInputController.selectedTextContent() ?? ""
+        let selectedText = editorInputController.selectedTextContent() ?? ""
         let hasSelection = !selectedText.isEmpty
         let items = [
             OuterframeContextMenuItem(id: "cut",
@@ -13085,11 +13698,11 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             OuterframeContextMenuItem(id: "paste",
                                       title: "Paste",
                                       action: .standardPaste,
-                                      isEnabled: workspaceRenameInputController.isFocused),
+                                      isEnabled: editorInputController.isFocused),
             OuterframeContextMenuItem(id: "select-all",
                                       title: "Select All",
                                       action: .standardSelectAll,
-                                      isEnabled: !workspaceRenameInputController.text.isEmpty)
+                                      isEnabled: !editorInputController.text.isEmpty)
         ]
         let attributedText = hasSelection
             ? NSAttributedString(
@@ -13133,6 +13746,20 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
     private func handleScroll(at point: CGPoint, delta: CGPoint, precise: Bool) {
         let multiplier: CGFloat = precise ? 1 : wheelScrollLineHeight
+        if managementPanel != nil {
+            managementScroll = min(max(managementScroll - delta.y * multiplier, 0), managementScrollLimit)
+            updateLayout()
+            return
+        }
+        if pendingFilePicker != nil {
+            if filePickerListFrame.contains(point) { setFilePickerScroll(filePickerScroll - delta.y * multiplier) }
+            return
+        }
+        if isContainerConfigurationEditorVisible, containerConfigurationTab == .codingAgent, containerConfigurationContentFrame.contains(point) {
+            codingAgentScroll = min(max(codingAgentScroll - delta.y * multiplier, 0), max(codingAgentContentHeight - containerConfigurationContentFrame.height, 0))
+            updateLayout()
+            return
+        }
         if containerConfigurationBuildError != nil,
            containerConfigurationBuildErrorTextFrame.contains(point) {
             let maximum = max(
@@ -13161,16 +13788,16 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             return
         }
         if isContainerConfigurationEditorVisible,
-           workspaceRenameFieldFrame.contains(point),
+           editorInputFieldFrame.contains(point),
            containerConfigurationTab == .dockerfile ||
             containerConfigurationTab == .environment ||
             containerConfigurationTab == .ports {
             let visibleFrame = containerConfigurationTextVisibleFrame
-            let text = workspaceRenameInputController.isFocused
-                ? workspaceRenameInputController.text
+            let text = editorInputController.isFocused
+                ? editorInputController.text
                 : workspaceRenameName
             let measurementLayout = CreateFieldLayout(
-                fieldFrame: workspaceRenameFieldFrame,
+                fieldFrame: editorInputFieldFrame,
                 textFrame: visibleFrame,
                 key: "containerConfiguration",
                 monospaced: true,
@@ -13180,12 +13807,17 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 text: text,
                 layout: measurementLayout
             ).count
-            let contentHeight = CGFloat(lineCount) * 16 + 8
+            let contentHeight = CGFloat(lineCount) * editorLineHeight + 8
             let maximum = max(contentHeight - visibleFrame.height, 0)
             let nextScroll = min(
                 max(containerConfigurationTextScroll - delta.y * multiplier, 0),
                 maximum
             )
+            if usesUnwrappedDockerfile {
+                let nextX = min(max(containerConfigurationHorizontalScroll - delta.x * multiplier, 0),
+                    max(containerConfigurationTextWidth - visibleFrame.width, 0))
+                scrollContainerConfigurationHorizontally(to: nextX)
+            }
             scrollContainerConfigurationText(to: nextScroll)
             return
         }
@@ -13242,19 +13874,36 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         }
     }
 
+    private func scrollContainerConfigurationHorizontally(to nextScroll: CGFloat) {
+        let delta = nextScroll - containerConfigurationHorizontalScroll
+        guard abs(delta) > 0.001 else { return }
+        containerConfigurationHorizontalScroll = nextScroll
+        editorInputTextFrame.origin.x -= delta
+        withoutImplicitAnimations {
+            containerConfigurationTextViewportLayer?.frame.origin.x -= delta
+            updateDockerfileTextSurface()
+        }
+        updateEditorTextInputGeometry()
+    }
+
     private func scrollContainerConfigurationText(to nextScroll: CGFloat) {
         let delta = nextScroll - containerConfigurationTextScroll
         guard abs(delta) > 0.001 else { return }
         containerConfigurationTextScroll = nextScroll
-        workspaceRenameTextFrame = workspaceRenameTextFrame.offsetBy(dx: 0,
+        editorInputTextFrame = editorInputTextFrame.offsetBy(dx: 0,
                                                                       dy: delta)
         withoutImplicitAnimations {
             if let layer = containerConfigurationTextViewportLayer {
                 layer.frame = layer.frame.offsetBy(dx: 0, dy: delta)
             }
+            updateDockerfileTextSurface()
         }
 
-        let refreshDistance = max(workspaceRenameFieldFrame.height * 0.65, 120)
+        if usesUnwrappedDockerfile {
+            updateEditorTextInputGeometry()
+            return
+        }
+        let refreshDistance = max(editorInputFieldFrame.height * 0.65, 120)
         if abs(nextScroll - containerConfigurationRenderedTextScroll) >= refreshDistance {
             updateLayout()
         }
@@ -13306,6 +13955,43 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                  clickCount: Int = 1) {
         pendingCreateTextDrag = nil
         pendingTextSelectionDrag = nil
+        if let panel = managementPanel {
+            if let action = managementActions.first(where: { $0.frame.contains(point) }) {
+                armButtonClick(frame: action.frame) { [weak self] in
+                    guard let self else { return }
+                    if action.id == "close" { self.dismissManagementPanel(); return }
+                    if action.id != "check" { self.managementPanel = nil; self.runtimeMenuPoint = nil }
+                    self.handleContextMenuSelection(menuID: panel.id, itemID: action.id)
+                    self.updateLayout()
+                }
+            }
+            return
+        }
+        if isContainerConfigurationEditorVisible, !isRenamingContainerConfiguration, containerConfigurationTab == .mounts, pendingFilePicker == nil,
+           let action = containerConfigurationMountActionFrames.first(where: { ($0.action == "host" || $0.action == "guest") && $0.frame.contains(point) }) {
+            armButtonClick(frame: action.frame) { [weak self] in self?.editMountPath(action.id, field: action.action) }
+            return
+        }
+        if pendingFilePicker != nil {
+            handleFilePickerMouseDown(at: point, modifierFlags: modifierFlags, clickCount: clickCount)
+            return
+        }
+        if isContainerConfigurationEditorVisible, !isRenamingContainerConfiguration, dockerfileZoomFrame.contains(point) {
+            let menuID = UUID()
+            pendingTextZoomMenus.insert(menuID)
+            outerframeHost.showContextMenu(menuID: menuID, items: [50, 75, 100, 125, 150, 200].map { OuterframeContextMenuItem(id: String($0), title: "\($0)%", isEnabled: true) }, at: point)
+            return
+        }
+        if isContainerConfigurationEditorVisible, codingAgentTabFrame.contains(point), containerConfigurationBuildError == nil, !isConfirmingContainerConfigurationDismissal, !isConfirmingContainerConfigurationRebuild {
+            armButtonClick(frame: codingAgentTabFrame) { [weak self] in self?.selectContainerConfigurationTab(.codingAgent) }
+            return
+        }
+        if !isRenamingContainerConfiguration, pendingPasswordAction == nil, pendingInstallBackend == nil, containerConfigurationBuildError == nil, !isConfirmingContainerConfigurationDismissal, !isConfirmingContainerConfigurationRebuild,
+           (isContainerConfigurationEditorVisible && containerConfigurationTab == .codingAgent || !isShowingWorkspacePanel && mode == .create),
+           let action = codingAgentActions.first(where: { $0.frame.contains(point) }) {
+            armButtonClick(frame: action.frame, action: .perform(action.action))
+            return
+        }
         pendingButtonClick = nil
         if handleStatusMouseDown(at: point, clickCount: clickCount) {
             return
@@ -13398,17 +14084,17 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                     }
                 }
             } else if isRenamingContainerConfiguration {
-                if workspaceRenameFieldFrame.contains(point) {
-                    let wasFocused = workspaceRenameInputController.isFocused
-                    let index = characterIndexForWorkspaceRenameField(at: point)
-                    focusWorkspaceRenameField(selectAll: clickCount >= 3)
+                if editorInputFieldFrame.contains(point) {
+                    let wasFocused = editorInputController.isFocused
+                    let index = characterIndexForEditorInput(at: point)
+                    focusEditorInput(selectAll: clickCount >= 3)
                     switch clickCount {
                     case 3...:
-                        workspaceRenameInputController.selectAll()
+                        editorInputController.selectAll()
                     case 2:
-                        workspaceRenameInputController.selectWord(at: index)
+                        editorInputController.selectWord(at: index)
                     default:
-                        workspaceRenameInputController.setCursorPosition(
+                        editorInputController.setCursorPosition(
                             index,
                             modifySelection: modifierFlags.contains(.shift) && wasFocused
                         )
@@ -13523,17 +14209,17 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 }
             } else if containerConfigurationEditorToolbarFrame.contains(point) {
                 return
-            } else if workspaceRenameFieldFrame.contains(point) {
-                let wasFocused = workspaceRenameInputController.isFocused
-                let index = characterIndexForWorkspaceRenameField(at: point)
-                focusWorkspaceRenameField(selectAll: clickCount >= 3)
+            } else if editorInputFieldFrame.contains(point) {
+                let wasFocused = editorInputController.isFocused
+                let index = characterIndexForEditorInput(at: point)
+                focusEditorInput(selectAll: clickCount >= 3)
                 switch clickCount {
                 case 3...:
-                    workspaceRenameInputController.selectAll()
+                    editorInputController.selectAll()
                 case 2:
-                    workspaceRenameInputController.selectWord(at: index)
+                    editorInputController.selectWord(at: index)
                 default:
-                    workspaceRenameInputController.setCursorPosition(
+                    editorInputController.setCursorPosition(
                         index,
                         modifySelection: modifierFlags.contains(.shift) && wasFocused
                     )
@@ -13546,12 +14232,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                       let workspace = pendingDockerfileWorkspace {
                 armButtonClick(frame: containerConfigurationAddMountFrame) { [weak self] in
                     guard let self else { return }
-                    if self.isWindowsHost {
-                        self.showContainerConfigurationRename(workspace)
-                        self.isAddingWindowsContainerFolder = true
-                        self.workspaceRenameName = ""
-                        self.focusWorkspaceRenameField()
-                        self.updateLayout()
+                    if self.serverSSHCommand != nil || self.isWindowsHost {
+                        self.showDirectoryPicker(for: "containerMount")
                     } else {
                         self.sendWorkspaceRequest(operation: "chooseFolder", workspaceID: workspace.id)
                     }
@@ -13575,7 +14257,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 }
             } else if containerConfigurationRebuildFrame.contains(point) {
                 armButtonClick(frame: containerConfigurationRebuildFrame) { [weak self] in
-                    self?.rebuildContainerConfiguration()
+                    guard let self else { return }
+                    self.rebuildContainerConfiguration()
+                    if self.isConfirmingContainerConfigurationRebuild { self.saveContainerConfigurationDockerfileAndRebuild() }
                 }
             } else if !workspacePanelFrame.contains(point) {
                 requestContainerConfigurationDismissal()
@@ -13600,7 +14284,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             if workspaceOuterShellBaseImageFrame.contains(point) {
                 armButtonClick(frame: workspaceOuterShellBaseImageFrame) { [weak self] in
                     self?.baseImageTemplate = .outerShell
-                    self?.blurWorkspaceRenameField()
+                    self?.blurEditorInput()
                     self?.updateLayout()
                 }
             } else if workspaceCustomBaseImageFrame.contains(point) {
@@ -13608,7 +14292,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                     guard let self else { return }
                     self.baseImageTemplate = .customWithSupport
                     self.workspaceRenameName = self.creationBaseImage
-                    self.focusWorkspaceRenameField(selectAll: true)
+                    self.focusEditorInput(selectAll: true)
                     self.updateLayout()
                 }
             } else if workspaceCustomAsIsFrame.contains(point) {
@@ -13616,35 +14300,35 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                     guard let self else { return }
                     self.baseImageTemplate = .customAsIs
                     self.workspaceRenameName = self.creationBaseImage
-                    self.focusWorkspaceRenameField(selectAll: true)
+                    self.focusEditorInput(selectAll: true)
                     self.updateLayout()
                 }
             } else if workspaceCreationBaseImageFrame.contains(point) {
                 armButtonClick(frame: workspaceCreationBaseImageFrame) { [weak self] in
                     guard let self else { return }
-                    self.pendingCreationContainerName = self.workspaceRenameInputController.text
+                    self.pendingCreationContainerName = self.editorInputController.text
                     self.isEditingCreationBaseImage = true
                     self.workspaceRenameName = self.creationBaseImage
                     self.workspacePanelMessage = ""
                     if self.baseImageTemplate == .outerShell {
-                        self.blurWorkspaceRenameField()
+                        self.blurEditorInput()
                     } else {
-                        self.focusWorkspaceRenameField(selectAll: true)
+                        self.focusEditorInput(selectAll: true)
                     }
                     self.updateLayout()
                 }
-            } else if workspaceRenameFieldFrame.contains(point),
+            } else if editorInputFieldFrame.contains(point),
                       !isBaseImageChoicePrompt || baseImageTemplate != .outerShell {
-                let wasFocused = workspaceRenameInputController.isFocused
-                let index = characterIndexForWorkspaceRenameField(at: point)
-                focusWorkspaceRenameField(selectAll: clickCount >= 3)
+                let wasFocused = editorInputController.isFocused
+                let index = characterIndexForEditorInput(at: point)
+                focusEditorInput(selectAll: clickCount >= 3)
                 switch clickCount {
                 case 3...:
-                    workspaceRenameInputController.selectAll()
+                    editorInputController.selectAll()
                 case 2:
-                    workspaceRenameInputController.selectWord(at: index)
+                    editorInputController.selectWord(at: index)
                 default:
-                    workspaceRenameInputController.setCursorPosition(
+                    editorInputController.setCursorPosition(
                         index,
                         modifySelection: modifierFlags.contains(.shift) && wasFocused
                     )
@@ -13751,7 +14435,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             return
         }
 
-        if pendingFilePicker != nil, mode == .create {
+        if pendingFilePicker != nil {
             let contentPoint = contentLayer.convert(point, from: rootLayer)
             let createPoint = createLayer.convert(contentPoint, from: contentLayer)
             handleFilePickerMouseDown(at: createPoint, modifierFlags: modifierFlags, clickCount: clickCount)
@@ -13987,8 +14671,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                     }
                     self.catalogWorkspaceID = self.catalogWorkspace?.id
                     self.workspaceCatalogBackends = []
-                    self.recipes = []
-                    self.selectedCreateSection = .appCatalog
+                    self.selectedCreateSection = .codingAgent
                     self.navigateToMode(.create, pushHistory: true)
                     self.fetchWorkspaceCatalog()
                 })
@@ -14106,11 +14789,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             if let select = createDirectorySelectFrames.first(where: { $0.frame.contains(createPoint) }) {
                 armButtonClick(frame: rootFrame(select.frame, from: createLayer),
                                action: .directorySelect(select.key))
-                return
-            }
-            if let recipeFrame = recipeFrames.first(where: { $0.frame.contains(createPoint) }) {
-                armButtonClick(frame: rootFrame(recipeFrame.frame, from: createLayer),
-                               action: .recipe(recipeFrame.recipeID))
                 return
             }
             if createButtonFrame.contains(createPoint) {
@@ -14255,6 +14933,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                modifierFlags: NSEvent.ModifierFlags,
                                isARepeat: Bool) {
         _ = isARepeat
+        if managementPanel != nil {
+            if keyCode == 53 { dismissManagementPanel() }
+            return
+        }
         if isContainerConfigurationEditorVisible {
             if isRenamingContainerConfiguration {
                 if keyCode == 53 {
@@ -14270,7 +14952,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 return
             }
             if keyCode == 53 {
-                guard !workspaceRenameInputController.isFocused else { return }
+                guard !editorInputController.isFocused else { return }
                 if isConfirmingContainerConfigurationDismissal {
                     dismissContainerConfigurationDismissalPrompt()
                 } else if isConfirmingContainerConfigurationRebuild {
@@ -14293,7 +14975,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             return
         }
         if isWorkspaceNamePromptVisible {
-            if workspaceRenameInputController.isFocused {
+            if editorInputController.isFocused {
                 if keyCode == 53 {
                     dismissWorkspaceRename()
                 }
@@ -14305,11 +14987,11 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             case 53:
                 dismissWorkspaceRename()
             default:
-                if !workspaceRenameInputController.isFocused,
+                if !editorInputController.isFocused,
                    let characters,
                    !characters.isEmpty {
-                    focusWorkspaceRenameField()
-                    workspaceRenameInputController.insertText(cleanSingleLineText(characters))
+                    focusEditorInput()
+                    editorInputController.insertText(cleanSingleLineText(characters))
                 }
             }
             return
@@ -14558,18 +15240,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         updateLayout()
     }
 
-    private func otherRecipeRecords() -> [RecipeRecord] {
-        recipes.filter { $0.identifier == "jupyter" || $0.identifier == "jupyter-uv" }
-    }
 
-    private func selectedRecipe() -> RecipeRecord? {
-        let visibleRecipes = selectedCreateSection == .otherRecipes ? otherRecipeRecords() : recipes
-        return visibleRecipes.first { $0.identifier == selectedRecipeID } ?? visibleRecipes.first
-    }
 
-    private func visibleCreateFields(for recipe: RecipeRecord) -> [RecipeFieldRecord] {
-        recipe.fields.filter { !isCreateFieldHidden($0, in: recipe) }
-    }
 
     private func visibleBashCreateFieldKeys() -> [String] {
         var keys = ["bashDisplayName", "bashCommands"]
@@ -14591,19 +15263,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         selectedCreateSection == .nativeApp ? visibleNativeCreateFieldKeys() : visibleBashCreateFieldKeys()
     }
 
-    private func isCreateFieldHidden(_ field: RecipeFieldRecord, in recipe: RecipeRecord) -> Bool {
-        if field.key == "port",
-           recipe.fields.contains(where: { $0.key == "frontendTransport" }),
-           createValues["frontendTransport", default: "port"] == "unixSocket" {
-            return true
-        }
-        if field.key == "socketPath",
-           recipe.fields.contains(where: { $0.key == "frontendTransport" }),
-           createValues["frontendTransport", default: "port"] != "unixSocket" {
-            return true
-        }
-        return false
-    }
 
     private func ensureBashDefaults() {
         if isWindowsCommandHost && createValues["bashFrontendTransport"] == "unixSocket" {
@@ -14762,25 +15421,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         return "\(trimmedDirectory)/\(filename)"
     }
 
-    private func createValue(for field: RecipeFieldRecord) -> String {
+    private func createValue(for field: CreateFieldRecord) -> String {
         createValues[field.key] ?? field.defaultValue
     }
 
-    private func applyRecipeDefaults(overwrite: Bool) {
-        guard let recipe = selectedRecipe() else { return }
-        for field in recipe.fields {
-            if overwrite || createValues[field.key] == nil {
-                createValues[field.key] = field.defaultValue
-            }
-        }
-        let visibleFields = visibleCreateFields(for: recipe)
-        if overwrite || activeCreateFieldKey == nil || !visibleFields.contains(where: { $0.key == activeCreateFieldKey }) {
-            activeCreateFieldKey = visibleFields.first(where: { $0.fieldType != "choice" })?.key
-        }
-        if createInputController.isFocused, let activeCreateFieldKey {
-            focusCreateField(activeCreateFieldKey)
-        }
-    }
 
     private func selectedBackend() -> BackendRecord? {
         guard let selectedServiceID else { return nil }
@@ -15425,7 +16069,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         isAddingWindowsContainerFolder = false
         pendingWorkspaceDeletion = nil
         if isWorkspaceNamePromptVisible {
-            blurWorkspaceRenameField()
+            blurEditorInput()
             pendingWorkspaceRename = nil
             pendingRecipeCommandWorkspace = nil
             pendingDockerfileWorkspace = nil
@@ -15641,7 +16285,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                         self.containerConfigurationBuildErrorCopyConfirmationID = nil
                         self.safeSpaceRecipeMessage = ""
                         self.workspacePanelMessage = ""
-                        self.blurWorkspaceRenameField()
+                        self.blurEditorInput()
                     } else {
                         self.workspacePanelMessage = message
                     }
@@ -15693,7 +16337,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         }
         if let selectedRecipeSafeSpaceID,
            !localWorkspaces.contains(where: { $0.id == selectedRecipeSafeSpaceID }) {
-            navigateToRecipeSafeSpace(nil, pushHistory: false)
+            navigateToRecipeSafeSpace(nil)
         } else if let selectedRecipeSafeSpaceID,
                   pendingDockerfileWorkspace == nil,
                   let workspace = localWorkspaces.first(where: {
@@ -15812,7 +16456,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                     containerConfigurationBuildErrorCopyConfirmationID = nil
                     safeSpaceRecipeMessage = ""
                     workspacePanelMessage = ""
-                    blurWorkspaceRenameField()
+                    blurEditorInput()
                 } else {
                     safeSpaceRecipeMessage = error
                 }
@@ -15873,13 +16517,13 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                let workspace = localWorkspaces.first(where: {
                    $0.id == operationWorkspaceID
                }) {
-                navigateToRecipeSafeSpace(workspace.id, pushHistory: true)
+                navigateToRecipeSafeSpace(workspace.id)
                 containerConfigurationBuildError = error
                 containerConfigurationBuildErrorScroll = 0
                 containerConfigurationBuildErrorRenderedScroll = 0
                 containerConfigurationBuildErrorCopyConfirmationID = nil
                 workspacePanelMessage = ""
-                blurWorkspaceRenameField()
+                blurEditorInput()
             } else {
                 workspacePanelMessage = error
             }
@@ -15974,7 +16618,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             containerConfigurationBuildErrorCopyConfirmationID = nil
             safeSpaceRecipeMessage = ""
             workspacePanelMessage = ""
-            blurWorkspaceRenameField()
+            blurEditorInput()
             updateLayout()
         default:
             break
@@ -16560,7 +17204,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 if self.pendingSharedContainerImport != nil {
                     self.isPerformingWorkspaceOperation = false
                     self.workspacePanelMessage = error.localizedDescription
-                    self.focusWorkspaceRenameField(selectAll: false)
+                    self.focusEditorInput(selectAll: false)
                     self.updateLayout()
                 } else {
                     self.finishSharedContainerImport(error: error)
@@ -16581,7 +17225,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                     self.workspaceRenameName = suggestedMountRoot
                     self.workspacePanelMessage = ""
                     self.isShowingWorkspacePanel = true
-                    self.focusWorkspaceRenameField(selectAll: false)
+                    self.focusEditorInput(selectAll: false)
                     self.updateLayout()
                     return
                 }
@@ -16594,7 +17238,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 let message = omitted > 0
                     ? "Imported the container. \(omitted) folder mount(s) need to be reconnected."
                     : "Imported the container. Its image is being built."
-                self.blurWorkspaceRenameField()
+                self.blurEditorInput()
                 self.workspaceNamePromptDismissesPanel = false
                 self.workspaceRenameName = ""
                 self.isShowingWorkspacePanel = false
@@ -16667,6 +17311,103 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         updateLayout()
     }
 
+    private struct ManagementPanel {
+        let id: UUID
+        let title: String
+        let detail: String
+        let items: [OuterframeContextMenuItem]
+    }
+    private var managementPanel: ManagementPanel?
+    private let managementOverlayLayer = CALayer()
+    private var managementActions: [(frame: CGRect, id: String, title: String)] = []
+    private var managementScroll: CGFloat = 0
+    private var managementScrollLimit: CGFloat = 0
+
+    private func showManagementPanel(id: UUID, title: String, detail: String, items: [OuterframeContextMenuItem]) {
+        managementPanel = ManagementPanel(id: id, title: title, detail: detail, items: items)
+        managementScroll = 0
+        blurCreateField()
+        blurEditorInput()
+        updateLayout()
+    }
+
+    private func dismissManagementPanel() {
+        if let panel = managementPanel {
+            pendingWorkspaceOverviewMenuActions.removeValue(forKey: panel.id)
+            pendingSafeSpaceProviderMenuSelections.removeValue(forKey: panel.id)
+        }
+        managementPanel = nil
+        runtimeMenuPoint = nil
+        updateLayout()
+    }
+
+    private func renderManagementPanel(width: CGFloat, height: CGFloat) {
+        managementOverlayLayer.removeFromSuperlayer()
+        managementOverlayLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
+        managementActions.removeAll()
+        guard let model = managementPanel else { return }
+        managementOverlayLayer.frame = CGRect(x: 0, y: 0, width: width, height: height)
+        managementOverlayLayer.backgroundColor = resolvedCGColor(NSColor.black.withAlphaComponent(0.25))
+        rootLayer.addSublayer(managementOverlayLayer)
+        let panel = CALayer()
+        let panelWidth = min(max(width - 40, 260), 740)
+        let panelHeight = min(max(height - 40, 240), 620)
+        panel.frame = CGRect(x: (width - panelWidth) / 2, y: (height - panelHeight) / 2, width: panelWidth, height: panelHeight)
+        panel.cornerRadius = 16
+        panel.backgroundColor = resolvedCGColor(.windowBackgroundColor)
+        managementOverlayLayer.addSublayer(panel)
+        let title = makeTextLayer(size: 21, weight: .semibold, color: .labelColor)
+        title.string = model.title
+        title.frame = CGRect(x: 24, y: panelHeight - 57, width: panelWidth - 100, height: 30)
+        panel.addSublayer(title)
+        let close = makeSymbolButtonLayer(symbolName: "xmark", accessibilityTitle: "Close")
+        close.frame = CGRect(x: panelWidth - 58, y: panelHeight - 58, width: 34, height: 34)
+        panel.addSublayer(close)
+        managementActions.append((rootLayer.convert(close.frame, from: panel), "close", "Close"))
+        let viewport = CALayer()
+        viewport.frame = CGRect(x: 24, y: 24, width: panelWidth - 48, height: panelHeight - 108)
+        viewport.masksToBounds = true
+        panel.addSublayer(viewport)
+        var y = viewport.bounds.height + managementScroll
+        y = agentText(model.detail, in: viewport, left: 0, top: y, width: viewport.bounds.width, size: 13) - 24
+        for item in model.items {
+            if case .separator = item.kind { y -= 12; continue }
+            if case .label = item.kind {
+                y = agentText(item.title, in: viewport, left: 0, top: y, width: viewport.bounds.width, size: 13) - 20
+                continue
+            }
+            let parts = item.title.components(separatedBy: " — ")
+            let rowHeight: CGFloat = parts.count > 1 ? 96 : 56
+            let row = CALayer()
+            row.frame = CGRect(x: 0, y: y - rowHeight, width: viewport.bounds.width, height: rowHeight)
+            row.cornerRadius = 10
+            row.backgroundColor = resolvedCGColor(.controlBackgroundColor)
+            row.borderWidth = 0.5
+            row.borderColor = resolvedCGColor(.separatorColor)
+            row.opacity = item.isEnabled ? 1 : 0.55
+            viewport.addSublayer(row)
+            let destructive = item.id == "delete"
+            let icon = CALayer()
+            icon.contents = symbolCGImage(named: item.systemImageName, pointSize: 20, color: destructive ? .systemRed : .controlAccentColor)
+            icon.contentsGravity = .resizeAspect
+            icon.frame = CGRect(x: 16, y: rowHeight - 40, width: 24, height: 24)
+            row.addSublayer(icon)
+            let heading = makeTextLayer(size: 14, weight: .medium, color: destructive ? .systemRed : .labelColor)
+            heading.string = parts[0]
+            heading.frame = CGRect(x: 54, y: rowHeight - 38, width: row.bounds.width - 70, height: 22)
+            row.addSublayer(heading)
+            if parts.count > 1 {
+                _ = agentText(parts.dropFirst().joined(separator: " — "), in: row, left: 54, top: rowHeight - 42, width: row.bounds.width - 70, size: 11)
+            }
+            let visible = row.frame.intersection(viewport.bounds)
+            if item.isEnabled, !visible.isEmpty {
+                managementActions.append((rootLayer.convert(visible, from: viewport), item.id, item.title))
+            }
+            y -= rowHeight + 12
+        }
+        managementScrollLimit = max(managementScroll - y, 0)
+    }
+
     private func showSafeSpaceProviderMenu(at point: CGPoint) {
         runtimeMenuPoint = point
         let providers = availableSafeSpaceProviders
@@ -16697,7 +17438,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         }
         pendingSafeSpaceProviderMenuSelections[menuID]?["check"] = "check"
         items.append(OuterframeContextMenuItem(id: "check", title: "Check runtimes again", isEnabled: true, systemImageName: "arrow.clockwise"))
-        outerframeHost.showContextMenu(menuID: menuID, items: items, at: point)
+        showManagementPanel(id: menuID, title: "Manage containers", detail: "Choose a runtime to create a container, review setup instructions, or manage container storage.", items: items)
     }
 
     private func showContainerPathMenu(at point: CGPoint) {
@@ -16741,12 +17482,12 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         pendingRecipeBaseImageWorkspace = nil
         workspaceRenameName = pendingCreationContainerName
         workspacePanelMessage = ""
-        focusWorkspaceRenameField(selectAll: true)
+        focusEditorInput(selectAll: true)
         updateLayout()
     }
 
     private func showRecipeCommandPrompt(for workspace: LocalWorkspaceRecord) {
-        workspaceRenameInputController.resetUndoHistory()
+        editorInputController.resetUndoHistory()
         workspaceNamePromptDismissesPanel = true
         isShowingWorkspacePanel = true
         isCreatingWorkspace = false
@@ -16765,7 +17506,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             && rm -rf /var/lib/apt/lists/*
         """
         workspacePanelMessage = ""
-        focusWorkspaceRenameField(selectAll: true)
+        focusEditorInput(selectAll: true)
         updateLayout()
     }
 
@@ -16782,7 +17523,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             sendWorkspaceRequest(operation: "list", includeDetails: true)
             return
         }
-        workspaceRenameInputController.resetUndoHistory()
+        editorInputController.resetUndoHistory()
         workspaceNamePromptDismissesPanel = true
         isShowingWorkspacePanel = true
         isCreatingWorkspace = false
@@ -16800,6 +17541,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         pendingSafeSpaceAppKind = nil
         pendingDockerfileWorkspace = workspace
         containerConfigurationTab = .dockerfile
+        codingAgentScope = nil
+        codingAgentScroll = 0
+        codingAgentMessage = ""
+        allowAllOpenCodeActions = false
         containerConfigurationDockerfile = recipe.containerfile
         containerConfigurationSavedDockerfile = recipe.containerfile
         containerConfigurationEnvironment = recipe.environment.map {
@@ -16835,6 +17580,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         pendingContainerConfigurationPreviousRequiresRebuild = nil
         pendingContainerConfigurationRuntimeSave = nil
         containerConfigurationTextScroll = 0
+        containerConfigurationHorizontalScroll = 0
         containerConfigurationMountScroll = 0
         containerConfigurationBuildError = nil
         containerConfigurationBuildErrorScroll = 0
@@ -16844,14 +17590,18 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         containerConfigurationBuildErrorCopyConfirmationID = nil
         workspaceRenameName = containerConfigurationDockerfile
         workspacePanelMessage = ""
-        focusWorkspaceRenameField()
+        focusEditorInput()
         scheduleContainerBuildProgressRefresh()
     }
 
     private func endContainerConfigurationEditor() {
         isAddingWindowsContainerFolder = false
         guard pendingDockerfileWorkspace != nil else { return }
-        blurWorkspaceRenameField()
+        blurEditorInput()
+        dockerfileTextSurface.removeFromSuperlayer()
+        dockerfileTextSurface.discardTiles()
+        dockerfileTextSurface.textLayout = nil
+        dockerfileTextLayout = nil
         pendingDockerfileWorkspace = nil
         isShowingWorkspacePanel = false
         workspaceNamePromptDismissesPanel = false
@@ -16876,6 +17626,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         pendingContainerConfigurationPreviousRequiresRebuild = nil
         pendingContainerConfigurationRuntimeSave = nil
         containerConfigurationTextScroll = 0
+        containerConfigurationHorizontalScroll = 0
         containerConfigurationMountScroll = 0
         containerConfigurationBuildError = nil
         containerConfigurationBuildErrorScroll = 0
@@ -16890,37 +17641,38 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
               containerConfigurationTab != tab else {
             return
         }
-        if workspaceRenameInputController.isFocused {
+        if editorInputController.isFocused {
             switch containerConfigurationTab {
             case .dockerfile:
-                containerConfigurationDockerfile = workspaceRenameInputController.text
+                containerConfigurationDockerfile = editorInputController.text
             case .environment:
-                containerConfigurationEnvironment = workspaceRenameInputController.text
+                containerConfigurationEnvironment = editorInputController.text
                 scheduleContainerConfigurationEnvironmentSave(after: 0)
             case .ports:
-                containerConfigurationPorts = workspaceRenameInputController.text
+                containerConfigurationPorts = editorInputController.text
                 scheduleContainerConfigurationEnvironmentSave(after: 0)
-            case .mounts, .runtime:
+            case .mounts, .runtime, .codingAgent:
                 break
             }
         }
         containerConfigurationTab = tab
         containerConfigurationTextScroll = 0
+        containerConfigurationHorizontalScroll = 0
         if tab == .mounts {
             containerConfigurationMountScroll = 0
         }
         switch tab {
         case .dockerfile:
             workspaceRenameName = containerConfigurationDockerfile
-            focusWorkspaceRenameField()
+            focusEditorInput()
         case .environment:
             workspaceRenameName = containerConfigurationEnvironment
-            focusWorkspaceRenameField()
+            focusEditorInput()
         case .ports:
             workspaceRenameName = containerConfigurationPorts
-            focusWorkspaceRenameField()
-        case .mounts, .runtime:
-            blurWorkspaceRenameField()
+            focusEditorInput()
+        case .mounts, .runtime, .codingAgent:
+            blurEditorInput()
         }
         updateLayout()
     }
@@ -16937,7 +17689,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             return containerConfigurationEnvironment
         case .ports:
             return containerConfigurationPorts
-        case .mounts, .runtime:
+        case .mounts, .runtime, .codingAgent:
             return ""
         }
     }
@@ -16950,14 +17702,14 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
     @discardableResult
     private func saveContainerConfigurationDockerfile() -> Bool {
-        workspaceRenameInputController.breakUndoCoalescing()
+        editorInputController.breakUndoCoalescing()
         guard let workspace = pendingDockerfileWorkspace,
               !isPerformingWorkspaceOperation else {
             return false
         }
         if containerConfigurationTab == .dockerfile,
-           workspaceRenameInputController.isFocused {
-            containerConfigurationDockerfile = workspaceRenameInputController.text
+           editorInputController.isFocused {
+            containerConfigurationDockerfile = editorInputController.text
         }
         let dockerfile = containerConfigurationDockerfile
         guard !dockerfile.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
@@ -16985,9 +17737,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
               !isPerformingWorkspaceOperation else { return }
         containerConfigurationDockerfile = containerConfigurationSavedDockerfile
         workspaceRenameName = containerConfigurationSavedDockerfile
-        isSynchronizingWorkspaceRenameInput = true
-        workspaceRenameInputController.setText(containerConfigurationSavedDockerfile)
-        isSynchronizingWorkspaceRenameInput = false
+        isSynchronizingEditorInput = true
+        editorInputController.setText(containerConfigurationSavedDockerfile)
+        isSynchronizingEditorInput = false
         workspacePanelMessage = ""
         updateLayout()
     }
@@ -17028,12 +17780,12 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             return
         }
         if containerConfigurationTab == .environment,
-           workspaceRenameInputController.isFocused {
-            containerConfigurationEnvironment = workspaceRenameInputController.text
+           editorInputController.isFocused {
+            containerConfigurationEnvironment = editorInputController.text
         }
         if containerConfigurationTab == .ports,
-           workspaceRenameInputController.isFocused {
-            containerConfigurationPorts = workspaceRenameInputController.text
+           editorInputController.isFocused {
+            containerConfigurationPorts = editorInputController.text
         }
         let environment: [ContainerConfigurationEnvironmentRequest]
         let publishedPorts: [ContainerConfigurationPublishedPortRequest]
@@ -17082,7 +17834,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         }
         if hasUnsavedContainerConfigurationDockerfile {
             isConfirmingContainerConfigurationRebuild = true
-            blurWorkspaceRenameField()
+            blurEditorInput()
             updateLayout()
             return
         }
@@ -17109,7 +17861,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         setDockerfileSelection(fragmentID: nil, range: nil)
         if isContainerConfigurationTextTab {
             workspaceRenameName = currentContainerConfigurationText
-            focusWorkspaceRenameField()
+            focusEditorInput()
         }
         updateLayout()
     }
@@ -17133,7 +17885,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         containerConfigurationRebuildAfterDockerfileSave = false
         if isContainerConfigurationTextTab {
             workspaceRenameName = currentContainerConfigurationText
-            focusWorkspaceRenameField()
+            focusEditorInput()
         }
         updateLayout()
     }
@@ -17142,8 +17894,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         guard isConfirmingContainerConfigurationRebuild else { return }
         isConfirmingContainerConfigurationRebuild = false
         containerConfigurationRebuildAfterDockerfileSave = true
+        containerConfigurationTab = .dockerfile
         workspaceRenameName = containerConfigurationDockerfile
-        focusWorkspaceRenameField()
+        focusEditorInput()
         saveContainerConfigurationDockerfile()
     }
 
@@ -17153,21 +17906,21 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         containerConfigurationRebuildAfterDockerfileSave = false
         containerConfigurationDockerfile = containerConfigurationSavedDockerfile
         workspaceRenameName = containerConfigurationSavedDockerfile
-        isSynchronizingWorkspaceRenameInput = true
-        workspaceRenameInputController.setText(containerConfigurationSavedDockerfile)
-        isSynchronizingWorkspaceRenameInput = false
+        isSynchronizingEditorInput = true
+        editorInputController.setText(containerConfigurationSavedDockerfile)
+        isSynchronizingEditorInput = false
         rebuildContainerConfiguration()
     }
 
     private func requestContainerConfigurationDismissal() {
         guard isContainerConfigurationEditorVisible else { return }
         if containerConfigurationTab == .dockerfile,
-           workspaceRenameInputController.isFocused {
-            containerConfigurationDockerfile = workspaceRenameInputController.text
+           editorInputController.isFocused {
+            containerConfigurationDockerfile = editorInputController.text
         }
         if pendingContainerConfigurationDockerfileSave != nil {
             containerConfigurationDismissAfterDockerfileSave = true
-            blurWorkspaceRenameField()
+            blurEditorInput()
             updateLayout()
             return
         }
@@ -17176,7 +17929,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             return
         }
         isConfirmingContainerConfigurationDismissal = true
-        blurWorkspaceRenameField()
+        blurEditorInput()
         updateLayout()
     }
 
@@ -17185,7 +17938,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         isConfirmingContainerConfigurationDismissal = false
         if isContainerConfigurationTextTab {
             workspaceRenameName = currentContainerConfigurationText
-            focusWorkspaceRenameField()
+            focusEditorInput()
         }
         updateLayout()
     }
@@ -17318,7 +18071,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func showRecipeBaseImagePrompt(for workspace: LocalWorkspaceRecord) {
-        workspaceRenameInputController.resetUndoHistory()
+        editorInputController.resetUndoHistory()
         guard let recipe = workspace.recipe else { return }
         workspaceNamePromptDismissesPanel = true
         isShowingWorkspacePanel = true
@@ -17348,9 +18101,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         workspaceRenameName = creationBaseImage
         workspacePanelMessage = ""
         if baseImageTemplate == .outerShell {
-            blurWorkspaceRenameField()
+            blurEditorInput()
         } else {
-            focusWorkspaceRenameField(selectAll: true)
+            focusEditorInput(selectAll: true)
         }
         updateLayout()
     }
@@ -17367,7 +18120,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func showRecipeUserPrompt(for workspace: LocalWorkspaceRecord) {
-        workspaceRenameInputController.resetUndoHistory()
+        editorInputController.resetUndoHistory()
         workspaceNamePromptDismissesPanel = true
         isShowingWorkspacePanel = true
         isCreatingWorkspace = false
@@ -17385,7 +18138,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         pendingRecipeUserWorkspace = workspace
         workspaceRenameName = ""
         workspacePanelMessage = ""
-        focusWorkspaceRenameField()
+        focusEditorInput()
         updateLayout()
     }
 
@@ -17393,7 +18146,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         for workspace: LocalWorkspaceRecord,
         step: LocalWorkspaceRecord.Recipe.Step
     ) {
-        workspaceRenameInputController.resetUndoHistory()
+        editorInputController.resetUndoHistory()
         guard step.isEditable else { return }
         workspaceNamePromptDismissesPanel = true
         isShowingWorkspacePanel = true
@@ -17412,7 +18165,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         pendingSafeSpaceAppKind = nil
         workspaceRenameName = step.dockerfileFragment
         workspacePanelMessage = ""
-        focusWorkspaceRenameField()
+        focusEditorInput()
         updateLayout()
     }
 
@@ -17420,7 +18173,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         for workspace: LocalWorkspaceRecord,
         userID: UUID?
     ) {
-        workspaceRenameInputController.resetUndoHistory()
+        editorInputController.resetUndoHistory()
         workspaceNamePromptDismissesPanel = true
         isShowingWorkspacePanel = true
         isCreatingWorkspace = false
@@ -17444,7 +18197,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             userID: userID
         )
         workspacePanelMessage = ""
-        focusWorkspaceRenameField(selectAll: true)
+        focusEditorInput(selectAll: true)
         updateLayout()
     }
 
@@ -17452,14 +18205,14 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         for workspace: LocalWorkspaceRecord,
         script: LocalWorkspaceRecord.Recipe.ScriptFile
     ) {
-        workspaceRenameInputController.resetUndoHistory()
+        editorInputController.resetUndoHistory()
         showRecipeScriptCreationPrompt(
             for: workspace,
             userID: UUID(uuidString: script.userID)
         )
         pendingRecipeScriptRename = script
         workspaceRenameName = script.fileName
-        focusWorkspaceRenameField(selectAll: true)
+        focusEditorInput(selectAll: true)
         updateLayout()
     }
 
@@ -17491,7 +18244,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
     private func showSafeSpaceAppPrompt(for workspace: LocalWorkspaceRecord,
                                         kind: String) {
-        workspaceRenameInputController.resetUndoHistory()
+        editorInputController.resetUndoHistory()
         workspaceNamePromptDismissesPanel = true
         isShowingWorkspacePanel = true
         isCreatingWorkspace = false
@@ -17508,7 +18261,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         pendingSafeSpaceAppKind = kind
         workspaceRenameName = "/home/workspace/Workspace"
         workspacePanelMessage = ""
-        focusWorkspaceRenameField(selectAll: true)
+        focusEditorInput(selectAll: true)
         updateLayout()
     }
 
@@ -17522,7 +18275,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func showWorkspaceRename(_ workspace: LocalWorkspaceRecord) {
-        workspaceRenameInputController.resetUndoHistory()
+        editorInputController.resetUndoHistory()
         isAddingWindowsContainerFolder = false
         isShowingWorkspacePanel = true
         isCreatingWorkspace = false
@@ -17534,33 +18287,33 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         pendingRecipeScriptRename = nil
         workspaceRenameName = workspace.name
         workspacePanelMessage = ""
-        focusWorkspaceRenameField(selectAll: true)
+        focusEditorInput(selectAll: true)
         updateLayout()
     }
 
     private func showContainerConfigurationRename(
         _ workspace: LocalWorkspaceRecord
     ) {
-        workspaceRenameInputController.resetUndoHistory()
+        editorInputController.resetUndoHistory()
         guard isContainerConfigurationEditorVisible else { return }
-        if workspaceRenameInputController.isFocused {
+        if editorInputController.isFocused {
             switch containerConfigurationTab {
             case .dockerfile:
-                containerConfigurationDockerfile = workspaceRenameInputController.text
+                containerConfigurationDockerfile = editorInputController.text
             case .environment:
-                containerConfigurationEnvironment = workspaceRenameInputController.text
+                containerConfigurationEnvironment = editorInputController.text
             case .ports:
-                containerConfigurationPorts = workspaceRenameInputController.text
-            case .mounts, .runtime:
+                containerConfigurationPorts = editorInputController.text
+            case .mounts, .runtime, .codingAgent:
                 break
             }
         }
-        blurWorkspaceRenameField()
+        blurEditorInput()
         workspaceNamePromptDismissesPanel = false
         pendingWorkspaceRename = workspace
         workspaceRenameName = workspace.name
         workspacePanelMessage = ""
-        focusWorkspaceRenameField(selectAll: true)
+        focusEditorInput(selectAll: true)
         updateLayout()
     }
 
@@ -17570,19 +18323,20 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         workspaceNamePromptDismissesPanel = true
         workspacePanelMessage = ""
         containerConfigurationTextScroll = 0
+        containerConfigurationHorizontalScroll = 0
         switch containerConfigurationTab {
         case .dockerfile:
             workspaceRenameName = containerConfigurationDockerfile
-            focusWorkspaceRenameField()
+            focusEditorInput()
         case .environment:
             workspaceRenameName = containerConfigurationEnvironment
-            focusWorkspaceRenameField()
+            focusEditorInput()
         case .ports:
             workspaceRenameName = containerConfigurationPorts
-            focusWorkspaceRenameField()
-        case .mounts, .runtime:
+            focusEditorInput()
+        case .mounts, .runtime, .codingAgent:
             workspaceRenameName = ""
-            blurWorkspaceRenameField()
+            blurEditorInput()
         }
     }
 
@@ -17611,10 +18365,18 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func dismissWorkspaceRename() {
+        pendingMountPathEdit = nil
+        if pendingEndpointRename != nil {
+            pendingEndpointRename = nil
+            isShowingWorkspacePanel = false
+            blurEditorInput()
+            updateLayout()
+            return
+        }
         if let pendingImport = pendingSharedContainerImport {
             guard !isPerformingWorkspaceOperation else { return }
             pendingSharedContainerImport = nil
-            blurWorkspaceRenameField()
+            blurEditorInput()
             workspaceNamePromptDismissesPanel = false
             workspaceRenameName = ""
             workspacePanelMessage = ""
@@ -17627,22 +18389,22 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             return
         }
         if isRenamingContainerConfiguration {
-            blurWorkspaceRenameField()
+            blurEditorInput()
             restoreContainerConfigurationInputAfterRename()
             updateLayout()
             return
         }
         if isCreatingWorkspace && isEditingCreationBaseImage {
-            blurWorkspaceRenameField()
+            blurEditorInput()
             isEditingCreationBaseImage = false
             workspaceRenameName = pendingCreationContainerName
             workspacePanelMessage = ""
-            focusWorkspaceRenameField(selectAll: true)
+            focusEditorInput(selectAll: true)
             updateLayout()
             return
         }
         let dismissesPanel = workspaceNamePromptDismissesPanel
-        blurWorkspaceRenameField()
+        blurEditorInput()
         pendingWorkspaceRename = nil
         pendingRecipeCommandWorkspace = nil
         pendingDockerfileWorkspace = nil
@@ -17665,13 +18427,35 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func submitWorkspaceRename() {
+        if let item = pendingEndpointRename {
+            let name = editorInputController.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            var layout = overviewLayout
+            layout.names[overviewKey(for: item)] = name.isEmpty ? nil : name
+            dismissWorkspaceRename()
+            saveOverviewLayout(layout)
+            return
+        }
+        if let edit = pendingMountPathEdit, let index = containerConfigurationMounts.firstIndex(where: { $0.id == edit.id }) {
+            let path = editorInputController.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard path.hasPrefix("/") || (edit.field == "host" && isWindowsHost && path.contains(":")) else {
+                workspacePanelMessage = "Enter an absolute folder path."
+                updateLayout()
+                return
+            }
+            if edit.field == "host" { containerConfigurationMounts[index].hostPath = path }
+            else { containerConfigurationMounts[index].guestPath = path }
+            pendingMountPathEdit = nil
+            dismissWorkspaceRename()
+            persistContainerRuntimeConfiguration()
+            return
+        }
         guard isWorkspaceNamePromptVisible else { return }
         guard !isPerformingWorkspaceOperation else {
             workspacePanelMessage = "Another container operation is still finishing. Your changes have not been discarded."
             updateLayout()
             return
         }
-        let submittedText = workspaceRenameInputController.text
+        let submittedText = editorInputController.text
         let name = submittedText.trimmingCharacters(
             in: .whitespacesAndNewlines
         )
@@ -17717,7 +18501,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         if let pendingImport = pendingSharedContainerImport {
             isPerformingWorkspaceOperation = true
             workspacePanelMessage = "Copying mounted folders…"
-            blurWorkspaceRenameField()
+            blurEditorInput()
             updateLayout()
             finishUploadedSharedContainer(
                 transferID: pendingImport.transferID,
@@ -17733,7 +18517,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             isEditingCreationBaseImage = false
             workspaceRenameName = pendingCreationContainerName
             workspacePanelMessage = ""
-            focusWorkspaceRenameField(selectAll: true)
+            focusEditorInput(selectAll: true)
             updateLayout()
             return
         }
@@ -17752,7 +18536,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         let createsWorkspace = isCreatingWorkspace
         let dismissesPanel = workspaceNamePromptDismissesPanel
         let renamesContainerConfiguration = isRenamingContainerConfiguration
-        blurWorkspaceRenameField()
+        blurEditorInput()
         pendingWorkspaceRename = nil
         if !renamesContainerConfiguration {
             pendingDockerfileWorkspace = nil
@@ -17923,8 +18707,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             workspacePanelFrame = .zero
             workspaceCloseFrame = .zero
             workspaceRenamePanelFrame = .zero
-            workspaceRenameFieldFrame = .zero
-            workspaceRenameTextFrame = .zero
+            editorInputFieldFrame = .zero
+            editorInputTextFrame = .zero
             workspaceRenameCancelFrame = .zero
             workspaceRenameConfirmFrame = .zero
             workspaceCreationBaseImageFrame = .zero
@@ -18016,8 +18800,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         workspaceOverlayLayer.backgroundColor = resolvedCGColor(
             NSColor.black.withAlphaComponent(0.28)
         )
-        let panelWidth = max(width - 48, 620)
-        let panelHeight = max(height - 48, 420)
+        let panelWidth = max(width - 32, 280)
+        let panelHeight = max(height - 32, 300)
         workspacePanelFrame = CGRect(x: floor((width - panelWidth) / 2),
                                      y: floor((height - panelHeight) / 2),
                                      width: panelWidth,
@@ -18032,6 +18816,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         workspacePanelLayer.shadowOpacity = 0.2
         workspacePanelLayer.shadowRadius = 20
         workspacePanelLayer.shadowOffset = CGSize(width: 0, height: -4)
+        dockerfileTextSurface.removeFromSuperlayer()
         workspacePanelLayer.sublayers = nil
         containerConfigurationTextViewportLayer = nil
         containerConfigurationBuildErrorViewportLayer = nil
@@ -18040,6 +18825,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         containerConfigurationTextFragmentsText = ""
         containerConfigurationTextFragmentsWidth = 0
         containerConfigurationMountActionFrames.removeAll()
+        codingAgentActions.removeAll()
+        codingAgentTabFrame = .zero
         containerConfigurationSaveFrame = .zero
         containerConfigurationDiscardFrame = .zero
         containerConfigurationRebuildFrame = .zero
@@ -18062,7 +18849,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         workspaceRenameCancelFrame = .zero
 
         let title = makeTextLayer(size: 20, weight: .semibold, color: .labelColor)
-        title.string = workspace.name
+        title.string = "Container: \(workspace.name)"
         title.frame = CGRect(x: 24,
                              y: panelHeight - 46,
                              width: panelWidth - 170,
@@ -18098,16 +18885,19 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
         let tabs: [(ContainerConfigurationTab, String)] = [
             (.dockerfile, "Dockerfile"),
+            (.codingAgent, "Coding agent"),
             (.mounts, "Folder Mounts"),
             (.environment, "Environment"),
-            (.ports, "Ports"),
+            (.ports, "Network"),
             (.runtime, "Runtime")
         ]
         var tabX: CGFloat = 24
+        var tabY = panelHeight - 94
         for (tab, label) in tabs {
             let tabWidth: CGFloat = label == "Folder Mounts" ? 126 : 108
+            if tabX + tabWidth > panelWidth - 24 { tabX = 24; tabY -= 40 }
             let localFrame = CGRect(x: tabX,
-                                    y: panelHeight - 94,
+                                    y: tabY,
                                     width: tabWidth,
                                     height: 32)
             let tabLayer = makeButtonLayer(
@@ -18119,6 +18909,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             let rootFrame = localFrame.offsetBy(dx: workspacePanelFrame.minX,
                                                  dy: workspacePanelFrame.minY)
             switch tab {
+            case .codingAgent:
+                codingAgentTabFrame = rootFrame
             case .dockerfile:
                 containerConfigurationDockerfileTabFrame = rootFrame
             case .mounts:
@@ -18136,11 +18928,11 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         containerConfigurationEditorToolbarFrame = .zero
         containerConfigurationCookbookFrame = .zero
         containerConfigurationCopyPathFrame = .zero
-        let contentTop = panelHeight - 108
+        let contentTop = tabY - 14
         let contentFrame = CGRect(x: 24,
-                                  y: 76,
+                                  y: 108,
                                   width: panelWidth - 48,
-                                  height: max(contentTop - 76, 150))
+                                  height: max(contentTop - 108, 60))
         containerConfigurationContentFrame = contentFrame.offsetBy(
             dx: workspacePanelFrame.minX,
             dy: workspacePanelFrame.minY
@@ -18172,6 +18964,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                     )
                 )
             }
+        case .codingAgent:
+            renderContainerAgent(in: contentFrame)
         case .mounts:
             renderContainerConfigurationMounts(in: contentFrame)
         case .environment:
@@ -18189,19 +18983,20 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         }
 
         let divider = CALayer()
-        divider.frame = CGRect(x: 0, y: 62, width: panelWidth, height: 0.5)
+        divider.frame = CGRect(x: 0, y: 100, width: panelWidth, height: 0.5)
         divider.backgroundColor = resolvedCGColor(.separatorColor)
         workspacePanelLayer.addSublayer(divider)
 
+        agentText("Rebuilding restarts the container. Changes outside its Dockerfile, persistent data, and mounted folders are not retained.", in: workspacePanelLayer, left: 24, top: 90, width: panelWidth - 48, size: 11)
         var buttonX = panelWidth - 24
-        let rebuildWidth: CGFloat = 88
+        let rebuildWidth: CGFloat = 140
         buttonX -= rebuildWidth
         let localRebuildFrame = CGRect(x: buttonX,
                                        y: 17,
                                        width: rebuildWidth,
                                        height: 32)
         let rebuild = makeButtonLayer(
-            title: "Rebuild",
+            title: "Save & rebuild",
             emphasized: containerConfigurationRequiresRebuild ||
                 containerConfigurationEnvironment != containerConfigurationSavedEnvironment ||
                 containerConfigurationPorts != containerConfigurationSavedPorts ||
@@ -18214,6 +19009,20 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             dx: workspacePanelFrame.minX,
             dy: workspacePanelFrame.minY
         )
+        let saveFrame = CGRect(x: buttonX - 78, y: 17, width: 68, height: 32)
+        let save = makeButtonLayer(title: "Save", emphasized: false)
+        save.frame = saveFrame
+        workspacePanelLayer.addSublayer(save)
+        containerConfigurationSaveFrame = rootLayer.convert(saveFrame, from: workspacePanelLayer)
+        dockerfileZoomFrame = .zero
+        if containerConfigurationTab == .dockerfile {
+            let zoomFrame = CGRect(x: 24, y: 18, width: min(130, max(buttonX - 112, 60)), height: 30)
+            let zoom = makeButtonLayer(title: "\(Int(dockerfileTextScale * 100))% · Text size", emphasized: false)
+            zoom.frame = zoomFrame
+            workspacePanelLayer.addSublayer(zoom)
+            dockerfileZoomFrame = rootLayer.convert(zoomFrame, from: workspacePanelLayer)
+        }
+
 
         if isActiveContainerBuildProgress(workspace.buildProgress) ||
             !workspacePanelMessage.isEmpty || !safeSpaceRecipeMessage.isEmpty {
@@ -18248,7 +19057,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             renderContainerConfigurationRebuildPrompt(panelWidth: panelWidth,
                                                        panelHeight: panelHeight)
         }
-        sendWorkspaceRenameTextInputGeometryUpdate()
+        updateEditorTextInputGeometry()
     }
 
     private func renderContainerConfigurationTextEditor(
@@ -18263,7 +19072,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         let field = CALayer()
         field.frame = localFieldFrame
         field.cornerRadius = 7
-        let isEditingField = workspaceRenameInputController.isFocused &&
+        let isEditingField = editorInputController.isFocused &&
             !isRenamingContainerConfiguration
         field.borderWidth = isEditingField ? 1.5 : 1
         field.borderColor = resolvedCGColor(
@@ -18289,51 +19098,63 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         containerConfigurationTextViewportLayer = viewport
         containerConfigurationRenderedTextScroll = containerConfigurationTextScroll
 
-        workspaceRenameFieldFrame = localFieldFrame.offsetBy(
+        editorInputFieldFrame = localFieldFrame.offsetBy(
             dx: workspacePanelFrame.minX,
             dy: workspacePanelFrame.minY
         )
         let visibleTextFrame = CGRect(
-            x: workspaceRenameFieldFrame.minX + 12,
-            y: workspaceRenameFieldFrame.minY + 10,
-            width: max(workspaceRenameFieldFrame.width - 24, 1),
-            height: max(workspaceRenameFieldFrame.height - 20 - toolbarHeight, 1)
+            x: editorInputFieldFrame.minX + 12,
+            y: editorInputFieldFrame.minY + 10,
+            width: max(editorInputFieldFrame.width - 24, 1),
+            height: max(editorInputFieldFrame.height - 20 - toolbarHeight, 1)
         )
         containerConfigurationTextVisibleFrame = visibleTextFrame
-        workspaceRenameTextFrame = visibleTextFrame.offsetBy(
+        editorInputTextFrame = visibleTextFrame.offsetBy(
             dx: 0,
             dy: containerConfigurationTextScroll
         )
-        workspaceRenameInputController.visualLineWidth = visibleTextFrame.width
+        editorInputController.visualLineWidth = usesUnwrappedDockerfile ? nil : visibleTextFrame.width
 
         let text: String
         if isRenamingContainerConfiguration {
             text = currentContainerConfigurationText
         } else {
-            text = workspaceRenameInputController.isFocused
-                ? workspaceRenameInputController.text
+            text = editorInputController.isFocused
+                ? editorInputController.text
                 : workspaceRenameName
         }
-        let layout = CreateFieldLayout(fieldFrame: workspaceRenameFieldFrame,
-                                       textFrame: workspaceRenameTextFrame,
+        containerConfigurationTextWidth = visibleTextFrame.width
+        if usesUnwrappedDockerfile {
+            containerConfigurationTextWidth = max(visibleTextFrame.width,
+                cachedDockerfileLayout(for: text).width * dockerfileTextScale + 4)
+            containerConfigurationHorizontalScroll = min(containerConfigurationHorizontalScroll,
+                max(containerConfigurationTextWidth - visibleTextFrame.width, 0))
+        } else {
+            containerConfigurationHorizontalScroll = 0
+        }
+        viewport.frame.origin.x = -containerConfigurationHorizontalScroll
+        editorInputTextFrame.origin.x -= containerConfigurationHorizontalScroll
+        editorInputTextFrame.size.width = containerConfigurationTextWidth
+        let layout = CreateFieldLayout(fieldFrame: editorInputFieldFrame,
+                                       textFrame: editorInputTextFrame,
                                        key: "containerConfiguration",
                                        monospaced: true,
                                        multiline: true)
         let fragments = createTextAreaLineFragments(text: text, layout: layout)
         containerConfigurationTextFragments = fragments
         containerConfigurationTextFragmentsText = text
-        containerConfigurationTextFragmentsWidth = visibleTextFrame.width
+        containerConfigurationTextFragmentsWidth = editorInputTextFrame.width
         if text.isEmpty {
-            let placeholderLayer = makeTextLayer(size: 12,
+            let placeholderLayer = makeTextLayer(size: 12 * editorTextScale,
                                                  weight: .regular,
                                                  color: .placeholderTextColor,
                                                  monospaced: true)
             placeholderLayer.string = placeholder
             placeholderLayer.frame = CGRect(x: 12,
                                              y: visibleTextFrame.maxY -
-                                                workspaceRenameFieldFrame.minY - 17,
+                                                editorInputFieldFrame.minY - 17,
                                              width: localFieldFrame.width - 24,
-                                             height: 16)
+                                             height: editorLineHeight)
             viewport.addSublayer(placeholderLayer)
         }
         let selectionLayer = CALayer()
@@ -18344,45 +19165,55 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         let buildSourceRange = pendingDockerfileWorkspace?.buildProgress.flatMap {
             dockerfileSourceCharacterRange(for: $0, in: text)
         }
-        for fragment in fragments {
-            let localY = fragment.y - workspaceRenameFieldFrame.minY
-            guard localY > -localFieldFrame.height,
-                  localY < localFieldFrame.height * 2 else {
-                continue
+        if usesUnwrappedDockerfile {
+            dockerfileTextSurface.frame = textClip.bounds
+            dockerfileTextSurface.textLayout = cachedDockerfileLayout(for: text)
+            dockerfileTextSurface.textColor = resolvedCGColor(.textColor)
+            dockerfileTextSurface.sourceHighlight = buildSourceRange
+            dockerfileTextSurface.highlightColor = resolvedCGColor(NSColor.controlAccentColor.withAlphaComponent(0.13))
+            textClip.addSublayer(dockerfileTextSurface)
+            updateDockerfileTextSurface()
+        } else {
+            for fragment in fragments {
+                let localY = fragment.y - editorInputFieldFrame.minY
+                guard localY > -localFieldFrame.height,
+                      localY < localFieldFrame.height * 2 else {
+                    continue
+                }
+                let line = makeTextLayer(size: 12 * editorTextScale,
+                                         weight: .regular,
+                                         color: .textColor,
+                                         monospaced: true)
+                if let buildSourceRange,
+                   fragment.end > buildSourceRange.lowerBound,
+                   fragment.start < buildSourceRange.upperBound {
+                    let highlight = CALayer()
+                    highlight.frame = CGRect(
+                        x: 7,
+                        y: localY - 1,
+                        width: max(visibleTextFrame.width + 10, 1),
+                        height: editorLineHeight + 2
+                    )
+                    highlight.backgroundColor = resolvedCGColor(
+                        NSColor.controlAccentColor.withAlphaComponent(0.13)
+                    )
+                    highlight.cornerRadius = 3
+                    viewport.insertSublayer(highlight, below: selectionLayer)
+                }
+                line.string = fragment.text
+                line.frame = CGRect(x: 12,
+                                    y: localY,
+                                    width: containerConfigurationTextWidth,
+                                    height: editorLineHeight)
+                viewport.addSublayer(line)
             }
-            let line = makeTextLayer(size: 12,
-                                     weight: .regular,
-                                     color: .textColor,
-                                     monospaced: true)
-            if let buildSourceRange,
-               fragment.end > buildSourceRange.lowerBound,
-               fragment.start < buildSourceRange.upperBound {
-                let highlight = CALayer()
-                highlight.frame = CGRect(
-                    x: 7,
-                    y: localY - 1,
-                    width: max(visibleTextFrame.width + 10, 1),
-                    height: 18
-                )
-                highlight.backgroundColor = resolvedCGColor(
-                    NSColor.controlAccentColor.withAlphaComponent(0.13)
-                )
-                highlight.cornerRadius = 3
-                viewport.insertSublayer(highlight, below: selectionLayer)
-            }
-            line.string = fragment.text
-            line.frame = CGRect(x: 12,
-                                y: localY,
-                                width: visibleTextFrame.width,
-                                height: 16)
-            viewport.addSublayer(line)
         }
         if !isRenamingContainerConfiguration,
-           let cursorFrame = workspaceRenameFieldCursorRect() {
+           let cursorFrame = editorInputCaretRect() {
             addBlinkingTextCaret(
                 to: viewport,
-                frame: cursorFrame.offsetBy(dx: -workspaceRenameFieldFrame.minX,
-                                            dy: -workspaceRenameFieldFrame.minY)
+                frame: cursorFrame.offsetBy(dx: -editorInputFieldFrame.minX + containerConfigurationHorizontalScroll,
+                                            dy: -editorInputFieldFrame.minY)
             )
         }
 
@@ -18402,58 +19233,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                    height: 0.5)
             divider.backgroundColor = resolvedCGColor(.separatorColor)
             toolbar.addSublayer(divider)
-
-            if hasUnsavedContainerConfigurationDockerfile {
-                var fileActionX: CGFloat = 6
-                let saveActionWidth: CGFloat = 62
-                let saveIcon = makeSymbolButtonLayer(
-                    symbolName: "checkmark",
-                    accessibilityTitle: "Save Dockerfile"
-                )
-                saveIcon.applyStyle(tintCGColor: resolvedCGColor(.controlAccentColor),
-                                    backgroundCGColor: resolvedCGColor(.clear))
-                saveIcon.frame = CGRect(x: fileActionX, y: 5, width: 26, height: 26)
-                toolbar.addSublayer(saveIcon)
-
-                let saveLabel = makeTextLayer(size: 11,
-                                              weight: .medium,
-                                              color: .controlAccentColor)
-                saveLabel.string = "Save"
-                saveLabel.frame = CGRect(x: fileActionX + 27, y: 10,
-                                         width: 34, height: 16)
-                toolbar.addSublayer(saveLabel)
-                let localSaveFrame = CGRect(x: fileActionX, y: 2,
-                                            width: saveActionWidth, height: 32)
-                containerConfigurationSaveFrame = localSaveFrame.offsetBy(
-                    dx: workspaceRenameFieldFrame.minX,
-                    dy: workspaceRenameFieldFrame.minY + toolbar.frame.minY
-                )
-
-                fileActionX += saveActionWidth + 6
-                let discardActionWidth: CGFloat = 138
-                let discardIcon = makeSymbolButtonLayer(
-                    symbolName: "arrow.uturn.backward",
-                    accessibilityTitle: "Discard Dockerfile changes"
-                )
-                discardIcon.applyStyle(tintCGColor: resolvedCGColor(.controlAccentColor),
-                                       backgroundCGColor: resolvedCGColor(.clear))
-                discardIcon.frame = CGRect(x: fileActionX, y: 5, width: 26, height: 26)
-                toolbar.addSublayer(discardIcon)
-
-                let discardLabel = makeTextLayer(size: 11,
-                                                 weight: .medium,
-                                                 color: .controlAccentColor)
-                discardLabel.string = "Discard Changes"
-                discardLabel.frame = CGRect(x: fileActionX + 27, y: 10,
-                                            width: 108, height: 16)
-                toolbar.addSublayer(discardLabel)
-                let localDiscardFrame = CGRect(x: fileActionX, y: 2,
-                                               width: discardActionWidth, height: 32)
-                containerConfigurationDiscardFrame = localDiscardFrame.offsetBy(
-                    dx: workspaceRenameFieldFrame.minX,
-                    dy: workspaceRenameFieldFrame.minY + toolbar.frame.minY
-                )
-            }
 
             let copyActionWidth: CGFloat = 190
             let cookbookActionWidth: CGFloat = 130
@@ -18497,8 +19276,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             let copyActionFrame = CGRect(x: copyActionX, y: 2,
                                          width: copyActionWidth, height: 32)
             containerConfigurationEditorToolbarFrame = toolbar.frame
-                .offsetBy(dx: workspaceRenameFieldFrame.minX,
-                          dy: workspaceRenameFieldFrame.minY)
+                .offsetBy(dx: editorInputFieldFrame.minX,
+                          dy: editorInputFieldFrame.minY)
             containerConfigurationCookbookFrame = cookbookActionFrame
                 .offsetBy(dx: containerConfigurationEditorToolbarFrame.minX,
                           dy: containerConfigurationEditorToolbarFrame.minY)
@@ -18646,16 +19425,16 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         guard let selectionLayer = containerConfigurationTextSelectionLayer else { return }
         withoutImplicitAnimations {
             selectionLayer.sublayers = nil
-            guard workspaceRenameInputController.isFocused,
-                  let selection = workspaceRenameInputController.selectionRange else {
+            guard editorInputController.isFocused,
+                  let selection = editorInputController.selectionRange else {
                 return
             }
-            let fieldHeight = workspaceRenameFieldFrame.height
+            let fieldHeight = editorInputFieldFrame.height
             for fragment in containerConfigurationTextFragments {
                 let lower = max(selection.lowerBound, fragment.start)
                 let upper = min(selection.upperBound, fragment.end)
                 guard upper > lower else { continue }
-                let localY = fragment.y - workspaceRenameFieldFrame.minY - 1
+                let localY = fragment.y - editorInputFieldFrame.minY - 1
                 guard localY > -fieldHeight,
                       localY < fieldHeight * 2 else {
                     continue
@@ -18665,14 +19444,14 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                     line: line,
                     text: fragment.text,
                     range: (lower - fragment.start)..<(upper - fragment.start),
-                    maxWidth: containerConfigurationTextVisibleFrame.width
+                    maxWidth: containerConfigurationTextWidth
                 )
                 let highlight = CALayer()
                 highlight.frame = CGRect(
                     x: 12 + offsets.start,
                     y: localY,
                     width: max(offsets.end - offsets.start, 1),
-                    height: 18
+                    height: editorLineHeight + 2
                 )
                 highlight.backgroundColor = resolvedCGColor(
                     NSColor.selectedTextBackgroundColor.withAlphaComponent(0.65)
@@ -19118,7 +19897,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         let detail = makeTextLayer(size: 11,
                                    weight: .regular,
                                    color: .secondaryLabelColor)
-        detail.string = "Folder mounts and persistent data are attached when the container starts."
+        detail.string = serverSSHCommand == nil ? "Share a folder with this container." : "Make an existing server folder available inside this container."
         detail.frame = CGRect(x: contentFrame.minX,
                               y: contentFrame.maxY - 22,
                               width: contentFrame.width,
@@ -19189,36 +19968,23 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             )
             workspacePanelLayer.addSublayer(row)
 
-            let name = makeTextLayer(size: 11, weight: .semibold, color: .labelColor)
-            name.string = mount.name
-            name.frame = CGRect(x: 12,
-                                y: 35,
-                                width: max(row.bounds.width - 210, 1),
-                                height: 14)
-            row.addSublayer(name)
-            let pathWidth = max(row.bounds.width - 210, 1)
-            let hostPathFrame = CGRect(x: 12, y: 19, width: pathWidth, height: 14)
-            renderSelectableMountedFolderPath(
-                mount.hostPath,
-                identifier: "configuration-mount:\(mount.id):host",
-                font: NSFont.systemFont(ofSize: 9, weight: .regular),
-                color: .secondaryLabelColor,
-                localFrame: hostPathFrame,
-                contentFrame: hostPathFrame.offsetBy(dx: rowFrame.minX, dy: rowFrame.minY),
-                contentSpace: .workspacePanel,
-                in: row
-            )
-            let guestPathFrame = CGRect(x: 12, y: 4, width: pathWidth, height: 14)
-            renderSelectableMountedFolderPath(
-                mount.guestPath,
-                identifier: "configuration-mount:\(mount.id):guest",
-                font: NSFont.systemFont(ofSize: 9, weight: .regular),
-                color: .secondaryLabelColor,
-                localFrame: guestPathFrame,
-                contentFrame: guestPathFrame.offsetBy(dx: rowFrame.minX, dy: rowFrame.minY),
-                contentSpace: .workspacePanel,
-                in: row
-            )
+            let pathWidth = max((row.bounds.width - 230) / 2, 80)
+            let hostPathFrame = CGRect(x: 12, y: 8, width: pathWidth, height: 18)
+            let guestPathFrame = CGRect(x: 40 + pathWidth, y: 8, width: pathWidth, height: 18)
+            for (label, path, field, pathFrame) in [(serverSSHCommand == nil ? "On this computer" : "On server", mount.hostPath, "host", hostPathFrame), ("In container", mount.guestPath, "guest", guestPathFrame)] {
+                let caption = makeTextLayer(size: 10, weight: .medium, color: .secondaryLabelColor)
+                caption.string = label
+                caption.frame = CGRect(x: pathFrame.minX, y: 31, width: pathWidth, height: 14)
+                row.addSublayer(caption)
+                renderSelectableMountedFolderPath(path, identifier: "configuration-mount:\(mount.id):\(field)", font: NSFont.monospacedSystemFont(ofSize: 11, weight: .regular), color: .labelColor, localFrame: pathFrame, contentFrame: pathFrame.offsetBy(dx: rowFrame.minX, dy: rowFrame.minY), contentSpace: .workspacePanel, in: row)
+                if !mount.isInfrastructure {
+                    containerConfigurationMountActionFrames.append((rootLayer.convert(pathFrame, from: row), mount.id, field))
+                }
+            }
+            let arrow = makeTextLayer(size: 13, weight: .regular, color: .tertiaryLabelColor, alignment: .center)
+            arrow.string = "→"
+            arrow.frame = CGRect(x: pathWidth + 14, y: 8, width: 24, height: 18)
+            row.addSublayer(arrow)
 
             let rootRowFrame = row.frame.offsetBy(dx: workspacePanelFrame.minX,
                                                    dy: workspacePanelFrame.minY)
@@ -19335,15 +20101,15 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                    y: contentFrame.minY,
                                    width: 154,
                                    height: 34)
-        let add = makeButtonLayer(title: "Mount Folder…", emphasized: false)
+        let add = makeButtonLayer(title: "Add folder mount…", emphasized: false)
         add.frame = localAddFrame
         workspacePanelLayer.addSublayer(add)
         containerConfigurationAddMountFrame = localAddFrame.offsetBy(
             dx: workspacePanelFrame.minX,
             dy: workspacePanelFrame.minY
         )
-        workspaceRenameFieldFrame = .zero
-        workspaceRenameTextFrame = .zero
+        editorInputFieldFrame = .zero
+        editorInputTextFrame = .zero
     }
 
     private func renderWorkspaceDeletionPrompt(panelWidth: CGFloat,
@@ -19404,8 +20170,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                                      panelHeight: CGFloat) {
         guard isWorkspaceNamePromptVisible else {
             workspaceRenamePanelFrame = .zero
-            workspaceRenameFieldFrame = .zero
-            workspaceRenameTextFrame = .zero
+            editorInputFieldFrame = .zero
+            editorInputTextFrame = .zero
             workspaceRenameCancelFrame = .zero
             workspaceRenameConfirmFrame = .zero
             workspaceCreationBaseImageFrame = .zero
@@ -19496,7 +20262,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         } else if pendingRecipeCommandWorkspace != nil {
             title.string = "Add Dockerfile Fragment"
         } else {
-            title.string = isAddingWindowsContainerFolder ? "Mount Windows Folder" : isCreatingWorkspace ? "Add Container" : "Rename Container"
+            title.string = pendingEndpointRename != nil ? "Rename endpoint" : pendingMountPathEdit != nil ? (pendingMountPathEdit?.field == "host" ? (serverSSHCommand == nil ? "On this computer" : "On server") : "In container") : isAddingWindowsContainerFolder ? "Mount Windows Folder" : isCreatingWorkspace ? "Add Container" : "Rename Container"
         }
         title.frame = CGRect(x: 18, y: promptHeight - 44, width: promptWidth - 36, height: 23)
         prompt.addSublayer(title)
@@ -19514,6 +20280,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             detail.string = "Choose the folder JupyterLab opens in \(workspace.name)."
         } else if isAddingWindowsContainerFolder {
             detail.string = "Enter a folder path on the Windows server. Rebuild the container to apply the mount."
+        } else if pendingMountPathEdit != nil {
+            detail.string = "Enter an absolute folder path. Rebuild the container to apply changes."
+        } else if pendingEndpointRename != nil {
+            detail.string = "Choose the name displayed for this app."
         } else if let workspace = pendingWorkspaceRename {
             detail.string = "Choose a new name for \(workspace.name)."
         } else if let workspace = pendingDockerfileWorkspace {
@@ -19569,9 +20339,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 let destination = makeTextLayer(size: 9,
                                                 weight: .regular,
                                                 color: .secondaryLabelColor)
-                let root = workspaceRenameInputController.text.isEmpty
+                let root = editorInputController.text.isEmpty
                     ? workspaceRenameName
-                    : workspaceRenameInputController.text
+                    : editorInputController.text
                 let serverPath = NSString(string: root)
                     .appendingPathComponent(mount.directoryName)
                 destination.string = "→ \(serverPath)   ·   mounted at \(mount.guestPath)"
@@ -19611,9 +20381,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         let field = CALayer()
         field.frame = localFieldFrame
         field.cornerRadius = 6
-        field.borderWidth = workspaceRenameInputController.isFocused ? 1.5 : 1
+        field.borderWidth = editorInputController.isFocused ? 1.5 : 1
         field.borderColor = resolvedCGColor(
-            workspaceRenameInputController.isFocused ? .controlAccentColor : .separatorColor
+            editorInputController.isFocused ? .controlAccentColor : .separatorColor
         )
         field.backgroundColor = resolvedCGColor(.textBackgroundColor)
         field.masksToBounds = true
@@ -19795,29 +20565,29 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             )
         }
 
-        workspaceRenameFieldFrame = localFieldFrame.offsetBy(dx: promptRootOrigin.x,
+        editorInputFieldFrame = localFieldFrame.offsetBy(dx: promptRootOrigin.x,
                                                               dy: promptRootOrigin.y)
-        workspaceRenameTextFrame = CGRect(x: workspaceRenameFieldFrame.minX + 9,
-                                          y: workspaceRenameFieldFrame.minY + 7,
-                                          width: max(workspaceRenameFieldFrame.width - 18, 1),
-                                          height: max(workspaceRenameFieldFrame.height - 14, 18))
+        editorInputTextFrame = CGRect(x: editorInputFieldFrame.minX + 9,
+                                          y: editorInputFieldFrame.minY + 7,
+                                          width: max(editorInputFieldFrame.width - 18, 1),
+                                          height: max(editorInputFieldFrame.height - 14, 18))
 
         if isDockerfileFragmentPrompt {
-            workspaceRenameInputController.visualLineWidth = workspaceRenameTextFrame.width
+            editorInputController.visualLineWidth = editorInputTextFrame.width
         }
 
-        let text = workspaceRenameInputController.isFocused
-            ? workspaceRenameInputController.text
+        let text = editorInputController.isFocused
+            ? editorInputController.text
             : workspaceRenameName
         if isDockerfileFragmentPrompt {
-            let layout = CreateFieldLayout(fieldFrame: workspaceRenameFieldFrame,
-                                           textFrame: workspaceRenameTextFrame,
+            let layout = CreateFieldLayout(fieldFrame: editorInputFieldFrame,
+                                           textFrame: editorInputTextFrame,
                                            key: "dockerfileFragment",
                                            monospaced: true,
                                            multiline: true)
             let fragments = createTextAreaLineFragments(text: text, layout: layout)
-            if workspaceRenameInputController.isFocused,
-               let selection = workspaceRenameInputController.selectionRange {
+            if editorInputController.isFocused,
+               let selection = editorInputController.selectionRange {
                 for fragment in fragments {
                     let lower = max(selection.lowerBound, fragment.start)
                     let upper = min(selection.upperBound, fragment.end)
@@ -19828,12 +20598,12 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                         line: line,
                         text: fragment.text,
                         range: (lower - fragment.start)..<(upper - fragment.start),
-                        maxWidth: workspaceRenameTextFrame.width
+                        maxWidth: editorInputTextFrame.width
                     )
                     let selectionLayer = CALayer()
                     selectionLayer.frame = CGRect(
-                        x: workspaceRenameTextFrame.minX - workspaceRenameFieldFrame.minX + offsets.start,
-                        y: fragment.y - workspaceRenameFieldFrame.minY - 1,
+                        x: editorInputTextFrame.minX - editorInputFieldFrame.minX + offsets.start,
+                        y: fragment.y - editorInputFieldFrame.minY - 1,
                         width: max(offsets.end - offsets.start, 1),
                         height: 18
                     )
@@ -19850,27 +20620,27 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                          monospaced: true)
                 line.string = fragment.text
                 line.frame = CGRect(
-                    x: workspaceRenameTextFrame.minX - workspaceRenameFieldFrame.minX,
-                    y: fragment.y - workspaceRenameFieldFrame.minY,
-                    width: workspaceRenameTextFrame.width,
+                    x: editorInputTextFrame.minX - editorInputFieldFrame.minX,
+                    y: fragment.y - editorInputFieldFrame.minY,
+                    width: editorInputTextFrame.width,
                     height: 16
                 )
                 field.addSublayer(line)
             }
-        } else if workspaceRenameInputController.isFocused,
-                  let selection = workspaceRenameInputController.selectionRange,
+        } else if editorInputController.isFocused,
+                  let selection = editorInputController.selectionRange,
                   !text.isEmpty {
             let line = makeWorkspaceNameFieldLine(for: text)
             let offsets = selectionOffsets(line: line,
                                            text: text,
                                            range: selection,
-                                           maxWidth: workspaceRenameTextFrame.width)
+                                           maxWidth: editorInputTextFrame.width)
             let selectionLayer = CALayer()
             selectionLayer.frame = CGRect(
-                x: workspaceRenameTextFrame.minX - workspaceRenameFieldFrame.minX + offsets.start,
-                y: workspaceRenameTextFrame.minY - workspaceRenameFieldFrame.minY,
+                x: editorInputTextFrame.minX - editorInputFieldFrame.minX + offsets.start,
+                y: editorInputTextFrame.minY - editorInputFieldFrame.minY,
                 width: max(offsets.end - offsets.start, 1),
-                height: workspaceRenameTextFrame.height
+                height: editorInputTextFrame.height
             )
             selectionLayer.backgroundColor = resolvedCGColor(
                 NSColor.selectedTextBackgroundColor.withAlphaComponent(0.65)
@@ -19903,11 +20673,11 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             field.addSublayer(value)
         }
 
-        if let cursorFrame = workspaceRenameFieldCursorRect() {
+        if let cursorFrame = editorInputCaretRect() {
             addBlinkingTextCaret(
                 to: field,
-                frame: cursorFrame.offsetBy(dx: -workspaceRenameFieldFrame.minX,
-                                            dy: -workspaceRenameFieldFrame.minY)
+                frame: cursorFrame.offsetBy(dx: -editorInputFieldFrame.minX,
+                                            dy: -editorInputFieldFrame.minY)
             )
         }
 
@@ -19928,7 +20698,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                     ? (pendingDockerfileWorkspace != nil || pendingRecipeEditStep != nil
                         ? "Save"
                         : "Add")
-                    : (isCreatingWorkspace ? "Create" : "Rename"))))))),
+                    : (pendingMountPathEdit != nil ? "Save" : isCreatingWorkspace ? "Create" : "Rename"))))))),
             emphasized: true
         )
         let localConfirmFrame = CGRect(x: promptWidth - 96, y: 18, width: 78, height: 30)
@@ -19947,7 +20717,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         prompt.addSublayer(cancel)
         workspaceRenameCancelFrame = localCancelFrame.offsetBy(dx: promptRootOrigin.x,
                                                                 dy: promptRootOrigin.y)
-        sendWorkspaceRenameTextInputGeometryUpdate()
+        updateEditorTextInputGeometry()
     }
 
     private func statusAttributedString() -> NSAttributedString {
@@ -20241,6 +21011,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             "delete": "delete"
         ]
         var items: [OuterframeContextMenuItem] = []
+        if let image = workspace.recipe?.baseImage ?? workspace.runtime?.operatingSystemName, !image.isEmpty {
+            items.append(OuterframeContextMenuItem(id: "image", title: image, kind: .label, isEnabled: false))
+        }
         items.append(
             OuterframeContextMenuItem(id: "state",
                                       title: canChangeState
@@ -20277,7 +21050,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                         : "minus.circle")
         ])
         pendingWorkspaceOverviewMenuActions[menuID] = (workspace, operations, point)
-        outerframeHost.showContextMenu(menuID: menuID, items: items, at: point)
+        showManagementPanel(id: menuID, title: "Container: \(workspace.name)", detail: "\(workspace.runtimeDescription) · \(displayedState.capitalized)", items: items)
     }
 
     private func showRecipeStepRemovalMenu(
@@ -20405,27 +21178,18 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             operations[visibilityItemID] = isProminent ? "moveToMoreApps" : "alwaysShow"
             items.append(OuterframeContextMenuItem(
                 id: visibilityItemID,
-                title: isProminent ? "Unpin" : "Pin to Top",
+                title: isProminent ? "Unpin" : "Pin",
                 isEnabled: true,
-                systemImageName: isProminent ? "ellipsis" : "pin"
+                systemImageName: isProminent ? "pin.slash" : "pin"
             ))
 
+            for extra in overviewMenuItems(for: item) { items.append(extra); operations[extra.id] = extra.id }
             pendingAppMenuActions[menuID] = (item, operations)
             outerframeHost.showContextMenu(menuID: menuID, items: items, at: point)
             return
         }
         var operationByItemID: [String: String] = [:]
         var items: [OuterframeContextMenuItem] = []
-        let sectionLabelStyle = OuterframeContextMenuItemStyle(height: 23,
-                                                               topInset: 4,
-                                                               leftInset: 16,
-                                                               bottomInset: 4,
-                                                               rightInset: 8,
-                                                               fontSize: 11,
-                                                               fontWeight: Float32(NSFont.Weight.semibold.rawValue),
-                                                               textColorRGBA: 0,
-                                                               alignment: .left)
-
         func appendSeparatorIfNeeded() {
             guard !items.isEmpty, items.last?.kind != .separator else { return }
             items.append(OuterframeContextMenuItem(id: "separator-\(items.count)",
@@ -20442,11 +21206,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                    openNewWindowOperation: String) {
             guard let endpoint else { return }
             appendSeparatorIfNeeded()
-            items.append(OuterframeContextMenuItem(id: "\(idPrefix)-heading",
-                                                   title: title,
-                                                   kind: .label,
-                                                   isEnabled: false,
-                                                   style: sectionLabelStyle))
 
             let openItemID = "\(idPrefix)-open"
             operationByItemID[openItemID] = openOperation
@@ -20543,6 +21302,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                   openNewWindowOperation: "runRootNewWindow")
         }
 
+        if item.backend.serviceID == hostOpenCodeItem?.backend.serviceID, let version = availableOpenCodeVersion {
+            operationByItemID["update-opencode"] = "updateOpenCode"
+            items.append(OuterframeContextMenuItem(id: "update-opencode", title: "Update to " + version + "…", isEnabled: true, systemImageName: "arrow.down.circle"))
+        }
         appendScriptItems()
 
         appendSeparatorIfNeeded()
@@ -20551,11 +21314,12 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         operationByItemID[visibilityItemID] = isProminent ? "moveToMoreApps" : "alwaysShow"
         items.append(OuterframeContextMenuItem(
             id: visibilityItemID,
-            title: isProminent ? "Unpin" : "Pin to Top",
+            title: isProminent ? "Unpin" : "Pin",
             isEnabled: true,
-            systemImageName: isProminent ? "ellipsis" : "pin"
+            systemImageName: isProminent ? "pin.slash" : "pin"
         ))
 
+        for extra in overviewMenuItems(for: item) { items.append(extra); operationByItemID[extra.id] = extra.id }
         let management = backendManagementMenuItems(for: item.backend, includePlaceholderRunActions: false)
         let managementOperationByItemID = management.operationByItemID
         var managementItems = management.items
@@ -20596,6 +21360,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func handleContextMenuSelection(menuID: UUID, itemID: String) {
+        if pendingTextZoomMenus.remove(menuID) != nil, let percentage = Double(itemID) {
+            resizeDockerfileText(percentage / 100)
+            return
+        }
         if let selection = pendingContainerCommandMenuActions.removeValue(forKey: menuID),
            let command = selection.commandByItemID[itemID] {
             copyTextToPasteboard(command)
@@ -20664,7 +21432,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             case "delete":
                 showWorkspaceDeletionConfirmation(action.workspace)
             case "editContainer":
-                navigateToRecipeSafeSpace(action.workspace.id, pushHistory: true)
+                navigateToRecipeSafeSpace(action.workspace.id)
             case "share":
                 showShareContainerOptions(for: action.workspace, at: action.anchor)
             case let value where value.hasPrefix("unmountFolder:"):

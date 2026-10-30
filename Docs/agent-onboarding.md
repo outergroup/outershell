@@ -1,6 +1,6 @@
 # Coding agent onboarding
 
-The first card in the HTML “Add more…” flow is “Coding agent”, selected by
+The first card in the HTML and outerframe “Add more…” flow is “Coding agent”, selected by
 default. It offers two paths without adding any homepage UI.
 “Use your coding agent” shows an inline copyable prompt ending with “[Your request here]”, with the integration guide at
 https://outershell.org/api/ and the SSH command supplied by Outer Loop's session
@@ -12,16 +12,14 @@ connection instructions. OpenCode setup appears alongside this section, or below
 it on narrow screens.
 
 OpenCode also appears in the HTML app catalog for the host user on macOS and
-Linux, and Windows. Both entry points use the same setup flow and offer “Open OpenCode” when
-it is installed. New installations are pinned to the user’s home group as soon
+Linux, and Windows. The catalog uses the same icon size and installed state as the other apps. The coding-agent guide offers “Open OpenCode” when it is installed. New installations are pinned to the user’s home group as soon
 as they are registered, preserving existing pins and layout changes from other devices.
 
 “Set up OpenCode” uses the existing command-port service recipe. It downloads
 the latest compatible stable OpenCode release from anomalyco/opencode on GitHub, checks the
 release asset’s SHA-256 digest, and runs its web UI on loopback (default port 4096).
 macOS and Linux ARM64/x86-64 are supported, including musl Linux. Windows x64 and ARM64 use a checksummed standalone
-executable launched through the existing scheduled-task command recipe. Native Outerframe onboarding is not
-changed by this HTML iteration.
+executable launched through the existing scheduled-task command recipe. The native outerframe frontend uses the same installer templates and verified release assets.
 
 The installer and skill are served from Resources/OuterShellWeb. The binary is
 kept at ~/.local/share/outershell-opencode/<initial-version>/opencode on Unix and %LOCALAPPDATA%/outershell-opencode/<initial-version>/opencode.exe on Windows.
@@ -39,7 +37,7 @@ request-target limit. The backend forwards that form to the existing create
 route. The daemon decodes full form values without its old PATH_MAX-based
 encoded-value truncation. Both backend and daemon must be updated together.
 
-Verify with Scripts/test_web_agent_onboarding.cjs, Scripts/test_create_query.c,
+Verify with Scripts/test_outerframe_opencode.py, Scripts/test_web_agent_onboarding.cjs, Scripts/test_create_query.c,
 and a real install through the HTML UI. The C test is compiled like the existing
 Scripts/test_launchd_failure_status.c. Changing the supported OpenCode major version also
 requires updating every platform asset digest in opencode-start.sh and opencode-start.ps1. Windows commands embed UTF-8
@@ -110,3 +108,19 @@ concurrent requests. Browser storage also retains the selected release across
 reloads. Network failures are silent and retried after an hour. Stopped apps
 are never started by a check. A newer compatible release adds a tile badge and
 an “Update to VERSION…” app-menu action; onboarding has no update button.
+
+## Native frontend parity
+
+The outerframe frontend preserves its New App project generator alongside Coding agent,
+Outer Shell app catalog, and Run bash commands. Other recipes and its discovery endpoint
+have been removed. Container Edit opens the Dockerfile directly, with an explicit choice
+between sandboxed container access and privileged host access on the Coding agent tab.
+Hosted OpenCode links prefill the appropriate prompt without submitting it. The editor
+supports pinch-to-resize text, a zoom menu, wrapping tabs, and a stable rebuild warning.
+Remote folder selection uses the in-page breadcrumb picker.
+
+App launches show a spinner in the status-dot position while waiting for readiness. Stopping uses a counterclockwise spinner in the same position. Homepage cards share row heights, command-section baselines, and bottom action alignment. Manage and Manage containers open scrollable panels rather than native context menus. Starting a
+stopped container app starts its container if needed, starts the service, and waits for its
+published endpoint before opening it. Menus use Pin/Unpin and Move earlier/later, without
+User/Root submenus. OpenCode checks its running version periodically and only offers update
+commands when a newer compatible stable version is known.

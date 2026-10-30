@@ -484,7 +484,7 @@ static void send_outer_descriptor(int fd,
                                   const char *request,
                                   size_t header_length,
                                   bool send_body) {
-    const char *plugin_json = "{\"backendsAPIPath\":\"/api/backends\",\"logsAPIPath\":\"/api/logs\",\"controlAPIPath\":\"/api/control\",\"createAPIPath\":\"/api/create\",\"recipesAPIPath\":\"/api/recipes\",\"filePickerAPIPath\":\"/api/file-picker\"}";
+    const char *plugin_json = "{\"backendsAPIPath\":\"/api/backends\",\"logsAPIPath\":\"/api/logs\",\"controlAPIPath\":\"/api/control\",\"createAPIPath\":\"/api/create\",\"filePickerAPIPath\":\"/api/file-picker\"}";
     char bundle_path[PATH_MAX];
     bundle_url_path(bundle_path, sizeof(bundle_path));
     size_t path_len = strlen(bundle_path);
@@ -2394,7 +2394,6 @@ static uint16_t ui_route_for_http_request(const char *method, const char *target
         if (strcmp(target, "/api/layout") == 0) return OUTERSHELLD_UI_ROUTE_LAYOUT_READ;
         if (strcmp(target, "/api/backends") == 0) return OUTERSHELLD_UI_ROUTE_BACKENDS;
         if (strcmp(target, "/api/logs") == 0) return OUTERSHELLD_UI_ROUTE_LOGS;
-        if (strcmp(target, "/api/recipes") == 0) return OUTERSHELLD_UI_ROUTE_RECIPES;
         if (strcmp(target, "/api/file-picker") == 0) return OUTERSHELLD_UI_ROUTE_FILE_PICKER;
         if (strcmp(target, "/api/events") == 0) return OUTERSHELLD_UI_ROUTE_EVENTS;
     }

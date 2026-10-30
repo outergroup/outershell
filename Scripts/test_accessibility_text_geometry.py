@@ -18,6 +18,8 @@ for name in names:
     methods.append(match.group().replace("private func", "func", 1))
 structs = "\n".join(re.search(r"private struct " + name + r" \{.*?^}", source, re.M | re.S).group().replace("private struct", "struct", 1)
                     for name in ["CreateFieldLayout", "CreateTextLineFragment"])
+layout_class = source[source.index("private final class DockerfileTextLayout"):source.index("private final class DockerfileTextTileLayer")].replace("private final class", "final class")
+structs = layout_class + structs
 fixture = r''' 
 import AppKit
 import QuartzCore
@@ -28,15 +30,19 @@ final class Fixture {
     let createLayer = CALayer()
     var accessibilityTextTargets: [UInt32: String] = [1: "workspace"]
     var accessibilityCurrentNodes: [UInt32: OuterframeAccessibilityNode] = [:]
-    var workspaceRenameFieldFrame = CGRect(x: 10, y: 20, width: 100, height: 48)
-    var workspaceRenameTextFrame = CGRect(x: 10, y: 20, width: 100, height: 48)
+    var editorInputFieldFrame = CGRect(x: 10, y: 20, width: 100, height: 48)
+    var editorInputTextFrame = CGRect(x: 10, y: 20, width: 100, height: 48)
     var isDockerfileFragmentPrompt = true
+    var usesUnwrappedDockerfile = false
+    var editorLineHeight: CGFloat = 16
+    var editorTextScale: CGFloat = 1
+    func cachedDockerfileLayout(for text: String) -> DockerfileTextLayout { DockerfileTextLayout(text: text) }
     var createFieldLayouts: [String: CreateFieldLayout] = [:]
     METHODS
 }
 let f = Fixture()
 let text = "a😀e\u{301}z\nsecond line\n"
-f.accessibilityCurrentNodes[1] = OuterframeAccessibilityNode(identifier: 1, role: .textArea, frame: f.workspaceRenameFieldFrame, value: text)
+f.accessibilityCurrentNodes[1] = OuterframeAccessibilityNode(identifier: 1, role: .textArea, frame: f.editorInputFieldFrame, value: text)
 func query(_ kind: OuterframeAccessibilityTextQuery, _ range: NSRange = NSRange(location: 0, length: 0), _ point: CGPoint = .zero) -> OuterframeAccessibilityTextResult? {
     f.accessibilityTextResult(identifier: 1, query: kind, range: range, point: point)
 }
@@ -49,22 +55,22 @@ precondition(query(.rangeForLine, NSRange(location: 0, length: 0))?.range == NSR
 precondition(query(.lineForIndex, NSRange(location: 7, length: 0))?.index == 1)
 precondition(query(.frameForRange, NSRange(location: 6, length: 1)) != nil)
 precondition(query(.frameForRange, NSRange(location: text.utf16.count, length: 0)) != nil)
-f.workspaceRenameTextFrame = f.workspaceRenameTextFrame.offsetBy(dx: 0, dy: 16)
+f.editorInputTextFrame = f.editorInputTextFrame.offsetBy(dx: 0, dy: 16)
 precondition(query(.visibleRange)!.range.location >= 7)
-f.workspaceRenameTextFrame.size.width = 24
+f.editorInputTextFrame.size.width = 24
 precondition(query(.lineForIndex, NSRange(location: 7, length: 0))!.index > 1)
 precondition(query(.rangeForLine, NSRange(location: 999, length: 0)) == nil)
-f.accessibilityCurrentNodes[1] = OuterframeAccessibilityNode(identifier: 1, role: .textField, frame: f.workspaceRenameFieldFrame, value: "")
+f.accessibilityCurrentNodes[1] = OuterframeAccessibilityNode(identifier: 1, role: .textField, frame: f.editorInputFieldFrame, value: "")
 f.isDockerfileFragmentPrompt = false
 precondition(query(.frameForRange)?.frame.width == 1)
 precondition(query(.rangeForLine)?.range == NSRange(location: 0, length: 0))
 f.rootLayer.addSublayer(f.createLayer)
 f.createLayer.frame = CGRect(x: 30, y: 50, width: 300, height: 300)
-f.createFieldLayouts["draft"] = CreateFieldLayout(fieldFrame: f.workspaceRenameFieldFrame, textFrame: f.workspaceRenameTextFrame, key: "draft", monospaced: true, multiline: false)
+f.createFieldLayouts["draft"] = CreateFieldLayout(fieldFrame: f.editorInputFieldFrame, textFrame: f.editorInputTextFrame, key: "draft", monospaced: true, multiline: false)
 f.accessibilityTextTargets[1] = "draft"
 let translated = query(.frameForRange)!.frame
-precondition(translated.minX == f.workspaceRenameTextFrame.minX + 30)
-precondition(translated.minY == f.workspaceRenameTextFrame.minY + 50)
+precondition(translated.minX == f.editorInputTextFrame.minX + 30)
+precondition(translated.minY == f.editorInputTextFrame.minY + 50)
 print("PASS CoreText accessibility geometry: Unicode, caret, hit testing, visual lines, wrapping, scrolling")
 '''.replace("pointRange", "NSRange(location: 0, length: 0)").replace("STRUCTS", structs).replace("METHODS", "\n".join(methods))
 with tempfile.TemporaryDirectory(prefix="outershell-ax-geometry-") as directory:

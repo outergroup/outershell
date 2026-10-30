@@ -482,7 +482,7 @@ static bool serve_outerframe(ShellHost *s, Connection *c, const HttpRequest *r) 
         snprintf(arm_url, sizeof(arm_url), "%s/macos-arm", url);
         snprintf(x86_url, sizeof(x86_url), "%s/macos-x86", url);
         if (navigator) {
-            const char *json = "{\"hostPlatform\":\"windows\",\"backendsAPIPath\":\"/api/backends\",\"logsAPIPath\":\"/api/logs\",\"controlAPIPath\":\"/api/control\",\"createAPIPath\":\"/api/create\",\"recipesAPIPath\":\"/api/recipes\",\"filePickerAPIPath\":\"/api/file-picker\"}";
+            const char *json = "{\"hostPlatform\":\"windows\",\"backendsAPIPath\":\"/api/backends\",\"logsAPIPath\":\"/api/logs\",\"controlAPIPath\":\"/api/control\",\"createAPIPath\":\"/api/create\",\"filePickerAPIPath\":\"/api/file-picker\"}";
             StringBuilder descriptor = payload(40);
             memcpy(descriptor.data, "OUTR", 4);
             payload_u32(&descriptor, 4, 1);
@@ -585,10 +585,6 @@ static void serve_http(Connection *c, void *context) {
     } else if (!strcmp(r.path, "/api/create")) {
         if (strcmp(r.method, "POST")) status = 405;
         else body = command_create(s, &r);
-    } else if (!strcmp(r.path, "/api/recipes")) {
-        body = payload(16);
-        uint32_t empty = 0;
-        payload_data(&body, 8, &empty, 4);
     } else {
         LeaveCriticalSection(&s->gate);
         if (!strncmp(r.path, "/api/", 5))

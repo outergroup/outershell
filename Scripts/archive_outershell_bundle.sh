@@ -114,5 +114,16 @@ archive_platform_bundle() {
 }
 
 mkdir -p "$DESTINATION_DIR"
+SYMBOL_BUNDLE="${SOURCE_BUNDLE}.dSYM"
+if [[ -d "$SYMBOL_BUNDLE" ]]; then
+    while read -r symbol_uuid; do
+        symbol_directory="$DESTINATION_DIR/symbols/$symbol_uuid"
+        mkdir -p "$symbol_directory"
+        ditto "$SYMBOL_BUNDLE" "$symbol_directory/$(basename "$SYMBOL_BUNDLE")"
+    done < <(dwarfdump --uuid "$SYMBOL_BUNDLE" | awk '{print $2}')
+else
+    echo "error: missing debug symbols at $SYMBOL_BUNDLE" >&2
+    exit 1
+fi
 archive_platform_bundle "$SOURCE_BUNDLE" "$DESTINATION_DIR" "macos-arm" "arm64" "$DESTINATION_DIR/$ARCHIVE_STEM.macos-arm.aar" "$ARCHIVE_BUNDLE_NAME"
 archive_platform_bundle "$SOURCE_BUNDLE" "$DESTINATION_DIR" "macos-x86" "x86_64" "$DESTINATION_DIR/$ARCHIVE_STEM.macos-x86.aar" "$ARCHIVE_BUNDLE_NAME"

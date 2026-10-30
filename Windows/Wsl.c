@@ -1316,12 +1316,12 @@ static void serve_workspace_api(Wsl *w, Connection *c, HttpRequest *r) {
     const char *route = strchr(id, '/');
     if (!route || route - id != 36 ||
         (strcmp(route, "/backends") && strcmp(route, "/control") &&
-         strcmp(route, "/recipes") && strcmp(route, "/create") &&
+         strcmp(route, "/create") &&
          strcmp(route, "/file-picker") && strcmp(route, "/native-app-projects"))) {
         http_text(c, r, 404, "Unknown Linux API.");
         return;
     }
-    bool read = !strcmp(route, "/backends") || !strcmp(route, "/recipes") || !strcmp(route, "/file-picker");
+    bool read = !strcmp(route, "/backends") || !strcmp(route, "/file-picker");
     if (strcmp(r->method, read ? "GET" : "POST")) {
         http_text(c, r, 405, "Unsupported method.");
         return;
