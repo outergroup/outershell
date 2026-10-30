@@ -110,7 +110,7 @@ typedef struct {
     char *project_resource_key;
     uint64_t created_at_milliseconds;
     uint32_t cpus;
-    uint32_t memory_in_gb;
+    uint32_t memory_in_mb;
     uint32_t flags;
 } OuterShellRegistryContainer;
 

@@ -49,7 +49,7 @@ function Wait-Container([string]$Name, [string]$State) {
 $name = "$Provider integration test " + [guid]::NewGuid().ToString('N')
 $id = $null
 try {
-    Operation 'create' @{runtimeProviderID=$Provider; name=$name; baseImage=$Image; cpus=2; memoryInGB=2} | Out-Null
+    Operation 'create' @{runtimeProviderID=$Provider; name=$name; baseImage=$Image; cpus=2; memoryInMB=2048} | Out-Null
     $container = Wait-Container $name 'running'
     $id = $container.id
     if (!$container.ownsContainer -or $container.runtime.providerID -ne $Provider) { throw 'Incorrect ownership/runtime.' }

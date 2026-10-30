@@ -355,9 +355,14 @@ typedef struct {
     char *project_resource_key;
     uint64_t created_at_milliseconds;
     uint32_t cpus;
-    uint32_t memory_in_gb;
+    uint32_t memory_in_mb;
     bool owns_container;
 } RegistryContainerRecord;
+
+enum {
+    REGISTRY_CONTAINER_ROW_OWNED = 0x01u,
+    REGISTRY_CONTAINER_ROW_MEMORY_IN_MB = 0x02u
+};
 
 typedef struct {
     RegistryBackendRecord *backends;
@@ -889,6 +894,12 @@ static RegistryContainerRecord *registry_store_find_container(RegistryStore *sto
     return NULL;
 }
 
+static uint32_t registry_container_row_memory_in_mb(const unsigned char *row_bytes) {
+    uint32_t memory = read_uint32_le(row_bytes + 92);
+    if (read_uint32_le(row_bytes + 96) & REGISTRY_CONTAINER_ROW_MEMORY_IN_MB) return memory;
+    return memory > UINT32_MAX / 1024u ? UINT32_MAX : memory * 1024u;
+}
+
 static bool registry_store_upsert_container(RegistryStore *store,
                                             const char *identifier,
                                             const char *display_name,
@@ -897,7 +908,7 @@ static bool registry_store_upsert_container(RegistryStore *store,
                                             const char *project_resource_key,
                                             uint64_t created_at_milliseconds,
                                             uint32_t cpus,
-                                            uint32_t memory_in_gb,
+                                            uint32_t memory_in_mb,
                                             bool owns_container) {
     RegistryContainerRecord *record = registry_store_find_container(store, identifier);
     if (!record) {
@@ -914,7 +925,7 @@ static bool registry_store_upsert_container(RegistryStore *store,
     }
     record->created_at_milliseconds = created_at_milliseconds;
     record->cpus = cpus;
-    record->memory_in_gb = memory_in_gb;
+    record->memory_in_mb = memory_in_mb;
     record->owns_container = owns_container;
     return true;
 }
@@ -1732,8 +1743,8 @@ static bool registry_store_load_orwa_file(RegistryStore *store, const char *path
                                                      project_resource_key,
                                                      read_uint64_le(row_bytes + 80),
                                                      read_uint32_le(row_bytes + 88),
-                                                     read_uint32_le(row_bytes + 92),
-                                                     (read_uint32_le(row_bytes + 96) & 1u) != 0);
+                                                     registry_container_row_memory_in_mb(row_bytes),
+                                                     (read_uint32_le(row_bytes + 96) & REGISTRY_CONTAINER_ROW_OWNED) != 0);
                 if (!ok) snprintf(error, error_size, "Out of memory.");
             }
             free(identifier);
@@ -1847,8 +1858,9 @@ static bool registry_store_write_orwa_file(RegistryStore *store, const char *pat
              registry_binary_append_string_ref(&pool, &variable_region, &rows, record->project_resource_key) &&
              binary_append_u64(&rows, record->created_at_milliseconds) &&
              binary_append_u32(&rows, record->cpus) &&
-             binary_append_u32(&rows, record->memory_in_gb) &&
-             binary_append_u32(&rows, record->owns_container ? 1u : 0u) &&
+             binary_append_u32(&rows, record->memory_in_mb) &&
+             binary_append_u32(&rows, REGISTRY_CONTAINER_ROW_MEMORY_IN_MB |
+                                      (record->owns_container ? REGISTRY_CONTAINER_ROW_OWNED : 0u)) &&
              binary_append_u32(&rows, 0u);
     }
     if (ok && rows.length != variable_region_offset - ORWA_HEADER_SIZE) {

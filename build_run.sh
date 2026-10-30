@@ -7,6 +7,8 @@ BUILD_ROOT="${BUILD_ROOT:-${SCRIPT_DIR}/build/macos}"
 RUN_ROOT="${RUN_ROOT:-${SCRIPT_DIR}/build/run}"
 CONFIGURATION="${CONFIGURATION:-Release}"
 CLEAN_FRONTEND_BUILD="${CLEAN_FRONTEND_BUILD:-0}"
+OUTER_SHELL_CODESIGN_IDENTITY="${OUTER_SHELL_CODESIGN_IDENTITY:-${CODE_SIGN_IDENTITY:--}}"
+OUTER_SHELL_NOTARY_PROFILE="${OUTER_SHELL_NOTARY_PROFILE:-}"
 
 require_tool() {
     if ! command -v "$1" >/dev/null 2>&1; then
@@ -159,7 +161,8 @@ echo "==> Building Outer Shell agent"
     build
 
 echo "==> Archiving OuterShell bundles"
-"${SCRIPT_DIR}/Scripts/archive_outershell_bundle.sh" \
+OUTER_SHELL_CODESIGN_IDENTITY="${OUTER_SHELL_CODESIGN_IDENTITY}" OUTER_SHELL_NOTARY_PROFILE="${OUTER_SHELL_NOTARY_PROFILE}" \
+    "${SCRIPT_DIR}/Scripts/archive_outershell_bundle.sh" \
     "${BUILD_ROOT}/${CONFIGURATION}/Outer Shell.bundle" \
     "${RUN_ROOT}/bundles" \
     OuterShell.bundle
@@ -179,45 +182,39 @@ bootstrap_run_resource="${RUN_ROOT}/container-bootstrap"
 rm -rf "${bootstrap_resource}" "${bootstrap_run_resource}"
 "${SCRIPT_DIR}/Scripts/build_socket_bridge_helpers.sh"
 "${SCRIPT_DIR}/Scripts/build_app_helpers.sh"
-for libc in glibc musl; do
-    if [[ "${libc}" == glibc ]]; then
-        linux_root="${SCRIPT_DIR}/build/linux-package/RemoteLinuxBinaries"
-    else
-        linux_root="${SCRIPT_DIR}/build/linux-package/RemoteLinuxBinariesMusl"
-    fi
-    for architecture in aarch64 x86_64; do
-        for tool in outershelld outerctl outer-files-helper outer-plaintext-helper outer-top-helper outer-profile-helper outer-firehose-helper; do
-            if [[ ! -x "${linux_root}/${architecture}/${tool}" ]]; then
-                echo "Missing container bootstrap tool: ${linux_root}/${architecture}/${tool}" >&2
-                exit 1
-            fi
-        done
-        socket_bridge="${linux_root}/${architecture}/outer-socket-bridge"
-        if [[ ! -x "${socket_bridge}" ]]; then
-            echo "Missing Outer Shell container socket bridge: ${socket_bridge}" >&2
-            echo "Build the ${libc}/${architecture} Linux resources before building Outer Shell." >&2
+linux_root="${SCRIPT_DIR}/build/linux-package/RemoteLinuxBinariesMusl"
+for architecture in aarch64 x86_64; do
+    for tool in outershelld outerctl outer-files-helper outer-plaintext-helper outer-top-helper outer-profile-helper outer-firehose-helper; do
+        if [[ ! -x "${linux_root}/${architecture}/${tool}" ]]; then
+            echo "Missing container bootstrap tool: ${linux_root}/${architecture}/${tool}" >&2
             exit 1
         fi
-        destination="${bootstrap_resource}/bin/${libc}/${architecture}"
-        run_destination="${bootstrap_run_resource}/bin/${libc}/${architecture}"
-        mkdir -p "${destination}" "${run_destination}"
-        cp "${linux_root}/${architecture}/outershelld" "${linux_root}/${architecture}/outerctl" \
-            "${destination}/"
-        cp "${linux_root}/${architecture}/outershelld" "${linux_root}/${architecture}/outerctl" \
-            "${run_destination}/"
-        cp "${linux_root}/${architecture}/outer-files-helper" "${destination}/"
-        cp "${linux_root}/${architecture}/outer-plaintext-helper" "${destination}/"
-        cp "${linux_root}/${architecture}/outer-top-helper" "${destination}/"
-        cp "${linux_root}/${architecture}/outer-profile-helper" "${destination}/"
-        cp "${linux_root}/${architecture}/outer-firehose-helper" "${destination}/"
-        cp "${linux_root}/${architecture}/outer-files-helper" "${run_destination}/"
-        cp "${linux_root}/${architecture}/outer-plaintext-helper" "${run_destination}/"
-        cp "${linux_root}/${architecture}/outer-top-helper" "${run_destination}/"
-        cp "${linux_root}/${architecture}/outer-profile-helper" "${run_destination}/"
-        cp "${linux_root}/${architecture}/outer-firehose-helper" "${run_destination}/"
-        cp "${socket_bridge}" "${destination}/outer-socket-bridge"
-        cp "${socket_bridge}" "${run_destination}/outer-socket-bridge"
     done
+    socket_bridge="${linux_root}/${architecture}/outer-socket-bridge"
+    if [[ ! -x "${socket_bridge}" ]]; then
+        echo "Missing Outer Shell container socket bridge: ${socket_bridge}" >&2
+        echo "Build the ${architecture} Linux resources before building Outer Shell." >&2
+        exit 1
+    fi
+    destination="${bootstrap_resource}/bin/${architecture}"
+    run_destination="${bootstrap_run_resource}/bin/${architecture}"
+    mkdir -p "${destination}" "${run_destination}"
+    cp "${linux_root}/${architecture}/outershelld" "${linux_root}/${architecture}/outerctl" \
+        "${destination}/"
+    cp "${linux_root}/${architecture}/outershelld" "${linux_root}/${architecture}/outerctl" \
+        "${run_destination}/"
+    cp "${linux_root}/${architecture}/outer-files-helper" "${destination}/"
+    cp "${linux_root}/${architecture}/outer-plaintext-helper" "${destination}/"
+    cp "${linux_root}/${architecture}/outer-top-helper" "${destination}/"
+    cp "${linux_root}/${architecture}/outer-profile-helper" "${destination}/"
+    cp "${linux_root}/${architecture}/outer-firehose-helper" "${destination}/"
+    cp "${linux_root}/${architecture}/outer-files-helper" "${run_destination}/"
+    cp "${linux_root}/${architecture}/outer-plaintext-helper" "${run_destination}/"
+    cp "${linux_root}/${architecture}/outer-top-helper" "${run_destination}/"
+    cp "${linux_root}/${architecture}/outer-profile-helper" "${run_destination}/"
+    cp "${linux_root}/${architecture}/outer-firehose-helper" "${run_destination}/"
+    cp "${socket_bridge}" "${destination}/outer-socket-bridge"
+    cp "${socket_bridge}" "${run_destination}/outer-socket-bridge"
 done
 rm -rf "${BUILD_ROOT}/${CONFIGURATION}/Outer Shell.app/Contents/Resources/bundled-apps"
 agentdiy_payload="${AGENTDIY_PAYLOAD_DIR:-${SCRIPT_DIR}/../AgentDIY/build/payload}"

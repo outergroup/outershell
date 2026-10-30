@@ -476,7 +476,7 @@ static DWORD WINAPI container_rebuild_thread(void *context) {
     snprintf(image, sizeof(image), "outershell/managed-%s:latest", d->id);
     snprintf(name, sizeof(name), "outershell-%s-%llu", d->id, (unsigned long long)GetTickCount64());
     snprintf(cpus, sizeof(cpus), "%u", d->cpus ? d->cpus : 4);
-    snprintf(memory, sizeof(memory), "%uG", d->memory_gb ? d->memory_gb : 8);
+    snprintf(memory, sizeof(memory), "%uM", d->memory_mb ? d->memory_mb : 8192);
     const char *error = "The container configuration is invalid.";
     bool ok = directory && *dockerfile && container_configuration(config, &args);
     container_arguments_free(&args); args = (ContainerArguments){0};

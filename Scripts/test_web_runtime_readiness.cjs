@@ -32,9 +32,11 @@ console.log("PASS: missing/unsupported/stopped/ready runtime UI, setup guidance,
   const submit = { disabled: true };
   const message = { textContent: "" };
   const guidance = { innerHTML: "" };
+  const resourceNote = { hidden: true, textContent: "" };
+  const numberInput = () => ({ value: "", dataset: {}, removeAttribute(name) { delete this[name]; } });
   const form = {
-    elements: { includeOpenCode: { checked: false, addEventListener() {} }, runtimeProviderID: { value: "", innerHTML: "" }, baseImage: { value: "" }, name: { value: "My project" } },
-    querySelector(selector) { return ({ ".runtime-recheck": recheck, ".container-message": message, ".runtime-guidance": guidance, '[type="submit"]': submit })[selector]; },
+    elements: { includeOpenCode: { checked: false, addEventListener() {} }, runtimeProviderID: { value: "", innerHTML: "", addEventListener() {} }, baseImage: { value: "" }, name: { value: "My project" }, cpus: numberInput(), memoryInMB: numberInput() },
+    querySelector(selector) { return ({ ".runtime-recheck": recheck, ".container-message": message, ".runtime-guidance": guidance, '[type="submit"]': submit, "[data-resource-note]": resourceNote })[selector]; },
     addEventListener() {},
   };
   const dialog = { isConnected: true, querySelector: () => form };
@@ -43,7 +45,7 @@ console.log("PASS: missing/unsupported/stopped/ready runtime UI, setup guidance,
   context.state.providers = [];
   context.safeSpaceRequest = async operation => {
     assert.equal(operation, "checkRuntimes");
-    context.state.providers = [{ id: "docker", name: "Docker", isAvailable: true, status: "ready", detail: "Ready", defaultBaseImage: "debian:bookworm" }];
+    context.state.providers = [{ id: "docker", name: "Docker", isAvailable: true, status: "ready", detail: "Ready", defaultBaseImage: "debian:bookworm", resources: { maxCPUs: 2, maxMemoryInMB: 3919, defaultCPUs: 2, defaultMemoryInMB: 3919 } }];
   };
   vm.runInContext(source.slice(source.indexOf("  function openCreateContainer("), source.indexOf("  function configurationRow(")), context);
   context.openCreateContainer();
@@ -54,6 +56,9 @@ console.log("PASS: missing/unsupported/stopped/ready runtime UI, setup guidance,
   assert.equal(form.elements.baseImage.value, "debian:bookworm");
   assert.match(form.elements.runtimeProviderID.innerHTML, /docker/);
   assert.equal(message.textContent, "Runtime check complete.");
+  assert.equal(form.elements.cpus.value, "2");
+  assert.equal(form.elements.memoryInMB.value, "3919 MB");
+  assert.equal(resourceNote.hidden, false);
   context.safeSpaceRequest = async () => { throw new Error("Server disconnected"); };
   await recheck.handler({ currentTarget: recheck });
   assert.equal(recheck.disabled, false);

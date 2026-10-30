@@ -2034,7 +2034,7 @@
       ["Status", safeSpaceState(workspace)],
       ["Image", workspace.recipe?.baseImage],
       ["Runtime", safeSpaceRuntimeDescription(workspace)],
-      ["Resources", workspace.cpus && workspace.memoryInGB ? `${workspace.cpus} CPUs · ${workspace.memoryInGB} GB memory` : ""]
+      ["Resources", workspace.cpus && workspace.memoryInMB ? `${workspace.cpus} CPUs · ${formatMemoryMB(workspace.memoryInMB)} memory` : ""]
     ].filter(([, value]) => value);
     return `<dl class="container-management-details">${rows.map(([label, value]) => `<div><dt>${label}</dt><dd>${escapeHTML(value)}</dd></div>`).join("")}</dl>`;
   }
@@ -2090,6 +2090,60 @@
         ? ` <a href="${escapeHTML(provider.setupURL)}" target="_blank" rel="noopener noreferrer">Setup instructions</a>` : "";
       return `<p><strong>${escapeHTML(provider.name)}</strong>: ${escapeHTML(provider.detail || "Runtime status unavailable.")}${!provider.isAvailable ? setup : ""}</p>`;
     }).join("");
+  }
+
+  const minimumContainerMemoryInMB = 128;
+
+  function formatMemoryMB(memoryInMB) {
+    if (!Number.isInteger(memoryInMB) || memoryInMB < 1) return "";
+    const gigabytes = memoryInMB / 1024;
+    return memoryInMB >= 1024 && Number.isInteger(gigabytes * 100) ? `${Number(gigabytes.toFixed(2))} GB` : `${memoryInMB} MB`;
+  }
+
+  function parseMemoryMB(text) {
+    const match = /^\s*(\d+(?:\.\d+)?|\.\d+)\s*(gb|g|gib|mb|m|mib)?\s*$/i.exec(String(text ?? ""));
+    if (!match) return NaN;
+    const amount = Number(match[1]);
+    return Math.round(/^m/i.test(match[2] || "") ? amount : amount * 1024);
+  }
+
+  function containerResourceLimits(provider) {
+    const resources = provider?.resources;
+    const valid = value => Number.isInteger(value) && value >= 1;
+    if (!resources || !valid(resources.maxCPUs) || !valid(resources.maxMemoryInMB)) return null;
+    return {
+      maxCPUs: resources.maxCPUs,
+      maxMemoryInMB: resources.maxMemoryInMB,
+      defaultCPUs: Math.min(valid(resources.defaultCPUs) ? resources.defaultCPUs : 4, resources.maxCPUs),
+      defaultMemoryInMB: Math.min(valid(resources.defaultMemoryInMB) ? resources.defaultMemoryInMB : 8192, resources.maxMemoryInMB)
+    };
+  }
+
+  function applyContainerResourceLimits(form, provider, current = null) {
+    const limits = containerResourceLimits(provider);
+    const note = form.querySelector("[data-resource-note]");
+    const cpus = form.elements.cpus, memory = form.elements.memoryInMB;
+    if (limits) cpus.max = String(limits.maxCPUs); else cpus.removeAttribute("max");
+    const editedCPUs = Number(cpus.value);
+    cpus.value = String(cpus.dataset.edited && Number.isInteger(editedCPUs) && editedCPUs >= 1
+      ? Math.min(editedCPUs, limits?.maxCPUs || editedCPUs) : current?.cpus ?? limits?.defaultCPUs ?? 4);
+    const editedMemory = parseMemoryMB(memory.value);
+    memory.value = formatMemoryMB(memory.dataset.edited && editedMemory >= minimumContainerMemoryInMB
+      ? Math.min(editedMemory, limits?.maxMemoryInMB || editedMemory) : current?.memoryInMB ?? limits?.defaultMemoryInMB ?? 8192);
+    for (const input of [cpus, memory]) input.oninput = () => { input.dataset.edited = "true"; };
+    note.hidden = !limits;
+    note.textContent = limits ? `${provider.name} on this server can use up to ${limits.maxCPUs} CPU${limits.maxCPUs === 1 ? "" : "s"} and ${formatMemoryMB(limits.maxMemoryInMB)} of memory.` : "";
+  }
+
+  function containerResourceValues(form) {
+    return { cpus: Number(form.elements.cpus.value), memoryInMB: parseMemoryMB(form.elements.memoryInMB.value) };
+  }
+
+  function validateContainerResources(resources, provider) {
+    const limits = containerResourceLimits(provider);
+    const maxCPUs = limits?.maxCPUs ?? 1024, maxMemoryInMB = limits?.maxMemoryInMB ?? 1073741824;
+    if (!Number.isInteger(resources.cpus) || resources.cpus < 1 || resources.cpus > maxCPUs) throw new Error(`Choose between 1 and ${maxCPUs} CPUs.`);
+    if (!Number.isInteger(resources.memoryInMB) || resources.memoryInMB < minimumContainerMemoryInMB || resources.memoryInMB > maxMemoryInMB) throw new Error(`Choose between ${formatMemoryMB(minimumContainerMemoryInMB)} and ${formatMemoryMB(maxMemoryInMB)} of memory, such as 512 MB or 1.5 GB.`);
   }
 
   function runtimeOptions(selected = "") {
@@ -2232,8 +2286,9 @@
         <label class="field full">Name<input name="name" required autocomplete="off" value="${includeOpenCode ? "OpenCode workspace" : ""}"></label>
         <label class="field full">Runtime<select name="runtimeProviderID">${runtimeOptions(provider?.id)}</select></label>
         <label class="field full">Base image<input name="baseImage" value="${escapeHTML(provider?.defaultBaseImage || "")}" required spellcheck="false"></label>
-        <label class="field">Max CPUs<input name="cpus" type="number" min="1" step="1" value="4" required></label>
-        <label class="field">Max Memory (GB)<input name="memoryInGB" type="number" min="1" step="1" value="8" required></label>
+        <label class="field">Max CPUs<input name="cpus" type="number" min="1" step="1" required></label>
+        <label class="field">Max Memory<input name="memoryInMB" type="text" inputmode="decimal" autocomplete="off" spellcheck="false" required></label>
+        <p class="field-note full" data-resource-note hidden></p>
         <label class="container-check full"><input name="includeOpenCode" type="checkbox" ${includeOpenCode ? "checked" : ""}>Install OpenCode</label>
         <div class="full" data-opencode-permissions ${includeOpenCode ? "" : "hidden"}><label class="container-check"><input name="allowAllOpenCodeActions" type="checkbox">Allow all actions without asking</label><p class="field-note">Applies to OpenCode in this container, including folders mounted into it.</p></div>
         <p class="field-note full">OpenCode opens a workspace with instructions for adding apps to this container. Its workspace and model-provider settings persist across rebuilds. Requires a Debian or Ubuntu image with Outer Shell support.</p>
@@ -2243,6 +2298,10 @@
         <p class="container-message full" role="status">${provider ? "" : "No container runtime is ready on this server."}</p>
       </div><footer class="dialog-footer"><button type="button" data-action="close-dialog">Cancel</button><button class="primary-button" type="submit" ${provider ? "" : "disabled"}>Create</button></footer></form>`);
     const form = dialog.querySelector("form");
+    applyContainerResourceLimits(form, provider);
+    form.elements.runtimeProviderID.addEventListener("change", () => {
+      applyContainerResourceLimits(form, state.providers.find(value => value.id === form.elements.runtimeProviderID.value));
+    });
     form.elements.includeOpenCode.addEventListener("change", () => {
       form.querySelector("[data-opencode-permissions]").hidden = !form.elements.includeOpenCode.checked;
     });
@@ -2258,6 +2317,7 @@
         const selected = state.providers.find(value => value.id === select.value && runtimeCanCreate(value)) || state.providers.find(runtimeCanCreate);
         select.innerHTML = runtimeOptions(selected?.id);
         if (!form.elements.baseImage.value && selected) form.elements.baseImage.value = selected.defaultBaseImage || "";
+        applyContainerResourceLimits(form, selected);
         form.querySelector(".runtime-guidance").innerHTML = runtimeGuidance();
         form.querySelector('[type="submit"]').disabled = !selected;
         message.textContent = selected ? "Runtime check complete." : "No container runtime is ready on this server.";
@@ -2274,8 +2334,10 @@
       try {
         const baseImage = String(data.get("baseImage")).trim();
         if (!/^[a-zA-Z0-9][a-zA-Z0-9._/:@-]*$/.test(baseImage)) throw new Error("Enter a valid base image reference.");
+        const resources = containerResourceValues(form);
+        validateContainerResources(resources, state.providers.find(value => value.id === data.get("runtimeProviderID")));
         const dockerfile = data.get("includeOpenCode") ? `# syntax=docker/dockerfile:1\nFROM ${baseImage}\n${await openCodeContainerFragment(data.get("allowAllOpenCodeActions") === "on")}` : undefined;
-        await containerOperation("create", { name: String(data.get("name")).trim(), runtimeProviderID: data.get("runtimeProviderID"), baseImage, dockerfile, cpus: Number(data.get("cpus")), memoryInGB: Number(data.get("memoryInGB")) });
+        await containerOperation("create", { name: String(data.get("name")).trim(), runtimeProviderID: data.get("runtimeProviderID"), baseImage, dockerfile, ...resources });
         if (dialog.isConnected) closeDialog();
         toast("Container creation requested. Its status appears under All endpoints.");
       } catch (error) { message.textContent = error.message; button.disabled = false; }
@@ -2587,6 +2649,7 @@
     const codingAgent = codingAgentHTML(null, true);
     const infrastructure = (workspace.mounts || []).filter(mount => mount.isInfrastructure);
     const tabs = [["dockerfile", "Dockerfile"], ["agent", "Coding agent"], ["mounts", "Folder mounts"], ["environment", "Environment"], ["ports", "Network"], ["runtime", "Runtime"]];
+    const resourceProvider = state.providers.find(provider => provider.id === workspace.runtime?.providerID);
     const dialog = openDialog(`${containerDialogHeader(`Container: ${workspace.name}`)}
       <form class="container-form" novalidate><div class="dialog-body">
         <label class="field">Name<input name="name" value="${escapeHTML(workspace.name)}" required></label>
@@ -2597,7 +2660,7 @@
         <section role="tabpanel" id="config-panel-mounts" aria-labelledby="config-tab-mounts" data-config-panel="mounts" hidden><div class="mounts-heading"><div><h3>Folder mounts</h3><p>${agentConnection().local ? "Share a folder with this container." : "Make an existing server folder available inside this container."}</p></div><button class="secondary-button" type="button" data-add-row="mounts"><span aria-hidden="true">＋</span> Add folder mount</button></div><div class="mount-list" data-rows="mounts">${(workspace.mounts || []).filter(mount => !mount.isInfrastructure).map(mount => configurationRow("mounts", mount)).join("")}</div><p class="mount-empty">No folder mounts yet. Add a folder to share files with this container.</p>${infrastructure.length ? `<details class="managed-mounts"><summary>Managed by Outer Shell <span>(${infrastructure.length})</span></summary><p>These folders support the container and are managed automatically.</p><div class="managed-mount-list">${infrastructure.map(mount => `<div><code>${escapeHTML(mount.hostPath)}</code><span aria-hidden="true">→</span><code>${escapeHTML(mount.guestPath)}</code></div>`).join("")}</div></details>` : ""}</section>
         <section role="tabpanel" id="config-panel-environment" aria-labelledby="config-tab-environment" data-config-panel="environment" hidden><div data-rows="environment">${(recipe.environment || []).map(value => configurationRow("environment", value)).join("")}</div><button type="button" data-add-row="environment">Add variable</button></section>
         <section role="tabpanel" id="config-panel-ports" aria-labelledby="config-tab-ports" data-config-panel="ports" hidden>${recipe.supportsRuntimeSettings ? `<label class="field">Network mode<select name="networkMode"><option value="bridge" ${recipe.networkMode !== "host" ? "selected" : ""}>Isolated network</option><option value="host" ${recipe.networkMode === "host" ? "selected" : ""}>Host network</option></select></label><p class="field-note">Host networking shares the server’s network for LAN device discovery. Apps listen directly on server ports and may be reachable from other devices. Port mappings are not used.</p>` : ""}<p class="field-note">Publish a container TCP port on this server when using an isolated network.</p><div data-rows="ports">${(recipe.publishedPorts || []).map(value => configurationRow("ports", value)).join("")}</div><button type="button" data-add-row="ports">Add port</button></section>
-        <section role="tabpanel" id="config-panel-runtime" aria-labelledby="config-tab-runtime" data-config-panel="runtime" hidden><p>${escapeHTML(safeSpaceRuntimeDescription(workspace))} · ${escapeHTML(workspace.cpus)} CPUs · ${escapeHTML(workspace.memoryInGB)} GB</p><label class="field">Runtime<select name="runtimeProviderID">${runtimeOptions(workspace.runtime?.providerID)}</select></label>${recipe.supportsRuntimeSettings ? `<label class="container-check"><input name="useInit" type="checkbox" ${recipe.useInit !== false ? "checked" : ""}>Use Docker’s init process</label><p class="field-note">Turn this off for images that provide their own init process, such as Home Assistant and Homebridge.</p><label class="container-check"><input name="restartUnlessStopped" type="checkbox" ${recipe.restartPolicy === "unless-stopped" ? "checked" : ""}>Restart automatically unless manually stopped</label>` : ""}<p class="field-note">Changing runtime saves the configuration and rebuilds the container with the selected provider.</p><button type="submit" value="runtime">Save &amp; change runtime</button></section>
+        <section role="tabpanel" id="config-panel-runtime" aria-labelledby="config-tab-runtime" data-config-panel="runtime" hidden><p>${escapeHTML(safeSpaceRuntimeDescription(workspace))} · ${escapeHTML(workspace.cpus)} CPUs · ${escapeHTML(formatMemoryMB(workspace.memoryInMB))}</p>${resourceProvider?.capabilities?.supportsResourceUpdates ? `<div class="form-grid"><label class="field">Max CPUs<input name="cpus" type="number" min="1" step="1" required></label><label class="field">Max Memory<input name="memoryInMB" type="text" inputmode="decimal" autocomplete="off" spellcheck="false" required></label><p class="field-note full" data-resource-note hidden></p><p class="field-note full">${resourceProvider.id === "docker" ? "Saving applies new limits to the running container." : "New limits take effect when the container is rebuilt."}</p></div>` : ""}<label class="field">Runtime<select name="runtimeProviderID">${runtimeOptions(workspace.runtime?.providerID)}</select></label>${recipe.supportsRuntimeSettings ? `<label class="container-check"><input name="useInit" type="checkbox" ${recipe.useInit !== false ? "checked" : ""}>Use Docker’s init process</label><p class="field-note">Turn this off for images that provide their own init process, such as Home Assistant and Homebridge.</p><label class="container-check"><input name="restartUnlessStopped" type="checkbox" ${recipe.restartPolicy === "unless-stopped" ? "checked" : ""}>Restart automatically unless manually stopped</label>` : ""}<p class="field-note">Changing runtime saves the configuration and rebuilds the container with the selected provider.</p><button type="submit" value="runtime">Save &amp; change runtime</button></section>
         <p class="container-message" role="status">${escapeHTML(recipe.needsRebuild ? "Saved changes need a rebuild." : "")}</p>
         </div>
       </div><footer class="dialog-footer"><p class="field-note container-rebuild-note">Rebuilding restarts the container. Changes outside its Dockerfile, persistent data, and mounted folders are not retained.</p><button type="button" data-action="close-dialog">Close</button><button type="submit" value="save">Save</button><button class="primary-button" type="submit" value="rebuild">Save &amp; rebuild</button></footer></form>`, "wide container-editor");
@@ -2636,6 +2699,8 @@
     });
     let savedDockerfile = recipe.containerfile;
     let savedName = workspace.name;
+    let savedResources = { cpus: workspace.cpus, memoryInMB: workspace.memoryInMB };
+    if (form.elements.cpus) applyContainerResourceLimits(form, resourceProvider, savedResources);
     let currentProvider = workspace.runtime?.providerID;
     form.addEventListener("submit", async event => {
       event.preventDefault();
@@ -2648,7 +2713,12 @@
         values.restartPolicy = form.elements.restartUnlessStopped.checked ? "unless-stopped" : "no";
       }
       const name = form.elements.name.value.trim();
-      try { if (!name) throw new Error("Enter a container name."); validateConfiguration(values); }
+      const resources = form.elements.cpus ? containerResourceValues(form) : null;
+      try {
+        if (!name) throw new Error("Enter a container name.");
+        validateConfiguration(values);
+        if (resources) validateContainerResources(resources, resourceProvider);
+      }
       catch (error) { message.textContent = error.message; return; }
       const provider = form.elements.runtimeProviderID.value;
       const controls = [...form.querySelectorAll("input, select, textarea, button")];
@@ -2664,6 +2734,11 @@
         }
         await containerOperation("updateContainerConfiguration", values);
         saved = true;
+        let resourceResult = null;
+        if (resources && (resources.cpus !== savedResources.cpus || resources.memoryInMB !== savedResources.memoryInMB)) {
+          resourceResult = await containerOperation("updateResources", { workspaceID: id, ...resources });
+          savedResources = resources;
+        }
         if (name !== savedName) { await containerOperation("rename", { workspaceID: id, name }); savedName = name; }
         if (action === "runtime" && provider !== currentProvider) {
           message.textContent = "Changing runtime…";
@@ -2673,7 +2748,9 @@
           message.textContent = "Rebuilding…";
           await containerOperation("rebuildRecipe", { workspaceID: id });
         }
-        if (action === "save") message.textContent = "Saved. Rebuild to apply configuration changes.";
+        if (action === "save") message.textContent = resourceResult?.resourcesApplied ? "Saved. New CPU and memory limits are in effect; rebuild to apply other configuration changes."
+          : resourceResult?.resourcesDetail ? `Saved, but the running container could not take the new limits (${resourceResult.resourcesDetail}). Rebuild to apply them.`
+          : "Saved. Rebuild to apply configuration changes.";
         else {
           if (dialog.isConnected) closeDialog();
           await refreshSafeSpaces({ quiet: true });

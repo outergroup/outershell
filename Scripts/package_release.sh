@@ -55,17 +55,15 @@ require_file "${REPO_ROOT}/Resources/OuterShellWeb/index.html"
 require_file "${REPO_ROOT}/Resources/OuterShellWeb/style.css"
 require_file "${REPO_ROOT}/Resources/OuterShellWeb/app.js"
 require_file "${REPO_ROOT}/Resources/outershell-container-provider"
-for libc in glibc musl; do
-    for arch in aarch64 x86_64; do
-        require_file "${RUN_ROOT}/container-bootstrap/bin/${libc}/${arch}/outershelld"
-        require_file "${RUN_ROOT}/container-bootstrap/bin/${libc}/${arch}/outerctl"
-        require_file "${RUN_ROOT}/container-bootstrap/bin/${libc}/${arch}/outer-socket-bridge"
-        require_file "${RUN_ROOT}/container-bootstrap/bin/${libc}/${arch}/outer-files-helper"
-        require_file "${RUN_ROOT}/container-bootstrap/bin/${libc}/${arch}/outer-plaintext-helper"
-        require_file "${RUN_ROOT}/container-bootstrap/bin/${libc}/${arch}/outer-top-helper"
-        require_file "${RUN_ROOT}/container-bootstrap/bin/${libc}/${arch}/outer-profile-helper"
-        require_file "${RUN_ROOT}/container-bootstrap/bin/${libc}/${arch}/outer-firehose-helper"
-    done
+for arch in aarch64 x86_64; do
+    require_file "${RUN_ROOT}/container-bootstrap/bin/${arch}/outershelld"
+    require_file "${RUN_ROOT}/container-bootstrap/bin/${arch}/outerctl"
+    require_file "${RUN_ROOT}/container-bootstrap/bin/${arch}/outer-socket-bridge"
+    require_file "${RUN_ROOT}/container-bootstrap/bin/${arch}/outer-files-helper"
+    require_file "${RUN_ROOT}/container-bootstrap/bin/${arch}/outer-plaintext-helper"
+    require_file "${RUN_ROOT}/container-bootstrap/bin/${arch}/outer-top-helper"
+    require_file "${RUN_ROOT}/container-bootstrap/bin/${arch}/outer-profile-helper"
+    require_file "${RUN_ROOT}/container-bootstrap/bin/${arch}/outer-firehose-helper"
 done
 for arch in aarch64 x86_64; do
     if wants_variant "linux-${arch}"; then

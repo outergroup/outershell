@@ -22,7 +22,10 @@ cd /Users/mrcslws/dev/outergroup-deploy
 ```
 
 `deploy-all.sh` deploys configured bundled app archives first, then deploys
-Outer Shell with a catalog that points at those app archives.
+Outer Shell with a catalog that points at those app archives, then builds,
+signs, and deploys the Windows installers with `deploy-windows.sh`. The
+Windows build and signing environment is documented in that workspace's
+README.
 
 ## Direct Server Deploys
 

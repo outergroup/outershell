@@ -2522,7 +2522,7 @@ int OuterShellRegistryCopyContainers(OuterShellRegistryContainer **records,
         copy[index].project_resource_key = registry_strdup(source->project_resource_key);
         copy[index].created_at_milliseconds = source->created_at_milliseconds;
         copy[index].cpus = source->cpus;
-        copy[index].memory_in_gb = source->memory_in_gb;
+        copy[index].memory_in_mb = source->memory_in_mb;
         copy[index].flags = source->owns_container ? OUTERSHELL_REGISTRY_CONTAINER_FLAG_OWNED : 0u;
         ok = copy[index].identifier && copy[index].display_name && copy[index].provider_id &&
              copy[index].runtime_name && copy[index].project_resource_key;
@@ -2559,7 +2559,7 @@ int OuterShellRegistryUpsertContainer(const OuterShellRegistryContainer *record,
                                               record->project_resource_key ? record->project_resource_key : "",
                                               record->created_at_milliseconds,
                                               record->cpus,
-                                              record->memory_in_gb,
+                                              record->memory_in_mb,
                                               (record->flags & OUTERSHELL_REGISTRY_CONTAINER_FLAG_OWNED) != 0);
     if (!ok && error && error_size) snprintf(error, error_size, "Out of memory.");
     return registry_store_close(&store, ok, error, error_size) ? 1 : 0;
@@ -7653,7 +7653,7 @@ static bool outerctl_print_registry_list(const RegistryStore *database,
     if (strcmp(resource, "container") == 0) {
         const char *headers[] = {
             "container_id", "display_name", "provider", "runtime_name", "project_key",
-            "created_at_milliseconds", "cpus", "memory_gb", "owns_container"
+            "created_at_milliseconds", "cpus", "memory_mb", "owns_container"
         };
         ok = outerctl_print_headers(out, headers, sizeof(headers) / sizeof(headers[0]));
         for (size_t i = 0; ok && i < database->container_count; i++) {
@@ -7665,7 +7665,7 @@ static bool outerctl_print_registry_list(const RegistryStore *database,
             snprintf(created_buffer, sizeof(created_buffer), "%llu",
                      (unsigned long long)record->created_at_milliseconds);
             snprintf(cpus_buffer, sizeof(cpus_buffer), "%u", record->cpus);
-            snprintf(memory_buffer, sizeof(memory_buffer), "%u", record->memory_in_gb);
+            snprintf(memory_buffer, sizeof(memory_buffer), "%u", record->memory_in_mb);
             const char *fields[] = {
                 record->identifier,
                 record->display_name,
@@ -7962,7 +7962,7 @@ static int outershelld_handle_outerctl(int argc, char **argv, StringBuilder *std
     const char *project_resource_key = NULL;
     uint64_t created_at_milliseconds = 0;
     uint32_t container_cpus = 2;
-    uint32_t container_memory_in_gb = 2;
+    uint32_t container_memory_in_mb = 2048;
     int port = 0;
     int rank = 0;
     uint32_t opener_capabilities = OUTERSHELLD_API_OPENER_CAPABILITY_DEFAULT;
@@ -8038,16 +8038,16 @@ static int outershelld_handle_outerctl(int argc, char **argv, StringBuilder *std
                 return 1;
             }
             container_cpus = (uint32_t)value;
-        } else if (strcmp(arg, "--memory-gb") == 0) {
+        } else if (strcmp(arg, "--memory-mb") == 0) {
             const char *raw = NULL;
-            REQUIRE_VALUE("--memory-gb", raw);
+            REQUIRE_VALUE("--memory-mb", raw);
             char *end = NULL;
             unsigned long value = strtoul(raw, &end, 10);
             if (!end || *end != '\0' || value == 0 || value > UINT32_MAX) {
-                sb_append(stderr_buffer, "Invalid --memory-gb value.\n");
+                sb_append(stderr_buffer, "Invalid --memory-mb value.\n");
                 return 1;
             }
-            container_memory_in_gb = (uint32_t)value;
+            container_memory_in_mb = (uint32_t)value;
         } else if (strcmp(arg, "--created-at-milliseconds") == 0) {
             const char *raw = NULL;
             REQUIRE_VALUE("--created-at-milliseconds", raw);
@@ -8141,7 +8141,7 @@ static int outershelld_handle_outerctl(int argc, char **argv, StringBuilder *std
                 .project_resource_key = (char *)(project_resource_key ? project_resource_key : ""),
                 .created_at_milliseconds = created_at_milliseconds,
                 .cpus = container_cpus,
-                .memory_in_gb = container_memory_in_gb,
+                .memory_in_mb = container_memory_in_mb,
                 .flags = owns_plist ? OUTERSHELL_REGISTRY_CONTAINER_FLAG_OWNED : 0u
             };
             if (!OuterShellRegistryUpsertContainer(&record, container_error, sizeof(container_error))) {
@@ -13197,7 +13197,7 @@ static bool process_api_command_request(ReactorClient *client, const unsigned ch
     char rank_buffer[32];
     char capabilities_buffer[16];
     char cpus_buffer[32];
-    char memory_in_gb_buffer[32];
+    char memory_in_mb_buffer[32];
     char created_at_milliseconds_buffer[32];
     uint16_t flags = 0;
     uint16_t endpoint_kind = OUTERSHELLD_API_FRONTEND_ENDPOINT_NONE;
@@ -13406,7 +13406,7 @@ static bool process_api_command_request(ReactorClient *client, const unsigned ch
         flags = ok ? read_uint16_le(message + 2) : 0;
         if (ok) {
             snprintf(cpus_buffer, sizeof(cpus_buffer), "%u", read_uint32_le(message + 4));
-            snprintf(memory_in_gb_buffer, sizeof(memory_in_gb_buffer), "%u", read_uint32_le(message + 8));
+            snprintf(memory_in_mb_buffer, sizeof(memory_in_mb_buffer), "%u", read_uint32_le(message + 8));
             snprintf(created_at_milliseconds_buffer,
                      sizeof(created_at_milliseconds_buffer),
                      "%llu",
@@ -13419,7 +13419,7 @@ static bool process_api_command_request(ReactorClient *client, const unsigned ch
              api_command_append_option(argv, &argc, 64, "--runtime-name", runtime_name) &&
              api_command_append_option(argv, &argc, 64, "--project-key", project_resource_key) &&
              api_command_append_option(argv, &argc, 64, "--cpus", cpus_buffer) &&
-             api_command_append_option(argv, &argc, 64, "--memory-gb", memory_in_gb_buffer) &&
+             api_command_append_option(argv, &argc, 64, "--memory-mb", memory_in_mb_buffer) &&
              api_command_append_option(argv, &argc, 64,
                                        "--created-at-milliseconds",
                                        created_at_milliseconds_buffer);

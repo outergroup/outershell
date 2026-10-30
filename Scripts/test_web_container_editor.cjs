@@ -8,16 +8,16 @@ function setup() {
   const response = new Promise((yes, no) => { resolve = yes; reject = no; });
   const dialogs = [], requests = [];
   const node = () => ({textContent: '', addEventListener() {}, append(child) { this.child = child; }});
-  const form = {addEventListener() {}, querySelector: node};
+  const form = {elements: {}, addEventListener() {}, querySelector: node};
   const context = {
     findSafeSpace: () => ({id: 'selected', name: 'Selected', ownsContainer: true}),
     managedContainer: value => value.ownsContainer !== false,
     containerDialogHeader: title => title,
-    escapeHTML: String, state: {},
+    escapeHTML: String, state: { providers: [] },
     configureDockerfileZoom: () => {},
     agentConnection: () => ({local: true}),
     codingAgentHTML: (scope, editing) => editing ? '<button type="button" data-add-opencode>Add OpenCode</button>' : "",
-    safeSpaceRuntimeDescription: () => 'Apple container', runtimeOptions: () => '',
+    safeSpaceRuntimeDescription: () => 'Apple container', runtimeOptions: () => '', formatMemoryMB: value => `${value} MB`,
     document: {createElement: node},
     safeSpaceRequest: (operation, values) => { requests.push({operation, values}); return response; },
     openDialog: markup => {

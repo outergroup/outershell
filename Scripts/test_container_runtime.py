@@ -23,7 +23,7 @@ class RuntimeTests(unittest.TestCase):
         recipe = {'networkMode': 'host', 'useInit': False, 'restartPolicy': 'unless-stopped', 'persistentData': [item]}
         calls = []
         class Records:
-            def __enter__(self): self.values = [{'id': 'test', 'cpus': 2, 'memoryInGB': 2}]; return self
+            def __enter__(self): self.values = [{'id': 'test', 'cpus': 2, 'memoryInMB': 2048}]; return self
             def __exit__(self, *args): pass
         with patch.dict(create.__globals__, load_recipe=lambda _: recipe, Records=Records,
                         find_record=lambda rows, _: rows[0], container_name=lambda _: 'container',

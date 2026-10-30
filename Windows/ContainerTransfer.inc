@@ -175,7 +175,7 @@ static bool container_share(Distribution *d, HttpRequest *request, StringBuilder
         free(archives); free(items);
     }
     StringBuilder manifest = {0}; append(&manifest, "{\"version\":2,"); field(&manifest, "name", d->name);
-    char limits[100]; snprintf(limits, sizeof(limits), ",\"cpus\":%u,\"memoryInGB\":%u,", d->cpus, d->memory_gb); append(&manifest, limits);
+    char limits[100]; snprintf(limits, sizeof(limits), ",\"cpus\":%u,\"memoryInMB\":%u,", d->cpus, d->memory_mb); append(&manifest, limits);
     field(&manifest, "sourceRuntimeProviderID", container_provider_id(d->container));
     append(&manifest, ",\"includesPersistentData\":"); append(&manifest, persistent_included ? "true" : "false"); append(&manifest, ",\"includedMounts\":"); append(&manifest, included && mounts ? mounts : "[]");
     append(&manifest, ",\"omittedMounts\":"); append(&manifest, !included && mounts ? mounts : "[]"); append(&manifest, "}");
@@ -378,12 +378,12 @@ static bool container_import(Wsl *w, HttpRequest *request, StringBuilder *extra,
         free(directory); free(from); free(to); free(wide);
     }
     if (ok) {
-        unsigned cpus = container_number(&record, "cpus", 4), memory = container_number(&record, "memoryInGB", 8);
-        ok = cpus && cpus <= 128 && memory && memory <= 128 && save_container_metadata(id, name, cpus, memory);
+        unsigned cpus = container_number(&record, "cpus", 4), memory = container_number(&record, "memoryInMB", 8192);
+        ok = cpus && cpus <= 128 && memory >= 128 && memory <= 1048576 && save_container_metadata(id, name, cpus, memory);
         if (ok) {
             Distribution *d = win_alloc(sizeof(*d)); d->owner = w; d->id = win_strdup(id); d->name = win_strdup(name);
             d->user = win_strdup("root"); d->runtime_id = win_strdup(""); d->managed = true; d->present = true;
-            d->container = !strcmp(provider, "docker") ? RUNTIME_DOCKER : RUNTIME_WSLC; d->cpus = cpus; d->memory_gb = memory;
+            d->container = !strcmp(provider, "docker") ? RUNTIME_DOCKER : RUNTIME_WSLC; d->cpus = cpus; d->memory_mb = memory;
             EnterCriticalSection(&w->gate); d->next = w->distributions; w->distributions = d; LeaveCriticalSection(&w->gate);
             ok = container_rebuild(d);
             if (ok) {

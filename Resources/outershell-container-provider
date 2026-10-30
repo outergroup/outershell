@@ -26,6 +26,9 @@ import uuid
 
 PROVIDER_ID = "docker"
 DEFAULT_BASE_IMAGE = "outershell/container-base:21"
+DEFAULT_CPUS = 4
+DEFAULT_MEMORY_IN_MB = 8192
+MINIMUM_MEMORY_IN_MB = 128
 FRAME_MAGIC = 0x3142524F
 FRAME_VERSION = 1
 FRAME_HELLO = 1
@@ -227,13 +230,13 @@ def registry_container_list():
             continue
         (
             identifier, name, provider, runtime_name, project_key,
-            created_at, cpus, memory_in_gb, owns_container,
+            created_at, cpus, memory_in_mb, owns_container,
         ) = fields
         try:
             identifier = canonical_container_id(identifier)
             created_at_seconds = int(created_at) / 1000
             cpu_count = int(cpus)
-            memory_count = int(memory_in_gb)
+            memory_count = int(memory_in_mb)
         except (ValueError, TypeError):
             continue
         values.append({
@@ -241,7 +244,7 @@ def registry_container_list():
             "name": name or "Container",
             "createdAt": created_at_seconds,
             "cpus": cpu_count,
-            "memoryInGB": memory_count,
+            "memoryInMB": memory_count,
             "runtimeProviderID": provider,
             "runtimeName": runtime_name,
             "projectResourceKey": project_key,
@@ -260,7 +263,7 @@ def registry_container_upsert(record):
         "--project-key", record.get("projectResourceKey", ""),
         "--created-at-milliseconds", str(round(record.get("createdAt", time.time()) * 1000)),
         "--cpus", str(record.get("cpus", 0)),
-        "--memory-gb", str(record.get("memoryInGB", 0)),
+        "--memory-mb", str(record.get("memoryInMB", 0)),
         "--outershell-owns", "true" if record.get("ownsContainer", False) else "false",
     ]
     result = subprocess.run(arguments, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -344,10 +347,25 @@ def docker_environment():
     environment = os.environ.copy()
     environment.pop("DOCKER_CONTEXT", None)
     environment["DOCKER_HOST"] = docker_host()
+    # Docker 18.09–22.x builds with the legacy builder unless this is set.
+    environment["DOCKER_BUILDKIT"] = "1"
     return environment
 
 
+def docker_buildkit_problem():
+    result = run([docker_path(), "version", "--format", "{{.Client.Version}}"],
+                 environment=docker_environment(), timeout=3)
+    match = re.match(r"(\d+)\.", result.stdout.strip())
+    if result.returncode != 0 or not match or int(match[1]) < 23:
+        return None
+    if run([docker_path(), "buildx", "version"], environment=docker_environment(), timeout=3).returncode == 0:
+        return None
+    return ("Docker " + result.stdout.strip() + " needs the Buildx plugin to build containers. "
+            "Install it (docker-buildx-plugin from Docker's apt repository, or docker-buildx from your distribution), then choose Check again.")
+
+
 _docker_readiness_cache = None
+_docker_host_resources = None
 
 
 def docker_readiness():
@@ -358,18 +376,64 @@ def docker_readiness():
     return _docker_readiness_cache[1]
 
 
+def resource_limits():
+    docker_readiness()
+    if not _docker_host_resources:
+        return None
+    max_cpus = max(_docker_host_resources["cpus"], 1)
+    max_memory = max(_docker_host_resources["memoryBytes"] // 1024**2, MINIMUM_MEMORY_IN_MB)
+    return {
+        "maxCPUs": max_cpus,
+        "maxMemoryInMB": max_memory,
+        "defaultCPUs": min(DEFAULT_CPUS, max_cpus),
+        "defaultMemoryInMB": min(DEFAULT_MEMORY_IN_MB, max_memory),
+    }
+
+
+def requested_resources(request):
+    limits = resource_limits()
+    cpus = request.get("cpus", limits["defaultCPUs"] if limits else DEFAULT_CPUS)
+    memory = request.get("memoryInMB", limits["defaultMemoryInMB"] if limits else DEFAULT_MEMORY_IN_MB)
+    max_cpus = limits["maxCPUs"] if limits else 1024
+    max_memory = limits["maxMemoryInMB"] if limits else 1073741824
+    if type(cpus) is not int or not 1 <= cpus <= max_cpus:
+        raise ValueError(f"Choose between 1 and {max_cpus} CPUs. Docker on this server has {max_cpus}.")
+    if type(memory) is not int or not MINIMUM_MEMORY_IN_MB <= memory <= max_memory:
+        raise ValueError(f"Choose between {MINIMUM_MEMORY_IN_MB} MB and {max_memory} MB of memory. Docker on this server has {max_memory} MB.")
+    return cpus, memory
+
+
+def runnable_cpus(cpus):
+    limits = resource_limits()
+    return min(cpus, limits["maxCPUs"]) if limits else cpus
+
+
+def runnable_memory(memory):
+    limits = resource_limits()
+    return min(memory, limits["maxMemoryInMB"]) if limits else memory
+
+
 def probe_docker_readiness():
+    global _docker_host_resources
+    _docker_host_resources = None
     if docker_path() is None:
         return "notInstalled", "Install Docker Engine with rootless support on this server, then configure it for this user and choose Check again."
     host = docker_host()
     if host.startswith("unix://") and not pathlib.Path(host[7:]).is_socket():
         return "stopped", "Rootless Docker is not running at " + host + ". Run dockerd-rootless-setuptool.sh install, or systemctl --user start docker if already configured, then choose Check again."
     try:
-        result = run([docker_path(), "info", "--format", "{{json .SecurityOptions}}"],
+        result = run([docker_path(), "info", "--format",
+                      '{"securityOptions":{{json .SecurityOptions}},"cpus":{{json .NCPU}},"memoryBytes":{{json .MemTotal}}}'],
                      environment=docker_environment(), timeout=3)
         if result.returncode == 0:
-            options = json.loads(result.stdout)
+            info = json.loads(result.stdout)
+            options = info.get("securityOptions")
             if isinstance(options, list) and any("rootless" in value for value in options):
+                problem = docker_buildkit_problem()
+                if problem:
+                    return "failed", problem
+                if type(info.get("cpus")) is int and type(info.get("memoryBytes")) is int:
+                    _docker_host_resources = {"cpus": info["cpus"], "memoryBytes": info["memoryBytes"]}
                 return "ready", "Rootless Docker is ready for this server user."
             return "failed", "The selected Docker engine is not rootless. Configure rootless Docker for this user; Outer Shell does not use the host-root daemon."
         message = (result.stderr or result.stdout).strip()
@@ -405,6 +469,7 @@ def provider_dictionary():
         "name": "Docker",
         "detail": detail,
         "defaultBaseImage": DEFAULT_BASE_IMAGE,
+        "resources": resource_limits(),
         "isolationName": "",
         "isAvailable": status == "ready",
         "status": status,
@@ -421,6 +486,7 @@ def capabilities():
         "supportsMounts": True,
         "supportsRecipes": True,
         "supportsStorageCleanup": True,
+        "supportsResourceUpdates": True,
     }
 
 
@@ -486,7 +552,7 @@ class Records:
             value.get("projectResourceKey", ""),
             value.get("createdAt", 0),
             value.get("cpus", 0),
-            value.get("memoryInGB", 0),
+            value.get("memoryInMB", 0),
             bool(value.get("ownsContainer", False)),
         )
 
@@ -721,11 +787,7 @@ case "$architecture" in
     x86_64|amd64) architecture=x86_64 ;;
     *) echo "Unsupported container architecture: $architecture" >&2; exit 1 ;;
 esac
-libc=glibc
-for loader in /lib/ld-musl-*.so.1 /lib/libc.musl-*.so.1; do
-    if [ -e "$loader" ]; then libc=musl; break; fi
-done
-source_directory="/tmp/outershell-bootstrap/bin/$libc/$architecture"
+source_directory="/tmp/outershell-bootstrap/bin/$architecture"
 test -x "$source_directory/outershelld"
 test -x "$source_directory/outerctl"
 test -x "$source_directory/outer-socket-bridge"
@@ -930,12 +992,12 @@ def create_runtime_container(container_id):
     arguments += ["--network", settings["networkMode"], "--restart", settings["restartPolicy"]]
     with Records() as records:
         record = find_record(records.values, container_id)
-        cpus = record.get("cpus", 4)
-        memory = record.get("memoryInGB", 8)
+        cpus = record.get("cpus", DEFAULT_CPUS)
+        memory = record.get("memoryInMB", DEFAULT_MEMORY_IN_MB)
     if cpus:
-        arguments += ["--cpus", str(cpus)]
+        arguments += ["--cpus", str(runnable_cpus(cpus))]
     if memory:
-        arguments += ["--memory", f"{memory}g"]
+        arguments += ["--memory", f"{runnable_memory(memory)}m"]
     project = recipe_directory(container_id)
     arguments += ["--mount", f"type=bind,src={project},dst=/var/lib/outershell/project"]
     for mount in recipe.get("mounts", []):
@@ -964,7 +1026,15 @@ def mark_realized(container_id):
     recipe["realizedEnvironment"] = recipe.get("environment", [])
     recipe["realizedPublishedPorts"] = recipe.get("publishedPorts", [])
     recipe["realizedRuntimeSettings"] = runtime_settings(recipe)
+    recipe["realizedResources"] = record_resources(container_id)
     save_recipe(container_id, recipe)
+
+
+def record_resources(container_id):
+    with Records() as records:
+        record = find_record(records.values, container_id)
+        return {"cpus": record.get("cpus", DEFAULT_CPUS),
+                "memoryInMB": record.get("memoryInMB", DEFAULT_MEMORY_IN_MB)}
 
 
 _storage_gate = threading.RLock()
@@ -1177,13 +1247,14 @@ def operation_create(request):
     initial_dockerfile = request.get("dockerfile")
     if initial_dockerfile is not None and (not isinstance(initial_dockerfile, str) or not initial_dockerfile.strip() or len(initial_dockerfile.encode()) > 1_000_000):
         raise RuntimeError("Invalid initial Dockerfile.")
+    cpus, memory = requested_resources(request)
     now = time.time()
     record = {
         "id": container_id,
         "name": name,
         "createdAt": now,
-        "cpus": request.get("cpus") or 4,
-        "memoryInGB": request.get("memoryInGB") or 8,
+        "cpus": cpus,
+        "memoryInMB": memory,
         "runtimeProviderID": PROVIDER_ID,
         "runtimeName": "outershell-container-" + container_id.lower(),
         "projectResourceKey": recipe_resource_key(container_id),
@@ -1276,6 +1347,32 @@ def operation_update_configuration(request):
         if key in request:
             recipe[key] = request[key]
     save_recipe(container_id, recipe)
+
+
+def operation_update_resources(request):
+    container_id = request["workspaceID"]
+    with Records() as records:
+        require_managed_container(find_record(records.values, container_id))
+    cpus, memory = requested_resources(request)
+    recipe = load_recipe(container_id)
+    recipe.setdefault("realizedResources", record_resources(container_id))
+    save_recipe(container_id, recipe)
+    update_record(container_id, cpus=cpus, memoryInMB=memory)
+    if docker_state(container_id) == "absent":
+        return {"resourcesApplied": False}
+    applied_cpus, applied_memory = runnable_cpus(cpus), runnable_memory(memory)
+    result = docker([
+        "update", "--cpus", str(applied_cpus),
+        "--memory", f"{applied_memory}m", "--memory-swap", f"{applied_memory * 2}m",
+        container_name(container_id),
+    ])
+    if result.returncode != 0:
+        return {"resourcesApplied": False,
+                "resourcesDetail": (result.stderr or result.stdout).strip()[:400]}
+    recipe = load_recipe(container_id)
+    recipe["realizedResources"] = {"cpus": cpus, "memoryInMB": memory}
+    save_recipe(container_id, recipe)
+    return {"resourcesApplied": True}
 
 
 def operation_rebuild(request):
@@ -1401,8 +1498,8 @@ def operation_prepare_share(request):
         manifest = {
             "version": 2,
             "name": record["name"],
-            "cpus": record.get("cpus", 4),
-            "memoryInGB": record.get("memoryInGB", 8),
+            "cpus": record.get("cpus", DEFAULT_CPUS),
+            "memoryInMB": record.get("memoryInMB", DEFAULT_MEMORY_IN_MB),
             "sourceRuntimeProviderID": PROVIDER_ID,
             "includesPersistentData": include_persistent,
             "includedMounts": included_mounts,
@@ -1595,8 +1692,8 @@ def operation_finish_import(request):
         "id": container_id,
         "name": name,
         "createdAt": time.time(),
-        "cpus": manifest.get("cpus", 4),
-        "memoryInGB": manifest.get("memoryInGB", 8),
+        "cpus": runnable_cpus(manifest.get("cpus", DEFAULT_CPUS)),
+        "memoryInMB": runnable_memory(manifest.get("memoryInMB", DEFAULT_MEMORY_IN_MB)),
         "runtimeProviderID": PROVIDER_ID,
         "runtimeName": "outershell-container-" + container_id.lower(),
         "projectResourceKey": recipe_resource_key(container_id),
@@ -1637,7 +1734,8 @@ def operation_finish_import(request):
         imported_mounts.append(imported)
     recipe["mounts"] = imported_mounts
     for key in ["realizedMounts", "realizedDockerfile", "realizedDockerfileContents",
-                "realizedEnvironment", "realizedPublishedPorts", "realizedRuntimeSettings"]:
+                "realizedEnvironment", "realizedPublishedPorts", "realizedRuntimeSettings",
+                "realizedResources"]:
         recipe.pop(key, None)
     recipe["hasUntrackedChanges"] = False
     save_recipe(container_id, recipe)
@@ -2083,11 +2181,7 @@ case "$architecture" in
     x86_64|amd64) architecture=x86_64 ;;
     *) exit 1 ;;
 esac
-libc=glibc
-for loader in /lib/ld-musl-*.so.1 /lib/libc.musl-*.so.1; do
-    if [ -e "$loader" ]; then libc=musl; break; fi
-done
-/usr/bin/printf '%s/%s' "$libc" "$architecture"
+/usr/bin/printf '%s' "$architecture"
 """,
     ], check=True).stdout.strip()
     if not platform or ".." in platform:
@@ -2257,6 +2351,8 @@ def recipe_dictionary(record, recipe):
         or recipe.get("realizedEnvironment") != recipe.get("environment", [])
         or recipe.get("realizedPublishedPorts") != recipe.get("publishedPorts", [])
         or (recipe.get("realizedRuntimeSettings") or runtime_settings({})) != runtime_settings(recipe)
+        or recipe.get("realizedResources", {"cpus": record.get("cpus"), "memoryInMB": record.get("memoryInMB")})
+        != {"cpus": record.get("cpus"), "memoryInMB": record.get("memoryInMB")}
     )
     return {
         "baseImage": recipe.get("baseImage", DEFAULT_BASE_IMAGE),
@@ -2388,8 +2484,8 @@ def workspace_dictionary(record, overview=False):
         "id": container_id,
         "name": record["name"],
         "state": state,
-        "cpus": record.get("cpus", 4),
-        "memoryInGB": record.get("memoryInGB", 8),
+        "cpus": record.get("cpus", DEFAULT_CPUS),
+        "memoryInMB": record.get("memoryInMB", DEFAULT_MEMORY_IN_MB),
         "runtimeKind": "docker",
         "managementKind": "managed" if owns_container else "attached",
         "ownsContainer": owns_container,
@@ -2441,8 +2537,8 @@ def unavailable_workspace_dictionary(record, error):
         "id": container_id,
         "name": record.get("name", "Container"),
         "state": record.get("transientState") or "absent",
-        "cpus": record.get("cpus", 4),
-        "memoryInGB": record.get("memoryInGB", 8),
+        "cpus": record.get("cpus", DEFAULT_CPUS),
+        "memoryInMB": record.get("memoryInMB", DEFAULT_MEMORY_IN_MB),
         "runtimeKind": "docker",
         "managementKind": "managed" if owns_container else "attached",
         "ownsContainer": owns_container,
@@ -2591,6 +2687,8 @@ def handle_request(request):
             operation_update_dockerfile(request)
         elif operation == "updateContainerConfiguration":
             operation_update_configuration(request)
+        elif operation == "updateResources":
+            extra = operation_update_resources(request)
         elif operation == "rebuildRecipe":
             operation_rebuild(request)
         elif operation in ("startApp", "stopApp", "restartApp"):

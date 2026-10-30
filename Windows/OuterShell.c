@@ -93,6 +93,7 @@ static bool update_allowlist(ShellHost *s) {
 #include "Commands.inc"
 #include "Setup.inc"
 #include "Updates.inc"
+#include "Uninstall.inc"
 static bool legacy_files_running(ShellHost *s) {
     if (!s->files)
         return false;
@@ -525,10 +526,13 @@ static void serve_http(Connection *c, void *context) {
         char *id = http_query(&r, "serviceID"), *operation = http_query(&r, "operation"), *scope = http_query(&r, "scope");
         bool handles = id && !strcmp(id, shell_id) && operation && (!scope || !strcmp(scope, "user"));
         if (handles) {
-            StringBuilder response = update_control(operation);
+            StringBuilder response = !strcmp(operation, "uninstallOuterShell") ? uninstall_control(s) : update_control(operation);
             http_send(c, &r, 200, "application/octet-stream", response.data, response.length);
+            bool uninstalling = !strcmp(operation, "uninstallOuterShell") && response.length >= 4 &&
+                (read_uint32_le((const unsigned char *)response.data) & 1);
             free(response.data);
             EnterCriticalSection(&s->gate); changed(s); LeaveCriticalSection(&s->gate);
+            if (uninstalling) SetEvent(s->stop);
         }
         free(id); free(operation); free(scope);
         if (handles) { http_free(&r); return; }

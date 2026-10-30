@@ -8,9 +8,10 @@ from unittest.mock import patch
 
 provider = runpy.run_path(str(Path(__file__).resolve().parents[1] / "Resources/outershell-container-provider"))
 g = provider["probe_docker_readiness"].__globals__
+ROOTLESS = '{"securityOptions":["name=rootless"],"cpus":2,"memoryBytes":4109926400}'
 
 class ReadinessTests(unittest.TestCase):
-    def probe(self, executable="/fake/docker", host="unix:///custom/docker.sock", socket=True, code=0, output='["name=rootless"]', error=""):
+    def probe(self, executable="/fake/docker", host="unix:///custom/docker.sock", socket=True, code=0, output=ROOTLESS, error=""):
         with patch.dict(g, docker_path=lambda: executable, docker_host=lambda: host), \
              patch.object(Path, "is_socket", return_value=socket), \
              patch.dict(g, run=lambda *args, **kwargs: subprocess.CompletedProcess(args, code, output, error)):
@@ -25,7 +26,7 @@ class ReadinessTests(unittest.TestCase):
 
     def test_engine_must_respond_and_be_rootless(self):
         self.assertEqual(self.probe()[0], "ready")
-        self.assertEqual(self.probe(output='["name=seccomp"]')[0], "failed")
+        self.assertEqual(self.probe(output='{"securityOptions":["name=seccomp"],"cpus":2,"memoryBytes":1}')[0], "failed")
         self.assertEqual(self.probe(output="invalid JSON")[0], "failed")
         self.assertEqual(self.probe(code=1, error="permission denied")[0], "failed")
         self.assertEqual(self.probe(host="tcp://test:123", socket=False)[0], "ready")
@@ -42,6 +43,46 @@ class ReadinessTests(unittest.TestCase):
             env = g["docker_environment"]()
             self.assertNotIn("DOCKER_CONTEXT", env)
             self.assertEqual(env["DOCKER_HOST"], "unix:///custom.sock")
+            self.assertEqual(env["DOCKER_BUILDKIT"], "1")
+
+    def test_builds_require_buildkit(self):
+        def probe(version, has_buildx):
+            def run(arguments, **kwargs):
+                if arguments[1] == "info":
+                    return subprocess.CompletedProcess(arguments, 0, ROOTLESS, "")
+                if arguments[1] == "version":
+                    return subprocess.CompletedProcess(arguments, 0, version + "\n", "")
+                return subprocess.CompletedProcess(arguments, 0 if has_buildx else 1, "", "")
+            with patch.dict(g, docker_path=lambda: "/fake/docker", docker_host=lambda: "tcp://test:123", run=run):
+                return g["probe_docker_readiness"]()
+        self.assertEqual(probe("20.10.24+dfsg1", False)[0], "ready")
+        self.assertEqual(probe("27.3.1", True)[0], "ready")
+        status, detail = probe("26.1.5+dfsg1", False)
+        self.assertEqual(status, "failed")
+        self.assertIn("Buildx", detail)
+
+    def test_resource_limits_follow_docker_host(self):
+        def limits(output):
+            with patch.dict(g, docker_path=lambda: "/fake/docker", docker_host=lambda: "tcp://test:123",
+                            run=lambda *args, **kwargs: subprocess.CompletedProcess(args, 0, output, "")):
+                self.assertEqual(g["probe_docker_readiness"]()[0], "ready")
+                with patch.dict(g, docker_readiness=lambda: ("ready", "ready")):
+                    return (g["resource_limits"](), g["requested_resources"]({}),
+                            g["runnable_cpus"](4), g["runnable_memory"](8192), g["requested_resources"])
+        resources, defaults, cpus, memory, _ = limits(ROOTLESS)
+        self.assertEqual(resources, {"maxCPUs": 2, "maxMemoryInMB": 3919, "defaultCPUs": 2, "defaultMemoryInMB": 3919})
+        self.assertEqual((defaults, cpus, memory), ((2, 3919), 2, 3919))
+        resources, defaults, cpus, memory, _ = limits('{"securityOptions":["name=rootless"],"cpus":16,"memoryBytes":68719476736}')
+        self.assertEqual((defaults, cpus, memory), ((4, 8192), 4, 8192))
+        self.assertEqual(resources["maxCPUs"], 16)
+        with patch.dict(g, resource_limits=lambda: {"maxCPUs": 2, "maxMemoryInMB": 3919, "defaultCPUs": 2, "defaultMemoryInMB": 3919}):
+            self.assertEqual(g["requested_resources"]({"cpus": 1, "memoryInMB": 1536}), (1, 1536))
+            with self.assertRaisesRegex(ValueError, "between 1 and 2 CPUs"):
+                g["requested_resources"]({"cpus": 4})
+            with self.assertRaisesRegex(ValueError, "between 128 MB and 3919 MB"):
+                g["requested_resources"]({"memoryInMB": 8192})
+            with self.assertRaises(ValueError):
+                g["requested_resources"]({"cpus": True})
 
     def test_recheck_after_install(self):
         with patch.dict(g, _docker_readiness_cache=(g["time"].monotonic(), ("notInstalled", "missing")),

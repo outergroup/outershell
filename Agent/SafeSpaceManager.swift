@@ -40,7 +40,7 @@ private struct OuterShellRegistryContainerRecord {
     var projectResourceKey: UnsafeMutablePointer<CChar>?
     var createdAtMilliseconds: UInt64
     var cpus: UInt32
-    var memoryInGB: UInt32
+    var memoryInMB: UInt32
     var flags: UInt32
 }
 
@@ -90,7 +90,7 @@ private struct SafeSpaceRecord: Codable {
     var name: String
     var createdAt: Date
     var cpus: Int
-    var memoryInGB: Int
+    var memoryInMB: Int
     var runtimeProviderID: String?
     var runtimeName: String? = nil
     var projectResourceKey: String? = nil
@@ -145,6 +145,8 @@ private struct SafeSpaceRecipe: Codable {
     var publishedPorts: [SafeSpacePublishedPort]?
     var realizedPublishedPorts: [SafeSpacePublishedPort]?
     var persistentData: [SafeSpacePersistentData]?
+    var realizedCPUs: Int?
+    var realizedMemoryInMB: Int?
 }
 
 private struct SafeSpaceEnvironmentVariable: Codable, Equatable {
@@ -189,7 +191,7 @@ private struct SafeSpaceTransferManifest: Codable {
     var version: Int
     var name: String
     var cpus: Int
-    var memoryInGB: Int
+    var memoryInMB: Int
     var sourceRuntimeProviderID: String
     var includesPersistentData: Bool
     var includedMounts: [SafeSpaceMount]
@@ -850,6 +852,9 @@ final class SafeSpaceManager: @unchecked Sendable {
         case "updateContainerConfiguration":
             try requireManagedContainer(try record(from: request))
             return try updateContainerConfiguration(request)
+        case "updateResources":
+            try requireManagedContainer(try record(from: request))
+            return try updateResources(request)
         case "rebuildRecipe":
             try requireManagedContainer(try record(from: request))
             return try beginRebuildRecipe(request)
@@ -913,6 +918,15 @@ final class SafeSpaceManager: @unchecked Sendable {
         }
     }
 
+    private func resourceLimits(for provider: SafeSpaceRuntimeProviderID) -> ContainerResourceLimits? {
+        switch provider {
+        case .appleContainer:
+            return .host
+        case .docker:
+            return runtimeReadiness()[provider.rawValue]?.resources
+        }
+    }
+
     private func providerDictionaries() -> [[String: Any]] {
         let readiness = runtimeReadiness()
         return [
@@ -921,6 +935,7 @@ final class SafeSpaceManager: @unchecked Sendable {
                 "name": "Apple container",
                 "detail": readiness["apple.container"]?.detail ?? "Runtime check failed.",
                 "defaultBaseImage": rootContainerBaseImage,
+                "resources": resourceLimits(for: .appleContainer).map { $0.dictionary as Any } ?? NSNull(),
                 "isolationName": "",
                 "isAvailable": readiness["apple.container"]?.isAvailable ?? false,
                 "status": readiness["apple.container"]?.status ?? "failed",
@@ -931,7 +946,8 @@ final class SafeSpaceManager: @unchecked Sendable {
                     "supportsLiveMounts": false,
                     "supportsMounts": true,
                     "supportsRecipes": true,
-                    "supportsStorageCleanup": true
+                    "supportsStorageCleanup": true,
+                    "supportsResourceUpdates": true
                 ]
             ],
             [
@@ -939,6 +955,7 @@ final class SafeSpaceManager: @unchecked Sendable {
                 "name": "Docker",
                 "detail": readiness["docker"]?.detail ?? "Runtime check failed.",
                 "defaultBaseImage": rootContainerBaseImage,
+                "resources": resourceLimits(for: .docker).map { $0.dictionary as Any } ?? NSNull(),
                 "isolationName": "",
                 "isAvailable": readiness["docker"]?.isAvailable ?? false,
                 "status": readiness["docker"]?.status ?? "failed",
@@ -949,7 +966,8 @@ final class SafeSpaceManager: @unchecked Sendable {
                     "supportsLiveMounts": true,
                     "supportsMounts": true,
                     "supportsRecipes": true,
-                    "supportsStorageCleanup": true
+                    "supportsStorageCleanup": true,
+                    "supportsResourceUpdates": true
                 ]
             ]
         ]
@@ -962,7 +980,7 @@ final class SafeSpaceManager: @unchecked Sendable {
             "id": record.id.uuidString,
             "name": record.name,
             "cpus": record.cpus,
-            "memoryInGB": record.memoryInGB,
+            "memoryInMB": record.memoryInMB,
             "ownsContainer": true,
             "managementKind": "managed",
             "runtime": try runtimeDictionary(for: record),
@@ -1104,7 +1122,7 @@ final class SafeSpaceManager: @unchecked Sendable {
                 "name": record.name,
                 "state": state,
                 "cpus": record.cpus,
-                "memoryInGB": record.memoryInGB,
+                "memoryInMB": record.memoryInMB,
                 "managementKind": ownsContainer ? "managed" : "attached",
                 "ownsContainer": ownsContainer,
                 "runtimeName": registeredRuntimeName(for: record),
@@ -1488,12 +1506,20 @@ final class SafeSpaceManager: @unchecked Sendable {
         let requestedDockerfile = request["dockerfile"] as? String
         if let requestedDockerfile { try validateDockerfile(requestedDockerfile) }
         let requestedSupportInstall = request["installsOuterShellSupport"] as? Bool
+        let limits = resourceLimits(for: provider) ?? .host
+        let resources: (cpus: Int, memoryInMB: Int)
+        switch limits.validated(cpus: request["cpus"], memoryInMB: request["memoryInMB"]) {
+        case .success(let value):
+            resources = value
+        case .failure(let error):
+            throw SafeSpaceManagerError.commandFailed(error.message)
+        }
         let id = UUID()
         let record = SafeSpaceRecord(id: id,
                                      name: name,
                                      createdAt: Date(),
-                                     cpus: max(request["cpus"] as? Int ?? 4, 1),
-                                     memoryInGB: max(request["memoryInGB"] as? Int ?? 8, 1),
+                                     cpus: resources.cpus,
+                                     memoryInMB: resources.memoryInMB,
                                      runtimeProviderID: provider.rawValue,
                                      runtimeName: managedContainerName(id),
                                      projectResourceKey: recipeResourceKey(id),
@@ -1546,12 +1572,14 @@ final class SafeSpaceManager: @unchecked Sendable {
         let name = requestedName.flatMap { $0.isEmpty ? nil : $0 }
             ?? "\(source.name) (\(provider.displayName))"
         let duplicateID = UUID()
+        let duplicateResources = (resourceLimits(for: provider) ?? .host)
+            .runnable(cpus: source.cpus, memoryInMB: source.memoryInMB)
         let duplicate = SafeSpaceRecord(
             id: duplicateID,
             name: name,
             createdAt: Date(),
-            cpus: source.cpus,
-            memoryInGB: source.memoryInGB,
+            cpus: duplicateResources.cpus,
+            memoryInMB: duplicateResources.memoryInMB,
             runtimeProviderID: provider.rawValue,
             runtimeName: managedContainerName(duplicateID),
             projectResourceKey: recipeResourceKey(duplicateID),
@@ -1574,6 +1602,8 @@ final class SafeSpaceManager: @unchecked Sendable {
         duplicatedRecipe.realizedMounts = nil
         duplicatedRecipe.realizedEnvironment = nil
         duplicatedRecipe.realizedPublishedPorts = nil
+        duplicatedRecipe.realizedCPUs = nil
+        duplicatedRecipe.realizedMemoryInMB = nil
         duplicatedRecipe.hasUntrackedChanges = false
         try saveRecipe(duplicatedRecipe, for: duplicate)
         lock.withSafeSpaceLock {
@@ -1675,7 +1705,7 @@ final class SafeSpaceManager: @unchecked Sendable {
             version: 2,
             name: record.name,
             cpus: record.cpus,
-            memoryInGB: record.memoryInGB,
+            memoryInMB: record.memoryInMB,
             sourceRuntimeProviderID: runtimeProvider(for: record).rawValue,
             includesPersistentData: includePersistentData,
             includedMounts: includedMounts,
@@ -1913,9 +1943,11 @@ final class SafeSpaceManager: @unchecked Sendable {
             }
         }
         let importedID = UUID()
+        let importedResources = (resourceLimits(for: provider) ?? .host)
+            .runnable(cpus: manifest.cpus, memoryInMB: manifest.memoryInMB)
         let record = SafeSpaceRecord(
             id: importedID, name: importedName, createdAt: Date(),
-            cpus: manifest.cpus, memoryInGB: manifest.memoryInGB,
+            cpus: importedResources.cpus, memoryInMB: importedResources.memoryInMB,
             runtimeProviderID: provider.rawValue,
             runtimeName: managedContainerName(importedID),
             projectResourceKey: recipeResourceKey(importedID),
@@ -1992,6 +2024,8 @@ final class SafeSpaceManager: @unchecked Sendable {
         importedRecipe.realizedDockerfileContents = nil
         importedRecipe.realizedEnvironment = nil
         importedRecipe.realizedPublishedPorts = nil
+        importedRecipe.realizedCPUs = nil
+        importedRecipe.realizedMemoryInMB = nil
         importedRecipe.hasUntrackedChanges = false
         try saveRecipe(importedRecipe, for: record)
         let persistentSource = extracted.appendingPathComponent("Volume Archives", isDirectory: true)
@@ -2260,6 +2294,12 @@ final class SafeSpaceManager: @unchecked Sendable {
         }
     }
 
+    private func runnableResources(_ record: SafeSpaceRecord) -> (cpus: Int, memoryInMB: Int) {
+        let provider = record.runtimeProviderID.flatMap(SafeSpaceRuntimeProviderID.init(rawValue:)) ?? .appleContainer
+        guard let limits = resourceLimits(for: provider) else { return (record.cpus, record.memoryInMB) }
+        return limits.runnable(cpus: record.cpus, memoryInMB: record.memoryInMB)
+    }
+
     private func createAppleContainer(_ record: SafeSpaceRecord,
                                       imageReference: String) throws {
         try createManagedDirectories(for: record)
@@ -2268,8 +2308,8 @@ final class SafeSpaceManager: @unchecked Sendable {
         var arguments = [
             "create",
             "--name", containerName(record.id),
-            "--cpus", String(record.cpus),
-            "--memory", "\(record.memoryInGB)G",
+            "--cpus", String(runnableResources(record).cpus),
+            "--memory", "\(runnableResources(record).memoryInMB)M",
             "--init",
             "--label", "org.outershell.safe-space=\(record.id.uuidString)",
             "--label", "org.outershell.container-id=\(record.id.uuidString)",
@@ -2333,8 +2373,8 @@ final class SafeSpaceManager: @unchecked Sendable {
         var arguments = [
             "create",
             "--name", containerName(record.id),
-            "--cpus", String(record.cpus),
-            "--memory", "\(record.memoryInGB)g",
+            "--cpus", String(runnableResources(record).cpus),
+            "--memory", "\(runnableResources(record).memoryInMB)m",
             "--init",
             "--label", "org.outershell.safe-space=\(record.id.uuidString)",
             "--label", "org.outershell.container-id=\(record.id.uuidString)",
@@ -3030,6 +3070,55 @@ final class SafeSpaceManager: @unchecked Sendable {
         return ["recipeCommandOutput": "", "recipeCommandApplied": false]
     }
 
+    private func updateResources(_ request: [String: Any]) throws -> [String: Any] {
+        let selected = try record(from: request)
+        let provider = runtimeProvider(for: selected)
+        let resources: (cpus: Int, memoryInMB: Int)
+        switch (resourceLimits(for: provider) ?? .host).validated(cpus: request["cpus"],
+                                                                  memoryInMB: request["memoryInMB"]) {
+        case .success(let value):
+            resources = value
+        case .failure(let error):
+            throw SafeSpaceManagerError.commandFailed(error.message)
+        }
+        var value = try recipe(for: selected)
+        if value.realizedCPUs == nil || value.realizedMemoryInMB == nil {
+            value.realizedCPUs = selected.cpus
+            value.realizedMemoryInMB = selected.memoryInMB
+            try saveRecipe(value, for: selected)
+        }
+        var updated = selected
+        updated.cpus = resources.cpus
+        updated.memoryInMB = resources.memoryInMB
+        lock.withSafeSpaceLock {
+            if let index = records.firstIndex(where: { $0.id == selected.id }) {
+                records[index] = updated
+            }
+        }
+        try saveRecords()
+        guard provider == .docker, try runtimeState(updated) != "absent" else {
+            return ["resourcesApplied": false]
+        }
+        let applied = runnableResources(updated)
+        let result = try runDocker([
+            "update",
+            "--cpus", String(applied.cpus),
+            "--memory", "\(applied.memoryInMB)m",
+            "--memory-swap", "\(applied.memoryInMB * 2)m",
+            containerName(updated.id)
+        ])
+        guard result.status == 0 else {
+            let detail = (result.stderr.isEmpty ? result.stdout : result.stderr)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            return ["resourcesApplied": false, "resourcesDetail": String(detail.prefix(400))]
+        }
+        value = try recipe(for: updated)
+        value.realizedCPUs = updated.cpus
+        value.realizedMemoryInMB = updated.memoryInMB
+        try saveRecipe(value, for: updated)
+        return ["resourcesApplied": true]
+    }
+
     private func validateDockerfile(_ contents: String) throws {
         guard !contents.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw SafeSpaceManagerError.commandFailed("The Dockerfile cannot be empty.")
@@ -3324,11 +3413,7 @@ final class SafeSpaceManager: @unchecked Sendable {
                 x86_64|amd64) architecture=x86_64 ;;
                 *) exit 1 ;;
             esac
-            libc=glibc
-            for loader in /lib/ld-musl-*.so.1 /lib/libc.musl-*.so.1; do
-                if [ -e "${loader}" ]; then libc=musl; break; fi
-            done
-            /usr/bin/printf '%s/%s' "${libc}" "${architecture}"
+            /usr/bin/printf '%s' "${architecture}"
             """
         ])
         try requireSuccess(platform, action: "identify the container platform")
@@ -3962,7 +4047,7 @@ final class SafeSpaceManager: @unchecked Sendable {
                 createdAt: Date(timeIntervalSince1970:
                     TimeInterval(value.createdAtMilliseconds) / 1000),
                 cpus: max(Int(value.cpus), 1),
-                memoryInGB: max(Int(value.memoryInGB), 1),
+                memoryInMB: max(Int(value.memoryInMB), 1),
                 runtimeProviderID: value.providerID.map { String(cString: $0) },
                 runtimeName: value.runtimeName.map { String(cString: $0) },
                 projectResourceKey: value.projectResourceKey.map { String(cString: $0) },
@@ -4032,7 +4117,7 @@ final class SafeSpaceManager: @unchecked Sendable {
                                     0
                                 )),
                                 cpus: UInt32(clamping: value.cpus),
-                                memoryInGB: UInt32(clamping: value.memoryInGB),
+                                memoryInMB: UInt32(clamping: value.memoryInMB),
                                 flags: recordOwnsContainer(value)
                                     ? outerShellRegistryContainerOwnedFlag
                                     : 0
@@ -4235,6 +4320,8 @@ final class SafeSpaceManager: @unchecked Sendable {
         value.realizedMounts = value.mounts ?? []
         value.realizedEnvironment = value.environment ?? []
         value.realizedPublishedPorts = value.publishedPorts ?? []
+        value.realizedCPUs = record.cpus
+        value.realizedMemoryInMB = record.memoryInMB
         value.hasUntrackedChanges = false
         try saveRecipe(value, for: record)
     }
@@ -4251,7 +4338,9 @@ final class SafeSpaceManager: @unchecked Sendable {
             value.realizedDockerfileContents != dockerfile ||
             value.realizedMounts.map { $0 != (value.mounts ?? []) } == true ||
             value.realizedEnvironment.map { $0 != (value.environment ?? []) } == true ||
-            value.realizedPublishedPorts.map { $0 != (value.publishedPorts ?? []) } == true
+            value.realizedPublishedPorts.map { $0 != (value.publishedPorts ?? []) } == true ||
+            value.realizedCPUs.map { $0 != record.cpus } == true ||
+            value.realizedMemoryInMB.map { $0 != record.memoryInMB } == true
         return [
             "baseImage": value.baseImage,
             "installsOuterShellSupport": value.installsOuterShellSupport ?? false,
@@ -5622,11 +5711,7 @@ final class SafeSpaceManager: @unchecked Sendable {
             x86_64|amd64) architecture=x86_64 ;;
             *) /bin/echo "Unsupported architecture: ${architecture}" >&2; exit 1 ;;
         esac
-        libc=glibc
-        for loader in /lib/ld-musl-*.so.1 /lib/libc.musl-*.so.1; do
-            if [ -e "${loader}" ]; then libc=musl; break; fi
-        done
-        source_directory=/tmp/outershell-bootstrap/bin/${libc}/${architecture}
+        source_directory=/tmp/outershell-bootstrap/bin/${architecture}
         test -x "${source_directory}/outershelld"
         test -x "${source_directory}/outerctl"
         test -x "${source_directory}/outer-socket-bridge"

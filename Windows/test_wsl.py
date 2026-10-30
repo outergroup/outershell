@@ -138,7 +138,7 @@ with Bridge(shell_pipe) as host_client:
     operation('start')
     print('Requested distribution start; waiting for Linux app discovery', flush=True)
     item = wait_for(lambda w: w['state'] == 'running' and len(w['apps']) >= 2)
-    for field in ('cpus', 'memoryInGB', 'shellCommand'): assert field in item
+    for field in ('cpus', 'memoryInMB', 'shellCommand'): assert field in item
     for app in item['apps']:
         for field in ('iconPath', 'iconObservationToken', 'publishedPort', 'externalSocketPath'): assert field in app
     apps = {a['serviceID']: a for a in item['apps']}

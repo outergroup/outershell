@@ -56,7 +56,7 @@ static bool save_container_metadata(const char *id, const char *name, unsigned c
     StringBuilder data = {0};
     append(&data, name);
     char limits[64];
-    snprintf(limits, sizeof(limits), "\n%u\n%u\n", cpus, memory);
+    snprintf(limits, sizeof(limits), "\n%u\n%u\nmb\n", cpus, memory);
     append(&data, limits);
     bool ok = path && win_atomic_write(path, data.data, data.length);
     free(path);
@@ -104,15 +104,15 @@ static bool create_container(Wsl *w, HttpRequest *request, const char **error) {
     char *dockerfile = request_string(request, "dockerfile");
     ContainerRuntime runtime = provider && !strcmp(provider, "docker") ? RUNTIME_DOCKER : RUNTIME_WSLC;
     unsigned cpus = container_number(request, "cpus", 4);
-    unsigned memory = container_number(request, "memoryInGB", 8);
+    unsigned memory = container_number(request, "memoryInMB", 8192);
     bool ok = false;
     StringBuilder output = {0};
-    *error = "Enter a container name, a valid image reference, and CPU/memory limits between 1 and 128.";
+    *error = "Enter a container name, a valid image reference, 1 to 128 CPUs, and 128 MB to 1 TB of memory.";
     if (dockerfile && (!*dockerfile || strlen(dockerfile) > 1000000)) goto done;
     if (!valid_container_name(name) || !provider || (strcmp(provider, "wsl.container") && strcmp(provider, "docker")) ||
         !image || !*image || strlen(image) > 512 ||
         strspn(image, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-/:@") != strlen(image) ||
-        !cpus || cpus > 128 || !memory || memory > 128)
+        !cpus || cpus > 128 || memory < 128 || memory > 1048576)
         goto done;
     if (!strcmp(image, "outershell/container-base:21")) {
         const char *inspect[] = {"image", "inspect", image, NULL};
@@ -164,7 +164,7 @@ static bool create_container(Wsl *w, HttpRequest *request, const char **error) {
     StringBuilder mount = {0};
     if (context) { append(&mount, "type=bind,source="); append(&mount, context); append(&mount, ",target=/var/lib/outershell/project"); }
     snprintf(cpu_text, sizeof(cpu_text), "%u", cpus);
-    snprintf(memory_text, sizeof(memory_text), "%uG", memory);
+    snprintf(memory_text, sizeof(memory_text), "%uM", memory);
     ContainerArguments args = {0};
     const char *prefix[] = {"run", "--detach", "--name", runtime_name, "--cpus", cpu_text,
                            "--memory", memory_text, "--mount", mount.data};
@@ -256,7 +256,9 @@ static void discover_containers(Wsl *w, ContainerRuntime runtime) {
                 *newline = 0;
                 free(d->name);
                 d->name = win_strdup(metadata.data);
-                sscanf(newline + 1, "%u\n%u", &d->cpus, &d->memory_gb);
+                char unit[3] = {0};
+                sscanf(newline + 1, "%u\n%u\n%2s", &d->cpus, &d->memory_mb, unit);
+                if (strcmp(unit, "mb") != 0) d->memory_mb *= 1024;
             }
             free(metadata.data);
             free(path);
@@ -332,7 +334,7 @@ static void container_snapshot(Distribution *d, StringBuilder *json) {
     append(json, ",\"ownsContainer\":");
     append(json, d->managed ? "true" : "false");
     char limits[100];
-    snprintf(limits, sizeof(limits), ",\"userName\":\"root\",\"cpus\":%u,\"memoryInGB\":%u,", d->cpus, d->memory_gb);
+    snprintf(limits, sizeof(limits), ",\"userName\":\"root\",\"cpus\":%u,\"memoryInMB\":%u,", d->cpus, d->memory_mb);
     append(json, limits);
     append(json, "\"runtime\":{");
     field(json, "providerID", container_provider_id(d->container));

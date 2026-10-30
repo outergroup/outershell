@@ -7,7 +7,8 @@ param(
     [string]$VisualStudioRoot,
     [string]$FilesRoot,
     [string]$OuterLoopRoot = "$PSScriptRoot/../../outerloop/OuterLoop",
-    [string]$BundlesDirectory = "$PSScriptRoot/../build/outerframe/bundles"
+    [string]$BundlesDirectory = "$PSScriptRoot/../build/outerframe/bundles",
+    [string]$PublicBaseURL = 'https://outershell.org/outer-shell'
 )
 $ErrorActionPreference = 'Stop'
 if (!$FilesRoot) { $FilesRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..\Files')) }
@@ -32,7 +33,7 @@ if (!$CoreDirectory) {
 call "$VisualStudioRoot\Common7\Tools\VsDevCmd.bat" -no_logo -arch=$Architecture -host_arch=$hostArchitecture
 if errorlevel 1 exit /b %errorlevel%
 set "PATH=$llvm;$ninja;%PATH%"
-"$cmake" -S "$PSScriptRoot" -B "$CoreDirectory" -G Ninja -DOUTERSHELL_UPDATE_TESTS=$updateTestsValue -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang-cl -DCMAKE_C_COMPILER_TARGET=$triple -DFILES_ROOT="$FilesRoot"
+"$cmake" -S "$PSScriptRoot" -B "$CoreDirectory" -G Ninja -DOUTERSHELL_UPDATE_TESTS=$updateTestsValue -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang-cl -DCMAKE_C_COMPILER_TARGET=$triple -DFILES_ROOT="$FilesRoot" -DOUTERSHELL_PUBLIC_BASE_URL="$PublicBaseURL"
 if errorlevel 1 exit /b %errorlevel%
 "$cmake" --build "$CoreDirectory" --parallel 4
 exit /b %errorlevel%

@@ -432,7 +432,7 @@ struct CommandRequest {
     const char *projectResourceKey = "";
     uint64_t createdAtMilliseconds = 0;
     uint32_t cpus = 2;
-    uint32_t memoryInGB = 2;
+    uint32_t memoryInMB = 2048;
     bool usedDeprecatedIcons = false;
     bool readSudoPasswordFromStdin = false;
 };
@@ -783,11 +783,11 @@ bool parseCommandRequest(int argc, char *argv[], CommandRequest &request, Buffer
                 assignCString(errorMessage, "Invalid --cpus value.");
                 return false;
             }
-        } else if (strcmp(arg, "--memory-gb") == 0) {
+        } else if (strcmp(arg, "--memory-mb") == 0) {
             const char *raw = nullptr;
-            REQUIRE_VALUE("--memory-gb", raw);
-            if (!parseUInt32(raw, 1048576, request.memoryInGB) || request.memoryInGB == 0) {
-                assignCString(errorMessage, "Invalid --memory-gb value.");
+            REQUIRE_VALUE("--memory-mb", raw);
+            if (!parseUInt32(raw, 1073741824, request.memoryInMB) || request.memoryInMB == 0) {
+                assignCString(errorMessage, "Invalid --memory-mb value.");
                 return false;
             }
         } else if (strcmp(arg, "--created-at-milliseconds") == 0) {
@@ -952,7 +952,7 @@ bool appendCommandRequestMessage(Buffer &message, const CommandRequest &request)
         ok = ok &&
             appendLittleEndianUInt16(message, request.flags) &&
             appendLittleEndianUInt32(message, request.cpus) &&
-            appendLittleEndianUInt32(message, request.memoryInGB) &&
+            appendLittleEndianUInt32(message, request.memoryInMB) &&
             appendLittleEndianUInt64(message, request.createdAtMilliseconds) &&
             appendStringRefs(message, values, 5);
         break;

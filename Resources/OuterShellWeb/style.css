@@ -1337,4 +1337,4 @@ body .container-editor { touch-action: pan-x pan-y; }
 #bash-form .field > textarea { min-height: 170px; padding: 12px; }
 #bash-form .dialog-footer { padding: 18px 0 0; margin-top: 12px; }
 
-.overview-add-more:hover, .overview-add-container:hover, .overview-controls [data-action="edit-container"]:hover { border-color: var(--line-strong); }
+.overview-add-more:hover, .overview-controls [data-action="edit-container"]:hover { border-color: var(--line-strong); }

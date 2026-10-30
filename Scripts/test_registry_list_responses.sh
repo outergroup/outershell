@@ -43,7 +43,7 @@ import struct
 import sys
 
 sizes = [68, 80, 32, 32, 96, 56, 32, 104]
-counts = [1, 1, 1, 0, 0, 0, 0, 0]
+counts = [1, 1, 1, 0, 0, 0, 0, 1]
 data = bytearray(b'ORWA' + struct.pack('<I', 1) + bytes(160))
 offsets = []
 for table, (size, count) in enumerate(zip(sizes, counts)):
@@ -68,6 +68,13 @@ struct.pack_into('<HHHH', data, app + 40, 1, 0, 1, 0)
 ref(app + 48, '/legacy')
 ref(app + 56, '127.0.0.1')
 struct.pack_into('<H', data, app + 64, 8123)
+container = offsets[7]
+ref(container, 'b1d7e6a4-0c55-4a51-9d0c-2f6f1f0e6a31', 64)
+ref(container + 16, 'Legacy container', 64)
+ref(container + 32, 'docker', 64)
+ref(container + 48, 'legacy-runtime', 64)
+ref(container + 64, 'containers/legacy/recipe', 64)
+struct.pack_into('<QIII', data, container + 80, 1787616000000, 2, 3, 1)
 ref(layout, 'legacy.app', 64)
 ref(layout + 16, 'Retired user group', 64)
 Path(sys.argv[1]).write_bytes(data)
@@ -270,6 +277,15 @@ outerctl resource remove --key test/binary
 outerctl resource get --key test/binary >"$build_dir/resource-removed.bin"
 [ ! -s "$build_dir/resource-removed.bin" ]
 
+legacy_container_id="b1d7e6a4-0c55-4a51-9d0c-2f6f1f0e6a31"
+outerctl container list >"$build_dir/legacy-container.tsv"
+awk -F '\t' -v id="$legacy_container_id" '
+    NR == 1 && $8 == "memory_mb" { header = 1 }
+    $1 == id && $7 == "2" && $8 == "3072" && $9 == "1" { found = 1 }
+    END { exit !(header && found) }
+' "$build_dir/legacy-container.tsv"
+outerctl container remove --container "$legacy_container_id"
+
 container_id="54a0a9ae-71f2-4dfa-a69e-3b875ca20a0f"
 outerctl container upsert \
     --container "$container_id" \
@@ -279,13 +295,13 @@ outerctl container upsert \
     --project-key containers/science/recipe \
     --created-at-milliseconds 1787616000000 \
     --cpus 6 \
-    --memory-gb 12 \
+    --memory-mb 1536 \
     --outershell-owns false
 outerctl container list >"$build_dir/container.tsv"
 awk -F '\t' -v id="$container_id" '
     NR == 2 && $1 == id && $2 == "Science" && $3 == "docker" &&
         $4 == "science-runtime" && $5 == "containers/science/recipe" &&
-        $7 == "6" && $8 == "12" && $9 == "0" { found = 1 }
+        $7 == "6" && $8 == "1536" && $9 == "0" { found = 1 }
     END { exit !found }
 ' "$build_dir/container.tsv"
 outerctl container remove --container "$container_id"

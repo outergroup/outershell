@@ -7,7 +7,10 @@
 #ifndef OUTERSHELL_VERSION
 #define OUTERSHELL_VERSION "0.0.0"
 #endif
-#define UPDATE_SOURCE "https://outershell.org/outer-shell"
+#ifndef OUTERSHELL_PUBLIC_BASE_URL
+#define OUTERSHELL_PUBLIC_BASE_URL "https://outershell.org/outer-shell"
+#endif
+#define UPDATE_SOURCE OUTERSHELL_PUBLIC_BASE_URL
 static CRITICAL_SECTION update_gate;
 static HANDLE update_thread;
 static char update_version[128];
@@ -35,13 +38,40 @@ static bool update_valid_version(const char *v) {
     return v && strlen(v) < 128 && isdigit((unsigned char)v[0]) &&
         sscanf(v, "%u.%u.%u%c", &a, &b, &c, &extra) == 3 && a <= 65535 && b <= 65535 && c <= 65535;
 }
+static bool update_source_parts(const char *source, char *host, size_t host_capacity, char *path, size_t path_capacity) {
+    static const char scheme[] = "https://";
+    if (strncmp(source, scheme, strlen(scheme))) return false;
+    const char *start = source + strlen(scheme), *slash = strchr(start, '/');
+    size_t host_length = slash ? (size_t)(slash - start) : strlen(start);
+    if (!host_length || host_length >= host_capacity) return false;
+    for (size_t i = 0; i < host_length; i++) {
+        unsigned char c = (unsigned char)start[i];
+        if (!isalnum(c) && c != '.' && c != '-') return false;
+    }
+    const char *rest = slash ? slash : "";
+    size_t path_length = strlen(rest);
+    while (path_length && rest[path_length - 1] == '/') path_length--;
+    if (path_length >= path_capacity) return false;
+    for (size_t i = 0; i < path_length; i++) {
+        unsigned char c = (unsigned char)rest[i];
+        if (!isalnum(c) && c != '/' && c != '.' && c != '-' && c != '_' && c != '~') return false;
+    }
+    memcpy(host, start, host_length); host[host_length] = '\0';
+    memcpy(path, rest, path_length); path[path_length] = '\0';
+    return true;
+}
 static bool update_fetch(const wchar_t *path, HANDLE file, StringBuilder *text, char *error, size_t capacity) {
     HINTERNET session = WinHttpOpen(L"Outer Shell Updates", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, NULL, NULL, 0);
     HINTERNET connection = NULL, request = NULL;
     bool ok = false;
-    if (!session) goto done;
+    char host[256], source_path[512];
+    wchar_t *host_w = NULL;
+    if (!update_source_parts(UPDATE_SOURCE, host, sizeof(host), source_path, sizeof(source_path))) {
+        snprintf(error, capacity, "The update source is not a valid HTTPS URL."); goto done;
+    }
+    if (!session || !(host_w = win_wide(host))) goto done;
     WinHttpSetTimeouts(session, 10000, 10000, 30000, 30000);
-    connection = WinHttpConnect(session, L"outershell.org", INTERNET_DEFAULT_HTTPS_PORT, 0);
+    connection = WinHttpConnect(session, host_w, INTERNET_DEFAULT_HTTPS_PORT, 0);
     if (!connection) goto done;
     request = WinHttpOpenRequest(connection, L"GET", path, NULL, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
     if (!request) goto done;
@@ -69,6 +99,7 @@ done:
     if (request) WinHttpCloseHandle(request);
     if (connection) WinHttpCloseHandle(connection);
     if (session) WinHttpCloseHandle(session);
+    free(host_w);
     return ok;
 }
 static bool update_query_value(StringBuilder *out, const char *value) {
@@ -85,7 +116,9 @@ static bool update_query_value(StringBuilder *out, const char *value) {
 }
 static bool update_query(StringBuilder *out, const char *heartbeat, const char *version,
                          const char *os_version, const char *arch) {
-    return sb_append(out, "/outer-shell/latest/windows-version.txt?heartbeat=") &&
+    char host[256], path[512];
+    return update_source_parts(UPDATE_SOURCE, host, sizeof(host), path, sizeof(path)) &&
+        sb_append(out, path) && sb_append(out, "/latest/windows-version.txt?heartbeat=") &&
         update_query_value(out, heartbeat) && sb_append(out, "&os=windows&osVersion=") &&
         update_query_value(out, os_version) && sb_append(out, "&arch=") &&
         update_query_value(out, arch) && sb_append(out, "&serviceManager=task-scheduler&appVersion=") &&
@@ -207,8 +240,11 @@ static bool update_stage(UpdateFetch fetch, char *error, size_t capacity) {
     HANDLE file = ok && setup_w ? CreateFileW(setup_w, GENERIC_READ | GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL) : INVALID_HANDLE_VALUE;
     SYSTEM_INFO system; GetNativeSystemInfo(&system);
     const wchar_t *arch = system.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_ARM64 ? L"arm64" : system.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_AMD64 ? L"x64" : L"x86";
-    wchar_t url[160]; swprintf(url, 160, L"/outer-shell/latest/outer-shell-windows-%ls-setup.exe", arch);
-    ok = file != INVALID_HANDLE_VALUE && fetch(url, file, NULL, error, capacity);
+    char host[256], source_path[512];
+    wchar_t url[640];
+    ok = ok && update_source_parts(UPDATE_SOURCE, host, sizeof(host), source_path, sizeof(source_path)) &&
+        swprintf(url, 640, L"%hs/latest/outer-shell-windows-%ls-setup.exe", source_path, arch) > 0;
+    ok = ok && file != INVALID_HANDLE_VALUE && fetch(url, file, NULL, error, capacity);
     if (file != INVALID_HANDLE_VALUE) { FlushFileBuffers(file); CloseHandle(file); }
     file = ok ? CreateFileW(setup_w, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL) : INVALID_HANDLE_VALUE;
     ok = ok && file != INVALID_HANDLE_VALUE && update_verify(setup_w, file);

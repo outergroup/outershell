@@ -28,7 +28,7 @@ case "$(uname -m)" in
     aarch64|arm64) architecture=aarch64 ;;
     *) echo 'Unsupported WSL architecture.' >&2; exit 1 ;;
 esac
-bridge="$state/outershelld/container-bootstrap/bin/musl/$architecture/outer-socket-bridge"
+bridge="$state/outershelld/container-bootstrap/bin/$architecture/outer-socket-bridge"
 if ! cmp -s "$bridge" /usr/local/bin/outer-socket-bridge; then
     sudo install -o root -g root -m 755 "$bridge" /usr/local/bin/outer-socket-bridge
 fi

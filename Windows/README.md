@@ -343,6 +343,13 @@ service setup, publisher configuration and signature-verification tests.
 
 ### Windows updates
 
+Each build has a public release base URL, which defaults to
+`https://outershell.org/outer-shell`. Release packaging sets it with
+`build.ps1 -PublicBaseURL`, which becomes the `OUTERSHELL_PUBLIC_BASE_URL` CMake
+cache value. It must be an HTTPS URL without a port. Update checks and update
+downloads use `<base>/latest/`, so an installer built for a release channel
+keeps updating from that channel. The paths below are shown for the default.
+
 Outer Shell checks `/outer-shell/latest/windows-version.txt` when the homepage
 requests `/api/backends`, at most once per day. The attempt timestamp persists across
 restarts, including failed checks. There is no startup check or periodic timer; an
@@ -462,3 +469,17 @@ inner Linux registry. A successful callback refreshes the homepage and guest sna
 Build with `-UpdateTests` and run `OuterShellIconTests.exe ..\app-icon.png` for
 cache/token/image validation. `test_host.py` also covers the named-pipe callback,
 origin enforcement, returned icon bytes, and persistence after restarting the host.
+
+### Uninstall from the homepage
+
+The `uninstallOuterShell` control action verifies the installed `unins000.exe`
+signature and schedules it with fixed silent arguments under the signed-in user's
+least-privilege interactive token. Its separate task starts five seconds later,
+allowing the API response to reach the client and the host to exit gracefully
+before the uninstaller removes its executable.
+The one-time trigger expires after five minutes and Task Scheduler removes the task
+an hour after expiration. App data, custom command tasks, and containers follow the
+same preservation rules as uninstalling through Windows Settings. A missing or
+untrusted uninstaller returns an actionable error without scheduling anything.
+`OuterShellUpdateFixture.exe uninstall-plan` tests the task definition; the native
+host test verifies that the homepage action reaches the uninstall handler.

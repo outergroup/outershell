@@ -28,6 +28,23 @@ if ! command -v lipo >/dev/null 2>&1; then
     exit 1
 fi
 
+CODESIGN_IDENTITY="${OUTER_SHELL_CODESIGN_IDENTITY:--}"
+NOTARY_PROFILE="${OUTER_SHELL_NOTARY_PROFILE:-}"
+WORK_ROOT="$(mktemp -d)"
+trap 'rm -rf "$WORK_ROOT" "$WORK_ROOT.zip"' EXIT
+PREPARED_PLATFORMS=()
+PREPARED_ROOTS=()
+PREPARED_BUNDLES=()
+PREPARED_ARCHIVES=()
+
+macos_codesign_args() {
+    if [[ "$CODESIGN_IDENTITY" == "-" ]]; then
+        printf '%s\n' --force --sign - --timestamp=none
+    else
+        printf '%s\n' --force --options runtime --timestamp --sign "$CODESIGN_IDENTITY"
+    fi
+}
+
 bundle_executable_name() {
     local bundle_path="$1"
     local info_plist="$bundle_path/Contents/Info.plist"
@@ -60,7 +77,8 @@ archive_platform_bundle() {
     local thinned_executable
     local executable_archs
 
-    temp_root="$(mktemp -d)"
+    temp_root="$WORK_ROOT/$platform"
+    mkdir -p "$temp_root"
     temp_bundle="$temp_root/$archive_bundle_name"
     cp -R "$source_bundle" "$temp_bundle"
 
@@ -100,17 +118,47 @@ archive_platform_bundle() {
     fi
 
     if command -v /usr/bin/codesign >/dev/null 2>&1; then
-        /usr/bin/codesign --force --sign - --timestamp=none "$temp_bundle" >/dev/null
+        local codesign_args=()
+        while IFS= read -r arg; do
+            codesign_args+=("$arg")
+        done < <(macos_codesign_args)
+        /usr/bin/codesign "${codesign_args[@]}" "$temp_bundle" >/dev/null
     fi
 
-    "$AA_TOOL" archive \
-        -d "$temp_root" \
-        -subdir "$(basename "$temp_bundle")" \
-        -o "$archive_path" \
-        -a lzfse
+    PREPARED_PLATFORMS+=("$platform")
+    PREPARED_ROOTS+=("$temp_root")
+    PREPARED_BUNDLES+=("$temp_bundle")
+    PREPARED_ARCHIVES+=("$archive_path")
+}
 
-    rm -rf "$temp_root"
-    echo "Archived $platform bundle at $archive_path"
+notarize_prepared_bundles_if_requested() {
+    if [[ -z "$NOTARY_PROFILE" ]]; then
+        return 0
+    fi
+    if [[ "$CODESIGN_IDENTITY" == "-" ]]; then
+        echo "error: a notary profile requires a Developer ID codesign identity" >&2
+        exit 1
+    fi
+    /usr/bin/ditto -c -k --norsrc "$WORK_ROOT" "$WORK_ROOT.zip"
+    xcrun notarytool submit "$WORK_ROOT.zip" \
+        --keychain-profile "$NOTARY_PROFILE" \
+        --wait
+    local bundle
+    for bundle in "${PREPARED_BUNDLES[@]}"; do
+        xcrun stapler staple "$bundle"
+    done
+}
+
+archive_prepared_bundles() {
+    local index
+    for index in "${!PREPARED_BUNDLES[@]}"; do
+        "$AA_TOOL" archive \
+            -d "${PREPARED_ROOTS[$index]}" \
+            -subdir "$(basename "${PREPARED_BUNDLES[$index]}")" \
+            -o "${PREPARED_ARCHIVES[$index]}" \
+            -a lzfse
+        echo "Archived ${PREPARED_PLATFORMS[$index]} bundle at ${PREPARED_ARCHIVES[$index]}"
+    done
 }
 
 mkdir -p "$DESTINATION_DIR"
@@ -127,3 +175,5 @@ else
 fi
 archive_platform_bundle "$SOURCE_BUNDLE" "$DESTINATION_DIR" "macos-arm" "arm64" "$DESTINATION_DIR/$ARCHIVE_STEM.macos-arm.aar" "$ARCHIVE_BUNDLE_NAME"
 archive_platform_bundle "$SOURCE_BUNDLE" "$DESTINATION_DIR" "macos-x86" "x86_64" "$DESTINATION_DIR/$ARCHIVE_STEM.macos-x86.aar" "$ARCHIVE_BUNDLE_NAME"
+notarize_prepared_bundles_if_requested
+archive_prepared_bundles

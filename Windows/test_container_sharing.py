@@ -134,7 +134,7 @@ def binary(t,operation,offset=0,chunk=b'',length=1000000):
  return header,response[header[5]:header[5]+header[6]]
 try:
  name='Sharing test '+uuid.uuid4().hex
- op('create',runtimeProviderID='docker',name=name,baseImage='outershell/windows-test:1',cpus=2,memoryInGB=2)
+ op('create',runtimeProviderID='docker',name=name,baseImage='outershell/windows-test:1',cpus=2,memoryInMB=2048)
  for _ in range(30):
   w=next((w for w in snapshot()['workspaces'] if w['name']==name),None)
   if w:break
@@ -157,7 +157,7 @@ try:
  # Generate the existing Unix archive format independently.
  memory=io.BytesIO()
  with tarfile.open(fileobj=memory,mode='w:gz') as tar:
-  values={'manifest.orwv':codec['offset_archive_encode']({'version':2,'name':'Unix import '+uuid.uuid4().hex,'cpus':2,'memoryInGB':2,'includedMounts':[],'omittedMounts':[]}),
+  values={'manifest.orwv':codec['offset_archive_encode']({'version':2,'name':'Unix import '+uuid.uuid4().hex,'cpus':2,'memoryInMB':2,'includedMounts':[],'omittedMounts':[]}),
           'Recipe/recipe.orwv':codec['offset_archive_encode']({'baseImage':'outershell/windows-test:1','mounts':[],'environment':[{'name':'FROM_UNIX','value':'yes'}],'publishedPorts':[]}),
           'Recipe/Dockerfile':b'FROM outershell/windows-test:1\nRUN echo unix > /from-unix\n'}
   for name,value in values.items():
@@ -197,7 +197,7 @@ try:
   inner.addfile(info,io.BytesIO(b'persistent contents'))
   info=tarfile.TarInfo('linux:name');info.type=tarfile.SYMTYPE;info.linkname='saved.txt';inner.addfile(info)
  with tarfile.open(fileobj=memory,mode='w:gz') as tar:
-  values={'manifest.orwv':codec['offset_archive_encode']({'version':2,'name':transfer_name,'cpus':2,'memoryInGB':2,'includedMounts':[mount],'omittedMounts':[]}),
+  values={'manifest.orwv':codec['offset_archive_encode']({'version':2,'name':transfer_name,'cpus':2,'memoryInMB':2,'includedMounts':[mount],'omittedMounts':[]}),
           'Recipe/recipe.orwv':codec['offset_archive_encode'](recipe), 'Recipe/Dockerfile':b'FROM outershell/windows-test:1\nVOLUME /saved\n',
           f'Mounted Folders/{mount_id}/hello.txt':b'mounted contents',f'Volume Archives/{data_id}.tar':volume.getvalue()}
   for name,value in values.items():
@@ -220,7 +220,7 @@ try:
  for unsafe in ('../escape.txt','Recipe/linked','Recipe/hardlinked','Recipe/CON'):
   memory=io.BytesIO()
   with tarfile.open(fileobj=memory,mode='w:gz') as tar:
-   safe_values={'manifest.orwv':codec['offset_archive_encode']({'version':2,'name':'Unsafe archive test','cpus':2,'memoryInGB':2,'includedMounts':[],'omittedMounts':[]}),
+   safe_values={'manifest.orwv':codec['offset_archive_encode']({'version':2,'name':'Unsafe archive test','cpus':2,'memoryInMB':2,'includedMounts':[],'omittedMounts':[]}),
                 'Recipe/recipe.orwv':codec['offset_archive_encode']({'mounts':[],'environment':[],'publishedPorts':[]}),
                 'Recipe/Dockerfile':b'FROM outershell/windows-test:1\nVOLUME /saved\n','Recipe/source.txt':b'safe'}
    for safe_name,value in safe_values.items():

@@ -167,6 +167,9 @@ with tempfile.TemporaryDirectory(prefix='outer-c-test-') as temporary:
         assert request(pipe, '/api/layout', b'OSLAY001' + bytes(8) + b'{broken}', 'POST')[0] == 400
         assert request(pipe, '/api/control?serviceID=org.outershell.Files&operation=stop', method='POST', extra=b'Origin: http://evil.invalid\r\n')[0] == 403
         assert request(pipe, '/api/control')[0] == 405
+        status, uninstall = request(pipe, '/api/control?serviceID=org.outershell.OuterShell&operation=uninstallOuterShell&scope=user', method='POST')
+        assert status == 200 and struct.unpack_from('<I', uninstall)[0] == 0
+        assert b'uninstaller is missing' in ref(uninstall, 4), uninstall
         assert raw(pipe, b'GET / HTTP/1.1\r\nHost: x\r\nHost: x\r\n\r\n')[0] == 400
         assert raw(pipe, b'POST / HTTP/1.1\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\r\n\r\n')[0] == 400
         assert raw(pipe, b'POST / HTTP/1.1\r\nContent-Length: 16777217\r\n\r\n')[0] == 400

@@ -34,7 +34,7 @@ struct Distribution {
     HANDLE build_thread;
     char *build_error;
     ContainerRuntime container;
-    unsigned cpus, memory_gb;
+    unsigned cpus, memory_mb;
     char *runtime_id;
     StringBuilder apps;
     StringBuilder endpoint_names;
@@ -1096,7 +1096,7 @@ static void publish_snapshot(Wsl *w) {
         append(&snapshot, ",");
         field(&snapshot, "state", d->running ? "running" : "stopped");
         append(&snapshot, ",\"runtimeKind\":\"wsl\",\"managementKind\":\"attached\","
-                          "\"ownsContainer\":false,\"cpus\":0,\"memoryInGB\":0,\"shellCommand\":\"\","
+                          "\"ownsContainer\":false,\"cpus\":0,\"memoryInMB\":0,\"shellCommand\":\"\","
                           "\"runtime\":{\"providerID\":\"wsl\",\"providerName\":\"WSL\","
                           "\"operatingSystemName\":\"Linux\",\"operatingSystemVersion\":\"\","
                           "\"architecture\":\"\",\"isolationKind\":\"wsl\",\"isolationName\":\"\"},"
@@ -1482,7 +1482,7 @@ void wsl_serve(Wsl *w, Connection *c, HttpRequest *r) {
     } else if (d->container && !strcmp(operation, "rename")) {
         char *name = request_string(r, "name");
         if (d->managed && valid_container_name(name)) {
-            ok = save_container_metadata(d->id, name, d->cpus, d->memory_gb);
+            ok = save_container_metadata(d->id, name, d->cpus, d->memory_mb);
         }
         free(name);
         error = "The container name could not be saved.";

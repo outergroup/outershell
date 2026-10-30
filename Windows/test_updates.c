@@ -14,6 +14,17 @@ static bool fixture_download(const wchar_t *url, HANDLE file, StringBuilder *tex
     }
     CloseHandle(source); return ok;
 }
+static void test_update_source(void) {
+    char host[256], path[512];
+    assert(update_source_parts("https://outershell.org/outer-shell/dev/", host, sizeof(host), path, sizeof(path)));
+    assert(!strcmp(host, "outershell.org") && !strcmp(path, "/outer-shell/dev"));
+    assert(update_source_parts("https://updates.example.com", host, sizeof(host), path, sizeof(path)));
+    assert(!strcmp(host, "updates.example.com") && !strcmp(path, ""));
+    assert(!update_source_parts("http://outershell.org/outer-shell", host, sizeof(host), path, sizeof(path)));
+    assert(!update_source_parts("https://outershell.org:8443/outer-shell", host, sizeof(host), path, sizeof(path)));
+    assert(!update_source_parts("https://outershell.org/outer shell", host, sizeof(host), path, sizeof(path)));
+    assert(!update_source_parts("https:///outer-shell", host, sizeof(host), path, sizeof(path)));
+}
 static void test_reporting(void) {
     StringBuilder query = {0};
     assert(update_query(&query, "day bucket", "0.2.7+dev", "10.0.26200", "arm64"));
@@ -59,7 +70,17 @@ int wmain(int argc, wchar_t **argv) {
     assert(!update_newer("0.1.9", "0.2.0"));
     assert(update_valid_version("0.2.7"));
     assert(!update_valid_version("../../setup.exe"));
-    if (argc == 2 && !wcscmp(argv[1], L"reporting")) { test_reporting(); return 0; }
+    if (argc == 2 && !wcscmp(argv[1], L"reporting")) { test_update_source(); test_reporting(); return 0; }
+    if (argc == 2 && !wcscmp(argv[1], L"uninstall-plan")) {
+        SYSTEMTIME time = {0}; time.wYear = 2026; time.wMonth = 10; time.wDay = 30; time.wHour = 23; time.wMinute = 59; time.wSecond = 58;
+        FILETIME filetime; assert(SystemTimeToFileTime(&time, &filetime));
+        ULARGE_INTEGER ticks; ticks.LowPart = filetime.dwLowDateTime; ticks.HighPart = filetime.dwHighDateTime;
+        StringBuilder xml = uninstall_definition("C:\\Users\\A&B\\unins000.exe", "S-1-5-21-1", ticks.QuadPart);
+        assert(xml.data && strstr(xml.data, "2026-10-31T00:00:03Z") && strstr(xml.data, "2026-10-31T00:04:58Z"));
+        assert(strstr(xml.data, "A&amp;B") && strstr(xml.data, "<RunLevel>LeastPrivilege</RunLevel>"));
+        assert(strstr(xml.data, "<LogonType>InteractiveToken</LogonType>") && strstr(xml.data, "<DeleteExpiredTaskAfter>PT1H</DeleteExpiredTaskAfter>"));
+        free(xml.data); puts("PASS deferred ordinary-user uninstall task, expiration, XML escaping, and UTC day rollover"); return 0;
+    }
     if (argc != 3) return 2;
     fixture = argv[2];
     HANDLE file = CreateFileW(fixture, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);

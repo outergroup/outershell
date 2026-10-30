@@ -5,7 +5,61 @@ struct ContainerRuntimeReadiness {
     let status: String
     let detail: String
     let setupURL: String
+    var resources: ContainerResourceLimits? = nil
     var isAvailable: Bool { status == "ready" }
+}
+
+struct ContainerResourceLimits: Equatable {
+    static let preferredCPUs = 4
+    static let preferredMemoryInMB = 8192
+    static let minimumMemoryInMB = 128
+
+    let maxCPUs: Int
+    let maxMemoryInMB: Int
+
+    init(cpus: Int, memoryBytes: Int64) {
+        maxCPUs = max(cpus, 1)
+        maxMemoryInMB = max(Int(memoryBytes / 1_048_576), Self.minimumMemoryInMB)
+    }
+
+    init?(dockerInfo: String) {
+        let fields = dockerInfo.split(whereSeparator: \.isWhitespace)
+        guard fields.count == 2, let cpus = Int(fields[0]), let memory = Int64(fields[1]) else { return nil }
+        self.init(cpus: cpus, memoryBytes: memory)
+    }
+
+    static var host: ContainerResourceLimits {
+        .init(cpus: ProcessInfo.processInfo.activeProcessorCount,
+              memoryBytes: Int64(clamping: ProcessInfo.processInfo.physicalMemory))
+    }
+
+    var defaultCPUs: Int { min(Self.preferredCPUs, maxCPUs) }
+    var defaultMemoryInMB: Int { min(Self.preferredMemoryInMB, maxMemoryInMB) }
+
+    var dictionary: [String: Int] {
+        ["maxCPUs": maxCPUs, "maxMemoryInMB": maxMemoryInMB,
+         "defaultCPUs": defaultCPUs, "defaultMemoryInMB": defaultMemoryInMB]
+    }
+
+    func validated(cpus: Any?, memoryInMB: Any?) -> Result<(cpus: Int, memoryInMB: Int), ContainerResourceError> {
+        let cpus = cpus.map { $0 as? Int } ?? defaultCPUs
+        let memory = memoryInMB.map { $0 as? Int } ?? defaultMemoryInMB
+        guard let cpus, (1...maxCPUs).contains(cpus) else {
+            return .failure(.init(message: "Choose between 1 and \(maxCPUs) CPUs. This runtime has \(maxCPUs)."))
+        }
+        guard let memory, (Self.minimumMemoryInMB...maxMemoryInMB).contains(memory) else {
+            return .failure(.init(message: "Choose between \(Self.minimumMemoryInMB) MB and \(maxMemoryInMB) MB of memory. This runtime has \(maxMemoryInMB) MB."))
+        }
+        return .success((cpus, memory))
+    }
+
+    func runnable(cpus: Int, memoryInMB: Int) -> (cpus: Int, memoryInMB: Int) {
+        (min(max(cpus, 1), maxCPUs), min(max(memoryInMB, Self.minimumMemoryInMB), maxMemoryInMB))
+    }
+}
+
+struct ContainerResourceError: Error {
+    let message: String
 }
 
 enum ContainerRuntime {
@@ -34,9 +88,10 @@ enum ContainerRuntime {
                 : "Install and open Docker Desktop on this server, finish its setup, then choose Check again.", setupURL: url)
         }
         do {
-            let result = try probe(executable, apple ? ["system", "status"] : ["info", "--format", "{{.ServerVersion}}"])
+            let result = try probe(executable, apple ? ["system", "status"] : ["info", "--format", "{{.NCPU}} {{.MemTotal}}"])
             if result.0 == 0 {
-                return .init(status: "ready", detail: apple ? "Apple container is ready on this server." : "Docker is ready using this server user's configured Docker endpoint.", setupURL: url)
+                return .init(status: "ready", detail: apple ? "Apple container is ready on this server." : "Docker is ready using this server user's configured Docker endpoint.", setupURL: url,
+                             resources: apple ? .host : ContainerResourceLimits(dockerInfo: result.1))
             }
             let message = result.1.lowercased()
             let stopped = message.contains("cannot connect") || message.contains("connection refused") ||

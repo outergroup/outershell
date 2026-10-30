@@ -3,12 +3,12 @@ from unittest.mock import patch,Mock
 p=runpy.run_path(str(pathlib.Path(__file__).resolve().parents[1] / 'Resources/outershell-container-provider'))
 f=p['ensure_container_socket_bridge']
 with tempfile.TemporaryDirectory() as d:
- root=pathlib.Path(d);src=root/'bin/glibc/aarch64/outer-socket-bridge';src.parent.mkdir(parents=True);src.write_bytes(b'bridge')
+ root=pathlib.Path(d);src=root/'bin/aarch64/outer-socket-bridge';src.parent.mkdir(parents=True);src.write_bytes(b'bridge')
  calls=[]
  def execute(cid,args,**kw):
   calls.append((args,kw))
   if len(calls)==1:return subprocess.CompletedProcess(args,127,'','missing loader')
-  if len(calls)==2:return subprocess.CompletedProcess(args,0,'glibc/aarch64','')
+  if len(calls)==2:return subprocess.CompletedProcess(args,0,'aarch64','')
   return subprocess.CompletedProcess(args,0,'outer-socket-bridge 1','')
  copy=Mock()
  with patch.dict(f.__globals__,container_exec=execute,provider_resources=lambda:root,docker=copy,container_name=lambda _: 'test'):
