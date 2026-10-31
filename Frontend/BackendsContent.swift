@@ -1771,6 +1771,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private var endpointIcons: [String: CGImage] = [:]
     private var terminalSymbolImages: [URL: CGImage] = [:]
     private var pendingIconURLs: Set<String> = []
+    private var isUninstallingOuterShell = false
     private var urlSession: URLSession?
     private var backendsEndpoint: URL?
     private var logsEndpoint: URL?
@@ -2641,6 +2642,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func recoverNetworkingIfNeeded(after error: Error) -> Bool {
+        guard !isUninstallingOuterShell else { return false }
         let nsError = error as NSError
         guard nsError.domain == NSURLErrorDomain else { return false }
         switch nsError.code {
@@ -4406,7 +4408,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             top = frame.maxY - 80 - appsHeight
             if let workspace = group.workspace, commandCount > 0 {
                 let label = makeTextLayer(size: 12, weight: .medium, color: .secondaryLabelColor)
-                label.string = "Command line tools"
+                label.string = "Terminal commands"
                 label.frame = CGRect(x: frame.minX + 16, y: top - 32, width: innerWidth, height: 18)
                 addAppsSublayer(label)
                 top -= 38
@@ -5368,7 +5370,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         renderContainerCopyCommandRow(
             workspace: workspace,
             keySuffix: "terminal-command",
-            title: "Terminal",
+            title: "Open terminal in container",
             symbolName: "apple.terminal",
             operation: "copyShell",
             frame: frame,
@@ -9419,7 +9421,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         }
         for target in workspaceOverviewActionFrames {
             if let frame = accessibilityFrame(target.frame, from: appsScrollContentLayer, clippedBy: clipFrame) {
-                let label = target.operation == "menu" ? "Manage \(target.workspace.name)" : target.operation == "editContainer" ? "Edit \(target.workspace.name)" : target.operation == "viewBuildLog" ? "View build log for \(target.workspace.name)" : target.operation == "copyShell" ? "Copy Terminal command" : "Copy \(target.workspace.commandLaunchers.first(where: { "copyCommand:\($0.id)" == target.operation })?.displayName ?? "command") command"
+                let label = target.operation == "menu" ? "Manage \(target.workspace.name)" : target.operation == "editContainer" ? "Edit \(target.workspace.name)" : target.operation == "viewBuildLog" ? "View build log for \(target.workspace.name)" : target.operation == "copyShell" ? "Copy command to open terminal in container" : "Copy \(target.workspace.commandLaunchers.first(where: { "copyCommand:\($0.id)" == target.operation })?.displayName ?? "command") command"
                 nodes.append(accessibilityNode(nextIdentifier: &nextIdentifier, role: .button, frame: frame, label: label, key: "workspace-action:\(target.workspace.id):\(target.operation):\(overviewGroupFrames.first { $0.frame.contains(target.frame.origin) }?.id ?? "")"))
             }
         }
@@ -10197,17 +10199,26 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                     self.backendError = statusCode.map { "Control request failed with HTTP \($0)." } ?? "Control request failed."
                 }
                 if actionCompleted {
+                    if operation == "uninstallOuterShell" {
+                        self.isUninstallingOuterShell = true
+                        self.stopEventWatch()
+                        self.backendsRefreshGeneration += 1
+                        self.urlSession?.invalidateAndCancel()
+                        self.urlSession = nil
+                        self.nativeAppInstallSession?.invalidateAndCancel()
+                        self.nativeAppInstallSession = nil
+                        self.safeSpaceOperationSession?.invalidateAndCancel()
+                        self.safeSpaceOperationSession = nil
+                        self.backendError = "Outer Shell is uninstalling. This connection will close shortly."
+                        self.updateLayout()
+                        return
+                    }
                     self.applyOptimisticStatus(for: backend.serviceID,
                                                serviceScope: backend.serviceScope,
                                                operation: operation)
                     self.scheduleBackendsRefreshes()
                     self.fetchWorkspaceCatalog()
                     self.sendWorkspaceRequest(operation: "list")
-                    if operation == "uninstallOuterShell",
-                       let url = self.outerframeHost.pluginURL() {
-                        self.outerframeHost.navigate(to: url)
-                        return
-                    }
                     if operation == "update" {
                         self.reloadOuterShellAfterUpdate()
                         return

@@ -663,7 +663,7 @@
       id: `command:${command.id}`, name: command.displayName || command.id,
       text: command.containerCommand || command.shellCommand || "", internalText: command.internalCommand || "", iconURL: command.iconURL
     }));
-    if (workspace.shellCommand) commands.unshift({ id: "terminal", name: "Terminal", text: workspace.shellCommand });
+    if (workspace.shellCommand) commands.unshift({ id: "terminal", name: "Open terminal in container", text: workspace.shellCommand });
     return commands.filter(command => command.text.trim());
   }
 
@@ -672,7 +672,7 @@
     const commands = containerCommands(workspace);
     if (!commands.length) return "";
     const disabled = !safeSpaceIsRunning(workspace) || containerPreparing(workspace);
-    return `<section class="container-commands" aria-label="Command line tools"><h3>Command line tools</h3>${commands.map(command => `<button type="button" class="container-command" data-action="show-container-command" data-safe-space-id="${escapeHTML(workspace.id)}" data-command-id="${escapeHTML(command.id)}" aria-label="Copy command for ${escapeHTML(command.name)}" aria-haspopup="dialog" ${disabled ? 'disabled title="Start the container to use this tool"' : ""}><span class="address-status" aria-hidden="true"></span><span class="container-command-icon" aria-hidden="true">${command.iconURL ? `<img src="${escapeHTML(command.iconURL)}" alt="">` : '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="2.5" y="4" width="19" height="16" rx="3"/><path d="m6.5 9 3 3-3 3m6 0h5"/></svg>'}</span><span>${escapeHTML(command.name)}</span><span class="container-command-copy" aria-hidden="true">⧉</span></button>`).join("")}</section>`;
+    return `<section class="container-commands" aria-label="Terminal commands"><h3>Terminal commands</h3>${commands.map(command => `<button type="button" class="container-command" data-action="show-container-command" data-safe-space-id="${escapeHTML(workspace.id)}" data-command-id="${escapeHTML(command.id)}" aria-label="Copy command for ${escapeHTML(command.name)}" aria-haspopup="dialog" ${disabled ? 'disabled title="Start the container to use this tool"' : ""}><span class="address-status" aria-hidden="true"></span><span class="container-command-icon" aria-hidden="true">${command.iconURL ? `<img src="${escapeHTML(command.iconURL)}" alt="">` : '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="2.5" y="4" width="19" height="16" rx="3"/><path d="m6.5 9 3 3-3 3m6 0h5"/></svg>'}</span><span>${escapeHTML(command.name)}</span><span class="container-command-copy" aria-hidden="true">⧉</span></button>`).join("")}</section>`;
   }
 
   function shellQuotedArgument(value) {
@@ -1121,7 +1121,7 @@
     const platformNote = windows
       ? `<p>Outer Shell downloads ttyd for you and adds two apps: ttyd (PowerShell) and ttyd (Command Prompt). You can start, stop, and remove each one separately.</p>`
       : `<p><strong>On macOS</strong>, install ttyd first, then choose Install ttyd:</p><pre class="command-block">brew install ttyd</pre><p>On Linux, Outer Shell downloads ttyd for you. If tmux is installed, your session keeps running when you close the page.</p>`;
-    const dialog = openDialog(`<header class="dialog-header"><div class="dialog-title-wrap"><h2 id="dialog-title">ttyd</h2><p>A shell on this server, in your browser</p></div><button class="dialog-close" type="button" data-action="close-dialog" aria-label="Close">×</button></header>
+    const dialog = openDialog(`<header class="dialog-header"><div class="dialog-title-wrap"><h2 id="dialog-title">ttyd</h2><p>A terminal on this server, in your browser</p></div><button class="dialog-close" type="button" data-action="close-dialog" aria-label="Close">×</button></header>
       <div class="dialog-body agent-guide"><p><a href="https://github.com/tsl0922/ttyd" target="_blank" rel="noopener">ttyd</a> is an open-source terminal for the browser. It runs as your user and is reachable only through your Outer Loop connection.</p>${platformNote}
       <p class="form-message" role="status" aria-live="polite"></p></div>
       <footer class="dialog-footer"><button class="secondary-button" type="button" data-action="close-dialog">Cancel</button><button class="primary-button" type="button" data-install-ttyd>Install ttyd</button></footer>`);

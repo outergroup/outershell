@@ -1,10 +1,35 @@
+static HRESULT setup_stop_commands(const char *directory) {
+    ShellHost host = {0};
+    host.state = win_strdup(directory);
+    host.registry = win_join(directory, "registry.orwa");
+    wchar_t *path = win_wide(host.registry);
+    HRESULT result = S_OK;
+    if (!path) result = E_OUTOFMEMORY;
+    else if (GetFileAttributesW(path) == INVALID_FILE_ATTRIBUTES) {
+        DWORD error = GetLastError();
+        if (error != ERROR_FILE_NOT_FOUND && error != ERROR_PATH_NOT_FOUND) result = HRESULT_FROM_WIN32(error);
+    } else if (!commands_load(&host)) result = E_FAIL;
+    for (CommandApp *app = host.commands; app && SUCCEEDED(result); app = app->next) {
+        result = command_task(app->task_name, "stop", NULL, NULL);
+        if (result == HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND) || result == SCHED_E_TASK_NOT_RUNNING) result = S_OK;
+        if (SUCCEEDED(result) && !command_wait_stopped(&host, app)) result = HRESULT_FROM_WIN32(ERROR_TIMEOUT);
+    }
+    while (host.commands) {
+        CommandApp *app = host.commands;
+        host.commands = app->next;
+        free(app->id); free(app->task_name); free(app);
+    }
+    free(path); free(host.state); free(host.registry);
+    return result;
+}
+
 
 static int setup_tasks(const char *operation) {
     char *sid = win_sid(), *local = win_folder(CSIDL_LOCAL_APPDATA);
     char *directory = local ? win_join(local, "OuterShell") : NULL; free(local);
     if (!sid || !directory) { free(sid); free(directory); return 1; }
     bool install = !strcmp(operation, "install"), remove = !strcmp(operation, "remove");
-    HRESULT result = S_OK;
+    HRESULT result = install ? S_OK : setup_stop_commands(directory);
     for (int index = 0; index < 6 && SUCCEEDED(result); index++) {
         StringBuilder name = {0}; sb_append(&name, index ? "\\OuterShell-" : "\\OuterShell-"); if (index) { sb_append(&name, bundled_apps[index - 1].name); sb_append(&name, "-"); } sb_append(&name, sid);
         if (install && index > 1) {

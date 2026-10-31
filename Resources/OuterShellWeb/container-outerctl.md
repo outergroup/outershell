@@ -61,7 +61,7 @@ RUN outerctl image add-command \
     -- /absolute/path/to/executable [ARGUMENTS...]
 ```
 
-Outer Shell displays the declaration under **COMMAND LINE TOOLS**. Selecting it
+Outer Shell displays the declaration under **TERMINAL COMMANDS**. Selecting it
 copies a host command that opens the tool interactively inside this container.
 The working directory defaults to `/root`, and the user defaults to `root`.
 
