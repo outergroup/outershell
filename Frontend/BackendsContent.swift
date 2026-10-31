@@ -6255,14 +6255,18 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func appendCodingAgentAction(_ rootFrame: CGRect, _ title: String, _ action: @escaping () -> Void) {
-        if isContainerConfigurationEditorVisible || rootLayer.bounds.contains(rootFrame) {
-            codingAgentActions.append((rootFrame, title, action))
-        }
+        codingAgentActions.append((rootFrame, title, action))
+    }
+
+    private var codingAgentActionClipFrame: CGRect {
+        isContainerConfigurationEditorVisible
+            ? containerConfigurationContentFrame
+            : rootLayer.convert(createContentClipFrame, from: createLayer)
     }
 
     private var visibleCodingAgentActions: [(frame: CGRect, title: String, action: () -> Void)] {
-        guard isContainerConfigurationEditorVisible else { return codingAgentActions }
-        return codingAgentActions.filter { containerConfigurationContentFrame.intersects($0.frame) }
+        let clipFrame = codingAgentActionClipFrame
+        return codingAgentActions.filter { clipFrame.intersects($0.frame) }
     }
 
     private func renderCodingAgentSection(left: CGFloat, top: CGFloat, width: CGFloat) -> CGFloat {
@@ -14327,7 +14331,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         }
         if !isRenamingContainerConfiguration, pendingPasswordAction == nil, pendingInstallBackend == nil, containerConfigurationBuildError == nil, !isConfirmingContainerConfigurationDismissal, !isConfirmingContainerConfigurationRebuild,
            (isContainerConfigurationEditorVisible && containerConfigurationTab == .codingAgent || !isShowingWorkspacePanel && mode == .create),
-           !isContainerConfigurationEditorVisible || containerConfigurationContentFrame.contains(point),
+           codingAgentActionClipFrame.contains(point),
            let action = codingAgentActions.first(where: { $0.frame.contains(point) }) {
             armButtonClick(frame: action.frame, action: .perform(action.action))
             return
