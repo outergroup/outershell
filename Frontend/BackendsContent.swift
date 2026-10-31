@@ -10298,7 +10298,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                   in workspace: LocalWorkspaceRecord,
                                   opensInNewTab: Bool,
                                   opensInNewWindow: Bool = false) {
-        if !app.isRunning || displayedWorkspaceState(for: workspace) != "running" {
+        if !app.isRunning || displayedWorkspaceState(for: workspace) != "running" ||
+            (app.publishedPort <= 0 && app.externalSocketPath?.isEmpty != false) {
             prepareAndOpenWorkspaceApp(app, in: workspace, opensInNewTab: opensInNewTab, opensInNewWindow: opensInNewWindow)
             return
         }

@@ -3360,12 +3360,12 @@ final class SafeSpaceManager: @unchecked Sendable {
                                        socketPath normalized: String,
                                        key: String) async throws -> String {
         try ensureContainerSocketBridge(record)
+        let socketUser = try socketOwner(in: record, socketPath: normalized) == 0 ? "root" : "workspace"
         if let existing = lock.withSafeSpaceLock({ publishedForwards[key] }),
            !existing.isClosed,
            let path = existing.publishedSocketPath {
             return path
         }
-        let socketUser = try socketOwner(in: record, socketPath: normalized) == 0 ? "root" : "workspace"
         try ensureSafeSpaceSocketAllowed(record,
                                          socketPath: normalized,
                                          user: socketUser)
@@ -3654,7 +3654,17 @@ final class SafeSpaceManager: @unchecked Sendable {
                           record.name,
                           error.localizedDescription)
                 }
-                result.append(snapshot)
+                result.append(SafeSpaceAppSnapshot(
+                    frontendID: snapshot.frontendID,
+                    serviceID: snapshot.serviceID,
+                    displayName: snapshot.displayName,
+                    socketPath: snapshot.socketPath,
+                    externalSocketPath: "",
+                    url: snapshot.url,
+                    iconPath: snapshot.iconPath,
+                    isRunning: snapshot.isRunning,
+                    publishedPort: snapshot.publishedPort
+                ))
             }
         }
         return result

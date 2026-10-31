@@ -2434,6 +2434,8 @@ def workspace_dictionary(record, overview=False):
             for app in discovered:
                 if app["isRunning"]:
                     try:
+                        if container_exec(container_id, ["/usr/bin/test", "-S", app["socketPath"]]).returncode != 0:
+                            raise RuntimeError("The app socket is not available yet.")
                         published = ensure_relay(container_id, app["socketPath"])
                         if app.get("externalSocketPath") != published:
                             container_exec(container_id, [
@@ -2443,7 +2445,7 @@ def workspace_dictionary(record, overview=False):
                             ], check=True)
                         app["externalSocketPath"] = published
                     except Exception:
-                        pass
+                        app["externalSocketPath"] = ""
             apps = discovered
         try:
             commands = command_snapshots(container_id)
