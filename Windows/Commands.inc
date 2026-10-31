@@ -55,6 +55,25 @@ static bool command_spawn(ShellHost *s, CommandApp *a) {
     wchar_t *cwd = home ? win_wide(home) : NULL;
     free(home); free(script); free(log);
     if (!script_w || !log_w || !cwd) { free(script_w); free(log_w); free(cwd); return false; }
+    char *bin = win_join(s->directory, "bin"), *outerctl = win_join(bin, "outerctl.exe");
+    for (char *p = bin; *p; p++) if (*p == '/') *p = '\\';
+    for (char *p = outerctl; *p; p++) if (*p == '/') *p = '\\';
+    wchar_t *bin_w = win_wide(bin), *outerctl_w = win_wide(outerctl);
+    free(bin); free(outerctl);
+    if (bin_w && outerctl_w) {
+        SetEnvironmentVariableW(L"OUTERCTL_PATH", outerctl_w);
+        DWORD path_length = GetEnvironmentVariableW(L"PATH", NULL, 0);
+        size_t combined_length = wcslen(bin_w) + path_length + 2;
+        wchar_t *combined = win_alloc(combined_length * sizeof(wchar_t));
+        wcscpy_s(combined, combined_length, bin_w);
+        if (path_length) {
+            wcscat_s(combined, combined_length, L";");
+            GetEnvironmentVariableW(L"PATH", combined + wcslen(combined), path_length);
+        }
+        SetEnvironmentVariableW(L"PATH", combined);
+        free(combined);
+    }
+    free(bin_w); free(outerctl_w);
     size_t size = wcslen(script_w) + MAX_PATH + 32;
     wchar_t *line = win_alloc(size * sizeof(wchar_t));
     swprintf(line, size, L"\"%s\" /d /s /c \"\"%s\"\"", system, script_w);
@@ -144,7 +163,8 @@ static HRESULT command_register(ShellHost *s, CommandApp *a) {
     sb_append(&xml, "</RunLevel></Principal></Principals><Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><AllowHardTerminate>true</AllowHardTerminate><StartWhenAvailable>true</StartWhenAvailable><ExecutionTimeLimit>PT0S</ExecutionTimeLimit><Enabled>true</Enabled><RestartOnFailure><Interval>PT1M</Interval><Count>3</Count></RestartOnFailure></Settings><Actions Context=\"Author\"><Exec><Command>");
     command_xml_text(&xml, runner);
     sb_append(&xml, "</Command><Arguments>--run-command "); command_xml_text(&xml, a->id);
-    sb_append(&xml, " --state &quot;"); command_xml_text(&xml, s->state); sb_append(&xml, "&quot;</Arguments><WorkingDirectory>");
+    sb_append(&xml, " --state &quot;"); command_xml_text(&xml, s->state);
+    sb_append(&xml, "&quot; --directory &quot;"); command_xml_text(&xml, s->directory); sb_append(&xml, "&quot;</Arguments><WorkingDirectory>");
     command_xml_text(&xml, home); sb_append(&xml, "</WorkingDirectory></Exec></Actions></Task>");
     HRESULT hr = command_task(a->task_name, "register", xml.data, NULL);
     free(runner); free(sid); free(home); free(xml.data); return hr;

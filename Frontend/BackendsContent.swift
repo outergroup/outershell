@@ -1141,6 +1141,7 @@ private enum ContainerResourceText {
 
 private enum ContainerConfigurationTab {
     case codingAgent
+    case apps
     case dockerfile
     case mounts
     case environment
@@ -2301,6 +2302,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private var containerConfigurationEnvironmentTabFrame = CGRect.zero
     private var containerConfigurationPortsTabFrame = CGRect.zero
     private var containerConfigurationRuntimeTabFrame = CGRect.zero
+    private var containerConfigurationAppsTabFrame = CGRect.zero
     private var containerConfigurationChangeRuntimeFrame = CGRect.zero
     private var containerConfigurationResourceFrames: [(frame: CGRect, resource: ContainerCreationResource, delta: Int)] = []
     private var containerConfigurationApplyResourcesFrame = CGRect.zero
@@ -5572,6 +5574,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private var openCodeIcon: CGImage?
+    private var ttydIcon: CGImage?
+    private var ttydIconLoading = false
+    private var ttydBusy = false
+    private var ttydMessage = ""
     private var openCodeIconLoading = false
     private var openCodeIconRetryAfter = Date.distantPast
     private var openCodeChecksScheduled = false
@@ -5594,7 +5600,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             guard let self else { return }
             defer { self.openCodeIconLoading = false }
             do {
-                let data = try await self.openCodeData("/web/icons/opencode.svg")
+                let data = try await self.webResourceData("/web/icons/opencode.svg")
                 self.openCodeIcon = decodedIconCGImage(data)
                 self.updateLayout()
             } catch {
@@ -5632,7 +5638,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         return latest.compare(current, options: .numeric) == .orderedDescending ? latest : nil
     }
 
-    private func openCodeData(_ path: String) async throws -> Data {
+    private func webResourceData(_ path: String) async throws -> Data {
         guard let base = outerframeHost.pluginBaseURL(), let url = URL(string: path, relativeTo: base)?.absoluteURL, let urlSession else {
             throw ContainerConfigurationInputError(message: "Outer Shell is unavailable.")
         }
@@ -5648,17 +5654,17 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 continue
             }
             guard response.statusCode == 200 else {
-                throw ContainerConfigurationInputError(message: "Could not load OpenCode setup (HTTP \(response.statusCode)).")
+                throw ContainerConfigurationInputError(message: "Outer Shell could not load \(url.path) (HTTP \(response.statusCode)).")
             }
             return data
         }
-        throw ContainerConfigurationInputError(message: "OpenCode update check timed out.")
+        throw ContainerConfigurationInputError(message: "Outer Shell timed out loading \(url.path).")
     }
 
     private func latestOpenCodeRelease() async throws -> OpenCodeRelease {
         if let release = openCodeRelease, let checked = openCodeReleaseChecked, Date().timeIntervalSince(checked) < 86_400 { return release }
         for page in 1...10 {
-            let data = try await openCodeData("/api/opencode-releases?page=\(page)")
+            let data = try await webResourceData("/api/opencode-releases?page=\(page)")
             let releases = try JSONDecoder().decode([OpenCodeRelease].self, from: data)
             let compatible = releases.filter { !$0.draft && !$0.prerelease && $0.tag_name.range(of: "^v1\\.[0-9]+\\.[0-9]+$", options: .regularExpression) != nil }
             if let release = compatible.sorted(by: { $0.tag_name.compare($1.tag_name, options: .numeric) == .orderedDescending }).first {
@@ -5688,7 +5694,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func openCodeText(_ path: String) async throws -> String {
-        let data = try await openCodeData("/web/" + path)
+        let data = try await webResourceData("/web/" + path)
         guard let text = String(data: data, encoding: .utf8) else {
             throw ContainerConfigurationInputError(message: "The OpenCode template is invalid.")
         }
@@ -5740,29 +5746,18 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 let template = try await self.openCodeText(self.isWindowsHost ? "opencode-start.ps1" : "opencode-start.sh")
                 let skill = try await self.openCodeText("outer-shell-skill.md")
                 let admin = try await self.openCodeText("server-admin.md")
+                let pipe = self.isWindowsHost ? self.localPipePath("opencode") : ""
                 let script = try self.prepareOpenCodeTemplate(template, release: release)
                     .replacingOccurrences(of: "__OPENCODE_MODE__", with: "install")
+                    .replacingOccurrences(of: "__OPENCODE_PIPE__", with: pipe)
                     .replacingOccurrences(of: "__OUTERSHELL_SKILL__", with: skill.trimmingCharacters(in: .newlines))
                     .replacingOccurrences(of: "__OUTERSHELL_ADMIN__", with: admin.trimmingCharacters(in: .newlines))
-                let command: String
-                if self.isWindowsHost {
-                    let encoded = Array(Data(script.utf8).base64EncodedString())
-                    var lines = ["@echo off", "set \"OC_SCRIPT=%LOCALAPPDATA%\\outershell-opencode-start.ps1\""]
-                    for offset in stride(from: 0, to: encoded.count, by: 1200) {
-                        let chunk = String(encoded[offset..<min(offset + 1200, encoded.count)])
-                        lines.append("\(offset == 0 ? ">" : ">>") \"%OC_SCRIPT%.b64\" echo \(chunk)")
-                    }
-                    lines.append("powershell.exe -NoProfile -Command \"[IO.File]::WriteAllBytes($env:OC_SCRIPT,[Convert]::FromBase64String([IO.File]::ReadAllText($env:OC_SCRIPT+'.b64')))\"")
-                    lines.append("if errorlevel 1 exit /b 1")
-                    lines.append("powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"%OC_SCRIPT%\" -Port 4096")
-                    lines.append("exit /b %errorlevel%")
-                    command = lines.joined(separator: "\r\n")
-                } else { command = script }
+                let command = self.isWindowsHost ? self.windowsScriptCommand(script, fileName: "outershell-opencode-start.ps1") : script
                 guard command.utf8.count < (self.isWindowsHost ? 262_144 : 32_768), let endpoint = self.createEndpoint, let session = self.urlSession else {
                     throw ContainerConfigurationInputError(message: "The OpenCode installer is unavailable or exceeds the command size limit.")
                 }
                 var form = URLComponents()
-                form.queryItems = [URLQueryItem(name: "recipe", value: "command-port"), URLQueryItem(name: "name", value: "OpenCode"), URLQueryItem(name: "identifier", value: self.isWindowsHost ? "opencode" : "org.outershell.OpenCode"), URLQueryItem(name: "command", value: command), URLQueryItem(name: "workdir", value: "~"), URLQueryItem(name: "scope", value: "user"), URLQueryItem(name: "frontendTransport", value: "port"), URLQueryItem(name: "port", value: "4096")]
+                form.queryItems = [URLQueryItem(name: "recipe", value: "command-port"), URLQueryItem(name: "name", value: "OpenCode"), URLQueryItem(name: "identifier", value: self.isWindowsHost ? "opencode" : "org.outershell.OpenCode"), URLQueryItem(name: "command", value: command), URLQueryItem(name: "workdir", value: "~"), URLQueryItem(name: "scope", value: "user"), URLQueryItem(name: "frontendTransport", value: self.isWindowsHost ? "namedPipe" : "unixSocket"), URLQueryItem(name: "socketPath", value: self.isWindowsHost ? pipe : "~/.local/state/outershell-opencode/opencode.sock")]
                 var request = URLRequest(url: endpoint)
                 request.httpMethod = "POST"
                 request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
@@ -5789,6 +5784,146 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         }
     }
 
+    private func localPipePath(_ name: String) -> String {
+        var bytes = [UInt8](repeating: 0, count: 12)
+        _ = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
+        return "\\\\.\\pipe\\org.outershell.\(name).\(bytes.map { String(format: "%02x", $0) }.joined())"
+    }
+
+    private func windowsScriptCommand(_ script: String, fileName: String) -> String {
+        let encoded = Array(Data(script.utf8).base64EncodedString())
+        var lines = ["@echo off", "set \"OC_SCRIPT=%LOCALAPPDATA%\\\(fileName)\""]
+        for offset in stride(from: 0, to: encoded.count, by: 1200) {
+            let chunk = String(encoded[offset..<min(offset + 1200, encoded.count)])
+            lines.append("\(offset == 0 ? ">" : ">>") \"%OC_SCRIPT%.b64\" echo \(chunk)")
+        }
+        lines.append("powershell.exe -NoProfile -Command \"[IO.File]::WriteAllBytes($env:OC_SCRIPT,[Convert]::FromBase64String([IO.File]::ReadAllText($env:OC_SCRIPT+'.b64')))\"")
+        lines.append("if errorlevel 1 exit /b 1")
+        lines.append("powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"%OC_SCRIPT%\"")
+        lines.append("exit /b %errorlevel%")
+        return lines.joined(separator: "\r\n")
+    }
+
+    private struct TtydApp {
+        let name: String
+        let identifier: String
+        let serviceID: String
+        let shell: String
+    }
+
+    private var ttydApps: [TtydApp] {
+        isWindowsHost
+            ? [TtydApp(name: "ttyd (PowerShell)", identifier: "ttyd-powershell", serviceID: "org.outershell.command.ttyd-powershell", shell: "powershell"),
+               TtydApp(name: "ttyd (Command Prompt)", identifier: "ttyd-cmd", serviceID: "org.outershell.command.ttyd-cmd", shell: "cmd")]
+            : [TtydApp(name: "ttyd", identifier: "org.outershell.ttyd", serviceID: "org.outershell.ttyd", shell: "")]
+    }
+
+    private func hostTtydItem(_ app: TtydApp) -> AppLauncherItem? {
+        appLauncherItems(from: backends).first {
+            $0.backend.serviceScope != "system" && $0.backend.serviceID == app.serviceID
+        }
+    }
+
+    private var ttydInstalled: Bool {
+        ttydApps.allSatisfy { hostTtydItem($0) != nil }
+    }
+
+    private var hostTtydItem: AppLauncherItem? {
+        ttydApps.lazy.compactMap { self.hostTtydItem($0) }.first
+    }
+
+    private func loadTtydIcon() {
+        guard ttydIcon == nil, !ttydIconLoading else { return }
+        ttydIconLoading = true
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                self.ttydIcon = decodedIconCGImage(try await self.webResourceData("/web/icons/ttyd.svg"))
+                self.updateLayout()
+            } catch {
+                NSLog("Could not load ttyd icon: %@", error.localizedDescription)
+            }
+        }
+    }
+
+    private func installHostTtyd() {
+        guard !ttydBusy else { return }
+        ttydBusy = true
+        updateLayout()
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { self.ttydBusy = false; self.updateLayout() }
+            do {
+                let data = try await self.webResourceData(self.isWindowsHost ? "/web/ttyd-start.ps1" : "/web/ttyd-start.sh")
+                let icon = try await self.webResourceData("/web/icons/ttyd.png")
+                let script = String(decoding: data, as: UTF8.self)
+                    .replacingOccurrences(of: "__TTYD_ICON__", with: icon.base64EncodedString())
+                guard let endpoint = self.createEndpoint, let session = self.urlSession else {
+                    throw ContainerConfigurationInputError(message: "Outer Shell is unavailable.")
+                }
+                for app in self.ttydApps where self.hostTtydItem(app) == nil {
+                    self.ttydMessage = "Setting up \(app.name)…"
+                    self.updateLayout()
+                    var form = URLComponents()
+                    if self.isWindowsHost {
+                        let pipe = self.localPipePath(app.identifier)
+                        let command = self.windowsScriptCommand(script.replacingOccurrences(of: "__TTYD_SHELL__", with: app.shell).replacingOccurrences(of: "__TTYD_PIPE__", with: pipe), fileName: "outershell-\(app.identifier)-start.ps1")
+                        form.queryItems = [URLQueryItem(name: "recipe", value: "command-port"), URLQueryItem(name: "name", value: app.name), URLQueryItem(name: "identifier", value: app.identifier), URLQueryItem(name: "command", value: command), URLQueryItem(name: "workdir", value: "~"), URLQueryItem(name: "scope", value: "user"), URLQueryItem(name: "frontendTransport", value: "namedPipe"), URLQueryItem(name: "socketPath", value: pipe)]
+                    } else {
+                        form.queryItems = [URLQueryItem(name: "recipe", value: "command-port"), URLQueryItem(name: "name", value: app.name), URLQueryItem(name: "identifier", value: app.identifier), URLQueryItem(name: "command", value: script), URLQueryItem(name: "workdir", value: "~"), URLQueryItem(name: "scope", value: "user"), URLQueryItem(name: "frontendTransport", value: "unixSocket"), URLQueryItem(name: "socketPath", value: "~/.local/state/outershell-ttyd/ttyd.sock")]
+                    }
+                    var request = URLRequest(url: endpoint)
+                    request.httpMethod = "POST"
+                    request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+                    request.httpBody = form.percentEncodedQuery?.replacingOccurrences(of: "+", with: "%2B").data(using: .utf8)
+                    let (responseData, _) = try await session.data(for: request)
+                    let response = try ActionResponse.decodeBinary(responseData)
+                    guard response.ok else { throw ContainerConfigurationInputError(message: response.message) }
+                    var running = false
+                    for _ in 0..<90 where !running {
+                        self.fetchBackends()
+                        if let item = self.hostTtydItem(app) {
+                            running = self.endpointIsRunning(item.primaryEndpoint)
+                            if !running, let failure = self.launcherFailureMessage(item.primaryEndpoint, displayName: app.name) {
+                                throw ContainerConfigurationInputError(message: failure)
+                            }
+                        }
+                        if !running { try await Task.sleep(nanoseconds: 1_000_000_000) }
+                    }
+                    guard running else {
+                        throw ContainerConfigurationInputError(message: "\(app.name) is still starting. Check its logs from the app menu.")
+                    }
+                }
+                self.ttydMessage = "ttyd is ready. Open it from your apps."
+            } catch { self.ttydMessage = error.localizedDescription }
+        }
+    }
+
+    private func addTtydToDockerfile() {
+        guard !ttydBusy, let workspace = pendingDockerfileWorkspace else { return }
+        if containerConfigurationDockerfile.contains("/usr/local/bin/outershell-ttyd") {
+            ttydMessage = "This Dockerfile already includes ttyd."
+            updateLayout()
+            return
+        }
+        ttydBusy = true
+        ttydMessage = ""
+        updateLayout()
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { self.ttydBusy = false; self.updateLayout() }
+            do {
+                let fragment = String(decoding: try await self.webResourceData("/web/ttyd-container.Dockerfile"), as: UTF8.self)
+                guard self.pendingDockerfileWorkspace?.id == workspace.id else { return }
+                self.containerConfigurationDockerfile += "\n\n" + fragment
+                self.ttydMessage = "ttyd added to the Dockerfile. Save and rebuild to install it."
+                self.selectContainerConfigurationTab(.dockerfile)
+            } catch {
+                self.ttydMessage = error.localizedDescription
+            }
+        }
+    }
+
     private func openCodeNavigationURL(_ url: URL, serviceID: String) -> URL {
         guard serviceID.lowercased().contains("opencode"), let prompt = openCodePrompt else { return url }
         openCodePrompt = nil
@@ -5801,7 +5936,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func checkOpenCodeUpdates() {
-        guard !checkingOpenCode, let item = hostOpenCodeItem, endpointIsRunning(item.primaryEndpoint), item.frontend.port > 0,
+        guard !checkingOpenCode, let item = hostOpenCodeItem, endpointIsRunning(item.primaryEndpoint), !item.frontend.socketPath.isEmpty,
               openCodeHealthChecked.map({ Date().timeIntervalSince($0) >= 300 }) ?? true else { return }
         checkingOpenCode = true
         openCodeHealthChecked = Date()
@@ -5810,7 +5945,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             defer { self.checkingOpenCode = false; self.updateLayout() }
             do {
                 struct Health: Decodable { let healthy: Bool; let version: String }
-                let data = try await self.openCodeData("/api/opencode-health?port=\(item.frontend.port)")
+                var query = URLComponents()
+                query.queryItems = [URLQueryItem(name: "socket", value: item.frontend.socketPath)]
+                let data = try await self.webResourceData("/api/opencode-health?\(query.percentEncodedQuery ?? "")")
                 let health = try JSONDecoder().decode(Health.self, from: data)
                 guard health.healthy else { return }
                 self.openCodeVersion = health.version
@@ -6225,6 +6362,52 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         codingAgentContentHeight = frame.height - bottom
         codingAgentScroll = min(codingAgentScroll, max(codingAgentContentHeight - frame.height, 0))
         content.frame.origin.y = codingAgentScroll
+    }
+
+    private func renderContainerApps(in frame: CGRect) {
+        editorInputFieldFrame = .zero
+        editorInputTextFrame = .zero
+        let clip = CALayer()
+        clip.frame = frame
+        clip.masksToBounds = true
+        workspacePanelLayer.addSublayer(clip)
+        loadOpenCodeIcon()
+        loadTtydIcon()
+        let width = frame.width
+        var y = agentText("Outer Shell apps", in: clip, left: 0, top: frame.height, width: width, size: 16, heading: true) - 6
+        y = agentText("Adds the app to the Dockerfile. Choose Save & rebuild to install it. Requires Debian or Ubuntu with Outer Shell support.", in: clip, left: 0, top: y, width: width) - 16
+        let apps: [(name: String, icon: CGImage?, marker: String, busy: Bool, add: () -> Void)] = [
+            ("OpenCode", openCodeIcon, "/usr/local/bin/outershell-opencode", codingAgentBusy, { [weak self] in self?.addOpenCodeToDockerfile() }),
+            ("ttyd (Terminal)", ttydIcon, "/usr/local/bin/outershell-ttyd", ttydBusy, { [weak self] in self?.addTtydToDockerfile() })
+        ]
+        for app in apps {
+            let added = containerConfigurationDockerfile.contains(app.marker)
+            let icon = CALayer()
+            icon.frame = CGRect(x: 0, y: y - 40, width: 36, height: 36)
+            icon.contentsGravity = .resizeAspect
+            icon.contents = app.icon
+            icon.opacity = added ? 0.62 : 1
+            clip.addSublayer(icon)
+            let name = makeTextLayer(size: 13, weight: .medium, color: added ? .secondaryLabelColor : .labelColor)
+            name.string = app.name
+            name.frame = CGRect(x: 48, y: y - 30, width: max(width - 48 - 112, 1), height: 18)
+            clip.addSublayer(name)
+            if added {
+                let status = makeTextLayer(size: 11, weight: .medium, color: .secondaryLabelColor)
+                status.string = "Added"
+                status.frame = CGRect(x: width - 100, y: y - 29, width: 100, height: 16)
+                clip.addSublayer(status)
+            } else {
+                agentButton(app.busy ? "Adding…" : "Add", in: clip, frame: CGRect(x: width - 100, y: y - 36, width: 100, height: 30)) {
+                    guard !app.busy else { return }
+                    app.add()
+                }
+            }
+            y -= 52
+        }
+        for message in [codingAgentMessage, ttydMessage] where !message.isEmpty {
+            y = agentText(message, in: clip, left: 0, top: y - 6, width: width)
+        }
     }
 
     private func scrollCodingAgent(to nextScroll: CGFloat) {
@@ -6687,9 +6870,12 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         var y = top - itemHeight
 
         var entries = apps.map { (name: $0.backend.displayName, app: Optional($0)) }
-        if catalogWorkspaceID == nil && catalogScope != "system" {
+        let showsHostApps = catalogWorkspaceID == nil && catalogScope != "system"
+        if showsHostApps {
             entries.append((name: "OpenCode", app: nil))
+            entries.append((name: "ttyd (Terminal)", app: nil))
             loadOpenCodeIcon()
+            loadTtydIcon()
         }
         entries.sort { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
         for (index, entry) in entries.enumerated() {
@@ -6699,28 +6885,48 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             if let app = entry.app {
                 renderAddableAppTile(app.backend, isInstalled: app.isInstalled, frame: frame)
             } else {
-                let installed = hostOpenCodeItem != nil
+                let terminal = entry.name == "ttyd (Terminal)"
+                let item = terminal ? hostTtydItem : hostOpenCodeItem
+                let installed = terminal ? ttydInstalled : item != nil
                 let icon = CALayer()
                 icon.frame = CGRect(x: frame.midX - 23, y: frame.maxY - 56, width: 46, height: 46)
                 icon.contentsGravity = .resizeAspect
-                icon.contents = openCodeIcon ?? hostOpenCodeItem.flatMap { launcherIconImage(for: $0) }
+                icon.contents = (terminal ? ttydIcon : openCodeIcon) ?? item.flatMap { launcherIconImage(for: $0) }
                 icon.opacity = installed ? 0.62 : 1
                 addCreateFormSublayer(icon)
                 let name = makeTextLayer(size: 12, weight: .medium, color: installed ? .secondaryLabelColor : .labelColor, alignment: .center)
-                name.string = "OpenCode"
+                name.string = entry.name
                 name.frame = CGRect(x: frame.minX, y: frame.minY + 20, width: frame.width, height: 28)
                 addCreateFormSublayer(name)
-                let status = makeTextLayer(size: 10, weight: .medium, color: .secondaryLabelColor, alignment: .center)
-                status.string = installed ? "Installed" : "Install"
-                status.frame = CGRect(x: frame.minX, y: frame.minY + 3, width: frame.width, height: 14)
-                addCreateFormSublayer(status)
+                if installed {
+                    let status = makeTextLayer(size: 10, weight: .medium, color: .secondaryLabelColor, alignment: .center)
+                    status.string = "Installed"
+                    status.frame = CGRect(x: frame.minX, y: frame.minY + 3, width: frame.width, height: 14)
+                    addCreateFormSublayer(status)
+                } else {
+                    renderCatalogInstallButton(terminal && ttydBusy ? "Installing…" : "Install", in: frame)
+                }
                 if !installed {
-                    codingAgentActions.append((rootLayer.convert(frame, from: createFormContentLayer), "Install OpenCode", { [weak self] in
-                        self?.selectedCreateSection = .codingAgent
-                        self?.createScroll = 0
-                        self?.updateLayout()
+                    codingAgentActions.append((rootLayer.convert(frame, from: createFormContentLayer), "Install \(entry.name)", { [weak self] in
+                        guard let self else { return }
+                        if terminal {
+                            self.installHostTtyd()
+                        } else {
+                            self.selectedCreateSection = .codingAgent
+                            self.createScroll = 0
+                            self.updateLayout()
+                        }
                     }))
                 }
+            }
+        }
+
+        if showsHostApps {
+            let note = !ttydMessage.isEmpty ? ttydMessage
+                : ttydInstalled || isWindowsHost ? ""
+                : "On macOS, install ttyd from Homebrew first (brew install ttyd). On Linux, Outer Shell downloads ttyd for you."
+            if !note.isEmpty {
+                y = agentText(note, in: createFormContentLayer, left: left, top: y - 18, width: width, size: 12)
             }
         }
 
@@ -6766,8 +6972,17 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             installedLayer.frame = CGRect(x: frame.minX, y: frame.minY + 3, width: frame.width, height: 14)
             addCreateFormSublayer(installedLayer)
         } else {
+            renderCatalogInstallButton("Install", in: frame)
             bundledAppInstallFrames.append((frame, backend))
         }
+    }
+
+    private func renderCatalogInstallButton(_ title: String, in frame: CGRect) {
+        let button = makeButtonLayer(title: title, emphasized: false)
+        let width: CGFloat = title == "Install" ? 64 : 88
+        button.frame = CGRect(x: frame.midX - width / 2, y: frame.minY - 2, width: width, height: 22)
+        button.cornerRadius = 11
+        addCreateFormSublayer(button)
     }
 
     private func renderAppListWidget(name: String,
@@ -9023,6 +9238,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                         (containerConfigurationRenameFrame, "Rename container"),
                         (containerConfigurationDockerfileTabFrame, "Dockerfile"),
                         (codingAgentTabFrame, "Coding agent"),
+                        (containerConfigurationAppsTabFrame, "Outer Shell apps"),
                         (containerConfigurationMountsTabFrame, "Folder mounts"),
                         (containerConfigurationEnvironmentTabFrame, "Environment"),
                         (containerConfigurationPortsTabFrame, "Network"),
@@ -9051,7 +9267,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                     }
                     return (action.frame, label)
                 }
-            case .codingAgent:
+            case .codingAgent, .apps:
                 controls += visibleCodingAgentActions.map { ($0.frame, $0.title) }
             case .runtime:
                 controls.append((containerConfigurationChangeRuntimeFrame, "Change runtime"))
@@ -9086,6 +9302,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             let selectedTab = isContainerConfigurationEditorVisible &&
                 ((label == "Dockerfile" && containerConfigurationTab == .dockerfile) ||
                  (label == "Coding agent" && containerConfigurationTab == .codingAgent) ||
+                 (label == "Outer Shell apps" && containerConfigurationTab == .apps) ||
                  (label == "Folder mounts" && containerConfigurationTab == .mounts) ||
                  (label == "Environment" && containerConfigurationTab == .environment) ||
                  (label == "Network" && containerConfigurationTab == .ports) ||
@@ -10041,7 +10258,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 try await self.containerLaunchRequest(operation, workspaceID: context.container.id, app: context.app)
                 let deadline = ProcessInfo.processInfo.systemUptime + 30
                 while ProcessInfo.processInfo.systemUptime < deadline {
-                    let data = try await self.openCodeData("/api/container-snapshot")
+                    let data = try await self.webResourceData("/api/container-snapshot")
                     let response = try LocalWorkspaceHostResponse.decode(data, snapshotRequestID: UUID())
                     if let workspace = response.workspaces.first(where: { $0.id == context.container.id }),
                        let app = workspace.apps.first(where: { $0.serviceID == context.app.serviceID && $0.frontendID == context.app.frontendID }),
@@ -10277,7 +10494,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 }
                 let deadline = ProcessInfo.processInfo.systemUptime + 120
                 while ProcessInfo.processInfo.systemUptime < deadline {
-                    let data = try await self.openCodeData("/api/container-snapshot")
+                    let data = try await self.webResourceData("/api/container-snapshot")
                     let response = try LocalWorkspaceHostResponse.decode(data, snapshotRequestID: UUID())
                     if let current = response.workspaces.first(where: { $0.id == workspace.id }),
                        let ready = current.apps.first(where: { $0.serviceID == app.serviceID && $0.frontendID == app.frontendID }),
@@ -11440,7 +11657,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 case .ports:
                     containerConfigurationPorts = editorInputController.text
                     scheduleContainerConfigurationEnvironmentSave()
-                case .mounts, .runtime, .codingAgent:
+                case .mounts, .runtime, .codingAgent, .apps:
                     break
                 }
             }
@@ -14330,7 +14547,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             return
         }
         if !isRenamingContainerConfiguration, pendingPasswordAction == nil, pendingInstallBackend == nil, containerConfigurationBuildError == nil, !isConfirmingContainerConfigurationDismissal, !isConfirmingContainerConfigurationRebuild,
-           (isContainerConfigurationEditorVisible && containerConfigurationTab == .codingAgent || !isShowingWorkspacePanel && mode == .create),
+           (isContainerConfigurationEditorVisible && [.codingAgent, .apps].contains(containerConfigurationTab) || !isShowingWorkspacePanel && mode == .create),
            codingAgentActionClipFrame.contains(point),
            let action = codingAgentActions.first(where: { $0.frame.contains(point) }) {
             armButtonClick(frame: action.frame, action: .perform(action.action))
@@ -14502,6 +14719,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             } else if containerConfigurationDockerfileTabFrame.contains(point) {
                 armButtonClick(frame: containerConfigurationDockerfileTabFrame) { [weak self] in
                     self?.selectContainerConfigurationTab(.dockerfile)
+                }
+            } else if containerConfigurationAppsTabFrame.contains(point) {
+                armButtonClick(frame: containerConfigurationAppsTabFrame) { [weak self] in
+                    self?.selectContainerConfigurationTab(.apps)
                 }
             } else if containerConfigurationMountsTabFrame.contains(point) {
                 armButtonClick(frame: containerConfigurationMountsTabFrame) { [weak self] in
@@ -18258,7 +18479,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             case .ports:
                 containerConfigurationPorts = editorInputController.text
                 scheduleContainerConfigurationEnvironmentSave(after: 0)
-            case .mounts, .runtime, .codingAgent:
+            case .mounts, .runtime, .codingAgent, .apps:
                 break
             }
         }
@@ -18278,7 +18499,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         case .ports:
             workspaceRenameName = containerConfigurationPorts
             focusEditorInput()
-        case .mounts, .runtime, .codingAgent:
+        case .mounts, .runtime, .codingAgent, .apps:
             blurEditorInput()
         }
         updateLayout()
@@ -18296,7 +18517,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             return containerConfigurationEnvironment
         case .ports:
             return containerConfigurationPorts
-        case .mounts, .runtime, .codingAgent:
+        case .mounts, .runtime, .codingAgent, .apps:
             return ""
         }
     }
@@ -18911,7 +19132,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 containerConfigurationEnvironment = editorInputController.text
             case .ports:
                 containerConfigurationPorts = editorInputController.text
-            case .mounts, .runtime, .codingAgent:
+            case .mounts, .runtime, .codingAgent, .apps:
                 break
             }
         }
@@ -18941,7 +19162,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         case .ports:
             workspaceRenameName = containerConfigurationPorts
             focusEditorInput()
-        case .mounts, .runtime, .codingAgent:
+        case .mounts, .runtime, .codingAgent, .apps:
             workspaceRenameName = ""
             blurEditorInput()
         }
@@ -19580,6 +19801,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         containerConfigurationRenameFrame = .zero
         containerConfigurationPortsTabFrame = .zero
         containerConfigurationRuntimeTabFrame = .zero
+        containerConfigurationAppsTabFrame = .zero
         containerConfigurationChangeRuntimeFrame = .zero
         containerConfigurationResourceFrames.removeAll()
         containerConfigurationResourceValueFrames.removeAll()
@@ -19625,6 +19847,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         let tabs: [(ContainerConfigurationTab, String)] = [
             (.dockerfile, "Dockerfile"),
             (.codingAgent, "Coding agent"),
+            (.apps, "Outer Shell apps"),
             (.mounts, "Folder Mounts"),
             (.environment, "Environment"),
             (.ports, "Network"),
@@ -19633,7 +19856,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         var tabX: CGFloat = 24
         var tabY = panelHeight - 94
         for (tab, label) in tabs {
-            let tabWidth: CGFloat = label == "Folder Mounts" ? 126 : 108
+            let tabWidth: CGFloat = label == "Outer Shell apps" ? 140 : label == "Folder Mounts" ? 126 : 108
             if tabX + tabWidth > panelWidth - 24 { tabX = 24; tabY -= 40 }
             let localFrame = CGRect(x: tabX,
                                     y: tabY,
@@ -19650,6 +19873,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             switch tab {
             case .codingAgent:
                 codingAgentTabFrame = rootFrame
+            case .apps:
+                containerConfigurationAppsTabFrame = rootFrame
             case .dockerfile:
                 containerConfigurationDockerfileTabFrame = rootFrame
             case .mounts:
@@ -19705,6 +19930,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             }
         case .codingAgent:
             renderContainerAgent(in: contentFrame)
+        case .apps:
+            renderContainerApps(in: contentFrame)
         case .mounts:
             renderContainerConfigurationMounts(in: contentFrame)
         case .environment:

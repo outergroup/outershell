@@ -30,6 +30,8 @@ vm.runInContext(source.slice(source.indexOf('  const openCodeUpdates ='), source
   }
   assert(Buffer.byteLength(fragment)<14000, 'Keep the embedded recipe below the Apple builder input limit');
   assert.match(fragment,/VOLUME \["\/work", "\/var\/lib\/opencode"\]/);
-  assert.match(fragment,/--socket-path \/run\/user\/0\/org.outershell.image.opencode/);
+  assert.match(fragment,/outerctl image add-app --id opencode .*--socket-argument=--socket -- \/usr\/local\/bin\/outershell-opencode/);
+  assert.match(fragment,/outerctl relay --listen "\$socket"/);
+  assert(!fragment.includes('--tcp-port'));
   console.log('PASS: portable container recipe, full instruction payloads, persistent workspace and agent state, socket launcher');
 })().catch(error=>{console.error(error);process.exitCode=1});

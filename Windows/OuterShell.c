@@ -91,6 +91,7 @@ static bool update_allowlist(ShellHost *s) {
     return store_close(s, &store, false) && ok;
 }
 #include "Commands.inc"
+#include "BundledApps.inc"
 #include "Setup.inc"
 #include "Updates.inc"
 #include "Uninstall.inc"
@@ -260,8 +261,11 @@ static StringBuilder backends(ShellHost *s) {
     if (!store_open(s, &store, false))
         return (StringBuilder){0};
     qsort(store.backends, store.backend_count, sizeof(*store.backends), compare_backends);
-    StringBuilder result = payload(12 + store.backend_count * 8);
-    payload_u32(&result, 8, (uint32_t)store.backend_count);
+    size_t catalog_count = 0;
+    for (size_t i = 0; i < sizeof(bundled_apps) / sizeof(*bundled_apps); i++)
+        if (!registry_store_find_backend(&store, bundled_apps[i].id) && bundled_available(s, &bundled_apps[i])) catalog_count++;
+    StringBuilder result = payload(12 + (store.backend_count + catalog_count) * 8);
+    payload_u32(&result, 8, (uint32_t)(store.backend_count + catalog_count));
     char *sid = win_sid();
     const char *scope = (sid && !strcmp(sid, "S-1-5-18")) ? "system" : "user";
     free(sid);
@@ -276,8 +280,11 @@ static StringBuilder backends(ShellHost *s) {
             char *result_path = win_join(s->state, "update-result.txt");
             if (win_read_file(result_path, 512, &update_result) && update_result.data && !strncmp(update_result.data, "Update failed", 13)) status = update_result.data;
             free(result_path);
-        } else if (!strcmp(b->service_id, files_id)) {
-            running = files_running(s);
+        } else if (bundled_find(b->service_id)) {
+            char *task = bundled_task_name(bundled_find(b->service_id));
+            DWORD state = 0;
+            running = SUCCEEDED(command_task(task, "query", NULL, &state)) && state == TASK_STATE_RUNNING;
+            free(task);
             status = running ? "running" : "stopped";
             controls = true;
         } else if (command_find(s, b->service_id)) {
@@ -343,7 +350,7 @@ static StringBuilder backends(ShellHost *s) {
         payload_text(&row, 16, b->unit_name);
         payload_text(&row, 32, scope);
         payload_text(&row, 40, status);
-        payload_u32(&row, 64, 8u | (controls ? 1u : 0u) | (command_find(s, b->service_id) ? 2u : 0u));
+        payload_u32(&row, 64, 8u | (controls ? 1u : 0u) | (command_find(s, b->service_id) ? 2u : 0u) | (bundled_find(b->service_id) ? 6u : 0u));
         payload_data(&row, 68, apps.data, apps.length);
         uint32_t empty = 0;
         if (command_find(s, b->service_id)) {
@@ -359,6 +366,17 @@ static StringBuilder backends(ShellHost *s) {
         free(update_result.data);
         free(apps.data);
     }
+    size_t catalog_index = store.backend_count;
+    for (size_t i = 0; i < sizeof(bundled_apps) / sizeof(*bundled_apps); i++) {
+        const BundledApp *app = &bundled_apps[i];
+        if (registry_store_find_backend(&store, app->id) || !bundled_available(s, app)) continue;
+        StringBuilder row = payload(116);
+        payload_text(&row, 0, app->id); payload_text(&row, 8, app->name);
+        payload_text(&row, 32, "user"); payload_text(&row, 40, "not installed"); payload_text(&row, 48, app->symbol);
+        payload_u32(&row, 64, 4);
+        uint32_t empty = 0; payload_data(&row, 68, &empty, 4); payload_data(&row, 76, &empty, 4);
+        payload_data(&result, 12 + catalog_index++ * 8, row.data, row.length); free(row.data);
+    }
     if (!store_close(s, &store, false)) {
         free(result.data);
         result = (StringBuilder){0};
@@ -370,12 +388,9 @@ static StringBuilder control(ShellHost *s, HttpRequest *r) {
     char *id = http_query(r, "serviceID"), *operation = http_query(r, "operation");
     bool ok = false;
     const char *message = "This operation is not supported for this backend.";
-    if (id && operation && !strcmp(id, files_id)) {
-        if (!strcmp(operation, "stop") || !strcmp(operation, "disable"))
-            ok = stop_files(s);
-        else if (!strcmp(operation, "start") || !strcmp(operation, "enable") || !strcmp(operation, "restart"))
-            ok = (strcmp(operation, "restart") || stop_files(s)) &&
-                 start_files(s);
+    if (id && operation && bundled_find(id)) {
+        ok = bundled_control(s, bundled_find(id), operation, task_error, sizeof(task_error));
+        if (!ok) message = task_error;
     } else if (id && operation && command_find(s, id)) {
         ok = command_control(s, command_find(s, id), operation, task_error, sizeof(task_error));
         if (!ok) message = task_error;
@@ -566,7 +581,7 @@ static void serve_http(Connection *c, void *context) {
         ULONGLONG deadline = GetTickCount64() + 15000;
         while (previous == s->version && GetTickCount64() < deadline &&
                WaitForSingleObject(s->stop, 0) != WAIT_OBJECT_0) {
-            files_running(s);
+            bundled_poll(s);
             for (CommandApp *a = s->commands; a; a = a->next) command_running(s, a);
             current_overview = (s->version << 32) ^ wsl_version(s->wsl);
             if (previous != s->version || prior_overview != current_overview)
@@ -618,7 +633,13 @@ static void serve_registry(Connection *c, void *context) {
     uint32_t response_length = 0;
     if (connection_read(c, request, length)) {
         EnterCriticalSection(&s->gate);
-        bool ok = OuterShellRegistryRequest(s->registry, request, length, &response, &response_length) != 0;
+        bool ok;
+        if (length == 2 && read_uint16_le(request) == 34) {
+            StringBuilder environments = wsl_environments(s->wsl);
+            response = (unsigned char *)environments.data;
+            response_length = (uint32_t)environments.length;
+            ok = response != NULL;
+        } else ok = OuterShellRegistryRequest(s->registry, request, length, &response, &response_length) != 0;
         if (ok && response_length >= 22 && read_uint16_le(response) == 100 &&
             read_uint32_le(response + 2) == 0) {
             if (!update_allowlist(s))
@@ -643,7 +664,7 @@ static bool shell_start(ShellHost *s) {
         return false;
     const char *ids[] = {shell_id, files_id}, *names[] = {"Outer Shell", "Files"};
     bool ok = true;
-    for (size_t i = 0; ok && i < 2; i++) {
+    for (size_t i = 0; ok && i < 1; i++) {
         char *pipe = win_pipe(ids[i]);
         char app[128];
         snprintf(app, sizeof(app), "%s:main", ids[i]);
@@ -652,6 +673,11 @@ static bool shell_start(ShellHost *s) {
              registry_store_upsert_frontend_endpoint(&store, app, ids[i], names[i], 3, 1, 0, "", 0, "/", pipe,
                                                      "", true);
         free(pipe);
+    }
+    for (size_t i = 0; ok && i < sizeof(bundled_apps) / sizeof(*bundled_apps); i++) {
+        char *task = bundled_task_name(&bundled_apps[i]); DWORD task_state = 0;
+        if (SUCCEEDED(command_task(task, "query", NULL, &task_state))) ok = bundled_registered(&store, &bundled_apps[i]);
+        free(task);
     }
     ok = store_close(s, &store, ok) && ok;
     if (!ok || !update_allowlist(s)) return false;
@@ -784,6 +810,9 @@ int wmain(int argc, wchar_t **argv) {
                 return 1;
             free(shell.state);
             shell.state = win_utf8(full);
+        } else if (!wcscmp(argv[i], L"--directory") && i + 1 < argc) {
+            free(shell.directory);
+            shell.directory = win_utf8(argv[++i]);
         } else if (!wcscmp(argv[i], L"--initialize"))
             initialize = true;
         else {
@@ -806,7 +835,8 @@ int wmain(int argc, wchar_t **argv) {
         free(b);
         return ok ? 0 : 1;
     }
-    shell.directory = win_executable_directory();
+    if (!shell.directory)
+        shell.directory = win_executable_directory();
     if (!shell.directory)
         return 1;
     shell.web = win_join(shell.directory, "web");

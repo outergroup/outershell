@@ -1,4 +1,5 @@
 #include "Wsl.h"
+#include "AppProcess.h"
 #include "Icons.h"
 #include "../Backend/EndpointNames.h"
 #include "../Backend/OuterShellLayout.h"
@@ -1602,3 +1603,32 @@ int wsl_inspect(void) {
 }
 
 void wsl_refresh(Wsl *w) { if (w) SetEvent(w->refresh); }
+
+StringBuilder wsl_environments(Wsl *w) {
+    if (!w) return (StringBuilder){0};
+    wsl_version(w);
+    EnterCriticalSection(&w->gate);
+    size_t count = 0;
+    for (Distribution *d = w->distributions; d; d = d->next)
+        if (d->present && d->container) count++;
+    StringBuilder result = payload(48 + count * 72);
+    memcpy(result.data, "OSED", 4);
+    payload_u32(&result, 4, 1);
+    payload_u32(&result, 12, (uint32_t)count);
+    payload_u32(&result, 16, 72);
+    payload_u32(&result, 20, 48);
+    payload_u32(&result, 24, (uint32_t)result.length);
+    payload_text(&result, 32, "");
+    size_t i = 0;
+    for (Distribution *d = w->distributions; d; d = d->next) {
+        if (!d->present || !d->container) continue;
+        const char *runtime = d->container == RUNTIME_DOCKER ? "docker" : "wslc";
+        const char *fields[] = {d->id, d->name, runtime, d->runtime_id,
+            d->running ? "running" : "stopped", "", "", "", ""};
+        for (size_t j = 0; j < 9; j++) payload_text(&result, 48 + i * 72 + j * 8, fields[j]);
+        i++;
+    }
+    payload_u32(&result, 8, (uint32_t)result.length);
+    LeaveCriticalSection(&w->gate);
+    return result;
+}

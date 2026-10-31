@@ -27,6 +27,7 @@ UninstallDisplayIcon={app}\OuterShell.exe
 CloseApplications=no
 RestartApplications=no
 SetupLogging=yes
+ChangesEnvironment=yes
 #ifdef SignCommand
 SignTool=release $f
 SignedUninstaller=yes
@@ -43,10 +44,42 @@ Source: "{#PayloadDirectory}\container-bootstrap\*"; DestDir: "{app}\container-b
 Source: "{#PayloadDirectory}\OuterShell.exe"; DestName: "SetupTasks.exe"; Flags: dontcopy
 Source: "{#PayloadDirectory}\OuterShell.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#PayloadDirectory}\FilesBackend.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#PayloadDirectory}\outerctl.exe"; DestDir: "{app}\bin"; Flags: ignoreversion
 Source: "{#PayloadDirectory}\web\*"; DestDir: "{app}\web"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "{#PayloadDirectory}\files-web\*"; DestDir: "{app}\files-web"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "{#PayloadDirectory}\bundles\*"; DestDir: "{app}\bundles"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#PayloadDirectory}\PlaintextBackend.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#PayloadDirectory}\plaintext-web\*"; DestDir: "{app}\plaintext-web"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#PayloadDirectory}\TopBackend.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#PayloadDirectory}\top-web\*"; DestDir: "{app}\top-web"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#PayloadDirectory}\FirehoseBackend.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#PayloadDirectory}\firehose-web\*"; DestDir: "{app}\firehose-web"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#PayloadDirectory}\ProfileBackend.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#PayloadDirectory}\profile-web\*"; DestDir: "{app}\profile-web"; Flags: ignoreversion recursesubdirs createallsubdirs
+[Registry]
+Root: HKCU; Subkey: "Environment"; ValueType: expandsz; ValueName: "Path"; ValueData: "{olddata};{app}\bin"; Check: NeedsPathEntry(ExpandConstant('{app}\bin'))
 [Code]
+function NeedsPathEntry(Entry: String): Boolean;
+var Path: String;
+begin
+  if not RegQueryStringValue(HKEY_CURRENT_USER, 'Environment', 'Path', Path) then Path := '';
+  Result := Pos(';' + Lowercase(Entry) + ';', ';' + Lowercase(Path) + ';') = 0;
+end;
+procedure RemovePathEntry(Entry: String);
+var Path: String; Index: Integer;
+begin
+  if not RegQueryStringValue(HKEY_CURRENT_USER, 'Environment', 'Path', Path) then exit;
+  Path := ';' + Path + ';';
+  Index := Pos(';' + Lowercase(Entry) + ';', Lowercase(Path));
+  if Index = 0 then exit;
+  Delete(Path, Index, Length(Entry) + 1);
+  Path := Copy(Path, 2, Length(Path) - 2);
+  RegWriteExpandStringValue(HKEY_CURRENT_USER, 'Environment', 'Path', Path);
+end;
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+begin
+  if CurUninstallStep = usPostUninstall then RemovePathEntry(ExpandConstant('{app}\bin'));
+end;
 function RunSetupOperation(Operation: String): Boolean;
 var Code: Integer;
 begin

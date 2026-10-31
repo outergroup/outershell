@@ -114,7 +114,7 @@ static bool create_container(Wsl *w, HttpRequest *request, const char **error) {
         strspn(image, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-/:@") != strlen(image) ||
         !cpus || cpus > 128 || memory < 128 || memory > 1048576)
         goto done;
-    if (!strcmp(image, "outershell/container-base:21")) {
+    if (!strcmp(image, "outershell/container-base:22")) {
         const char *inspect[] = {"image", "inspect", image, NULL};
         if (!capture_runtime(w, inspect, &output, runtime)) {
             free(output.data);
@@ -217,8 +217,16 @@ static void discover_containers(Wsl *w, ContainerRuntime runtime) {
         char *runtime_id = container_string(line, length, "ID");
         char *name = container_string(line, length, "Names");
         char *state = container_string(line, length, "State");
+        char *labels = runtime == RUNTIME_DOCKER ? container_string(line, length, "Labels") : NULL;
+        bool internal = false;
+        for (const char *label = labels; label && *label;) {
+            if (!strncmp(label, "org.outershell.tracing-worker=", sizeof("org.outershell.tracing-worker=") - 1)) internal = true;
+            const char *comma = strchr(label, ',');
+            label = comma ? comma + 1 : NULL;
+        }
+        free(labels);
         char id[37];
-        bool valid = runtime_id && strlen(runtime_id) == 64 &&
+        bool valid = !internal && runtime_id && strlen(runtime_id) == 64 &&
                      strspn(runtime_id, "0123456789abcdef") == 64 && name && *name && state;
         if (valid && container_identity(runtime, runtime_id, id)) {
             if (!strncmp(name, "outershell-", 11) && strlen(name) >= 47) {
@@ -310,7 +318,7 @@ static void container_provider(Wsl *w, StringBuilder *json, ContainerRuntime run
     append(json, ",\"setupURL\":");
     json_string(json, runtime == RUNTIME_DOCKER ? "https://docs.docker.com/desktop/setup/install/windows-install/" :
                 "https://learn.microsoft.com/windows/wsl/wsl-container");
-    append(json, ",\"defaultBaseImage\":\"outershell/container-base:21\"}");
+    append(json, ",\"defaultBaseImage\":\"outershell/container-base:22\"}");
 }
 
 static void container_snapshot(Distribution *d, StringBuilder *json) {

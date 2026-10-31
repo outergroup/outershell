@@ -11,7 +11,7 @@ if (!$SignCommand -and !$DevelopmentUnsigned) { throw 'Release packaging require
 $PayloadDirectory = [IO.Path]::GetFullPath($PayloadDirectory)
 $args = @("/DPayloadDirectory=$PayloadDirectory", "/DReleaseArchitecture=$Architecture", "/DReleaseVersion=$Version")
 if ($SignCommand) {
-    foreach ($name in @('OuterShell.exe','FilesBackend.exe')) {
+    foreach ($name in @('OuterShell.exe','FilesBackend.exe','PlaintextBackend.exe','TopBackend.exe','FirehoseBackend.exe','ProfileBackend.exe','outerctl.exe')) {
         $signature = Get-AuthenticodeSignature (Join-Path $PayloadDirectory $name)
         if ($signature.Status -ne 'Valid') { throw "$name must be signed before release packaging." }
     }

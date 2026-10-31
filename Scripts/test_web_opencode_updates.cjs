@@ -3,7 +3,7 @@ const fs = require('node:fs');
 const vm = require('node:vm');
 const source = fs.readFileSync('Resources/OuterShellWeb/app.js','utf8');
 let now=1000000000, running=true, installed=true, healthCalls=0, releaseCalls=0, version='1.19.3', fail=false;
-const item={identity:'opencode',primary:{frontend:{port:4096}}};
+const item={identity:'opencode',primary:{frontend:{socketPath:'/run/user/1000/outershell-opencode/opencode.sock'}}};
 const storage=new Map();
 const context={Date:{now:()=>now},document:{hidden:false},state:{},openCodeItem:()=>installed?item:undefined,
   endpointRunning:()=>running,render:()=>{},escapeHTML:s=>s,URL,AbortSignal,delay:async()=>{},

@@ -51,6 +51,10 @@ RUN mkdir -p /usr/local/share/outershell \
 COPY --chmod=0755 <<'OPENCODE_START' /usr/local/bin/outershell-opencode
 #!/bin/sh
 set -eu
+case "${1:-}" in
+    --socket=/*) socket=${1#--socket=} ;;
+    *) echo 'Usage: outershell-opencode --socket=PATH' >&2; exit 2 ;;
+esac
 export XDG_CONFIG_HOME=/var/lib/opencode/config
 export XDG_DATA_HOME=/var/lib/opencode/data
 export XDG_STATE_HOME=/var/lib/opencode/state
@@ -63,40 +67,62 @@ export OPENCODE_CONFIG_CONTENT='__OPENCODE_CONFIG__'
 workspace=/work
 app_root=/var/lib/opencode
 binary=/usr/local/bin/opencode
-PORT=4096
 cd "$workspace"
 if command -v git >/dev/null 2>&1 && [ ! -e .git ] && [ "$(git rev-parse --show-toplevel 2>/dev/null || true)" != "$workspace" ]; then
     git init -q
     git -c user.name='Outer Shell' -c user.email='outershell@localhost' -c commit.gpgsign=false commit --allow-empty -qm 'Initialize container workspace'
 fi
-"$binary" serve --hostname 127.0.0.1 --port "$PORT" &
+password=$(head -c 32 /dev/urandom | base64 | tr -d '/+=\n')
+authorization="Basic $(printf %s "opencode:$password" | base64 | tr -d '\n')"
+listen_log="$app_root/listen.log"
+: > "$listen_log"
+OPENCODE_SERVER_USERNAME=opencode OPENCODE_SERVER_PASSWORD="$password" "$binary" serve --hostname 127.0.0.1 --port 0 >> "$listen_log" 2>&1 &
 server_pid=$!
-trap 'kill "$server_pid" 2>/dev/null || true; wait "$server_pid" 2>/dev/null || true' EXIT
+tail -n +1 -f "$listen_log" &
+tail_pid=$!
+relay_pid=
+trap 'kill $server_pid $tail_pid $relay_pid 2>/dev/null || true; wait 2>/dev/null || true' EXIT
 trap 'exit 0' INT TERM
-base="http://127.0.0.1:$PORT"
+port=
+for attempt in $(seq 1 120); do
+    kill -0 "$server_pid" 2>/dev/null || { echo 'OpenCode exited during startup.' >&2; exit 1; }
+    port=$(sed -n 's|.*listening on http://127\.0\.0\.1:\([0-9][0-9]*\).*|\1|p' "$listen_log" | head -n 1)
+    [ -z "$port" ] || break
+    sleep 1
+done
+[ -n "$port" ] || { echo 'OpenCode startup timed out.' >&2; exit 1; }
+mkdir -p "${socket%/*}"
+OUTERSHELL_RELAY_HEADER="Authorization: $authorization" outerctl relay --listen "$socket" --to "127.0.0.1:$port" --header-from-env OUTERSHELL_RELAY_HEADER &
+relay_pid=$!
+opencode_request() {
+    printf 'header = "Authorization: %s"\n' "$authorization" | curl -K - "$@"
+}
+base="http://127.0.0.1:$port"
 ready=false
 for attempt in $(seq 1 120); do
     kill -0 "$server_pid" 2>/dev/null || { echo 'OpenCode exited during startup.' >&2; exit 1; }
-    if curl --fail --silent --max-time 2 "$base/global/health" >/dev/null; then ready=true; break; fi
+    if opencode_request --fail --silent --max-time 2 "$base/global/health" >/dev/null; then ready=true; break; fi
     sleep 1
- done
+done
 [ "$ready" = true ] || { echo 'OpenCode startup timed out.' >&2; exit 1; }
 encoded=$(printf %s "$workspace" | od -An -tx1 | tr -s ' \n' ' ' | sed 's/^ //;s/ $//;s/ /%/g;s/^/%/')
 state_file="$app_root/workspace-session"
 session_id=$(cat "$state_file" 2>/dev/null || true)
 case "$session_id" in ses_[a-zA-Z0-9]*) ;; *) session_id= ;; esac
-if [ -z "$session_id" ] || ! curl --fail --silent --max-time 10 "$base/session/$session_id?directory=$encoded" >/dev/null; then
-    result=$(curl --fail --silent --show-error --max-time 30 -H 'Content-Type: application/json' -d '{"title":"Container workspace"}' "$base/session?directory=$encoded")
+if [ -z "$session_id" ] || ! opencode_request --fail --silent --max-time 10 "$base/session/$session_id?directory=$encoded" >/dev/null; then
+    result=$(opencode_request --fail --silent --show-error --max-time 30 -H 'Content-Type: application/json' -d '{"title":"Container workspace"}' "$base/session?directory=$encoded")
     session_id=$(printf %s "$result" | sed -n 's/.*"id":"\(ses_[a-zA-Z0-9]*\)".*/\1/p')
     [ -n "$session_id" ] || { echo 'Could not create the container workspace session.' >&2; exit 1; }
     printf %s "$session_id" > "$state_file.tmp"
     mv "$state_file.tmp" "$state_file"
 fi
 directory_id=$(printf %s "$workspace" | base64 | tr '+/' '-_' | tr -d '=\r\n')
-outerctl app upsert --backend org.outershell.image.opencode --frontend-id org.outershell.image.opencode:main --name OpenCode --socket-path /run/user/0/org.outershell.image.opencode --url "/$directory_id/session/$session_id"
+outerctl app upsert --backend org.outershell.image.opencode --frontend-id org.outershell.image.opencode:main --name OpenCode --socket-path "$socket" --url "/$directory_id/session/$session_id"
 echo 'OpenCode container workspace is ready.'
-wait "$server_pid"
+while kill -0 "$server_pid" 2>/dev/null && kill -0 "$relay_pid" 2>/dev/null; do sleep 1; done
+echo 'OpenCode or its relay exited.' >&2
+exit 1
 OPENCODE_START
-RUN mkdir -p /work /var/lib/opencode && outerctl image add-app --id opencode --name OpenCode --working-directory /work --tcp-port 4096 -- /usr/local/bin/outershell-opencode
+RUN mkdir -p /work /var/lib/opencode && outerctl image add-app --id opencode --name OpenCode --working-directory /work --socket-argument=--socket -- /usr/local/bin/outershell-opencode
 VOLUME ["/work", "/var/lib/opencode"]
 WORKDIR /work

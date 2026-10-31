@@ -1,4 +1,3 @@
-param([ValidateRange(1024,65535)][int]$Port = 4096)
 & {
 $mode = '__OPENCODE_MODE__'
 $ErrorActionPreference = 'Stop'
@@ -9,10 +8,6 @@ $config = if ($env:XDG_CONFIG_HOME) { Join-Path $env:XDG_CONFIG_HOME 'opencode' 
 $workspace = Join-Path $env:USERPROFILE 'server-admin'
 $utf8 = New-Object System.Text.UTF8Encoding($false)
 New-Item -ItemType Directory -Force $root, "$config\skills\outer-shell", $workspace | Out-Null
-if ($mode -ne 'update') {
-$listener = New-Object Net.Sockets.TcpListener([Net.IPAddress]::Loopback, $Port)
-try { $listener.Start() } finally { $listener.Stop() }
-}
 $arch = [Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
 switch ($arch) {
     'X64' { $asset='opencode-windows-x64-baseline.zip'; $digest='__OPENCODE_SHA256_opencode-windows-x64-baseline.zip__' }
@@ -64,13 +59,34 @@ if ((Get-Command git -ErrorAction SilentlyContinue) -and !(Test-Path .git)) {
     git -c user.name='Outer Shell' -c user.email='outershell@localhost' -c commit.gpgsign=false commit --allow-empty -qm 'Initialize server administration workspace'
     if ($LASTEXITCODE) { throw 'Could not initialize server-admin history.' }
 }
-$server = Start-Process -FilePath $binary -ArgumentList @('serve','--hostname','127.0.0.1','--port',"$Port") -WorkingDirectory $workspace -NoNewWindow -PassThru
+$pipe = '__OPENCODE_PIPE__'
+$bytes = New-Object byte[] 32
+[Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
+$password = [Convert]::ToBase64String($bytes).TrimEnd('=').Replace('+', '-').Replace('/', '_')
+$authorization = 'Basic ' + [Convert]::ToBase64String($utf8.GetBytes("opencode:$password"))
+$headers = @{ Authorization = $authorization }
+$listener = New-Object Net.Sockets.TcpListener([Net.IPAddress]::Loopback, 0)
+$listener.Start()
+$Port = $listener.LocalEndpoint.Port
+$listener.Stop()
+$outerctl = if ($env:OUTERCTL_PATH) { $env:OUTERCTL_PATH } else { 'outerctl.exe' }
+$servers = @()
+$env:OPENCODE_SERVER_USERNAME = 'opencode'
+$env:OPENCODE_SERVER_PASSWORD = $password
 try {
+    $servers += Start-Process -FilePath $binary -ArgumentList @('serve','--hostname','127.0.0.1','--port',"$Port") -WorkingDirectory $workspace -NoNewWindow -PassThru
+} finally { Remove-Item Env:\OPENCODE_SERVER_PASSWORD }
+try {
+    $env:OUTERSHELL_RELAY_HEADER = "Authorization: $authorization"
+    try {
+        $servers += Start-Process -FilePath $outerctl -ArgumentList @('relay', '--listen', $pipe, '--to', "127.0.0.1:$Port", '--header-from-env', 'OUTERSHELL_RELAY_HEADER') -NoNewWindow -PassThru
+    } finally { Remove-Item Env:\OUTERSHELL_RELAY_HEADER }
+    foreach ($server in $servers) { $null = $server.Handle }
     $base = "http://127.0.0.1:$Port"
     $ready = $false
     for ($attempt = 0; $attempt -lt 120; $attempt++) {
-        if ($server.HasExited) { throw 'OpenCode exited during startup.' }
-        try { $health = Invoke-RestMethod "$base/global/health" -TimeoutSec 2; $ready = $health.healthy; if ($ready) { break } } catch { }
+        if ($servers | Where-Object { $_.HasExited }) { throw 'OpenCode exited during startup.' }
+        try { $health = Invoke-RestMethod "$base/global/health" -Headers $headers -TimeoutSec 2; $ready = $health.healthy; if ($ready) { break } } catch { }
         Start-Sleep 1
     }
     if (!$ready) { throw 'OpenCode startup timed out.' }
@@ -81,45 +97,28 @@ try {
     if (Test-Path $sessionFile) {
         $id = [IO.File]::ReadAllText($sessionFile).Trim()
         if ($id -match '^ses_[a-zA-Z0-9]+$') {
-            try { $session = Invoke-RestMethod "$base/session/$id$query" -TimeoutSec 10 } catch { }
+            try { $session = Invoke-RestMethod "$base/session/$id$query" -Headers $headers -TimeoutSec 10 } catch { }
         }
     }
     if (!$session) {
-        $session = Invoke-RestMethod "$base/session$query" -Method Post -ContentType 'application/json' -Body '{"title":"Server administration"}' -TimeoutSec 30
+        $session = Invoke-RestMethod "$base/session$query" -Method Post -Headers $headers -ContentType 'application/json' -Body '{"title":"Server administration"}' -TimeoutSec 30
         if ($session.id -notmatch '^ses_[a-zA-Z0-9]+$') { throw 'Could not create server-admin session.' }
         [IO.File]::WriteAllText($sessionFile, $session.id, $utf8)
     }
     $encoded = [Convert]::ToBase64String($utf8.GetBytes($directory)).TrimEnd('=').Replace('+','-').Replace('/','_')
     $path = "/$encoded/session/$($session.id)"
     $backend = 'org.outershell.command.opencode'
-    $values = @($backend, "${backend}:main", 'OpenCode', $path, '127.0.0.1', '', '', '', '')
-    $stream = New-Object IO.MemoryStream
-    $writer = New-Object IO.BinaryWriter($stream)
-    foreach ($value in @(13,1,1,0,$Port)) { $writer.Write([uint16]$value) }
-    $writer.Write((New-Object byte[] 72))
-    for ($i=0; $i -lt $values.Count; $i++) {
-        $bytes = $utf8.GetBytes($values[$i]); $offset = $stream.Length
-        $stream.Position = 10 + $i * 8; $writer.Write([uint32]$offset); $writer.Write([uint32]$bytes.Length)
-        $stream.Position = $offset; $writer.Write($bytes)
-    }
-    $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value.ToLowerInvariant()
-    $pipe = New-Object IO.Pipes.NamedPipeClientStream('.', "org.outershell.outershelld.$sid", [IO.Pipes.PipeDirection]::InOut)
-    try {
-        $pipe.Connect(10000)
-        $out = New-Object IO.BinaryWriter($pipe)
-        $out.Write([uint32]$stream.Length); $out.Write($stream.ToArray()); $out.Flush()
-        $reader = New-Object IO.BinaryReader($pipe)
-        $length = $reader.ReadUInt32()
-        if ($length -lt 6 -or $length -gt 1048576) { throw 'Invalid registry response.' }
-        $response = $reader.ReadBytes($length)
-        if ($response.Length -ne $length -or [BitConverter]::ToUInt16($response,0) -ne 100 -or [BitConverter]::ToUInt32($response,2) -ne 0) { throw 'Could not register the server-admin launcher.' }
-    } finally { $pipe.Dispose(); $writer.Dispose(); $stream.Dispose() }
+    & $outerctl app upsert --backend $backend --frontend-id "${backend}:main" --name 'OpenCode' --socket-path $pipe --url $path
+    if ($LASTEXITCODE) { throw 'Could not register the server-admin launcher.' }
     Write-Output 'OpenCode server-admin workspace is ready.'
-    $server.WaitForExit()
-    if ($server.ExitCode) { throw "OpenCode exited with code $($server.ExitCode)." }
+    while (!($servers | Where-Object { $_.HasExited })) { Start-Sleep 1 }
+    $exited = $servers | Where-Object { $_.HasExited } | Select-Object -First 1
+    throw "$(Split-Path -Leaf $exited.Path) exited with code $($exited.ExitCode)."
 } finally {
-    if (!$server.HasExited) { Stop-Process -Id $server.Id -Force }
-    $server.Dispose()
+    foreach ($server in $servers) {
+        if (!$server.HasExited) { Stop-Process -Id $server.Id -Force }
+        $server.Dispose()
+    }
 }
 
 }

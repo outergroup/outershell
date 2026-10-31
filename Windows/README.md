@@ -81,6 +81,13 @@ Outer Shell protocol. It is not an HTTP allowlist entry. Backend/app/log
 registration and removal, listing, and binary resource operations are implemented.
 Other registry operations return explicit unsupported-operation errors.
 
+`outerctl.exe` (built from `Resources/outerctl.cpp`) is installed in `bin` under the
+install directory, which is added to the user `Path`. It speaks this pipe protocol
+and rejects commands Windows does not implement before connecting. Command apps
+run with `OUTERCTL_PATH` set to it and `bin` prepended to `PATH`, so scripts call
+`& $env:OUTERCTL_PATH app upsert --backend ... --port ... --url ...`. Set
+`OUTERSHELLD_API_SOCKET` to a `\\.\pipe\...` path to target a different pipe.
+
 The pipe owner is its SID, with a protected DACL allowing that user and SYSTEM.
 Remote SMB clients are rejected and first-instance creation rejects occupied
 names. Outer Loop independently verifies the allowlist and the connected pipe's
@@ -483,3 +490,53 @@ same preservation rules as uninstalling through Windows Settings. A missing or
 untrusted uninstaller returns an actionable error without scheduling anything.
 `OuterShellUpdateFixture.exe uninstall-plan` tests the task definition; the native
 host test verifies that the homepage action reaches the uninstall handler.
+
+
+## Bundled Windows apps
+
+The Windows package includes native C backends for Files, Plaintext, Top,
+Firehose and Profile. Add Apps registers each app as an ordinary interactive-user
+Task Scheduler task, with its own named pipe and activation mapping. Stop,
+start and uninstall operate on that task. Uninstalling an app removes its
+registration and activation mapping while retaining its data and packaged binary.
+Setup installs Files by default and preserves optional app selections on upgrades.
+
+Files and Plaintext support the Windows filesystem and registered Docker/WSLc
+containers. The same binary file, revision and shared-draft protocols are used on
+all platforms. Host paths support drive letters, UNC paths and known folders;
+container paths remain Linux paths. Files can open a host file in Plaintext via
+its named pipe, or pass the container target through to Plaintext.
+
+Top is container-only on Windows. Rows and actions are identified by runtime,
+container ID, PID and process start identity; overlapping container PIDs remain
+independent. Both HTML and macOS native content support container process lists,
+details and termination. Windows host process monitoring is deliberately absent.
+
+Firehose and Profile use container-only Linux helpers. Docker runs a disposable
+helper in the selected container's PID namespace, with BPF, PERFMON, SYS_PTRACE,
+SYS_ADMIN and IPC_LOCK capabilities and seccomp disabled for that helper. It does
+not change the target container's configuration or elevate the Windows task.
+The helper uses binary stdin/stdout transport, without publishing a port. Its
+image is built on demand from the packaged container bootstrap. Profile recordings
+are retained under LocalAppData/OuterShell/tracing/Profile/<container-id>.
+
+WSLc helper transport and process discovery work, but current WSLc releases do
+not expose the capabilities/seccomp configuration needed for live tracing and
+profiling. The picker explains this limitation and helper failures remain visible.
+Running Outer Shell as Windows administrator does not resolve this Linux limit.
+
+Build with Windows/build.ps1 for x64, arm64 or x86. Build the six macOS content
+bundles with Windows/build-outerframe-bundles.sh. Container bootstrap packaging
+requires all five app helpers, in addition to the existing Linux platform tools.
+Run `python Windows/test_bundled_apps.py <build-directory>` on Windows without an
+existing Outer Shell running under that same account. It exercises actual named
+pipes, native filesystem operations, revision conflicts, shared drafts and app
+routing. Live container testing additionally requires Docker/WSLc and helper-equipped
+images in the same interactive user session as Outer Shell.
+
+
+Validation on Marcus-XPS: Files/Plaintext host and Docker/WSLc reads, writes,
+revision conflicts and native content delivery; optional app task lifecycle;
+Top colliding PIDs and stale-identity rejection; Docker Firehose eBPF events and
+Profile CPU samples. Profile's Linux listener and accepted sockets are now
+close-on-exec so a recording process cannot keep the helper HTTP response open.

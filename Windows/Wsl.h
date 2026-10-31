@@ -2,6 +2,7 @@
 #define OUTER_WINDOWS_WSL_H
 #include "Runtime.h"
 typedef struct Wsl Wsl;
+StringBuilder wsl_environments(Wsl *wsl);
 int wsl_inspect(void);
 Wsl *wsl_start(HANDLE stop);
 void wsl_refresh(Wsl *wsl);

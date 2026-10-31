@@ -17,7 +17,7 @@ if ($SystemService) {
     $service = Get-Service $serviceName -ErrorAction SilentlyContinue
     if ($service -and $service.Status -ne 'Stopped') { Stop-Service $serviceName; $service.WaitForStatus('Stopped', [TimeSpan]::FromSeconds(20)) }
  } else {
-    foreach ($taskName in @("OuterShell-$sid", "OuterShell-Files-$sid")) {
+    foreach ($taskName in @("OuterShell-$sid", "OuterShell-Files-$sid", "OuterShell-Plaintext-$sid", "OuterShell-Top-$sid", "OuterShell-Firehose-$sid", "OuterShell-Profile-$sid")) {
         if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) {
             Disable-ScheduledTask -TaskName $taskName | Out-Null
             Stop-ScheduledTask -TaskName $taskName
@@ -27,12 +27,23 @@ if ($SystemService) {
         if ($process) { $process.Kill(); if (!$process.WaitForExit(10000)) { throw 'The existing app did not stop.' }; $process.Dispose() }
     }
 }
-foreach ($file in @('OuterShell.exe', 'FilesBackend.exe')) {
+foreach ($file in @('OuterShell.exe', 'FilesBackend.exe', 'PlaintextBackend.exe', 'TopBackend.exe', 'FirehoseBackend.exe', 'ProfileBackend.exe')) {
     for ($attempt = 0; ; $attempt++) {
         try { Copy-Item (Join-Path $SourceDirectory $file) $destination -Force; break }
         catch [IO.IOException], [UnauthorizedAccessException] { if ($attempt -ge 20) { throw }; Start-Sleep -Milliseconds 250 }
     }
 }
+
+New-Item -ItemType Directory -Force (Join-Path $destination 'bin') | Out-Null
+Copy-Item (Join-Path $SourceDirectory 'outerctl.exe') (Join-Path $destination 'bin') -Force
+$bin = Join-Path $destination 'bin'
+$environmentKey = if ($SystemService) { [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey('SYSTEM\CurrentControlSet\Control\Session Manager\Environment', $true) } else { [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey('Environment') }
+try {
+    $path = [string]$environmentKey.GetValue('Path', '', [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+    if (!(($path -split ';') -contains $bin)) {
+        $environmentKey.SetValue('Path', ((@($path -split ';' | Where-Object { $_ }) + $bin) -join ';'), [Microsoft.Win32.RegistryValueKind]::ExpandString)
+    }
+} finally { $environmentKey.Dispose() }
 
 foreach ($obsolete in @('OuterShell.Windows.Runtime.dll', 'outershell-core.dll')) {
     $oldFile = Join-Path $destination $obsolete
@@ -44,7 +55,7 @@ foreach ($obsolete in @('OuterShell.Windows.Runtime.dll', 'outershell-core.dll')
         }
     }
 }
-foreach ($folder in @('web', 'files-web', 'bundles')) {
+foreach ($folder in @('web', 'files-web', 'plaintext-web', 'top-web', 'firehose-web', 'profile-web', 'bundles')) {
     New-Item -ItemType Directory -Force (Join-Path $destination $folder) | Out-Null
     Copy-Item (Join-Path $SourceDirectory "$folder/*") (Join-Path $destination $folder) -Recurse -Force
 }
@@ -70,13 +81,8 @@ if ($SystemService) {
 } else {
     $initialization = Start-Process -FilePath $executable -ArgumentList '--initialize' -Wait -PassThru
     if ($initialization.ExitCode) { throw 'Could not initialize the HTTP named-pipe allowlist.' }
-    $principal = New-ScheduledTaskPrincipal -UserId $identity.Name -LogonType Interactive -RunLevel Limited
-    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
-    foreach ($app in @(@{Name="OuterShell-$sid"; File='OuterShell.exe'}, @{Name="OuterShell-Files-$sid"; File='FilesBackend.exe'})) {
-        $action = New-ScheduledTaskAction -Execute (Join-Path $destination $app.File) -WorkingDirectory $destination
-        Register-ScheduledTask -TaskName $app.Name -Action $action -Principal $principal -Settings $settings -Force | Out-Null
-        Enable-ScheduledTask -TaskName $app.Name | Out-Null
-    }
+    & $executable --setup-install
+    if ($LASTEXITCODE) { throw 'Could not register the app tasks.' }
     if ($Start) { Start-ScheduledTask -TaskName "OuterShell-$sid" }
 }
 Write-Output "Installed Outer Shell and Files in $destination"

@@ -1,17 +1,38 @@
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <windows.h>
+#include <sddl.h>
+#include <shellapi.h>
+#include <fcntl.h>
+#include <io.h>
+#else
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
+#include <netdb.h>
+#include <poll.h>
+#include <signal.h>
 #include <unistd.h>
+#include <glob.h>
+#endif
 
 #include <errno.h>
-#include <glob.h>
 #include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef _WIN32
+#ifndef PATH_MAX
+#define PATH_MAX 32768
+#endif
+#else
 #include "OuterShellPaths.h"
+#endif
 
 namespace {
 
@@ -210,7 +231,66 @@ bool appendOuterctlApiStringListRef(Buffer &message, size_t refOffset, const cha
     return index == count;
 }
 
-bool readExact(int fd, void *data, size_t size) {
+#ifdef _WIN32
+using ApiConnection = HANDLE;
+const ApiConnection kInvalidApiConnection = INVALID_HANDLE_VALUE;
+
+bool setTransportError(Buffer &errorMessage, const char *prefix) {
+    const DWORD error = GetLastError();
+    char message[512] = "";
+    DWORD length = FormatMessageA(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+                                  nullptr,
+                                  error,
+                                  0,
+                                  message,
+                                  sizeof(message),
+                                  nullptr);
+    while (length > 0 && (message[length - 1] == '\r' || message[length - 1] == '\n' || message[length - 1] == '.')) {
+        message[--length] = '\0';
+    }
+    char code[48];
+    snprintf(code, sizeof(code), " (Windows error %lu)", static_cast<unsigned long>(error));
+    return assignCString(errorMessage, prefix) &&
+        appendCString(errorMessage, message) &&
+        appendCString(errorMessage, code);
+}
+
+bool readExact(ApiConnection connection, void *data, size_t size) {
+    char *bytes = static_cast<char *>(data);
+    while (size > 0) {
+        DWORD got = 0;
+        const DWORD chunk = size > 65536 ? 65536 : static_cast<DWORD>(size);
+        if (!ReadFile(connection, bytes, chunk, &got, nullptr) || got == 0) return false;
+        bytes += got;
+        size -= got;
+    }
+    return true;
+}
+
+bool writeExact(ApiConnection connection, const void *data, size_t size) {
+    const char *bytes = static_cast<const char *>(data);
+    while (size > 0) {
+        DWORD wrote = 0;
+        const DWORD chunk = size > 65536 ? 65536 : static_cast<DWORD>(size);
+        if (!WriteFile(connection, bytes, chunk, &wrote, nullptr) || wrote == 0) return false;
+        bytes += wrote;
+        size -= wrote;
+    }
+    return true;
+}
+
+void closeApiConnection(ApiConnection connection) {
+    CloseHandle(connection);
+}
+#else
+using ApiConnection = int;
+const ApiConnection kInvalidApiConnection = -1;
+
+bool setTransportError(Buffer &errorMessage, const char *prefix) {
+    return setErrnoError(errorMessage, prefix);
+}
+
+bool readExact(ApiConnection fd, void *data, size_t size) {
     char *bytes = static_cast<char *>(data);
     while (size > 0) {
         ssize_t got = read(fd, bytes, size);
@@ -225,7 +305,7 @@ bool readExact(int fd, void *data, size_t size) {
     return true;
 }
 
-bool writeExact(int fd, const void *data, size_t size) {
+bool writeExact(ApiConnection fd, const void *data, size_t size) {
     const char *bytes = static_cast<const char *>(data);
     while (size > 0) {
         ssize_t wrote = write(fd, bytes, size);
@@ -238,6 +318,11 @@ bool writeExact(int fd, const void *data, size_t size) {
     }
     return true;
 }
+
+void closeApiConnection(ApiConnection fd) {
+    close(fd);
+}
+#endif
 
 bool readOuterctlApiStringRef(const Buffer &message, size_t refOffset, Buffer &out) {
     if (refOffset + 8 > message.size) return false;
@@ -341,9 +426,101 @@ bool writeTsvRefRow(const Buffer &message, size_t rowOffset, const size_t *refs,
         fputc('\n', stdout) != EOF;
 }
 
-void defaultOuterctlApiSocketPath(char *out, size_t outSize) {
-    outer_shell_default_api_socket_path(out, outSize);
+#ifdef _WIN32
+bool defaultOuterctlApiPipePath(Buffer &out) {
+    const char *environmentPath = getenv("OUTERSHELLD_API_SOCKET");
+    if (environmentPath && _strnicmp(environmentPath, "\\\\.\\pipe\\", 9) == 0) {
+        return assignCString(out, environmentPath);
+    }
+    HANDLE token = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) return false;
+    DWORD length = 0;
+    GetTokenInformation(token, TokenUser, nullptr, 0, &length);
+    TOKEN_USER *user = length ? static_cast<TOKEN_USER *>(malloc(length)) : nullptr;
+    char *sid = nullptr;
+    bool ok = user &&
+        GetTokenInformation(token, TokenUser, user, length, &length) &&
+        ConvertSidToStringSidA(user->User.Sid, &sid) &&
+        assignCString(out, "\\\\.\\pipe\\org.outershell.outershelld.") &&
+        appendCString(out, sid);
+    if (sid) LocalFree(sid);
+    free(user);
+    CloseHandle(token);
+    for (size_t i = 0; ok && i < out.size; i += 1) {
+        if (out.data[i] >= 'A' && out.data[i] <= 'Z') out.data[i] = static_cast<char>(out.data[i] - 'A' + 'a');
+    }
+    return ok;
 }
+
+bool openOuterctlApi(ApiConnection &connection, Buffer &errorMessage) {
+    Buffer pipePath;
+    if (!defaultOuterctlApiPipePath(pipePath)) {
+        freeBuffer(pipePath);
+        return setTransportError(errorMessage, "Failed to determine the outershelld API pipe: ");
+    }
+    const int wideLength = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, pipePath.data, -1, nullptr, 0);
+    wchar_t *widePath = wideLength > 0 ? static_cast<wchar_t *>(malloc(static_cast<size_t>(wideLength) * sizeof(wchar_t))) : nullptr;
+    if (!widePath || !MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, pipePath.data, -1, widePath, wideLength)) {
+        free(widePath);
+        freeBuffer(pipePath);
+        assignCString(errorMessage, "outershelld API pipe path is invalid.");
+        return false;
+    }
+    const ULONGLONG deadline = GetTickCount64() + 10000;
+    for (;;) {
+        connection = CreateFileW(widePath, GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+        if (connection != INVALID_HANDLE_VALUE) break;
+        const DWORD error = GetLastError();
+        const ULONGLONG now = GetTickCount64();
+        if (error != ERROR_PIPE_BUSY || now >= deadline) {
+            if (error == ERROR_FILE_NOT_FOUND) {
+                assignCString(errorMessage, "Outer Shell is not running (no outershelld API pipe at ");
+                appendCString(errorMessage, pipePath.data);
+                appendCString(errorMessage, "). Start Outer Shell and try again.");
+            } else {
+                setTransportError(errorMessage, "Failed to connect to outershelld API pipe: ");
+            }
+            free(widePath);
+            freeBuffer(pipePath);
+            return false;
+        }
+        WaitNamedPipeW(widePath, static_cast<DWORD>(deadline - now));
+    }
+    free(widePath);
+    freeBuffer(pipePath);
+    return true;
+}
+#else
+bool openOuterctlApi(ApiConnection &connection, Buffer &errorMessage) {
+    char socketPath[PATH_MAX];
+    outer_shell_default_api_socket_path(socketPath, sizeof(socketPath));
+
+    connection = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (connection < 0) {
+        setErrnoError(errorMessage, "Failed to create API socket: ");
+        return false;
+    }
+    sockaddr_un address {};
+    address.sun_family = AF_UNIX;
+    if (strlen(socketPath) >= sizeof(address.sun_path)) {
+        close(connection);
+        assignCString(errorMessage, "outershelld API socket path is too long.");
+        return false;
+    }
+    snprintf(address.sun_path, sizeof(address.sun_path), "%s", socketPath);
+    if (connect(connection, reinterpret_cast<sockaddr *>(&address), sizeof(address)) != 0) {
+        errorMessage.size = 0;
+        if (errorMessage.data) errorMessage.data[0] = '\0';
+        appendCString(errorMessage, "Failed to connect to outershelld API socket ");
+        appendCString(errorMessage, socketPath);
+        appendCString(errorMessage, ": ");
+        appendCString(errorMessage, strerror(errno));
+        close(connection);
+        return false;
+    }
+    return true;
+}
+#endif
 
 enum : uint16_t {
     kMessageBackendUpsertRequest = 10,
@@ -384,8 +561,15 @@ enum : uint16_t {
 enum : uint16_t {
     kFrontendEndpointNone = 0,
     kFrontendEndpointTcp = 1,
-    kFrontendEndpointUnix = 2
+    kFrontendEndpointUnix = 2,
+    kFrontendEndpointNamedPipe = 3
 };
+
+#ifdef _WIN32
+constexpr uint16_t kFrontendEndpointLocalSocket = kFrontendEndpointNamedPipe;
+#else
+constexpr uint16_t kFrontendEndpointLocalSocket = kFrontendEndpointUnix;
+#endif
 
 enum : uint16_t {
     kFrontendSchemeDefault = 0,
@@ -513,7 +697,7 @@ bool parseHostPort(const char *start, size_t length, Buffer &host, uint32_t &por
 bool parseAppEndpoint(CommandRequest &request, Buffer &hostBuffer, Buffer &pathBuffer, Buffer &errorMessage) {
     bool hasSocket = request.socketPath && request.socketPath[0];
     bool hasPort = request.port > 0;
-    request.endpointKind = hasSocket ? kFrontendEndpointUnix : (hasPort ? kFrontendEndpointTcp : kFrontendEndpointNone);
+    request.endpointKind = hasSocket ? kFrontendEndpointLocalSocket : (hasPort ? kFrontendEndpointTcp : kFrontendEndpointNone);
     if (request.endpointScheme == kFrontendSchemeDefault) request.endpointScheme = kFrontendSchemeHttp;
     assignCString(hostBuffer, "127.0.0.1");
     normalizePath("/", pathBuffer);
@@ -561,7 +745,7 @@ bool parseAppEndpoint(CommandRequest &request, Buffer &hostBuffer, Buffer &pathB
     }
     if (request.path && request.path[0]) normalizePath(request.path, pathBuffer);
     if (hasPort) request.endpointKind = kFrontendEndpointTcp;
-    if (hasSocket) request.endpointKind = kFrontendEndpointUnix;
+    if (hasSocket) request.endpointKind = kFrontendEndpointLocalSocket;
     request.host = hostBuffer.data ? hostBuffer.data : "";
     request.path = pathBuffer.data ? pathBuffer.data : "/";
     return true;
@@ -1155,38 +1339,14 @@ bool writeRegistryListResponse(const CommandRequest &request, const Buffer &resp
 }
 
 bool tryOuterctlApi(const CommandRequest &request, int &exitStatus, Buffer &errorMessage) {
-    char socketPath[PATH_MAX];
-    defaultOuterctlApiSocketPath(socketPath, sizeof(socketPath));
-
-    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (fd < 0) {
-        setErrnoError(errorMessage, "Failed to create API socket: ");
-        return false;
-    }
-    sockaddr_un address {};
-    address.sun_family = AF_UNIX;
-    if (strlen(socketPath) >= sizeof(address.sun_path)) {
-        close(fd);
-        assignCString(errorMessage, "outershelld API socket path is too long.");
-        return false;
-    }
-    snprintf(address.sun_path, sizeof(address.sun_path), "%s", socketPath);
-    if (connect(fd, reinterpret_cast<sockaddr *>(&address), sizeof(address)) != 0) {
-        errorMessage.size = 0;
-        if (errorMessage.data) errorMessage.data[0] = '\0';
-        appendCString(errorMessage, "Failed to connect to outershelld API socket ");
-        appendCString(errorMessage, socketPath);
-        appendCString(errorMessage, ": ");
-        appendCString(errorMessage, strerror(errno));
-        close(fd);
-        return false;
-    }
+    ApiConnection fd = kInvalidApiConnection;
+    if (!openOuterctlApi(fd, errorMessage)) return false;
 
     Buffer message;
     bool ok = appendCommandRequestMessage(message, request);
     if (!ok || message.size > UINT32_MAX) {
         freeBuffer(message);
-        close(fd);
+        closeApiConnection(fd);
         assignCString(errorMessage, "Failed to encode outershelld API request.");
         return false;
     }
@@ -1197,30 +1357,30 @@ bool tryOuterctlApi(const CommandRequest &request, int &exitStatus, Buffer &erro
         writeExact(fd, message.data, message.size);
     freeBuffer(message);
     if (!ok) {
-        close(fd);
-        setErrnoError(errorMessage, "Failed to write outershelld API request: ");
+        closeApiConnection(fd);
+        setTransportError(errorMessage, "Failed to write outershelld API request: ");
         return false;
     }
 
     uint8_t responseLengthBytes[4];
     if (!readExact(fd, responseLengthBytes, sizeof(responseLengthBytes))) {
-        close(fd);
-        setErrnoError(errorMessage, "Failed to read outershelld API response header: ");
+        closeApiConnection(fd);
+        setTransportError(errorMessage, "Failed to read outershelld API response header: ");
         return false;
     }
     const uint32_t responseLength = readLittleEndianUInt32(responseLengthBytes);
     if (responseLength < 18 || responseLength > kOuterctlApiMaxFrameLength) {
-        close(fd);
+        closeApiConnection(fd);
         assignCString(errorMessage, "outershelld API response frame is invalid.");
         return false;
     }
 
     Buffer response;
     ok = reserveBuffer(response, responseLength) && readExact(fd, response.data, responseLength);
-    close(fd);
+    closeApiConnection(fd);
     if (!ok) {
         freeBuffer(response);
-        setErrnoError(errorMessage, "Failed to read outershelld API response: ");
+        setTransportError(errorMessage, "Failed to read outershelld API response: ");
         return false;
     }
     response.size = responseLength;
@@ -1253,6 +1413,7 @@ bool tryOuterctlApi(const CommandRequest &request, int &exitStatus, Buffer &erro
     return ok;
 }
 
+#ifndef _WIN32
 struct ImageAppRequest {
     const char *startMode = "manual";
     const char *id = "";
@@ -1969,9 +2130,569 @@ int handleImageListCommands(int argc, char *argv[]) {
     return 0;
 }
 
+#endif
+
+constexpr size_t kRelayMaxRequestHead = 64 * 1024;
+
+struct RelayOptions {
+    const char *listenPath = "";
+    const char *host = "";
+    const char *port = "";
+    const char *header = "";
+};
+
+void printRelayUsage(FILE *stream) {
+    fputs(
+        "Usage: outerctl relay --listen PATH --to HOST:PORT [--header-from-env VARIABLE]\n"
+        "\n"
+        "Accepts connections on a Unix socket (or a Windows named pipe such as\n"
+        "\\\\.\\pipe\\NAME) that only the current user can open, and forwards them to an\n"
+        "HTTP server on the loopback interface. When --header-from-env is given, the\n"
+        "variable holds one \"Name: value\" header that is added to every request,\n"
+        "replacing any header of the same name sent by the client.\n",
+        stream);
+}
+
+bool headerNameMatches(const char *line, size_t length, const char *name, size_t nameLength) {
+    if (length <= nameLength || line[nameLength] != ':') return false;
+    for (size_t i = 0; i < nameLength; i += 1) {
+        char a = line[i], b = name[i];
+        if (a >= 'A' && a <= 'Z') a = static_cast<char>(a - 'A' + 'a');
+        if (b >= 'A' && b <= 'Z') b = static_cast<char>(b - 'A' + 'a');
+        if (a != b) return false;
+    }
+    return true;
+}
+
+bool relayFailure(Buffer &errorMessage, const char *message) {
+    assignCString(errorMessage, message);
+    return false;
+}
+
+bool parseRelayOptions(int argc, char *argv[], RelayOptions &options, Buffer &errorMessage) {
+    const char *target = "";
+    const char *headerVariable = "";
+    for (int i = 2; i < argc; i += 1) {
+        if (strcmp(argv[i], "--listen") == 0 && i + 1 < argc) {
+            options.listenPath = argv[++i];
+        } else if (strcmp(argv[i], "--to") == 0 && i + 1 < argc) {
+            target = argv[++i];
+        } else if (strcmp(argv[i], "--header-from-env") == 0 && i + 1 < argc) {
+            headerVariable = argv[++i];
+        } else {
+            assignCString(errorMessage, "Unknown relay argument: ");
+            appendCString(errorMessage, argv[i]);
+            return false;
+        }
+    }
+    if (!options.listenPath[0] || !target[0]) return relayFailure(errorMessage, "--listen and --to are required.");
+#ifdef _WIN32
+    if (_strnicmp(options.listenPath, "\\\\.\\pipe\\", 9) != 0 || !options.listenPath[9]) {
+        return relayFailure(errorMessage, "--listen must be a named pipe path such as \\\\.\\pipe\\NAME.");
+    }
+#else
+    if (options.listenPath[0] != '/' || strlen(options.listenPath) >= sizeof(sockaddr_un::sun_path)) {
+        return relayFailure(errorMessage, "--listen must be an absolute Unix socket path.");
+    }
+#endif
+    const char *colon = strrchr(target, ':');
+    if (!colon || !colon[1]) return relayFailure(errorMessage, "--to must be HOST:PORT.");
+    static char host[64];
+    const size_t hostLength = static_cast<size_t>(colon - target);
+    if (hostLength == 0 || hostLength >= sizeof(host)) return relayFailure(errorMessage, "--to must be HOST:PORT.");
+    memcpy(host, target, hostLength);
+    host[hostLength] = '\0';
+    if (strcmp(host, "127.0.0.1") != 0 && strcmp(host, "localhost") != 0 && strcmp(host, "[::1]") != 0) {
+        return relayFailure(errorMessage, "--to must name a loopback address: 127.0.0.1, localhost, or [::1].");
+    }
+    if (strcmp(host, "[::1]") == 0) strcpy(host, "::1");
+    options.host = host;
+    options.port = colon + 1;
+    for (const char *p = options.port; *p; p += 1) {
+        if (*p < '0' || *p > '9') return relayFailure(errorMessage, "--to must be HOST:PORT.");
+    }
+    if (headerVariable[0]) {
+        const char *value = getenv(headerVariable);
+        if (!value || !strchr(value, ':') || strchr(value, '\r') || strchr(value, '\n') || value[0] == ':') {
+            return relayFailure(errorMessage, "The --header-from-env variable must hold one \"Name: value\" header.");
+        }
+        options.header = value;
+    }
+    return true;
+}
+
+const char *findRequestHeadEnd(const char *data, size_t length) {
+    for (size_t i = 3; i < length; i += 1) {
+        if (data[i] == '\n' && data[i - 1] == '\r' && data[i - 2] == '\n' && data[i - 3] == '\r') return data + i + 1;
+    }
+    return nullptr;
+}
+
+enum class RelayRequestState {
+    Head,
+    Body,
+    ChunkSize,
+    ChunkData,
+    Trailers,
+    Raw,
+};
+
+struct RelayRequestStream {
+    RelayRequestState state = RelayRequestState::Head;
+    Buffer pending;
+    uint64_t remaining = 0;
+};
+
+bool headerValueContains(const char *line, size_t length, size_t nameLength, const char *token) {
+    const size_t tokenLength = strlen(token);
+    for (size_t i = nameLength + 1; i + tokenLength <= length; i += 1) {
+        size_t matched = 0;
+        while (matched < tokenLength) {
+            char c = line[i + matched];
+            if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+            if (c != token[matched]) break;
+            matched += 1;
+        }
+        if (matched == tokenLength) return true;
+    }
+    return false;
+}
+
+bool forwardRelayRequestHead(RelayRequestStream &stream, const char *head, size_t length, const RelayOptions &options, Buffer &out) {
+    const char *end = head + length;
+    const char *lineEnd = static_cast<const char *>(memchr(head, '\n', length));
+    if (!lineEnd) return false;
+    const size_t headerNameLength = options.header[0] ? static_cast<size_t>(strchr(options.header, ':') - options.header) : 0;
+    if (!appendBuffer(out, head, static_cast<size_t>(lineEnd + 1 - head))) return false;
+    if (options.header[0] && !(appendCString(out, options.header) && appendCString(out, "\r\n"))) return false;
+    bool upgrade = false;
+    bool chunked = false;
+    uint64_t contentLength = 0;
+    for (const char *line = lineEnd + 1; line < end;) {
+        const char *next = static_cast<const char *>(memchr(line, '\n', static_cast<size_t>(end - line)));
+        if (!next) return false;
+        const size_t lineLength = static_cast<size_t>(next - line);
+        if (headerNameMatches(line, lineLength, "upgrade", 7)) upgrade = true;
+        if (headerNameMatches(line, lineLength, "transfer-encoding", 17) && headerValueContains(line, lineLength, 17, "chunked")) chunked = true;
+        if (headerNameMatches(line, lineLength, "content-length", 14)) {
+            contentLength = 0;
+            for (const char *p = line + 15; p < next; p += 1) {
+                if (*p >= '0' && *p <= '9') contentLength = contentLength * 10 + static_cast<uint64_t>(*p - '0');
+            }
+        }
+        if (!(headerNameLength && headerNameMatches(line, lineLength, options.header, headerNameLength)) &&
+            !appendBuffer(out, line, lineLength + 1)) {
+            return false;
+        }
+        line = next + 1;
+    }
+    if (upgrade) {
+        stream.state = RelayRequestState::Raw;
+    } else if (chunked) {
+        stream.state = RelayRequestState::ChunkSize;
+    } else if (contentLength > 0) {
+        stream.state = RelayRequestState::Body;
+        stream.remaining = contentLength;
+    } else {
+        stream.state = RelayRequestState::Head;
+    }
+    return true;
+}
+
+bool relayClientData(RelayRequestStream &stream, const RelayOptions &options, const char *data, size_t size, Buffer &out) {
+    while (size > 0) {
+        switch (stream.state) {
+        case RelayRequestState::Raw:
+            return appendBuffer(out, data, size);
+        case RelayRequestState::Body:
+        case RelayRequestState::ChunkData: {
+            const size_t take = stream.remaining < size ? static_cast<size_t>(stream.remaining) : size;
+            if (!appendBuffer(out, data, take)) return false;
+            data += take;
+            size -= take;
+            stream.remaining -= take;
+            if (stream.remaining == 0) {
+                stream.state = stream.state == RelayRequestState::Body ? RelayRequestState::Head : RelayRequestState::ChunkSize;
+            }
+            break;
+        }
+        case RelayRequestState::Head: {
+            const size_t previous = stream.pending.size;
+            if (!appendBuffer(stream.pending, data, size)) return false;
+            const char *headEnd = findRequestHeadEnd(stream.pending.data, stream.pending.size);
+            if (!headEnd) {
+                if (stream.pending.size > kRelayMaxRequestHead) return false;
+                return true;
+            }
+            const size_t headLength = static_cast<size_t>(headEnd - stream.pending.data);
+            const size_t consumed = headLength - previous;
+            Buffer head;
+            const bool ok = appendBuffer(head, stream.pending.data, headLength) &&
+                forwardRelayRequestHead(stream, head.data, head.size, options, out);
+            freeBuffer(head);
+            freeBuffer(stream.pending);
+            if (!ok) return false;
+            data += consumed;
+            size -= consumed;
+            break;
+        }
+        case RelayRequestState::ChunkSize:
+        case RelayRequestState::Trailers: {
+            const char *newline = static_cast<const char *>(memchr(data, '\n', size));
+            const size_t take = newline ? static_cast<size_t>(newline - data) + 1 : size;
+            if (!appendBuffer(stream.pending, data, take) || !appendBuffer(out, data, take)) return false;
+            data += take;
+            size -= take;
+            if (!newline) {
+                if (stream.pending.size > kRelayMaxRequestHead) return false;
+                break;
+            }
+            const bool blank = stream.pending.size <= 2;
+            if (stream.state == RelayRequestState::ChunkSize) {
+                uint64_t chunkSize = 0;
+                bool digits = false;
+                for (size_t i = 0; i < stream.pending.size; i += 1) {
+                    const char c = stream.pending.data[i];
+                    const int value = c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;
+                    if (value < 0) break;
+                    chunkSize = chunkSize * 16 + static_cast<uint64_t>(value);
+                    digits = true;
+                }
+                if (!digits) return false;
+                stream.state = chunkSize == 0 ? RelayRequestState::Trailers : RelayRequestState::ChunkData;
+                stream.remaining = chunkSize + 2;
+            } else if (blank) {
+                stream.state = RelayRequestState::Head;
+            }
+            freeBuffer(stream.pending);
+            break;
+        }
+        }
+    }
+    return true;
+}
+
+#ifdef _WIN32
+using RelaySocket = SOCKET;
+const RelaySocket kInvalidRelaySocket = INVALID_SOCKET;
+void closeRelaySocket(RelaySocket socket) { closesocket(socket); }
+#else
+using RelaySocket = int;
+const RelaySocket kInvalidRelaySocket = -1;
+void closeRelaySocket(RelaySocket socket) { close(socket); }
+#endif
+
+RelaySocket connectRelayTarget(const RelayOptions &options) {
+    addrinfo hints = {};
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    addrinfo *addresses = nullptr;
+    if (getaddrinfo(options.host, options.port, &hints, &addresses) != 0) return kInvalidRelaySocket;
+    RelaySocket result = kInvalidRelaySocket;
+    for (addrinfo *address = addresses; address && result == kInvalidRelaySocket; address = address->ai_next) {
+        RelaySocket candidate = socket(address->ai_family, address->ai_socktype, address->ai_protocol);
+        if (candidate == kInvalidRelaySocket) continue;
+        if (connect(candidate, address->ai_addr, static_cast<int>(address->ai_addrlen)) == 0) {
+            result = candidate;
+        } else {
+            closeRelaySocket(candidate);
+        }
+    }
+    freeaddrinfo(addresses);
+    return result;
+}
+
+bool sendAllToRelaySocket(RelaySocket socket, const char *data, size_t size) {
+    while (size > 0) {
+        const int chunk = size > 65536 ? 65536 : static_cast<int>(size);
+        const int sent = static_cast<int>(send(socket, data, chunk, 0));
+        if (sent <= 0) return false;
+        data += sent;
+        size -= static_cast<size_t>(sent);
+    }
+    return true;
+}
+
+#ifdef _WIN32
+bool relayPipeIo(HANDLE pipe, bool write, void *data, DWORD size, DWORD &done) {
+    OVERLAPPED overlapped = {};
+    overlapped.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!overlapped.hEvent) return false;
+    BOOL ok = write ? WriteFile(pipe, data, size, nullptr, &overlapped) : ReadFile(pipe, data, size, nullptr, &overlapped);
+    if (!ok && GetLastError() != ERROR_IO_PENDING) {
+        CloseHandle(overlapped.hEvent);
+        return false;
+    }
+    ok = GetOverlappedResult(pipe, &overlapped, &done, TRUE);
+    CloseHandle(overlapped.hEvent);
+    return ok && (write || done > 0);
+}
+
+bool writeAllToRelayPipe(HANDLE pipe, const char *data, size_t size) {
+    while (size > 0) {
+        DWORD written = 0;
+        const DWORD chunk = size > 65536 ? 65536 : static_cast<DWORD>(size);
+        if (!relayPipeIo(pipe, true, const_cast<char *>(data), chunk, written) || written == 0) return false;
+        data += written;
+        size -= written;
+    }
+    return true;
+}
+
+struct RelayConnection {
+    HANDLE pipe;
+    RelaySocket socket;
+    const RelayOptions *options;
+};
+
+DWORD WINAPI relayPipeToSocket(void *argument) {
+    RelayConnection *connection = static_cast<RelayConnection *>(argument);
+    RelayRequestStream stream;
+    Buffer forward;
+    char buffer[65536];
+    DWORD got = 0;
+    while (relayPipeIo(connection->pipe, false, buffer, sizeof(buffer), got)) {
+        forward.size = 0;
+        if (!relayClientData(stream, *connection->options, buffer, got, forward) ||
+            !sendAllToRelaySocket(connection->socket, forward.data, forward.size)) {
+            break;
+        }
+    }
+    shutdown(connection->socket, SD_BOTH);
+    freeBuffer(forward);
+    freeBuffer(stream.pending);
+    return 0;
+}
+
+DWORD WINAPI handleRelayConnection(void *argument) {
+    RelayConnection *connection = static_cast<RelayConnection *>(argument);
+    connection->socket = connectRelayTarget(*connection->options);
+    HANDLE upstream = connection->socket != kInvalidRelaySocket
+        ? CreateThread(nullptr, 0, relayPipeToSocket, connection, 0, nullptr)
+        : nullptr;
+    if (upstream) {
+        char buffer[65536];
+        int got = 0;
+        while ((got = recv(connection->socket, buffer, sizeof(buffer), 0)) > 0) {
+            if (!writeAllToRelayPipe(connection->pipe, buffer, static_cast<size_t>(got))) break;
+        }
+        FlushFileBuffers(connection->pipe);
+        CancelIoEx(connection->pipe, nullptr);
+        shutdown(connection->socket, SD_BOTH);
+        WaitForSingleObject(upstream, INFINITE);
+        CloseHandle(upstream);
+    }
+    if (connection->socket != kInvalidRelaySocket) closeRelaySocket(connection->socket);
+    DisconnectNamedPipe(connection->pipe);
+    CloseHandle(connection->pipe);
+    free(connection);
+    return 0;
+}
+
+int handleRelay(int argc, char *argv[]) {
+    RelayOptions options;
+    Buffer errorMessage;
+    if (!parseRelayOptions(argc, argv, options, errorMessage)) {
+        fprintf(stderr, "%s\n", errorMessage.data ? errorMessage.data : "Invalid relay arguments.");
+        printRelayUsage(stderr);
+        freeBuffer(errorMessage);
+        return 2;
+    }
+    WSADATA wsaData;
+    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
+        fputs("Could not initialize Windows sockets.\n", stderr);
+        return 1;
+    }
+    HANDLE token = nullptr;
+    DWORD length = 0;
+    TOKEN_USER *user = nullptr;
+    char *sid = nullptr;
+    if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) {
+        GetTokenInformation(token, TokenUser, nullptr, 0, &length);
+        user = length ? static_cast<TOKEN_USER *>(malloc(length)) : nullptr;
+        if (user && !GetTokenInformation(token, TokenUser, user, length, &length)) {
+            free(user);
+            user = nullptr;
+        }
+        CloseHandle(token);
+    }
+    Buffer descriptorText;
+    PSECURITY_DESCRIPTOR descriptor = nullptr;
+    const bool secured = user && ConvertSidToStringSidA(user->User.Sid, &sid) &&
+        assignCString(descriptorText, "D:P(A;;GA;;;") && appendCString(descriptorText, sid) && appendCString(descriptorText, ")") &&
+        ConvertStringSecurityDescriptorToSecurityDescriptorA(descriptorText.data, SDDL_REVISION_1, &descriptor, nullptr);
+    if (sid) LocalFree(sid);
+    free(user);
+    freeBuffer(descriptorText);
+    if (!secured) {
+        fputs("Could not create a named pipe restricted to the current user.\n", stderr);
+        return 1;
+    }
+    SECURITY_ATTRIBUTES attributes = {sizeof(attributes), descriptor, FALSE};
+    const int pathLength = MultiByteToWideChar(CP_UTF8, 0, options.listenPath, -1, nullptr, 0);
+    wchar_t *pipePath = pathLength > 0 ? static_cast<wchar_t *>(malloc(static_cast<size_t>(pathLength) * sizeof(wchar_t))) : nullptr;
+    if (!pipePath || !MultiByteToWideChar(CP_UTF8, 0, options.listenPath, -1, pipePath, pathLength)) {
+        fputs("Invalid named pipe path.\n", stderr);
+        return 1;
+    }
+    for (bool first = true;; first = false) {
+        HANDLE pipe = CreateNamedPipeW(pipePath,
+                                       PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED | (first ? FILE_FLAG_FIRST_PIPE_INSTANCE : 0),
+                                       PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+                                       PIPE_UNLIMITED_INSTANCES,
+                                       65536,
+                                       65536,
+                                       0,
+                                       &attributes);
+        if (pipe == INVALID_HANDLE_VALUE) {
+            Buffer message;
+            setTransportError(message, first ? "Could not create the relay pipe: " : "Could not accept another relay connection: ");
+            fprintf(stderr, "%s\n", message.data ? message.data : "Could not create the relay pipe.");
+            freeBuffer(message);
+            return 1;
+        }
+        OVERLAPPED overlapped = {};
+        overlapped.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        DWORD ignored = 0;
+        const bool connected = overlapped.hEvent &&
+            (ConnectNamedPipe(pipe, &overlapped) ||
+             GetLastError() == ERROR_PIPE_CONNECTED ||
+             (GetLastError() == ERROR_IO_PENDING && GetOverlappedResult(pipe, &overlapped, &ignored, TRUE)));
+        if (overlapped.hEvent) CloseHandle(overlapped.hEvent);
+        RelayConnection *connection = connected ? static_cast<RelayConnection *>(calloc(1, sizeof(RelayConnection))) : nullptr;
+        HANDLE thread = nullptr;
+        if (connection) {
+            connection->pipe = pipe;
+            connection->socket = kInvalidRelaySocket;
+            connection->options = &options;
+            thread = CreateThread(nullptr, 0, handleRelayConnection, connection, 0, nullptr);
+        }
+        if (thread) {
+            CloseHandle(thread);
+        } else {
+            free(connection);
+            DisconnectNamedPipe(pipe);
+            CloseHandle(pipe);
+        }
+    }
+}
+#else
+void relayClientConnection(int client, const RelayOptions &options) {
+    const int target = connectRelayTarget(options);
+    if (target == kInvalidRelaySocket) return;
+    RelayRequestStream stream;
+    Buffer forward;
+    char buffer[65536];
+    pollfd fds[2] = {{client, POLLIN, 0}, {target, POLLIN, 0}};
+    while (fds[0].fd >= 0 || fds[1].fd >= 0) {
+        if (poll(fds, 2, -1) < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        bool failed = false;
+        if (fds[0].fd >= 0 && (fds[0].revents & (POLLIN | POLLHUP | POLLERR))) {
+            const ssize_t got = read(client, buffer, sizeof(buffer));
+            forward.size = 0;
+            if (got <= 0) {
+                fds[0].fd = -1;
+                shutdown(target, SHUT_WR);
+            } else if (!relayClientData(stream, options, buffer, static_cast<size_t>(got), forward) ||
+                       !sendAllToRelaySocket(target, forward.data, forward.size)) {
+                failed = true;
+            }
+        }
+        if (fds[1].fd >= 0 && (fds[1].revents & (POLLIN | POLLHUP | POLLERR))) {
+            const ssize_t got = read(target, buffer, sizeof(buffer));
+            if (got <= 0 || !sendAllToRelaySocket(client, buffer, static_cast<size_t>(got))) failed = true;
+        }
+        if (failed) break;
+    }
+    close(target);
+    freeBuffer(forward);
+    freeBuffer(stream.pending);
+}
+
+int handleRelay(int argc, char *argv[]) {
+    RelayOptions options;
+    Buffer errorMessage;
+    if (!parseRelayOptions(argc, argv, options, errorMessage)) {
+        fprintf(stderr, "%s\n", errorMessage.data ? errorMessage.data : "Invalid relay arguments.");
+        printRelayUsage(stderr);
+        freeBuffer(errorMessage);
+        return 2;
+    }
+    signal(SIGPIPE, SIG_IGN);
+    signal(SIGCHLD, SIG_IGN);
+    const int listener = socket(AF_UNIX, SOCK_STREAM, 0);
+    sockaddr_un address = {};
+    address.sun_family = AF_UNIX;
+    snprintf(address.sun_path, sizeof(address.sun_path), "%s", options.listenPath);
+    unlink(options.listenPath);
+    const mode_t previousMask = umask(0177);
+    const bool bound = listener >= 0 && bind(listener, reinterpret_cast<sockaddr *>(&address), sizeof(address)) == 0;
+    umask(previousMask);
+    if (!bound || listen(listener, 64) != 0) {
+        fprintf(stderr, "Could not listen on %s: %s\n", options.listenPath, strerror(errno));
+        return 1;
+    }
+    for (;;) {
+        const int client = accept(listener, nullptr, nullptr);
+        if (client < 0) {
+            if (errno == EINTR) continue;
+            fprintf(stderr, "Could not accept a relay connection: %s\n", strerror(errno));
+            return 1;
+        }
+        const pid_t child = fork();
+        if (child == 0) {
+            close(listener);
+            relayClientConnection(client, options);
+            close(client);
+            _exit(0);
+        }
+        close(client);
+    }
+}
+#endif
+
+#ifdef _WIN32
+bool isSupportedOnWindows(uint16_t messageType) {
+    return (messageType >= kMessageBackendUpsertRequest && messageType <= kMessageLogListRequest) ||
+        (messageType >= kMessageResourceGetRequest && messageType <= kMessageResourceRemoveRequest);
+}
+
+char **utf8Arguments(int &argc) {
+    wchar_t **wideArguments = CommandLineToArgvW(GetCommandLineW(), &argc);
+    if (!wideArguments) return nullptr;
+    char **arguments = static_cast<char **>(calloc(static_cast<size_t>(argc) + 1, sizeof(char *)));
+    for (int i = 0; arguments && i < argc; i += 1) {
+        const int length = WideCharToMultiByte(CP_UTF8, 0, wideArguments[i], -1, nullptr, 0, nullptr, nullptr);
+        arguments[i] = length > 0 ? static_cast<char *>(malloc(static_cast<size_t>(length))) : nullptr;
+        if (!arguments[i] ||
+            !WideCharToMultiByte(CP_UTF8, 0, wideArguments[i], -1, arguments[i], length, nullptr, nullptr)) {
+            arguments = nullptr;
+        }
+    }
+    LocalFree(wideArguments);
+    return arguments;
+}
+#endif
+
 } // namespace
 
 int main(int argc, char *argv[]) {
+#ifdef _WIN32
+    argv = utf8Arguments(argc);
+    if (!argv) {
+        fputs("Failed to read the command line.\n", stderr);
+        return 1;
+    }
+    _setmode(_fileno(stdin), _O_BINARY);
+    _setmode(_fileno(stdout), _O_BINARY);
+    if (argc >= 2 && strcmp(argv[1], "image") == 0) {
+        fputs("outerctl image commands prepare Linux container images and are not available on Windows.\n", stderr);
+        return 1;
+    }
+#else
     if (argc >= 3 && strcmp(argv[1], "image") == 0 && strcmp(argv[2], "add-app") == 0) {
         return handleImageAddApp(argc, argv);
     }
@@ -1981,6 +2702,10 @@ int main(int argc, char *argv[]) {
     if (argc >= 3 && strcmp(argv[1], "image") == 0 && strcmp(argv[2], "list-commands") == 0) {
         return handleImageListCommands(argc, argv);
     }
+#endif
+    if (argc >= 2 && strcmp(argv[1], "relay") == 0) {
+        return handleRelay(argc, argv);
+    }
     int apiExitStatus = 1;
     Buffer apiError;
     CommandRequest request;
@@ -1989,7 +2714,16 @@ int main(int argc, char *argv[]) {
         freeBuffer(apiError);
         return 1;
     }
+#ifdef _WIN32
+    if (!isSupportedOnWindows(request.messageType)) {
+        fprintf(stderr, "outerctl %s %s is not supported by Outer Shell on Windows.\n", argv[1], argv[2]);
+        freeBuffer(apiError);
+        return 1;
+    }
+    if (request.usedDeprecatedIcons && _isatty(_fileno(stderr))) {
+#else
     if (request.usedDeprecatedIcons && isatty(STDERR_FILENO)) {
+#endif
         fputs("warning: --icons is deprecated and has no effect; app list already includes icon_path.\n",
               stderr);
     }

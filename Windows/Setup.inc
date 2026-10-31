@@ -5,13 +5,17 @@ static int setup_tasks(const char *operation) {
     if (!sid || !directory) { free(sid); free(directory); return 1; }
     bool install = !strcmp(operation, "install"), remove = !strcmp(operation, "remove");
     HRESULT result = S_OK;
-    for (int index = 0; index < 2 && SUCCEEDED(result); index++) {
-        StringBuilder name = {0}; sb_append(&name, index ? "\\OuterShell-Files-" : "\\OuterShell-"); sb_append(&name, sid);
+    for (int index = 0; index < 6 && SUCCEEDED(result); index++) {
+        StringBuilder name = {0}; sb_append(&name, index ? "\\OuterShell-" : "\\OuterShell-"); if (index) { sb_append(&name, bundled_apps[index - 1].name); sb_append(&name, "-"); } sb_append(&name, sid);
+        if (install && index > 1) {
+            DWORD state = 0;
+            if (FAILED(command_task(name.data, "query", NULL, &state))) { free(name.data); continue; }
+        }
         if (!install) {
             result = command_task(name.data, remove ? "uninstall" : "stop", NULL, NULL);
             if (result == HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND) || result == SCHED_E_TASK_NOT_RUNNING) result = S_OK;
         } else {
-            char *path = win_join(directory, index ? "FilesBackend.exe" : "OuterShell.exe");
+            char *path = win_join(directory, index ? bundled_apps[index - 1].executable : "OuterShell.exe");
             StringBuilder xml = {0};
             sb_append(&xml, "<Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\"><Principals><Principal id=\"User\"><UserId>");
             command_xml_text(&xml, sid);
@@ -22,7 +26,7 @@ static int setup_tasks(const char *operation) {
             free(xml.data); free(path);
         }
         if (SUCCEEDED(result) && (install || remove)) {
-            char *pipe = win_pipe(index ? files_id : shell_id);
+            char *pipe = win_pipe(index ? bundled_apps[index - 1].id : shell_id);
             bool ok = pipe && win_set_pipe_activation(pipe, install ? name.data : NULL);
             if (remove && pipe) ok = win_disallow_pipe(pipe) && ok;
             if (!index) {

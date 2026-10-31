@@ -832,16 +832,21 @@
     </div>`;
   }
 
-  function windowsOpenCodeCommand(script, port) {
+  function localPipePath(name) {
+    const suffix = Array.from(crypto.getRandomValues(new Uint8Array(12)), byte => byte.toString(16).padStart(2, "0")).join("");
+    return `\\\\.\\pipe\\org.outershell.${name}.${suffix}`;
+  }
+
+  function windowsScriptCommand(script, fileName) {
     const bytes = new TextEncoder().encode(script);
     const encoded = btoa(Array.from(bytes, byte => String.fromCharCode(byte)).join(""));
     const chunks = encoded.match(/.{1,1200}/g) || [];
     return [
-      'set "OC_SCRIPT=%LOCALAPPDATA%\\outershell-opencode-start.ps1"',
+      `set "OC_SCRIPT=%LOCALAPPDATA%\\${fileName}"`,
       ...chunks.map((chunk, index) => `${index ? ">>" : ">"} "%OC_SCRIPT%.b64" echo ${chunk}`),
       `powershell.exe -NoProfile -Command "[IO.File]::WriteAllBytes($env:OC_SCRIPT,[Convert]::FromBase64String([IO.File]::ReadAllText($env:OC_SCRIPT+'.b64')))"`,
       'if errorlevel 1 exit /b 1',
-      `powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%OC_SCRIPT%" -Port ${port}`,
+      'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%OC_SCRIPT%"',
       'exit /b %errorlevel%'
     ].join("\n");
   }
@@ -904,9 +909,9 @@
     openCodeUpdates.checking = true;
     const identity = item.identity;
     try {
-      const port = Number(item.primary.frontend.port || new URL(item.primary.frontend.url).port);
-      if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error("No OpenCode port is registered.");
-      const health = await openCodeCheckJSON(`/api/opencode-health?port=${port}`);
+      const socket = item.primary.frontend.socketPath;
+      if (!socket) throw new Error("No OpenCode socket is registered.");
+      const health = await openCodeCheckJSON(`/api/opencode-health?socket=${encodeURIComponent(socket)}`);
       if (!health.healthy || !/^1\.\d+\.\d+$/.test(health.version)) throw new Error("OpenCode version unavailable.");
       openCodeUpdates.version = health.version;
       let cached;
@@ -1042,7 +1047,6 @@
     const windows = state.hostPlatform === "windows";
     const dialog = openDialog(`<header class="dialog-header"><div class="dialog-title-wrap"><h2 id="dialog-title">Your coding agent, on this server</h2><p>Set up OpenCode</p></div><button class="dialog-close" type="button" data-action="close-dialog" aria-label="Close">×</button></header>
       <div class="dialog-body agent-guide"><p><button class="secondary-button" type="button" data-opencode-container>Set up in a new container</button></p><p>Or install directly on this server:</p><ol class="assistant-steps"><li><strong>Install OpenCode</strong><span>Outer Shell downloads it and adds it to your apps. No terminal needed.</span></li><li><strong>Connect a model provider</strong><span>Sign in or add your API key in OpenCode. Your provider’s pricing applies.</span></li><li><strong>Ask for what you want</strong><span>OpenCode comes with instructions for adding apps to Outer Shell.</span></li></ol>
-      <details><summary>Connection settings</summary><label for="opencode-port">Port</label><input id="opencode-port" type="number" min="1024" max="65535" value="4096"><p class="field-note">Available only on this server and through your Outer Loop connection.</p></details>
       <p class="form-message" role="status" aria-live="polite"></p></div>
       <footer class="dialog-footer"><button class="secondary-button" type="button" data-action="agent-guide">Use my own agent</button><button class="primary-button" type="button" data-install-opencode>Install OpenCode</button></footer>`);
     dialog.querySelector("[data-opencode-container]").addEventListener("click", () => openCreateContainer(true));
@@ -1050,18 +1054,17 @@
       const button = event.currentTarget;
       if (button.disabled) return;
       const message = dialog.querySelector(".form-message");
-      const port = Number(dialog.querySelector("#opencode-port").value);
-      if (!Number.isInteger(port) || port < 1024 || port > 65535) { message.textContent = "Choose a port between 1024 and 65535."; return; }
       button.disabled = true;
       button.textContent = "Installing…";
       message.textContent = "Downloading OpenCode and preparing your coding agent. This can take a few minutes. You can close this dialog; installation will continue.";
       try {
         const load = async path => { const response = await fetch(path); if (!response.ok) throw new Error("Could not load the OpenCode installer. Refresh Outer Shell and try again."); return response.text(); };
         const [script, skill, admin, release] = await Promise.all([load(windows ? "/web/opencode-start.ps1" : "/web/opencode-start.sh"), load("/web/outer-shell-skill.md"), load("/web/server-admin.md"), resolveOpenCodeRelease()]);
-        const prepared = prepareOpenCodeRelease(script, release).replace("__OPENCODE_MODE__", "install").replace("__OUTERSHELL_SKILL__", () => skill.trimEnd()).replace("__OUTERSHELL_ADMIN__", () => admin.trimEnd());
-        const command = windows ? windowsOpenCodeCommand(prepared, port) : prepared;
+        const pipe = windows ? localPipePath("opencode") : "";
+        const prepared = prepareOpenCodeRelease(script, release).replace("__OPENCODE_MODE__", "install").replace("__OPENCODE_PIPE__", () => pipe).replace("__OUTERSHELL_SKILL__", () => skill.trimEnd()).replace("__OUTERSHELL_ADMIN__", () => admin.trimEnd());
+        const command = windows ? windowsScriptCommand(prepared, "outershell-opencode-start.ps1") : prepared;
         if (new TextEncoder().encode(command).length >= (windows ? 262144 : 32768)) throw new Error("OpenCode installer exceeds the command size limit.");
-        const query = new URLSearchParams({ recipe: "command-port", name: "OpenCode", identifier: windows ? "opencode" : "org.outershell.OpenCode", command, workdir: "~", scope: "user", frontendTransport: "port", port: String(port) });
+        const query = new URLSearchParams({ recipe: "command-port", name: "OpenCode", identifier: windows ? "opencode" : "org.outershell.OpenCode", command, workdir: "~", scope: "user", frontendTransport: windows ? "namedPipe" : "unixSocket", socketPath: windows ? pipe : "~/.local/state/outershell-opencode/opencode.sock" });
         const { buffer } = await requestBuffer("/api/create", { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: query });
         const result = decodeAction(buffer);
         if (!result.ok) throw new Error(result.message || "Could not install OpenCode.");
@@ -1092,6 +1095,76 @@
         button.replaceWith(button.cloneNode(true));
         const retry = dialog.querySelector("[data-install-opencode]");
         retry?.addEventListener("click", () => { closeDialog(); openOpenCodeSetup(prompt).catch(error => toast(error.message || String(error))); });
+      }
+    });
+  }
+
+  function ttydApps() {
+    return state.hostPlatform === "windows"
+      ? [{ shell: "powershell", name: "ttyd (PowerShell)", identifier: "ttyd-powershell", serviceID: "org.outershell.command.ttyd-powershell" },
+        { shell: "cmd", name: "ttyd (Command Prompt)", identifier: "ttyd-cmd", serviceID: "org.outershell.command.ttyd-cmd" }]
+      : [{ name: "ttyd", identifier: "org.outershell.ttyd", serviceID: "org.outershell.ttyd" }];
+  }
+
+  function ttydItem(app) {
+    return launcherItems().find(item => item.backend.serviceID === app.serviceID && item.primary?.backend.serviceScope !== "system");
+  }
+
+  function ttydInstalled() {
+    return ttydApps().every(app => ttydItem(app));
+  }
+
+  async function openTtydSetup() {
+    const apps = ttydApps();
+    if (ttydInstalled()) { await launch(ttydItem(apps[0]).identity, "primary", false, { host: true }); return; }
+    const windows = state.hostPlatform === "windows";
+    const platformNote = windows
+      ? `<p>Outer Shell downloads ttyd for you and adds two apps: ttyd (PowerShell) and ttyd (Command Prompt). You can start, stop, and remove each one separately.</p>`
+      : `<p><strong>On macOS</strong>, install ttyd first, then choose Install ttyd:</p><pre class="command-block">brew install ttyd</pre><p>On Linux, Outer Shell downloads ttyd for you. If tmux is installed, your session keeps running when you close the page.</p>`;
+    const dialog = openDialog(`<header class="dialog-header"><div class="dialog-title-wrap"><h2 id="dialog-title">ttyd</h2><p>A shell on this server, in your browser</p></div><button class="dialog-close" type="button" data-action="close-dialog" aria-label="Close">×</button></header>
+      <div class="dialog-body agent-guide"><p><a href="https://github.com/tsl0922/ttyd" target="_blank" rel="noopener">ttyd</a> is an open-source terminal for the browser. It runs as your user and is reachable only through your Outer Loop connection.</p>${platformNote}
+      <p class="form-message" role="status" aria-live="polite"></p></div>
+      <footer class="dialog-footer"><button class="secondary-button" type="button" data-action="close-dialog">Cancel</button><button class="primary-button" type="button" data-install-ttyd>Install ttyd</button></footer>`);
+    dialog.querySelector("[data-install-ttyd]").addEventListener("click", async event => {
+      const button = event.currentTarget;
+      if (button.disabled) return;
+      const message = dialog.querySelector(".form-message");
+      button.disabled = true;
+      button.textContent = "Installing…";
+      try {
+        const [response, iconResponse] = await Promise.all([fetch(windows ? "/web/ttyd-start.ps1" : "/web/ttyd-start.sh"), fetch("/web/icons/ttyd.png")]);
+        if (!response.ok || !iconResponse.ok) throw new Error("Could not load the ttyd installer. Refresh Outer Shell and try again.");
+        const iconBytes = new Uint8Array(await iconResponse.arrayBuffer());
+        const script = (await response.text()).replace("__TTYD_ICON__", btoa(Array.from(iconBytes, byte => String.fromCharCode(byte)).join("")));
+        for (const app of apps) {
+          if (ttydItem(app)) continue;
+          message.textContent = `Setting up ${app.name}…`;
+          const pipe = windows ? localPipePath(app.identifier) : "";
+          const query = new URLSearchParams(windows
+            ? { recipe: "command-port", name: app.name, identifier: app.identifier, command: windowsScriptCommand(script.replace("__TTYD_SHELL__", app.shell).replace("__TTYD_PIPE__", pipe), `outershell-${app.identifier}-start.ps1`), workdir: "~", scope: "user", frontendTransport: "namedPipe", socketPath: pipe }
+            : { recipe: "command-port", name: app.name, identifier: app.identifier, command: script, workdir: "~", scope: "user", frontendTransport: "unixSocket", socketPath: "~/.local/state/outershell-ttyd/ttyd.sock" });
+          const { buffer } = await requestBuffer("/api/create", { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: query });
+          const result = decodeAction(buffer);
+          if (!result.ok) throw new Error(result.message || `Could not install ${app.name}.`);
+          let running = false;
+          for (let attempt = 0; attempt < 90 && !running; attempt += 1) {
+            await refreshBackends({ quiet: true });
+            const item = ttydItem(app);
+            running = Boolean(item?.primary && endpointRunning(item.primary));
+            const failure = !running && item?.primary && endpointFailure(item.primary, app.name);
+            if (failure) throw new Error(`${failure} Open its app menu and check the logs for details.`);
+            if (!running) await delay(1000);
+          }
+          if (!running) throw new Error(`${app.name} is still starting. Check its logs from the app menu.`);
+        }
+        if (!dialog.isConnected) { toast("ttyd is ready. Open it from your apps."); return; }
+        closeDialog();
+        await launch(ttydItem(apps[0]).identity, "primary", false, { host: true });
+      } catch (error) {
+        message.textContent = error.message || String(error);
+        await refreshBackends({ quiet: true });
+        button.disabled = false;
+        button.textContent = "Install ttyd";
       }
     });
   }
@@ -1862,6 +1935,11 @@
       catalogEntries.push({ name: "OpenCode", html: `<article class="add-catalog-app ${installed ? "installed" : ""}">
         <span class="app-icon has-image" aria-hidden="true"><img src="/web/icons/opencode.svg" alt=""></span><h3>OpenCode</h3>
         ${installed ? '<span class="catalog-installed">Installed</span>' : '<button class="secondary-button" type="button" data-action="setup-opencode">Install</button>'}
+      </article>` });
+      const ttydDone = ttydInstalled();
+      catalogEntries.push({ name: "ttyd (Terminal)", html: `<article class="add-catalog-app ${ttydDone ? "installed" : ""}">
+        <span class="app-icon has-image" aria-hidden="true"><img src="/web/icons/ttyd.svg" alt=""></span><h3>ttyd (Terminal)</h3>
+        ${ttydDone ? '<span class="catalog-installed">Installed</span>' : '<button class="secondary-button" type="button" data-action="setup-ttyd">Install</button>'}
       </article>` });
     }
     const catalog = catalogEntries.length ? `<div class="add-catalog">${catalogEntries.sort((a, b) => a.name.localeCompare(b.name)).map(entry => entry.html).join("")}</div>` : `<p class="add-empty">No bundled apps are available for this account.</p>`;
@@ -2648,7 +2726,11 @@
     state.addWorkspace = workspace;
     const codingAgent = codingAgentHTML(null, true);
     const infrastructure = (workspace.mounts || []).filter(mount => mount.isInfrastructure);
-    const tabs = [["dockerfile", "Dockerfile"], ["agent", "Coding agent"], ["mounts", "Folder mounts"], ["environment", "Environment"], ["ports", "Network"], ["runtime", "Runtime"]];
+    const appsCatalog = `<div class="add-catalog">${[["OpenCode", "/web/icons/opencode.svg", "data-add-opencode", "/usr/local/bin/outershell-opencode"], ["ttyd (Terminal)", "/web/icons/ttyd.svg", "data-add-ttyd", "/usr/local/bin/outershell-ttyd"]].map(([name, icon, attribute, marker]) => {
+      const added = recipe.containerfile.includes(marker);
+      return `<article class="add-catalog-app ${added ? "installed" : ""}"><span class="app-icon has-image" aria-hidden="true"><img src="${icon}" alt=""></span><h3>${name}</h3>${added ? '<span class="catalog-installed">Added</span>' : `<button class="secondary-button" type="button" ${attribute}>Add</button>`}</article>`;
+    }).join("")}</div><p class="field-note">Adds the app to the Dockerfile. Choose Save &amp; rebuild to install it. Requires Debian or Ubuntu with Outer Shell support.</p>`;
+    const tabs = [["dockerfile", "Dockerfile"], ["agent", "Coding agent"], ["apps", "Outer Shell apps"], ["mounts", "Folder mounts"], ["environment", "Environment"], ["ports", "Network"], ["runtime", "Runtime"]];
     const resourceProvider = state.providers.find(provider => provider.id === workspace.runtime?.providerID);
     const dialog = openDialog(`${containerDialogHeader(`Container: ${workspace.name}`)}
       <form class="container-form" novalidate><div class="dialog-body">
@@ -2657,6 +2739,7 @@
         <div class="configuration-content">
         <section role="tabpanel" id="config-panel-dockerfile" aria-labelledby="config-tab-dockerfile" data-config-panel="dockerfile"><div class="dockerfile-toolbar"><label for="container-dockerfile">Dockerfile</label><div class="dockerfile-zoom" role="group" aria-label="Dockerfile text size"><span>Pinch to resize text</span><button type="button" data-dockerfile-smaller aria-label="Smaller Dockerfile text">A−</button><button type="button" data-dockerfile-reset title="Reset text size">100%</button><button type="button" data-dockerfile-larger aria-label="Larger Dockerfile text">A+</button></div></div><div class="field"><textarea id="container-dockerfile" name="dockerfile" class="dockerfile-editor" spellcheck="false" autocapitalize="off" autocorrect="off">${escapeHTML(recipe.containerfile)}</textarea></div></section>
         <section role="tabpanel" id="config-panel-agent" aria-labelledby="config-tab-agent" data-config-panel="agent" hidden>${codingAgent}</section>
+        <section role="tabpanel" id="config-panel-apps" aria-labelledby="config-tab-apps" data-config-panel="apps" hidden>${appsCatalog}</section>
         <section role="tabpanel" id="config-panel-mounts" aria-labelledby="config-tab-mounts" data-config-panel="mounts" hidden><div class="mounts-heading"><div><h3>Folder mounts</h3><p>${agentConnection().local ? "Share a folder with this container." : "Make an existing server folder available inside this container."}</p></div><button class="secondary-button" type="button" data-add-row="mounts"><span aria-hidden="true">＋</span> Add folder mount</button></div><div class="mount-list" data-rows="mounts">${(workspace.mounts || []).filter(mount => !mount.isInfrastructure).map(mount => configurationRow("mounts", mount)).join("")}</div><p class="mount-empty">No folder mounts yet. Add a folder to share files with this container.</p>${infrastructure.length ? `<details class="managed-mounts"><summary>Managed by Outer Shell <span>(${infrastructure.length})</span></summary><p>These folders support the container and are managed automatically.</p><div class="managed-mount-list">${infrastructure.map(mount => `<div><code>${escapeHTML(mount.hostPath)}</code><span aria-hidden="true">→</span><code>${escapeHTML(mount.guestPath)}</code></div>`).join("")}</div></details>` : ""}</section>
         <section role="tabpanel" id="config-panel-environment" aria-labelledby="config-tab-environment" data-config-panel="environment" hidden><div data-rows="environment">${(recipe.environment || []).map(value => configurationRow("environment", value)).join("")}</div><button type="button" data-add-row="environment">Add variable</button></section>
         <section role="tabpanel" id="config-panel-ports" aria-labelledby="config-tab-ports" data-config-panel="ports" hidden>${recipe.supportsRuntimeSettings ? `<label class="field">Network mode<select name="networkMode"><option value="bridge" ${recipe.networkMode !== "host" ? "selected" : ""}>Isolated network</option><option value="host" ${recipe.networkMode === "host" ? "selected" : ""}>Host network</option></select></label><p class="field-note">Host networking shares the server’s network for LAN device discovery. Apps listen directly on server ports and may be reachable from other devices. Port mappings are not used.</p>` : ""}<p class="field-note">Publish a container TCP port on this server when using an isolated network.</p><div data-rows="ports">${(recipe.publishedPorts || []).map(value => configurationRow("ports", value)).join("")}</div><button type="button" data-add-row="ports">Add port</button></section>
@@ -2682,7 +2765,7 @@
       }
       event.target.closest("[data-remove-row]")?.closest("[data-row]").remove();
     });
-    form.querySelector("[data-add-opencode]")?.addEventListener("click", async event => {
+    form.querySelectorAll("[data-add-opencode]").forEach(element => element.addEventListener("click", async event => {
       const button = event.currentTarget;
       const message = form.querySelector(".container-message");
       if (form.elements.dockerfile.value.includes("/usr/local/bin/outershell-opencode")) {
@@ -2691,9 +2774,25 @@
       }
       button.disabled = true;
       try {
-        const fragment = await openCodeContainerFragment(form.elements.allowAllOpenCodeActions.checked);
+        const fragment = await openCodeContainerFragment(form.elements.allowAllOpenCodeActions?.checked ?? false);
         form.elements.dockerfile.value = form.elements.dockerfile.value.trimEnd() + "\n\n" + fragment;
         message.textContent = "OpenCode added. Choose Save & rebuild to install it.";
+      } catch (error) { message.textContent = error.message; }
+      finally { button.disabled = false; }
+    }));
+    form.querySelector("[data-add-ttyd]")?.addEventListener("click", async event => {
+      const button = event.currentTarget;
+      const message = form.querySelector(".container-message");
+      if (form.elements.dockerfile.value.includes("/usr/local/bin/outershell-ttyd")) {
+        message.textContent = "This Dockerfile already includes ttyd.";
+        return;
+      }
+      button.disabled = true;
+      try {
+        const response = await fetch("/web/ttyd-container.Dockerfile");
+        if (!response.ok) throw new Error("Could not load the ttyd container setup. Refresh Outer Shell and try again.");
+        form.elements.dockerfile.value = form.elements.dockerfile.value.trimEnd() + "\n\n" + await response.text();
+        message.textContent = "ttyd added. Choose Save & rebuild to install it.";
       } catch (error) { message.textContent = error.message; }
       finally { button.disabled = false; }
     });
@@ -3545,6 +3644,7 @@
     if (action === "example-prompt") { await copyText(agentExamples[Number(actionElement.dataset.example)] || agentExamples[2]); return; }
     if (action === "update-opencode") { await openOpenCodeUpdate(); return; }
     if (action === "setup-opencode") { try { await openOpenCodeSetup(); } catch (error) { toast(error.message || String(error)); } return; }
+    if (action === "setup-ttyd") { try { await openTtydSetup(); } catch (error) { toast(error.message || String(error)); } return; }
     if (action === "rename-endpoint") { const item = findItem(actionElement.dataset.appKey); if (item) openRenameEndpoint(item); return; }
     if (action === "show-container-command") { const bounds = actionElement.getBoundingClientRect(); openContainerCommand(actionElement.dataset.safeSpaceId, actionElement.dataset.commandId, { x: bounds.left, y: bounds.bottom }); return; }
     if (action === "setup-container-opencode") { openCreateContainer(true); return; }

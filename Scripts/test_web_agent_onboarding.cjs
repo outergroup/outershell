@@ -47,13 +47,13 @@ for (const extension of ["sh", "ps1"]) {
   if (extension === "sh") assert(Buffer.byteLength(script) < 32768);
   else {
     const original = script + "\n# Unicode: café 🦊; shell: %PATH% & | $() `\n";
-    const command = context.windowsOpenCodeCommand(original, 4096);
+    const command = context.windowsScriptCommand(original, "outershell-opencode-start.ps1");
     assert(Buffer.byteLength(command) < 262144);
     const lines = command.split("\n");
     assert(lines.every(line => line.length < 8192));
     const encoded = lines.filter(line => /^>>? /.test(line)).map(line => line.split(" echo ")[1]).join("");
     assert.equal(Buffer.from(encoded, "base64").toString("utf8"), original);
-    assert.match(command, /-Port 4096/);
+    assert.match(command, /-File "%OC_SCRIPT%"$/m);
   }
 }
 console.log("PASS: connection prompts, OpenCode discovery, installer limits, Windows Unicode and shell-safe encoding");
