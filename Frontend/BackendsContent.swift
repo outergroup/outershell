@@ -10308,11 +10308,12 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         launchingEndpoints.insert(key)
         backendError = ""
         updateLayout()
-        if let pipe = app.externalSocketPath, pipe.hasPrefix("\\\\.\\pipe\\") {
+        if let socket = app.externalSocketPath, !socket.isEmpty {
             let path = pathAndQuery(fromFrontendURL: app.url, socketPath: app.socketPath)
-            guard let url = URL(string: "http+pipe://\(percentEncodedSocketPath(pipe))\(path)") else {
+            let scheme = socket.hasPrefix("\\\\.\\pipe\\") ? "http+pipe" : "http+unix"
+            guard let url = URL(string: "\(scheme)://\(percentEncodedSocketPath(socket))\(path)") else {
                 launchingEndpoints.remove(key)
-                backendError = "The app returned an invalid named pipe address."
+                backendError = "The app returned an invalid container socket address."
                 updateLayout()
                 return
             }
