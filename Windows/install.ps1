@@ -23,15 +23,13 @@ if ($SystemService) {
             Stop-ScheduledTask -TaskName $taskName
         }
     }
-    Get-CimInstance Win32_Process -Filter "Name='OuterShell.exe' OR Name='FilesBackend.exe'" | Where-Object { $_.ExecutablePath -eq "$destination\OuterShell.exe" -or $_.ExecutablePath -eq "$destination\FilesBackend.exe" } | ForEach-Object { $process = Get-Process -Id $_.ProcessId -ErrorAction SilentlyContinue
+    Get-CimInstance Win32_Process -Filter "Name='OuterShell.exe'" | Where-Object { $_.ExecutablePath -eq "$destination\OuterShell.exe" } | ForEach-Object { $process = Get-Process -Id $_.ProcessId -ErrorAction SilentlyContinue
         if ($process) { $process.Kill(); if (!$process.WaitForExit(10000)) { throw 'The existing app did not stop.' }; $process.Dispose() }
     }
 }
-foreach ($file in @('OuterShell.exe', 'FilesBackend.exe', 'PlaintextBackend.exe', 'TopBackend.exe', 'FirehoseBackend.exe', 'ProfileBackend.exe', 'TerminalBackend.exe')) {
-    for ($attempt = 0; ; $attempt++) {
-        try { Copy-Item (Join-Path $SourceDirectory $file) $destination -Force; break }
-        catch [IO.IOException], [UnauthorizedAccessException] { if ($attempt -ge 20) { throw }; Start-Sleep -Milliseconds 250 }
-    }
+for ($attempt = 0; ; $attempt++) {
+    try { Copy-Item (Join-Path $SourceDirectory 'OuterShell.exe') $destination -Force; break }
+    catch [IO.IOException], [UnauthorizedAccessException] { if ($attempt -ge 20) { throw }; Start-Sleep -Milliseconds 250 }
 }
 
 New-Item -ItemType Directory -Force (Join-Path $destination 'bin') | Out-Null
@@ -55,7 +53,7 @@ foreach ($obsolete in @('OuterShell.Windows.Runtime.dll', 'outershell-core.dll')
         }
     }
 }
-foreach ($folder in @('web', 'files-web', 'plaintext-web', 'top-web', 'firehose-web', 'profile-web', 'terminal-web', 'bundles')) {
+foreach ($folder in @('web', 'bundles')) {
     New-Item -ItemType Directory -Force (Join-Path $destination $folder) | Out-Null
     Copy-Item (Join-Path $SourceDirectory "$folder/*") (Join-Path $destination $folder) -Recurse -Force
 }
@@ -85,4 +83,4 @@ if ($SystemService) {
     if ($LASTEXITCODE) { throw 'Could not register the app tasks.' }
     if ($Start) { Start-ScheduledTask -TaskName "OuterShell-$sid" }
 }
-Write-Output "Installed Outer Shell and Files in $destination"
+Write-Output "Installed Outer Shell in $destination"

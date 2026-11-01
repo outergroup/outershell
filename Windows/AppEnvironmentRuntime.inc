@@ -237,20 +237,20 @@ BinaryReply environment_binary_operation(const char *target, const char *user,
         session_close(session);
     }
     if (!session->id) {
-        const char *args[10] = {"exec", "--interactive", NULL};
+        const char *args[32] = {"exec", "--interactive", NULL};
         size_t n = 2;
         if (*user) {
             args[n++] = "--user";
             args[n++] = user;
         }
         args[n++] = selected->container;
-        args[n++] = HELPER_PATH;
-        args[n++] = "serve";
-        args[n] = NULL;
-        if (!app_process_start(environment_stop, environment_job,
-                               selected->runtime, args, &session->child)) {
-            fail("Could not start the container helper (Windows error %lu).",
-                 GetLastError());
+        const char *serve[] = {"serve", NULL};
+        char error[512];
+        if (!app_helper_start(environment_stop, environment_job,
+                              selected->runtime, args, n, 32, HELPER_APP_ID,
+                              HELPER_NAME, serve, &session->child, error,
+                              sizeof(error))) {
+            fail("%s", error);
             goto done;
         }
         session->id = strdup(target);
@@ -263,9 +263,7 @@ BinaryReply environment_binary_operation(const char *target, const char *user,
                   get_u32(hello.data + 12) == MAX_FRAME;
         bytes_free(&hello);
         if (!ok) {
-            fail("Container helper is missing or incompatible. Rebuild the "
-                 "container "
-                 "with current app helpers.");
+            fail("The container helper is incompatible with this app.");
             session_close(session);
             goto done;
         }

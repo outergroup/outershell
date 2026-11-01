@@ -15,8 +15,6 @@ typedef struct {
     CRITICAL_SECTION gate;
     CONDITION_VARIABLE changed;
     uint64_t version;
-    DWORD files_task_state;
-    ULONGLONG files_queried;
     PipeServer *http, *api;
     Wsl *wsl;
 } ShellHost;
@@ -91,9 +89,9 @@ static bool update_allowlist(ShellHost *s) {
     return store_close(s, &store, false) && ok;
 }
 #include "Commands.inc"
+#include "Updates.inc"
 #include "BundledApps.inc"
 #include "Setup.inc"
-#include "Updates.inc"
 #include "Uninstall.inc"
 static bool legacy_files_running(ShellHost *s) {
     if (!s->files)
@@ -110,7 +108,9 @@ static bool legacy_start_files(ShellHost *s) {
         return true;
     if (WaitForSingleObject(s->stop, 0) == WAIT_OBJECT_0)
         return false;
-    char *path = win_join(s->directory, "FilesBackend.exe");
+    char *path = bundled_executable(s, bundled_find(files_id));
+    if (!path)
+        return true;
     wchar_t *exe = win_wide(path);
     free(path);
     if (!exe)
@@ -152,34 +152,6 @@ static bool legacy_stop_files(ShellHost *s) {
     changed(s);
     return true;
 }
-static char *files_task_name(void) {
-    char *sid = win_sid();
-    if (!sid) return NULL;
-    StringBuilder name = {0}; sb_append(&name, "\\OuterShell-Files-"); sb_append(&name, sid);
-    free(sid); return name.data;
-}
-static bool files_running(ShellHost *s) {
-    if (s->service_name[0]) return legacy_files_running(s);
-    ULONGLONG now = GetTickCount64();
-    if (!s->files_queried || now - s->files_queried >= 1000) {
-        char *name = files_task_name(); DWORD state = 0;
-        if (name) command_task(name, "query", NULL, &state);
-        free(name);
-        if (state != s->files_task_state) { s->files_task_state = state; changed(s); }
-        s->files_queried = now;
-    }
-    return s->files_task_state == 4;
-}
-static bool files_task_control(ShellHost *s, const char *operation) {
-    char *name = files_task_name();
-    HRESULT hr = name ? command_task(name, operation, NULL, NULL) : E_FAIL;
-    free(name);
-    s->files_queried = 0;
-    if (FAILED(hr)) { log_error(s, "Could not control the Files task."); return false; }
-    changed(s); return true;
-}
-static bool start_files(ShellHost *s) { return s->service_name[0] ? legacy_start_files(s) : files_task_control(s, "start"); }
-static bool stop_files(ShellHost *s) { return s->service_name[0] ? legacy_stop_files(s) : files_task_control(s, "stop"); }
 static DWORD service_query(const char *name) {
     SC_HANDLE manager = OpenSCManagerW(NULL, NULL, SC_MANAGER_CONNECT);
     if (!manager)
@@ -263,7 +235,7 @@ static StringBuilder backends(ShellHost *s) {
     qsort(store.backends, store.backend_count, sizeof(*store.backends), compare_backends);
     size_t catalog_count = 0;
     for (size_t i = 0; i < sizeof(bundled_apps) / sizeof(*bundled_apps); i++)
-        if (!registry_store_find_backend(&store, bundled_apps[i].id) && bundled_available(s, &bundled_apps[i])) catalog_count++;
+        if (!registry_store_find_backend(&store, bundled_apps[i].id)) catalog_count++;
     StringBuilder result = payload(12 + (store.backend_count + catalog_count) * 8);
     payload_u32(&result, 8, (uint32_t)(store.backend_count + catalog_count));
     char *sid = win_sid();
@@ -369,7 +341,7 @@ static StringBuilder backends(ShellHost *s) {
     size_t catalog_index = store.backend_count;
     for (size_t i = 0; i < sizeof(bundled_apps) / sizeof(*bundled_apps); i++) {
         const BundledApp *app = &bundled_apps[i];
-        if (registry_store_find_backend(&store, app->id) || !bundled_available(s, app)) continue;
+        if (registry_store_find_backend(&store, app->id)) continue;
         StringBuilder row = payload(116);
         payload_text(&row, 0, app->id); payload_text(&row, 8, app->name);
         payload_text(&row, 32, "user"); payload_text(&row, 40, "not installed"); payload_text(&row, 48, app->symbol);
@@ -698,6 +670,8 @@ static bool shell_start(ShellHost *s) {
     free(http);
     if (!s->api || !s->http || !commands_load(s))
         return false;
+    HANDLE migration = CreateThread(NULL, 0, bundled_migrate, s, 0, NULL);
+    if (migration) CloseHandle(migration);
     char pid[32];
     int n = snprintf(pid, sizeof(pid), "%lu", GetCurrentProcessId());
     char *path = win_join(s->state, "daemon.pid");
@@ -823,16 +797,14 @@ int wmain(int argc, wchar_t **argv) {
     if (!shell.state || !shell.service_name)
         return 1;
     if (initialize) {
-        char *a = win_pipe(shell_id), *b = win_pipe(files_id);
-        const char *paths[] = {a, b};
-        bool ok = a && b && win_allow_pipes(paths, 2);
-        char *sid = win_sid(), *api = win_pipe("org.outershell.outershelld"), *files_task = files_task_name();
+        char *a = win_pipe(shell_id);
+        const char *paths[] = {a};
+        bool ok = a && win_allow_pipes(paths, 1);
+        char *sid = win_sid(), *api = win_pipe("org.outershell.outershelld");
         StringBuilder task = {0}; sb_append(&task, "\\OuterShell-"); if (sid) sb_append(&task, sid);
-        ok = ok && sid && api && files_task && win_set_pipe_activation(a, task.data) &&
-             win_set_pipe_activation(api, task.data) && win_set_pipe_activation(b, files_task);
-        free(sid); free(api); free(files_task); free(task.data);
+        ok = ok && sid && api && win_set_pipe_activation(a, task.data) && win_set_pipe_activation(api, task.data);
+        free(sid); free(api); free(task.data);
         free(a);
-        free(b);
         return ok ? 0 : 1;
     }
     if (!shell.directory)

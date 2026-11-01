@@ -405,6 +405,34 @@ sudo OUTERSHELL_HOME=/Library/Application\ Support/outershell "$OUTERCTL" ...
 If a root backend updates its runtime URL, its process should use the root
 registry home when invoking `outerctl`.
 
+## Container Helpers
+
+An app that works inside containers can run its own static Linux helper there
+over the container runtime's `exec -i`, as Files, Plaintext, Top, Firehose and
+Profile do. Outer Shell gives its own apps no other path. Ship the helpers
+beside the app's `web` folder:
+
+```text
+helpers/linux-x86_64/<helper-name>
+helpers/linux-aarch64/<helper-name>
+```
+
+Copy `Resources/ContainerHelper.h` into the app and run
+`container_helper_command()` through `exec -i`. The first time a container
+needs a helper version, the app streams it in; after that it runs the copy in
+the container. Helpers live at `<directory>/<app id>/<sha256>/<name>`, so
+versions never collide, under `$HOME/.cache/outershell/helpers` (or
+`/tmp/outershell-helpers-<uid>`) when uploaded. The container needs `/bin/sh`.
+
+When Outer Shell builds a container image with Docker, on macOS, Linux or
+Windows, it copies the helpers of every app installed in its apps directory
+(`apps/<app id>/helpers`, `apps/<app id>/*.app/Contents/Resources/helpers` on
+macOS, or `apps\<app id>\<current>\helpers` on Windows) to
+`/usr/local/lib/outershell/helpers`, so containers it builds start with them.
+The app ID is the app's install directory name. Images built with Apple
+`container` or WSL containers, images built elsewhere, and apps installed after
+a build get the helper uploaded on first use instead.
+
 ## Verify
 
 After registration, these commands should show the backend, app, and log file:

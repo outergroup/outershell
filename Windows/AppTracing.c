@@ -165,7 +165,7 @@ static bool tracing_request(Connection *c, HttpRequest *r, Target *target) {
         sb_append(&mount, ":/state");
         sb_append(&pid, "container:");
         sb_append(&pid, target->id);
-        const char *args[48] = {0};
+        const char *args[64] = {0};
         size_t argument = 0;
         args[argument++] = docker ? "run" : "exec";
         args[argument++] = "--interactive";
@@ -195,12 +195,13 @@ static bool tracing_request(Connection *c, HttpRequest *r, Target *target) {
         args[argument++] = "-e";
         args[argument++] = name.data;
         args[argument++] = docker ? "outershell/container-base:22" : target->id;
-        args[argument++] = APP_HELPER;
-        args[argument++] = "serve";
         args[argument] = NULL;
+        const char *serve[] = {"serve", NULL};
+        char error[512];
         ok = (!docker || (state_ready && docker_image())) &&
-             app_process_start(tracing_stop, tracing_job, target->runtime, args,
-                               &session->child);
+             app_helper_start(tracing_stop, tracing_job, target->runtime, args,
+                              argument, 64, APP_SERVICE, APP_HELPER_NAME, serve,
+                              &session->child, error, sizeof(error));
         free(local);
         free(state_root);
         free(app_state);
@@ -335,8 +336,8 @@ static void tracing_serve(Connection *c, void *context) {
     else if (!tracing_request(c, &forwarded, selected) && !c->responded)
         http_text(
             c, &r, 503,
-            "The container tracing helper is unavailable. Rebuild the "
-            "container with this app's helper and profiling capabilities.");
+            "The container tracing helper could not start. Profile also "
+            "requires perf and profiling capabilities in the container.");
     free_targets(targets, count);
     http_free(&r);
 }

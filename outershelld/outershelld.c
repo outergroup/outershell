@@ -9235,12 +9235,33 @@ static bool remove_bundled_root_support(const BundledAppDefinition *app,
 #endif
 
 #ifndef __APPLE__
+// Copies a staged resource directory in a root install script, accepting
+// only regular files and directories.
+static void write_resource_tree_copy(FILE *script, const char *quoted_source, const char *quoted_target, const char *label) {
+    if (!quoted_source[0]) return;
+    fprintf(script,
+            "if [ -L %s ] || [ -n \"$(find -P %s -mindepth 1 ! -type d ! -type f -print -quit)\" ]; then\n"
+            "  echo '%s must be regular files and directories.' >&2\n"
+            "  exit 1\n"
+            "fi\n"
+            "mkdir -p %s\n"
+            "cp -R -- %s/. %s/\n"
+            "if [ -n \"$(find -P %s -mindepth 1 ! -type d ! -type f -print -quit)\" ]; then\n"
+            "  echo '%s must be regular files and directories.' >&2\n"
+            "  rm -rf -- %s\n"
+            "  exit 1\n"
+            "fi\n"
+            "chmod -R a+rX %s\n",
+            quoted_source, quoted_source, label, quoted_target, quoted_source, quoted_target,
+            quoted_target, label, quoted_target, quoted_target);
+}
 static bool install_bundled_app_internal(const BundledAppDefinition *app,
                                          const char *source_binary,
                                          const char *source_bundle_arm,
                                          const char *source_bundle_x86,
                                          const char *source_icon,
                                          const char *source_web_dir,
+                                         const char *source_helpers_dir,
                                          char *message,
                                          size_t message_size) {
     bool system_scope = direct_root_session_uses_system_scope();
@@ -9262,6 +9283,8 @@ static bool install_bundled_app_internal(const BundledAppDefinition *app,
     if (source_icon && source_icon[0]) snprintf(target_icon, sizeof(target_icon), "%s/%s", install_root, app->icon_name);
     char target_web_dir[PATH_MAX];
     snprintf(target_web_dir, sizeof(target_web_dir), "%s/web", install_root);
+    char target_helpers_dir[PATH_MAX];
+    snprintf(target_helpers_dir, sizeof(target_helpers_dir), "%s/helpers", install_root);
     char version_path[PATH_MAX];
     snprintf(version_path, sizeof(version_path), "%s/version", install_root);
     char log_path[PATH_MAX];
@@ -9308,6 +9331,7 @@ static bool install_bundled_app_internal(const BundledAppDefinition *app,
           !copy_file(source_bundle_x86, target_bundle_x86, data_mode, error, sizeof(error)))) ||
         (target_icon[0] && !copy_file(source_icon, target_icon, data_mode, error, sizeof(error))) ||
         !replace_directory_tree(source_web_dir, target_web_dir, data_mode, directory_mode, error, sizeof(error)) ||
+        !replace_directory_tree(source_helpers_dir, target_helpers_dir, data_mode, directory_mode, error, sizeof(error)) ||
         !write_text_file(version_path, app->version, error, sizeof(error))) {
         snprintf(message, message_size, "%s", error);
         return false;
@@ -9483,6 +9507,8 @@ static bool install_bundled_app(const BundledAppDefinition *app,
     }
     char source_web_dir[PATH_MAX];
     snprintf(source_web_dir, sizeof(source_web_dir), "%s/web", stage_root);
+    char source_helpers_dir[PATH_MAX];
+    snprintf(source_helpers_dir, sizeof(source_helpers_dir), "%s/helpers", stage_root);
 
     char error[1024] = "";
     struct stat st;
@@ -9516,6 +9542,18 @@ static bool install_bundled_app(const BundledAppDefinition *app,
         snprintf(message, message_size, "%s", error);
         return false;
     }
+    if (lstat(source_helpers_dir, &st) != 0) {
+        if (errno != ENOENT) {
+            snprintf(message, message_size, "Failed to inspect %s: %s", source_helpers_dir, strerror(errno));
+            return false;
+        }
+        source_helpers_dir[0] = '\0';
+    } else if (!S_ISDIR(st.st_mode) || !validate_directory_tree(source_helpers_dir, error, sizeof(error))) {
+        snprintf(message, message_size,
+                 "Container helpers must be regular files and directories; unsupported resource at %s.",
+                 source_helpers_dir);
+        return false;
+    }
 
     if (g_internal_service_manager) {
         return install_bundled_app_internal(app,
@@ -9524,6 +9562,7 @@ static bool install_bundled_app(const BundledAppDefinition *app,
                                             source_bundle_x86,
                                             source_icon,
                                             source_web_dir,
+                                            source_helpers_dir,
                                             message,
                                             message_size);
     }
@@ -9552,6 +9591,8 @@ static bool install_bundled_app(const BundledAppDefinition *app,
         }
         char target_web_dir[PATH_MAX];
         snprintf(target_web_dir, sizeof(target_web_dir), "%s/web", install_root);
+        char target_helpers_dir[PATH_MAX];
+        snprintf(target_helpers_dir, sizeof(target_helpers_dir), "%s/helpers", install_root);
         char version_path[PATH_MAX];
         snprintf(version_path, sizeof(version_path), "%s/version", install_root);
         char system_users_dir[PATH_MAX];
@@ -9580,6 +9621,8 @@ static bool install_bundled_app(const BundledAppDefinition *app,
         char quoted_source_bundle_x86[PATH_MAX + 8];
         char quoted_source_icon[PATH_MAX + 8];
         char quoted_source_web_dir[PATH_MAX + 8];
+        char quoted_source_helpers_dir[PATH_MAX + 8];
+        char quoted_target_helpers_dir[PATH_MAX + 8];
         char quoted_install_root[PATH_MAX + 8];
         char quoted_bundles_dir[PATH_MAX + 8];
         char quoted_target_binary[PATH_MAX + 8];
@@ -9601,6 +9644,8 @@ static bool install_bundled_app(const BundledAppDefinition *app,
         shell_quote(source_bundle_x86, quoted_source_bundle_x86, sizeof(quoted_source_bundle_x86));
         if (source_icon[0]) shell_quote(source_icon, quoted_source_icon, sizeof(quoted_source_icon)); else quoted_source_icon[0] = '\0';
         if (source_web_dir[0]) shell_quote(source_web_dir, quoted_source_web_dir, sizeof(quoted_source_web_dir)); else quoted_source_web_dir[0] = '\0';
+        if (source_helpers_dir[0]) shell_quote(source_helpers_dir, quoted_source_helpers_dir, sizeof(quoted_source_helpers_dir)); else quoted_source_helpers_dir[0] = '\0';
+        shell_quote(target_helpers_dir, quoted_target_helpers_dir, sizeof(quoted_target_helpers_dir));
         shell_quote(install_root, quoted_install_root, sizeof(quoted_install_root));
         shell_quote(bundles_dir, quoted_bundles_dir, sizeof(quoted_bundles_dir));
         shell_quote(target_binary, quoted_target_binary, sizeof(quoted_target_binary));
@@ -9751,29 +9796,9 @@ static bool install_bundled_app(const BundledAppDefinition *app,
                 quoted_target_bundle_x86);
         write_linux_selinux_functions(script);
         fprintf(script, "restore_selinux_context %s\n", quoted_target_binary);
-        if (quoted_source_web_dir[0]) {
-            fprintf(script,
-                    "if [ -L %s ] || [ -n \"$(find -P %s -mindepth 1 ! -type d ! -type f -print -quit)\" ]; then\n"
-                    "  echo 'Web resources must be regular files and directories.' >&2\n"
-                    "  exit 1\n"
-                    "fi\n"
-                    "mkdir -p %s\n"
-                    "cp -R -- %s/. %s/\n"
-                    "if [ -n \"$(find -P %s -mindepth 1 ! -type d ! -type f -print -quit)\" ]; then\n"
-                    "  echo 'Web resources must be regular files and directories.' >&2\n"
-                    "  rm -rf -- %s\n"
-                    "  exit 1\n"
-                    "fi\n"
-                    "chmod -R a+rX %s\n",
-                    quoted_source_web_dir,
-                    quoted_source_web_dir,
-                    quoted_target_web_dir,
-                    quoted_source_web_dir,
-                    quoted_target_web_dir,
-                    quoted_target_web_dir,
-                    quoted_target_web_dir,
-                    quoted_target_web_dir);
-        }
+        fprintf(script, "rm -rf -- %s\n", quoted_target_helpers_dir);
+        write_resource_tree_copy(script, quoted_source_web_dir, quoted_target_web_dir, "Web resources");
+        write_resource_tree_copy(script, quoted_source_helpers_dir, quoted_target_helpers_dir, "Container helpers");
         fprintf(script,
                 "mkdir -p %s\n"
                 "chmod 1777 %s\n"
@@ -9904,6 +9929,8 @@ static bool install_bundled_app(const BundledAppDefinition *app,
     }
     char target_web_dir[PATH_MAX];
     snprintf(target_web_dir, sizeof(target_web_dir), "%s/web", install_root);
+    char target_helpers_dir[PATH_MAX];
+    snprintf(target_helpers_dir, sizeof(target_helpers_dir), "%s/helpers", install_root);
     char version_path[PATH_MAX];
     snprintf(version_path, sizeof(version_path), "%s/version", install_root);
     char log_path[PATH_MAX];
@@ -9934,7 +9961,8 @@ static bool install_bundled_app(const BundledAppDefinition *app,
          (!copy_file(source_bundle_arm, target_bundle_arm, 0600, error, sizeof(error)) ||
           !copy_file(source_bundle_x86, target_bundle_x86, 0600, error, sizeof(error)))) ||
         (source_icon[0] && !copy_file(source_icon, target_icon, 0600, error, sizeof(error))) ||
-        !replace_directory_tree(source_web_dir, target_web_dir, 0600, 0700, error, sizeof(error))) {
+        !replace_directory_tree(source_web_dir, target_web_dir, 0600, 0700, error, sizeof(error)) ||
+        !replace_directory_tree(source_helpers_dir, target_helpers_dir, 0600, 0700, error, sizeof(error))) {
         snprintf(message, message_size, "%s", error);
         return false;
     }

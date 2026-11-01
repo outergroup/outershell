@@ -462,6 +462,90 @@ static void container_recipe_snapshot(Distribution *d, StringBuilder *json) {
     free(dockerfile); free(realized); free(config); free(prior); free(path); free(directory); free(mounts); free(env); free(ports);
 }
 
+#ifndef OUTERSHELL_ARCHITECTURE
+#define OUTERSHELL_ARCHITECTURE "x64"
+#endif
+static bool container_tree(const char *source, const char *destination, unsigned depth);
+// Lays out the container helpers of the apps installed through Outer Shell, for
+// this machine's architecture, at their content-addressed paths in directory
+// (see Resources/ContainerHelper.h). Returns false when there are none.
+static bool container_helpers_context(const char *directory) {
+    const char *architecture = !strcmp(OUTERSHELL_ARCHITECTURE, "arm64") ? "linux-aarch64" : "linux-x86_64";
+    wchar_t *existing = win_wide(directory);
+    if (existing && GetFileAttributesW(existing) != INVALID_FILE_ATTRIBUTES) container_tree(directory, NULL, 0);
+    free(existing);
+    char *local = win_folder(CSIDL_LOCAL_APPDATA), *home = local ? win_join(local, "OuterShell") : NULL;
+    char *apps = home ? win_join(home, "apps") : NULL, *pattern = apps ? win_join(apps, "*") : NULL;
+    wchar_t *search = pattern ? win_wide(pattern) : NULL;
+    WIN32_FIND_DATAW app;
+    HANDLE iterator = search ? FindFirstFileW(search, &app) : INVALID_HANDLE_VALUE;
+    bool found = false;
+    if (iterator != INVALID_HANDLE_VALUE) {
+        do {
+            if (!(app.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || app.cFileName[0] == L'.') continue;
+            char *id = win_utf8(app.cFileName), *root = id ? win_join(apps, id) : NULL;
+            char *current_path = root ? win_join(root, "current") : NULL;
+            StringBuilder current = {0};
+            char *helpers = NULL;
+            if (current_path && win_read_file(current_path, 64, &current) && current.data && current.length &&
+                !strpbrk(current.data, "\\/.:")) {
+                char *folder = win_join(root, current.data), *all = folder ? win_join(folder, "helpers") : NULL;
+                helpers = all ? win_join(all, architecture) : NULL;
+                free(folder); free(all);
+            }
+            char *files = helpers ? win_join(helpers, "*") : NULL;
+            wchar_t *files_wide = files ? win_wide(files) : NULL;
+            WIN32_FIND_DATAW helper;
+            HANDLE helper_iterator = files_wide ? FindFirstFileW(files_wide, &helper) : INVALID_HANDLE_VALUE;
+            if (helper_iterator != INVALID_HANDLE_VALUE) {
+                do {
+                    if (helper.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) continue;
+                    char *name = win_utf8(helper.cFileName), *source = name ? win_join(helpers, name) : NULL;
+                    size_t length = 0;
+                    unsigned char *data = source ? container_helper_read_file(source, &length) : NULL;
+                    char hash[65];
+                    if (data) container_helper_sha256(data, length, hash);
+                    char *app_directory = data ? win_join(directory, id) : NULL;
+                    char *hash_directory = app_directory ? win_join(app_directory, hash) : NULL;
+                    char *target = hash_directory ? win_join(hash_directory, name) : NULL;
+                    if (target && win_secure_directory(directory) && win_secure_directory(app_directory) &&
+                        win_secure_directory(hash_directory) && win_atomic_write(target, data, length))
+                        found = true;
+                    free(name); free(source); free(data); free(app_directory); free(hash_directory); free(target);
+                } while (FindNextFileW(helper_iterator, &helper));
+                FindClose(helper_iterator);
+            }
+            free(id); free(root); free(current_path); free(current.data); free(helpers); free(files); free(files_wide);
+        } while (FindNextFileW(iterator, &app));
+        FindClose(iterator);
+    }
+    free(local); free(home); free(apps); free(pattern); free(search);
+    return found;
+}
+// Builds a container's image from its recipe. Docker builds also copy the
+// installed apps' container helpers into the image, in a final layer.
+static bool container_build(Wsl *w, ContainerRuntime runtime, const char *id, const char *dockerfile,
+                            const char *image, const char *context, StringBuilder *output) {
+    char *directory = container_directory(id);
+    char *helpers = directory && runtime == RUNTIME_DOCKER ? win_join(directory, "Helpers") : NULL;
+    char *derived = directory ? win_join(directory, "Dockerfile.outershell") : NULL;
+    StringBuilder text = {0}, source = {0};
+    bool baked = helpers && derived && container_helpers_context(helpers);
+    if (baked) {
+        append(&text, dockerfile);
+        append(&text, "\nCOPY --from=outershell-helpers / /usr/local/lib/outershell/helpers/\n");
+        append(&source, "outershell-helpers=");
+        append(&source, helpers);
+        baked = win_atomic_write(derived, text.data, text.length);
+    }
+    const char *plain[] = {"build", "--progress", "plain", "--tag", image, context, NULL};
+    const char *with_helpers[] = {"build", "--progress", "plain", "--tag", image, "--file", derived,
+                                  "--build-context", source.data, context, NULL};
+    bool ok = capture_runtime(w, baked ? with_helpers : plain, output, runtime);
+    free(directory); free(helpers); free(derived); free(text.data); free(source.data);
+    return ok;
+}
+
 static void publish_snapshot(Wsl *w);
 static DWORD WINAPI container_rebuild_thread(void *context) {
     Distribution *d = context;
@@ -481,9 +565,8 @@ static DWORD WINAPI container_rebuild_thread(void *context) {
     bool ok = directory && *dockerfile && container_configuration(config, &args);
     container_arguments_free(&args); args = (ContainerArguments){0};
     if (ok) {
-        const char *build[] = {"build", "--progress", "plain", "--tag", image, directory, NULL};
         error = "The image build failed. The existing container was retained. See the container runtime log.";
-        ok = capture_runtime(w, build, &output, d->container);
+        ok = container_build(w, d->container, d->id, dockerfile, image, directory, &output);
         if (output.data) container_write(d->id, "build.log", output.data, output.length);
     }
     if (ok) {

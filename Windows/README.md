@@ -12,9 +12,8 @@ optionally expose their Linux apps through the same Windows host.
 
 ## Build and install
 
-Place the `Backends` and `Files` repositories beside each other. Install Visual
-Studio C++ Build Tools, its CMake/Ninja components, and LLVM. Build the frontend
-archives on a Mac first:
+Install Visual Studio C++ Build Tools, its CMake/Ninja components, and LLVM.
+Build the frontend archives on a Mac first:
 
 ```sh
 bash Windows/build-outerframe-bundles.sh
@@ -27,20 +26,40 @@ Copy `build/outerframe/bundles` to the Windows build machine. From Windows Power
 .\build\windows\install.ps1 -Start
 ```
 
-`-FilesRoot`, `-VisualStudioRoot`, and `-OutputDirectory` override those locations.
+`-VisualStudioRoot` and `-OutputDirectory` override those locations.
 `-Architecture arm64`, `x64`, or `x86` selects the target; the default is the host
-architecture. `-CoreDirectory` uses an already-built directory containing both
-executables. The production package contains `OuterShell.exe`, `FilesBackend.exe`,
-both macOS outerframe archives, and the shared web assets. `outershell-core.dll` is built only as a registry-test
-harness and is not installed. The installer removes obsolete managed/runtime DLLs
-when upgrading an existing installation.
+architecture. `-CoreDirectory` uses an already-built directory. The production
+package contains `OuterShell.exe`, `outerctl.exe`, Outer Shell's macOS outerframe
+archives, and the shared web assets. `outershell-core.dll` is built only as a
+registry-test harness and is not installed. The installer removes obsolete
+files when upgrading an existing installation.
 
-Install as the ordinary desktop user. Files, registry data, logs, and layout live
-in `%LOCALAPPDATA%\OuterShell`. Installation registers two interactive-user tasks:
-`OuterShell-<SID>` and `OuterShell-Files-<SID>`. Neither has a logon trigger;
-`-Start` optionally starts Outer Shell immediately. The user must have a desktop
+Apps are not part of the installation. As on macOS and Linux, Outer Shell
+downloads an app when it is installed, from
+`<release URL>/apps/<App>/windows-<architecture>.tar.gz`. It unpacks the archive
+with Windows' `tar.exe`, requires the app's backend to carry the release
+signature, and installs it in `%LOCALAPPDATA%\OuterShell\apps\<id>\<folder>`,
+where `apps\<id>\current` names the folder in use. Each install uses a new
+folder, so programs still running from an older copy, such as Terminal
+sessions, do not block it. Uninstalling an app removes its folder. When an
+installation from before this change starts, Outer Shell downloads the apps whose
+tasks are registered.
+
+`build.ps1 -App <App>` builds one app (Files, Plaintext, Top, Firehose, Profile or
+Terminal) from the repository beside this one (`Trace` for Firehose; `-AppRoot`
+overrides it) into `<output>\<App>`, laid out as its archive:
+`<App>Backend.exe`, `web`, `bundles` (except Terminal), and `app-icon.png`.
+`-BundlesDirectory` names the folder with the app's outerframe archives.
+
+Install as the ordinary desktop user; setup refuses to run elevated. Registry
+data, logs, layout, and apps live in `%LOCALAPPDATA%\OuterShell`. Installation
+registers the interactive-user task `OuterShell-<SID>`, and installing an app
+registers `OuterShell-<App>-<SID>`. Neither has a logon trigger; `-Start`
+optionally starts Outer Shell immediately. The user must have a desktop
 session. No password is stored. Tasks ignore duplicate launch requests, have no
-execution time limit, and can recover after failures.
+execution time limit, and can recover after failures. Setup moves programs that
+are still running, such as Terminal session keepers from older installations,
+aside as `<name>.<time>.old` and removes them once they have exited.
 
 Both executables use the Windows GUI subsystem with a shared background entry
 point, so Task Scheduler never allocates a console window for them. Command
@@ -149,8 +168,8 @@ account's normal filesystem permissions; Files is not a filesystem sandbox.
 `test_host.py <path-to-packaged-OuterShell.exe>` exercises HTTP framing, origin
 checks, outerframe negotiation and both macOS bundle downloads, layout conflicts
 and persistence, Unicode Files listings, binary/chunked
-transfers, controls, concurrency, and Files independence. Install the package first
-so the Files task exists. Run it under an account with
+transfers, controls, concurrency, and Files independence. Install the package and
+the Files app first so the Files task exists. Run it under an account with
 no existing Outer Shell process, because it uses that account's canonical pipes.
 It uses temporary registry state and restores the account's prior allowlist.
 
@@ -516,8 +535,10 @@ Firehose and Profile use container-only Linux helpers. Docker runs a disposable
 helper in the selected container's PID namespace, with BPF, PERFMON, SYS_PTRACE,
 SYS_ADMIN and IPC_LOCK capabilities and seccomp disabled for that helper. It does
 not change the target container's configuration or elevate the Windows task.
-The helper uses binary stdin/stdout transport, without publishing a port. Its
-image is built on demand from the packaged container bootstrap. Profile recordings
+The helper uses binary stdin/stdout transport, without publishing a port. The
+disposable container uses Outer Shell's base image, built on demand from the
+packaged container bootstrap, and the app copies its helper into it from the
+app's `helpers` folder (see `Resources/ContainerHelper.h`). Profile recordings
 are retained under LocalAppData/OuterShell/tracing/Profile/<container-id>.
 
 WSLc helper transport and process discovery work, but current WSLc releases do

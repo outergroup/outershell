@@ -43,21 +43,26 @@ ArchitecturesAllowed=x86compatible
 Source: "{#PayloadDirectory}\container-bootstrap\*"; DestDir: "{app}\container-bootstrap"; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist
 Source: "{#PayloadDirectory}\OuterShell.exe"; DestName: "SetupTasks.exe"; Flags: dontcopy
 Source: "{#PayloadDirectory}\OuterShell.exe"; DestDir: "{app}"; Flags: ignoreversion
-Source: "{#PayloadDirectory}\FilesBackend.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#PayloadDirectory}\outerctl.exe"; DestDir: "{app}\bin"; Flags: ignoreversion
 Source: "{#PayloadDirectory}\web\*"; DestDir: "{app}\web"; Flags: ignoreversion recursesubdirs createallsubdirs
-Source: "{#PayloadDirectory}\files-web\*"; DestDir: "{app}\files-web"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "{#PayloadDirectory}\bundles\*"; DestDir: "{app}\bundles"; Flags: ignoreversion recursesubdirs createallsubdirs
-Source: "{#PayloadDirectory}\PlaintextBackend.exe"; DestDir: "{app}"; Flags: ignoreversion
-Source: "{#PayloadDirectory}\plaintext-web\*"; DestDir: "{app}\plaintext-web"; Flags: ignoreversion recursesubdirs createallsubdirs
-Source: "{#PayloadDirectory}\TopBackend.exe"; DestDir: "{app}"; Flags: ignoreversion
-Source: "{#PayloadDirectory}\top-web\*"; DestDir: "{app}\top-web"; Flags: ignoreversion recursesubdirs createallsubdirs
-Source: "{#PayloadDirectory}\FirehoseBackend.exe"; DestDir: "{app}"; Flags: ignoreversion
-Source: "{#PayloadDirectory}\firehose-web\*"; DestDir: "{app}\firehose-web"; Flags: ignoreversion recursesubdirs createallsubdirs
-Source: "{#PayloadDirectory}\ProfileBackend.exe"; DestDir: "{app}"; Flags: ignoreversion
-Source: "{#PayloadDirectory}\profile-web\*"; DestDir: "{app}\profile-web"; Flags: ignoreversion recursesubdirs createallsubdirs
-Source: "{#PayloadDirectory}\TerminalBackend.exe"; DestDir: "{app}"; Flags: ignoreversion
-Source: "{#PayloadDirectory}\terminal-web\*"; DestDir: "{app}\terminal-web"; Flags: ignoreversion recursesubdirs createallsubdirs
+[InstallDelete]
+Type: files; Name: "{app}\FilesBackend.exe"
+Type: files; Name: "{app}\PlaintextBackend.exe"
+Type: files; Name: "{app}\TopBackend.exe"
+Type: files; Name: "{app}\FirehoseBackend.exe"
+Type: files; Name: "{app}\ProfileBackend.exe"
+Type: files; Name: "{app}\TerminalBackend.exe"
+Type: filesandordirs; Name: "{app}\files-web"
+Type: filesandordirs; Name: "{app}\plaintext-web"
+Type: filesandordirs; Name: "{app}\top-web"
+Type: filesandordirs; Name: "{app}\firehose-web"
+Type: filesandordirs; Name: "{app}\profile-web"
+Type: filesandordirs; Name: "{app}\terminal-web"
+Type: files; Name: "{app}\bundles\*Content.bundle.*.aar"
+[UninstallDelete]
+Type: filesandordirs; Name: "{app}\apps"
+Type: files; Name: "{app}\*.old"
 [Registry]
 Root: HKCU; Subkey: "Environment"; ValueType: expandsz; ValueName: "Path"; ValueData: "{olddata};{app}\bin"; Check: NeedsPathEntry(ExpandConstant('{app}\bin'))
 [Code]
@@ -87,11 +92,55 @@ var Code: Integer;
 begin
   Result := Exec(ExpandConstant('{tmp}\SetupTasks.exe'), Operation, ExpandConstant('{tmp}'), SW_HIDE, ewWaitUntilTerminated, Code) and (Code = 0);
 end;
+function InitializeSetup(): Boolean;
+begin
+  Result := not IsAdmin;
+  if not Result then
+    SuppressibleMsgBox('Run Outer Shell setup as your ordinary Windows user, without administrator elevation. An elevated install cannot be uninstalled without administrator approval on this PC.', mbError, MB_OK, IDOK);
+end;
+function FileInUse(Path: String): Boolean;
+var Stream: TFileStream;
+begin
+  Result := False;
+  try
+    Stream := TFileStream.Create(Path, fmOpenReadWrite or fmShareExclusive);
+    Stream.Free;
+  except
+    Result := True;
+  end;
+end;
+function MoveRunningExecutablesAside(): Boolean;
+var Find: TFindRec; Directory, Path, Suffix: String;
+begin
+  Result := True;
+  Directory := ExpandConstant('{app}\');
+  if FindFirst(Directory + '*.old', Find) then begin
+    try
+      repeat DeleteFile(Directory + Find.Name); until not FindNext(Find);
+    finally
+      FindClose(Find);
+    end;
+  end;
+  Suffix := '.' + GetDateTimeString('yyyymmddhhnnss', #0, #0) + '.old';
+  if FindFirst(Directory + '*.exe', Find) then begin
+    try
+      repeat
+        Path := Directory + Find.Name;
+        if (Pos('unins', Lowercase(Find.Name)) <> 1) and FileInUse(Path) then
+          Result := RenameFile(Path, Path + Suffix) and Result;
+      until not FindNext(Find);
+    finally
+      FindClose(Find);
+    end;
+  end;
+end;
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 begin
   ExtractTemporaryFile('SetupTasks.exe');
   if FileExists(ExpandConstant('{app}\OuterShell.exe')) and not RunSetupOperation('--setup-stop') then
-    Result := 'Could not stop the existing Outer Shell tasks. Close Outer Shell and try again.';
+    Result := 'Could not stop the existing Outer Shell tasks. Close Outer Shell and try again.'
+  else if not MoveRunningExecutablesAside() then
+    Result := 'Could not replace Outer Shell programs that are still running. Close Terminal sessions and try again.';
 end;
 procedure CurStepChanged(CurStep: TSetupStep);
 begin
@@ -103,8 +152,8 @@ end;
 function InitializeUninstall(): Boolean;
 var Code: Integer;
 begin
-  if IsAdmin then begin
-    MsgBox('Run this per-user uninstaller without administrator elevation.', mbError, MB_OK);
+  if IsAdmin and (Pos(Lowercase(AddBackslash(ExpandConstant('{localappdata}'))), Lowercase(ExpandConstant('{app}'))) <> 1) then begin
+    MsgBox('Uninstall Outer Shell while signed in as the Windows user who installed it.', mbError, MB_OK);
     Result := False;
     exit;
   end;

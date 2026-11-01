@@ -3,6 +3,7 @@
 #include "Icons.h"
 #include "../Backend/EndpointNames.h"
 #include "../Backend/OuterShellLayout.h"
+#include "../Resources/ContainerHelper.h"
 #include <bcrypt.h>
 #include <shlobj.h>
 #include <ctype.h>

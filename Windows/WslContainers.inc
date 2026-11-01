@@ -152,9 +152,8 @@ static bool create_container(Wsl *w, HttpRequest *request, const char **error) {
     if (dockerfile) {
         if (!context || !container_write(id, "Dockerfile", dockerfile, strlen(dockerfile))) { free(context); goto done; }
         snprintf(built_image, sizeof(built_image), "outershell/managed-%s:latest", id);
-        const char *build[] = {"build", "--progress", "plain", "--tag", built_image, context, NULL};
         *error = "Could not build the container. Check the container build log.";
-        bool built = capture_runtime(w, build, &output, runtime);
+        bool built = container_build(w, runtime, id, dockerfile, built_image, context, &output);
         if (output.data) container_write(id, "build.log", output.data, output.length);
         free(output.data); output = (StringBuilder){0};
         if (!built) { free(context); goto done; }

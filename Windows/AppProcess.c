@@ -1,5 +1,6 @@
 #include "AppProcess.h"
 #include "CommandTasks.h"
+#include "../Resources/ContainerHelper.h"
 #include <shlobj.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -228,4 +229,69 @@ HANDLE app_open_registry(HANDLE stop) {
         if (WaitForSingleObject(stop, 50) != WAIT_TIMEOUT) break;
     } while (GetTickCount64() < deadline);
     free(wide); return result;
+}
+static ContainerHelper app_helper;
+static bool app_helper_loaded;
+static SRWLOCK app_helper_lock = SRWLOCK_INIT;
+bool app_helper_start(HANDLE stop, HANDLE job, const char *runtime,
+                      const char **args, size_t count, size_t capacity,
+                      const char *id, const char *name,
+                      const char *const *helper_args, AppProcess *p,
+                      char *error, size_t error_capacity) {
+    AcquireSRWLockExclusive(&app_helper_lock);
+    if (!app_helper_loaded) {
+        char *directory = win_executable_directory();
+        char *helpers = directory ? win_join(directory, "helpers") : NULL;
+        app_helper_loaded =
+            helpers && container_helper_load(&app_helper, id, name, helpers);
+        free(directory);
+        free(helpers);
+    }
+    bool loaded = app_helper_loaded;
+    ReleaseSRWLockExclusive(&app_helper_lock);
+    if (!loaded) {
+        snprintf(error, error_capacity,
+                 "This app's container helpers are missing from its "
+                 "installation.");
+        return false;
+    }
+    if (!container_helper_command(&app_helper, args, count, capacity,
+                                  helper_args) ||
+        !app_process_start(stop, job, runtime, args, p)) {
+        snprintf(error, error_capacity,
+                 "Could not start the container helper (Windows error %lu).",
+                 GetLastError());
+        return false;
+    }
+    char line[512], message[512];
+    size_t used = 0;
+    for (;;) {
+        if (used + 1 == sizeof(line) ||
+            !connection_read(&p->output, line + used, 1)) {
+            app_process_close(p);
+            snprintf(error, error_capacity,
+                     "The container helper could not start.");
+            return false;
+        }
+        if (line[used] == '\n')
+            break;
+        used++;
+    }
+    line[used] = 0;
+    int architecture = 0;
+    int reply = container_helper_reply(line, &architecture, message,
+                                       sizeof(message));
+    if (reply == 2 &&
+        !connection_write(&p->input, app_helper.data[architecture],
+                          app_helper.length[architecture])) {
+        reply = 0;
+        snprintf(message, sizeof(message),
+                 "Could not copy the helper into the container.");
+    }
+    if (!reply) {
+        app_process_close(p);
+        snprintf(error, error_capacity, "%s", message);
+        return false;
+    }
+    return true;
 }

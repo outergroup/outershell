@@ -437,6 +437,12 @@ static unsigned __stdcall pipe_listener(void *argument) {
             connected = GetOverlappedResult(pipe, &ov, &n, TRUE) && wait == WAIT_OBJECT_0 + 1;
         }
         CloseHandle(ov.hEvent);
+        if (!connected && WaitForSingleObject(s->stop, 0) != WAIT_OBJECT_0 &&
+            (error == ERROR_NO_DATA || error == ERROR_IO_PENDING)) {
+            // The client closed its end before the connection completed.
+            DisconnectNamedPipe(pipe);
+            continue;
+        }
         if (!connected)
             break;
         HANDLE next = new_pipe(s, false);

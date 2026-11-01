@@ -19,6 +19,38 @@ static StringBuilder uninstall_definition(const char *path, const char *sid, ULO
     sb_append(&xml, "</Command><Arguments>/VERYSILENT /SUPPRESSMSGBOXES /NORESTART</Arguments></Exec></Actions></Task>");
     return xml;
 }
+static uint32_t uninstall_crc32(const unsigned char *data, size_t size) {
+    uint32_t crc = 0xffffffffu;
+    for (size_t i = 0; i < size; i++) {
+        crc ^= data[i];
+        for (int bit = 0; bit < 8; bit++) crc = (crc >> 1) ^ (0xedb88320u & (0u - (crc & 1)));
+    }
+    return ~crc;
+}
+// Inno Setup records whether setup ran elevated (bit 0 of the uninstall log
+// header's flags) and its uninstaller then asks for elevation. Everything this
+// per-user installation writes is in the user's profile, so the flag can be
+// cleared, keeping the header's CRC valid.
+static bool uninstall_clear_admin_flag(const char *directory) {
+    char *path = win_join(directory, "unins000.dat");
+    wchar_t *wide = path ? win_wide(path) : NULL;
+    HANDLE file = wide ? CreateFileW(wide, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL) : INVALID_HANDLE_VALUE;
+    unsigned char header[448]; DWORD done = 0;
+    bool ok = file != INVALID_HANDLE_VALUE && ReadFile(file, header, sizeof(header), &done, NULL) && done == sizeof(header);
+    uint32_t crc = 0;
+    if (ok) memcpy(&crc, header + 444, 4);
+    ok = ok && !memcmp(header, "Inno Setup Uninstall Log (b)", 29) && crc == uninstall_crc32(header, 444);
+    if (ok && (header[332] & 1)) {
+        header[332] &= (unsigned char)~1u;
+        crc = uninstall_crc32(header, 444);
+        memcpy(header + 444, &crc, 4);
+        LARGE_INTEGER zero = {0};
+        ok = SetFilePointerEx(file, zero, NULL, FILE_BEGIN) && WriteFile(file, header, sizeof(header), &done, NULL) && done == sizeof(header);
+    }
+    if (file != INVALID_HANDLE_VALUE) CloseHandle(file);
+    free(path); free(wide);
+    return ok;
+}
 static StringBuilder uninstall_control(ShellHost *s) {
     char error[512] = "";
     bool ok = false;
@@ -36,6 +68,7 @@ static StringBuilder uninstall_control(ShellHost *s) {
     else {
         file = CreateFileW(wide, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
         if (file == INVALID_HANDLE_VALUE) snprintf(error, sizeof(error), "The Windows uninstaller is missing. Run the Outer Shell installer to repair this installation, then try again.");
+        else if (!uninstall_clear_admin_flag(s->directory)) snprintf(error, sizeof(error), "Outer Shell could not prepare its uninstall record, so Windows might ask for approval on this PC. Uninstall it from Windows Settings > Apps while signed in to this PC.");
         else if (!update_verify(wide, file)) snprintf(error, sizeof(error), "The Windows uninstaller does not have a trusted Outer Shell signature.");
         else {
             sb_append(&task, "\\OuterShell-Uninstall-"); sb_append(&task, sid);

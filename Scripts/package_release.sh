@@ -59,11 +59,6 @@ for arch in aarch64 x86_64; do
     require_file "${RUN_ROOT}/container-bootstrap/bin/${arch}/outershelld"
     require_file "${RUN_ROOT}/container-bootstrap/bin/${arch}/outerctl"
     require_file "${RUN_ROOT}/container-bootstrap/bin/${arch}/outer-socket-bridge"
-    require_file "${RUN_ROOT}/container-bootstrap/bin/${arch}/outer-files-helper"
-    require_file "${RUN_ROOT}/container-bootstrap/bin/${arch}/outer-plaintext-helper"
-    require_file "${RUN_ROOT}/container-bootstrap/bin/${arch}/outer-top-helper"
-    require_file "${RUN_ROOT}/container-bootstrap/bin/${arch}/outer-profile-helper"
-    require_file "${RUN_ROOT}/container-bootstrap/bin/${arch}/outer-firehose-helper"
 done
 for arch in aarch64 x86_64; do
     if wants_variant "linux-${arch}"; then

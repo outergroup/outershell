@@ -66,6 +66,7 @@ HRESULT command_task(const char *name, const char *operation, const char *xml, D
             }
             if (SUCCEEDED(hr) && (value == TASK_STATE_RUNNING || value == TASK_STATE_QUEUED)) hr = HRESULT_FROM_WIN32(ERROR_TIMEOUT);
         }
+        if (SUCCEEDED(hr) && !strcmp(operation, "enable")) hr = IRegisteredTask_put_Enabled(task, VARIANT_TRUE);
         if (SUCCEEDED(hr) && start) {
             hr = IRegisteredTask_put_Enabled(task, VARIANT_TRUE);
             if (SUCCEEDED(hr)) hr = IRegisteredTask_Run(task, empty, &running);

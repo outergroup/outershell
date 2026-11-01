@@ -5725,11 +5725,6 @@ final class SafeSpaceManager: @unchecked Sendable {
         test -x "${source_directory}/outershelld"
         test -x "${source_directory}/outerctl"
         test -x "${source_directory}/outer-socket-bridge"
-        test -x "${source_directory}/outer-files-helper"
-        test -x "${source_directory}/outer-plaintext-helper"
-        test -x "${source_directory}/outer-top-helper"
-        test -x "${source_directory}/outer-profile-helper"
-        test -x "${source_directory}/outer-firehose-helper"
         /bin/mkdir -p /usr/local/bin /run/user/0 /var/lib/outershell/services \
             /var/lib/outershell/apps /etc/outershell/apps.d /root/.config/outerssh \
             /root/.local/share/jupyter /root/.cache
@@ -5737,14 +5732,9 @@ final class SafeSpaceManager: @unchecked Sendable {
         /bin/cp "${source_directory}/outerctl" /usr/local/bin/outerctl
         /bin/cp "${source_directory}/outer-socket-bridge" \
             /usr/local/bin/outer-socket-bridge
-        /bin/cp "${source_directory}/outer-files-helper" /usr/local/bin/outer-files-helper
-        /bin/cp "${source_directory}/outer-plaintext-helper" /usr/local/bin/outer-plaintext-helper
-        /bin/cp "${source_directory}/outer-top-helper" /usr/local/bin/outer-top-helper
-        /bin/cp "${source_directory}/outer-profile-helper" /usr/local/bin/outer-profile-helper
-        /bin/cp "${source_directory}/outer-firehose-helper" /usr/local/bin/outer-firehose-helper
         /bin/cp /tmp/outershell-bootstrap/outershell-container-init \
             /usr/local/bin/outershell-container-init
-        /bin/chmod 0755 /usr/local/bin/outer-files-helper /usr/local/bin/outer-plaintext-helper /usr/local/bin/outer-top-helper /usr/local/bin/outer-profile-helper /usr/local/bin/outer-firehose-helper /usr/local/bin/outershelld /usr/local/bin/outerctl \
+        /bin/chmod 0755 /usr/local/bin/outershelld /usr/local/bin/outerctl \
             /usr/local/bin/outer-socket-bridge \
             /usr/local/bin/outershell-container-init
         /bin/chmod 0700 /run/user/0 /root/.config/outerssh
@@ -6679,9 +6669,20 @@ final class SafeSpaceManager: @unchecked Sendable {
             detail: "Building the container image",
             for: record.id
         )
-        let result = try runRuntime(record, [
-            "build",
-            "--file", "Dockerfile",
+        var buildArguments = ["build", "--file", "Dockerfile"]
+        if runtimeProvider(for: record) == .docker,
+           let helpers = try containerHelpersBuildContext(for: record) {
+            let dockerfile = try safeSpaceDirectory(record.id)
+                .appendingPathComponent("Dockerfile.outershell")
+            let contents = try String(contentsOf: directory.appendingPathComponent("Dockerfile"),
+                                      encoding: .utf8)
+            try (contents.trimmingCharacters(in: .newlines) +
+                 "\nCOPY --from=outershell-helpers / /usr/local/lib/outershell/helpers/\n")
+                .write(to: dockerfile, atomically: true, encoding: .utf8)
+            buildArguments = ["build", "--file", dockerfile.path,
+                              "--build-context", "outershell-helpers=" + helpers.path]
+        }
+        let result = try runRuntime(record, buildArguments + [
             "--tag", imageReference,
             "--progress", "plain",
             "."
@@ -6690,6 +6691,49 @@ final class SafeSpaceManager: @unchecked Sendable {
         }
         try requireSuccess(result, action: "build the container image")
         return result
+    }
+
+    /// Lays out the container helpers of apps installed through Outer Shell,
+    /// for the Docker engine's architecture, at their content-addressed paths
+    /// (see ContainerHelper.h). Returns nil when there are none.
+    private func containerHelpersBuildContext(for record: SafeSpaceRecord) throws -> URL? {
+        let info = try runDocker(["info", "--format", "{{.Architecture}}"])
+        var architecture = info.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        architecture = ["amd64": "x86_64", "arm64": "aarch64"][architecture] ?? architecture
+        let root = ProcessInfo.processInfo.environment["OUTERSHELL_HOME"]
+            ?? NSHomeDirectory() + "/Library/Application Support/outershell"
+        let apps = URL(fileURLWithPath: (root as NSString).expandingTildeInPath)
+            .appendingPathComponent("apps", isDirectory: true)
+        let fileManager = FileManager.default
+        let context = try safeSpaceDirectory(record.id)
+            .appendingPathComponent("Helpers", isDirectory: true)
+        try? fileManager.removeItem(at: context)
+        var found = false
+        for app in (try? fileManager.contentsOfDirectory(atPath: apps.path))?.sorted() ?? [] {
+            let appURL = apps.appendingPathComponent(app, isDirectory: true)
+            let bundles = ((try? fileManager.contentsOfDirectory(atPath: appURL.path)) ?? [])
+                .filter { $0.hasSuffix(".app") }.sorted()
+            let candidates = [appURL.appendingPathComponent("helpers", isDirectory: true)] +
+                bundles.map { appURL.appendingPathComponent($0 + "/Contents/Resources/helpers", isDirectory: true) }
+            for helpers in candidates {
+                let directory = helpers.appendingPathComponent("linux-" + architecture, isDirectory: true)
+                for name in (try? fileManager.contentsOfDirectory(atPath: directory.path))?.sorted() ?? [] {
+                    let source = directory.appendingPathComponent(name)
+                    let values = try? source.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
+                    guard values?.isRegularFile == true, values?.isSymbolicLink != true else { continue }
+                    let data = try Data(contentsOf: source)
+                    let hash = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+                    let target = context.appendingPathComponent("\(app)/\(hash)/\(name)")
+                    guard !fileManager.fileExists(atPath: target.path) else { continue }
+                    try fileManager.createDirectory(at: target.deletingLastPathComponent(),
+                                                    withIntermediateDirectories: true)
+                    try data.write(to: target)
+                    try fileManager.setAttributes([.posixPermissions: 0o755], ofItemAtPath: target.path)
+                    found = true
+                }
+            }
+        }
+        return found ? context : nil
     }
 
     private func prepareBundledAppOCIImages(

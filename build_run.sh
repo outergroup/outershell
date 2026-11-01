@@ -181,10 +181,9 @@ bootstrap_resource="${BUILD_ROOT}/${CONFIGURATION}/Outer Shell.app/Contents/Reso
 bootstrap_run_resource="${RUN_ROOT}/container-bootstrap"
 rm -rf "${bootstrap_resource}" "${bootstrap_run_resource}"
 "${SCRIPT_DIR}/Scripts/build_socket_bridge_helpers.sh"
-"${SCRIPT_DIR}/Scripts/build_app_helpers.sh"
 linux_root="${SCRIPT_DIR}/build/linux-package/RemoteLinuxBinariesMusl"
 for architecture in aarch64 x86_64; do
-    for tool in outershelld outerctl outer-files-helper outer-plaintext-helper outer-top-helper outer-profile-helper outer-firehose-helper; do
+    for tool in outershelld outerctl; do
         if [[ ! -x "${linux_root}/${architecture}/${tool}" ]]; then
             echo "Missing container bootstrap tool: ${linux_root}/${architecture}/${tool}" >&2
             exit 1
@@ -203,16 +202,6 @@ for architecture in aarch64 x86_64; do
         "${destination}/"
     cp "${linux_root}/${architecture}/outershelld" "${linux_root}/${architecture}/outerctl" \
         "${run_destination}/"
-    cp "${linux_root}/${architecture}/outer-files-helper" "${destination}/"
-    cp "${linux_root}/${architecture}/outer-plaintext-helper" "${destination}/"
-    cp "${linux_root}/${architecture}/outer-top-helper" "${destination}/"
-    cp "${linux_root}/${architecture}/outer-profile-helper" "${destination}/"
-    cp "${linux_root}/${architecture}/outer-firehose-helper" "${destination}/"
-    cp "${linux_root}/${architecture}/outer-files-helper" "${run_destination}/"
-    cp "${linux_root}/${architecture}/outer-plaintext-helper" "${run_destination}/"
-    cp "${linux_root}/${architecture}/outer-top-helper" "${run_destination}/"
-    cp "${linux_root}/${architecture}/outer-profile-helper" "${run_destination}/"
-    cp "${linux_root}/${architecture}/outer-firehose-helper" "${run_destination}/"
     cp "${socket_bridge}" "${destination}/outer-socket-bridge"
     cp "${socket_bridge}" "${run_destination}/outer-socket-bridge"
 done

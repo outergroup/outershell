@@ -791,16 +791,10 @@ source_directory="/tmp/outershell-bootstrap/bin/$architecture"
 test -x "$source_directory/outershelld"
 test -x "$source_directory/outerctl"
 test -x "$source_directory/outer-socket-bridge"
-test -x "$source_directory/outer-files-helper"
-test -x "$source_directory/outer-plaintext-helper"
-test -x "$source_directory/outer-top-helper"
 install -d -m 0755 /usr/local/bin /etc/outershell/apps.d /var/lib/outershell/services /var/lib/outershell/apps /run/user/0
 install -m 0755 "$source_directory/outershelld" /usr/local/bin/outershelld
 install -m 0755 "$source_directory/outerctl" /usr/local/bin/outerctl
 install -m 0755 "$source_directory/outer-socket-bridge" /usr/local/bin/outer-socket-bridge
-install -m 0755 "$source_directory/outer-files-helper" /usr/local/bin/outer-files-helper
-install -m 0755 "$source_directory/outer-plaintext-helper" /usr/local/bin/outer-plaintext-helper
-install -m 0755 "$source_directory/outer-top-helper" /usr/local/bin/outer-top-helper
 install -m 0755 /tmp/outershell-bootstrap/outershell-container-init /usr/local/bin/outershell-container-init
 """)
     os.chmod(install_script, 0o755)
@@ -875,8 +869,54 @@ def set_build_progress(container_id, phase, detail, log="", instruction=None,
     update_record(container_id, buildProgress=progress)
 
 
-def build_image(context, tag, log_path, *, container_id=None, base_build=False):
-    command = [docker_path(), "build", "--label", "org.outershell.managed=true", "--progress", "plain", "--tag", tag, str(context)]
+CONTAINER_HELPERS_DIRECTORY = "/usr/local/lib/outershell/helpers"
+
+
+def installed_app_helpers(architecture):
+    """The container helpers of apps installed through Outer Shell, keyed by
+    (app id, helper name). Apps ship them as helpers/linux-<arch>/<name>; see
+    ContainerHelper.h."""
+    helpers = {}
+    for root in [outer_shell_home() / "apps", pathlib.Path("/opt/outershell")]:
+        if not root.is_dir():
+            continue
+        for app in sorted(root.iterdir()):
+            for directory in [app / "helpers", *sorted(app.glob("*.app/Contents/Resources/helpers"))]:
+                directory = directory / ("linux-" + architecture)
+                if not directory.is_dir() or directory.is_symlink():
+                    continue
+                for helper in sorted(directory.iterdir()):
+                    if helper.is_file() and not helper.is_symlink():
+                        helpers.setdefault((app.name, helper.name), helper)
+    return helpers
+
+
+def helpers_build_context(directory):
+    """Lays out installed apps' helpers for the Docker engine's architecture
+    at their content-addressed paths. Returns False when there are none."""
+    architecture = docker(["info", "--format", "{{.Architecture}}"]).stdout.strip()
+    architecture = {"amd64": "x86_64", "arm64": "aarch64"}.get(architecture, architecture)
+    if directory.exists():
+        shutil.rmtree(directory)
+    found = False
+    for (app_id, name), source in installed_app_helpers(architecture).items():
+        data = source.read_bytes()
+        target = directory / app_id / hashlib.sha256(data).hexdigest() / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+        target.chmod(0o755)
+        found = True
+    return found
+
+
+def build_image(context, tag, log_path, *, container_id=None, base_build=False, helpers=None):
+    command = [docker_path(), "build", "--label", "org.outershell.managed=true", "--progress", "plain", "--tag", tag]
+    if helpers:
+        dockerfile = helpers.parent / "Dockerfile.outershell"
+        dockerfile.write_text((context / "Dockerfile").read_text().rstrip("\n") +
+                              "\nCOPY --from=outershell-helpers / " + CONTAINER_HELPERS_DIRECTORY + "/\n")
+        command += ["--build-context", "outershell-helpers=" + str(helpers), "--file", str(dockerfile)]
+    command.append(str(context))
     with open(log_path, "w", buffering=1) as log_file:
         process = subprocess.Popen(
             command,
@@ -1198,7 +1238,9 @@ def rebuild(container_id):
         set_build_progress(container_id, "preparing", "Preparing the container build…")
         ensure_base_image(log_path)
         context = build_context(container_id)
-        build_image(context, image_name(container_id), log_path, container_id=container_id)
+        helpers = runtime_directory(container_id) / "Helpers"
+        build_image(context, image_name(container_id), log_path, container_id=container_id,
+                    helpers=helpers if helpers_build_context(helpers) else None)
         set_build_progress(container_id, "replacing", "Replacing the container…",
                            log_path.read_text())
         reconcile_image_volumes(container_id)
