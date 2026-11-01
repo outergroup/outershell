@@ -35,7 +35,7 @@ console.log("PASS: missing/unsupported/stopped/ready runtime UI, setup guidance,
   const resourceNote = { hidden: true, textContent: "" };
   const numberInput = () => ({ value: "", dataset: {}, removeAttribute(name) { delete this[name]; } });
   const form = {
-    elements: { includeOpenCode: { checked: false, addEventListener() {} }, runtimeProviderID: { value: "", innerHTML: "", addEventListener() {} }, baseImage: { value: "" }, name: { value: "My project" }, cpus: numberInput(), memoryInMB: numberInput() },
+    elements: { runtimeProviderID: { value: "", innerHTML: "", addEventListener() {} }, baseImage: { value: "" }, name: { value: "My project" }, cpus: numberInput(), memoryInMB: numberInput() },
     querySelector(selector) { return ({ ".runtime-recheck": recheck, ".container-message": message, ".runtime-guidance": guidance, '[type="submit"]': submit, "[data-resource-note]": resourceNote })[selector]; },
     addEventListener() {},
   };

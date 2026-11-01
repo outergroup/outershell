@@ -44,7 +44,7 @@ import json
 from types import SimpleNamespace
 reconcile = provider['reconcile_image_volumes']
 recipe = {'mounts': [], 'persistentData': []}
-volumes = {'/work': {}, '/var/lib/opencode': {}}
+volumes = {'/work': {}, '/var/lib/codex': {}}
 def save_recipe(_, value):
     recipe.clear()
     recipe.update(copy.deepcopy(value))
@@ -53,7 +53,7 @@ with patch.dict(reconcile.__globals__,
                 load_recipe=lambda _: copy.deepcopy(recipe), save_recipe=save_recipe):
     reconcile('test')
     identities = {item['guestPath']: item['id'] for item in recipe['persistentData']}
-    assert set(identities) == {'/work', '/var/lib/opencode'}
+    assert set(identities) == {'/work', '/var/lib/codex'}
     reconcile('test')
     assert {item['guestPath']: item['id'] for item in recipe['persistentData']} == identities
     del volumes['/work']

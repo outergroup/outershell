@@ -1091,8 +1091,11 @@ h1 { margin: 0; font-size: clamp(30px, 5vw, 45px); line-height: 1.05; letter-spa
 
 .container-commands { margin-top: 18px; }
 .container-commands h3 { margin: 0 0 6px; color: var(--muted); font-size: 12px; font-weight: 500; }
-.container-command { display: flex; align-items: center; gap: 9px; width: 100%; min-height: 32px; padding: 5px 0; border: 0; border-radius: 0; background: transparent; color: var(--text); text-align: left; font: 400 12px/1.45 var(--font); }
+.container-command { display: flex; align-items: center; gap: 4px; }
 .container-command + .container-command { border-top: 1px solid var(--line); }
+.container-command-main { display: flex; flex: 1; min-width: 0; align-items: center; gap: 9px; min-height: 32px; padding: 5px 0; border: 0; border-radius: 0; background: transparent; color: var(--text); text-align: left; font: 400 12px/1.45 var(--font); }
+.container-command-open { display: grid; place-items: center; flex: 0 0 auto; min-width: 32px; min-height: 32px; padding: 0; border: 0; border-radius: 6px; background: transparent; color: var(--muted); font: 400 13px/1 var(--font); }
+.container-command-open:hover:not(:disabled) { background: var(--accent-soft); color: var(--text); }
 .container-command .address-status { align-self: center; margin: 0; }
 .container-command-icon { display: grid; place-items: center; width: 22px; height: 22px; flex: 0 0 22px; color: var(--muted); }
 .container-command-icon img, .container-command-icon svg { width: 100%; height: 100%; object-fit: contain; }
@@ -1158,6 +1161,11 @@ h1 { margin: 0; font-size: clamp(30px, 5vw, 45px); line-height: 1.05; letter-spa
 .agent-hosted { padding: 20px; border: 1px solid var(--line); border-radius: 12px; background: var(--accent-soft); }
 .agent-actions { display: flex; flex-direction: column; align-items: flex-start; gap: 10px; }
 .agent-hosted small { display: block; margin-top: 12px; font-size: 12px; color: var(--muted); }
+.agent-hosted h3 { margin: 22px 0 0; font-size: 14px; }
+.agent-hosted .add-catalog { margin-top: 12px; }
+.agent-kinds { margin: 0 0 16px; padding-left: 18px; }
+.agent-kinds li { margin: 0 0 8px; }
+.agent-kinds code { font-size: 12px; overflow-wrap: anywhere; }
 .example-copy { color: var(--muted); font-size: 12px; flex-shrink: 0; }
 @media (max-width: 700px) {
   .agent-options { grid-template-columns: 1fr; gap: 24px; }
@@ -1210,8 +1218,6 @@ h1 { margin: 0; font-size: clamp(30px, 5vw, 45px); line-height: 1.05; letter-spa
   .dialog.container-editor { height: calc(100dvh - 16px - var(--outerloop-overlay-clearance)); }
 }
 
-.app-update-badge { display: inline-block; border-radius: 999px; padding: 2px 7px; font-size: 11px; line-height: 1.4; color: var(--accent, #2563eb); background: color-mix(in srgb, currentColor 10%, transparent); white-space: nowrap; }
-.overview-shortcut-wrap > .app-update-badge { margin: 4px auto 0; }
 
 .agent-choice-intro { margin: 4px 0 22px; }
 .agent-choice-intro h3 { margin: 0 0 8px; font-size: 20px; letter-spacing: -0.025em; }

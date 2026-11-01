@@ -1,24 +1,30 @@
 # Outer Shell Container Cookbook
 
-## OpenCode
+## Coding agents
 
-In the HTML home, choose **Add more… → Coding agent → Set up in a container**.
-The container form opens with **Install OpenCode** selected. This option is also
-available in the normal new-container form. For an existing Debian/Ubuntu
-container with Outer Shell support, open its Dockerfile editor and choose
-**Add OpenCode**, then **Save & rebuild**.
+Use any coding agent installed in a container from Terminal, whether it came
+with the image or you added it. Open the container's **Terminal** command, or
+open an agent registered as a terminal command directly. Terminal sessions keep
+running when you close the page or switch devices.
 
-OpenCode opens a saved **Container workspace** session in `/work`, with the
-Outer Shell skill and container instructions already loaded. Ask it to install
-Jupyter or TensorBoard, register the app with Outer Shell, and keep experiments
-in `/work`. It is instructed to update the mounted Dockerfile for durable changes
-and use `outerctl image add-app` for app registration. The app appears under that
-container on the home page. `/work` and OpenCode's configuration/session directory
-are persistent volumes, so rebuilding keeps your projects and agent state.
+To add an agent, add it to the Dockerfile. Containers are rebuilt from their
+Dockerfile, so anything installed only in the running container is lost on the
+next rebuild.
 
-Model-provider sign-in happens inside OpenCode. Host and container installations
-have separate provider settings.
+To build Claude Code or Codex into a container, open its editor's **Coding
+agent** tab, choose **Inside container**, and add one of the ready-made
+snippets, then **Save & rebuild**. The snippets are below.
 
+For any other agent, add it to the Dockerfile:
+
+- **Install it** with `RUN`.
+- **Keep its sign-in** across rebuilds by making its settings folder a
+  `VOLUME`.
+- **Runs in a terminal:** register it with `RUN outerctl image add-command`,
+  and it appears among the container's terminal commands.
+- **Runs in a browser:** register it with `RUN outerctl image add-app`, and it
+  appears with the container's apps; see
+  [Publish another app](#publish-another-app).
 
 These snippets are ordinary Dockerfile instructions. They can be used in Outer
 Shell, `docker build`, or any OCI builder that supports Dockerfile syntax.
@@ -157,9 +163,9 @@ RUN outerctl image add-command \
     -- /usr/local/bin/codex --dangerously-bypass-approvals-and-sandbox
 ```
 
-Outer Shell shows **Codex CLI (copy command)** on the container. The copied
-command opens Codex interactively inside this container and starts it in
-`/work`. Codex can change anything available to its container user without
+Outer Shell shows **Codex CLI** among the container's terminal commands. It
+opens in Terminal, or offers its command to copy when Terminal isn't installed,
+and starts Codex interactively inside this container in `/work`. Codex can change anything available to its container user without
 additional approval prompts. Any explicitly mounted folders are also within
 that boundary and remain accessible according to their mount permissions. The
 standard `VOLUME` declaration tells Outer Shell to preserve Codex's login and

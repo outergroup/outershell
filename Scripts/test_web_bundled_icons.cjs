@@ -4,7 +4,7 @@ const path = require("node:path");
 const vm = require("node:vm");
 const source = fs.readFileSync(path.join(__dirname, "../Resources/OuterShellWeb/app.js"), "utf8");
 let html = "";
-const context = { addContainer: () => null, openCodeItem: () => null, codingAgentHTML: () => "", Uint8Array, TextDecoder, decoder: new TextDecoder(), btoa,
+const context = { addContainer: () => null, codingAgentHTML: () => "", Uint8Array, TextDecoder, decoder: new TextDecoder(), btoa,
   state: { addTab: "catalog", addScope: "user", backends: [] },
   openDialog: value => { html = value; }
 };

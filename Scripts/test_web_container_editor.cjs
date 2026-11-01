@@ -16,7 +16,7 @@ function setup() {
     escapeHTML: String, state: { providers: [] },
     configureDockerfileZoom: () => {},
     agentConnection: () => ({local: true}),
-    codingAgentHTML: (scope, editing) => editing ? '<button type="button" data-add-opencode>Add OpenCode</button>' : "",
+    codingAgentHTML: (scope, editing) => editing ? '<button type="button" data-add-agent="0">Add</button>' : "",
     safeSpaceRuntimeDescription: () => 'Apple container', runtimeOptions: () => '', formatMemoryMB: value => `${value} MB`,
     document: {createElement: node},
     safeSpaceRequest: (operation, values) => { requests.push({operation, values}); return response; },
@@ -47,8 +47,8 @@ function setup() {
   assert.match(ready.dialogs[1].markup, /FROM fresh/);
   assert.match(ready.dialogs[1].markup, /aria-selected="true" data-config-tab="dockerfile"/);
   assert.match(ready.dialogs[1].markup, /data-config-panel="agent" hidden/);
-  assert.match(ready.dialogs[1].markup, /data-config-panel="agent" hidden><button type="button" data-add-opencode>Add OpenCode/);
-  assert.match(ready.dialogs[1].markup, /data-config-panel="apps" hidden>.*data-add-opencode>Add</s);
+  assert.match(ready.dialogs[1].markup, /data-config-panel="agent" hidden><button type="button" data-add-agent="0">Add/);
+  assert.doesNotMatch(ready.dialogs[1].markup, /data-config-tab="apps"/);
   assert.doesNotMatch(ready.dialogs[1].markup, /data-action="configure-container"/);
   const closed = setup();
   const abandoned = closed.context.openContainerConfiguration('selected');

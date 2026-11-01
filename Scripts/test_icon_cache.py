@@ -68,12 +68,13 @@ autoreleasepool {
     precondition(decodedIconCGImage(svg) === icon)
     precondition(decodedIconCGImage(Data()) == nil)
     precondition(decodedIconCGImage(Data("invalid image".utf8)) == nil)
-    print("PASS resized P3/alpha PNG, raw bitmap roundtrip and corruption recovery, identical memory-cache hits, OpenCode SVG, invalid input")
+    print("PASS resized P3/alpha PNG, raw bitmap roundtrip and corruption recovery, identical memory-cache hits, SVG, invalid input")
     print(String(format: "PNG cold %.3f ms; warm average %.3f ms", cold * 1000, warm * 1000))
 }
 '''
 with tempfile.TemporaryDirectory(prefix="outershell-icon-test-") as temporary:
     work = pathlib.Path(temporary)
     (work / "main.swift").write_text(test)
+    (work / "icon.svg").write_text('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96"><rect width="96" height="96" rx="20" fill="#0088ff"/></svg>')
     subprocess.run(["xcrun", "swiftc", "-O", "-module-cache-path", str(work / "modules"), str(work / "main.swift"), "-o", str(work / "test")], check=True)
-    subprocess.run([str(work / "test"), str(work / "icons"), str(root / "Resources/OuterShellWeb/icons/opencode.svg")], check=True)
+    subprocess.run([str(work / "test"), str(work / "icons"), str(work / "icon.svg")], check=True)

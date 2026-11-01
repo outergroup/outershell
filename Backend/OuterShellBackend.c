@@ -334,134 +334,6 @@ static void send_text_response(int fd, int status, const char *message) {
     send_response(fd, status, http_status_text(status), "text/plain; charset=utf-8", message, strlen(message));
 }
 
-static bool query_value(const char *query, const char *name, char *dst, size_t dst_size);
-
-typedef struct {
-    char *body;
-    size_t capacity;
-    char url[160];
-    bool fetching;
-    bool valid;
-    int64_t next_check;
-    int ttl_seconds;
-} OpenCodeCheck;
-
-static pthread_mutex_t g_opencode_check_mutex = PTHREAD_MUTEX_INITIALIZER;
-static OpenCodeCheck g_opencode_releases[10];
-static OpenCodeCheck g_opencode_health[16];
-
-static bool fetch_unix_socket_health(const char *socket_path, char *body, size_t capacity) {
-    struct sockaddr_un address = {0};
-    address.sun_family = AF_UNIX;
-    if (strlen(socket_path) >= sizeof(address.sun_path)) return false;
-    snprintf(address.sun_path, sizeof(address.sun_path), "%s", socket_path);
-    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (fd < 0) return false;
-    struct timeval timeout = {.tv_sec = 5};
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
-    static const char request[] = "GET /global/health HTTP/1.0\r\nHost: localhost\r\n\r\n";
-    size_t length = 0;
-    bool ok = connect(fd, (struct sockaddr *)&address, sizeof(address)) == 0 &&
-        write(fd, request, sizeof(request) - 1) == (ssize_t)(sizeof(request) - 1);
-    while (ok && length + 1 < capacity) {
-        ssize_t got = read(fd, body + length, capacity - 1 - length);
-        if (got <= 0) break;
-        length += (size_t)got;
-    }
-    close(fd);
-    if (!ok) return false;
-    body[length] = '\0';
-    char *content = strstr(body, "\r\n\r\n");
-    if (strncmp(body, "HTTP/1.", 7) || strncmp(body + 8, " 200", 4) || !content) return false;
-    memmove(body, content + 4, strlen(content + 4) + 1);
-    return true;
-}
-
-static void *fetch_opencode_check(void *argument) {
-    OpenCodeCheck *check = argument;
-    char *body = malloc(check->capacity);
-    char error[256] = "";
-    bool ok = body && (strncmp(check->url, "unix:", 5) == 0
-        ? fetch_unix_socket_health(check->url + 5, body, check->capacity)
-        : outer_shell_fetch_url_text(check->url, body, check->capacity, error, sizeof(error)));
-    pthread_mutex_lock(&g_opencode_check_mutex);
-    free(check->body);
-    check->body = ok ? body : NULL;
-    if (!ok) free(body);
-    check->valid = ok;
-    check->next_check = api_monotonic_milliseconds() + (int64_t)(ok ? check->ttl_seconds : 60) * 1000;
-    check->fetching = false;
-    pthread_mutex_unlock(&g_opencode_check_mutex);
-    return NULL;
-}
-
-static bool valid_opencode_health_socket(const char *path) {
-    static const char suffix[] = "/outershell-opencode/opencode.sock";
-    size_t length = strlen(path);
-    return path[0] == '/' && length > sizeof(suffix) - 1 && length < sizeof(((struct sockaddr_un *)0)->sun_path) &&
-        !strstr(path, "/../") && !strcmp(path + length - (sizeof(suffix) - 1), suffix);
-}
-
-static void send_opencode_check(int fd, bool releases, const char *query) {
-    char value[16];
-    char socket_path[PATH_MAX] = "";
-    char url[160];
-    unsigned long number = 0;
-    if (!releases && query_value(query, "socket", socket_path, sizeof(socket_path))) {
-        if (!valid_opencode_health_socket(socket_path)) {
-            send_text_response(fd, 400, "Invalid OpenCode check parameter.");
-            return;
-        }
-        snprintf(url, sizeof(url), "unix:%s", socket_path);
-    } else {
-        if (!query_value(query, releases ? "page" : "port", value, sizeof(value)) || !value[0] ||
-            strspn(value, "0123456789") != strlen(value)) {
-            send_text_response(fd, 400, "Invalid OpenCode check parameter.");
-            return;
-        }
-        number = strtoul(value, NULL, 10);
-        if (number < 1 || number > (releases ? 10 : 65535)) {
-            send_text_response(fd, 400, "Invalid OpenCode check parameter.");
-            return;
-        }
-        if (releases) snprintf(url, sizeof(url), "https://api.github.com/repos/anomalyco/opencode/releases?per_page=30&page=%lu", number);
-        else snprintf(url, sizeof(url), "http://127.0.0.1:%lu/global/health", number);
-    }
-    pthread_mutex_lock(&g_opencode_check_mutex);
-    OpenCodeCheck *check = releases ? &g_opencode_releases[number - 1] : NULL;
-    if (!releases) {
-        for (size_t i = 0; i < 16; i++) {
-            if (!strcmp(g_opencode_health[i].url, url)) { check = &g_opencode_health[i]; break; }
-        }
-        if (!check) {
-            for (size_t i = 0; i < 16; i++) {
-                if (!g_opencode_health[i].fetching && g_opencode_health[i].next_check <= api_monotonic_milliseconds()) {
-                    check = &g_opencode_health[i]; break;
-                }
-            }
-        }
-    }
-    if (!check) {
-        pthread_mutex_unlock(&g_opencode_check_mutex);
-        send_text_response(fd, 503, "OpenCode checks are busy.");
-        return;
-    }
-    if (!check->fetching && check->next_check <= api_monotonic_milliseconds()) {
-        snprintf(check->url, sizeof(check->url), "%s", url);
-        check->capacity = releases ? 8 * 1024 * 1024 : 4096;
-        check->ttl_seconds = releases ? 24 * 60 * 60 : 60;
-        check->fetching = true;
-        pthread_t worker;
-        if (pthread_create(&worker, NULL, fetch_opencode_check, check) == 0) pthread_detach(worker);
-        else { check->fetching = false; check->valid = false; check->next_check = api_monotonic_milliseconds() + 60000; }
-    }
-    if (check->fetching) send_text_response(fd, 202, "Checking OpenCode.");
-    else if (check->valid) send_response(fd, 200, "OK", "application/json", check->body, strlen(check->body));
-    else send_text_response(fd, 503, "Could not check OpenCode. Try again later.");
-    pthread_mutex_unlock(&g_opencode_check_mutex);
-}
-
 static void send_container_upload_response(int fd, int status, uint64_t offset) {
     char header[512];
     int header_len = snprintf(header, sizeof(header),
@@ -2631,8 +2503,6 @@ static bool process_http_client_request(ReactorClient *client, char *request, si
         dispatch_native_app_project_creation(fd, query, body, body_length);
     } else if (strcasecmp(method, "POST") == 0) {
         send_text_response(fd, 404, "not found\n");
-    } else if (strcmp(target, "/api/opencode-releases") == 0 || strcmp(target, "/api/opencode-health") == 0) {
-        send_opencode_check(fd, strcmp(target, "/api/opencode-releases") == 0, query);
     } else if (strcmp(target, "/api/native-app-template") == 0) {
         send_native_app_template_archive(fd);
     } else if (strcmp(target, "/container-storage") == 0) {
@@ -2650,16 +2520,11 @@ static bool process_http_client_request(ReactorClient *client, char *request, si
     } else if (strcmp(target, "/web/app.js") == 0) {
         send_versioned_web_asset(fd, "app.js", "text/javascript; charset=utf-8", query,
                                  request, header_length, strcasecmp(method, "HEAD") != 0);
-    } else if (strcmp(target, "/web/opencode-start.sh") == 0 || strcmp(target, "/web/outer-shell-skill.md") == 0 || strcmp(target, "/web/server-admin.md") == 0 || strcmp(target, "/web/opencode-start.ps1") == 0 || strcmp(target, "/web/opencode-container.Dockerfile") == 0 || strcmp(target, "/web/container-agent.md") == 0 || strcmp(target, "/web/container-outerctl.md") == 0) {
-        send_versioned_web_asset(fd, target + 5, "text/plain; charset=utf-8", query,
-                                 request, header_length, strcasecmp(method, "HEAD") != 0);
     } else if (strcmp(target, "/web/icons/org.outershell.Files.png") == 0 ||
                strcmp(target, "/web/icons/org.outershell.Plaintext.png") == 0 ||
                strcmp(target, "/web/icons/org.outershell.Top.png") == 0 ||
-               strcmp(target, "/web/icons/org.outershell.Terminal.png") == 0 ||
-               strcmp(target, "/web/icons/opencode.svg") == 0) {
-        send_versioned_web_asset(fd, target + 5,
-                                 strstr(target, ".svg") ? "image/svg+xml" : "image/png", query,
+               strcmp(target, "/web/icons/org.outershell.Terminal.png") == 0) {
+        send_versioned_web_asset(fd, target + 5, "image/png", query,
                                  request, header_length, strcasecmp(method, "HEAD") != 0);
     } else if (strcmp(target, "/web/favicon.png") == 0) {
         send_web_app_icon(fd, request, header_length, strcasecmp(method, "HEAD") != 0);

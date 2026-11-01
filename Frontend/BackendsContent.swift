@@ -1139,9 +1139,14 @@ private enum ContainerResourceText {
     }
 }
 
+private enum AgentTextRun {
+    case plain(String)
+    case bold(String)
+    case code(String)
+}
+
 private enum ContainerConfigurationTab {
     case codingAgent
-    case apps
     case dockerfile
     case mounts
     case environment
@@ -2308,7 +2313,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private var containerConfigurationEnvironmentTabFrame = CGRect.zero
     private var containerConfigurationPortsTabFrame = CGRect.zero
     private var containerConfigurationRuntimeTabFrame = CGRect.zero
-    private var containerConfigurationAppsTabFrame = CGRect.zero
     private var containerConfigurationChangeRuntimeFrame = CGRect.zero
     private var containerConfigurationResourceFrames: [(frame: CGRect, resource: ContainerCreationResource, delta: Int)] = []
     private var containerConfigurationApplyResourcesFrame = CGRect.zero
@@ -2416,7 +2420,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             fetchBackends()
             if mode == .create { fetchWorkspaceCatalog() }
             startEventWatch()
-            scheduleOpenCodeChecks()
             if workspaceContextID == nil {
                 sendWorkspaceRequest(operation: "list")
             }
@@ -2527,7 +2530,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 passwordInputController.breakUndoCoalescing()
             }
             updateWindowActiveAppearance()
-            if isActive { checkOpenCodeUpdates() }
 
         case .selectionToPasteboardCopyRequest(let requestID):
             outerframeHost.sendCopySelectedPasteboardResponse(requestID: requestID,
@@ -4675,12 +4677,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                           image: launcherIconImage(for: item), symbolName: launcherIconSymbolName(for: item),
                           symbolColor: appIconTintColor(for: item.backend), title: title)
         visibleIconKeys.insert(item.iconKey)
-        if item.backend.serviceID == hostOpenCodeItem?.backend.serviceID, availableOpenCodeVersion != nil {
-            let badge = CALayer()
-            badge.contents = symbolCGImage(named: "arrow.down.circle.fill", pointSize: 14, color: .systemOrange)
-            badge.frame = CGRect(x: iconFrame.maxX - 7, y: iconFrame.maxY - 7, width: 14, height: 14)
-            addAppsSublayer(badge)
-        }
         let isThisPage = item.backend.isBackendsSelf && item.backend.serviceScope == "user"
         let textFrame = pinned
             ? CGRect(x: frame.minX + 12, y: frame.minY + 8, width: frame.width - 24, height: 32)
@@ -4960,6 +4956,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         in workspace: LocalWorkspaceRecord,
         at point: CGPoint
     ) -> Bool {
+        let operation = operation == "openShell" || operation.hasPrefix("openCommand:")
+            ? "copy" + operation.dropFirst("open".count) : operation
         if operation == "copyShell" {
             showWorkspaceShellCommandMenu(workspace, at: point)
             return true
@@ -4983,23 +4981,27 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             guard let self else { return }
             var commandByItemID: [String: String] = ["container": containerCommand]
             var items: [OuterframeContextMenuItem] = []
+            if self.hostTerminalItem != nil && self.terminalReaches(workspace) {
+                items.append(OuterframeContextMenuItem(
+                    id: "terminal",
+                    title: "Open in Terminal",
+                    isEnabled: true,
+                    systemImageName: "apple.terminal"
+                ))
+            }
             if let arguments, !arguments.isEmpty {
                 let sshCommand = self.commandForSSHArguments(arguments, command: containerCommand)
                 commandByItemID["ssh"] = sshCommand
                 items.append(OuterframeContextMenuItem(
                     id: "ssh",
-                    title: internalCommand == nil
-                        ? "SSH command, container command"
-                        : "SSH command, container command, and internal command",
+                    title: "Copy SSH command",
                     isEnabled: true,
                     systemImageName: "network"
                 ))
             }
             items.append(OuterframeContextMenuItem(
                 id: "container",
-                title: internalCommand == nil
-                    ? "Container command"
-                    : "Container command and internal command",
+                title: "Copy container command",
                 isEnabled: true,
                 systemImageName: "shippingbox"
             ))
@@ -5007,7 +5009,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 commandByItemID["internal"] = internalCommand
                 items.append(OuterframeContextMenuItem(
                     id: "internal",
-                    title: "Internal command",
+                    title: "Copy internal command",
                     isEnabled: true,
                     systemImageName: "terminal"
                 ))
@@ -5185,13 +5187,11 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         } else if operation == "viewBuildLog" {
             containerBuildLogRequestWorkspaceID = workspace.id
             navigateToRecipeSafeSpace(workspace.id)
-        } else if operation == "copyShell" {
-            showWorkspaceShellCommandMenu(workspace, at: point)
-        } else if operation.hasPrefix("copyCommand:"),
-                  let command = workspace.commandLaunchers.first(where: {
-                      $0.id == String(operation.dropFirst("copyCommand:".count))
-                  }) {
-            showWorkspaceCommandMenu(command, in: workspace, at: point)
+        } else if operation == "openShell" {
+            openInTerminal(workspace)
+        } else if operation.hasPrefix("openCommand:") {
+            openInTerminal(workspace, commandID: String(operation.dropFirst("openCommand:".count)))
+        } else if showWorkspaceOverviewCommandMenu(for: operation, in: workspace, at: point) {
         } else if operation.hasPrefix("unmountFolder:") {
             let identifier = String(operation.dropFirst("unmountFolder:".count))
             guard let mountID = UUID(uuidString: identifier) else { return }
@@ -5375,7 +5375,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         renderContainerCopyCommandRow(
             workspace: workspace,
             keySuffix: "terminal-command",
-            title: "Open terminal in container",
+            title: "Terminal",
             symbolName: "apple.terminal",
             operation: "copyShell",
             frame: frame,
@@ -5470,9 +5470,14 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         let copy = CALayer()
         copy.frame = CGRect(x: frame.maxX - 20, y: frame.midY - 7, width: 14, height: 14)
         copy.contentsGravity = .resizeAspect
-        copy.contents = symbolCGImage(named: "doc.on.doc", pointSize: 14)
+        copy.contents = symbolCGImage(named: hostTerminalItem != nil && terminalReaches(workspace) ? "arrow.up.forward" : "doc.on.doc",
+                                      pointSize: 14)
         copy.opacity = 0.65
         addAppsSublayer(copy)
+        if hostTerminalItem != nil && terminalReaches(workspace) {
+            let arrowFrame = CGRect(x: frame.maxX - 34, y: frame.minY, width: 34, height: frame.height)
+            workspaceOverviewActionFrames.append((arrowFrame, workspace, "open" + operation.dropFirst("copy".count)))
+        }
         workspaceOverviewActionFrames.append((frame, workspace, operation))
     }
 
@@ -5580,65 +5585,46 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         card.addSublayer(titleLayer)
     }
 
-    private var openCodeIcon: CGImage?
-    private var openCodeIconLoading = false
-    private var openCodeIconRetryAfter = Date.distantPast
-    private var openCodeChecksScheduled = false
+    private var pendingTerminalFragment: String?
 
-    private func scheduleOpenCodeChecks() {
-        guard !openCodeChecksScheduled else { return }
-        openCodeChecksScheduled = true
-        DispatchQueue.main.asyncAfter(deadline: .now() + 60) { [weak self] in
-            guard let self else { return }
-            self.openCodeChecksScheduled = false
-            self.checkOpenCodeUpdates()
-            self.scheduleOpenCodeChecks()
-        }
-    }
-
-    private func loadOpenCodeIcon() {
-        guard openCodeIcon == nil, !openCodeIconLoading, Date() >= openCodeIconRetryAfter else { return }
-        openCodeIconLoading = true
-        Task { @MainActor [weak self] in
-            guard let self else { return }
-            defer { self.openCodeIconLoading = false }
-            do {
-                let data = try await self.webResourceData("/web/icons/opencode.svg")
-                self.openCodeIcon = decodedIconCGImage(data)
-                self.updateLayout()
-            } catch {
-                self.openCodeIconRetryAfter = Date().addingTimeInterval(300)
-                NSLog("Could not load OpenCode icon: %@", error.localizedDescription)
-            }
-        }
-    }
-
-    private struct OpenCodeRelease: Decodable {
-        struct Asset: Decodable { let name: String; let digest: String? }
-        let tag_name: String
-        let draft: Bool
-        let prerelease: Bool
-        let assets: [Asset]
-    }
-    private var openCodePrompt: String?
-    private var openCodeRelease: OpenCodeRelease?
-    private var openCodeReleaseChecked: Date?
-    private var openCodeHealthChecked: Date?
-    private var checkingOpenCode = false
-    private var openCodeVersion: String?
-    private var openCodeUpdateCommand = ""
-
-    private var hostOpenCodeItem: AppLauncherItem? {
+    private var hostTerminalItem: AppLauncherItem? {
         appLauncherItems(from: backends).first {
-            $0.backend.serviceScope != "system" &&
-                ($0.backend.serviceID.lowercased().contains("opencode") || $0.displayName.lowercased() == "opencode")
+            $0.backend.serviceID == "org.outershell.Terminal" && $0.backend.serviceScope != "system"
         }
     }
 
-    private var availableOpenCodeVersion: String? {
-        guard let current = openCodeVersion, let release = openCodeRelease else { return nil }
-        let latest = String(release.tag_name.dropFirst())
-        return latest.compare(current, options: .numeric) == .orderedDescending ? latest : nil
+    private var terminalBackendToInstall: BackendRecord? {
+        backends.first { $0.serviceID == "org.outershell.Terminal" && $0.serviceScope == "user" && $0.isInstalled == false }
+    }
+
+    // Terminal can start sessions in containers, not in WSL distributions.
+    private func terminalReaches(_ workspace: LocalWorkspaceRecord) -> Bool {
+        workspace.runtimeKind != "wsl"
+    }
+
+    // Opens Terminal with a new session, in the container when one is given,
+    // running one of its registered commands when commandID is given.
+    private func openInTerminal(_ workspace: LocalWorkspaceRecord?, commandID: String? = nil) {
+        guard let item = hostTerminalItem else {
+            workspacePanelMessage = "Install Terminal from the Outer Shell app catalog to open terminals here."
+            updateLayout()
+            return
+        }
+        var components = URLComponents()
+        if let workspace {
+            components.queryItems = [URLQueryItem(name: "new", value: workspace.id.uuidString.lowercased())] +
+                (commandID.map { [URLQueryItem(name: "command", value: $0)] } ?? [])
+        }
+        pendingTerminalFragment = components.percentEncodedQuery
+        openLauncherItem(item, opensInNewTab: false)
+    }
+
+    private func terminalNavigationURL(_ url: URL, serviceID: String) -> URL {
+        guard serviceID == "org.outershell.Terminal", let fragment = pendingTerminalFragment else { return url }
+        pendingTerminalFragment = nil
+        var components = URLComponents(url: url, resolvingAgainstBaseURL: false)
+        components?.percentEncodedFragment = fragment
+        return components?.url ?? url
     }
 
     private func webResourceData(_ path: String) async throws -> Data {
@@ -5662,203 +5648,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             return data
         }
         throw ContainerConfigurationInputError(message: "Outer Shell timed out loading \(url.path).")
-    }
-
-    private func latestOpenCodeRelease() async throws -> OpenCodeRelease {
-        if let release = openCodeRelease, let checked = openCodeReleaseChecked, Date().timeIntervalSince(checked) < 86_400 { return release }
-        for page in 1...10 {
-            let data = try await webResourceData("/api/opencode-releases?page=\(page)")
-            let releases = try JSONDecoder().decode([OpenCodeRelease].self, from: data)
-            let compatible = releases.filter { !$0.draft && !$0.prerelease && $0.tag_name.range(of: "^v1\\.[0-9]+\\.[0-9]+$", options: .regularExpression) != nil }
-            if let release = compatible.sorted(by: { $0.tag_name.compare($1.tag_name, options: .numeric) == .orderedDescending }).first {
-                openCodeRelease = release
-                openCodeReleaseChecked = Date()
-                return release
-            }
-            if releases.count < 30 { break }
-        }
-        throw ContainerConfigurationInputError(message: "No compatible stable OpenCode release was found.")
-    }
-
-    private func prepareOpenCodeTemplate(_ template: String, release: OpenCodeRelease) throws -> String {
-        var result = template.replacingOccurrences(of: "__OPENCODE_VERSION__", with: String(release.tag_name.dropFirst()))
-        let pattern = try NSRegularExpression(pattern: "__OPENCODE_SHA256_([A-Za-z0-9_.-]+)__")
-        let matches = pattern.matches(in: result, range: NSRange(result.startIndex..., in: result))
-        for match in matches.reversed() {
-            let name = (result as NSString).substring(with: match.range(at: 1))
-            guard let digest = release.assets.first(where: { $0.name == name })?.digest,
-                  digest.range(of: "^sha256:[a-f0-9]{64}$", options: .regularExpression) != nil,
-                  let range = Range(match.range, in: result) else {
-                throw ContainerConfigurationInputError(message: "OpenCode \(release.tag_name) has no verified download for \(name).")
-            }
-            result.replaceSubrange(range, with: digest.dropFirst(7))
-        }
-        return result
-    }
-
-    private func openCodeText(_ path: String) async throws -> String {
-        let data = try await webResourceData("/web/" + path)
-        guard let text = String(data: data, encoding: .utf8) else {
-            throw ContainerConfigurationInputError(message: "The OpenCode template is invalid.")
-        }
-        return text
-    }
-
-    private func addOpenCodeToDockerfile() {
-        guard !codingAgentBusy, let workspace = pendingDockerfileWorkspace else { return }
-        codingAgentBusy = true
-        codingAgentMessage = "Checking the latest compatible OpenCode release…"
-        let allowAll = allowAllOpenCodeActions
-        updateLayout()
-        Task { @MainActor [weak self] in
-            guard let self else { return }
-            defer { self.codingAgentBusy = false; self.updateLayout() }
-            do {
-                let release = try await self.latestOpenCodeRelease()
-                let template = try await self.openCodeText("opencode-container.Dockerfile")
-                var fragment = try self.prepareOpenCodeTemplate(template, release: release)
-                for (placeholder, path) in [("__CONTAINER_AGENT__", "container-agent.md"), ("__CONTAINER_OUTERCTL__", "container-outerctl.md"), ("__OUTERSHELL_SKILL__", "outer-shell-skill.md")] {
-                    let text = try await self.openCodeText(path)
-                    fragment = fragment.replacingOccurrences(of: placeholder, with: Data(text.utf8).base64EncodedString())
-                }
-                fragment = fragment.replacingOccurrences(of: "| base64 -d | gzip -d", with: "| base64 -d")
-                var configuration: [String: Any] = ["instructions": ["/usr/local/share/outershell/container-agent.md"]]
-                if allowAll { configuration["permission"] = "allow" }
-                let config = try JSONSerialization.data(withJSONObject: configuration, options: [.sortedKeys, .withoutEscapingSlashes])
-                fragment = fragment.replacingOccurrences(of: "__OPENCODE_CONFIG__", with: String(decoding: config, as: UTF8.self))
-                guard self.pendingDockerfileWorkspace?.id == workspace.id else { return }
-                self.containerConfigurationDockerfile += "\n\n" + fragment
-                self.codingAgentMessage = "OpenCode \(release.tag_name.dropFirst()) added to the Dockerfile. Save and rebuild to install it."
-                self.selectContainerConfigurationTab(.dockerfile)
-            } catch {
-                self.codingAgentMessage = error.localizedDescription
-            }
-        }
-    }
-
-    private func installHostOpenCode() {
-        guard !codingAgentBusy else { return }
-        codingAgentBusy = true
-        codingAgentMessage = "Downloading OpenCode and preparing your coding agent. This can take a few minutes."
-        updateLayout()
-        Task { @MainActor [weak self] in
-            guard let self else { return }
-            defer { self.codingAgentBusy = false; self.updateLayout() }
-            do {
-                let release = try await self.latestOpenCodeRelease()
-                let template = try await self.openCodeText(self.isWindowsHost ? "opencode-start.ps1" : "opencode-start.sh")
-                let skill = try await self.openCodeText("outer-shell-skill.md")
-                let admin = try await self.openCodeText("server-admin.md")
-                let pipe = self.isWindowsHost ? self.localPipePath("opencode") : ""
-                let script = try self.prepareOpenCodeTemplate(template, release: release)
-                    .replacingOccurrences(of: "__OPENCODE_MODE__", with: "install")
-                    .replacingOccurrences(of: "__OPENCODE_PIPE__", with: pipe)
-                    .replacingOccurrences(of: "__OUTERSHELL_SKILL__", with: skill.trimmingCharacters(in: .newlines))
-                    .replacingOccurrences(of: "__OUTERSHELL_ADMIN__", with: admin.trimmingCharacters(in: .newlines))
-                let command = self.isWindowsHost ? self.windowsScriptCommand(script, fileName: "outershell-opencode-start.ps1") : script
-                guard command.utf8.count < (self.isWindowsHost ? 262_144 : 32_768), let endpoint = self.createEndpoint, let session = self.urlSession else {
-                    throw ContainerConfigurationInputError(message: "The OpenCode installer is unavailable or exceeds the command size limit.")
-                }
-                var form = URLComponents()
-                form.queryItems = [URLQueryItem(name: "recipe", value: "command-port"), URLQueryItem(name: "name", value: "OpenCode"), URLQueryItem(name: "identifier", value: self.isWindowsHost ? "opencode" : "org.outershell.OpenCode"), URLQueryItem(name: "command", value: command), URLQueryItem(name: "workdir", value: "~"), URLQueryItem(name: "scope", value: "user"), URLQueryItem(name: "frontendTransport", value: self.isWindowsHost ? "namedPipe" : "unixSocket"), URLQueryItem(name: "socketPath", value: self.isWindowsHost ? pipe : "~/.local/state/outershell-opencode/opencode.sock")]
-                var request = URLRequest(url: endpoint)
-                request.httpMethod = "POST"
-                request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
-                request.httpBody = form.percentEncodedQuery?.replacingOccurrences(of: "+", with: "%2B").data(using: .utf8)
-                let (data, _) = try await session.data(for: request)
-                let response = try ActionResponse.decodeBinary(data)
-                guard response.ok else { throw ContainerConfigurationInputError(message: response.message) }
-                for _ in 0..<180 {
-                    self.fetchBackends()
-                    if let item = self.hostOpenCodeItem {
-                        if !self.isAppProminent(item) { self.moveOverviewItem(item, pinned: true) }
-                        if self.endpointIsRunning(item.primaryEndpoint), item.frontend.url.contains("/session/ses_") {
-                            self.codingAgentMessage = "OpenCode is ready. Connect your model provider, then ask it to add your first app."
-                            return
-                        }
-                        if let failure = self.launcherFailureMessage(item.primaryEndpoint, displayName: "OpenCode") {
-                            throw ContainerConfigurationInputError(message: failure)
-                        }
-                    }
-                    try await Task.sleep(nanoseconds: 2_000_000_000)
-                }
-                self.codingAgentMessage = "OpenCode is still preparing. Check its logs from the app menu."
-            } catch { self.codingAgentMessage = error.localizedDescription }
-        }
-    }
-
-    private func localPipePath(_ name: String) -> String {
-        var bytes = [UInt8](repeating: 0, count: 12)
-        _ = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
-        return "\\\\.\\pipe\\org.outershell.\(name).\(bytes.map { String(format: "%02x", $0) }.joined())"
-    }
-
-    private func windowsScriptCommand(_ script: String, fileName: String) -> String {
-        let encoded = Array(Data(script.utf8).base64EncodedString())
-        var lines = ["@echo off", "set \"OC_SCRIPT=%LOCALAPPDATA%\\\(fileName)\""]
-        for offset in stride(from: 0, to: encoded.count, by: 1200) {
-            let chunk = String(encoded[offset..<min(offset + 1200, encoded.count)])
-            lines.append("\(offset == 0 ? ">" : ">>") \"%OC_SCRIPT%.b64\" echo \(chunk)")
-        }
-        lines.append("powershell.exe -NoProfile -Command \"[IO.File]::WriteAllBytes($env:OC_SCRIPT,[Convert]::FromBase64String([IO.File]::ReadAllText($env:OC_SCRIPT+'.b64')))\"")
-        lines.append("if errorlevel 1 exit /b 1")
-        lines.append("powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"%OC_SCRIPT%\"")
-        lines.append("exit /b %errorlevel%")
-        return lines.joined(separator: "\r\n")
-    }
-
-    private func openCodeNavigationURL(_ url: URL, serviceID: String) -> URL {
-        guard serviceID.lowercased().contains("opencode"), let prompt = openCodePrompt else { return url }
-        openCodePrompt = nil
-        guard var components = URLComponents(url: url, resolvingAgainstBaseURL: false),
-              let range = components.path.range(of: "/session(?:/[^/]*)?$", options: .regularExpression) else { return url }
-        components.path = String(components.path[..<range.lowerBound]) + "/session"
-        components.fragment = nil
-        components.queryItems = (components.queryItems ?? []).filter { $0.name != "prompt" } + [URLQueryItem(name: "prompt", value: prompt)]
-        return components.url ?? url
-    }
-
-    private func checkOpenCodeUpdates() {
-        guard !checkingOpenCode, let item = hostOpenCodeItem, endpointIsRunning(item.primaryEndpoint), !item.frontend.socketPath.isEmpty,
-              openCodeHealthChecked.map({ Date().timeIntervalSince($0) >= 300 }) ?? true else { return }
-        checkingOpenCode = true
-        openCodeHealthChecked = Date()
-        Task { @MainActor [weak self] in
-            guard let self else { return }
-            defer { self.checkingOpenCode = false; self.updateLayout() }
-            do {
-                struct Health: Decodable { let healthy: Bool; let version: String }
-                var query = URLComponents()
-                query.queryItems = [URLQueryItem(name: "socket", value: item.frontend.socketPath)]
-                let data = try await self.webResourceData("/api/opencode-health?\(query.percentEncodedQuery ?? "")")
-                let health = try JSONDecoder().decode(Health.self, from: data)
-                guard health.healthy else { return }
-                self.openCodeVersion = health.version
-                _ = try await self.latestOpenCodeRelease()
-            } catch {
-                self.openCodeHealthChecked = Date().addingTimeInterval(3_300)
-            }
-        }
-    }
-
-    private func showOpenCodeUpdate() {
-        selectedCreateSection = .codingAgent
-        codingAgentMessage = "Checking the latest compatible OpenCode release…"
-        navigateToMode(.create, pushHistory: true)
-        Task { @MainActor [weak self] in
-            guard let self else { return }
-            do {
-                let release = try await self.latestOpenCodeRelease()
-                let template = try await self.openCodeText(self.isWindowsHost ? "opencode-start.ps1" : "opencode-start.sh")
-                let boundary = self.isWindowsHost ? "if (!(Test-Path \"$config\\skills\\outer-shell\\SKILL.md\"))" : "if [ ! -e \"$config_root/skills/outer-shell/SKILL.md\" ]"
-                guard let range = template.range(of: boundary) else { throw ContainerConfigurationInputError(message: "Invalid OpenCode updater template.") }
-                let prefix = String(template[..<range.lowerBound]).replacingOccurrences(of: "^param\\([^\\n]+\\)\\n", with: "", options: .regularExpression)
-                self.openCodeUpdateCommand = try self.prepareOpenCodeTemplate(prefix, release: release).replacingOccurrences(of: "__OPENCODE_MODE__", with: "update")
-                self.openCodeUpdateCommand = self.isWindowsHost ? self.openCodeUpdateCommand + "\n}\n" : "(\n" + self.openCodeUpdateCommand + "\n)\n"
-                self.codingAgentMessage = "OpenCode \(release.tag_name.dropFirst()) is available. Stop OpenCode from its app menu, run the update commands on the host as your user, then start it again. Sessions and provider settings are preserved."
-            } catch { self.codingAgentMessage = error.localizedDescription }
-            self.updateLayout()
-        }
     }
 
     private var pendingMountPathEdit: (id: UUID, field: String)?
@@ -5936,24 +5725,18 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private var codingAgentScope: String?
     private var codingAgentScroll: CGFloat = 0
     private var codingAgentContentHeight: CGFloat = 0
-    private var allowAllOpenCodeActions = false
-    private var codingAgentBusy = false
     private var codingAgentMessage = ""
     private var codingAgentActions: [(frame: CGRect, title: String, action: () -> Void)] = []
     private var codingAgentContentLayer: CALayer?
     private var codingAgentTabFrame = CGRect.zero
 
-    private func agentInstructions(workspace: LocalWorkspaceRecord?, scope: String, hosted: Bool) -> String {
+    private func agentInstructions(workspace: LocalWorkspaceRecord?, scope: String) -> String {
         var parts: [String] = []
-        if !hosted, let command = serverSSHCommand { parts.append("Connect using:\n" + command) }
+        if let command = serverSSHCommand { parts.append("Connect using:\n" + command) }
         if let workspace {
             if scope == "container" {
-                if hosted {
-                    parts.append("You are running inside the “\(workspace.name)” container.")
-                } else {
-                    parts.append("Run commands inside the “\(workspace.name)” container using:\n\(workspace.runtimeKind == "apple.container" ? "container" : "docker") exec outershell-container-\(workspace.id.uuidString.lowercased()) /bin/bash -lc '<command>'")
-                }
-                parts.append("Read https://outershell.org/api/containers/ and /usr/local/share/outershell/container-agent.md for instructions. Keep durable installs and app registrations in the Dockerfile and build context. Use existing mounted folders or persistent volumes for user data. Work only inside the container and its existing mounts. Do not change host mounts or invoke the host container engine from inside the container. For host configuration, ask the user to use Folder mounts or a whole-server coding agent.")
+                parts.append("Run commands inside the “\(workspace.name)” container using:\n\(workspace.runtimeKind == "apple.container" ? "container" : "docker") exec outershell-container-\(workspace.id.uuidString.lowercased()) /bin/bash -lc '<command>'")
+                parts.append("Read https://outershell.org/api/containers/ for instructions. Keep durable installs and app registrations in the Dockerfile and build context. Use existing mounted folders or persistent volumes for user data. Work only inside the container and its existing mounts. Do not change host mounts or invoke the host container engine from inside the container. For host configuration, ask the user to use Folder mounts or a whole-server coding agent.")
             } else {
                 parts.append("Help me update the “\(workspace.name)” container in Outer Shell (ID: \(workspace.id.uuidString.lowercased())).")
                 parts.append("Read https://outershell.org/api/containers/ for container configuration instructions. Inspect its current configuration and preserve unrelated settings. Use Outer Shell to manage folder mounts, environment variables, networking, and rebuilds. Keep durable installs and app registrations in the Dockerfile and build context, and user data in persistent or mounted folders.")
@@ -5979,6 +5762,116 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             layer.addSublayer(label)
         }
         return top - CGFloat(lines.count) * lineHeight
+    }
+
+    // Lays out wrapped text with bold phrases and inline commands. Clicking a
+    // command copies it.
+    @discardableResult
+    private func agentRichText(_ runs: [AgentTextRun], in layer: CALayer, left: CGFloat, top: CGFloat,
+                               width: CGFloat, bullet: Bool = false, size: CGFloat = 13) -> CGFloat {
+        let fonts = (plain: NSFont.systemFont(ofSize: size, weight: .regular),
+                     bold: NSFont.systemFont(ofSize: size, weight: .semibold),
+                     code: NSFont.monospacedSystemFont(ofSize: size - 1, weight: .regular))
+        let lineHeight = ceil(size * 1.5)
+        let indent: CGFloat = bullet ? 14 : 0
+        let available = max(width - indent, 1)
+        let codePadding: CGFloat = 4
+        if bullet {
+            let mark = makeTextLayer(size: size, weight: .regular, color: .secondaryLabelColor)
+            mark.string = "•"
+            mark.frame = CGRect(x: left, y: top - lineHeight, width: indent, height: lineHeight)
+            layer.addSublayer(mark)
+        }
+        var fragments: [(text: String, run: Int, x: CGFloat, width: CGFloat, line: Int)] = []
+        var x: CGFloat = 0
+        var line = 0
+        for (index, run) in runs.enumerated() {
+            let (text, font, isCode): (String, NSFont, Bool) = switch run {
+            case .plain(let text): (text, fonts.plain, false)
+            case .bold(let text): (text, fonts.bold, false)
+            case .code(let text): (text, fonts.code, true)
+            }
+            var tokens: [String] = []
+            var current = ""
+            for character in text {
+                current.append(character)
+                if character == " " {
+                    tokens.append(current)
+                    current = ""
+                }
+            }
+            if !current.isEmpty { tokens.append(current) }
+            if isCode { x += codePadding }
+            for token in tokens {
+                let tokenWidth = ceil((token as NSString).size(withAttributes: [.font: font]).width)
+                let visibleWidth = ceil((token.trimmingCharacters(in: .whitespaces) as NSString).size(withAttributes: [.font: font]).width)
+                if x > 0, x + visibleWidth + (isCode ? codePadding : 0) > available {
+                    line += 1
+                    x = isCode ? codePadding : 0
+                }
+                fragments.append((token, index, x, tokenWidth, line))
+                x += tokenWidth
+            }
+            if isCode { x += codePadding }
+        }
+        var groups: [(text: String, run: Int, x: CGFloat, width: CGFloat, line: Int)] = []
+        for fragment in fragments {
+            if let last = groups.last, last.run == fragment.run, last.line == fragment.line {
+                groups[groups.count - 1].text += fragment.text
+                groups[groups.count - 1].width = fragment.x + fragment.width - last.x
+            } else {
+                groups.append(fragment)
+            }
+        }
+        for group in groups {
+            let lineTop = top - CGFloat(group.line) * lineHeight
+            let frame = CGRect(x: left + indent + group.x, y: lineTop - lineHeight,
+                               width: group.width + 2, height: lineHeight)
+            switch runs[group.run] {
+            case .plain, .bold:
+                let isBold = if case .bold = runs[group.run] { true } else { false }
+                let label = makeTextLayer(size: size, weight: isBold ? .semibold : .regular,
+                                          color: isBold ? .labelColor : .secondaryLabelColor)
+                label.string = group.text
+                label.frame = frame
+                layer.addSublayer(label)
+            case .code(let command):
+                let trimmed = group.text.trimmingCharacters(in: .whitespaces)
+                let textWidth = ceil((trimmed as NSString).size(withAttributes: [.font: fonts.code]).width)
+                let chipFrame = CGRect(x: frame.minX - codePadding + 1, y: frame.minY + 2,
+                                       width: textWidth + codePadding * 2 - 2, height: lineHeight - 3)
+                let chip = CALayer()
+                chip.frame = chipFrame
+                chip.cornerRadius = 4
+                chip.backgroundColor = resolvedCGColor(NSColor.labelColor.withAlphaComponent(0.08))
+                layer.addSublayer(chip)
+                let label = makeTextLayer(size: size - 1, weight: .regular, color: .labelColor, monospaced: true)
+                label.string = trimmed
+                label.frame = CGRect(x: frame.minX, y: frame.minY - 1, width: textWidth + 2, height: lineHeight)
+                layer.addSublayer(label)
+                let rootFrame = rootLayer.convert(chipFrame, from: layer)
+                appendCodingAgentAction(rootFrame, "Copy \(command)") { [weak self] in
+                    self?.copyTextToPasteboard(command)
+                    self?.showCommandCopiedConfirmation(at: CGPoint(x: rootFrame.midX, y: rootFrame.minY))
+                }
+            }
+        }
+        return top - CGFloat(line + 1) * lineHeight
+    }
+
+    private func agentLink(_ title: String, url: String, in layer: CALayer, left: CGFloat, top: CGFloat) -> CGFloat {
+        let font = NSFont.systemFont(ofSize: 13, weight: .regular)
+        let width = ceil((title as NSString).size(withAttributes: [.font: font]).width) + 2
+        let frame = CGRect(x: left, y: top - 20, width: width, height: 20)
+        let label = makeTextLayer(size: 13, weight: .regular, color: .linkColor)
+        label.string = title
+        label.frame = frame
+        layer.addSublayer(label)
+        appendCodingAgentAction(rootLayer.convert(frame, from: layer), title) { [weak self] in
+            guard let self, let url = URL(string: url) else { return }
+            self.outerframeHost.openURLExternally(url)
+        }
+        return frame.minY
     }
 
     private func agentButton(_ title: String, in layer: CALayer, frame: CGRect,
@@ -6057,7 +5950,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         let ownWidth = twoColumns ? width - gap - hostedWidth : width
         let ownBottom = renderOwnAgentSection(in: layer, left: frame.minX, top: y, width: ownWidth,
                                               workspace: workspace, scope: scope)
-        let hostedBottom = renderHostedAgentCard(in: layer,
+        let hostedBottom = renderTerminalAgentCard(in: layer,
                                                  left: twoColumns ? frame.minX + ownWidth + gap : frame.minX,
                                                  top: twoColumns ? y : ownBottom - 24,
                                                  width: hostedWidth,
@@ -6077,7 +5970,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         var y = agentText("Use your coding agent", in: layer, left: left, top: top, width: width, size: 16, heading: true) - 4
         y = agentText("Paste these details into your agent, then add your request.", in: layer, left: left, top: y, width: width) - 14
 
-        let prompt = agentInstructions(workspace: workspace, scope: scope, hosted: false)
+        let prompt = agentInstructions(workspace: workspace, scope: scope)
         let promptFont = NSFont.monospacedSystemFont(ofSize: 11.5, weight: .regular)
         let padding: CGFloat = 12
         let box = CALayer()
@@ -6121,8 +6014,36 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         return y
     }
 
-    private func renderHostedAgentCard(in layer: CALayer, left: CGFloat, top: CGFloat, width: CGFloat,
-                                       workspace: LocalWorkspaceRecord?, scope: String) -> CGFloat {
+    // Dockerfile snippets that install a coding agent, keep its sign-in across
+    // rebuilds, and register it as a command that opens in Terminal.
+    private static let agentSnippets: [(id: String, name: String, marker: String, text: String)] = [
+        ("claude", "Claude Code", "add-command --id claude ", """
+        # Claude Code
+        RUN apt-get update \\
+            && apt-get install -y --no-install-recommends ca-certificates curl \\
+            && curl -fsSL https://claude.ai/install.sh | bash \\
+            && rm -rf /var/lib/apt/lists/*
+        ENV CLAUDE_CONFIG_DIR=/root/.claude
+        VOLUME ["/root/.claude"]
+        RUN outerctl image add-command --id claude --name "Claude Code" --working-directory /root --user root -- /root/.local/bin/claude
+        """),
+        ("codex", "Codex", "add-command --id codex ", """
+        # Codex
+        RUN apt-get update \\
+            && apt-get install -y --no-install-recommends ca-certificates curl \\
+            && curl -fsSL https://chatgpt.com/codex/install.sh \\
+                | CODEX_HOME=/opt/codex-cli CODEX_NON_INTERACTIVE=1 CODEX_INSTALL_DIR=/usr/local/bin sh \\
+            && rm -rf /var/lib/apt/lists/*
+        ENV CODEX_HOME=/var/lib/codex
+        VOLUME ["/var/lib/codex"]
+        RUN outerctl image add-command --id codex --name "Codex" --working-directory /root --user root -- /usr/local/bin/codex
+        """)
+    ]
+
+    private func renderTerminalAgentCard(in layer: CALayer, left: CGFloat, top: CGFloat, width: CGFloat,
+                                         workspace: LocalWorkspaceRecord?, scope: String) -> CGFloat {
+        let inContainer = workspace != nil && scope == "container"
+        if let workspace, inContainer, !terminalReaches(workspace) { return top }
         let padding: CGFloat = 20
         let card = CALayer()
         card.cornerRadius = 12
@@ -6132,61 +6053,102 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         layer.addSublayer(card)
         let innerLeft = left + padding
         let innerWidth = max(width - padding * 2, 1)
-        let onHost = workspace == nil || scope == "server"
         var y = top - padding
-        y = agentText(workspace != nil && scope == "server" ? "OpenCode on this server" : "Want a coding agent here?",
-                      in: layer, left: innerLeft, top: y, width: innerWidth, size: 16, heading: true) - 6
-        let body = workspace != nil && scope == "server"
-            ? "OpenCode runs as your user on the host, outside the container. It can configure folder mounts and container runtime settings with your user’s permissions."
-            : onHost
-            ? "OpenCode runs on this server. Use it from your phone or computer to install tools and build things."
-            : "OpenCode runs inside this container. Use it from your phone or computer to install tools and build things."
-        y = agentText(body, in: layer, left: innerLeft, top: y, width: innerWidth) - 16
-
-        let existing = scope == "container"
-            ? workspace.flatMap { space in appLauncherItems(in: space).first { $0.displayName.lowercased().contains("opencode") } }
-            : hostOpenCodeItem
-        if scope == "container", existing == nil {
-            agentButton((allowAllOpenCodeActions ? "☑ " : "☐ ") + "Allow all actions without asking", in: layer,
-                        frame: CGRect(x: innerLeft, y: y - 32, width: min(innerWidth, 300), height: 32)) { [weak self] in
-                self?.allowAllOpenCodeActions.toggle()
-                self?.updateLayout()
+        let running = workspace.map { $0.state == "running" } ?? true
+        func terminalButton(_ title: String, commandID: String? = nil, emphasized: Bool = true) {
+            if hostTerminalItem != nil {
+                agentButton("\(title) →", in: layer,
+                            frame: CGRect(x: innerLeft, y: y - 34, width: min(innerWidth, 260), height: 34),
+                            emphasized: emphasized) { [weak self] in
+                    self?.openInTerminal(inContainer ? workspace : nil, commandID: commandID)
+                }
+                y -= 34 + 12
+            } else if let backend = terminalBackendToInstall {
+                agentButton("Install Terminal", in: layer,
+                            frame: CGRect(x: innerLeft, y: y - 34, width: min(innerWidth, 200), height: 34),
+                            emphasized: true) { [weak self] in
+                    self?.showInstallPrompt(for: backend)
+                }
+                y -= 34 + 12
             }
-            y -= 40
-            y = agentText("Applies to OpenCode in this container, including folders mounted into it.",
-                          in: layer, left: innerLeft, top: y, width: innerWidth, size: 11) - 12
         }
-        let title = codingAgentBusy ? "Preparing OpenCode…"
-            : existing != nil ? "Open OpenCode →"
-            : scope == "container" ? "Add OpenCode" : "Set up OpenCode →"
-        agentButton(title, in: layer, frame: CGRect(x: innerLeft, y: y - 34, width: min(innerWidth, 200), height: 34),
-                    emphasized: true) { [weak self] in
-            guard let self, !self.codingAgentBusy else { return }
-            if let existing {
-                self.openCodePrompt = self.agentInstructions(workspace: workspace, scope: scope, hosted: true)
-                self.openLauncherItem(existing, opensInNewTab: true)
-            } else if scope == "container" {
-                self.addOpenCodeToDockerfile()
+        if let workspace, inContainer {
+            y = agentText("Coding agents in this container", in: layer, left: innerLeft, top: y, width: innerWidth, size: 16, heading: true) - 6
+            y = agentText("Use any coding agent installed in this container from Terminal, whether it came with the image or you added it.",
+                          in: layer, left: innerLeft, top: y, width: innerWidth) - 10
+            if running {
+                let agents = (workspace.commands ?? []).filter { command in
+                    Self.agentSnippets.contains { $0.id == command.id }
+                }
+                for agent in agents {
+                    terminalButton("Open \(agent.displayName.isEmpty ? agent.id : agent.displayName)", commandID: agent.id)
+                }
+                terminalButton("Open Terminal in this container", emphasized: agents.isEmpty)
             } else {
-                self.installHostOpenCode()
+                y = agentText("Start the container to open Terminal in it.", in: layer, left: innerLeft, top: y, width: innerWidth) - 10
             }
+            y = agentText("Add an agent", in: layer, left: innerLeft, top: y - 8, width: innerWidth, size: 14, heading: true) - 6
+            y = agentText("Containers are rebuilt from their Dockerfile, so that’s where to add one. Anything installed only in the running container is lost on the next rebuild.",
+                          in: layer, left: innerLeft, top: y, width: innerWidth) - 10
+            if workspace.ownsContainer != false {
+                y = agentText("Ready-made snippets", in: layer, left: innerLeft, top: y - 8, width: innerWidth, size: 14, heading: true) - 8
+                if pendingDockerfileWorkspace?.id == workspace.id {
+                    for snippet in Self.agentSnippets {
+                        let added = containerConfigurationDockerfile.contains(snippet.marker)
+                        agentButton(added ? "\(snippet.name) added" : "Add \(snippet.name)", in: layer,
+                                    frame: CGRect(x: innerLeft, y: y - 32, width: min(innerWidth, 220), height: 32)) { [weak self] in
+                            guard let self, !self.containerConfigurationDockerfile.contains(snippet.marker) else { return }
+                            self.containerConfigurationDockerfile = self.containerConfigurationDockerfile
+                                .trimmingCharacters(in: .whitespacesAndNewlines) + "\n\n" + snippet.text + "\n"
+                            self.codingAgentMessage = "\(snippet.name) added. Choose Save & rebuild to install it."
+                            self.updateLayout()
+                        }
+                        y -= 40
+                    }
+                    y = agentText("Each one installs the agent, keeps its sign-in in a volume so it survives rebuilds, and adds it to this container’s terminal commands. Choose Save & rebuild to install. Requires Debian or Ubuntu with Outer Shell support.",
+                                  in: layer, left: innerLeft, top: y - 2, width: innerWidth, size: 11) - 10
+                } else {
+                    y = agentText("The container editor can add Claude Code or Codex to the Dockerfile for you.",
+                                  in: layer, left: innerLeft, top: y, width: innerWidth) - 10
+                    agentButton("Edit the Dockerfile…", in: layer,
+                                frame: CGRect(x: innerLeft, y: y - 32, width: min(innerWidth, 260), height: 32)) { [weak self] in
+                        self?.navigateToRecipeSafeSpace(workspace.id)
+                    }
+                    y -= 40
+                }
+            }
+            y = agentText("Any other agent", in: layer, left: innerLeft, top: y - 8, width: innerWidth, size: 14, heading: true) - 6
+            y = agentText("Add it to the Dockerfile:", in: layer, left: innerLeft, top: y, width: innerWidth) - 6
+            let steps: [[AgentTextRun]] = [
+                [.bold("Install it"), .plain(" with "), .code("RUN"), .plain(".")],
+                [.bold("Keep its sign-in"), .plain(" across rebuilds by making its settings folder a "), .code("VOLUME"), .plain(".")],
+                [.bold("Runs in a terminal:"), .plain(" register it with "), .code("RUN outerctl image add-command"),
+                 .plain(", and it appears among this container’s terminal commands.")],
+                [.bold("Runs in a browser:"), .plain(" register it with "), .code("RUN outerctl image add-app"),
+                 .plain(", and it appears with this container’s apps.")]
+            ]
+            for step in steps {
+                y = agentRichText(step, in: layer, left: innerLeft, top: y, width: innerWidth, bullet: true) - 6
+            }
+            y = agentLink("Container cookbook ↗", url: "https://outershell.org/cookbook", in: layer, left: innerLeft, top: y - 4) - 12
+        } else {
+            y = agentText("Add a coding agent", in: layer, left: innerLeft, top: y, width: innerWidth, size: 16, heading: true) - 6
+            y = agentText("Install any coding agent on this server, then use it from here.",
+                          in: layer, left: innerLeft, top: y, width: innerWidth) - 8
+            let kinds: [[AgentTextRun]] = [
+                [.bold("Runs in a terminal:"), .plain(" install and run it in Terminal. Your sessions keep running when you close the page or switch devices.")],
+                [.bold("Runs in a browser:"), .plain(" install it in Terminal, then register it with "), .code("outerctl app upsert"),
+                 .plain(" so it appears with your apps.")]
+            ]
+            for kind in kinds {
+                y = agentRichText(kind, in: layer, left: innerLeft, top: y, width: innerWidth, bullet: true) - 6
+            }
+            y -= 10
+            terminalButton("Open Terminal")
         }
-        y -= 34 + 12
-        let note = scope == "container" && existing == nil
-            ? "Adds OpenCode and container instructions to the Dockerfile. Choose Save & rebuild to install it. Requires Debian or Ubuntu with Outer Shell support. Bring your model provider account or API key."
-            : workspace != nil && scope == "server"
-            ? "Bring your model provider account or API key. Runs as your user, not as root."
-            : "Bring your model provider account or API key."
-        y = agentText(note, in: layer, left: innerLeft, top: y, width: innerWidth, size: 11)
+        y = agentText("Bring your model provider account or API key.", in: layer, left: innerLeft, top: y, width: innerWidth, size: 11)
         if !codingAgentMessage.isEmpty {
             y = agentText(codingAgentMessage, in: layer, left: innerLeft, top: y - 10, width: innerWidth)
-        }
-        if !openCodeUpdateCommand.isEmpty && workspace == nil {
-            agentButton("Copy update commands", in: layer, frame: CGRect(x: innerLeft, y: y - 44, width: min(innerWidth, 200), height: 32)) { [weak self] in
-                guard let self else { return }
-                self.copyTextToPasteboard(self.openCodeUpdateCommand)
-            }
-            y -= 44
         }
         card.frame = CGRect(x: left, y: y - padding, width: width, height: top - y + padding)
         return card.frame.minY
@@ -6245,50 +6207,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         codingAgentContentHeight = frame.height - bottom
         codingAgentScroll = min(codingAgentScroll, max(codingAgentContentHeight - frame.height, 0))
         content.frame.origin.y = codingAgentScroll
-    }
-
-    private func renderContainerApps(in frame: CGRect) {
-        editorInputFieldFrame = .zero
-        editorInputTextFrame = .zero
-        let clip = CALayer()
-        clip.frame = frame
-        clip.masksToBounds = true
-        workspacePanelLayer.addSublayer(clip)
-        loadOpenCodeIcon()
-        let width = frame.width
-        var y = agentText("Outer Shell apps", in: clip, left: 0, top: frame.height, width: width, size: 16, heading: true) - 6
-        y = agentText("Adds the app to the Dockerfile. Choose Save & rebuild to install it. Requires Debian or Ubuntu with Outer Shell support.", in: clip, left: 0, top: y, width: width) - 16
-        let apps: [(name: String, icon: CGImage?, marker: String, busy: Bool, add: () -> Void)] = [
-            ("OpenCode", openCodeIcon, "/usr/local/bin/outershell-opencode", codingAgentBusy, { [weak self] in self?.addOpenCodeToDockerfile() })
-        ]
-        for app in apps {
-            let added = containerConfigurationDockerfile.contains(app.marker)
-            let icon = CALayer()
-            icon.frame = CGRect(x: 0, y: y - 40, width: 36, height: 36)
-            icon.contentsGravity = .resizeAspect
-            icon.contents = app.icon
-            icon.opacity = added ? 0.62 : 1
-            clip.addSublayer(icon)
-            let name = makeTextLayer(size: 13, weight: .medium, color: added ? .secondaryLabelColor : .labelColor)
-            name.string = app.name
-            name.frame = CGRect(x: 48, y: y - 30, width: max(width - 48 - 112, 1), height: 18)
-            clip.addSublayer(name)
-            if added {
-                let status = makeTextLayer(size: 11, weight: .medium, color: .secondaryLabelColor)
-                status.string = "Added"
-                status.frame = CGRect(x: width - 100, y: y - 29, width: 100, height: 16)
-                clip.addSublayer(status)
-            } else {
-                agentButton(app.busy ? "Adding…" : "Add", in: clip, frame: CGRect(x: width - 100, y: y - 36, width: 100, height: 30)) {
-                    guard !app.busy else { return }
-                    app.add()
-                }
-            }
-            y -= 52
-        }
-        if !codingAgentMessage.isEmpty {
-            y = agentText(codingAgentMessage, in: clip, left: 0, top: y - 6, width: width)
-        }
     }
 
     private func scrollCodingAgent(to nextScroll: CGFloat) {
@@ -6750,49 +6668,14 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         var x = left
         var y = top - itemHeight
 
-        var entries = apps.map { (name: $0.backend.displayName, app: Optional($0)) }
-        let showsHostApps = catalogWorkspaceID == nil && catalogScope != "system"
-        if showsHostApps {
-            entries.append((name: "OpenCode", app: nil))
-            loadOpenCodeIcon()
+        let sorted = apps.sorted {
+            $0.backend.displayName.localizedCaseInsensitiveCompare($1.backend.displayName) == .orderedAscending
         }
-        entries.sort { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
-        for (index, entry) in entries.enumerated() {
+        for (index, app) in sorted.enumerated() {
             x = startX + CGFloat(index % columns) * (itemWidth + itemGap)
             y = top - itemHeight - CGFloat(index / columns) * (itemHeight + itemGap)
             let frame = CGRect(x: x, y: y, width: itemWidth, height: itemHeight)
-            if let app = entry.app {
-                renderAddableAppTile(app.backend, isInstalled: app.isInstalled, frame: frame)
-            } else {
-                let item = hostOpenCodeItem
-                let installed = item != nil
-                let icon = CALayer()
-                icon.frame = CGRect(x: frame.midX - 23, y: frame.maxY - 56, width: 46, height: 46)
-                icon.contentsGravity = .resizeAspect
-                icon.contents = openCodeIcon ?? item.flatMap { launcherIconImage(for: $0) }
-                icon.opacity = installed ? 0.62 : 1
-                addCreateFormSublayer(icon)
-                let name = makeTextLayer(size: 12, weight: .medium, color: installed ? .secondaryLabelColor : .labelColor, alignment: .center)
-                name.string = entry.name
-                name.frame = CGRect(x: frame.minX, y: frame.minY + 20, width: frame.width, height: 28)
-                addCreateFormSublayer(name)
-                if installed {
-                    let status = makeTextLayer(size: 10, weight: .medium, color: .secondaryLabelColor, alignment: .center)
-                    status.string = "Installed"
-                    status.frame = CGRect(x: frame.minX, y: frame.minY + 3, width: frame.width, height: 14)
-                    addCreateFormSublayer(status)
-                } else {
-                    renderCatalogInstallButton("Install", in: frame)
-                }
-                if !installed {
-                    codingAgentActions.append((rootLayer.convert(frame, from: createFormContentLayer), "Install \(entry.name)", { [weak self] in
-                        guard let self else { return }
-                        self.selectedCreateSection = .codingAgent
-                        self.createScroll = 0
-                        self.updateLayout()
-                    }))
-                }
-            }
+            renderAddableAppTile(app.backend, isInstalled: app.isInstalled, frame: frame)
         }
 
         return y - 34
@@ -9107,7 +8990,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                         (containerConfigurationRenameFrame, "Rename container"),
                         (containerConfigurationDockerfileTabFrame, "Dockerfile"),
                         (codingAgentTabFrame, "Coding agent"),
-                        (containerConfigurationAppsTabFrame, "Outer Shell apps"),
                         (containerConfigurationMountsTabFrame, "Folder mounts"),
                         (containerConfigurationEnvironmentTabFrame, "Environment"),
                         (containerConfigurationPortsTabFrame, "Network"),
@@ -9136,7 +9018,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                     }
                     return (action.frame, label)
                 }
-            case .codingAgent, .apps:
+            case .codingAgent:
                 controls += visibleCodingAgentActions.map { ($0.frame, $0.title) }
             case .runtime:
                 controls.append((containerConfigurationChangeRuntimeFrame, "Change runtime"))
@@ -9171,7 +9053,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             let selectedTab = isContainerConfigurationEditorVisible &&
                 ((label == "Dockerfile" && containerConfigurationTab == .dockerfile) ||
                  (label == "Coding agent" && containerConfigurationTab == .codingAgent) ||
-                 (label == "Outer Shell apps" && containerConfigurationTab == .apps) ||
                  (label == "Folder mounts" && containerConfigurationTab == .mounts) ||
                  (label == "Environment" && containerConfigurationTab == .environment) ||
                  (label == "Network" && containerConfigurationTab == .ports) ||
@@ -9288,7 +9169,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         }
         for target in workspaceOverviewActionFrames {
             if let frame = accessibilityFrame(target.frame, from: appsScrollContentLayer, clippedBy: clipFrame) {
-                let label = target.operation == "menu" ? "Manage \(target.workspace.name)" : target.operation == "editContainer" ? "Edit \(target.workspace.name)" : target.operation == "viewBuildLog" ? "View build log for \(target.workspace.name)" : target.operation == "copyShell" ? "Copy command to open terminal in container" : "Copy \(target.workspace.commandLaunchers.first(where: { "copyCommand:\($0.id)" == target.operation })?.displayName ?? "command") command"
+                let label = target.operation == "menu" ? "Manage \(target.workspace.name)" : target.operation == "editContainer" ? "Edit \(target.workspace.name)" : target.operation == "viewBuildLog" ? "View build log for \(target.workspace.name)" : target.operation == "copyShell" ? "Ways to open a terminal in \(target.workspace.name)" : target.operation == "openShell" ? "Open Terminal in \(target.workspace.name)" : target.operation.hasPrefix("openCommand:") ? "Open \(target.workspace.commandLaunchers.first(where: { "openCommand:\($0.id)" == target.operation })?.displayName ?? "command") in Terminal" : "Ways to run \(target.workspace.commandLaunchers.first(where: { "copyCommand:\($0.id)" == target.operation })?.displayName ?? "command")"
                 nodes.append(accessibilityNode(nextIdentifier: &nextIdentifier, role: .button, frame: frame, label: label, key: "workspace-action:\(target.workspace.id):\(target.operation):\(overviewGroupFrames.first { $0.frame.contains(target.frame.origin) }?.id ?? "")"))
             }
         }
@@ -9850,7 +9731,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                     self.lastBackendsResponseData = data
                     self.backendError = response.error
                     self.backends = response.backends
-                    self.checkOpenCodeUpdates()
                     self.fetchEndpointIcons()
                     if let path = self.backends.first(where: { $0.serviceScope == "user" && $0.serviceUnitPath != nil })?.serviceUnitPath {
                         let components = path.split(separator: "/")
@@ -10266,7 +10146,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                   ) else {
                 return
             }
-            let targetURL = self.openCodeNavigationURL(url, serviceID: endpoint.backend.serviceID)
+            let targetURL = self.terminalNavigationURL(url,
+                                                       serviceID: endpoint.backend.serviceID)
             let pipeDisplayName = endpoint.frontend.socketPath.hasPrefix("\\\\.\\pipe\\wsl.")
                 ? "WSL / \(endpoint.backend.serviceScope == "system" ? "root" : self.overviewUsername) / \(displayName)"
                 : nil
@@ -10424,7 +10305,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             launchingEndpoints.remove(key)
             backendError = ""
             updateLayout()
-            navigateToWorkspaceApp(workspaceAppNavigationURL(openCodeNavigationURL(url, serviceID: app.serviceID), app: app),
+            navigateToWorkspaceApp(workspaceAppNavigationURL(url, app: app),
                                    opensInNewTab: opensInNewTab,
                                    opensInNewWindow: opensInNewWindow)
             return
@@ -10441,7 +10322,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             launchingEndpoints.remove(key)
             backendError = ""
             updateLayout()
-            navigateToWorkspaceApp(workspaceAppNavigationURL(openCodeNavigationURL(url, serviceID: app.serviceID), app: app),
+            navigateToWorkspaceApp(workspaceAppNavigationURL(url, app: app),
                                    opensInNewTab: opensInNewTab,
                                    opensInNewWindow: opensInNewWindow)
             return
@@ -10468,7 +10349,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             }
             self.backendError = ""
             self.updateLayout()
-            let navigationURL = self.workspaceAppNavigationURL(self.openCodeNavigationURL(url, serviceID: app.serviceID), app: app)
+            let navigationURL = self.workspaceAppNavigationURL(url, app: app)
             self.navigateToWorkspaceApp(navigationURL,
                                         opensInNewTab: opensInNewTab,
                                         opensInNewWindow: opensInNewWindow)
@@ -10650,7 +10531,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 if let data,
                    let response = try? BackendsResponse.decodeBinary(data) {
                     self.backends = response.backends
-                    self.checkOpenCodeUpdates()
                     if let failedEndpoint = self.findLauncherEndpoint(serviceID: endpoint.backend.serviceID,
                                                                        serviceScope: endpoint.backend.serviceScope,
                                                                        frontendID: endpoint.frontend.id),
@@ -10759,7 +10639,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
     private func performAppMenuAction(_ item: AppLauncherItem, operation: String) {
         if performOverviewMenuAction(item, operation: operation) { return }
-        if operation == "updateOpenCode" { showOpenCodeUpdate(); return }
         if operation == "alwaysShow" {
             moveOverviewItem(item, pinned: true)
             return
@@ -11539,7 +11418,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 case .ports:
                     containerConfigurationPorts = editorInputController.text
                     scheduleContainerConfigurationEnvironmentSave()
-                case .mounts, .runtime, .codingAgent, .apps:
+                case .mounts, .runtime, .codingAgent:
                     break
                 }
             }
@@ -14449,7 +14328,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             return
         }
         if !isRenamingContainerConfiguration, pendingPasswordAction == nil, pendingInstallBackend == nil, containerConfigurationBuildError == nil, !isConfirmingContainerConfigurationDismissal, !isConfirmingContainerConfigurationRebuild,
-           (isContainerConfigurationEditorVisible && [.codingAgent, .apps].contains(containerConfigurationTab) || !isShowingWorkspacePanel && mode == .create),
+           (isContainerConfigurationEditorVisible && containerConfigurationTab == .codingAgent || !isShowingWorkspacePanel && mode == .create),
            codingAgentActionClipFrame.contains(point),
            let action = codingAgentActions.first(where: { $0.frame.contains(point) }) {
             armButtonClick(frame: action.frame, action: .perform(action.action))
@@ -14621,10 +14500,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             } else if containerConfigurationDockerfileTabFrame.contains(point) {
                 armButtonClick(frame: containerConfigurationDockerfileTabFrame) { [weak self] in
                     self?.selectContainerConfigurationTab(.dockerfile)
-                }
-            } else if containerConfigurationAppsTabFrame.contains(point) {
-                armButtonClick(frame: containerConfigurationAppsTabFrame) { [weak self] in
-                    self?.selectContainerConfigurationTab(.apps)
                 }
             } else if containerConfigurationMountsTabFrame.contains(point) {
                 armButtonClick(frame: containerConfigurationMountsTabFrame) { [weak self] in
@@ -18250,7 +18125,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         codingAgentScope = nil
         codingAgentScroll = 0
         codingAgentMessage = ""
-        allowAllOpenCodeActions = false
         containerConfigurationDockerfile = recipe.containerfile
         containerConfigurationSavedDockerfile = recipe.containerfile
         containerConfigurationEnvironment = recipe.environment.map {
@@ -18381,7 +18255,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             case .ports:
                 containerConfigurationPorts = editorInputController.text
                 scheduleContainerConfigurationEnvironmentSave(after: 0)
-            case .mounts, .runtime, .codingAgent, .apps:
+            case .mounts, .runtime, .codingAgent:
                 break
             }
         }
@@ -18401,7 +18275,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         case .ports:
             workspaceRenameName = containerConfigurationPorts
             focusEditorInput()
-        case .mounts, .runtime, .codingAgent, .apps:
+        case .mounts, .runtime, .codingAgent:
             blurEditorInput()
         }
         updateLayout()
@@ -18419,7 +18293,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             return containerConfigurationEnvironment
         case .ports:
             return containerConfigurationPorts
-        case .mounts, .runtime, .codingAgent, .apps:
+        case .mounts, .runtime, .codingAgent:
             return ""
         }
     }
@@ -19034,7 +18908,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 containerConfigurationEnvironment = editorInputController.text
             case .ports:
                 containerConfigurationPorts = editorInputController.text
-            case .mounts, .runtime, .codingAgent, .apps:
+            case .mounts, .runtime, .codingAgent:
                 break
             }
         }
@@ -19064,7 +18938,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         case .ports:
             workspaceRenameName = containerConfigurationPorts
             focusEditorInput()
-        case .mounts, .runtime, .codingAgent, .apps:
+        case .mounts, .runtime, .codingAgent:
             workspaceRenameName = ""
             blurEditorInput()
         }
@@ -19703,7 +19577,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         containerConfigurationRenameFrame = .zero
         containerConfigurationPortsTabFrame = .zero
         containerConfigurationRuntimeTabFrame = .zero
-        containerConfigurationAppsTabFrame = .zero
         containerConfigurationChangeRuntimeFrame = .zero
         containerConfigurationResourceFrames.removeAll()
         containerConfigurationResourceValueFrames.removeAll()
@@ -19749,7 +19622,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         let tabs: [(ContainerConfigurationTab, String)] = [
             (.dockerfile, "Dockerfile"),
             (.codingAgent, "Coding agent"),
-            (.apps, "Outer Shell apps"),
             (.mounts, "Folder Mounts"),
             (.environment, "Environment"),
             (.ports, "Network"),
@@ -19758,7 +19630,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         var tabX: CGFloat = 24
         var tabY = panelHeight - 94
         for (tab, label) in tabs {
-            let tabWidth: CGFloat = label == "Outer Shell apps" ? 140 : label == "Folder Mounts" ? 126 : 108
+            let tabWidth: CGFloat = label == "Folder Mounts" ? 126 : 108
             if tabX + tabWidth > panelWidth - 24 { tabX = 24; tabY -= 40 }
             let localFrame = CGRect(x: tabX,
                                     y: tabY,
@@ -19775,8 +19647,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             switch tab {
             case .codingAgent:
                 codingAgentTabFrame = rootFrame
-            case .apps:
-                containerConfigurationAppsTabFrame = rootFrame
             case .dockerfile:
                 containerConfigurationDockerfileTabFrame = rootFrame
             case .mounts:
@@ -19832,8 +19702,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             }
         case .codingAgent:
             renderContainerAgent(in: contentFrame)
-        case .apps:
-            renderContainerApps(in: contentFrame)
         case .mounts:
             renderContainerConfigurationMounts(in: contentFrame)
         case .environment:
@@ -22266,10 +22134,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                   openNewWindowOperation: "runRootNewWindow")
         }
 
-        if item.backend.serviceID == hostOpenCodeItem?.backend.serviceID, let version = availableOpenCodeVersion {
-            operationByItemID["update-opencode"] = "updateOpenCode"
-            items.append(OuterframeContextMenuItem(id: "update-opencode", title: "Update to " + version + "…", isEnabled: true, systemImageName: "arrow.down.circle"))
-        }
         appendScriptItems()
 
         appendSeparatorIfNeeded()
@@ -22326,6 +22190,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private func handleContextMenuSelection(menuID: UUID, itemID: String) {
         if pendingTextZoomMenus.remove(menuID) != nil, let percentage = Double(itemID) {
             resizeDockerfileText(percentage / 100)
+            return
+        }
+        if itemID == "terminal", let selection = pendingContainerCommandMenuActions.removeValue(forKey: menuID) {
+            openInTerminal(selection.workspace, commandID: selection.command?.id)
             return
         }
         if let selection = pendingContainerCommandMenuActions.removeValue(forKey: menuID),
