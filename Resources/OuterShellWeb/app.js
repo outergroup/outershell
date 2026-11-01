@@ -1099,76 +1099,6 @@
     });
   }
 
-  function ttydApps() {
-    return state.hostPlatform === "windows"
-      ? [{ shell: "powershell", name: "ttyd (PowerShell)", identifier: "ttyd-powershell", serviceID: "org.outershell.command.ttyd-powershell" },
-        { shell: "cmd", name: "ttyd (Command Prompt)", identifier: "ttyd-cmd", serviceID: "org.outershell.command.ttyd-cmd" }]
-      : [{ name: "ttyd", identifier: "org.outershell.ttyd", serviceID: "org.outershell.ttyd" }];
-  }
-
-  function ttydItem(app) {
-    return launcherItems().find(item => item.backend.serviceID === app.serviceID && item.primary?.backend.serviceScope !== "system");
-  }
-
-  function ttydInstalled() {
-    return ttydApps().every(app => ttydItem(app));
-  }
-
-  async function openTtydSetup() {
-    const apps = ttydApps();
-    if (ttydInstalled()) { await launch(ttydItem(apps[0]).identity, "primary", false, { host: true }); return; }
-    const windows = state.hostPlatform === "windows";
-    const platformNote = windows
-      ? `<p>Outer Shell downloads ttyd for you and adds two apps: ttyd (PowerShell) and ttyd (Command Prompt). You can start, stop, and remove each one separately.</p>`
-      : `<p><strong>On macOS</strong>, install ttyd first, then choose Install ttyd:</p><pre class="command-block">brew install ttyd</pre><p>On Linux, Outer Shell downloads ttyd for you. If tmux is installed, your session keeps running when you close the page.</p>`;
-    const dialog = openDialog(`<header class="dialog-header"><div class="dialog-title-wrap"><h2 id="dialog-title">ttyd</h2><p>A terminal on this server, in your browser</p></div><button class="dialog-close" type="button" data-action="close-dialog" aria-label="Close">×</button></header>
-      <div class="dialog-body agent-guide"><p><a href="https://github.com/tsl0922/ttyd" target="_blank" rel="noopener">ttyd</a> is an open-source terminal for the browser. It runs as your user and is reachable only through your Outer Loop connection.</p>${platformNote}
-      <p class="form-message" role="status" aria-live="polite"></p></div>
-      <footer class="dialog-footer"><button class="secondary-button" type="button" data-action="close-dialog">Cancel</button><button class="primary-button" type="button" data-install-ttyd>Install ttyd</button></footer>`);
-    dialog.querySelector("[data-install-ttyd]").addEventListener("click", async event => {
-      const button = event.currentTarget;
-      if (button.disabled) return;
-      const message = dialog.querySelector(".form-message");
-      button.disabled = true;
-      button.textContent = "Installing…";
-      try {
-        const [response, iconResponse] = await Promise.all([fetch(windows ? "/web/ttyd-start.ps1" : "/web/ttyd-start.sh"), fetch("/web/icons/ttyd.png")]);
-        if (!response.ok || !iconResponse.ok) throw new Error("Could not load the ttyd installer. Refresh Outer Shell and try again.");
-        const iconBytes = new Uint8Array(await iconResponse.arrayBuffer());
-        const script = (await response.text()).replace("__TTYD_ICON__", btoa(Array.from(iconBytes, byte => String.fromCharCode(byte)).join("")));
-        for (const app of apps) {
-          if (ttydItem(app)) continue;
-          message.textContent = `Setting up ${app.name}…`;
-          const pipe = windows ? localPipePath(app.identifier) : "";
-          const query = new URLSearchParams(windows
-            ? { recipe: "command-port", name: app.name, identifier: app.identifier, command: windowsScriptCommand(script.replace("__TTYD_SHELL__", app.shell).replace("__TTYD_PIPE__", pipe), `outershell-${app.identifier}-start.ps1`), workdir: "~", scope: "user", frontendTransport: "namedPipe", socketPath: pipe }
-            : { recipe: "command-port", name: app.name, identifier: app.identifier, command: script, workdir: "~", scope: "user", frontendTransport: "unixSocket", socketPath: "~/.local/state/outershell-ttyd/ttyd.sock" });
-          const { buffer } = await requestBuffer("/api/create", { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: query });
-          const result = decodeAction(buffer);
-          if (!result.ok) throw new Error(result.message || `Could not install ${app.name}.`);
-          let running = false;
-          for (let attempt = 0; attempt < 90 && !running; attempt += 1) {
-            await refreshBackends({ quiet: true });
-            const item = ttydItem(app);
-            running = Boolean(item?.primary && endpointRunning(item.primary));
-            const failure = !running && item?.primary && endpointFailure(item.primary, app.name);
-            if (failure) throw new Error(`${failure} Open its app menu and check the logs for details.`);
-            if (!running) await delay(1000);
-          }
-          if (!running) throw new Error(`${app.name} is still starting. Check its logs from the app menu.`);
-        }
-        if (!dialog.isConnected) { toast("ttyd is ready. Open it from your apps."); return; }
-        closeDialog();
-        await launch(ttydItem(apps[0]).identity, "primary", false, { host: true });
-      } catch (error) {
-        message.textContent = error.message || String(error);
-        await refreshBackends({ quiet: true });
-        button.disabled = false;
-        button.textContent = "Install ttyd";
-      }
-    });
-  }
-
   function renderOverview(entries) {
     if (state.groupDrag || state.endpointDrag) return;
     if (renderInitialLoading()) return;
@@ -1935,11 +1865,6 @@
       catalogEntries.push({ name: "OpenCode", html: `<article class="add-catalog-app ${installed ? "installed" : ""}">
         <span class="app-icon has-image" aria-hidden="true"><img src="/web/icons/opencode.svg" alt=""></span><h3>OpenCode</h3>
         ${installed ? '<span class="catalog-installed">Installed</span>' : '<button class="secondary-button" type="button" data-action="setup-opencode">Install</button>'}
-      </article>` });
-      const ttydDone = ttydInstalled();
-      catalogEntries.push({ name: "ttyd (Terminal)", html: `<article class="add-catalog-app ${ttydDone ? "installed" : ""}">
-        <span class="app-icon has-image" aria-hidden="true"><img src="/web/icons/ttyd.svg" alt=""></span><h3>ttyd (Terminal)</h3>
-        ${ttydDone ? '<span class="catalog-installed">Installed</span>' : '<button class="secondary-button" type="button" data-action="setup-ttyd">Install</button>'}
       </article>` });
     }
     const catalog = catalogEntries.length ? `<div class="add-catalog">${catalogEntries.sort((a, b) => a.name.localeCompare(b.name)).map(entry => entry.html).join("")}</div>` : `<p class="add-empty">No bundled apps are available for this account.</p>`;
@@ -2726,7 +2651,7 @@
     state.addWorkspace = workspace;
     const codingAgent = codingAgentHTML(null, true);
     const infrastructure = (workspace.mounts || []).filter(mount => mount.isInfrastructure);
-    const appsCatalog = `<div class="add-catalog">${[["OpenCode", "/web/icons/opencode.svg", "data-add-opencode", "/usr/local/bin/outershell-opencode"], ["ttyd (Terminal)", "/web/icons/ttyd.svg", "data-add-ttyd", "/usr/local/bin/outershell-ttyd"]].map(([name, icon, attribute, marker]) => {
+    const appsCatalog = `<div class="add-catalog">${[["OpenCode", "/web/icons/opencode.svg", "data-add-opencode", "/usr/local/bin/outershell-opencode"]].map(([name, icon, attribute, marker]) => {
       const added = recipe.containerfile.includes(marker);
       return `<article class="add-catalog-app ${added ? "installed" : ""}"><span class="app-icon has-image" aria-hidden="true"><img src="${icon}" alt=""></span><h3>${name}</h3>${added ? '<span class="catalog-installed">Added</span>' : `<button class="secondary-button" type="button" ${attribute}>Add</button>`}</article>`;
     }).join("")}</div><p class="field-note">Adds the app to the Dockerfile. Choose Save &amp; rebuild to install it. Requires Debian or Ubuntu with Outer Shell support.</p>`;
@@ -2780,22 +2705,6 @@
       } catch (error) { message.textContent = error.message; }
       finally { button.disabled = false; }
     }));
-    form.querySelector("[data-add-ttyd]")?.addEventListener("click", async event => {
-      const button = event.currentTarget;
-      const message = form.querySelector(".container-message");
-      if (form.elements.dockerfile.value.includes("/usr/local/bin/outershell-ttyd")) {
-        message.textContent = "This Dockerfile already includes ttyd.";
-        return;
-      }
-      button.disabled = true;
-      try {
-        const response = await fetch("/web/ttyd-container.Dockerfile");
-        if (!response.ok) throw new Error("Could not load the ttyd container setup. Refresh Outer Shell and try again.");
-        form.elements.dockerfile.value = form.elements.dockerfile.value.trimEnd() + "\n\n" + await response.text();
-        message.textContent = "ttyd added. Choose Save & rebuild to install it.";
-      } catch (error) { message.textContent = error.message; }
-      finally { button.disabled = false; }
-    });
     let savedDockerfile = recipe.containerfile;
     let savedName = workspace.name;
     let savedResources = { cpus: workspace.cpus, memoryInMB: workspace.memoryInMB };
@@ -3644,7 +3553,6 @@
     if (action === "example-prompt") { await copyText(agentExamples[Number(actionElement.dataset.example)] || agentExamples[2]); return; }
     if (action === "update-opencode") { await openOpenCodeUpdate(); return; }
     if (action === "setup-opencode") { try { await openOpenCodeSetup(); } catch (error) { toast(error.message || String(error)); } return; }
-    if (action === "setup-ttyd") { try { await openTtydSetup(); } catch (error) { toast(error.message || String(error)); } return; }
     if (action === "rename-endpoint") { const item = findItem(actionElement.dataset.appKey); if (item) openRenameEndpoint(item); return; }
     if (action === "show-container-command") { const bounds = actionElement.getBoundingClientRect(); openContainerCommand(actionElement.dataset.safeSpaceId, actionElement.dataset.commandId, { x: bounds.left, y: bounds.bottom }); return; }
     if (action === "setup-container-opencode") { openCreateContainer(true); return; }

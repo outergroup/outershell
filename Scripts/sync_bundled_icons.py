@@ -7,7 +7,7 @@ parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--check", action="store_true")
 args = parser.parse_args()
 root = Path(__file__).resolve().parents[2]
-for repo, name in [("Top", "Top"), ("Files", "Files"), ("Plaintext", "Plaintext"), ("Profile", "Profile"), ("Trace", "Firehose")]:
+for repo, name in [("Top", "Top"), ("Files", "Files"), ("Plaintext", "Plaintext"), ("Profile", "Profile"), ("Trace", "Firehose"), ("Terminal", "Terminal")]:
     source = root / repo / "app-icon.png"
     for target in [root / "Backends" / "Resources" / "OuterShellWeb" / "icons" / f"org.outershell.{name}.png",
                    root / repo / "Resources" / f"{name}Web" / "app-icon.png"]:

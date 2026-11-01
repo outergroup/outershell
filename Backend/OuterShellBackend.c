@@ -270,6 +270,16 @@ static const BundledAppDefinition kBundledApps[] = {
         .icon_name = "app-icon.png",
         .source_name = "ProfileBackend.c",
         .supports_macos = true
+    },
+    {
+        .service_id = "org.outershell.Terminal",
+        .display_name = "Terminal",
+        .stage_directory_name = "Terminal",
+        .binary_name = "TerminalBackend",
+        .bundle_prefix = NULL,
+        .icon_name = "app-icon.png",
+        .source_name = NULL,
+        .supports_macos = true
     }
 };
 
@@ -856,13 +866,15 @@ static bool bundled_app_stage_has_expected_files(const BundledAppDefinition *app
     snprintf(app_bundle, sizeof(app_bundle), "%s/%s.app", stage_root, app->stage_directory_name);
     char app_binary[PATH_MAX];
     snprintf(app_binary, sizeof(app_binary), "%s/Contents/MacOS/%s", app_bundle, app->binary_name);
-    char app_bundle_arm[PATH_MAX];
-    snprintf(app_bundle_arm, sizeof(app_bundle_arm), "%s/Contents/Resources/bundles/%s.bundle.macos-arm.aar", app_bundle, app->bundle_prefix);
-    char app_bundle_x86[PATH_MAX];
-    snprintf(app_bundle_x86, sizeof(app_bundle_x86), "%s/Contents/Resources/bundles/%s.bundle.macos-x86.aar", app_bundle, app->bundle_prefix);
-    bool has_app_bundle = stat(app_binary, &st) == 0 && S_ISREG(st.st_mode) &&
-                          stat(app_bundle_arm, &st) == 0 && S_ISREG(st.st_mode) &&
-                          stat(app_bundle_x86, &st) == 0 && S_ISREG(st.st_mode);
+    bool has_app_bundle = stat(app_binary, &st) == 0 && S_ISREG(st.st_mode);
+    if (has_app_bundle && app->bundle_prefix) {
+        char app_bundle_arm[PATH_MAX];
+        snprintf(app_bundle_arm, sizeof(app_bundle_arm), "%s/Contents/Resources/bundles/%s.bundle.macos-arm.aar", app_bundle, app->bundle_prefix);
+        char app_bundle_x86[PATH_MAX];
+        snprintf(app_bundle_x86, sizeof(app_bundle_x86), "%s/Contents/Resources/bundles/%s.bundle.macos-x86.aar", app_bundle, app->bundle_prefix);
+        has_app_bundle = stat(app_bundle_arm, &st) == 0 && S_ISREG(st.st_mode) &&
+                         stat(app_bundle_x86, &st) == 0 && S_ISREG(st.st_mode);
+    }
     if (has_app_bundle && app->icon_name && app->icon_name[0]) {
         char app_icon[PATH_MAX];
         snprintf(app_icon, sizeof(app_icon), "%s/Contents/Resources/%s", app_bundle, app->icon_name);
@@ -870,12 +882,14 @@ static bool bundled_app_stage_has_expected_files(const BundledAppDefinition *app
     }
     if (has_app_bundle) return true;
 #endif
-    char bundle_arm[PATH_MAX];
-    snprintf(bundle_arm, sizeof(bundle_arm), "%s/bundles/%s.bundle.macos-arm.aar", stage_root, app->bundle_prefix);
-    if (stat(bundle_arm, &st) != 0 || !S_ISREG(st.st_mode)) return false;
-    char bundle_x86[PATH_MAX];
-    snprintf(bundle_x86, sizeof(bundle_x86), "%s/bundles/%s.bundle.macos-x86.aar", stage_root, app->bundle_prefix);
-    if (stat(bundle_x86, &st) != 0 || !S_ISREG(st.st_mode)) return false;
+    if (app->bundle_prefix) {
+        char bundle_arm[PATH_MAX];
+        snprintf(bundle_arm, sizeof(bundle_arm), "%s/bundles/%s.bundle.macos-arm.aar", stage_root, app->bundle_prefix);
+        if (stat(bundle_arm, &st) != 0 || !S_ISREG(st.st_mode)) return false;
+        char bundle_x86[PATH_MAX];
+        snprintf(bundle_x86, sizeof(bundle_x86), "%s/bundles/%s.bundle.macos-x86.aar", stage_root, app->bundle_prefix);
+        if (stat(bundle_x86, &st) != 0 || !S_ISREG(st.st_mode)) return false;
+    }
     if (app->icon_name && app->icon_name[0]) {
         char icon_path[PATH_MAX];
         snprintf(icon_path, sizeof(icon_path), "%s/%s", stage_root, app->icon_name);
@@ -2636,15 +2650,14 @@ static bool process_http_client_request(ReactorClient *client, char *request, si
     } else if (strcmp(target, "/web/app.js") == 0) {
         send_versioned_web_asset(fd, "app.js", "text/javascript; charset=utf-8", query,
                                  request, header_length, strcasecmp(method, "HEAD") != 0);
-    } else if (strcmp(target, "/web/opencode-start.sh") == 0 || strcmp(target, "/web/outer-shell-skill.md") == 0 || strcmp(target, "/web/server-admin.md") == 0 || strcmp(target, "/web/opencode-start.ps1") == 0 || strcmp(target, "/web/opencode-container.Dockerfile") == 0 || strcmp(target, "/web/ttyd-start.sh") == 0 || strcmp(target, "/web/ttyd-container.Dockerfile") == 0 || strcmp(target, "/web/container-agent.md") == 0 || strcmp(target, "/web/container-outerctl.md") == 0) {
+    } else if (strcmp(target, "/web/opencode-start.sh") == 0 || strcmp(target, "/web/outer-shell-skill.md") == 0 || strcmp(target, "/web/server-admin.md") == 0 || strcmp(target, "/web/opencode-start.ps1") == 0 || strcmp(target, "/web/opencode-container.Dockerfile") == 0 || strcmp(target, "/web/container-agent.md") == 0 || strcmp(target, "/web/container-outerctl.md") == 0) {
         send_versioned_web_asset(fd, target + 5, "text/plain; charset=utf-8", query,
                                  request, header_length, strcasecmp(method, "HEAD") != 0);
     } else if (strcmp(target, "/web/icons/org.outershell.Files.png") == 0 ||
                strcmp(target, "/web/icons/org.outershell.Plaintext.png") == 0 ||
                strcmp(target, "/web/icons/org.outershell.Top.png") == 0 ||
-               strcmp(target, "/web/icons/opencode.svg") == 0 ||
-               strcmp(target, "/web/icons/ttyd.svg") == 0 ||
-               strcmp(target, "/web/icons/ttyd.png") == 0) {
+               strcmp(target, "/web/icons/org.outershell.Terminal.png") == 0 ||
+               strcmp(target, "/web/icons/opencode.svg") == 0) {
         send_versioned_web_asset(fd, target + 5,
                                  strstr(target, ".svg") ? "image/svg+xml" : "image/png", query,
                                  request, header_length, strcasecmp(method, "HEAD") != 0);

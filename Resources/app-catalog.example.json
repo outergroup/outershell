@@ -51,6 +51,17 @@
         "linux-aarch64": "https://example.com/outer-shell/apps/Profile/linux-aarch64.tar.gz",
         "linux-x86_64": "https://example.com/outer-shell/apps/Profile/linux-x86_64.tar.gz"
       }
+    },
+    {
+      "serviceID": "org.outershell.Terminal",
+      "name": "Terminal",
+      "supportsRoot": false,
+      "archives": {
+        "linux-aarch64": "https://example.com/outer-shell/apps/Terminal/linux-aarch64.tar.gz",
+        "linux-x86_64": "https://example.com/outer-shell/apps/Terminal/linux-x86_64.tar.gz",
+        "macos-arm64": "https://example.com/outer-shell/apps/Terminal/macos-arm64.tar.gz",
+        "macos-x86_64": "https://example.com/outer-shell/apps/Terminal/macos-x86_64.tar.gz"
+      }
     }
   ]
 }

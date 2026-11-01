@@ -1282,6 +1282,11 @@ private struct PendingOuterShellUpdate {
     let message: String
 }
 
+private struct MessageDialog {
+    let title: String
+    let text: String
+}
+
 private struct IconMatchState {
     let frame: CGRect
     let image: CGImage?
@@ -1379,7 +1384,7 @@ private enum PendingButtonAction {
     case logDismiss
     case updateCancel
     case updateConfirm
-    case aboutDismiss
+    case messageDialogDismiss
     case passwordCancel
     case passwordSubmit
     case createSection(CreateSection)
@@ -2083,8 +2088,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private let iconTransitionLayer = CALayer()
     private let installOverlayLayer = CALayer()
     private let updateOverlayLayer = CALayer()
-    private let aboutOverlayLayer = CALayer()
-    private let aboutSelectionLayer = CALayer()
+    private let messageDialogOverlayLayer = CALayer()
+    private let messageDialogSelectionLayer = CALayer()
     private let passwordOverlayLayer = CALayer()
     private let workspaceOverlayLayer = CALayer()
     private let workspacePanelLayer = CALayer()
@@ -2127,7 +2132,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private var pendingButtonClick: PendingButtonClick?
     private var pendingOuterShellUpdate: PendingOuterShellUpdate?
     private var didShowAutomaticOuterShellUpdatePrompt = false
-    private var pendingAboutBackend: BackendRecord?
+    private var pendingMessageDialog: MessageDialog?
     private var iconMatchStates: [String: IconMatchState] = [:]
     private var iconMatchLayers: [String: CALayer] = [:]
     private struct RunningBadgeSymbolKey: Hashable {
@@ -2202,12 +2207,12 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private var updatePanelFrame = CGRect.zero
     private var updateCancelFrame = CGRect.zero
     private var updateConfirmFrame = CGRect.zero
-    private var aboutPanelFrame = CGRect.zero
-    private var aboutDoneFrame = CGRect.zero
-    private var aboutTextFrame = CGRect.zero
-    private var aboutSelectionRange: NSRange?
-    private var aboutDragAnchorOffset: Int?
-    private var renderedAboutText = ""
+    private var messageDialogPanelFrame = CGRect.zero
+    private var messageDialogDoneFrame = CGRect.zero
+    private var messageDialogTextFrame = CGRect.zero
+    private var messageDialogSelectionRange: NSRange?
+    private var messageDialogDragAnchorOffset: Int?
+    private var renderedMessageDialogText = ""
     private var pendingInstallBackend: BackendRecord?
     private var pendingInstallOperation: String = "run"
     private var installPanelFrame = CGRect.zero
@@ -2975,7 +2980,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         rootLayer.addSublayer(createLayer)
         rootLayer.addSublayer(installOverlayLayer)
         rootLayer.addSublayer(updateOverlayLayer)
-        rootLayer.addSublayer(aboutOverlayLayer)
+        rootLayer.addSublayer(messageDialogOverlayLayer)
         rootLayer.addSublayer(passwordOverlayLayer)
         rootLayer.addSublayer(workspaceOverlayLayer)
         workspaceOverlayLayer.addSublayer(workspacePanelLayer)
@@ -3020,7 +3025,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         safeSpacesHeaderLayer.isHidden = true
         installOverlayLayer.isHidden = true
         updateOverlayLayer.isHidden = true
-        aboutOverlayLayer.isHidden = true
+        messageDialogOverlayLayer.isHidden = true
         passwordOverlayLayer.isHidden = true
         workspaceOverlayLayer.isHidden = true
         copyConfirmationLayer.isHidden = true
@@ -3119,7 +3124,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 updateStatusText()
                 renderInstallPromptIfNeeded(width: width, height: height)
                 renderUpdatePromptIfNeeded(width: width, height: height)
-                renderAboutPromptIfNeeded(width: width, height: height)
+                renderMessageDialogIfNeeded(width: width, height: height)
                 renderPasswordPromptIfNeeded(width: width, height: height)
                 renderWorkspacePanelIfNeeded(width: width, height: height)
                 renderFilePickerIfNeeded(width: width, height: height)
@@ -3179,8 +3184,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         if logTextSelectionRange != nil {
             updateLogTextSelectionLayers(force: true)
         }
-        if aboutSelectionRange != nil {
-            updateAboutSelectionLayers()
+        if messageDialogSelectionRange != nil {
+            updateMessageDialogSelectionLayers()
         }
     }
 
@@ -4157,18 +4162,18 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         let length = string.length
         guard length > 0 else { return nil }
         var location = min(max(offset, 0), length - 1)
-        if location > 0, !aboutCharacterIsWordLike(string.character(at: location)) {
+        if location > 0, !messageDialogCharacterIsWordLike(string.character(at: location)) {
             location -= 1
         }
-        guard aboutCharacterIsWordLike(string.character(at: location)) else {
+        guard messageDialogCharacterIsWordLike(string.character(at: location)) else {
             return nil
         }
         var start = location
-        while start > 0, aboutCharacterIsWordLike(string.character(at: start - 1)) {
+        while start > 0, messageDialogCharacterIsWordLike(string.character(at: start - 1)) {
             start -= 1
         }
         var end = location + 1
-        while end < length, aboutCharacterIsWordLike(string.character(at: end)) {
+        while end < length, messageDialogCharacterIsWordLike(string.character(at: end)) {
             end += 1
         }
         return NSRange(location: start, length: end - start)
@@ -5576,10 +5581,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private var openCodeIcon: CGImage?
-    private var ttydIcon: CGImage?
-    private var ttydIconLoading = false
-    private var ttydBusy = false
-    private var ttydMessage = ""
     private var openCodeIconLoading = false
     private var openCodeIconRetryAfter = Date.distantPast
     private var openCodeChecksScheduled = false
@@ -5804,126 +5805,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         lines.append("powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"%OC_SCRIPT%\"")
         lines.append("exit /b %errorlevel%")
         return lines.joined(separator: "\r\n")
-    }
-
-    private struct TtydApp {
-        let name: String
-        let identifier: String
-        let serviceID: String
-        let shell: String
-    }
-
-    private var ttydApps: [TtydApp] {
-        isWindowsHost
-            ? [TtydApp(name: "ttyd (PowerShell)", identifier: "ttyd-powershell", serviceID: "org.outershell.command.ttyd-powershell", shell: "powershell"),
-               TtydApp(name: "ttyd (Command Prompt)", identifier: "ttyd-cmd", serviceID: "org.outershell.command.ttyd-cmd", shell: "cmd")]
-            : [TtydApp(name: "ttyd", identifier: "org.outershell.ttyd", serviceID: "org.outershell.ttyd", shell: "")]
-    }
-
-    private func hostTtydItem(_ app: TtydApp) -> AppLauncherItem? {
-        appLauncherItems(from: backends).first {
-            $0.backend.serviceScope != "system" && $0.backend.serviceID == app.serviceID
-        }
-    }
-
-    private var ttydInstalled: Bool {
-        ttydApps.allSatisfy { hostTtydItem($0) != nil }
-    }
-
-    private var hostTtydItem: AppLauncherItem? {
-        ttydApps.lazy.compactMap { self.hostTtydItem($0) }.first
-    }
-
-    private func loadTtydIcon() {
-        guard ttydIcon == nil, !ttydIconLoading else { return }
-        ttydIconLoading = true
-        Task { @MainActor [weak self] in
-            guard let self else { return }
-            do {
-                self.ttydIcon = decodedIconCGImage(try await self.webResourceData("/web/icons/ttyd.svg"))
-                self.updateLayout()
-            } catch {
-                NSLog("Could not load ttyd icon: %@", error.localizedDescription)
-            }
-        }
-    }
-
-    private func installHostTtyd() {
-        guard !ttydBusy else { return }
-        ttydBusy = true
-        updateLayout()
-        Task { @MainActor [weak self] in
-            guard let self else { return }
-            defer { self.ttydBusy = false; self.updateLayout() }
-            do {
-                let data = try await self.webResourceData(self.isWindowsHost ? "/web/ttyd-start.ps1" : "/web/ttyd-start.sh")
-                let icon = try await self.webResourceData("/web/icons/ttyd.png")
-                let script = String(decoding: data, as: UTF8.self)
-                    .replacingOccurrences(of: "__TTYD_ICON__", with: icon.base64EncodedString())
-                guard let endpoint = self.createEndpoint, let session = self.urlSession else {
-                    throw ContainerConfigurationInputError(message: "Outer Shell is unavailable.")
-                }
-                for app in self.ttydApps where self.hostTtydItem(app) == nil {
-                    self.ttydMessage = "Setting up \(app.name)…"
-                    self.updateLayout()
-                    var form = URLComponents()
-                    if self.isWindowsHost {
-                        let pipe = self.localPipePath(app.identifier)
-                        let command = self.windowsScriptCommand(script.replacingOccurrences(of: "__TTYD_SHELL__", with: app.shell).replacingOccurrences(of: "__TTYD_PIPE__", with: pipe), fileName: "outershell-\(app.identifier)-start.ps1")
-                        form.queryItems = [URLQueryItem(name: "recipe", value: "command-port"), URLQueryItem(name: "name", value: app.name), URLQueryItem(name: "identifier", value: app.identifier), URLQueryItem(name: "command", value: command), URLQueryItem(name: "workdir", value: "~"), URLQueryItem(name: "scope", value: "user"), URLQueryItem(name: "frontendTransport", value: "namedPipe"), URLQueryItem(name: "socketPath", value: pipe)]
-                    } else {
-                        form.queryItems = [URLQueryItem(name: "recipe", value: "command-port"), URLQueryItem(name: "name", value: app.name), URLQueryItem(name: "identifier", value: app.identifier), URLQueryItem(name: "command", value: script), URLQueryItem(name: "workdir", value: "~"), URLQueryItem(name: "scope", value: "user"), URLQueryItem(name: "frontendTransport", value: "unixSocket"), URLQueryItem(name: "socketPath", value: "~/.local/state/outershell-ttyd/ttyd.sock")]
-                    }
-                    var request = URLRequest(url: endpoint)
-                    request.httpMethod = "POST"
-                    request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
-                    request.httpBody = form.percentEncodedQuery?.replacingOccurrences(of: "+", with: "%2B").data(using: .utf8)
-                    let (responseData, _) = try await session.data(for: request)
-                    let response = try ActionResponse.decodeBinary(responseData)
-                    guard response.ok else { throw ContainerConfigurationInputError(message: response.message) }
-                    var running = false
-                    for _ in 0..<90 where !running {
-                        self.fetchBackends()
-                        if let item = self.hostTtydItem(app) {
-                            running = self.endpointIsRunning(item.primaryEndpoint)
-                            if !running, let failure = self.launcherFailureMessage(item.primaryEndpoint, displayName: app.name) {
-                                throw ContainerConfigurationInputError(message: failure)
-                            }
-                        }
-                        if !running { try await Task.sleep(nanoseconds: 1_000_000_000) }
-                    }
-                    guard running else {
-                        throw ContainerConfigurationInputError(message: "\(app.name) is still starting. Check its logs from the app menu.")
-                    }
-                }
-                self.ttydMessage = "ttyd is ready. Open it from your apps."
-            } catch { self.ttydMessage = error.localizedDescription }
-        }
-    }
-
-    private func addTtydToDockerfile() {
-        guard !ttydBusy, let workspace = pendingDockerfileWorkspace else { return }
-        if containerConfigurationDockerfile.contains("/usr/local/bin/outershell-ttyd") {
-            ttydMessage = "This Dockerfile already includes ttyd."
-            updateLayout()
-            return
-        }
-        ttydBusy = true
-        ttydMessage = ""
-        updateLayout()
-        Task { @MainActor [weak self] in
-            guard let self else { return }
-            defer { self.ttydBusy = false; self.updateLayout() }
-            do {
-                let fragment = String(decoding: try await self.webResourceData("/web/ttyd-container.Dockerfile"), as: UTF8.self)
-                guard self.pendingDockerfileWorkspace?.id == workspace.id else { return }
-                self.containerConfigurationDockerfile += "\n\n" + fragment
-                self.ttydMessage = "ttyd added to the Dockerfile. Save and rebuild to install it."
-                self.selectContainerConfigurationTab(.dockerfile)
-            } catch {
-                self.ttydMessage = error.localizedDescription
-            }
-        }
     }
 
     private func openCodeNavigationURL(_ url: URL, serviceID: String) -> URL {
@@ -6374,13 +6255,11 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         clip.masksToBounds = true
         workspacePanelLayer.addSublayer(clip)
         loadOpenCodeIcon()
-        loadTtydIcon()
         let width = frame.width
         var y = agentText("Outer Shell apps", in: clip, left: 0, top: frame.height, width: width, size: 16, heading: true) - 6
         y = agentText("Adds the app to the Dockerfile. Choose Save & rebuild to install it. Requires Debian or Ubuntu with Outer Shell support.", in: clip, left: 0, top: y, width: width) - 16
         let apps: [(name: String, icon: CGImage?, marker: String, busy: Bool, add: () -> Void)] = [
-            ("OpenCode", openCodeIcon, "/usr/local/bin/outershell-opencode", codingAgentBusy, { [weak self] in self?.addOpenCodeToDockerfile() }),
-            ("ttyd (Terminal)", ttydIcon, "/usr/local/bin/outershell-ttyd", ttydBusy, { [weak self] in self?.addTtydToDockerfile() })
+            ("OpenCode", openCodeIcon, "/usr/local/bin/outershell-opencode", codingAgentBusy, { [weak self] in self?.addOpenCodeToDockerfile() })
         ]
         for app in apps {
             let added = containerConfigurationDockerfile.contains(app.marker)
@@ -6407,8 +6286,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             }
             y -= 52
         }
-        for message in [codingAgentMessage, ttydMessage] where !message.isEmpty {
-            y = agentText(message, in: clip, left: 0, top: y - 6, width: width)
+        if !codingAgentMessage.isEmpty {
+            y = agentText(codingAgentMessage, in: clip, left: 0, top: y - 6, width: width)
         }
     }
 
@@ -6875,9 +6754,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         let showsHostApps = catalogWorkspaceID == nil && catalogScope != "system"
         if showsHostApps {
             entries.append((name: "OpenCode", app: nil))
-            entries.append((name: "ttyd (Terminal)", app: nil))
             loadOpenCodeIcon()
-            loadTtydIcon()
         }
         entries.sort { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
         for (index, entry) in entries.enumerated() {
@@ -6887,13 +6764,12 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             if let app = entry.app {
                 renderAddableAppTile(app.backend, isInstalled: app.isInstalled, frame: frame)
             } else {
-                let terminal = entry.name == "ttyd (Terminal)"
-                let item = terminal ? hostTtydItem : hostOpenCodeItem
-                let installed = terminal ? ttydInstalled : item != nil
+                let item = hostOpenCodeItem
+                let installed = item != nil
                 let icon = CALayer()
                 icon.frame = CGRect(x: frame.midX - 23, y: frame.maxY - 56, width: 46, height: 46)
                 icon.contentsGravity = .resizeAspect
-                icon.contents = (terminal ? ttydIcon : openCodeIcon) ?? item.flatMap { launcherIconImage(for: $0) }
+                icon.contents = openCodeIcon ?? item.flatMap { launcherIconImage(for: $0) }
                 icon.opacity = installed ? 0.62 : 1
                 addCreateFormSublayer(icon)
                 let name = makeTextLayer(size: 12, weight: .medium, color: installed ? .secondaryLabelColor : .labelColor, alignment: .center)
@@ -6906,29 +6782,16 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                     status.frame = CGRect(x: frame.minX, y: frame.minY + 3, width: frame.width, height: 14)
                     addCreateFormSublayer(status)
                 } else {
-                    renderCatalogInstallButton(terminal && ttydBusy ? "Installing…" : "Install", in: frame)
+                    renderCatalogInstallButton("Install", in: frame)
                 }
                 if !installed {
                     codingAgentActions.append((rootLayer.convert(frame, from: createFormContentLayer), "Install \(entry.name)", { [weak self] in
                         guard let self else { return }
-                        if terminal {
-                            self.installHostTtyd()
-                        } else {
-                            self.selectedCreateSection = .codingAgent
-                            self.createScroll = 0
-                            self.updateLayout()
-                        }
+                        self.selectedCreateSection = .codingAgent
+                        self.createScroll = 0
+                        self.updateLayout()
                     }))
                 }
-            }
-        }
-
-        if showsHostApps {
-            let note = !ttydMessage.isEmpty ? ttydMessage
-                : ttydInstalled || isWindowsHost ? ""
-                : "On macOS, install ttyd from Homebrew first (brew install ttyd). On Linux, Outer Shell downloads ttyd for you."
-            if !note.isEmpty {
-                y = agentText(note, in: createFormContentLayer, left: left, top: y - 18, width: width, size: 12)
             }
         }
 
@@ -7624,31 +7487,35 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         updateConfirmFrame = updateLocal.offsetBy(dx: panelFrame.minX, dy: panelFrame.minY)
     }
 
-    private func renderAboutPromptIfNeeded(width: CGFloat, height: CGFloat) {
-        aboutOverlayLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
-        guard let backend = pendingAboutBackend else {
-            aboutOverlayLayer.isHidden = true
-            aboutSelectionLayer.removeFromSuperlayer()
-            aboutSelectionLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
-            aboutPanelFrame = .zero
-            aboutDoneFrame = .zero
-            aboutTextFrame = .zero
-            renderedAboutText = ""
-            aboutSelectionRange = nil
+    private func renderMessageDialogIfNeeded(width: CGFloat, height: CGFloat) {
+        messageDialogOverlayLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
+        guard let dialog = pendingMessageDialog else {
+            messageDialogOverlayLayer.isHidden = true
+            messageDialogSelectionLayer.removeFromSuperlayer()
+            messageDialogSelectionLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
+            messageDialogPanelFrame = .zero
+            messageDialogDoneFrame = .zero
+            messageDialogTextFrame = .zero
+            renderedMessageDialogText = ""
+            messageDialogSelectionRange = nil
             return
         }
 
-        aboutOverlayLayer.isHidden = false
-        aboutOverlayLayer.frame = CGRect(x: 0, y: 0, width: width, height: height)
-        aboutOverlayLayer.backgroundColor = resolvedCGColor(NSColor.black.withAlphaComponent(0.22))
+        messageDialogOverlayLayer.isHidden = false
+        messageDialogOverlayLayer.frame = CGRect(x: 0, y: 0, width: width, height: height)
+        messageDialogOverlayLayer.backgroundColor = resolvedCGColor(NSColor.black.withAlphaComponent(0.22))
 
+        renderedMessageDialogText = dialog.text
         let panelWidth = min(max(width - 48, 340), 500)
-        let panelHeight: CGFloat = 244
+        let lineCount = CGFloat(messageDialogWrappedLines(width: panelWidth - 56).count)
+        let maximumTextHeight = max(height - 48 - 112, messageDialogTextLineHeight() + 8)
+        let textHeight = min(lineCount * messageDialogTextLineHeight() + 8, maximumTextHeight)
+        let panelHeight = textHeight + 112
         let panelFrame = CGRect(x: floor((width - panelWidth) / 2),
                                 y: floor((height - panelHeight) / 2),
                                 width: panelWidth,
                                 height: panelHeight)
-        aboutPanelFrame = panelFrame
+        messageDialogPanelFrame = panelFrame
 
         let panel = CALayer()
         panel.frame = panelFrame
@@ -7656,41 +7523,41 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         panel.borderWidth = 1
         panel.backgroundColor = resolvedCGColor(.windowBackgroundColor)
         panel.borderColor = resolvedCGColor(.separatorColor)
-        aboutOverlayLayer.addSublayer(panel)
+        messageDialogOverlayLayer.addSublayer(panel)
 
         let title = makeTextLayer(size: 15, weight: .semibold, color: .labelColor)
-        title.string = "About Outer Shell"
+        title.string = dialog.title
         title.frame = CGRect(x: 18, y: panelHeight - 38, width: panelWidth - 36, height: 20)
         panel.addSublayer(title)
 
-        renderedAboutText = aboutDialogText(for: backend)
-        let textLocalFrame = CGRect(x: 18, y: 58, width: panelWidth - 36, height: 132)
-        aboutTextFrame = textLocalFrame.offsetBy(dx: panelFrame.minX, dy: panelFrame.minY)
+        let textLocalFrame = CGRect(x: 18, y: 58, width: panelWidth - 36, height: textHeight)
+        messageDialogTextFrame = textLocalFrame.offsetBy(dx: panelFrame.minX, dy: panelFrame.minY)
 
         let textBackground = CALayer()
         textBackground.frame = textLocalFrame
+        textBackground.masksToBounds = true
         textBackground.cornerRadius = 6
         textBackground.borderWidth = 1
         textBackground.backgroundColor = resolvedCGColor(.textBackgroundColor)
         textBackground.borderColor = resolvedCGColor(.separatorColor)
         panel.addSublayer(textBackground)
 
-        aboutSelectionLayer.frame = textBackground.bounds
-        textBackground.addSublayer(aboutSelectionLayer)
-        updateAboutSelectionLayers()
-        renderAboutTextLines(in: textBackground)
+        messageDialogSelectionLayer.frame = textBackground.bounds
+        textBackground.addSublayer(messageDialogSelectionLayer)
+        updateMessageDialogSelectionLayers()
+        renderMessageDialogTextLines(in: textBackground)
 
         let done = makeButtonLayer(title: "Done", emphasized: true)
         let doneLocal = CGRect(x: panelWidth - 18 - 76, y: 18, width: 76, height: 30)
         done.frame = doneLocal
         panel.addSublayer(done)
-        aboutDoneFrame = doneLocal.offsetBy(dx: panelFrame.minX, dy: panelFrame.minY)
+        messageDialogDoneFrame = doneLocal.offsetBy(dx: panelFrame.minX, dy: panelFrame.minY)
     }
 
-    private func renderAboutTextLines(in layer: CALayer) {
-        let font = aboutTextFont()
-        let lineHeight = aboutTextLineHeight()
-        for fragment in aboutLineFragments() {
+    private func renderMessageDialogTextLines(in layer: CALayer) {
+        let font = messageDialogTextFont()
+        let lineHeight = messageDialogTextLineHeight()
+        for fragment in messageDialogLineFragments() {
             let text = makeTextLayer(size: 12, weight: .regular, color: .labelColor, monospaced: true)
             text.string = fragment.text
             text.frame = CGRect(x: 10,
@@ -7702,21 +7569,21 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         }
     }
 
-    private func updateAboutSelectionLayers() {
+    private func updateMessageDialogSelectionLayers() {
         withoutImplicitAnimations {
-            aboutSelectionLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
-            renderAboutSelection(in: aboutSelectionLayer)
+            messageDialogSelectionLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
+            renderMessageDialogSelection(in: messageDialogSelectionLayer)
         }
     }
 
-    private func renderAboutSelection(in layer: CALayer) {
-        guard let selectionRange = normalizedAboutSelectionRange(aboutSelectionRange) else { return }
+    private func renderMessageDialogSelection(in layer: CALayer) {
+        guard let selectionRange = normalizedMessageDialogSelectionRange(messageDialogSelectionRange) else { return }
         let color = resolvedCGColor(windowIsActive ? NSColor.selectedTextBackgroundColor : NSColor.unemphasizedSelectedTextBackgroundColor)
-        for fragment in aboutLineFragments() {
+        for fragment in messageDialogLineFragments() {
             let lower = max(selectionRange.location, fragment.range.location)
             let upper = min(selectionRange.location + selectionRange.length, fragment.range.location + fragment.range.length)
             guard upper > lower else { continue }
-            let line = aboutTextLine(for: fragment.text)
+            let line = messageDialogTextLine(for: fragment.text)
             var startSecondary: CGFloat = 0
             var endSecondary: CGFloat = 0
             let start = CGFloat(CTLineGetOffsetForStringIndex(line, lower - fragment.range.location, &startSecondary))
@@ -7727,7 +7594,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             selection.frame = CGRect(x: 10 + x,
                                      y: fragment.y + 1,
                                      width: width,
-                                     height: aboutTextLineHeight() - 2)
+                                     height: messageDialogTextLineHeight() - 2)
             selection.backgroundColor = color
             selection.cornerRadius = 2
             layer.addSublayer(selection)
@@ -9008,7 +8875,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         accessibilityCurrentNodes.removeAll(keepingCapacity: true)
         accessibilityReorderTargets.removeAll(keepingCapacity: true)
         accessibilityTextTargets.removeAll(keepingCapacity: true)
-        accessibilityContext = "\(mode)-\(isShowingWorkspacePanel)-\(pendingDockerfileWorkspace?.id.uuidString ?? "")-\(pendingWorkspaceRename?.id.uuidString ?? "")-\(isCreatingWorkspace)-\(pendingAboutBackend != nil)-\(pendingOuterShellUpdate != nil)-\(pendingInstallBackend != nil)-\(pendingPasswordAction != nil)-\(pendingFilePicker != nil)"
+        accessibilityContext = "\(mode)-\(isShowingWorkspacePanel)-\(pendingDockerfileWorkspace?.id.uuidString ?? "")-\(pendingWorkspaceRename?.id.uuidString ?? "")-\(isCreatingWorkspace)-\(pendingMessageDialog != nil)-\(pendingOuterShellUpdate != nil)-\(pendingInstallBackend != nil)-\(pendingPasswordAction != nil)-\(pendingFilePicker != nil)"
         var nextIdentifier: UInt32 = 1
         var children: [OuterframeAccessibilityNode] = []
 
@@ -9019,9 +8886,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             children = buildFilePickerAccessibilityNodes(nextIdentifier: &nextIdentifier)
         } else if isShowingWorkspacePanel {
             children = buildWorkspaceAccessibilityNodes(nextIdentifier: &nextIdentifier)
-        } else if pendingAboutBackend != nil {
-            children = accessibilityVisibleText(in: aboutOverlayLayer, nextIdentifier: &nextIdentifier)
-            children.append(accessibilityNode(nextIdentifier: &nextIdentifier, role: .button, frame: aboutDoneFrame, label: "Done"))
+        } else if pendingMessageDialog != nil {
+            children = accessibilityVisibleText(in: messageDialogOverlayLayer, nextIdentifier: &nextIdentifier)
+            children.append(accessibilityNode(nextIdentifier: &nextIdentifier, role: .button, frame: messageDialogDoneFrame, label: "Done"))
         } else if pendingOuterShellUpdate != nil {
             children = accessibilityVisibleText(in: updateOverlayLayer, nextIdentifier: &nextIdentifier)
             children.append(accessibilityNode(nextIdentifier: &nextIdentifier, role: .button, frame: updateCancelFrame, label: "Cancel"))
@@ -9044,9 +8911,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         }
 
         let root = OuterframeAccessibilityNode(identifier: 0,
-                                               role: pendingAboutBackend != nil || pendingOuterShellUpdate != nil || (mode == .create && pendingInstallBackend == nil && pendingPasswordAction == nil && pendingFilePicker == nil) ? .dialog : .container,
+                                               role: pendingMessageDialog != nil || pendingOuterShellUpdate != nil || (mode == .create && pendingInstallBackend == nil && pendingPasswordAction == nil && pendingFilePicker == nil) ? .dialog : .container,
                                                frame: rootLayer.bounds,
-                                               label: pendingAboutBackend != nil ? "About Outer Shell" : pendingOuterShellUpdate != nil ? "Update Outer Shell" : mode == .create ? "Add apps and endpoints" : "Outer Shell",
+                                               label: pendingMessageDialog.map(\.title) ?? (pendingOuterShellUpdate != nil ? "Update Outer Shell" : mode == .create ? "Add apps and endpoints" : "Outer Shell"),
                                                children: children)
         return OuterframeAccessibilitySnapshot(rootNodes: [root])
     }
@@ -10022,7 +9889,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
               pendingOuterShellUpdate == nil,
               pendingInstallBackend == nil,
               pendingPasswordAction == nil,
-              pendingAboutBackend == nil,
+              pendingMessageDialog == nil,
               let backend = outerShellBackend(),
               backend.status == "update available" else {
             return
@@ -10174,7 +10041,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                                   didRecoverNetworking: true)
                         return
                     }
-                    self.backendError = error.localizedDescription
+                    self.showActionFailure(operation: operation, backend: backend, message: error.localizedDescription)
                 } else if let data,
                           let response = try? ActionResponse.decodeBinary(data) {
                     if response.needsPassword == true {
@@ -10186,17 +10053,21 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                                                                availableVersion: response.availableVersion,
                                                                                message: response.message)
                         self.backendError = ""
+                    } else if response.ok {
+                        self.backendError = operation == "checkUpdate" ? response.message : ""
+                        actionCompleted = true
                     } else {
-                        self.backendError = response.ok ? (operation == "checkUpdate" ? response.message : "") : response.message
-                        actionCompleted = response.ok
+                        self.showActionFailure(operation: operation, backend: backend, message: response.message)
                     }
                 } else if let data,
                           let message = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
                           !message.isEmpty {
-                    self.backendError = message
+                    self.showActionFailure(operation: operation, backend: backend, message: message)
                 } else {
                     let statusCode = (urlResponse as? HTTPURLResponse)?.statusCode
-                    self.backendError = statusCode.map { "Control request failed with HTTP \($0)." } ?? "Control request failed."
+                    self.showActionFailure(operation: operation,
+                                           backend: backend,
+                                           message: statusCode.map { "Control request failed with HTTP \($0)." } ?? "Control request failed.")
                 }
                 if actionCompleted {
                     if operation == "uninstallOuterShell" {
@@ -12315,7 +12186,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
         var enabledCommands: OuterframeEditCommandSet = []
         if requestedCommands.contains(.copy),
-           ((aboutSelectionRange?.length ?? 0) > 0 ||
+           ((messageDialogSelectionRange?.length ?? 0) > 0 ||
             (statusSelectionRange?.length ?? 0) > 0 ||
             (logHeaderDetailSelectionRange?.length ?? 0) > 0 ||
             (logTextSelectionRange?.length ?? 0) > 0 ||
@@ -12891,7 +12762,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             return pasteboardItems(for: selectedText)
         }
 
-        if let selectedText = selectedAboutAttributedText(),
+        if let selectedText = selectedMessageDialogAttributedText(),
            selectedText.length > 0 {
             return pasteboardItems(for: selectedText)
         }
@@ -12918,79 +12789,99 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         ].joined(separator: "\n")
     }
 
-    private func aboutTextFont() -> NSFont {
+    private func messageDialogTextFont() -> NSFont {
         NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
     }
 
-    private func aboutTextLineHeight() -> CGFloat {
+    private func messageDialogTextLineHeight() -> CGFloat {
         18
     }
 
-    private func aboutTextLine(for text: String) -> CTLine {
-        CTLineCreateWithAttributedString(NSAttributedString(string: text, attributes: [.font: aboutTextFont()]))
+    private func messageDialogTextLine(for text: String) -> CTLine {
+        CTLineCreateWithAttributedString(NSAttributedString(string: text, attributes: [.font: messageDialogTextFont()]))
     }
 
-    private func aboutLineFragments() -> [(text: String, range: NSRange, y: CGFloat)] {
-        let lines = renderedAboutText.components(separatedBy: "\n")
-        let lineHeight = aboutTextLineHeight()
-        var location = 0
-        var fragments: [(text: String, range: NSRange, y: CGFloat)] = []
-        fragments.reserveCapacity(lines.count)
-        for (index, line) in lines.enumerated() {
-            let length = (line as NSString).length
-            fragments.append((text: line,
-                              range: NSRange(location: location, length: length),
-                              y: aboutTextFrame.height - CGFloat(index + 1) * lineHeight - 4))
-            location += length
-            if index < lines.count - 1 {
-                location += 1
+    private func messageDialogWrappedLines(width: CGFloat) -> [(text: String, range: NSRange)] {
+        let string = renderedMessageDialogText as NSString
+        var lines: [(text: String, range: NSRange)] = []
+        var paragraphStart = 0
+        while true {
+            let newline = string.range(of: "\n", range: NSRange(location: paragraphStart, length: string.length - paragraphStart))
+            let paragraphEnd = newline.location == NSNotFound ? string.length : newline.location
+            let paragraph = string.substring(with: NSRange(location: paragraphStart, length: paragraphEnd - paragraphStart))
+            let paragraphLength = (paragraph as NSString).length
+            if paragraphLength == 0 {
+                lines.append((text: "", range: NSRange(location: paragraphStart, length: 0)))
+            } else {
+                let typesetter = CTTypesetterCreateWithAttributedString(
+                    NSAttributedString(string: paragraph, attributes: [.font: messageDialogTextFont()])
+                )
+                var offset = 0
+                while offset < paragraphLength {
+                    let count = max(CTTypesetterSuggestLineBreak(typesetter, offset, Double(max(width, 1))), 1)
+                    let range = NSRange(location: offset, length: min(count, paragraphLength - offset))
+                    lines.append((text: (paragraph as NSString).substring(with: range),
+                                  range: NSRange(location: paragraphStart + range.location, length: range.length)))
+                    offset += range.length
+                }
             }
+            guard newline.location != NSNotFound else { break }
+            paragraphStart = newline.location + 1
         }
-        return fragments
+        return lines
     }
 
-    private func normalizedAboutSelectionRange(_ range: NSRange?) -> NSRange? {
+    private func messageDialogLineFragments() -> [(text: String, range: NSRange, y: CGFloat)] {
+        let lineHeight = messageDialogTextLineHeight()
+        return messageDialogWrappedLines(width: messageDialogTextFrame.width - 20).enumerated().map { index, line in
+            (text: line.text,
+             range: line.range,
+             y: messageDialogTextFrame.height - CGFloat(index + 1) * lineHeight - 4)
+        }
+    }
+
+    private func normalizedMessageDialogSelectionRange(_ range: NSRange?) -> NSRange? {
         guard let range else { return nil }
-        let length = (renderedAboutText as NSString).length
+        let length = (renderedMessageDialogText as NSString).length
         let lower = max(min(range.location, length), 0)
         let upper = max(min(range.location + range.length, length), lower)
         guard upper > lower else { return nil }
         return NSRange(location: lower, length: upper - lower)
     }
 
-    private func setAboutSelectionRange(_ range: NSRange?) {
-        let nextRange = normalizedAboutSelectionRange(range)
-        guard nextRange != aboutSelectionRange else { return }
-        aboutSelectionRange = nextRange
-        updateAboutSelectionLayers()
+    private func setMessageDialogSelectionRange(_ range: NSRange?) {
+        let nextRange = normalizedMessageDialogSelectionRange(range)
+        guard nextRange != messageDialogSelectionRange else { return }
+        messageDialogSelectionRange = nextRange
+        updateMessageDialogSelectionLayers()
         updateEditingAndPasteboardState()
     }
 
-    private func selectedAboutAttributedText() -> NSAttributedString? {
-        guard let selectionRange = normalizedAboutSelectionRange(aboutSelectionRange) else {
+    private func selectedMessageDialogAttributedText() -> NSAttributedString? {
+        guard let selectionRange = normalizedMessageDialogSelectionRange(messageDialogSelectionRange) else {
             return nil
         }
-        let attributed = NSAttributedString(string: renderedAboutText,
-                                            attributes: [.font: aboutTextFont(),
+        let attributed = NSAttributedString(string: renderedMessageDialogText,
+                                            attributes: [.font: messageDialogTextFont(),
                                                          .foregroundColor: NSColor.labelColor])
         return attributed.attributedSubstring(from: selectionRange)
     }
 
-    private func aboutTextOffset(at point: CGPoint) -> Int {
-        let length = (renderedAboutText as NSString).length
+    private func messageDialogTextOffset(at point: CGPoint) -> Int {
+        let length = (renderedMessageDialogText as NSString).length
         guard length > 0 else { return 0 }
-        let x = max(point.x - aboutTextFrame.minX - 10, 0)
-        let y = point.y - aboutTextFrame.minY
-        let lineHeight = aboutTextLineHeight()
-        let fragments = aboutLineFragments()
+        let x = max(point.x - messageDialogTextFrame.minX - 10, 0)
+        let y = point.y - messageDialogTextFrame.minY
+        let lineHeight = messageDialogTextLineHeight()
+        let fragments = messageDialogLineFragments()
         guard !fragments.isEmpty else { return 0 }
-        let rawIndex = Int(floor((aboutTextFrame.height - y - 4) / lineHeight))
+        let rawIndex = Int(floor((messageDialogTextFrame.height - y - 4) / lineHeight))
         let lineIndex = min(max(rawIndex, 0), fragments.count - 1)
         let fragment = fragments[lineIndex]
         if x <= 0 {
             return fragment.range.location
         }
-        let line = aboutTextLine(for: fragment.text)
+        let line = messageDialogTextLine(for: fragment.text)
         let index = CTLineGetStringIndexForPosition(line, CGPoint(x: x, y: 0))
         if index == kCFNotFound {
             return fragment.range.location + fragment.range.length
@@ -12999,61 +12890,61 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                    fragment.range.location + fragment.range.length)
     }
 
-    private func aboutWordRange(containing offset: Int) -> NSRange? {
-        let string = renderedAboutText as NSString
+    private func messageDialogWordRange(containing offset: Int) -> NSRange? {
+        let string = renderedMessageDialogText as NSString
         let length = string.length
         guard length > 0 else { return nil }
         var location = min(max(offset, 0), length - 1)
-        if location > 0, !aboutCharacterIsWordLike(string.character(at: location)) {
+        if location > 0, !messageDialogCharacterIsWordLike(string.character(at: location)) {
             location -= 1
         }
-        guard aboutCharacterIsWordLike(string.character(at: location)) else {
+        guard messageDialogCharacterIsWordLike(string.character(at: location)) else {
             return NSRange(location: min(max(offset, 0), length), length: 0)
         }
         var start = location
-        while start > 0, aboutCharacterIsWordLike(string.character(at: start - 1)) {
+        while start > 0, messageDialogCharacterIsWordLike(string.character(at: start - 1)) {
             start -= 1
         }
         var end = location + 1
-        while end < length, aboutCharacterIsWordLike(string.character(at: end)) {
+        while end < length, messageDialogCharacterIsWordLike(string.character(at: end)) {
             end += 1
         }
         return NSRange(location: start, length: end - start)
     }
 
-    private func aboutCharacterIsWordLike(_ character: unichar) -> Bool {
+    private func messageDialogCharacterIsWordLike(_ character: unichar) -> Bool {
         if character >= 48 && character <= 57 { return true }
         if character >= 65 && character <= 90 { return true }
         if character >= 97 && character <= 122 { return true }
         return character == 45 || character == 46 || character == 47 || character == 58 || character == 95
     }
 
-    private func handleAboutMouseDragged(to point: CGPoint) -> Bool {
-        guard let aboutDragAnchorOffset else { return false }
-        let offset = aboutTextOffset(at: point)
-        let location = min(aboutDragAnchorOffset, offset)
-        let length = abs(offset - aboutDragAnchorOffset)
-        setAboutSelectionRange(NSRange(location: location, length: length))
+    private func handleMessageDialogMouseDragged(to point: CGPoint) -> Bool {
+        guard let messageDialogDragAnchorOffset else { return false }
+        let offset = messageDialogTextOffset(at: point)
+        let location = min(messageDialogDragAnchorOffset, offset)
+        let length = abs(offset - messageDialogDragAnchorOffset)
+        setMessageDialogSelectionRange(NSRange(location: location, length: length))
         return true
     }
 
-    private func handleAboutRightMouseDown(at point: CGPoint) {
-        guard aboutTextFrame.contains(point) else { return }
-        let offset = aboutTextOffset(at: point)
-        if let selectionRange = normalizedAboutSelectionRange(aboutSelectionRange),
+    private func handleMessageDialogRightMouseDown(at point: CGPoint) {
+        guard messageDialogTextFrame.contains(point) else { return }
+        let offset = messageDialogTextOffset(at: point)
+        if let selectionRange = normalizedMessageDialogSelectionRange(messageDialogSelectionRange),
            offset >= selectionRange.location,
            offset <= selectionRange.location + selectionRange.length,
-           let selectedText = selectedAboutAttributedText() {
+           let selectedText = selectedMessageDialogAttributedText() {
             outerframeHost.showContextMenu(for: selectedText, at: point)
             return
         }
-        if let wordRange = aboutWordRange(containing: offset),
+        if let wordRange = messageDialogWordRange(containing: offset),
            wordRange.length > 0 {
-            setAboutSelectionRange(wordRange)
+            setMessageDialogSelectionRange(wordRange)
         } else {
-            setAboutSelectionRange(NSRange(location: 0, length: (renderedAboutText as NSString).length))
+            setMessageDialogSelectionRange(NSRange(location: 0, length: (renderedMessageDialogText as NSString).length))
         }
-        if let selectedText = selectedAboutAttributedText() {
+        if let selectedText = selectedMessageDialogAttributedText() {
             outerframeHost.showContextMenu(for: selectedText, at: point)
         }
     }
@@ -13669,8 +13560,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             updateLayout()
         case .updateConfirm:
             confirmOuterShellUpdate()
-        case .aboutDismiss:
-            dismissAboutPrompt()
+        case .messageDialogDismiss:
+            dismissMessageDialog()
         case .passwordCancel:
             dismissPasswordPrompt()
         case .passwordSubmit:
@@ -13707,7 +13598,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         if logScrollbarController?.handleMouseDragged(to: rootLayer.convert(point, to: logRowsClipLayer)) == true {
             return
         }
-        if handleAboutMouseDragged(to: point) {
+        if handleMessageDialogMouseDragged(to: point) {
             return
         }
         if handleLogHeaderMouseDragged(to: point) {
@@ -13845,7 +13736,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             return
         }
         statusDragAnchorOffset = nil
-        aboutDragAnchorOffset = nil
+        messageDialogDragAnchorOffset = nil
         logDragAnchorOffset = nil
         logHeaderDetailDragAnchorOffset = nil
         createMessageDragAnchorOffset = nil
@@ -14009,10 +13900,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             setCursorIfNeeded((installConfirmFrame.contains(point) || installRootConfirmFrame.contains(point) || installCancelFrame.contains(point)) ? .pointingHand : .arrow)
             return
         }
-        if pendingAboutBackend != nil {
-            if aboutDoneFrame.contains(point) {
+        if pendingMessageDialog != nil {
+            if messageDialogDoneFrame.contains(point) {
                 setCursorIfNeeded(.pointingHand)
-            } else if aboutTextFrame.contains(point) {
+            } else if messageDialogTextFrame.contains(point) {
                 setCursorIfNeeded(.iBeam)
             } else {
                 setCursorIfNeeded(.arrow)
@@ -14156,8 +14047,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             showWorkspaceNameFieldContextMenu(at: point)
             return
         }
-        if pendingAboutBackend != nil {
-            handleAboutRightMouseDown(at: point)
+        if pendingMessageDialog != nil {
+            handleMessageDialogRightMouseDown(at: point)
             return
         }
         if handleLogHeaderRightMouseDown(at: point) {
@@ -14990,22 +14881,22 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             }
             return
         }
-        if pendingAboutBackend != nil {
-            if aboutDoneFrame.contains(point) {
-                armButtonClick(frame: aboutDoneFrame, action: .aboutDismiss)
-            } else if aboutTextFrame.contains(point) {
-                let offset = aboutTextOffset(at: point)
-                aboutDragAnchorOffset = offset
+        if pendingMessageDialog != nil {
+            if messageDialogDoneFrame.contains(point) {
+                armButtonClick(frame: messageDialogDoneFrame, action: .messageDialogDismiss)
+            } else if messageDialogTextFrame.contains(point) {
+                let offset = messageDialogTextOffset(at: point)
+                messageDialogDragAnchorOffset = offset
                 switch clickCount {
                 case 3...:
-                    setAboutSelectionRange(NSRange(location: 0, length: (renderedAboutText as NSString).length))
+                    setMessageDialogSelectionRange(NSRange(location: 0, length: (renderedMessageDialogText as NSString).length))
                 case 2:
-                    setAboutSelectionRange(aboutWordRange(containing: offset))
+                    setMessageDialogSelectionRange(messageDialogWordRange(containing: offset))
                 default:
-                    setAboutSelectionRange(nil)
+                    setMessageDialogSelectionRange(nil)
                 }
-            } else if !aboutPanelFrame.contains(point) {
-                dismissAboutPrompt()
+            } else if !messageDialogPanelFrame.contains(point) {
+                dismissMessageDialog()
             }
             return
         }
@@ -15605,8 +15496,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             handleUpdatePromptKeyDown(keyCode: keyCode)
             return
         }
-        if pendingAboutBackend != nil {
-            handleAboutPromptKeyDown(keyCode: keyCode)
+        if pendingMessageDialog != nil {
+            handleMessageDialogKeyDown(keyCode: keyCode)
             return
         }
         if pendingPasswordAction != nil {
@@ -15673,28 +15564,28 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         }
     }
 
-    private func handleAboutPromptKeyDown(keyCode: UInt16) {
+    private func handleMessageDialogKeyDown(keyCode: UInt16) {
         switch keyCode {
         case 36, 53, 76:
-            dismissAboutPrompt()
+            dismissMessageDialog()
         default:
             break
         }
     }
 
-    private func showAboutPrompt(for backend: BackendRecord) {
+    private func showMessageDialog(title: String, text: String) {
         blurCreateField()
         blurPasswordField()
-        pendingAboutBackend = backend
-        aboutSelectionRange = nil
-        aboutDragAnchorOffset = nil
+        pendingMessageDialog = MessageDialog(title: title, text: text)
+        messageDialogSelectionRange = nil
+        messageDialogDragAnchorOffset = nil
         updateLayout()
     }
 
-    private func dismissAboutPrompt() {
-        pendingAboutBackend = nil
-        aboutSelectionRange = nil
-        aboutDragAnchorOffset = nil
+    private func dismissMessageDialog() {
+        pendingMessageDialog = nil
+        messageDialogSelectionRange = nil
+        messageDialogDragAnchorOffset = nil
         updateEditingAndPasteboardState()
         updateLayout()
     }
@@ -22555,7 +22446,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             return
         }
         if operation == "aboutOuterShell" {
-            showAboutPrompt(for: backend)
+            showMessageDialog(title: "About Outer Shell", text: aboutDialogText(for: backend))
             return
         }
         performControlAction(for: backend, operation: operation)
@@ -22661,6 +22552,37 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         var allowed = CharacterSet.alphanumerics
         allowed.insert(charactersIn: "-._~")
         return socketPath.addingPercentEncoding(withAllowedCharacters: allowed) ?? socketPath
+    }
+
+    private func showActionFailure(operation: String, backend: BackendRecord, message: String) {
+        backendError = ""
+        let text = message.isEmpty ? "The operation failed without an error message." : message
+        showMessageDialog(title: actionFailureTitle(operation: operation, backend: backend), text: text)
+    }
+
+    private func actionFailureTitle(operation: String, backend: BackendRecord) -> String {
+        switch operation {
+        case "run", "runUser", "installUser":
+            return "Couldn't Install \(backend.displayName)"
+        case "runRoot", "installRoot", "addRootSupport":
+            return "Couldn't Install \(backend.displayName) as \(administrativeRoleName)"
+        case "removeRootSupport":
+            return "Couldn't Remove \(administrativeRoleName) Support from \(backend.displayName)"
+        case "uninstall", "uninstallOuterShell":
+            return "Couldn't Uninstall \(backend.displayName)"
+        case "checkUpdate":
+            return "Couldn't Check for \(backend.displayName) Updates"
+        case "update":
+            return "Couldn't Update \(backend.displayName)"
+        case "start":
+            return "Couldn't Start \(backend.displayName)"
+        case "stop":
+            return "Couldn't Stop \(backend.displayName)"
+        case "restart":
+            return "Couldn't Restart \(backend.displayName)"
+        default:
+            return "\(backend.displayName) Error"
+        }
     }
 
     private func actionProgressText(operation: String, backend: BackendRecord) -> String {

@@ -30,7 +30,7 @@ static int setup_tasks(const char *operation) {
     if (!sid || !directory) { free(sid); free(directory); return 1; }
     bool install = !strcmp(operation, "install"), remove = !strcmp(operation, "remove");
     HRESULT result = install ? S_OK : setup_stop_commands(directory);
-    for (int index = 0; index < 6 && SUCCEEDED(result); index++) {
+    for (int index = 0; index < 1 + (int)(sizeof(bundled_apps) / sizeof(*bundled_apps)) && SUCCEEDED(result); index++) {
         StringBuilder name = {0}; sb_append(&name, index ? "\\OuterShell-" : "\\OuterShell-"); if (index) { sb_append(&name, bundled_apps[index - 1].name); sb_append(&name, "-"); } sb_append(&name, sid);
         if (install && index > 1) {
             DWORD state = 0;

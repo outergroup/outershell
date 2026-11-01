@@ -8,7 +8,9 @@ static const BundledApp bundled_apps[] = {
     {"org.outershell.Top", "Top", "TopBackend.exe", "waveform.path.ecg"},
     {"org.outershell.Firehose", "Firehose", "FirehoseBackend.exe", "flame"},
     {"org.outershell.Profile", "Profile", "ProfileBackend.exe",
-     "chart.bar.xaxis"}};
+     "chart.bar.xaxis"},
+    {"org.outershell.Terminal", "Terminal", "TerminalBackend.exe",
+     "apple.terminal"}};
 static const BundledApp *bundled_find(const char *id) {
     for (size_t i = 0; i < sizeof(bundled_apps) / sizeof(*bundled_apps); i++)
         if (!strcmp(id, bundled_apps[i].id))
@@ -136,7 +138,7 @@ done:
     return ok;
 }
 
-static DWORD bundled_states[5];
+static DWORD bundled_states[sizeof(bundled_apps) / sizeof(*bundled_apps)];
 static ULONGLONG bundled_queried;
 static void bundled_poll(ShellHost *s) {
     ULONGLONG now = GetTickCount64();

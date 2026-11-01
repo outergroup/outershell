@@ -1181,6 +1181,16 @@ static bool registry_storage_exists_at(const char *database_path);
 static void mark_backend_event_changed(void);
 static void publish_backend_event_changed(void);
 
+// Apps without outerframe content bundles, such as HTML-only apps, leave
+// bundle_prefix NULL.
+static bool bundled_app_has_content(const BundledAppDefinition *app) {
+    return app->bundle_prefix && app->bundle_prefix[0];
+}
+
+static const char *bundled_app_bundle_prefix(const BundledAppDefinition *app) {
+    return bundled_app_has_content(app) ? app->bundle_prefix : "";
+}
+
 static const BundledAppOpenerDefinition kPlaintextOpeners[] = {
     {
         .content_type = "public.text",
@@ -1290,6 +1300,24 @@ static const BundledAppDefinition kBundledApps[] = {
 #else
         .supports_root = true,
 #endif
+        .root_only = false,
+        .supports_macos = true,
+        .version = "1"
+    },
+    {
+        .service_id = "org.outershell.Terminal",
+        .display_name = "Terminal",
+        .unit_name = "org.outershell.Terminal.service",
+        .stage_directory_name = "Terminal",
+        .install_directory_name = "org.outershell.Terminal",
+        .binary_name = "TerminalBackend",
+        .bundle_prefix = NULL,
+        .icon_symbol_name = "apple.terminal",
+        .icon_name = "app-icon.png",
+        .source_name = NULL,
+        .socket_name = "org.outershell.Terminal",
+        .socket_activated = true,
+        .supports_root = false,
         .root_only = false,
         .supports_macos = true,
         .version = "1"
@@ -2264,14 +2292,16 @@ static bool bundled_app_macos_app_has_expected_files(const BundledAppDefinition 
     bundled_app_macos_app_binary_path(app, app_bundle, app_binary, sizeof(app_binary));
     if (stat(app_binary, &st) != 0 || !S_ISREG(st.st_mode)) return false;
 
-    char bundles_dir[PATH_MAX];
-    bundled_app_macos_app_bundles_dir(app_bundle, bundles_dir, sizeof(bundles_dir));
-    char bundle_arm[PATH_MAX];
-    snprintf(bundle_arm, sizeof(bundle_arm), "%s/%s.bundle.macos-arm.aar", bundles_dir, app->bundle_prefix);
-    if (stat(bundle_arm, &st) != 0 || !S_ISREG(st.st_mode)) return false;
-    char bundle_x86[PATH_MAX];
-    snprintf(bundle_x86, sizeof(bundle_x86), "%s/%s.bundle.macos-x86.aar", bundles_dir, app->bundle_prefix);
-    if (stat(bundle_x86, &st) != 0 || !S_ISREG(st.st_mode)) return false;
+    if (bundled_app_has_content(app)) {
+        char bundles_dir[PATH_MAX];
+        bundled_app_macos_app_bundles_dir(app_bundle, bundles_dir, sizeof(bundles_dir));
+        char bundle_arm[PATH_MAX];
+        snprintf(bundle_arm, sizeof(bundle_arm), "%s/%s.bundle.macos-arm.aar", bundles_dir, bundled_app_bundle_prefix(app));
+        if (stat(bundle_arm, &st) != 0 || !S_ISREG(st.st_mode)) return false;
+        char bundle_x86[PATH_MAX];
+        snprintf(bundle_x86, sizeof(bundle_x86), "%s/%s.bundle.macos-x86.aar", bundles_dir, bundled_app_bundle_prefix(app));
+        if (stat(bundle_x86, &st) != 0 || !S_ISREG(st.st_mode)) return false;
+    }
 
     if (app->icon_name && app->icon_name[0]) {
         char icon_path[PATH_MAX];
@@ -2292,13 +2322,15 @@ static bool bundled_app_stage_has_expected_files(const BundledAppDefinition *app
     if (bundled_app_macos_app_has_expected_files(app, app_bundle)) return true;
 #endif
 
-    char bundle_arm[PATH_MAX];
-    snprintf(bundle_arm, sizeof(bundle_arm), "%s/bundles/%s.bundle.macos-arm.aar", stage_root, app->bundle_prefix);
-    if (stat(bundle_arm, &st) != 0 || !S_ISREG(st.st_mode)) return false;
+    if (bundled_app_has_content(app)) {
+        char bundle_arm[PATH_MAX];
+        snprintf(bundle_arm, sizeof(bundle_arm), "%s/bundles/%s.bundle.macos-arm.aar", stage_root, bundled_app_bundle_prefix(app));
+        if (stat(bundle_arm, &st) != 0 || !S_ISREG(st.st_mode)) return false;
 
-    char bundle_x86[PATH_MAX];
-    snprintf(bundle_x86, sizeof(bundle_x86), "%s/bundles/%s.bundle.macos-x86.aar", stage_root, app->bundle_prefix);
-    if (stat(bundle_x86, &st) != 0 || !S_ISREG(st.st_mode)) return false;
+        char bundle_x86[PATH_MAX];
+        snprintf(bundle_x86, sizeof(bundle_x86), "%s/bundles/%s.bundle.macos-x86.aar", stage_root, bundled_app_bundle_prefix(app));
+        if (stat(bundle_x86, &st) != 0 || !S_ISREG(st.st_mode)) return false;
+    }
 
     if (app->icon_name && app->icon_name[0]) {
         char icon_path[PATH_MAX];
@@ -9223,9 +9255,9 @@ static bool install_bundled_app_internal(const BundledAppDefinition *app,
     char target_binary[PATH_MAX];
     snprintf(target_binary, sizeof(target_binary), system_scope ? "%s/bin/%s" : "%s/%s", install_root, app->binary_name);
     char target_bundle_arm[PATH_MAX];
-    snprintf(target_bundle_arm, sizeof(target_bundle_arm), "%s/%s.bundle.macos-arm.aar", bundles_dir, app->bundle_prefix);
+    snprintf(target_bundle_arm, sizeof(target_bundle_arm), "%s/%s.bundle.macos-arm.aar", bundles_dir, bundled_app_bundle_prefix(app));
     char target_bundle_x86[PATH_MAX];
-    snprintf(target_bundle_x86, sizeof(target_bundle_x86), "%s/%s.bundle.macos-x86.aar", bundles_dir, app->bundle_prefix);
+    snprintf(target_bundle_x86, sizeof(target_bundle_x86), "%s/%s.bundle.macos-x86.aar", bundles_dir, bundled_app_bundle_prefix(app));
     char target_icon[PATH_MAX] = "";
     if (source_icon && source_icon[0]) snprintf(target_icon, sizeof(target_icon), "%s/%s", install_root, app->icon_name);
     char target_web_dir[PATH_MAX];
@@ -9271,8 +9303,9 @@ static bool install_bundled_app_internal(const BundledAppDefinition *app,
     mode_t data_mode = system_scope ? 0644 : 0600;
     mode_t directory_mode = system_scope ? 0755 : 0700;
     if (!copy_file(source_binary, target_binary, binary_mode, error, sizeof(error)) ||
-        !copy_file(source_bundle_arm, target_bundle_arm, data_mode, error, sizeof(error)) ||
-        !copy_file(source_bundle_x86, target_bundle_x86, data_mode, error, sizeof(error)) ||
+        (bundled_app_has_content(app) &&
+         (!copy_file(source_bundle_arm, target_bundle_arm, data_mode, error, sizeof(error)) ||
+          !copy_file(source_bundle_x86, target_bundle_x86, data_mode, error, sizeof(error)))) ||
         (target_icon[0] && !copy_file(source_icon, target_icon, data_mode, error, sizeof(error))) ||
         !replace_directory_tree(source_web_dir, target_web_dir, data_mode, directory_mode, error, sizeof(error)) ||
         !write_text_file(version_path, app->version, error, sizeof(error))) {
@@ -9439,9 +9472,9 @@ static bool install_bundled_app(const BundledAppDefinition *app,
     char source_binary[PATH_MAX];
     snprintf(source_binary, sizeof(source_binary), "%s/%s/%s/%s", stage_root, remote_linux_binary_directory(), architecture, app->binary_name);
     char source_bundle_arm[PATH_MAX];
-    snprintf(source_bundle_arm, sizeof(source_bundle_arm), "%s/bundles/%s.bundle.macos-arm.aar", stage_root, app->bundle_prefix);
+    snprintf(source_bundle_arm, sizeof(source_bundle_arm), "%s/bundles/%s.bundle.macos-arm.aar", stage_root, bundled_app_bundle_prefix(app));
     char source_bundle_x86[PATH_MAX];
-    snprintf(source_bundle_x86, sizeof(source_bundle_x86), "%s/bundles/%s.bundle.macos-x86.aar", stage_root, app->bundle_prefix);
+    snprintf(source_bundle_x86, sizeof(source_bundle_x86), "%s/bundles/%s.bundle.macos-x86.aar", stage_root, bundled_app_bundle_prefix(app));
     char source_icon[PATH_MAX];
     if (app->icon_name && app->icon_name[0]) {
         snprintf(source_icon, sizeof(source_icon), "%s/%s", stage_root, app->icon_name);
@@ -9458,8 +9491,9 @@ static bool install_bundled_app(const BundledAppDefinition *app,
         snprintf(message, message_size, "Missing %s binary for %s at %s.", app->display_name, architecture, source_binary);
         return false;
     }
-    if (stat(source_bundle_arm, &st) != 0 || !S_ISREG(st.st_mode) ||
-        stat(source_bundle_x86, &st) != 0 || !S_ISREG(st.st_mode)) {
+    if (bundled_app_has_content(app) &&
+        (stat(source_bundle_arm, &st) != 0 || !S_ISREG(st.st_mode) ||
+         stat(source_bundle_x86, &st) != 0 || !S_ISREG(st.st_mode))) {
         snprintf(message, message_size, "Missing %s content archives under %s/bundles.", app->display_name, stage_root);
         return false;
     }
@@ -9507,9 +9541,9 @@ static bool install_bundled_app(const BundledAppDefinition *app,
         char target_binary[PATH_MAX];
         snprintf(target_binary, sizeof(target_binary), "%s/bin/%s", install_root, app->binary_name);
         char target_bundle_arm[PATH_MAX];
-        snprintf(target_bundle_arm, sizeof(target_bundle_arm), "%s/%s.bundle.macos-arm.aar", bundles_dir, app->bundle_prefix);
+        snprintf(target_bundle_arm, sizeof(target_bundle_arm), "%s/%s.bundle.macos-arm.aar", bundles_dir, bundled_app_bundle_prefix(app));
         char target_bundle_x86[PATH_MAX];
-        snprintf(target_bundle_x86, sizeof(target_bundle_x86), "%s/%s.bundle.macos-x86.aar", bundles_dir, app->bundle_prefix);
+        snprintf(target_bundle_x86, sizeof(target_bundle_x86), "%s/%s.bundle.macos-x86.aar", bundles_dir, bundled_app_bundle_prefix(app));
         char target_icon[PATH_MAX];
         if (app->icon_name && app->icon_name[0]) {
             snprintf(target_icon, sizeof(target_icon), "%s/%s", install_root, app->icon_name);
@@ -9859,9 +9893,9 @@ static bool install_bundled_app(const BundledAppDefinition *app,
     char target_binary[PATH_MAX];
     snprintf(target_binary, sizeof(target_binary), "%s/%s", install_root, app->binary_name);
     char target_bundle_arm[PATH_MAX];
-    snprintf(target_bundle_arm, sizeof(target_bundle_arm), "%s/%s.bundle.macos-arm.aar", bundles_dir, app->bundle_prefix);
+    snprintf(target_bundle_arm, sizeof(target_bundle_arm), "%s/%s.bundle.macos-arm.aar", bundles_dir, bundled_app_bundle_prefix(app));
     char target_bundle_x86[PATH_MAX];
-    snprintf(target_bundle_x86, sizeof(target_bundle_x86), "%s/%s.bundle.macos-x86.aar", bundles_dir, app->bundle_prefix);
+    snprintf(target_bundle_x86, sizeof(target_bundle_x86), "%s/%s.bundle.macos-x86.aar", bundles_dir, bundled_app_bundle_prefix(app));
     char target_icon[PATH_MAX];
     if (app->icon_name && app->icon_name[0]) {
         snprintf(target_icon, sizeof(target_icon), "%s/%s", install_root, app->icon_name);
@@ -9896,8 +9930,9 @@ static bool install_bundled_app(const BundledAppDefinition *app,
         snprintf(message, message_size, "%s", error);
         return false;
     }
-    if (!copy_file(source_bundle_arm, target_bundle_arm, 0600, error, sizeof(error)) ||
-        !copy_file(source_bundle_x86, target_bundle_x86, 0600, error, sizeof(error)) ||
+    if ((bundled_app_has_content(app) &&
+         (!copy_file(source_bundle_arm, target_bundle_arm, 0600, error, sizeof(error)) ||
+          !copy_file(source_bundle_x86, target_bundle_x86, 0600, error, sizeof(error)))) ||
         (source_icon[0] && !copy_file(source_icon, target_icon, 0600, error, sizeof(error))) ||
         !replace_directory_tree(source_web_dir, target_web_dir, 0600, 0700, error, sizeof(error))) {
         snprintf(message, message_size, "%s", error);
@@ -10339,17 +10374,17 @@ static bool install_bundled_app_macos(const BundledAppDefinition *app,
     if (source_is_app_bundle) {
         char source_bundles_dir[PATH_MAX];
         bundled_app_macos_app_bundles_dir(source_app_bundle, source_bundles_dir, sizeof(source_bundles_dir));
-        snprintf(source_bundle_arm, sizeof(source_bundle_arm), "%s/%s.bundle.macos-arm.aar", source_bundles_dir, app->bundle_prefix);
+        snprintf(source_bundle_arm, sizeof(source_bundle_arm), "%s/%s.bundle.macos-arm.aar", source_bundles_dir, bundled_app_bundle_prefix(app));
     } else {
-        snprintf(source_bundle_arm, sizeof(source_bundle_arm), "%s/bundles/%s.bundle.macos-arm.aar", stage_root, app->bundle_prefix);
+        snprintf(source_bundle_arm, sizeof(source_bundle_arm), "%s/bundles/%s.bundle.macos-arm.aar", stage_root, bundled_app_bundle_prefix(app));
     }
     char source_bundle_x86[PATH_MAX];
     if (source_is_app_bundle) {
         char source_bundles_dir[PATH_MAX];
         bundled_app_macos_app_bundles_dir(source_app_bundle, source_bundles_dir, sizeof(source_bundles_dir));
-        snprintf(source_bundle_x86, sizeof(source_bundle_x86), "%s/%s.bundle.macos-x86.aar", source_bundles_dir, app->bundle_prefix);
+        snprintf(source_bundle_x86, sizeof(source_bundle_x86), "%s/%s.bundle.macos-x86.aar", source_bundles_dir, bundled_app_bundle_prefix(app));
     } else {
-        snprintf(source_bundle_x86, sizeof(source_bundle_x86), "%s/bundles/%s.bundle.macos-x86.aar", stage_root, app->bundle_prefix);
+        snprintf(source_bundle_x86, sizeof(source_bundle_x86), "%s/bundles/%s.bundle.macos-x86.aar", stage_root, bundled_app_bundle_prefix(app));
     }
     char source_icon[PATH_MAX] = "";
     if (app->icon_name && app->icon_name[0]) {
@@ -10365,8 +10400,9 @@ static bool install_bundled_app_macos(const BundledAppDefinition *app,
         snprintf(message, message_size, "Missing %s backend at %s.", app->display_name, source_binary);
         return false;
     }
-    if (stat(source_bundle_arm, &st) != 0 || !S_ISREG(st.st_mode) ||
-        stat(source_bundle_x86, &st) != 0 || !S_ISREG(st.st_mode)) {
+    if (bundled_app_has_content(app) &&
+        (stat(source_bundle_arm, &st) != 0 || !S_ISREG(st.st_mode) ||
+         stat(source_bundle_x86, &st) != 0 || !S_ISREG(st.st_mode))) {
         snprintf(message, message_size, "Missing %s content archives under %s/bundles.", app->display_name, stage_root);
         return false;
     }
@@ -10400,9 +10436,9 @@ static bool install_bundled_app_macos(const BundledAppDefinition *app,
             snprintf(target_binary, sizeof(target_binary), "%s/%s", install_root, app->binary_name);
         }
         char target_bundle_arm[PATH_MAX];
-        snprintf(target_bundle_arm, sizeof(target_bundle_arm), "%s/%s.bundle.macos-arm.aar", bundles_dir, app->bundle_prefix);
+        snprintf(target_bundle_arm, sizeof(target_bundle_arm), "%s/%s.bundle.macos-arm.aar", bundles_dir, bundled_app_bundle_prefix(app));
         char target_bundle_x86[PATH_MAX];
-        snprintf(target_bundle_x86, sizeof(target_bundle_x86), "%s/%s.bundle.macos-x86.aar", bundles_dir, app->bundle_prefix);
+        snprintf(target_bundle_x86, sizeof(target_bundle_x86), "%s/%s.bundle.macos-x86.aar", bundles_dir, bundled_app_bundle_prefix(app));
         char target_icon[PATH_MAX] = "";
         if (source_icon[0]) {
             if (source_is_app_bundle) {
@@ -10582,9 +10618,9 @@ static bool install_bundled_app_macos(const BundledAppDefinition *app,
         snprintf(target_binary, sizeof(target_binary), "%s/%s", install_root, app->binary_name);
     }
     char target_bundle_arm[PATH_MAX];
-    snprintf(target_bundle_arm, sizeof(target_bundle_arm), "%s/%s.bundle.macos-arm.aar", bundles_dir, app->bundle_prefix);
+    snprintf(target_bundle_arm, sizeof(target_bundle_arm), "%s/%s.bundle.macos-arm.aar", bundles_dir, bundled_app_bundle_prefix(app));
     char target_bundle_x86[PATH_MAX];
-    snprintf(target_bundle_x86, sizeof(target_bundle_x86), "%s/%s.bundle.macos-x86.aar", bundles_dir, app->bundle_prefix);
+    snprintf(target_bundle_x86, sizeof(target_bundle_x86), "%s/%s.bundle.macos-x86.aar", bundles_dir, bundled_app_bundle_prefix(app));
     char target_icon[PATH_MAX] = "";
     if (source_icon[0]) {
         if (source_is_app_bundle) {
@@ -10654,8 +10690,9 @@ static bool install_bundled_app_macos(const BundledAppDefinition *app,
         }
     } else {
         if (!copy_file(source_binary, target_binary, 0700, error, sizeof(error)) ||
-            !copy_file(source_bundle_arm, target_bundle_arm, 0600, error, sizeof(error)) ||
-            !copy_file(source_bundle_x86, target_bundle_x86, 0600, error, sizeof(error)) ||
+            (bundled_app_has_content(app) &&
+             (!copy_file(source_bundle_arm, target_bundle_arm, 0600, error, sizeof(error)) ||
+              !copy_file(source_bundle_x86, target_bundle_x86, 0600, error, sizeof(error)))) ||
             (source_icon[0] && !copy_file(source_icon, target_icon, 0600, error, sizeof(error)))) {
             snprintf(message, message_size, "%s", error);
             return false;

@@ -44,7 +44,7 @@ exit /b %errorlevel%
         if ($LASTEXITCODE) { throw 'Windows C build failed.' }
     } finally { Remove-Item -LiteralPath $batch -Force -ErrorAction SilentlyContinue }
 }
-foreach ($file in @('OuterShell.exe', 'FilesBackend.exe', 'PlaintextBackend.exe', 'TopBackend.exe', 'FirehoseBackend.exe', 'ProfileBackend.exe', 'outerctl.exe')) {
+foreach ($file in @('OuterShell.exe', 'FilesBackend.exe', 'PlaintextBackend.exe', 'TopBackend.exe', 'FirehoseBackend.exe', 'ProfileBackend.exe', 'TerminalBackend.exe', 'outerctl.exe')) {
     Copy-Item (Join-Path $CoreDirectory $file) $OutputDirectory -Force
 }
 foreach ($obsolete in @('OuterShell.Windows.Runtime.dll', 'outershell-core.dll')) {
@@ -60,6 +60,9 @@ New-Item -ItemType Directory -Force "$OutputDirectory/web", "$OutputDirectory/fi
 Copy-Item "$PSScriptRoot/../Resources/OuterShellWeb/*" "$OutputDirectory/web" -Recurse -Force
 Copy-Item "$PSScriptRoot/../app-icon.png" "$OutputDirectory/web/favicon.png" -Force
 Copy-Item "$FilesRoot/Resources/FilesWeb/*" "$OutputDirectory/files-web" -Recurse -Force
+New-Item -ItemType Directory -Force "$OutputDirectory/terminal-web" | Out-Null
+Copy-Item "$PSScriptRoot/../../Terminal/Resources/TerminalWeb/*" "$OutputDirectory/terminal-web" -Recurse -Force
+Copy-Item "$PSScriptRoot/../../Terminal/app-icon.png" "$OutputDirectory/terminal-web/app-icon.png" -Force
 Copy-Item "$PSScriptRoot/install.ps1" $OutputDirectory -Force
 
 if ($ContainerBootstrapDirectory) {

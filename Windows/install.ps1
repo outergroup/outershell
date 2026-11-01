@@ -27,7 +27,7 @@ if ($SystemService) {
         if ($process) { $process.Kill(); if (!$process.WaitForExit(10000)) { throw 'The existing app did not stop.' }; $process.Dispose() }
     }
 }
-foreach ($file in @('OuterShell.exe', 'FilesBackend.exe', 'PlaintextBackend.exe', 'TopBackend.exe', 'FirehoseBackend.exe', 'ProfileBackend.exe')) {
+foreach ($file in @('OuterShell.exe', 'FilesBackend.exe', 'PlaintextBackend.exe', 'TopBackend.exe', 'FirehoseBackend.exe', 'ProfileBackend.exe', 'TerminalBackend.exe')) {
     for ($attempt = 0; ; $attempt++) {
         try { Copy-Item (Join-Path $SourceDirectory $file) $destination -Force; break }
         catch [IO.IOException], [UnauthorizedAccessException] { if ($attempt -ge 20) { throw }; Start-Sleep -Milliseconds 250 }
@@ -55,7 +55,7 @@ foreach ($obsolete in @('OuterShell.Windows.Runtime.dll', 'outershell-core.dll')
         }
     }
 }
-foreach ($folder in @('web', 'files-web', 'plaintext-web', 'top-web', 'firehose-web', 'profile-web', 'bundles')) {
+foreach ($folder in @('web', 'files-web', 'plaintext-web', 'top-web', 'firehose-web', 'profile-web', 'terminal-web', 'bundles')) {
     New-Item -ItemType Directory -Force (Join-Path $destination $folder) | Out-Null
     Copy-Item (Join-Path $SourceDirectory "$folder/*") (Join-Path $destination $folder) -Recurse -Force
 }

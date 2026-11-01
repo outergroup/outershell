@@ -719,6 +719,10 @@ bool http_read(Connection *c, HttpRequest *r) {
             r->host = win_strdup(colon);
         else if (!strcmp(line.data, "origin"))
             r->origin = win_strdup(colon);
+        else if (!strcmp(line.data, "upgrade"))
+            r->upgrade = win_strdup(colon);
+        else if (!strcmp(line.data, "sec-websocket-key"))
+            r->websocket_key = win_strdup(colon);
         else if (!strcmp(line.data, "expect")) {
             if (_stricmp(colon, "100-continue"))
                 goto done;
@@ -775,6 +779,8 @@ void http_free(HttpRequest *r) {
     free(r->origin);
     free(r->upload_offset);
     free(r->upload_protocol);
+    free(r->upgrade);
+    free(r->websocket_key);
     free(r->headers.data);
     free(r->body.data);
     memset(r, 0, sizeof(*r));

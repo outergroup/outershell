@@ -11,7 +11,7 @@ const record = (scope, installed) => ({
 });
 const state = { addTab: "catalog", addScope: "user", backends: [record("user", false), record("system", true)] };
 const context = {
-  addContainer: () => null, openCodeItem: () => null, ttydInstalled: () => false, codingAgentHTML: () => "",
+  addContainer: () => null, openCodeItem: () => null, codingAgentHTML: () => "",
   state, window: {}, escapeHTML: String, iconHTML: () => "", backendKey: b => b.serviceScope,
   openDialog: value => { html = value; }, closeDialog() {}, toast() {},
   findBackend: scope => state.backends.find(b => b.serviceScope === scope),
@@ -26,13 +26,13 @@ vm.runInContext(source.slice(source.indexOf("  async function installBackend("),
   context.openAddDialog();
   assert.match(html, /data-backend-key="user"/);
   assert.doesNotMatch(html, /data-backend-key="system"/);
-  assert.match(html, /data-action="setup-ttyd"/);
+  assert.match(html, /data-action="setup-opencode"/);
   await context.installBackend("user", {});
   state.addScope = "system";
   context.openAddDialog();
   assert.match(html, /catalog-installed/);
   assert.doesNotMatch(html, /data-action="install"/);
-  assert.doesNotMatch(html, /setup-ttyd/);
+  assert.doesNotMatch(html, /setup-opencode/);
   state.backends = [record("user", true), record("system", false)];
   context.openAddDialog();
   assert.match(html, /data-backend-key="system"/);

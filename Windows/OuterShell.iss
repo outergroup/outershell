@@ -56,6 +56,8 @@ Source: "{#PayloadDirectory}\FirehoseBackend.exe"; DestDir: "{app}"; Flags: igno
 Source: "{#PayloadDirectory}\firehose-web\*"; DestDir: "{app}\firehose-web"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "{#PayloadDirectory}\ProfileBackend.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#PayloadDirectory}\profile-web\*"; DestDir: "{app}\profile-web"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#PayloadDirectory}\TerminalBackend.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#PayloadDirectory}\terminal-web\*"; DestDir: "{app}\terminal-web"; Flags: ignoreversion recursesubdirs createallsubdirs
 [Registry]
 Root: HKCU; Subkey: "Environment"; ValueType: expandsz; ValueName: "Path"; ValueData: "{olddata};{app}\bin"; Check: NeedsPathEntry(ExpandConstant('{app}\bin'))
 [Code]
