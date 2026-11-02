@@ -55,6 +55,9 @@ if ($App) {
     Copy-Item "$AppRoot/Resources/$($App)Web/*" "$root/web" -Recurse -Force
     Copy-Item "$AppRoot/app-icon.png" "$root/app-icon.png" -Force
     if ($App -eq 'Top') {
+        $symbols = Join-Path $OutputDirectory "symbols/Top"
+        New-Item -ItemType Directory -Force $symbols | Out-Null
+        Copy-Item (Join-Path $CoreDirectory "TopBackend.pdb") $symbols -Force
         $index = Join-Path "$root/web" 'index.html'
         [IO.File]::WriteAllText($index, [IO.File]::ReadAllText($index).Replace('<html', '<html data-combined-processes="true"'))
     }
@@ -72,6 +75,9 @@ if ($App) {
 foreach ($file in @('OuterShell.exe', 'outerctl.exe')) {
     Copy-Item (Join-Path $CoreDirectory $file) $OutputDirectory -Force
 }
+$symbols = Join-Path $OutputDirectory 'symbols/OuterShell'
+New-Item -ItemType Directory -Force $symbols | Out-Null
+Copy-Item (Join-Path $CoreDirectory 'OuterShell.pdb') $symbols -Force
 foreach ($obsolete in @('OuterShell.Windows.Runtime.dll', 'outershell-core.dll')) {
     Remove-Item (Join-Path $OutputDirectory $obsolete) -Force -ErrorAction SilentlyContinue
 }

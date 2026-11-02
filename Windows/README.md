@@ -569,3 +569,24 @@ revision conflicts and native content delivery; optional app task lifecycle;
 Top colliding PIDs and stale-identity rejection; Docker Firehose eBPF events and
 Profile CPU samples. Profile's Linux listener and accepted sockets are now
 close-on-exec so a recording process cannot keep the helper HTTP response open.
+
+### Windows performance symbols
+
+Optimized Outer Shell and Top builds emit full PDBs, including the shared Windows
+runtime. Builds keep `symbols/OuterShell/OuterShell.pdb` and
+`symbols/Top/TopBackend.pdb` alongside the staging directories. Keep
+that exact PDB with its matching signed executable; a later build's PDB cannot
+symbolize an earlier binary.
+
+On the recording/analysis machine, index both files with:
+
+```powershell
+python Top/Windows/install_symbols.py TopBackend.exe TopBackend.pdb --store C:\Symbols
+python Top/Windows/install_symbols.py OuterShell.exe OuterShell.pdb --store C:\Symbols
+```
+
+The installer checks the executable and PDB GUID/age before copying into the
+standard symbol-store layout. Add `srv*C:\Symbols` to WPA's symbol paths, ahead
+of `srv*C:\Symbols*https://msdl.microsoft.com/download/symbols`. This may also
+be set in the user's `_NT_SYMBOL_PATH` for future WPA launches. In an already
+running WPA, use Trace > Configure Symbol Paths, then Trace > Load Symbols.

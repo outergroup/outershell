@@ -342,11 +342,12 @@ final class SingleLineTextInputController<DelegateClass: SingleLineTextInputCont
     func selectWord(at position: Int) {
         guard isFocused else { return }
         clearMarkedTextState()
-        let clamped = clamp(position)
-        let start = findPreviousWordBoundary(from: clamped)
-        let end = findNextWordBoundary(from: clamped)
-        selectionAnchor = start
-        cursorPosition = end
+        if masksWordBoundaries { selectAll(); return }
+        guard !text.isEmpty else { return }
+        let offset = stringIndex(forCharacterIndex: clamp(position)).utf16Offset(in: text)
+        let range = NSAttributedString(string: text).doubleClick(at: min(offset, text.utf16.count - 1))
+        selectionAnchor = characterIndexForUTF16(range.location)
+        cursorPosition = characterIndexForUTF16(NSMaxRange(range))
         notifyStateChanged()
     }
 
@@ -628,56 +629,15 @@ final class SingleLineTextInputController<DelegateClass: SingleLineTextInputCont
     }
 
     private func findPreviousWordBoundary(from position: Int) -> Int {
-        guard !text.isEmpty else { return 0 }
-        let clamped = clamp(position)
-        if clamped == 0 { return 0 }
         if masksWordBoundaries { return 0 }
-
-        let cfString = text as CFString
-        let tokenizer = CFStringTokenizerCreate(kCFAllocatorDefault,
-                                                cfString,
-                                                CFRangeMake(0, text.utf16.count),
-                                                kCFStringTokenizerUnitWordBoundary,
-                                                nil)
-
-        var previousBoundary = 0
-        var tokenType = CFStringTokenizerAdvanceToNextToken(tokenizer)
-        while tokenType.rawValue != 0 {
-            let range = CFStringTokenizerGetCurrentTokenRange(tokenizer)
-            let tokenEnd = range.location + range.length
-            let characterIndex = characterIndexForUTF16(tokenEnd)
-            if characterIndex >= clamped {
-                break
-            }
-            previousBoundary = characterIndex
-            tokenType = CFStringTokenizerAdvanceToNextToken(tokenizer)
-        }
-        return previousBoundary
+        let offset = stringIndex(forCharacterIndex: clamp(position)).utf16Offset(in: text)
+        return characterIndexForUTF16(NSAttributedString(string: text).nextWord(from: offset, forward: false))
     }
 
     private func findNextWordBoundary(from position: Int) -> Int {
-        guard !text.isEmpty else { return 0 }
-        let clamped = clamp(position)
-        if clamped >= text.count { return text.count }
         if masksWordBoundaries { return text.count }
-
-        let cfString = text as CFString
-        let tokenizer = CFStringTokenizerCreate(kCFAllocatorDefault,
-                                                cfString,
-                                                CFRangeMake(0, text.utf16.count),
-                                                kCFStringTokenizerUnitWordBoundary,
-                                                nil)
-
-        var tokenType = CFStringTokenizerAdvanceToNextToken(tokenizer)
-        while tokenType.rawValue != 0 {
-            let range = CFStringTokenizerGetCurrentTokenRange(tokenizer)
-            let characterIndex = characterIndexForUTF16(range.location + range.length)
-            if characterIndex > clamped {
-                return characterIndex
-            }
-            tokenType = CFStringTokenizerAdvanceToNextToken(tokenizer)
-        }
-        return text.count
+        let offset = stringIndex(forCharacterIndex: clamp(position)).utf16Offset(in: text)
+        return characterIndexForUTF16(NSAttributedString(string: text).nextWord(from: offset, forward: true))
     }
 
     private func stringIndex(forCharacterIndex index: Int) -> String.Index {

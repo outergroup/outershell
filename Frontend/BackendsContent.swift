@@ -2356,6 +2356,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private let horizontalInset: CGFloat = 18
     private let createBottomInset: CGFloat = 18
     private let textCaretBlinkAnimationKey = "textCaretBlink"
+    private var textCaretBlinkStartTime = CACurrentMediaTime() + 0.55
+    private let textCaretLayers = NSHashTable<CALayer>.weakObjects()
     init(outerframeHost: OuterframeHost, appConnection: OuterframeAppConnection) {
         self.outerframeHost = outerframeHost
         self.appConnection = appConnection
@@ -2368,7 +2370,30 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         retainedSelf = self
     }
 
+    private func resetTextCaretBlink() {
+        textCaretBlinkStartTime = CACurrentMediaTime() + 0.55
+        let caretLayers = textCaretLayers.allObjects
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        for caret in caretLayers {
+            guard let animation = caret.animation(forKey: textCaretBlinkAnimationKey)?.copy() as? CAAnimation else { continue }
+            caret.removeAnimation(forKey: textCaretBlinkAnimationKey)
+            caret.opacity = 1
+            animation.beginTime = textCaretBlinkStartTime
+            caret.add(animation, forKey: textCaretBlinkAnimationKey)
+        }
+        CATransaction.commit()
+    }
+
     func outerframeHost(_ host: OuterframeHost, didReceiveMessage message: BrowserToContentMessage) {
+        switch message {
+        case .keyDown, .textInput, .setMarkedText, .textCommand, .setCursorPosition,
+             .mouseDown, .mouseDragged, .pasteboardContentPasted, .pasteboardContentDropped,
+             .contextMenuItemSelected, .accessibilityActionAndSnapshot:
+            resetTextCaretBlink()
+        default:
+            break
+        }
         switch message {
         case .initializeContent(let arguments):
             if let data = arguments.data,
@@ -12392,11 +12417,12 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         animation.fromValue = 1
         animation.toValue = 0
         animation.duration = 0.55
-        animation.beginTime = CACurrentMediaTime() + 0.55
+        animation.beginTime = textCaretBlinkStartTime
         animation.autoreverses = true
         animation.repeatCount = .infinity
         animation.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
         caret.add(animation, forKey: textCaretBlinkAnimationKey)
+        textCaretLayers.add(caret)
         layer.addSublayer(caret)
     }
 
