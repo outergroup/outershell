@@ -222,7 +222,6 @@ private struct SafeSpaceRecipeCatalogItem {
     let liveCommand: String?
     let dockerfileFragment: String?
     let isEditable: Bool
-    let bundledPayloadName: String?
     let ociImageReference: String?
     let ociImageBuildCommand: String?
 }
@@ -2313,7 +2312,6 @@ final class SafeSpaceManager: @unchecked Sendable {
             "--init",
             "--label", "org.outershell.safe-space=\(record.id.uuidString)",
             "--label", "org.outershell.container-id=\(record.id.uuidString)",
-            "--volume", "\(base.appendingPathComponent("Runtime/PiAgent").path):/var/lib/outershell/pi-agent",
             "--volume", "\(try recipeDirectory(record.id).path):/var/lib/outershell/project"
         ]
         for user in recipe.users ?? [] {
@@ -2334,10 +2332,7 @@ final class SafeSpaceManager: @unchecked Sendable {
             for: record,
             imageReference: imageReference
         )
-        var occupiedGuestPaths: Set<String> = [
-            "/var/lib/outershell/pi-agent",
-            "/var/lib/outershell/project"
-        ]
+        var occupiedGuestPaths: Set<String> = ["/var/lib/outershell/project"]
         occupiedGuestPaths.formUnion((recipe.mounts ?? []).map(\.guestPath))
         occupiedGuestPaths.formUnion((recipe.users ?? []).compactMap { user in
             user.name == "workspace" ? user.workingDirectory : nil
@@ -2378,7 +2373,6 @@ final class SafeSpaceManager: @unchecked Sendable {
             "--init",
             "--label", "org.outershell.safe-space=\(record.id.uuidString)",
             "--label", "org.outershell.container-id=\(record.id.uuidString)",
-            "--volume", "\(base.appendingPathComponent("Runtime/PiAgent").path):/var/lib/outershell/pi-agent",
             "--volume", "\(try recipeDirectory(record.id).path):/var/lib/outershell/project"
         ]
         for user in recipe.users ?? [] where user.name == "workspace" {
@@ -2396,9 +2390,7 @@ final class SafeSpaceManager: @unchecked Sendable {
             for: record,
             imageReference: imageReference
         )
-        var occupiedGuestPaths: Set<String> = [
-            "/var/lib/outershell/pi-agent", "/var/lib/outershell/project"
-        ]
+        var occupiedGuestPaths: Set<String> = ["/var/lib/outershell/project"]
         occupiedGuestPaths.formUnion((recipe.mounts ?? []).map(\.guestPath))
         occupiedGuestPaths.formUnion((recipe.users ?? []).compactMap {
             $0.name == "workspace" ? $0.workingDirectory : nil
@@ -4486,7 +4478,7 @@ final class SafeSpaceManager: @unchecked Sendable {
     }
 
     private func recipeCatalog() -> [SafeSpaceRecipeCatalogItem] {
-        let bundledApps = [
+        return [
             ("files", "Files", "Browse and manage files in this container.",
              "org.outershell.Files", "Files", "FilesBackend"),
             ("plaintext", "Plaintext", "Read and edit text files.",
@@ -4518,27 +4510,10 @@ final class SafeSpaceManager: @unchecked Sendable {
                 ),
                 dockerfileFragment: "COPY --from=\(imageReference) /outershell-rootfs/ /",
                 isEditable: false,
-                bundledPayloadName: nil,
                 ociImageReference: imageReference,
                 ociImageBuildCommand: installCommand
             )
         }
-        return bundledApps + [
-            SafeSpaceRecipeCatalogItem(
-                id: "outershell.agentdiy",
-                displayName: "Container Agent",
-                summary: "A root-capable Pi assistant that can install software and build this container recipe.",
-                kind: .bundledApp,
-                serviceID: "org.outershell.AgentDIY",
-                command: "",
-                liveCommand: nil,
-                dockerfileFragment: "COPY --from=ghcr.io/outergroup/outershell-app-container-agent:\(bundledAppOCIImageVersion) /outershell-rootfs/ /",
-                isEditable: false,
-                bundledPayloadName: "AgentDIY",
-                ociImageReference: "ghcr.io/outergroup/outershell-app-container-agent:\(bundledAppOCIImageVersion)",
-                ociImageBuildCommand: agentDIYRecipeCommand()
-            )
-        ]
     }
 
     private func recipeAppLiveCommand(command: String,
@@ -4555,249 +4530,6 @@ final class SafeSpaceManager: @unchecked Sendable {
         /bin/mkdir -p /etc/outershell/apps.d
         /bin/mkdir -p /var/lib/outershell/services /var/lib/outershell/apps
         /bin/mkdir -p /root/.local/share/jupyter /root/.cache
-        """
-    }
-
-    private func agentDIYRecipeCommand() -> String {
-        let serviceID = "org.outershell.AgentDIY"
-        let appDirectory = "/opt/outershell/apps/org.outershell.AgentDIY"
-        let socketPath = "/run/user/0/org.outershell.agentdiy"
-        let serviceFile = "/var/lib/outershell/services/\(serviceID).outerservice"
-        let logDirectory = "/var/lib/outershell/apps/\(serviceID)"
-        let registration = recipeAppRegistrationCommand(
-            displayName: "Container Agent",
-            serviceID: serviceID,
-            socketPath: socketPath,
-            iconPath: "\(appDirectory)/app-icon.png"
-        )
-        return """
-        set -eu
-        /usr/bin/apt-get update
-        /usr/bin/apt-get install -y --no-install-recommends ca-certificates curl sudo xz-utils
-        /bin/rm -rf /var/lib/apt/lists/*
-        node_version=22.23.2
-        case "$(/usr/bin/dpkg --print-architecture)" in
-            arm64)
-                node_arch=arm64
-                node_sha256=fff4078c5def658577f92c88db7db3bc0072924bfb93fe52c1e744a54e94abb8
-                ;;
-            amd64)
-                node_arch=x64
-                node_sha256=d60acfe00a2932254bb0ad20e01b0d74397a0875595de719654b214f4b03f307
-                ;;
-            *)
-                /usr/bin/printf 'Unsupported architecture for Container Agent.\n' >&2
-                exit 1
-                ;;
-        esac
-        node_archive="node-v${node_version}-linux-${node_arch}.tar.xz"
-        /usr/bin/curl --fail --location --silent --show-error \
-            "https://nodejs.org/dist/v${node_version}/${node_archive}" \
-            --output "/tmp/${node_archive}"
-        /usr/bin/printf '%s  %s\n' "${node_sha256}" "/tmp/${node_archive}" | \
-            /usr/bin/sha256sum --check --status
-        /bin/tar -xJf "/tmp/${node_archive}" --strip-components=1 -C /usr/local
-        /bin/rm -f "/tmp/${node_archive}"
-        /usr/local/bin/npm install --global --ignore-scripts \
-            @earendil-works/pi-coding-agent@0.84.1
-
-        /bin/cat >/usr/local/bin/outershell-app <<'OUTERSHELL_APP_HELPER'
-        #!/bin/sh
-        set -eu
-
-        operation=${1:-}
-        case "${operation}" in
-            publish|register-live) shift ;;
-            *)
-                /usr/bin/printf '%s\n' \
-                    'Usage: outershell-app publish --id ID --name NAME --service-file PATH --socket PATH [--url PATH] [--log PATH] [--icon PATH]' >&2
-                exit 64
-                ;;
-        esac
-
-        service_id=
-        display_name=
-        service_file=
-        socket_path=
-        frontend_url=/
-        log_path=
-        icon_path=
-        while [ "$#" -gt 0 ]; do
-            option=$1
-            [ "$#" -ge 2 ] || {
-                /usr/bin/printf 'Missing value for %s\n' "${option}" >&2
-                exit 64
-            }
-            value=$2
-            shift 2
-            case "${option}" in
-                --id) service_id=${value} ;;
-                --name) display_name=${value} ;;
-                --service-file) service_file=${value} ;;
-                --socket) socket_path=${value} ;;
-                --url) frontend_url=${value} ;;
-                --log) log_path=${value} ;;
-                --icon) icon_path=${value} ;;
-                *)
-                    /usr/bin/printf 'Unknown option: %s\n' "${option}" >&2
-                    exit 64
-                    ;;
-            esac
-        done
-
-        case "${service_id}" in
-            ''|*[!A-Za-z0-9._-]*)
-                /usr/bin/printf 'The app identifier is invalid.\n' >&2
-                exit 64
-                ;;
-        esac
-        [ -n "${display_name}" ] && [ -n "${service_file}" ] && [ -n "${socket_path}" ] || {
-            /usr/bin/printf 'The app name, service file, and socket are required.\n' >&2
-            exit 64
-        }
-        case "${service_file}:${socket_path}" in
-            *[![:print:]]*|*'\t'*|*'\n'*)
-                /usr/bin/printf 'App paths must be single-line printable text.\n' >&2
-                exit 64
-                ;;
-        esac
-        case "${service_file}" in /*) ;; *) exit 64 ;; esac
-        case "${socket_path}" in /*) ;; *) exit 64 ;; esac
-
-        append_argument() {
-            escaped=$(/usr/bin/printf '%s' "$1" | /usr/bin/sed "s/'/'\\\\''/g")
-            /usr/bin/printf " '%s'" "${escaped}"
-        }
-
-        if [ "${operation}" = publish ]; then
-            /bin/mkdir -p /etc/outershell/apps.d
-            registration=/etc/outershell/apps.d/${service_id}.sh
-            temporary=${registration}.tmp.$$
-            {
-                /usr/bin/printf '%s\n%s' '#!/bin/sh' \
-                    'exec /usr/local/bin/outershell-app register-live'
-                append_argument --id
-                append_argument "${service_id}"
-                append_argument --name
-                append_argument "${display_name}"
-                append_argument --service-file
-                append_argument "${service_file}"
-                append_argument --socket
-                append_argument "${socket_path}"
-                append_argument --url
-                append_argument "${frontend_url}"
-                if [ -n "${log_path}" ]; then
-                    append_argument --log
-                    append_argument "${log_path}"
-                fi
-                if [ -n "${icon_path}" ]; then
-                    append_argument --icon
-                    append_argument "${icon_path}"
-                fi
-                /usr/bin/printf '\n'
-            } >"${temporary}"
-            /bin/chmod 0755 "${temporary}"
-            /bin/mv -f "${temporary}" "${registration}"
-            [ -S /run/user/0/outershelld-api ] || exit 0
-        fi
-
-        export HOME=/root
-        export USER=root
-        export LOGNAME=root
-        export XDG_RUNTIME_DIR=/run/user/0
-        export OUTERSHELLD_API_SOCKET=/run/user/0/outershelld-api
-        outerctl=/usr/local/bin/outerctl
-        "${outerctl}" backend upsert \
-            --backend "${service_id}" \
-            --name "${display_name}" \
-            --service-file "${service_file}" \
-            --outershell-owns true
-        set -- app upsert \
-            --backend "${service_id}" \
-            --frontend-id "${service_id}:main" \
-            --socket-path "${socket_path}" \
-            --name "${display_name}" \
-            --url "${frontend_url}"
-        if [ -n "${icon_path}" ]; then set -- "$@" --icon-path "${icon_path}"; fi
-        "${outerctl}" "$@"
-        if [ -n "${log_path}" ]; then
-            "${outerctl}" log add --backend "${service_id}" --path "${log_path}"
-        fi
-        OUTERSHELL_APP_HELPER
-        /bin/chmod 0755 /usr/local/bin/outershell-app
-
-        /bin/chmod 0755 \(appDirectory)/AgentDIYBackend
-        /bin/mkdir -p \(logDirectory) "$(/usr/bin/dirname \(serviceFile))"
-        /bin/cat >\(appDirectory)/AGENTS.md <<'OUTERSHELL_PI_CONTEXT'
-        This container is reproducibly built from the Dockerfile at
-        /var/lib/outershell/project/Dockerfile. The containing directory is the OCI
-        build context and is mounted read-write from the host for root processes.
-
-        When changing the environment, make the change in the running container and
-        add the equivalent portable, idempotent Dockerfile instructions. Edit the
-        Dockerfile directly; do not introduce a parallel recipe or setup-script
-        system. Do not add host mounts, because those remain host configuration.
-
-        Apps in this container are portable services owned by its outershelld. To add
-        an app, create its .outerservice and log from Dockerfile instructions, then
-        arrange for `outershell-app publish` during the image build. That command records a startup
-        announcement, registers the app immediately through the inner outershelld API,
-        and starts services whose .outerservice says `Start=eager`. Run the saved root
-        equivalent commands once in the live container so the change appears immediately.
-        Never restart or kill outershelld to make it discover an app.
-
-        A JupyterLab launcher should use a distinct stable identifier and Unix socket,
-        disable token/password authentication, and set its requested root directory.
-        Its recipe step should end with commands equivalent to:
-
-            /usr/local/bin/outershell-app publish \\
-                --id org.outershell.JupyterLab.hello \\
-                --name 'JupyterLab: hello' \\
-                --service-file /var/lib/outershell/services/org.outershell.JupyterLab.hello.outerservice \\
-                --socket /run/user/0/org.outershell.JupyterLab.hello \\
-                --url /lab \\
-                --log /var/lib/outershell/apps/org.outershell.JupyterLab.hello/backend.log
-
-        The container service manager runs as root. Do not create users or switch a
-        service to another account unless the user explicitly asks for that design.
-        OUTERSHELL_PI_CONTEXT
-        /bin/cat >\(appDirectory)/run-as-root <<'OUTERSHELL_AGENTDIY_RUNNER'
-        #!/bin/sh
-        set -eu
-        umask 077
-        export HOME=/root
-        export USER=root
-        export LOGNAME=root
-        export PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin
-        export PI_CODING_AGENT_DIR=/var/lib/outershell/pi-agent
-        /bin/mkdir -p "${PI_CODING_AGENT_DIR}"
-        /bin/cp /opt/outershell/apps/org.outershell.AgentDIY/AGENTS.md \
-            "${PI_CODING_AGENT_DIR}/AGENTS.md"
-        exec /opt/outershell/apps/org.outershell.AgentDIY/AgentDIYBackend \
-            --socket /run/user/0/org.outershell.agentdiy \
-            --root /opt/outershell/apps/org.outershell.AgentDIY \
-            --workspace /root
-        OUTERSHELL_AGENTDIY_RUNNER
-        /bin/chmod 0755 \(appDirectory)/run-as-root
-        /bin/touch \(logDirectory)/backend.log
-        /bin/chmod 0644 \(logDirectory)/backend.log
-        /bin/cat >\(serviceFile) <<'OUTERSHELL_SERVICE'
-        [Service]
-        Format=1
-        Name=Container Agent
-        Executable=/opt/outershell/apps/org.outershell.AgentDIY/run-as-root
-        WorkingDirectory=/root
-        EnvironmentPolicy=clean
-        Start=manual
-        Restart=on-failure
-        RestartDelayMilliseconds=1000
-        StopTimeoutMilliseconds=10000
-        LogPath=\(logDirectory)/backend.log
-        OUTERSHELL_SERVICE
-        /bin/cat >/etc/outershell/apps.d/\(serviceID).sh <<'OUTERSHELL_REGISTRATION'
-        \(registration)
-        OUTERSHELL_REGISTRATION
-        /bin/chmod 0755 /etc/outershell/apps.d/\(serviceID).sh
         """
     }
 
@@ -5893,24 +5625,6 @@ final class SafeSpaceManager: @unchecked Sendable {
         }
     }
 
-    private func bundledRecipePayloadURL(named name: String) -> URL? {
-        let architecture = cpuArchitecture() == "arm64" ? "linux-aarch64" : "linux-x86_64"
-        let candidates = [
-            Bundle.main.resourceURL?
-                .appendingPathComponent("bundled-apps", isDirectory: true)
-                .appendingPathComponent(name, isDirectory: true)
-                .appendingPathComponent(architecture, isDirectory: true),
-            URL(fileURLWithPath: FileManager.default.currentDirectoryPath,
-                isDirectory: true)
-                .appendingPathComponent("build/run/bundled-apps", isDirectory: true)
-                .appendingPathComponent(name, isDirectory: true)
-                .appendingPathComponent(architecture, isDirectory: true)
-        ].compactMap { $0 }
-        return candidates.first {
-            FileManager.default.fileExists(atPath: $0.path)
-        }
-    }
-
     private func recipeResourceKey(_ id: UUID) -> String {
         "containers/\(id.uuidString.lowercased())/recipe"
     }
@@ -5921,13 +5635,11 @@ final class SafeSpaceManager: @unchecked Sendable {
 
     private func createManagedDirectories(for record: SafeSpaceRecord) throws {
         let base = try safeSpaceDirectory(record.id)
-        for name in ["Runtime/PiAgent", "Persistent Data"] {
-            try FileManager.default.createDirectory(
-                at: base.appendingPathComponent(name, isDirectory: true),
-                withIntermediateDirectories: true,
-                attributes: [.posixPermissions: 0o700]
-            )
-        }
+        try FileManager.default.createDirectory(
+            at: base.appendingPathComponent("Persistent Data", isDirectory: true),
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
     }
 
     private func persistentDataDirectory(
@@ -6795,31 +6507,11 @@ final class SafeSpaceManager: @unchecked Sendable {
             encoding: .utf8
         )
         var installerInstructions = [
-            "FROM debian:bookworm AS installer"
-        ]
-        if let payloadName = item.bundledPayloadName {
-            guard let source = bundledRecipePayloadURL(named: payloadName) else {
-                throw SafeSpaceManagerError.commandFailed(
-                    "Outer Shell does not include the \(payloadName) container payload."
-                )
-            }
-            let assets = directory.appendingPathComponent("assets", isDirectory: true)
-            try FileManager.default.createDirectory(at: assets,
-                                                    withIntermediateDirectories: true,
-                                                    attributes: [.posixPermissions: 0o700])
-            try FileManager.default.copyItem(
-                at: source,
-                to: assets.appendingPathComponent(payloadName, isDirectory: true)
-            )
-            installerInstructions.append(
-                "COPY --chmod=0755 assets/\(payloadName) /opt/outershell/apps/\(item.serviceID)"
-            )
-        }
-        installerInstructions.append(contentsOf: [
+            "FROM debian:bookworm AS installer",
             "COPY --chmod=0755 install.sh /tmp/outershell-install-app.sh",
             "RUN /tmp/outershell-install-app.sh && rm -f /tmp/outershell-install-app.sh",
             "FROM scratch"
-        ])
+        ]
         for path in bundledAppOCIPayloadPaths(item) {
             installerInstructions.append(
                 "COPY --from=installer \(path) /outershell-rootfs\(path)"
@@ -6844,23 +6536,11 @@ final class SafeSpaceManager: @unchecked Sendable {
     private func bundledAppOCIPayloadPaths(
         _ item: SafeSpaceRecipeCatalogItem
     ) -> [String] {
-        var paths = [
+        [
             "/var/lib/outershell/apps/\(item.serviceID)",
             "/var/lib/outershell/services/\(item.serviceID).outerservice",
             "/etc/outershell/apps.d/\(item.serviceID).sh"
         ]
-        if item.id == "outershell.agentdiy" {
-            paths.append(contentsOf: [
-                "/opt/outershell/apps/\(item.serviceID)",
-                "/usr/local/bin/node",
-                "/usr/local/bin/npm",
-                "/usr/local/bin/npx",
-                "/usr/local/bin/pi",
-                "/usr/local/bin/outershell-app",
-                "/usr/local/lib/node_modules"
-            ])
-        }
-        return paths
     }
 
     private func cpuArchitecture() -> String {

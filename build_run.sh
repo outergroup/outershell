@@ -206,24 +206,6 @@ for architecture in aarch64 x86_64; do
     cp "${socket_bridge}" "${run_destination}/outer-socket-bridge"
 done
 rm -rf "${BUILD_ROOT}/${CONFIGURATION}/Outer Shell.app/Contents/Resources/bundled-apps"
-agentdiy_payload="${AGENTDIY_PAYLOAD_DIR:-${SCRIPT_DIR}/../AgentDIY/build/payload}"
-if [[ -x "${agentdiy_payload}/AgentDIYBackend" ]]; then
-    agentdiy_file_info="$(/usr/bin/file "${agentdiy_payload}/AgentDIYBackend")"
-    if [[ "${agentdiy_file_info}" == *"aarch64"* || "${agentdiy_file_info}" == *"arm64"* ]]; then
-        agentdiy_platform="linux-aarch64"
-    elif [[ "${agentdiy_file_info}" == *"x86-64"* || "${agentdiy_file_info}" == *"x86_64"* ]]; then
-        agentdiy_platform="linux-x86_64"
-    else
-        echo "Unsupported Container Agent backend architecture: ${agentdiy_file_info}" >&2
-        exit 1
-    fi
-    agentdiy_resource="${BUILD_ROOT}/${CONFIGURATION}/Outer Shell.app/Contents/Resources/bundled-apps/AgentDIY/${agentdiy_platform}"
-    mkdir -p "${agentdiy_resource}"
-    cp -R "${agentdiy_payload}/." "${agentdiy_resource}/"
-else
-    echo "Container Agent payload is missing; build Container Agent before Outer Shell." >&2
-    exit 1
-fi
 /usr/bin/codesign --force --sign - \
     --entitlements "${SCRIPT_DIR}/Agent/OuterShellAgent.entitlements" \
     "${BUILD_ROOT}/${CONFIGURATION}/Outer Shell.app"
