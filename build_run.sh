@@ -189,7 +189,7 @@ for architecture in aarch64 x86_64; do
             exit 1
         fi
     done
-    socket_bridge="${linux_root}/${architecture}/outer-socket-bridge"
+    socket_bridge="${linux_root}/${architecture}/outershell-socket-bridge"
     if [[ ! -x "${socket_bridge}" ]]; then
         echo "Missing Outer Shell container socket bridge: ${socket_bridge}" >&2
         echo "Build the ${architecture} Linux resources before building Outer Shell." >&2
@@ -202,8 +202,8 @@ for architecture in aarch64 x86_64; do
         "${destination}/"
     cp "${linux_root}/${architecture}/outershelld" "${linux_root}/${architecture}/outerctl" \
         "${run_destination}/"
-    cp "${socket_bridge}" "${destination}/outer-socket-bridge"
-    cp "${socket_bridge}" "${run_destination}/outer-socket-bridge"
+    cp "${socket_bridge}" "${destination}/outershell-socket-bridge"
+    cp "${socket_bridge}" "${run_destination}/outershell-socket-bridge"
 done
 rm -rf "${BUILD_ROOT}/${CONFIGURATION}/Outer Shell.app/Contents/Resources/bundled-apps"
 /usr/bin/codesign --force --sign - \

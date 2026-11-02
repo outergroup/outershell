@@ -225,8 +225,13 @@ static bool bundled_control(ShellHost *s, const BundledApp *app,
     char *task = bundled_task_name(app), *pipe = win_pipe(app->id);
     HRESULT hr = E_INVALIDARG;
     bool ok = false;
-    bool install = !strcmp(operation, "install"),
+    bool install = !strcmp(operation, "install") || !strcmp(operation, "installUser") ||
+                   !strcmp(operation, "run") || !strcmp(operation, "runUser"),
          remove = !strcmp(operation, "uninstall");
+    if (!strcmp(operation, "installRoot") || !strcmp(operation, "runRoot")) {
+        snprintf(error, capacity, "%s cannot be installed with administrator privileges on Windows.", app->name);
+        goto done;
+    }
     if (install) {
         if (!bundled_download(s, app, error, capacity))
             goto done;
@@ -264,6 +269,8 @@ static bool bundled_control(ShellHost *s, const BundledApp *app,
         command_xml_text(&xml, directory);
         sb_append(&xml, "</WorkingDirectory></Exec></Actions></Task>");
         hr = command_task(task, "register-core", xml.data, NULL);
+        if (SUCCEEDED(hr) && (!strcmp(operation, "run") || !strcmp(operation, "runUser")))
+            hr = command_task(task, "start", NULL, NULL);
         free(xml.data);
         free(directory);
         free(path);
@@ -282,8 +289,9 @@ static bool bundled_control(ShellHost *s, const BundledApp *app,
     if (remove && hr == HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND))
         hr = S_OK;
     if (FAILED(hr)) {
-        snprintf(error, capacity, "Windows could not %s %s (0x%08lx).",
-                 operation, app->name, (unsigned long)hr);
+        char reason[512];
+        win_hresult_text(hr, reason, sizeof(reason));
+        snprintf(error, capacity, "Windows could not %s %s: %s", operation, app->name, reason);
         goto done;
     }
     ok = true;
@@ -321,15 +329,23 @@ done:
     return ok;
 }
 
-// Installs from before apps were downloaded have tasks for programs that came
-// with Outer Shell. Download those apps again.
+// Download apps that are installed but whose program is missing: installs from
+// before apps were downloaded, and reinstalls after an uninstall, which removes
+// the apps' programs and tasks but keeps the app registry.
 static DWORD WINAPI bundled_migrate(void *context) {
     ShellHost *s = context;
+    bool registered[sizeof(bundled_apps) / sizeof(*bundled_apps)] = {0};
+    RegistryStore store;
+    if (store_open(s, &store, false)) {
+        for (size_t i = 0; i < sizeof(bundled_apps) / sizeof(*bundled_apps); i++)
+            registered[i] = registry_store_find_backend(&store, bundled_apps[i].id) != NULL;
+        store_close(s, &store, false);
+    }
     for (size_t i = 0; i < sizeof(bundled_apps) / sizeof(*bundled_apps); i++) {
         const BundledApp *app = &bundled_apps[i];
         char *task = bundled_task_name(app), *path = bundled_executable(s, app);
         DWORD state = 0;
-        if (task && !path && SUCCEEDED(command_task(task, "query", NULL, &state))) {
+        if (task && !path && (registered[i] || SUCCEEDED(command_task(task, "query", NULL, &state)))) {
             char error[512] = "";
             if (!bundled_control(s, app, "install", error, sizeof(error)))
                 log_error(s, error);

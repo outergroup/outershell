@@ -59,9 +59,9 @@ enum SafeSpaceSocketRelayError: Error, LocalizedError {
         case .sudoPasswordRequired:
             return "A sudo password is required to start the root socket bridge."
         case .missingHelper:
-            return "The bundled outer-socket-bridge helper is missing."
+            return "The bundled outershell-socket-bridge helper is missing."
         case .helperNotExecutable(let path):
-            return "The bundled outer-socket-bridge helper is not executable at \(path)."
+            return "The bundled outershell-socket-bridge helper is not executable at \(path)."
         case .listenFailed(let message):
             return "Failed to start the local root socket proxy: \(message)"
         case .sudoValidationFailed(let message):
@@ -338,7 +338,7 @@ final class SafeSpaceSocketRelayConnection: @unchecked Sendable {
             "LOGNAME=\(user)",
             "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
             "XDG_RUNTIME_DIR=/run/user/\(runtimeUserID)",
-            "/usr/local/bin/outer-socket-bridge",
+            "/usr/local/bin/outershell-socket-bridge",
             "bridge",
             "--socket",
             socketPath
@@ -429,9 +429,9 @@ final class SafeSpaceSocketRelayConnection: @unchecked Sendable {
     private static func helperURL() throws -> URL {
         let executableDirectory = Bundle.main.executableURL?.deletingLastPathComponent()
         var candidates = [
-            executableDirectory?.appendingPathComponent("outer-socket-bridge"),
-            Bundle.main.url(forResource: "outer-socket-bridge", withExtension: nil),
-            Bundle.main.resourceURL?.appendingPathComponent("outer-socket-bridge")
+            executableDirectory?.appendingPathComponent("outershell-socket-bridge"),
+            Bundle.main.url(forResource: "outershell-socket-bridge", withExtension: nil),
+            Bundle.main.resourceURL?.appendingPathComponent("outershell-socket-bridge")
         ].compactMap { $0 }
         if let executableDirectory,
            executableDirectory.lastPathComponent == "MacOS",
@@ -446,7 +446,7 @@ final class SafeSpaceSocketRelayConnection: @unchecked Sendable {
                 .deletingLastPathComponent()
                 .deletingLastPathComponent()
                 .appendingPathComponent("MacOS", isDirectory: true)
-            candidates.append(appMacOSDirectory.appendingPathComponent("outer-socket-bridge"))
+            candidates.append(appMacOSDirectory.appendingPathComponent("outershell-socket-bridge"))
         }
 
         for url in candidates {
@@ -519,7 +519,7 @@ final class SafeSpaceSocketRelayConnection: @unchecked Sendable {
                     guard !bridge.closed, !data.isEmpty else { return }
                     bridge.stderr.append(data)
                     if let text = String(data: data, encoding: .utf8), !text.isEmpty {
-                        safeSpaceSocketRelayLogger.error("outer-socket-bridge stderr: \(text, privacy: .public)")
+                        safeSpaceSocketRelayLogger.error("outershell-socket-bridge stderr: \(text, privacy: .public)")
                     }
                 }
             }

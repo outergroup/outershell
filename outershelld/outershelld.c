@@ -1055,6 +1055,7 @@ static const char *kSystemOuterShellRoot = "/var/lib/outershell";
 static char g_registry_database_path[PATH_MAX] = "";
 static char g_system_registry_database_path[PATH_MAX] = "";
 static char g_bundled_apps_directory[PATH_MAX] = "";
+static char g_web_root_directory[PATH_MAX] = "";
 static char g_home_screen_public_base_url[2048] = "";
 static char g_listen_socket_path[PATH_MAX] = "";
 static char g_api_socket_path[PATH_MAX] = "";
@@ -4294,12 +4295,16 @@ static bool build_backend_payload(const char *service_id,
                                   StringBuilder *log_files_array,
                                   StringBuilder *payload) {
     char icon_path[PATH_MAX] = "";
-    if (flags & BACKEND_FLAG_IS_BUNDLED) {
-        char root[PATH_MAX];
-        bundled_apps_root(root, sizeof(root));
-        char parent[PATH_MAX];
-        parent_directory(root, parent, sizeof(parent));
-        snprintf(icon_path, sizeof(icon_path), "%s/web/icons/%s.png", parent, service_id);
+    if ((flags & BACKEND_FLAG_IS_BUNDLED) || is_home_screen_service_id(service_id)) {
+        if (g_web_root_directory[0]) {
+            snprintf(icon_path, sizeof(icon_path), "%s/icons/%s.png", g_web_root_directory, service_id);
+        } else {
+            char root[PATH_MAX];
+            bundled_apps_root(root, sizeof(root));
+            char parent[PATH_MAX];
+            parent_directory(root, parent, sizeof(parent));
+            snprintf(icon_path, sizeof(icon_path), "%s/web/icons/%s.png", parent, service_id);
+        }
     }
     if (!binary_append_zero(payload, 124)) return false;
     return binary_append_string_ref_at(payload, 0, service_id) &&
@@ -14268,7 +14273,7 @@ static void run_api_reactor(int api_listener) {
 }
 
 static void outershelld_usage(const char *program) {
-    fprintf(stderr, "Usage: %s [--api-socket-path PATH] [--database PATH] [--system-database PATH] [--bundled-apps-dir DIR] [--public-base-url URL] [--service-manager system|internal] [--services-dir DIR] [--stay-alive]\n", program);
+    fprintf(stderr, "Usage: %s [--api-socket-path PATH] [--database PATH] [--system-database PATH] [--bundled-apps-dir DIR] [--web-root DIR] [--public-base-url URL] [--service-manager system|internal] [--services-dir DIR] [--stay-alive]\n", program);
 }
 
 static void initialize_runtime_paths(char *api_socket_path, size_t api_socket_path_size) {
@@ -14298,6 +14303,8 @@ int OuterShelldMain(int argc, char **argv) {
             expand_tilde_path(argv[++i], api_socket_path, sizeof(api_socket_path));
         } else if (strcmp(argv[i], "--bundled-apps-dir") == 0 && i + 1 < argc) {
             expand_tilde_path(argv[++i], g_bundled_apps_directory, sizeof(g_bundled_apps_directory));
+        } else if (strcmp(argv[i], "--web-root") == 0 && i + 1 < argc) {
+            expand_tilde_path(argv[++i], g_web_root_directory, sizeof(g_web_root_directory));
         } else if (strcmp(argv[i], "--app-base-url") == 0 && i + 1 < argc) {
             i++;
         } else if (strcmp(argv[i], "--public-base-url") == 0 && i + 1 < argc) {

@@ -80,10 +80,10 @@ The script writes binaries to:
 ```text
 build/linux-package/RemoteLinuxBinaries/<arch>/outershelld
 build/linux-package/RemoteLinuxBinaries/<arch>/outerctl
-build/linux-package/RemoteLinuxBinaries/<arch>/outer-socket-bridge
+build/linux-package/RemoteLinuxBinaries/<arch>/outershell-socket-bridge
 build/linux-package/RemoteLinuxBinariesMusl/<arch>/outershelld
 build/linux-package/RemoteLinuxBinariesMusl/<arch>/outerctl
-build/linux-package/RemoteLinuxBinariesMusl/<arch>/outer-socket-bridge
+build/linux-package/RemoteLinuxBinariesMusl/<arch>/outershell-socket-bridge
 ```
 
 `outerctl` lives in this repository under:
@@ -95,7 +95,7 @@ Resources/outerctl.cpp
 The container socket bridge is built from Outer Shell's own source checkout:
 
 ```text
-SocketBridge/outer-socket-bridge.c
+SocketBridge/outershell-socket-bridge.c
 ```
 
 Outer Shell does not consume Outer Loop source files or build products.

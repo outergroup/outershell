@@ -214,7 +214,7 @@ For each registered Linux Unix socket, the host publishes a stable Windows pipe:
 The digest identifies the distribution registration, Linux UID, and socket path.
 It is a routing identifier, not an access credential. Pipes use the same protected
 Windows ACL and exact-path allowlist as native apps. Each connection launches
-`wsl.exe --distribution NAME --exec /usr/local/bin/outer-socket-bridge bridge
+`wsl.exe --distribution NAME --exec /usr/local/bin/outershell-socket-bridge bridge
 --socket PATH`. The Linux bridge independently checks its Unix allowlist and socket
 ownership on every connection. No Linux SSH server, exposed port, or cross-OS
 filesystem socket access is required. The relay carries bytes in both directions;
@@ -279,7 +279,7 @@ Cross-app Open With and WSL recipe/mount/shell editors are not implemented.
 With a configured Windows host and a Windows bridge executable:
 
 ```sh
-python3 Windows/test_wsl.py marcbook-windows 'C:\path\to\outer-socket-bridge.exe' Ubuntu
+python3 Windows/test_wsl.py marcbook-windows 'C:\path\to\outershell-socket-bridge.exe' Ubuntu
 ```
 
 This test starts and stops the selected distribution. It checks discovery, app
@@ -432,7 +432,7 @@ are stored as newline-delimited UTF-8 in `container-names` under the user's
 Outer Shell directory. Runtime diagnostics go to `container-runtime.log`.
 
 For a release payload, build static Linux `outershelld`, `outerctl`, and
-`outer-socket-bridge` for the target Linux architecture. Run
+`outershell-socket-bridge` for the target Linux architecture. Run
 `build-container-bootstrap.ps1 -LinuxBinariesDirectory ... -OutputDirectory ...`,
 then pass that directory as `-ContainerBootstrapDirectory` to `build.ps1`.
 The installer copies this optional image-building payload. These Linux tools
@@ -517,7 +517,7 @@ The Windows package includes native C backends for Files, Plaintext, Top,
 Firehose and Profile. Add Apps registers each app as an ordinary interactive-user
 Task Scheduler task, with its own named pipe and activation mapping. Stop,
 start and uninstall operate on that task. Uninstalling an app removes its
-registration and activation mapping while retaining its data and packaged binary.
+registration, activation mapping and downloaded folder.
 Setup installs Files by default and preserves optional app selections on upgrades.
 
 Files and Plaintext support the Windows filesystem and registered Docker/WSLc
@@ -526,10 +526,16 @@ all platforms. Host paths support drive letters, UNC paths and known folders;
 container paths remain Linux paths. Files can open a host file in Plaintext via
 its named pipe, or pass the container target through to Plaintext.
 
-Top is container-only on Windows. Rows and actions are identified by runtime,
-container ID, PID and process start identity; overlapping container PIDs remain
-independent. Both HTML and macOS native content support container process lists,
-details and termination. Windows host process monitoring is deliberately absent.
+Top samples Windows host CPU counters and processes once per second and retains
+three minutes of CPU and process history. Container discovery runs independently,
+so a slow container cannot block host sampling. Both HTML and macOS native content
+show the combined process list and historical selections. The chart uses Windows
+host counters, never the sum of host and guest rows (VM host processes overlap
+with their guest processes). Transport row IDs are separate from displayed PIDs;
+host creation times and container start identities distinguish reused PIDs.
+Windows process inspection uses the signed-in user's normal query permissions.
+Quit sends WM_CLOSE to a host process's windows; Force Quit uses TerminateProcess.
+Protected processes may have unavailable metrics or reject termination.
 
 Firehose and Profile use container-only Linux helpers. Docker runs a disposable
 helper in the selected container's PID namespace, with BPF, PERFMON, SYS_PTRACE,
@@ -548,7 +554,9 @@ Running Outer Shell as Windows administrator does not resolve this Linux limit.
 
 Build with Windows/build.ps1 for x64, arm64 or x86. Build the six macOS content
 bundles with Windows/build-outerframe-bundles.sh. Container bootstrap packaging
-requires all five app helpers, in addition to the existing Linux platform tools.
+needs only the Linux platform tools (`outershelld`, `outerctl` and
+`outershell-socket-bridge`); each app ships its own container helpers in its
+archive's `helpers` folder.
 Run `python Windows/test_bundled_apps.py <build-directory>` on Windows without an
 existing Outer Shell running under that same account. It exercises actual named
 pipes, native filesystem operations, revision conflicts, shared drafts and app

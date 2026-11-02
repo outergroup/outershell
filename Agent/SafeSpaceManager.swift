@@ -3387,8 +3387,8 @@ final class SafeSpaceManager: @unchecked Sendable {
             "exec", "--user", "root", containerName(record.id),
             "/bin/sh", "-c",
             """
-            if [ ! -x /usr/local/bin/outer-socket-bridge ]; then exit 1; fi
-            /usr/local/bin/outer-socket-bridge >/dev/null 2>&1
+            if [ ! -x /usr/local/bin/outershell-socket-bridge ]; then exit 1; fi
+            /usr/local/bin/outershell-socket-bridge >/dev/null 2>&1
             status=$?
             [ "$status" -ne 126 ] && [ "$status" -ne 127 ]
             """
@@ -3418,7 +3418,7 @@ final class SafeSpaceManager: @unchecked Sendable {
             )
         }
 
-        let temporaryPath = "/tmp/outershell-outer-socket-bridge"
+        let temporaryPath = "/tmp/outershell-socket-bridge"
         let copy = try runRuntime(record, [
             "cp", source.path, "\(containerName(record.id)):\(temporaryPath)"
         ])
@@ -3426,7 +3426,7 @@ final class SafeSpaceManager: @unchecked Sendable {
         let install = try runRuntime(record, [
             "exec", "--user", "root", containerName(record.id),
             "/bin/sh", "-c",
-            "/bin/mkdir -p /usr/local/bin && /bin/cp \(temporaryPath) /usr/local/bin/outer-socket-bridge && /bin/chmod 0755 /usr/local/bin/outer-socket-bridge && /bin/rm -f \(temporaryPath)"
+            "/bin/mkdir -p /usr/local/bin && /bin/cp \(temporaryPath) /usr/local/bin/outershell-socket-bridge && /bin/chmod 0755 /usr/local/bin/outershell-socket-bridge && /bin/rm -f \(temporaryPath)"
         ])
         try requireSuccess(install, action: "install the container socket bridge")
     }
@@ -3437,13 +3437,13 @@ final class SafeSpaceManager: @unchecked Sendable {
                 .appendingPathComponent("container-bootstrap", isDirectory: true)
                 .appendingPathComponent("bin", isDirectory: true)
                 .appendingPathComponent(platform, isDirectory: true)
-                .appendingPathComponent("outer-socket-bridge"),
+                .appendingPathComponent("outershell-socket-bridge"),
             URL(fileURLWithPath: FileManager.default.currentDirectoryPath,
                 isDirectory: true)
                 .appendingPathComponent("build/run/container-bootstrap", isDirectory: true)
                 .appendingPathComponent("bin", isDirectory: true)
                 .appendingPathComponent(platform, isDirectory: true)
-                .appendingPathComponent("outer-socket-bridge")
+                .appendingPathComponent("outershell-socket-bridge")
         ].compactMap { $0 }
         return candidates.first {
             FileManager.default.isExecutableFile(atPath: $0.path)
@@ -5456,18 +5456,18 @@ final class SafeSpaceManager: @unchecked Sendable {
         source_directory=/tmp/outershell-bootstrap/bin/${architecture}
         test -x "${source_directory}/outershelld"
         test -x "${source_directory}/outerctl"
-        test -x "${source_directory}/outer-socket-bridge"
+        test -x "${source_directory}/outershell-socket-bridge"
         /bin/mkdir -p /usr/local/bin /run/user/0 /var/lib/outershell/services \
             /var/lib/outershell/apps /etc/outershell/apps.d /root/.config/outerssh \
             /root/.local/share/jupyter /root/.cache
         /bin/cp "${source_directory}/outershelld" /usr/local/bin/outershelld
         /bin/cp "${source_directory}/outerctl" /usr/local/bin/outerctl
-        /bin/cp "${source_directory}/outer-socket-bridge" \
-            /usr/local/bin/outer-socket-bridge
+        /bin/cp "${source_directory}/outershell-socket-bridge" \
+            /usr/local/bin/outershell-socket-bridge
         /bin/cp /tmp/outershell-bootstrap/outershell-container-init \
             /usr/local/bin/outershell-container-init
         /bin/chmod 0755 /usr/local/bin/outershelld /usr/local/bin/outerctl \
-            /usr/local/bin/outer-socket-bridge \
+            /usr/local/bin/outershell-socket-bridge \
             /usr/local/bin/outershell-container-init
         /bin/chmod 0700 /run/user/0 /root/.config/outerssh
         """

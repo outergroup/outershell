@@ -19751,14 +19751,15 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         workspacePanelLayer.addSublayer(save)
         containerConfigurationSaveFrame = rootLayer.convert(saveFrame, from: workspacePanelLayer)
         dockerfileZoomFrame = .zero
+        var messageLeft: CGFloat = 24
         if containerConfigurationTab == .dockerfile {
             let zoomFrame = CGRect(x: 24, y: 18, width: min(130, max(buttonX - 112, 60)), height: 30)
             let zoom = makeButtonLayer(title: "\(Int(dockerfileTextScale * 100))% · Text size", emphasized: false)
             zoom.frame = zoomFrame
             workspacePanelLayer.addSublayer(zoom)
             dockerfileZoomFrame = rootLayer.convert(zoomFrame, from: workspacePanelLayer)
+            messageLeft = zoomFrame.maxX + 12
         }
-
 
         if isActiveContainerBuildProgress(workspace.buildProgress) ||
             !workspacePanelMessage.isEmpty || !safeSpaceRecipeMessage.isEmpty {
@@ -19777,9 +19778,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             )
             message.string = value
             message.truncationMode = .end
-            message.frame = CGRect(x: 24,
+            message.frame = CGRect(x: messageLeft,
                                    y: 25,
-                                   width: max(buttonX - 40, 1),
+                                   width: max(saveFrame.minX - 12 - messageLeft, 1),
                                    height: 16)
             workspacePanelLayer.addSublayer(message)
         }

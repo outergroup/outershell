@@ -479,7 +479,7 @@ int main(int argc, char **argv) {
     const char *socket_path = NULL;
     signal(SIGPIPE, SIG_IGN);
     if (argc == 2 && strcmp(argv[1], "--version") == 0) {
-        puts("outer-socket-bridge 1");
+        puts("outershell-socket-bridge 1");
         return 0;
     }
     if (argc == 2 && strcmp(argv[1], "list") == 0) {
@@ -496,8 +496,8 @@ int main(int argc, char **argv) {
     } else if (argc == 3 && strcmp(argv[1], "--socket") == 0) {
         socket_path = argv[2];
     } else {
-        fprintf(stderr, "usage: outer-socket-bridge list|watch|authorize --socket PATH|bridge --socket PATH\n");
-        fprintf(stderr, "compatibility: outer-socket-bridge --socket PATH\n");
+        fprintf(stderr, "usage: outershell-socket-bridge list|watch|authorize --socket PATH|bridge --socket PATH\n");
+        fprintf(stderr, "compatibility: outershell-socket-bridge --socket PATH\n");
         return 2;
     }
     char err[512];

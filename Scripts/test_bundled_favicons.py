@@ -1,6 +1,7 @@
 from pathlib import Path
 import subprocess,tempfile,time,socket,http.client,sys
 root=Path(__file__).resolve().parents[2]
+assert (root/'Backends/app-icon.png').read_bytes()==(root/'Backends/Resources/OuterShellWeb/icons/org.outershell.OuterShell.png').read_bytes()
 for repo,name in [('Top','Top'),('Files','Files'),('Plaintext','Plaintext'),('Profile','Profile'),('Trace','Firehose')]:
  p=root/repo; png=(p/'app-icon.png').read_bytes()
  assert png==(root/f'Backends/Resources/OuterShellWeb/icons/org.outershell.{name}.png').read_bytes()

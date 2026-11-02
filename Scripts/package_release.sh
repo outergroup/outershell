@@ -58,7 +58,7 @@ require_file "${REPO_ROOT}/Resources/outershell-container-provider"
 for arch in aarch64 x86_64; do
     require_file "${RUN_ROOT}/container-bootstrap/bin/${arch}/outershelld"
     require_file "${RUN_ROOT}/container-bootstrap/bin/${arch}/outerctl"
-    require_file "${RUN_ROOT}/container-bootstrap/bin/${arch}/outer-socket-bridge"
+    require_file "${RUN_ROOT}/container-bootstrap/bin/${arch}/outershell-socket-bridge"
 done
 for arch in aarch64 x86_64; do
     if wants_variant "linux-${arch}"; then
@@ -860,6 +860,7 @@ start_internal_service_manager() {
                 --service-manager internal \
                 --services-dir "$services_dir" \
                 --api-socket-path "$api_socket_path" \
+                --web-root "$install_root/web" \
                 --stay-alive >>"$broker_log_path" 2>&1 </dev/null &
     else
         OUTERSHELL_HOME="$outershell_home" OUTER_SHELL_PUBLIC_BASE_URL="$public_base_url" \
@@ -870,6 +871,7 @@ start_internal_service_manager() {
                 --service-manager internal \
                 --services-dir "$services_dir" \
                 --api-socket-path "$api_socket_path" \
+                --web-root "$install_root/web" \
                 --stay-alive >>"$broker_log_path" 2>&1 </dev/null &
     fi
     daemon_pid=$!
@@ -1342,7 +1344,7 @@ Environment=OUTER_SHELL_PUBLIC_BASE_URL=$public_base_url
 Environment=OUTER_SHELL_CONTAINER_PROVIDER=$container_provider_path
 Environment=OUTER_SHELL_CONTAINER_PROVIDER_RESOURCES=$container_provider_resources
 Environment=OUTER_SHELL_SERVICE_MANAGER=systemd
-ExecStart=$outershelld_path
+ExecStart=$(systemd_quote_arg "$outershelld_path") --web-root $(systemd_quote_arg "$install_root/web")
 Restart=no
 StandardOutput=append:$broker_log_path
 StandardError=append:$broker_log_path

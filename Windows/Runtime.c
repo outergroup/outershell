@@ -44,6 +44,19 @@ char *win_utf8(const wchar_t *value) {
     }
     return r;
 }
+void win_hresult_text(long hr, char *out, size_t capacity) {
+    wchar_t *text = NULL;
+    DWORD length = FormatMessageW(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM |
+                                      FORMAT_MESSAGE_IGNORE_INSERTS,
+                                  NULL, (DWORD)hr, 0, (wchar_t *)&text, 0, NULL);
+    while (length && (text[length - 1] == L'\r' || text[length - 1] == L'\n' || text[length - 1] == L' '))
+        text[--length] = 0;
+    char *description = length ? win_utf8(text) : NULL;
+    if (text) LocalFree(text);
+    if (description) snprintf(out, capacity, "%s (0x%08lx)", description, (unsigned long)hr);
+    else snprintf(out, capacity, "0x%08lx", (unsigned long)hr);
+    free(description);
+}
 char *win_join(const char *base, const char *name) {
     size_t n = strlen(base) + strlen(name) + 2;
     char *r = win_alloc(n);

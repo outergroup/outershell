@@ -4,7 +4,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-HELPER_SOURCE="${REPO_ROOT}/SocketBridge/outer-socket-bridge.c"
+HELPER_SOURCE="${REPO_ROOT}/SocketBridge/outershell-socket-bridge.c"
 GLIBC_OUTPUT_DIR="${REPO_ROOT}/build/linux-package/RemoteLinuxBinaries"
 MUSL_OUTPUT_DIR="${REPO_ROOT}/build/linux-package/RemoteLinuxBinariesMusl"
 BUILD_CONTAINER_RUNTIME=""
@@ -87,24 +87,34 @@ build_variant() {
             ;;
     esac
 
-    output_dir="${OUTER_SOCKET_BRIDGE_OUTPUT_DIR:-/out}"
+    output_dir="${OUTERSHELL_SOCKET_BRIDGE_OUTPUT_DIR:-/out}"
     mkdir -p "${output_dir}"
     if [[ ! -s "${HELPER_SOURCE}" ]]; then
         echo "error: could not find helper source at ${HELPER_SOURCE}" >&2
         exit 1
     fi
 
-    output="${output_dir}/outer-socket-bridge-linux-${arch}-${libc}"
-    cc -x c -std=gnu17 -O2 -Wall -Wextra -o "${output}" "${HELPER_SOURCE}"
+    # The musl build is static, so it also runs in glibc containers, which get
+    # it in Outer Shell's container bootstrap.
+    output="${output_dir}/outershell-socket-bridge-linux-${arch}-${libc}"
+    link_flags=()
+    if [[ "${libc}" == musl ]]; then
+        link_flags+=(-static)
+    fi
+    cc -x c -std=gnu17 -O2 -Wall -Wextra ${link_flags[@]+"${link_flags[@]}"} -o "${output}" "${HELPER_SOURCE}"
     strip --strip-unneeded "${output}"
     "${output}" --version
 
-    if ! readelf -l "${output}" | grep -F "Requesting program interpreter" >/dev/null; then
+    if [[ "${libc}" == musl ]] && readelf -l "${output}" | grep -F "Requesting program interpreter" >/dev/null; then
+        echo "error: ${output} is not statically linked" >&2
+        exit 1
+    fi
+    if [[ "${libc}" == glibc ]] && ! readelf -l "${output}" | grep -F "Requesting program interpreter" >/dev/null; then
         echo "error: ${output} is not dynamically linked" >&2
         exit 1
     fi
 
-    echo "Built outer-socket-bridge Linux helper for ${arch}/${libc}"
+    echo "Built outershell-socket-bridge Linux helper for ${arch}/${libc}"
 }
 
 matrix_is_current() {
@@ -116,7 +126,7 @@ matrix_is_current() {
             output_dir="${MUSL_OUTPUT_DIR}"
         fi
         for arch in aarch64 x86_64; do
-            output="${output_dir}/${arch}/outer-socket-bridge"
+            output="${output_dir}/${arch}/outershell-socket-bridge"
             if [[ ! -x "${output}" || "${HELPER_SOURCE}" -nt "${output}" ]]; then
                 return 1
             fi
@@ -135,8 +145,8 @@ build_matrix() {
 
     require_build_container_runtime
     mkdir -p "${REPO_ROOT}/build/linux-package"
-    staging_dir="$(mktemp -d "${REPO_ROOT}/build/linux-package/.outer-socket-bridge-build.XXXXXX")"
-    build_input_dir="$(mktemp -d "${TMPDIR:-/tmp}/outer-socket-bridge-input.XXXXXX")"
+    staging_dir="$(mktemp -d "${REPO_ROOT}/build/linux-package/.outershell-socket-bridge-build.XXXXXX")"
+    build_input_dir="$(mktemp -d "${TMPDIR:-/tmp}/outershell-socket-bridge-input.XXXXXX")"
     trap 'rm -rf "${staging_dir:-}" "${build_input_dir:-}"' EXIT
     mkdir -p "${build_input_dir}/SocketBridge" "${build_input_dir}/Scripts"
     cp "${HELPER_SOURCE}" "${build_input_dir}/SocketBridge/"
@@ -155,13 +165,13 @@ build_matrix() {
                 platform="linux/amd64"
             fi
 
-            echo "==> Building outer-socket-bridge for Linux/${arch}/${libc}"
+            echo "==> Building outershell-socket-bridge for Linux/${arch}/${libc}"
             if [[ "${BUILD_CONTAINER_RUNTIME}" == container ]]; then
                 container run --rm --platform "${platform}" \
                     --mount "type=bind,source=${build_input_dir},target=/work,readonly" \
                     --mount "type=bind,source=${staging_dir},target=/out" \
                     --workdir /work \
-                    --env OUTER_SOCKET_BRIDGE_OUTPUT_DIR=/out \
+                    --env OUTERSHELL_SOCKET_BRIDGE_OUTPUT_DIR=/out \
                     "${image}" \
                     bash ./Scripts/build_socket_bridge_helpers.sh --build-variant "${libc}"
             else
@@ -170,7 +180,7 @@ build_matrix() {
                     --mount "type=bind,source=${build_input_dir},target=/work,readonly" \
                     --mount "type=bind,source=${staging_dir},target=/out" \
                     --workdir /work \
-                    --env OUTER_SOCKET_BRIDGE_OUTPUT_DIR=/out \
+                    --env OUTERSHELL_SOCKET_BRIDGE_OUTPUT_DIR=/out \
                     "${image}" \
                     bash ./Scripts/build_socket_bridge_helpers.sh --build-variant "${libc}"
             fi
@@ -184,9 +194,9 @@ build_matrix() {
             output_dir="${MUSL_OUTPUT_DIR}"
         fi
         for arch in aarch64 x86_64; do
-            output_name="outer-socket-bridge-linux-${arch}-${libc}"
+            output_name="outershell-socket-bridge-linux-${arch}-${libc}"
             mkdir -p "${output_dir}/${arch}"
-            mv "${staging_dir}/${output_name}" "${output_dir}/${arch}/outer-socket-bridge"
+            mv "${staging_dir}/${output_name}" "${output_dir}/${arch}/outershell-socket-bridge"
         done
     done
     rm -rf "${staging_dir}"

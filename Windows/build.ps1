@@ -56,7 +56,7 @@ if ($App) {
     Copy-Item "$AppRoot/app-icon.png" "$root/app-icon.png" -Force
     if ($App -eq 'Top') {
         $index = Join-Path "$root/web" 'index.html'
-        [IO.File]::WriteAllText($index, [IO.File]::ReadAllText($index).Replace('<html', '<html data-containers-only="true"'))
+        [IO.File]::WriteAllText($index, [IO.File]::ReadAllText($index).Replace('<html', '<html data-combined-processes="true"'))
     }
     if ($HelpersDirectory -and (Test-Path $HelpersDirectory)) {
         Copy-Item $HelpersDirectory "$root/helpers" -Recurse -Force

@@ -1,6 +1,6 @@
-# outer-socket-bridge
+# outershell-socket-bridge
 
-`outer-socket-bridge` carries multiplexed byte streams between its standard
+`outershell-socket-bridge` carries multiplexed byte streams between its standard
 input/output and Unix-domain sockets. Outer Shell uses it to publish sockets
 from container runtimes without requiring SSH inside a container.
 
@@ -29,4 +29,4 @@ helper came from a particular application. Alternative browsers may use this
 protocol, native SSH stream-local forwarding, or another transport to reach
 the Unix sockets published by Outer Shell.
 
-Run `outer-socket-bridge --version` to inspect the executable version.
+Run `outershell-socket-bridge --version` to inspect the executable version.

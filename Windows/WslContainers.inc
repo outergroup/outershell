@@ -114,22 +114,9 @@ static bool create_container(Wsl *w, HttpRequest *request, const char **error) {
         strspn(image, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-/:@") != strlen(image) ||
         !cpus || cpus > 128 || memory < 128 || memory > 1048576)
         goto done;
-    if (!strcmp(image, "outershell/container-base:22")) {
-        const char *inspect[] = {"image", "inspect", image, NULL};
-        if (!capture_runtime(w, inspect, &output, runtime)) {
-            free(output.data);
-            output = (StringBuilder){0};
-            char *directory = win_executable_directory();
-            char *context = directory ? win_join(directory, "container-bootstrap") : NULL;
-            const char *build[] = {"build", "--progress", "plain", "--tag", image, context, NULL};
-            ok = context && capture_runtime(w, build, &output, runtime);
-            free(context);
-            free(directory);
-            if (!ok) {
-                *error = "Could not prepare the Outer Shell container image. Check the Outer Shell log and the installed container bootstrap.";
-                goto done;
-            }
-        }
+    if (!container_prepare_base(w, runtime, image)) {
+        *error = "Could not prepare the Outer Shell container image. Check the Outer Shell log and the installed container bootstrap.";
+        goto done;
     }
     free(output.data);
     output = (StringBuilder){0};
@@ -317,7 +304,7 @@ static void container_provider(Wsl *w, StringBuilder *json, ContainerRuntime run
     append(json, ",\"setupURL\":");
     json_string(json, runtime == RUNTIME_DOCKER ? "https://docs.docker.com/desktop/setup/install/windows-install/" :
                 "https://learn.microsoft.com/windows/wsl/wsl-container");
-    append(json, ",\"defaultBaseImage\":\"outershell/container-base:22\"}");
+    append(json, ",\"defaultBaseImage\":\"outershell/container-base:24\"}");
 }
 
 static void container_snapshot(Distribution *d, StringBuilder *json) {

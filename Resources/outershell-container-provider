@@ -29,6 +29,7 @@ DEFAULT_BASE_IMAGE = "outershell/container-base:21"
 DEFAULT_CPUS = 4
 DEFAULT_MEMORY_IN_MB = 8192
 MINIMUM_MEMORY_IN_MB = 128
+SOCKET_BRIDGE_VERSION = "outershell-socket-bridge 1"
 FRAME_MAGIC = 0x3142524F
 FRAME_VERSION = 1
 FRAME_HELLO = 1
@@ -790,11 +791,11 @@ esac
 source_directory="/tmp/outershell-bootstrap/bin/$architecture"
 test -x "$source_directory/outershelld"
 test -x "$source_directory/outerctl"
-test -x "$source_directory/outer-socket-bridge"
+test -x "$source_directory/outershell-socket-bridge"
 install -d -m 0755 /usr/local/bin /etc/outershell/apps.d /var/lib/outershell/services /var/lib/outershell/apps /run/user/0
 install -m 0755 "$source_directory/outershelld" /usr/local/bin/outershelld
 install -m 0755 "$source_directory/outerctl" /usr/local/bin/outerctl
-install -m 0755 "$source_directory/outer-socket-bridge" /usr/local/bin/outer-socket-bridge
+install -m 0755 "$source_directory/outershell-socket-bridge" /usr/local/bin/outershell-socket-bridge
 install -m 0755 /tmp/outershell-bootstrap/outershell-container-init /usr/local/bin/outershell-container-init
 """)
     os.chmod(install_script, 0o755)
@@ -2210,9 +2211,9 @@ def authorize_container_socket(container_id, socket_path):
 
 def ensure_container_socket_bridge(container_id):
     installed = container_exec(container_id, [
-        "/usr/local/bin/outer-socket-bridge", "--version",
+        "/usr/local/bin/outershell-socket-bridge", "--version",
     ])
-    if installed.returncode == 0:
+    if installed.returncode == 0 and installed.stdout.strip() == SOCKET_BRIDGE_VERSION:
         return
 
     platform = container_exec(container_id, [
@@ -2228,21 +2229,21 @@ esac
     ], check=True).stdout.strip()
     if not platform or ".." in platform:
         raise RuntimeError("Outer Shell could not identify the container platform.")
-    source = provider_resources() / "bin" / platform / "outer-socket-bridge"
+    source = provider_resources() / "bin" / platform / "outershell-socket-bridge"
     if not source.is_file():
         raise RuntimeError(
             "Outer Shell does not include a socket bridge for this container platform."
         )
-    temporary = "/tmp/outershell-outer-socket-bridge"
+    temporary = "/tmp/outershell-socket-bridge"
     docker(["cp", str(source), f"{container_name(container_id)}:{temporary}"], check=True)
     container_exec(container_id, [
         "/bin/sh", "-c",
         "install -d -m 0755 /usr/local/bin && "
-        f"install -m 0755 {temporary} /usr/local/bin/outer-socket-bridge && "
+        f"install -m 0755 {temporary} /usr/local/bin/outershell-socket-bridge && "
         f"rm -f {temporary}",
     ], check=True)
     container_exec(container_id, [
-        "/usr/local/bin/outer-socket-bridge", "--version",
+        "/usr/local/bin/outershell-socket-bridge", "--version",
     ], check=True)
 
 
@@ -2825,7 +2826,7 @@ class ContainerSocketBridge:
         self.process = subprocess.Popen(
             [docker_path(), "exec", "--interactive", "--user", "root", container_name(container_id)]
             + container_environment("root")
-            + ["/usr/local/bin/outer-socket-bridge", "bridge", "--socket", inner_path],
+            + ["/usr/local/bin/outershell-socket-bridge", "bridge", "--socket", inner_path],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=None,

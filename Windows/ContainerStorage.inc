@@ -96,7 +96,7 @@ static bool storage_inventory(Wsl *w, ContainerRuntime runtime, const char *excl
             StringBuilder reference = {0}; append(&reference, repository); append(&reference, ":"); append(&reference, tag);
             StorageImage *image = win_alloc(sizeof(*image));
             image->reference = reference.data; image->digest = digest; digest = NULL;
-            image->protected = !strcmp(image->reference, "outershell/container-base:22") ||
+            image->protected = !strcmp(image->reference, "outershell/container-base:24") ||
                 (definitions.data && (strstr(definitions.data, image->reference) || strstr(definitions.data, image->digest) || strchr(definitions.data, '$') || strstr(definitions.data, "@sha256:")));
             image->next = *images; *images = image;
         }

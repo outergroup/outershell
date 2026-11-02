@@ -522,6 +522,46 @@ static bool container_helpers_context(const char *directory) {
     free(local); free(home); free(apps); free(pattern); free(search);
     return found;
 }
+static const char container_base_prefix[] = "outershell/container-base:";
+static const char container_current_base_image[] = "outershell/container-base:24";
+
+// Recipes keep the base image version they were created with. Rebuilds move
+// them to the current version, which carries the current container tools.
+static char *container_current_base(const char *dockerfile) {
+    StringBuilder text = {0};
+    const char *cursor = dockerfile, *match;
+    while ((match = strstr(cursor, container_base_prefix))) {
+        const char *tag = match + strlen(container_base_prefix);
+        size_t digits = strspn(tag, "0123456789");
+        bytes(&text, cursor, (size_t)(match - cursor));
+        append(&text, digits ? container_current_base_image : container_base_prefix);
+        cursor = tag + digits;
+    }
+    append(&text, cursor);
+    return text.data ? text.data : win_strdup("");
+}
+
+// Builds the current base image from the installed container bootstrap when a
+// recipe uses it and the runtime does not have it yet.
+static bool container_prepare_base(Wsl *w, ContainerRuntime runtime, const char *dockerfile) {
+    if (!strstr(dockerfile, container_current_base_image)) return true;
+    StringBuilder output = {0};
+    const char *inspect[] = {"image", "inspect", container_current_base_image, NULL};
+    bool ok = capture_runtime(w, inspect, &output, runtime);
+    if (!ok) {
+        free(output.data);
+        output = (StringBuilder){0};
+        char *directory = win_executable_directory();
+        char *context = directory ? win_join(directory, "container-bootstrap") : NULL;
+        const char *build[] = {"build", "--progress", "plain", "--tag", container_current_base_image, context, NULL};
+        ok = context && capture_runtime(w, build, &output, runtime);
+        free(context);
+        free(directory);
+    }
+    free(output.data);
+    return ok;
+}
+
 // Builds a container's image from its recipe. Docker builds also copy the
 // installed apps' container helpers into the image, in a final layer.
 static bool container_build(Wsl *w, ContainerRuntime runtime, const char *id, const char *dockerfile,
@@ -530,6 +570,11 @@ static bool container_build(Wsl *w, ContainerRuntime runtime, const char *id, co
     char *helpers = directory && runtime == RUNTIME_DOCKER ? win_join(directory, "Helpers") : NULL;
     char *derived = directory ? win_join(directory, "Dockerfile.outershell") : NULL;
     StringBuilder text = {0}, source = {0};
+    if (!container_prepare_base(w, runtime, dockerfile)) {
+        append(output, "Could not prepare the Outer Shell container image from the installed container bootstrap.\n");
+        free(directory); free(helpers); free(derived);
+        return false;
+    }
     bool baked = helpers && derived && container_helpers_context(helpers);
     if (baked) {
         append(&text, dockerfile);
@@ -564,6 +609,12 @@ static DWORD WINAPI container_rebuild_thread(void *context) {
     const char *error = "The container configuration is invalid.";
     bool ok = directory && *dockerfile && container_configuration(config, &args);
     container_arguments_free(&args); args = (ContainerArguments){0};
+    char *current = container_current_base(dockerfile);
+    if (ok && strcmp(current, dockerfile)) {
+        error = "Could not update the Dockerfile to the current Outer Shell base image.";
+        ok = container_write(d->id, "Dockerfile", current, strlen(current));
+    }
+    free(dockerfile); dockerfile = current;
     if (ok) {
         error = "The image build failed. The existing container was retained. See the container runtime log.";
         ok = container_build(w, d->container, d->id, dockerfile, image, directory, &output);

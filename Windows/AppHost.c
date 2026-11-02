@@ -5,6 +5,7 @@
 #include <string.h>
 char *environment_request(const void *, size_t, size_t *);
 #ifdef APP_TOP
+#include "Host.h"
 char *environment_processes(size_t *);
 char *environment_detail(const char *, uint32_t, const char *, size_t *);
 bool environment_signal_request(const char *, uint32_t, const char *, bool,
@@ -64,45 +65,11 @@ static void serve_app(Connection *c, void *context) {
         return;
     }
 #ifdef APP_TOP
-    char *mode = http_query(&r, "mode"), *target = http_query(&r, "target"),
-         *identity = http_query(&r, "start");
-    bool detail = (!strcmp(r.path, "/") && mode && !strcmp(mode, "detail")) ||
-                  !strncmp(r.path, "/api/processes/", 15);
-    if (detail) {
-        char *pid = http_query(&r, "pid");
-        const char *number =
-            pid ? pid
-                : (!strncmp(r.path, "/api/processes/", 15) ? r.path + 15 : "");
-        char *end = NULL;
-        unsigned long value = strtoul(number, &end, 10);
-        size_t length = 0;
-        char *body =
-            target && identity && *number && end && !*end && value > 0 &&
-                    value <= INT_MAX
-                ? environment_detail(target, (uint32_t)value, identity, &length)
-                : NULL;
-        if (!body)
-            http_text(c, &r, 404,
-                      "This container process has exited or changed identity.");
-        else if (!strcmp(r.path, "/")) {
-            if (!app_resources_payload(c, &r, app_directory, APP_BUNDLE, body, length))
-                http_static(c, &r, app_web);
-        }
-        else
-            http_send(c, &r, 200, "application/octet-stream", body, length);
-        free(body);
-        free(pid);
-        free(mode);
-        free(target);
-        free(identity);
+    if (top_request(c, &r, app_directory)) {
         http_free(&r);
         return;
     }
-    free(mode);
-    free(target);
-    free(identity);
-    bool resource = app_resources(c, &r, app_directory, APP_BUNDLE,
-                                  "{\"containersOnly\":true}");
+    bool resource = app_resources(c, &r, app_directory, APP_BUNDLE, "{\"windowsHost\":true}");
 #else
     bool resource =
         app_resources(c, &r, app_directory, APP_BUNDLE, APP_INITIAL);
@@ -172,6 +139,9 @@ int wmain(int argc, wchar_t **argv) {
     SetConsoleCtrlHandler(stop_app, TRUE);
     app_directory = win_executable_directory();
     app_web = win_join(app_directory, APP_WEB);
+#ifdef APP_TOP
+    if (!top_start(app_stop)) { top_stop(); return 1; }
+#endif
     char *name = win_pipe(APP_SERVICE);
     PipeServer *server = pipe_server_start(name, serve_app, NULL);
     free(name);
@@ -179,6 +149,9 @@ int wmain(int argc, wchar_t **argv) {
         return 1;
     pipe_servers_wait_idle(app_stop, 300000);
     pipe_server_stop(server);
+#ifdef APP_TOP
+    top_stop();
+#endif
     CloseHandle(app_stop);
     free(app_directory);
     free(app_web);

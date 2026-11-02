@@ -222,7 +222,12 @@ static bool command_control(ShellHost *s, CommandApp *a, const char *operation, 
     if (SUCCEEDED(hr) && restart) hr = command_task(a->task_name, "start", NULL, NULL);
     a->queried_at = 0;
     bool removed = !strcmp(operation, "uninstall");
-    if (FAILED(hr) && !(removed && hr == HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND))) { snprintf(error, error_size, "Windows could not %s the task (0x%08lx).", operation, (unsigned long)hr); return false; }
+    if (FAILED(hr) && !(removed && hr == HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND))) {
+        char reason[512];
+        win_hresult_text(hr, reason, sizeof(reason));
+        snprintf(error, error_size, "Windows could not %s the task: %s", operation, reason);
+        return false;
+    }
     if (!removed) return true;
     RegistryStore store;
     if (!store_open(s, &store, true)) return false;
@@ -341,7 +346,9 @@ static StringBuilder command_create(ShellHost *s, HttpRequest *r) {
         }
         wchar_t *wide = win_wide(dir); if (wide) RemoveDirectoryW(wide); free(wide);
         free(a->task_name); free(a->id); free(a);
-        snprintf(task_error, sizeof(task_error), "Windows could not register the app task (0x%08lx).", (unsigned long)task_result);
+        char reason[512];
+        win_hresult_text(task_result, reason, sizeof(reason));
+        snprintf(task_error, sizeof(task_error), "Windows could not register the app task: %s", reason);
         message = task_error; ok = false; goto done;
     }
     ok = update_allowlist(s) && SUCCEEDED(command_task(a->task_name, "start", NULL, NULL));

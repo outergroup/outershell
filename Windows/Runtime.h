@@ -30,6 +30,9 @@ char *win_join(const char *base, const char *name);
 char *win_folder(int folder);
 char *win_executable_directory(void);
 char *win_sid(void);
+// Writes Windows' description of an HRESULT followed by its code, such as
+// "The system cannot find the file specified. (0x80070002)".
+void win_hresult_text(long hr, char *out, size_t capacity);
 char *win_pipe(const char *app);
 bool win_secure_directory(const char *path);
 bool win_atomic_write(const char *path, const void *data, size_t length);

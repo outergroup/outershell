@@ -117,12 +117,12 @@ static bool docker_command(const char *const *args) {
     return ok;
 }
 static bool docker_image(void) {
-    const char *inspect[] = {"image", "inspect", "outershell/container-base:22",
+    const char *inspect[] = {"image", "inspect", "outershell/container-base:24",
                              NULL};
     if (docker_command(inspect))
         return true;
     char *context = win_join(tracing_directory, "container-bootstrap");
-    const char *build[] = {"build", "--tag", "outershell/container-base:22",
+    const char *build[] = {"build", "--tag", "outershell/container-base:24",
                            context, NULL};
     bool ok = docker_command(build);
     free(context);
@@ -194,7 +194,7 @@ static bool tracing_request(Connection *c, HttpRequest *r, Target *target) {
         args[argument++] = context.data;
         args[argument++] = "-e";
         args[argument++] = name.data;
-        args[argument++] = docker ? "outershell/container-base:22" : target->id;
+        args[argument++] = docker ? "outershell/container-base:24" : target->id;
         args[argument] = NULL;
         const char *serve[] = {"serve", NULL};
         char error[512];

@@ -72,7 +72,11 @@ static int setup_tasks(const char *operation) {
         if (!a || !win_allow_pipes(paths, 1)) result = E_FAIL;
         free(a);
     }
-    if (FAILED(result)) fprintf(stderr, "Outer Shell task setup failed (0x%08lx).\n", (unsigned long)result);
+    if (FAILED(result)) {
+        char reason[512];
+        win_hresult_text(result, reason, sizeof(reason));
+        fprintf(stderr, "Outer Shell task setup failed: %s\n", reason);
+    }
     free(sid); free(directory);
     return SUCCEEDED(result) ? 0 : 1;
 }

@@ -12,7 +12,7 @@
 #include <string.h>
 
 #define WSL_LIMIT (4u * 1024u * 1024u)
-#define WSL_BRIDGE "/usr/local/bin/outer-socket-bridge"
+#define WSL_BRIDGE "/usr/local/bin/outershell-socket-bridge"
 typedef struct {
     HANDLE process, cancel;
     Connection input, output;

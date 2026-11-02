@@ -14,7 +14,7 @@ import threading
 import time
 
 exe = Path(sys.argv[1]).resolve()
-bridge = exe.parent/'outer-socket-bridge.exe'
+bridge = exe.parent/'outershell-socket-bridge.exe'
 sid = subprocess.check_output(['whoami','/user','/fo','csv','/nh'],text=True).strip().split(',')[-1].strip('"')
 shell_pipe = r'\\.\pipe\org.outershell.outershell.'+sid.lower()
 files_pipe = r'\\.\pipe\org.outershell.files.'+sid.lower()
