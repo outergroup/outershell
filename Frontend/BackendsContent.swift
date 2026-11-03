@@ -3088,6 +3088,38 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         }
     }
 
+    private var usesDarkAppearance: Bool {
+        var isDark = false
+        withEffectiveAppearance {
+            isDark = NSAppearance.currentDrawing().bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+        }
+        return isDark
+    }
+
+    private func cardBorderCGColor() -> CGColor {
+        usesDarkAppearance ? CGColor(gray: 1, alpha: 0.3) : CGColor(gray: 0, alpha: 0.34)
+    }
+
+    private func applyCardStyle(_ layer: CALayer) {
+        layer.cornerRadius = 0
+        layer.borderWidth = 1
+        layer.borderColor = cardBorderCGColor()
+        layer.shadowColor = CGColor(gray: 0, alpha: 1)
+        layer.shadowOpacity = usesDarkAppearance ? 0.4 : 0.14
+        layer.shadowRadius = 8
+        layer.shadowOffset = CGSize(width: 0, height: -3)
+    }
+
+    private func applyPopoverStyle(_ layer: CALayer) {
+        layer.cornerRadius = 0
+        layer.borderWidth = 1
+        layer.borderColor = cardBorderCGColor()
+        layer.shadowColor = CGColor(gray: 0, alpha: 1)
+        layer.shadowOpacity = usesDarkAppearance ? 0.5 : 0.22
+        layer.shadowRadius = 22
+        layer.shadowOffset = CGSize(width: 0, height: -8)
+    }
+
     private func resolvedCGColor(_ color: NSColor) -> CGColor {
         var resolved = CGColor(gray: 0, alpha: 1)
         withEffectiveAppearance {
@@ -4377,11 +4409,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                y: tops[column] - cardHeight, width: cardWidth, height: cardHeight)
             let card = CALayer()
             card.frame = frame
-            card.cornerRadius = 14
-            card.cornerCurve = .continuous
+            applyCardStyle(card)
             card.backgroundColor = resolvedCGColor(.controlBackgroundColor)
-            card.borderWidth = 0.5
-            card.borderColor = resolvedCGColor(.separatorColor)
             addAppsSublayer(card)
             overviewGroupFrames.append((frame, CGRect(x: frame.minX, y: frame.maxY - 70, width: frame.width, height: 70), group.id))
             let titleWidth = innerWidth
@@ -5152,14 +5181,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
         let bubble = CALayer()
         bubble.frame = bubbleFrame
-        bubble.cornerRadius = 10
+        applyPopoverStyle(bubble)
         bubble.backgroundColor = resolvedCGColor(backgroundColor)
-        bubble.borderWidth = 0.5
-        bubble.borderColor = resolvedCGColor(NSColor.separatorColor)
-        bubble.shadowColor = resolvedCGColor(NSColor.black)
-        bubble.shadowOpacity = 0.18
-        bubble.shadowRadius = 9
-        bubble.shadowOffset = CGSize(width: 0, height: -2)
         copyConfirmationLayer.addSublayer(bubble)
 
         let arrowCenterX = min(max(anchor.x, bubbleFrame.minX + 20), bubbleFrame.maxX - 20)
@@ -5589,7 +5612,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         let selected = selectedCreateSection == section
         let card = CALayer()
         card.frame = frame
-        card.cornerRadius = 8
+        card.cornerRadius = 0
         card.borderWidth = selected ? 1.5 : 1
         card.borderColor = selected ? resolvedCGColor(.controlAccentColor) : resolvedCGColor(.separatorColor)
         card.backgroundColor = selected ? resolvedCGColor(NSColor.controlAccentColor.withAlphaComponent(0.12)) : resolvedCGColor(NSColor.controlBackgroundColor.withAlphaComponent(0.45))
@@ -5919,7 +5942,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             for (index, choice) in [("container", "Inside container · Sandboxed", "Work inside this container and its existing mounts. Install tools and apps with limited access."), ("server", "Whole server · Privileged", "Run as your user on the host. Configure mounted folders, networking, and container runtime settings.")].enumerated() {
                 let card = CALayer()
                 card.frame = CGRect(x: frame.minX + (columns == 2 ? CGFloat(index) * (cardWidth + 16) : 0), y: y - 172 - (columns == 1 ? CGFloat(index) * 188 : 0), width: cardWidth, height: 172)
-                card.cornerRadius = 12
+                card.cornerRadius = 0
                 card.borderWidth = 1
                 card.borderColor = resolvedCGColor(.separatorColor)
                 card.backgroundColor = resolvedCGColor(.controlBackgroundColor)
@@ -6071,7 +6094,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         if let workspace, inContainer, !terminalReaches(workspace) { return top }
         let padding: CGFloat = 20
         let card = CALayer()
-        card.cornerRadius = 12
+        card.cornerRadius = 0
         card.borderWidth = 1
         card.borderColor = resolvedCGColor(.separatorColor)
         card.backgroundColor = resolvedCGColor(NSColor.controlAccentColor.withAlphaComponent(0.07))
@@ -7188,10 +7211,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
         let panel = CALayer()
         panel.frame = panelFrame
-        panel.cornerRadius = 8
-        panel.borderWidth = 1
+        applyPopoverStyle(panel)
         panel.backgroundColor = resolvedCGColor(.windowBackgroundColor)
-        panel.borderColor = resolvedCGColor(.separatorColor)
         installOverlayLayer.addSublayer(panel)
 
         let iconSize: CGFloat = 42
@@ -7260,10 +7281,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
         let panel = CALayer()
         panel.frame = panelFrame
-        panel.cornerRadius = 8
-        panel.borderWidth = 1
+        applyPopoverStyle(panel)
         panel.backgroundColor = resolvedCGColor(.windowBackgroundColor)
-        panel.borderColor = resolvedCGColor(.separatorColor)
         passwordOverlayLayer.addSublayer(panel)
 
         let title = makeTextLayer(size: 15, weight: .semibold, color: .labelColor)
@@ -7361,10 +7380,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
         let panel = CALayer()
         panel.frame = panelFrame
-        panel.cornerRadius = 8
-        panel.borderWidth = 1
+        applyPopoverStyle(panel)
         panel.backgroundColor = resolvedCGColor(.windowBackgroundColor)
-        panel.borderColor = resolvedCGColor(.separatorColor)
         updateOverlayLayer.addSublayer(panel)
 
         let title = makeTextLayer(size: 15, weight: .semibold, color: .labelColor)
@@ -7427,10 +7444,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
         let panel = CALayer()
         panel.frame = panelFrame
-        panel.cornerRadius = 8
-        panel.borderWidth = 1
+        applyPopoverStyle(panel)
         panel.backgroundColor = resolvedCGColor(.windowBackgroundColor)
-        panel.borderColor = resolvedCGColor(.separatorColor)
         messageDialogOverlayLayer.addSublayer(panel)
 
         let title = makeTextLayer(size: 15, weight: .semibold, color: .labelColor)
@@ -7547,10 +7562,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         let bottomControlsHeight: CGFloat = 72
         let panel = CALayer()
         panel.frame = panelFrame
-        panel.cornerRadius = 8
-        panel.borderWidth = 1
+        applyPopoverStyle(panel)
         panel.backgroundColor = resolvedCGColor(.windowBackgroundColor)
-        panel.borderColor = resolvedCGColor(.separatorColor)
         filePickerOverlayLayer.addSublayer(panel)
 
         let title = makeTextLayer(size: 15, weight: .semibold, color: .labelColor)
@@ -8350,9 +8363,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                 height: max(createLayer.bounds.height - 44, 80))
         let panel = CALayer()
         panel.frame = panelFrame
-        panel.cornerRadius = 12
-        panel.borderWidth = 1
-        panel.borderColor = resolvedCGColor(.separatorColor)
+        applyPopoverStyle(panel)
         panel.backgroundColor = resolvedCGColor(.windowBackgroundColor)
         createLayer.addSublayer(panel)
 
@@ -17782,7 +17793,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         let panelWidth = min(max(width - 40, 260), 740)
         let panelHeight = min(max(height - 40, 240), 620)
         panel.frame = CGRect(x: (width - panelWidth) / 2, y: (height - panelHeight) / 2, width: panelWidth, height: panelHeight)
-        panel.cornerRadius = 16
+        applyPopoverStyle(panel)
         panel.backgroundColor = resolvedCGColor(.windowBackgroundColor)
         managementOverlayLayer.addSublayer(panel)
         let title = makeTextLayer(size: 21, weight: .semibold, color: .labelColor)
@@ -19386,13 +19397,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         )
         workspacePanelLayer.frame = workspacePanelFrame
         workspacePanelLayer.backgroundColor = resolvedCGColor(.windowBackgroundColor)
-        workspacePanelLayer.cornerRadius = 14
-        workspacePanelLayer.borderWidth = 0.5
-        workspacePanelLayer.borderColor = resolvedCGColor(.separatorColor)
-        workspacePanelLayer.shadowColor = resolvedCGColor(.black)
-        workspacePanelLayer.shadowOpacity = 0.18
-        workspacePanelLayer.shadowRadius = 18
-        workspacePanelLayer.shadowOffset = CGSize(width: 0, height: -4)
+        applyPopoverStyle(workspacePanelLayer)
         workspacePanelLayer.sublayers = nil
 
         let title = makeTextLayer(size: 20, weight: .semibold, color: .labelColor)
@@ -19421,7 +19426,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         let card = CALayer()
         card.frame = localFileFrame
         card.backgroundColor = resolvedCGColor(.controlBackgroundColor)
-        card.cornerRadius = 10
+        card.cornerRadius = 0
         card.borderWidth = 1
         card.borderColor = resolvedCGColor(.separatorColor)
         workspacePanelLayer.addSublayer(card)
@@ -19530,13 +19535,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                      height: panelHeight)
         workspacePanelLayer.frame = workspacePanelFrame
         workspacePanelLayer.backgroundColor = resolvedCGColor(.windowBackgroundColor)
-        workspacePanelLayer.cornerRadius = 14
-        workspacePanelLayer.borderWidth = 0.5
-        workspacePanelLayer.borderColor = resolvedCGColor(.separatorColor)
-        workspacePanelLayer.shadowColor = resolvedCGColor(.black)
-        workspacePanelLayer.shadowOpacity = 0.18
-        workspacePanelLayer.shadowRadius = 18
-        workspacePanelLayer.shadowOffset = CGSize(width: 0, height: -4)
+        applyPopoverStyle(workspacePanelLayer)
         workspacePanelLayer.sublayers = nil
 
         if showsDeletePrompt {
@@ -19567,13 +19566,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         workspaceRenamePanelFrame = workspacePanelFrame
         workspacePanelLayer.frame = workspacePanelFrame
         workspacePanelLayer.backgroundColor = resolvedCGColor(.windowBackgroundColor)
-        workspacePanelLayer.cornerRadius = 14
-        workspacePanelLayer.borderWidth = 0.5
-        workspacePanelLayer.borderColor = resolvedCGColor(.separatorColor)
-        workspacePanelLayer.shadowColor = resolvedCGColor(.black)
-        workspacePanelLayer.shadowOpacity = 0.2
-        workspacePanelLayer.shadowRadius = 20
-        workspacePanelLayer.shadowOffset = CGSize(width: 0, height: -4)
+        applyPopoverStyle(workspacePanelLayer)
         dockerfileTextSurface.removeFromSuperlayer()
         workspacePanelLayer.sublayers = nil
         containerConfigurationTextViewportLayer = nil
@@ -20084,7 +20077,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         guard frame.height > 0 else { return }
         let card = CALayer()
         card.frame = frame
-        card.cornerRadius = 7
+        card.cornerRadius = 0
         card.backgroundColor = resolvedCGColor(.controlBackgroundColor)
         card.borderWidth = 0.5
         card.borderColor = resolvedCGColor(.separatorColor)
@@ -20261,14 +20254,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         )
         let prompt = CALayer()
         prompt.frame = promptFrame
-        prompt.cornerRadius = 12
+        applyPopoverStyle(prompt)
         prompt.backgroundColor = resolvedCGColor(.windowBackgroundColor)
-        prompt.borderWidth = 0.5
-        prompt.borderColor = resolvedCGColor(.separatorColor)
-        prompt.shadowColor = resolvedCGColor(.black)
-        prompt.shadowOpacity = 0.2
-        prompt.shadowRadius = 16
-        prompt.shadowOffset = CGSize(width: 0, height: -3)
         workspacePanelLayer.addSublayer(prompt)
 
         let title = makeTextLayer(size: 17, weight: .semibold, color: .labelColor)
@@ -20429,14 +20416,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         )
         let prompt = CALayer()
         prompt.frame = localPromptFrame
-        prompt.cornerRadius = 10
-        prompt.borderWidth = 0.5
-        prompt.borderColor = resolvedCGColor(.separatorColor)
+        applyPopoverStyle(prompt)
         prompt.backgroundColor = resolvedCGColor(.windowBackgroundColor)
-        prompt.shadowColor = resolvedCGColor(.black)
-        prompt.shadowOpacity = 0.18
-        prompt.shadowRadius = 14
-        prompt.shadowOffset = CGSize(width: 0, height: -3)
         workspacePanelLayer.addSublayer(prompt)
         containerConfigurationRebuildPromptFrame = localPromptFrame.offsetBy(
             dx: workspacePanelFrame.minX,
@@ -20511,14 +20492,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         )
         let prompt = CALayer()
         prompt.frame = localPromptFrame
-        prompt.cornerRadius = 10
-        prompt.borderWidth = 0.5
-        prompt.borderColor = resolvedCGColor(.separatorColor)
+        applyPopoverStyle(prompt)
         prompt.backgroundColor = resolvedCGColor(.windowBackgroundColor)
-        prompt.shadowColor = resolvedCGColor(.black)
-        prompt.shadowOpacity = 0.18
-        prompt.shadowRadius = 14
-        prompt.shadowOffset = CGSize(width: 0, height: -3)
         workspacePanelLayer.addSublayer(prompt)
         containerConfigurationDismissPromptFrame = localPromptFrame.offsetBy(
             dx: workspacePanelFrame.minX,
@@ -21059,13 +21034,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             let nestedPrompt = CALayer()
             nestedPrompt.frame = localPromptFrame
             nestedPrompt.backgroundColor = resolvedCGColor(.windowBackgroundColor)
-            nestedPrompt.cornerRadius = 12
-            nestedPrompt.borderWidth = 0.5
-            nestedPrompt.borderColor = resolvedCGColor(.separatorColor)
-            nestedPrompt.shadowColor = resolvedCGColor(.black)
-            nestedPrompt.shadowOpacity = 0.15
-            nestedPrompt.shadowRadius = 14
-            nestedPrompt.shadowOffset = CGSize(width: 0, height: -3)
+            applyPopoverStyle(nestedPrompt)
             workspacePanelLayer.addSublayer(nestedPrompt)
             workspaceRenamePanelFrame = localPromptFrame.offsetBy(
                 dx: workspacePanelFrame.minX,
@@ -21800,6 +21769,11 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         return "No logs yet."
     }
 
+    private var isLocalhostMode: Bool {
+        guard let host = outerframeHost.pluginURL()?.host?.lowercased() else { return false }
+        return host == "outerloop.localhost" || host.hasSuffix(".outerloop.localhost") || host == "outerframe.local"
+    }
+
     private func backendManagementMenuItems(for backend: BackendRecord,
                                             includePlaceholderRunActions: Bool) -> (operationByItemID: [String: String], items: [OuterframeContextMenuItem]) {
         var operationByItemID: [String: String] = [:]
@@ -21814,7 +21788,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                                    title: "Show logs",
                                                    isEnabled: true,
                                                    systemImageName: "doc.plaintext"))
-            if backend.menuBarVisibilityAvailable {
+            if backend.menuBarVisibilityAvailable && isLocalhostMode {
                 operationByItemID["menuBarVisibility"] = "toggleMenuBarVisibility"
                 items.append(OuterframeContextMenuItem(id: "menuBarVisibility",
                                                        title: "Show in macOS menu bar when backends are running",

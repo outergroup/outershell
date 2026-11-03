@@ -1,7 +1,9 @@
 (() => {
   "use strict";
 
-  document.documentElement.classList.toggle("outerloop-host", /(^|\.)outerloop\.localhost$/i.test(window.location.hostname));
+  const isOuterLoopHost = /(^|\.)outerloop\.localhost$/i.test(window.location.hostname);
+  const isLocalhostMode = isOuterLoopHost || ["localhost", "127.0.0.1", "[::1]"].includes(window.location.hostname.toLowerCase());
+  document.documentElement.classList.toggle("outerloop-host", isOuterLoopHost);
 
   const decoder = new TextDecoder();
   const elements = {
@@ -923,7 +925,7 @@ RUN outerctl image add-command --id codex --name "Codex" --working-directory /ro
     const ranks = new Map(state.groupOrder.map((id, index) => [id, index]));
     groups.sort((a, b) => (ranks.get(a.id) ?? Infinity) - (ranks.get(b.id) ?? Infinity));
     const markup = groups.map(group => {
-      const shield = group.shield ? '<svg aria-hidden="true" viewBox="0 0 16 18" width="14" height="16" style="vertical-align:middle;margin-right:6px;color:#2678d4"><path d="M8 1L14 3V8C14 12 11 15 8 17C5 15 2 12 2 8V3Z" fill="none" stroke="currentColor"/><path d="M8 1V17C11 15 14 12 14 8V3Z" fill="currentColor"/></svg>' : "";
+      const shield = group.shield ? '<svg aria-hidden="true" viewBox="0 0 16 18" width="14" height="16" style="vertical-align:middle;margin-right:6px;color:var(--accent)"><path d="M8 1L14 3V8C14 12 11 15 8 17C5 15 2 12 2 8V3Z" fill="none" stroke="currentColor"/><path d="M8 1V17C11 15 14 12 14 8V3Z" fill="currentColor"/></svg>' : "";
       const workspace = group.workspace;
       const id = escapeHTML(workspace?.id || "");
       const preparing = workspace && containerPreparing(workspace);
@@ -1801,7 +1803,7 @@ RUN outerctl image add-command --id codex --name "Codex" --working-directory /ro
         `<button class="context-menu-item" type="button" data-action="about-outer-shell" data-backend-key="${key}" role="menuitem">${contextMenuGlyph("ⓘ")}<span>About Outer Shell</span></button>`,
         `<button class="context-menu-item" type="button" data-action="check-outer-shell-update" data-backend-key="${key}" role="menuitem">${contextMenuGlyph("↻")}<span>Check for Updates</span></button>`
       );
-      if (backend.menuBarVisibilityAvailable) {
+      if (backend.menuBarVisibilityAvailable && isLocalhostMode) {
         management.push(`<button class="context-menu-item menu-toggle" type="button" data-action="toggle-menu-bar" data-backend-key="${key}" data-enabled="${backend.menuBarVisibilityEnabled ? "true" : "false"}" role="menuitemcheckbox" aria-checked="${backend.menuBarVisibilityEnabled ? "true" : "false"}">${contextMenuGlyph(backend.menuBarVisibilityEnabled ? "✓" : "")}<span>Show in macOS menu bar when backends are running</span></button>`);
       }
     }
