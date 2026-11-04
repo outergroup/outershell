@@ -2626,12 +2626,43 @@ def unavailable_workspace_dictionary(record, error):
     }
 
 
+def layout_endpoint_names():
+    registry = os.environ.get("OUTERSHELL_REGISTRY")
+    path = (pathlib.Path(os.path.expanduser(registry + ".layout")) if registry else
+            outer_shell_home() / "registry.orwa.layout")
+    try:
+        data = path.read_bytes()
+    except FileNotFoundError:
+        return {}
+    except OSError as error:
+        print(f"Could not read endpoint names from {path}: {error}", file=sys.stderr)
+        return {}
+    try:
+        if len(data) < 18 or data[:8] != b"OSLAY001":
+            raise ValueError("unrecognized layout record")
+        names = json.loads(data[16:].decode()).get("names", {})
+    except (ValueError, AttributeError) as error:
+        print(f"Could not read endpoint names from {path}: {error}", file=sys.stderr)
+        return {}
+    if not isinstance(names, dict):
+        return {}
+    return {key: value for key, value in names.items() if isinstance(value, str) and value}
+
+
+def container_endpoint_layout_key(workspace, app):
+    def encode(value):
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    frontend = encode([app.get("frontendID") or "", app.get("socketPath") or "", app.get("url") or "", 0])
+    return encode(["container", str(workspace["id"]).lower(), app["serviceID"], frontend])
+
+
 def publish_endpoint_names(workspaces):
     config_home = pathlib.Path(os.environ.get("XDG_CONFIG_HOME") or pathlib.Path.home() / ".config")
     if not config_home.is_absolute():
         config_home = pathlib.Path.home() / ".config"
     configuration = config_home / "outerssh" / "endpoints.d"
     configuration.mkdir(parents=True, exist_ok=True, mode=0o700)
+    names = layout_endpoint_names()
     lines = ["outerssh-endpoints-v2"]
     for workspace in workspaces:
         for app in workspace.get("apps", []):
@@ -2639,7 +2670,8 @@ def publish_endpoint_names(workspaces):
             port = app.get("publishedPort")
             endpoints = ([f"tcp {host} {port}" for host in ("localhost", "127.0.0.1", "::1")] if port else
                          [f"unix {socket}"] if socket else [])
-            fields = [workspace["name"], app.get("displayName") or app["serviceID"]]
+            name = names.get(container_endpoint_layout_key(workspace, app))
+            fields = [workspace["name"], name or app.get("displayName") or app["serviceID"]]
             if any(len(field.encode()) > 256 or any(ord(c) < 32 or 127 <= ord(c) < 160 for c in field) for field in fields):
                 continue
             for endpoint in endpoints:

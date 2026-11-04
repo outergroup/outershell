@@ -22,4 +22,27 @@ static bool endpoint_name_append(StringBuilder *out, const char *transport, cons
         sb_append(out, "\n") &&
         sb_append(out, app) && sb_append(out, "\n");
 }
+static inline bool endpoint_name_append_json_string(StringBuilder *out, const char *text) {
+    bool ok = sb_append(out, "\"");
+    for (const unsigned char *p = (const unsigned char *)text; ok && *p; p++) {
+        const char *escape = *p == '"' ? "\\\"" : *p == '\\' ? "\\\\" : *p == '\b' ? "\\b" :
+            *p == '\f' ? "\\f" : *p == '\n' ? "\\n" : *p == '\r' ? "\\r" : *p == '\t' ? "\\t" : NULL;
+        if (escape) {
+            ok = sb_append(out, escape);
+        } else if (*p < 32) {
+            char code[8];
+            snprintf(code, sizeof(code), "\\u%04x", *p);
+            ok = sb_append(out, code);
+        } else {
+            ok = sb_append_n(out, (const char *)p, 1);
+        }
+    }
+    return ok && sb_append(out, "\"");
+}
+static inline bool endpoint_name_host_layout_key(StringBuilder *out, const char *scope, const char *service_id,
+                                                 const char *frontend_id) {
+    return sb_append(out, "[\"host\",") && endpoint_name_append_json_string(out, scope) &&
+        sb_append(out, ",") && endpoint_name_append_json_string(out, service_id) &&
+        sb_append(out, ",") && endpoint_name_append_json_string(out, frontend_id) && sb_append(out, "]");
+}
 #endif

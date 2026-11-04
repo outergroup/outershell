@@ -1558,6 +1558,8 @@ static bool direct_root_session_uses_system_scope(void) {
 #endif
 }
 
+static void standard_user_outershell_root(char *out, size_t out_size);
+
 static void default_user_outershell_root(char *out, size_t out_size) {
     if (!out || out_size == 0) return;
     const char *override_root = getenv("OUTERSHELL_HOME");
@@ -1571,6 +1573,10 @@ static void default_user_outershell_root(char *out, size_t out_size) {
         }
         return;
     }
+    standard_user_outershell_root(out, out_size);
+}
+
+static void standard_user_outershell_root(char *out, size_t out_size) {
 #ifdef __APPLE__
     if (direct_root_session_uses_system_scope()) {
         snprintf(out, out_size, "%s", kSystemOuterShellRoot);
@@ -4664,15 +4670,73 @@ static uint64_t current_log_path_event_version(const char *raw_path) {
 }
 
 #include "../Backend/EndpointNames.h"
+#include "../Backend/OuterShellLayout.h"
+
+static void load_layout_endpoint_names(LayoutNames *names) {
+    memset(names, 0, sizeof(*names));
+    char path[PATH_MAX];
+    if (snprintf(path, sizeof(path), "%s.layout", g_registry_database_path) >= (int)sizeof(path)) return;
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        if (errno != ENOENT) fprintf(stderr, "Could not read endpoint names from %s: %s\n", path, strerror(errno));
+        return;
+    }
+    struct stat st;
+    StringBuilder data = {0};
+    bool ok = fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_size <= LAYOUT_MAX_BYTES &&
+        sb_reserve(&data, (size_t)st.st_size);
+    while (ok && data.length < (size_t)st.st_size) {
+        ssize_t count = read(fd, data.data + data.length, (size_t)st.st_size - data.length);
+        if (count < 0 && errno == EINTR) continue;
+        if (count <= 0) ok = false;
+        else data.length += (size_t)count;
+    }
+    close(fd);
+    if (!ok || !layout_names_parse(data.data, data.length, names))
+        fprintf(stderr, "Could not read endpoint names from %s; using registered names.\n", path);
+    free(data.data);
+}
+
+static const char *host_endpoint_display_name(const LayoutNames *names, const char *scope,
+                                              const RegistryFrontendRecord *app) {
+    if (!names->count || !app->service_id || !app->frontend_id || !app->frontend_id[0]) return app->display_name;
+    StringBuilder key = {0};
+    const char *name = NULL;
+    if (endpoint_name_host_layout_key(&key, scope, app->service_id, app->frontend_id))
+        name = layout_names_find(names, key.data);
+    free(key.data);
+    return name ? name : app->display_name;
+}
+
+static bool registry_is_standard_for_home(void) {
+    char root[PATH_MAX], standard[PATH_MAX];
+    standard_user_outershell_root(root, sizeof(root));
+    snprintf(standard, sizeof(standard), "%s/registry.orwa", root);
+    if (strcmp(standard, g_registry_database_path) == 0) return true;
+    char resolved_standard[PATH_MAX], resolved_registry[PATH_MAX];
+    char standard_parent[PATH_MAX], registry_parent[PATH_MAX];
+    if (!parent_directory(standard, standard_parent, sizeof(standard_parent)) ||
+        !parent_directory(g_registry_database_path, registry_parent, sizeof(registry_parent)) ||
+        !realpath(standard_parent, resolved_standard) || !realpath(registry_parent, resolved_registry))
+        return false;
+    const char *standard_name = strrchr(standard, '/');
+    const char *registry_name = strrchr(g_registry_database_path, '/');
+    return standard_name && registry_name && strcmp(standard_name, registry_name) == 0 &&
+        strcmp(resolved_standard, resolved_registry) == 0;
+}
 
 static void publish_endpoint_names(void) {
+    if (!registry_is_standard_for_home()) return;
     RegistryStore store;
     char error[512] = "", path[PATH_MAX], directory[PATH_MAX], temporary[PATH_MAX];
     if (!registry_store_open_user_readonly(&store, error, sizeof(error))) return;
     bool system = direct_root_session_uses_system_scope();
+    const char *scope = system ? "system" : "user";
     outerssh_http_unix_allowlist_path(system, directory, sizeof(directory));
     char *separator = strrchr(directory, '/');
     if (!separator) { registry_store_free(&store); return; }
+    LayoutNames names;
+    load_layout_endpoint_names(&names);
     *separator = 0;
     size_t used = strlen(directory);
     snprintf(directory + used, sizeof(directory) - used, "/endpoints.d");
@@ -4682,18 +4746,20 @@ static void publish_endpoint_names(void) {
     bool ok = sb_append(&text, "outerssh-endpoints-v2\n");
     for (size_t i = 0; ok && i < store.frontend_count; i++) {
         const RegistryFrontendRecord *app = &store.frontends[i];
+        const char *display_name = host_endpoint_display_name(&names, scope, app);
         if (app->socket_path && app->socket_path[0]) {
-            ok = endpoint_name_append(&text, "unix", app->socket_path, 0, "", app->display_name);
+            ok = endpoint_name_append(&text, "unix", app->socket_path, 0, "", display_name);
         } else if (app->port > 0) {
             const char *host = app->host && app->host[0] ? app->host : "localhost";
-            ok = endpoint_name_append(&text, "tcp", host, app->port, "", app->display_name);
+            ok = endpoint_name_append(&text, "tcp", host, app->port, "", display_name);
             if (!strcmp(host, "localhost") || !strcmp(host, "127.0.0.1") || !strcmp(host, "::1")) {
                 const char *aliases[] = {"localhost", "127.0.0.1", "::1"};
                 for (size_t j = 0; ok && j < 3; j++)
-                    if (strcmp(host, aliases[j])) ok = endpoint_name_append(&text, "tcp", aliases[j], app->port, "", app->display_name);
+                    if (strcmp(host, aliases[j])) ok = endpoint_name_append(&text, "tcp", aliases[j], app->port, "", display_name);
             }
         }
     }
+    layout_names_free(&names);
     registry_store_free(&store);
     if (ok && text.length <= 65536 && mkdir_p(directory)) {
         if (system && chmod(directory, 0755) != 0) {
@@ -7081,9 +7147,21 @@ static bool append_inline_shell_startup_snapshot(StringBuilder *builder) {
 #ifdef __APPLE__
     const char *shell_name = "zsh";
     const char *files[] = {".zprofile", ".zshrc"};
+    const char *install_failure_trap =
+        "trap '__outershell_inline_startup_report_failure \"$?\" \"${funcsourcetrace[1]%:*}\" "
+        "\"$(( ${funcsourcetrace[1]##*:} + LINENO ))\"' ZERR\n";
+    const char *remove_failure_trap = "trap - ZERR\n";
 #else
     const char *shell_name = "bash";
     const char *files[] = {".bash_profile", ".bash_login", ".profile", ".bashrc"};
+    const char *install_failure_trap =
+        "__outershell_inline_startup_had_errtrace=0\n"
+        "case $- in *E*) __outershell_inline_startup_had_errtrace=1 ;; *) set -E ;; esac\n"
+        "trap '__outershell_inline_startup_report_failure \"$?\" \"${BASH_SOURCE[0]}\" \"$LINENO\"' ERR\n";
+    const char *remove_failure_trap =
+        "trap - ERR\n"
+        "if [ \"$__outershell_inline_startup_had_errtrace\" = 0 ]; then set +E; fi\n"
+        "unset __outershell_inline_startup_had_errtrace\n";
 #endif
     bool ok = sb_append(builder,
         "\n"
@@ -7098,12 +7176,34 @@ static bool append_inline_shell_startup_snapshot(StringBuilder *builder) {
     }
     return ok && sb_append(builder,
         "}\n"
+        "__outershell_inline_startup_report_failure() {\n"
+        "    [ \"${ZSH_SUBSHELL:-${BASH_SUBSHELL:-0}}\" = 0 ] || return 0\n"
+        "    [ -z \"${__outershell_inline_startup_reported:-}\" ] || return 0\n"
+        "    __outershell_inline_startup_reported=1\n"
+        "    local exit_status=$1 source_file=$2 source_line=$3 origin text\n"
+        "    origin=$(awk -v n=\"$source_line\" 'NR > n { exit }\n"
+        "        /^# --- Begin inline .* ---$/ { name = $5; start = NR }\n"
+        "        /^# --- End inline .* ---$/ { name = \"\" }\n"
+        "        END { if (name != \"\") print name \" line \" (n - start) }' \"$source_file\" 2>/dev/null) || origin=\n"
+        "    text=$(sed -n \"${source_line}p\" \"$source_file\" 2>/dev/null) || text=\n"
+        "    printf 'Outer Shell: this launcher stopped because a command from your shell startup files exited with status %s.\\n' \"$exit_status\" >&2\n"
+        "    if [ -n \"$origin\" ]; then\n"
+        "        printf '  ~/%s: %s\\n' \"$origin\" \"$text\" >&2\n"
+        "        printf '  Outer Shell copied that file into %s when this app was installed. Edit or remove line %s there.\\n' \"$source_file\" \"$source_line\" >&2\n"
+        "    else\n"
+        "        printf '  %s line %s: %s\\n' \"$source_file\" \"$source_line\" \"$text\" >&2\n"
+        "    fi\n"
+        "}\n"
         "__outershell_inline_startup_had_nounset=0\n"
-        "case $- in *u*) __outershell_inline_startup_had_nounset=1; set +u ;; esac\n"
-        "__outershell_inline_startup\n"
+        "case $- in *u*) __outershell_inline_startup_had_nounset=1; set +u ;; esac\n") &&
+        sb_append(builder, install_failure_trap) &&
+        sb_append(builder,
+        "__outershell_inline_startup\n") &&
+        sb_append(builder, remove_failure_trap) &&
+        sb_append(builder,
         "if [ \"$__outershell_inline_startup_had_nounset\" = 1 ]; then set -u; fi\n"
         "unset __outershell_inline_startup_had_nounset\n"
-        "unset -f __outershell_inline_startup 2>/dev/null || true\n");
+        "unset -f __outershell_inline_startup __outershell_inline_startup_report_failure 2>/dev/null || true\n");
 }
 
 static bool append_generated_script_log_redirect(StringBuilder *builder) {
@@ -11892,6 +11992,7 @@ done:
     free(data.data);
     flock(lock_fd, LOCK_UN);
     close(lock_fd);
+    if (write_layout && status == 200) publish_endpoint_names();
 }
 
 static void process_ui_route_request(uint16_t route, const char *query, const char *body, size_t body_length, UiApiResponse *response) {

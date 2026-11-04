@@ -1163,14 +1163,53 @@ final class SafeSpaceManager: @unchecked Sendable {
         return values
     }
 
+    private func layoutEndpointNames() -> [String: String] {
+        let root = ProcessInfo.processInfo.environment["OUTERSHELL_HOME"]
+            ?? NSHomeDirectory() + "/Library/Application Support/outershell"
+        let registry = ProcessInfo.processInfo.environment["OUTERSHELL_REGISTRY"]
+            ?? (root as NSString).appendingPathComponent("registry.orwa")
+        let path = (registry as NSString).expandingTildeInPath + ".layout"
+        guard FileManager.default.fileExists(atPath: path) else { return [:] }
+        do {
+            let data = try Data(contentsOf: URL(fileURLWithPath: path))
+            guard data.count >= 18, data.prefix(8) == Data("OSLAY001".utf8),
+                  let layout = try JSONSerialization.jsonObject(with: data.dropFirst(16)) as? [String: Any] else {
+                NSLog("Could not read endpoint names from %@: unrecognized layout record", path)
+                return [:]
+            }
+            return (layout["names"] as? [String: Any] ?? [:]).compactMapValues { value in
+                guard let name = value as? String, !name.isEmpty else { return nil }
+                return name
+            }
+        } catch {
+            NSLog("Could not read endpoint names from %@: %@", path, error.localizedDescription)
+            return [:]
+        }
+    }
+
+    private func containerEndpointLayoutKey(workspaceID: String, app: [String: Any]) -> String? {
+        func encode(_ values: [Any]) -> String? {
+            guard let data = try? JSONSerialization.data(withJSONObject: values,
+                                                         options: [.fragmentsAllowed, .withoutEscapingSlashes]) else { return nil }
+            return String(data: data, encoding: .utf8)
+        }
+        guard let serviceID = app["serviceID"] as? String,
+              let frontend = encode([app["frontendID"] as? String ?? "", app["socketPath"] as? String ?? "",
+                                     app["url"] as? String ?? "", 0]) else { return nil }
+        return encode(["container", workspaceID.lowercased(), serviceID, frontend])
+    }
+
     private func publishEndpointNames(_ workspaces: [[String: Any]]) throws {
+        let names = layoutEndpointNames()
         var lines = ["outerssh-endpoints-v2"]
         for workspace in workspaces {
             guard let container = workspace["name"] as? String,
                   let apps = workspace["apps"] as? [[String: Any]] else { continue }
+            let workspaceID = workspace["id"] as? String ?? ""
             for app in apps {
                 let socket = app["externalSocketPath"] as? String ?? ""
-                let name = app["displayName"] as? String ?? app["serviceID"] as? String ?? ""
+                let renamed = containerEndpointLayoutKey(workspaceID: workspaceID, app: app).flatMap { names[$0] }
+                let name = renamed ?? app["displayName"] as? String ?? app["serviceID"] as? String ?? ""
                 let fields = [container, name]
                 guard !name.isEmpty, fields.allSatisfy({ $0.utf8.count <= 256 &&
                     !$0.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains) }) else { continue }

@@ -11,9 +11,11 @@ cxx_command="${CXX:-c++}"
 daemon_pid=""
 image_libraries="-lpng -lz"
 service_option="--systemd-unit"
+state_dir="$build_dir/home/.local/state/outershell"
 if [ "$(uname -s)" = "Darwin" ]; then
     image_libraries="-framework ImageIO -framework CoreGraphics -framework CoreFoundation"
     service_option="--launchd-plist"
+    state_dir="$build_dir/home/Library/Application Support/outershell"
 fi
 
 cleanup() {
@@ -25,7 +27,7 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-mkdir -p "$build_dir/home/services"
+mkdir -p "$build_dir/home/services" "$state_dir"
 "$cc_command" -std=gnu17 -O2 -o "$build_dir/outershelld" \
     "$repo_root/Backend/OuterShellBuffer.c" \
     "$repo_root/Backend/OuterShellAPI.c" \
@@ -37,7 +39,7 @@ mkdir -p "$build_dir/home/services"
 "$cxx_command" -std=c++17 -O2 -I "$repo_root/Resources" \
     -o "$build_dir/outerctl" "$repo_root/Resources/outerctl.cpp"
 
-python3 - "$build_dir/home/registry.orwa" <<'PYFIXTURE'
+python3 - "$state_dir/registry.orwa" <<'PYFIXTURE'
 from pathlib import Path
 import struct
 import sys
@@ -80,7 +82,8 @@ ref(layout + 16, 'Retired user group', 64)
 Path(sys.argv[1]).write_bytes(data)
 PYFIXTURE
 
-HOME="$build_dir/home" XDG_CONFIG_HOME="$build_dir/home/.config" OUTERSHELL_HOME="$build_dir/home" "$build_dir/outershelld" \
+HOME="$build_dir/home" XDG_CONFIG_HOME="$build_dir/home/.config" XDG_STATE_HOME="$build_dir/home/.local/state" \
+    OUTERSHELL_HOME="$state_dir" "$build_dir/outershelld" \
     --service-manager internal \
     --services-dir "$build_dir/home/services" \
     --api-socket-path "$api_socket" \
@@ -108,6 +111,57 @@ assert lines[0] == "outerssh-endpoints-v2"
 assert ["tcp 127.0.0.1 8123", "", "Legacy app"] in [lines[i:i+3] for i in range(1, len(lines), 3)]
 PYUPGRADE
 
+python3 - "$build_dir/home" "$api_socket" <<'PYRENAME'
+from pathlib import Path
+import json
+import socket
+import struct
+import sys
+
+home, api = Path(sys.argv[1]), sys.argv[2]
+
+def exact(sock, count):
+    data = b''
+    while len(data) < count:
+        block = sock.recv(count - len(data))
+        assert block, 'Unexpected API disconnect'
+        data += block
+    return data
+
+def request(route, body=b''):
+    message = struct.pack('<HHIIIII', 26, route, 0, 24, 0, 24, len(body)) + body
+    with socket.socket(socket.AF_UNIX) as sock:
+        sock.settimeout(5)
+        sock.connect(api)
+        sock.sendall(struct.pack('<I', len(message)) + message)
+        reply = exact(sock, struct.unpack('<I', exact(sock, 4))[0])
+    status = struct.unpack_from('<I', reply, 2)[0]
+    offset, length = struct.unpack_from('<II', reply, 16)
+    return status, reply[offset:offset + length]
+
+def records():
+    base = home / ("Library/Application Support/org.outerssh" if sys.platform == "darwin" else ".config/outerssh")
+    lines = (base / "endpoints.d/outershell").read_text().splitlines()
+    assert lines[0] == "outerssh-endpoints-v2"
+    return [lines[i:i+3] for i in range(1, len(lines), 3)]
+
+def save_names(names):
+    status, current = request(11)
+    assert status == 200, status
+    body = current[:16] + json.dumps({"version": 1, "names": names}, ensure_ascii=False).encode()
+    status, _ = request(12, body)
+    assert status == 200, status
+
+key = json.dumps(["host", "user", "legacy.backend", "legacy.app"], separators=(",", ":"))
+save_names({key: "Renamed · app", json.dumps(["host", "user", "other", "other:main"]): "Unrelated"})
+renamed = records()
+for host in ("localhost", "127.0.0.1", "::1"):
+    assert [f"tcp {host} 8123", "", "Renamed · app"] in renamed, renamed
+assert not any(record[2] == "Legacy app" for record in renamed), renamed
+save_names({})
+assert ["tcp 127.0.0.1 8123", "", "Legacy app"] in records()
+PYRENAME
+
 outerctl app list --backend legacy.backend >"$build_dir/legacy.tsv"
 awk -F '\t' '
     NR == 1 && NF != 12 { exit 1 }
@@ -117,7 +171,7 @@ awk -F '\t' '
 ' "$build_dir/legacy.tsv"
 outerctl app upsert --backend legacy.backend --frontend-id legacy.app \
     --name "Legacy app" --host 127.0.0.1 --port 8123 --path /legacy
-python3 - "$build_dir/home/registry.orwa" <<'PYCHECK'
+python3 - "$state_dir/registry.orwa" <<'PYCHECK'
 from pathlib import Path
 import struct
 import sys

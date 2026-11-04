@@ -1400,6 +1400,11 @@ private enum PendingButtonAction {
 private struct PendingButtonClick {
     let frame: CGRect
     let action: PendingButtonAction
+    var excludedFrame: CGRect?
+
+    func contains(_ point: CGPoint) -> Bool {
+        frame.contains(point) && !(excludedFrame?.contains(point) ?? false)
+    }
 }
 
 private struct CopyConfirmation {
@@ -2200,6 +2205,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private var createSuggestionFrames: [(frame: CGRect, key: String, value: String)] = []
     private var createDirectorySelectFrames: [(frame: CGRect, key: String)] = []
     private var createContentClipFrame = CGRect.zero
+    private var createPanelFrame = CGRect.zero
     private var createDismissFrame = CGRect.zero
     private var createButtonFrame = CGRect.zero
     private var cancelCreateFrame = CGRect.zero
@@ -2336,6 +2342,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private var containerConfigurationBuildErrorCopyFrame = CGRect.zero
     private var containerConfigurationBuildErrorDismissFrame = CGRect.zero
     private var containerConfigurationDismissPromptFrame = CGRect.zero
+    private var containerConfigurationBuildErrorPromptFrame = CGRect.zero
     private var containerConfigurationDismissSaveFrame = CGRect.zero
     private var containerConfigurationDismissWithoutSavingFrame = CGRect.zero
     private var containerConfigurationDismissCancelFrame = CGRect.zero
@@ -8338,6 +8345,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         createSuggestionFrames.removeAll()
         createDirectorySelectFrames.removeAll()
         createContentClipFrame = .zero
+        createPanelFrame = .zero
         createDismissFrame = .zero
         createButtonFrame = .zero
         cancelCreateFrame = .zero
@@ -8369,6 +8377,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
         let contentClipFrame = panelFrame.insetBy(dx: 1, dy: 1)
         createContentClipFrame = contentClipFrame
+        createPanelFrame = panelFrame
         let contentClipLayer = CALayer()
         contentClipLayer.frame = contentClipFrame
         contentClipLayer.masksToBounds = true
@@ -13383,6 +13392,14 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         armButtonClick(frame: frame, action: .perform(action))
     }
 
+    private func armBackdropClick(outside panelFrame: CGRect, action: PendingButtonAction) {
+        pendingButtonClick = PendingButtonClick(frame: rootLayer.bounds, action: action, excludedFrame: panelFrame)
+    }
+
+    private func armBackdropClick(outside panelFrame: CGRect, perform action: @escaping () -> Void) {
+        armBackdropClick(outside: panelFrame, action: .perform(action))
+    }
+
     private func armButtonClick(frame: CGRect,
                                 performAtPoint action: @escaping (CGPoint) -> Void) {
         armButtonClick(frame: frame, action: .performAtPoint(action))
@@ -13398,7 +13415,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             return false
         }
         self.pendingButtonClick = nil
-        guard pendingButtonClick.frame.contains(point) else {
+        guard pendingButtonClick.contains(point) else {
             return true
         }
         performPendingButtonAction(pendingButtonClick.action, at: point)
@@ -14342,6 +14359,11 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                     self.handleContextMenuSelection(menuID: panel.id, itemID: action.id)
                     self.updateLayout()
                 }
+            } else if !managementPanelFrame.contains(point) {
+                armBackdropClick(outside: managementPanelFrame) { [weak self] in
+                    self?.dismissManagementPanel()
+                    self?.updateLayout()
+                }
             }
             return
         }
@@ -14439,6 +14461,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                     armButtonClick(frame: containerConfigurationBuildErrorDismissFrame) { [weak self] in
                         self?.dismissContainerConfigurationBuildError()
                     }
+                } else if !containerConfigurationBuildErrorPromptFrame.contains(point) {
+                    armBackdropClick(outside: containerConfigurationBuildErrorPromptFrame) { [weak self] in
+                        self?.dismissContainerConfigurationBuildError()
+                    }
                 } else {
                     let panelPoint = workspacePanelLayer.convert(point, from: rootLayer)
                     if let block = dockerfileTextBlock(
@@ -14510,6 +14536,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                     armButtonClick(frame: containerConfigurationDismissCancelFrame) { [weak self] in
                         self?.dismissContainerConfigurationDismissalPrompt()
                     }
+                } else if !containerConfigurationDismissPromptFrame.contains(point) {
+                    armBackdropClick(outside: containerConfigurationDismissPromptFrame) { [weak self] in
+                        self?.dismissContainerConfigurationDismissalPrompt()
+                    }
                 }
             } else if isConfirmingContainerConfigurationRebuild {
                 if containerConfigurationRebuildSaveFrame.contains(point) {
@@ -14522,6 +14552,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                     }
                 } else if containerConfigurationRebuildCancelFrame.contains(point) {
                     armButtonClick(frame: containerConfigurationRebuildCancelFrame) { [weak self] in
+                        self?.dismissContainerConfigurationRebuildPrompt()
+                    }
+                } else if !containerConfigurationRebuildPromptFrame.contains(point) {
+                    armBackdropClick(outside: containerConfigurationRebuildPromptFrame) { [weak self] in
                         self?.dismissContainerConfigurationRebuildPrompt()
                     }
                 }
@@ -15151,6 +15185,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                     blurCreateField()
                     updateLayout()
                 }
+                armBackdropClick(outside: rootFrame(createPanelFrame, from: createLayer), action: .createCancel)
                 return
             }
             if let block = dockerfileTextBlock(at: createPoint, contentSpace: .create) {
@@ -15325,9 +15360,12 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             }
             return
         }
-        if !filePickerPanelFrame.contains(createPoint), createInputController.isFocused {
-            blurCreateField()
-            updateLayout()
+        if !filePickerPanelFrame.contains(createPoint) {
+            if createInputController.isFocused {
+                blurCreateField()
+                updateLayout()
+            }
+            armBackdropClick(outside: rootFrame(filePickerPanelFrame, from: createLayer), action: .filePickerCancel)
         }
     }
 
@@ -17754,6 +17792,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
     private var loadingContainerConfigurationID: UUID?
     private var managementPanel: ManagementPanel?
+    private var managementPanelFrame = CGRect.zero
     private let managementOverlayLayer = CALayer()
     private var managementActions: [(frame: CGRect, id: String, title: String)] = []
     private var managementScroll: CGFloat = 0
@@ -17785,6 +17824,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         managementOverlayLayer.removeFromSuperlayer()
         managementOverlayLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
         managementActions.removeAll()
+        managementPanelFrame = .zero
         guard let model = managementPanel else { return }
         managementOverlayLayer.frame = CGRect(x: 0, y: 0, width: width, height: height)
         managementOverlayLayer.backgroundColor = resolvedCGColor(NSColor.black.withAlphaComponent(0.25))
@@ -17793,6 +17833,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         let panelWidth = min(max(width - 40, 260), 740)
         let panelHeight = min(max(height - 40, 240), 620)
         panel.frame = CGRect(x: (width - panelWidth) / 2, y: (height - panelHeight) / 2, width: panelWidth, height: panelHeight)
+        managementPanelFrame = panel.frame
         applyPopoverStyle(panel)
         panel.backgroundColor = resolvedCGColor(.windowBackgroundColor)
         managementOverlayLayer.addSublayer(panel)
@@ -19590,6 +19631,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         containerConfigurationBuildErrorCopyFrame = .zero
         containerConfigurationBuildErrorDismissFrame = .zero
         containerConfigurationDismissPromptFrame = .zero
+        containerConfigurationBuildErrorPromptFrame = .zero
         containerConfigurationDismissSaveFrame = .zero
         containerConfigurationDismissWithoutSavingFrame = .zero
         containerConfigurationDismissCancelFrame = .zero
@@ -20257,6 +20299,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         applyPopoverStyle(prompt)
         prompt.backgroundColor = resolvedCGColor(.windowBackgroundColor)
         workspacePanelLayer.addSublayer(prompt)
+        containerConfigurationBuildErrorPromptFrame = promptFrame.offsetBy(
+            dx: workspacePanelFrame.minX,
+            dy: workspacePanelFrame.minY
+        )
 
         let title = makeTextLayer(size: 17, weight: .semibold, color: .labelColor)
         title.string = "Container Build Failed"

@@ -46,7 +46,7 @@ def main():
         (home / 'services').mkdir(parents=True)
         api = root / 'api'
         log = open(root / 'daemon.log', 'wb')
-        env = dict(os.environ, OUTERSHELL_HOME=str(home))
+        env = dict(os.environ, OUTERSHELL_HOME=str(home), HOME=str(home), XDG_CONFIG_HOME=str(home / '.config'))
         def start():
             process = subprocess.Popen([sys.argv[1], '--service-manager', 'internal', '--services-dir', str(home / 'services'), '--api-socket-path', str(api), '--stay-alive'], env=env, stdout=log, stderr=log)
             for _ in range(100):
