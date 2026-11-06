@@ -22,6 +22,11 @@ record. A stale write returns HTTP 409 without modifying storage. Invalid framin
 JSON, encoding, excessive nesting, or size returns 400. Storage failures and
 corrupted existing records return 500; corrupt records are never reset silently.
 
+Clients normally don't GET the layout. Every `/api/events` response that sets the
+overview-changed flag also carries the current layout record, so watching clients
+receive layout changes as notifications. GET remains for recovery, such as after a
+409 or when an events response could not include the record.
+
 The web layout schema (version 1) is:
 
 ```json

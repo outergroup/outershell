@@ -221,6 +221,7 @@
   function decodeEvents(buffer) {
     const reader = new PayloadReader(buffer);
     const flags = reader.u32(0);
+    const layout = reader.bytes.byteLength >= 40 ? reader.bytesRef(32) : new Uint8Array();
     return {
       backendsChanged: Boolean(flags & 0x01),
       logChanged: Boolean(flags & 0x02),
@@ -228,7 +229,8 @@
       backendsVersion: reader.u64(8),
       logVersion: reader.u64(16),
       overviewChanged: Boolean(flags & 0x08),
-      overviewVersion: reader.u64(24)
+      overviewVersion: reader.u64(24),
+      layout: layout.length ? layout.slice().buffer : null
     };
   }
 
@@ -460,14 +462,14 @@
     return decodeLayout(buffer);
   }
 
-  async function refreshLayout() {
+  async function refreshLayout(pushedLayout = null) {
     if (state.layoutFetching || state.layoutSaving || state.groupDrag || state.endpointDrag || state.suspended || state.stopped) return;
     state.layoutFetching = true;
     const controller = new AbortController();
     const timeout = startRefreshTimeout(controller);
     state.layoutAbort = controller;
     try {
-      const result = await fetchLayout(controller.signal);
+      const result = pushedLayout ? decodeLayout(pushedLayout) : await fetchLayout(controller.signal);
       if (state.layoutAbort !== controller) return;
       if (state.layoutAbort !== controller || state.layoutSaving || state.groupDrag || state.endpointDrag) return;
       if (!state.layoutReady || result.revision > state.layoutRevision) {
@@ -1476,7 +1478,7 @@ RUN outerctl image add-command --id codex --name "Codex" --working-directory /ro
       toast(`Starting ${item.displayName}…`);
       const action = await control(endpoint.backend, "start", {}, true, options.host ? null : state.addWorkspace);
       if (!action.ok) throw new Error(action.message || `Could not start ${item.displayName}.`);
-      for (let attempt = 0; attempt < 30; attempt += 1) {
+      for (let attempt = 0; attempt < 120; attempt += 1) {
         await delay(500);
         await refreshBackends({ quiet: true });
         item = findItem(identity);
@@ -3090,7 +3092,7 @@ RUN outerctl image add-command --id codex --name "Codex" --working-directory /ro
             await delay(150);
             continue;
           }
-          await Promise.all([refreshLayout(), refreshSafeSpaces({ quiet: true })]);
+          await Promise.all([refreshLayout(event.overviewChanged ? event.layout : null), refreshSafeSpaces({ quiet: true })]);
           state.overviewVersion = event.overviewVersion;
         }
         if (state.backendError || state.refreshErrorTimers.backendError) await refreshBackends({ quiet: true });

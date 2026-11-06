@@ -303,6 +303,7 @@ private struct EventResponse {
     let timedOut: Bool
     let backendsVersion: UInt64
     let logVersion: UInt64
+    let overviewLayout: Data?
 }
 
 private struct CreateFieldRecord: Decodable {
@@ -513,13 +514,15 @@ private extension EventResponse {
     static func decodeBinary(_ data: Data) throws -> EventResponse {
         let reader = BinaryPayloadReader(data: data)
         let flags = try reader.uint32(at: 0)
+        let layout = data.count >= 40 ? try reader.dataRef(at: 32) : Data()
         return EventResponse(backendsChanged: (flags & 0x01) != 0,
                              overviewChanged: (flags & 0x08) != 0,
                              overviewVersion: try reader.uint64(at: 24),
                              logChanged: (flags & 0x02) != 0,
                              timedOut: (flags & 0x04) != 0,
                              backendsVersion: try reader.uint64(at: 8),
-                             logVersion: try reader.uint64(at: 16))
+                             logVersion: try reader.uint64(at: 16),
+                             overviewLayout: layout.isEmpty ? nil : layout)
     }
 }
 
@@ -1292,22 +1295,6 @@ private struct MessageDialog {
     let text: String
 }
 
-private struct IconMatchState {
-    let frame: CGRect
-    let image: CGImage?
-    let symbolName: String?
-    let title: String
-}
-
-private struct TextMatchState {
-    let frame: CGRect
-    let title: String
-    let fontSize: CGFloat
-    let weight: NSFont.Weight
-    let alignment: CATextLayerAlignmentMode
-    let isWrapped: Bool
-}
-
 private struct CreateFieldLayout {
     let fieldFrame: CGRect
     let textFrame: CGRect
@@ -1773,6 +1760,7 @@ private struct OverviewLayout: Codable {
 }
 
 private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLineTextInputControllerDelegate, ScrollbarControllerDelegate {
+    private lazy var elasticScrolling = ElasticScrollController(host: outerframeHost)
     private let outerframeHost: OuterframeHost
     private let appConnection: OuterframeAppConnection
     private var retainedSelf: BackendsHandler?
@@ -1810,6 +1798,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private var launchingEndpoints: Set<String> = []
     private var stoppingEndpoints: Set<String> = []
     private var backendError = ""
+    private var overviewLayoutLoadError: String?
     private var selectedServiceID: String?
     private var selectedLog: LogSelection?
     private var selectedContainerLogContext: ContainerAppLauncherContext?
@@ -2095,7 +2084,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private let dividerLayer = CALayer()
     private let createLayer = CALayer()
     private let createFormContentLayer = CALayer()
-    private let iconTransitionLayer = CALayer()
     private let installOverlayLayer = CALayer()
     private let updateOverlayLayer = CALayer()
     private let messageDialogOverlayLayer = CALayer()
@@ -2129,8 +2117,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private var workspacePaneFrame = CGRect.zero
     private var usesWorkspaceSplitLayout = false
     private var isRenderingWorkspacePane = false
-    private var workspaceVisibleIconKeys = Set<String>()
-    private var workspaceVisibleTextKeys = Set<String>()
     private var appsRenderTargetOverride: CALayer?
     private var pendingAppDrag: PendingAppDrag?
     private var pendingNativeProjectDrag: PendingNativeProjectDrag?
@@ -2143,7 +2129,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private var pendingOuterShellUpdate: PendingOuterShellUpdate?
     private var didShowAutomaticOuterShellUpdatePrompt = false
     private var pendingMessageDialog: MessageDialog?
-    private var iconMatchStates: [String: IconMatchState] = [:]
     private var iconMatchLayers: [String: CALayer] = [:]
     private struct RunningBadgeSymbolKey: Hashable {
         let symbolName: String
@@ -2151,7 +2136,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         let isRoot: Bool
     }
     private var runningBadgeSymbolImages: [RunningBadgeSymbolKey: (image: CGImage, size: CGSize)] = [:]
-    private var textMatchStates: [String: TextMatchState] = [:]
     private var textMatchLayers: [String: CATextLayer] = [:]
     private var pendingMenuActions: [UUID: (serviceID: String, serviceScope: String, operationByItemID: [String: String])] = [:]
     private var pendingAppMenuActions: [UUID: (item: AppLauncherItem, operationByItemID: [String: String])] = [:]
@@ -2434,7 +2418,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                     NSPasteboard.PasteboardType.fileURL.rawValue
                 ]
             )
-            loadOverviewLayout()
             outerframeHost.requestOuterLoopSSHCommandArguments { [weak self] arguments in
                 guard let self, let arguments else { return }
                 self.serverSSHCommand = arguments.isEmpty ? nil : arguments.map(Self.shellQuotedArgument).joined(separator: " ")
@@ -2468,10 +2451,11 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 updateColors()
             }
 
-        case .scrollWheelEvent(let point, let delta, _, _, _, let hasPreciseScrollingDeltas):
-            handleScroll(at: point, delta: delta, precise: hasPreciseScrollingDeltas)
+        case .scrollWheelEvent(let point, let delta, _, let phase, let momentumPhase, let hasPreciseScrollingDeltas):
+            handleScroll(at: point, delta: delta, precise: hasPreciseScrollingDeltas, phase: phase, momentumPhase: momentumPhase)
 
         case .mouseDown(let point, let modifierFlags, let clickCount):
+            let point = elasticScrolling.finish(at: point, in: rootLayer)
             if modifierFlags.contains(.control) {
                 handleRightMouseDown(at: point, modifierFlags: modifierFlags, clickCount: clickCount)
             } else {
@@ -2479,10 +2463,12 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             }
 
         case .magnification(_, let magnification, let location, _):
+            elasticScrolling.reset()
             if isContainerConfigurationEditorVisible, containerConfigurationTab == .dockerfile, containerConfigurationContentFrame.contains(location) {
                 scheduleDockerfileMagnification(magnification)
             }
         case .magnificationEnded:
+            elasticScrolling.reset()
             break
         case .mouseDragged(let point, let modifierFlags):
             handleMouseDragged(to: point, modifierFlags: modifierFlags)
@@ -2500,6 +2486,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             handleContextMenuSelection(menuID: menuID, itemID: itemID)
 
         case .keyDown(let keyCode, let characters, let charactersIgnoringModifiers, let modifierFlags, let isARepeat):
+            elasticScrolling.reset()
             handleKeyDown(keyCode: keyCode,
                           characters: characters,
                           charactersIgnoringModifiers: charactersIgnoringModifiers,
@@ -2625,6 +2612,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                                              snapshot: buildAccessibilitySnapshot())
 
         case .shutdown:
+            elasticScrolling.reset()
             stopEventWatch()
             retainedSelf = nil
 
@@ -2634,6 +2622,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     func outerframeHostDidDisconnect(_ host: OuterframeHost) {
+        elasticScrolling.reset()
         stopEventWatch()
         retainedSelf = nil
     }
@@ -2952,13 +2941,16 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                     self.logEventVersion = event.logVersion
                     if event.overviewChanged || !self.overviewLayoutReady {
                         self.overviewEventVersion = event.overviewVersion
-                        self.loadOverviewLayout()
+                        if let layoutData = event.overviewLayout {
+                            self.applyOverviewLayout(layoutData)
+                        } else {
+                            self.loadOverviewLayout()
+                        }
                         if !self.isRefreshingWorkspaces && self.workspaceContextID == nil {
                             self.sendWorkspaceRequest(operation: "list")
                         }
                     }
                     if event.backendsChanged {
-                        self.loadOverviewLayout()
                         self.fetchBackends(quiet: true)
                     }
                     if event.logChanged, self.selectedLog != nil {
@@ -3009,7 +3001,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         rootLayer.masksToBounds = true
         rootLayer.addSublayer(toolbarLayer)
         rootLayer.addSublayer(contentLayer)
-        rootLayer.addSublayer(iconTransitionLayer)
         rootLayer.addSublayer(overviewDragFeedbackLayer)
         rootLayer.addSublayer(createLayer)
         rootLayer.addSublayer(installOverlayLayer)
@@ -3153,7 +3144,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 toolbarLayer.frame = CGRect(x: 0, y: max(height - visibleToolbarHeight, 0), width: width, height: visibleToolbarHeight)
                 toolbarLayer.isHidden = visibleToolbarHeight == 0
                 contentLayer.frame = CGRect(x: 0, y: 0, width: width, height: max(height - visibleToolbarHeight, 0))
-                iconTransitionLayer.frame = rootLayer.bounds
                 overviewDragFeedbackLayer.frame = rootLayer.bounds
                 overviewDragFeedbackLayer.isHidden = mode != .apps
                 createLayer.frame = rootLayer.bounds
@@ -3349,79 +3339,20 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             : .apps
     }
 
-    private func updateMatchedLayerVisibility() {
-        let appsClipFrame = rootLayer.convert(appsLayer.bounds, from: appsLayer).insetBy(dx: -1, dy: -1)
-        let workspaceClipFrame = rootLayer.convert(
-            workspacePaneClipLayer.bounds,
-            from: workspacePaneClipLayer
-        ).insetBy(dx: -1, dy: -1)
-        for (key, state) in iconMatchStates {
-            let clipFrame = usesWorkspaceSplitLayout && workspaceVisibleIconKeys.contains(key)
-                ? workspaceClipFrame
-                : appsClipFrame
-            iconMatchLayers[key]?.isHidden = !state.frame.intersects(clipFrame)
-        }
-        for (key, state) in textMatchStates {
-            let clipFrame = usesWorkspaceSplitLayout && workspaceVisibleTextKeys.contains(key)
-                ? workspaceClipFrame
-                : appsClipFrame
-            textMatchLayers[key]?.isHidden = !state.frame.intersects(clipFrame)
-        }
-    }
-
-    private func offsetMatchedLayers(deltaY: CGFloat, workspaceOnly: Bool? = nil) {
-        guard abs(deltaY) > 0.001 else {
-            updateMatchedLayerVisibility()
-            return
-        }
-        for (key, state) in iconMatchStates {
-            if let workspaceOnly,
-               workspaceVisibleIconKeys.contains(key) != workspaceOnly {
-                continue
-            }
-            let frame = state.frame.offsetBy(dx: 0, dy: deltaY)
-            iconMatchStates[key] = IconMatchState(frame: frame,
-                                                  image: state.image,
-                                                  symbolName: state.symbolName,
-                                                  title: state.title)
-            iconMatchLayers[key]?.frame = frame
-        }
-        for (key, state) in textMatchStates {
-            if let workspaceOnly,
-               workspaceVisibleTextKeys.contains(key) != workspaceOnly {
-                continue
-            }
-            let frame = state.frame.offsetBy(dx: 0, dy: deltaY)
-            textMatchStates[key] = TextMatchState(frame: frame,
-                                                  title: state.title,
-                                                  fontSize: state.fontSize,
-                                                  weight: state.weight,
-                                                  alignment: state.alignment,
-                                                  isWrapped: state.isWrapped)
-            textMatchLayers[key]?.frame = frame
-        }
-        updateMatchedLayerVisibility()
-    }
-
     private func scrollCurrentModeWithoutRerender(deltaY: CGFloat) {
         withoutImplicitAnimations {
             switch mode {
             case .apps:
                 updateAppsScrollLayerFrames()
-                offsetMatchedLayers(
-                    deltaY: deltaY,
-                    workspaceOnly: usesWorkspaceSplitLayout ? false : nil
-                )
             case .create:
                 offsetCreateFormWithoutRerender(deltaY: deltaY)
             }
         }
     }
 
-    private func scrollWorkspaceWithoutRerender(deltaY: CGFloat) {
+    private func scrollWorkspaceWithoutRerender() {
         withoutImplicitAnimations {
             updateAppsScrollLayerFrames()
-            offsetMatchedLayers(deltaY: deltaY, workspaceOnly: true)
         }
     }
 
@@ -3522,10 +3453,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         safeSpaceDetailCatalogFrames.removeAll()
         safeSpaceDockerfileTextBlocks.removeAll()
         addAppFrame = .zero
-        iconMatchStates.removeAll()
-        textMatchStates.removeAll()
-        workspaceVisibleIconKeys.removeAll()
-        workspaceVisibleTextKeys.removeAll()
         var visibleIconKeys = Set<String>()
         var visibleTextKeys = Set<String>()
 
@@ -3540,7 +3467,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         workspaceContentBottom = 0
         renderOverviewDragFrame()
         hideUnrenderedMatchedLayers(visibleIconKeys: visibleIconKeys, visibleTextKeys: visibleTextKeys)
-        updateMatchedLayerVisibility()
         let didClampAppsScroll = clampAppsScrollUsingRenderedContent()
         let didClampWorkspaceScroll = clampWorkspaceScrollUsingRenderedContent()
         if didClampAppsScroll || didClampWorkspaceScroll {
@@ -4734,7 +4660,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         let iconFrame = CGRect(x: pinned ? frame.midX - size / 2 : frame.minX + 14,
                                y: pinned ? frame.maxY - size - 8 : frame.midY - size / 2,
                                width: size, height: size)
-        recordMatchedIcon(key: item.iconKey, frame: rootLayer.convert(iconFrame, from: activeAppsContentLayer),
+        recordMatchedIcon(key: item.iconKey, frame: iconFrame,
                           image: launcherIconImage(for: item), symbolName: launcherIconSymbolName(for: item),
                           symbolColor: appIconTintColor(for: item.backend), title: title)
         visibleIconKeys.insert(item.iconKey)
@@ -4742,7 +4668,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         let textFrame = pinned
             ? CGRect(x: frame.minX + 12, y: frame.minY + 8, width: frame.width - 24, height: 32)
             : CGRect(x: iconFrame.maxX + 10, y: frame.midY - 9, width: max(frame.maxX - iconFrame.maxX - (isThisPage ? 98 : 42), 1), height: 18)
-        recordMatchedText(key: item.iconKey, frame: rootLayer.convert(textFrame, from: activeAppsContentLayer),
+        recordMatchedText(key: item.iconKey, frame: textFrame,
                           title: title, fontSize: 13, weight: .regular,
                           alignment: pinned ? .center : .left, isWrapped: pinned)
         visibleTextKeys.insert(item.iconKey)
@@ -4813,22 +4739,45 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             Task { @MainActor in
                 guard let self else { return }
                 self.overviewLayoutRequestPending = false
-                do {
-                    if let error { throw error }
-                    guard (response as? HTTPURLResponse)?.statusCode == 200, let data else { throw URLError(.badServerResponse) }
-                    let (layout, revision) = try OverviewLayout.decode(data)
-                    guard !self.overviewLayoutSaving,
-                          !self.overviewLayoutReady || revision > self.overviewLayoutRevision else { return }
-                    self.overviewLayout = layout
-                    self.overviewLayoutRevision = revision
-                    self.overviewLayoutReady = true
-                    self.scheduleLayoutUpdate()
-                } catch {
-                    self.backendError = "Could not load the layout: \(error.localizedDescription)"
-                    self.scheduleLayoutUpdate()
+                guard error == nil, (response as? HTTPURLResponse)?.statusCode == 200, let data else {
+                    self.reportOverviewLayoutLoadFailure(error ?? URLError(.badServerResponse))
+                    return
                 }
+                self.applyOverviewLayout(data)
             }
         }.resume()
+    }
+
+    private func applyOverviewLayout(_ data: Data) {
+        let layout: OverviewLayout
+        let revision: UInt64
+        do {
+            (layout, revision) = try OverviewLayout.decode(data)
+        } catch {
+            reportOverviewLayoutLoadFailure(error)
+            return
+        }
+        if let message = overviewLayoutLoadError {
+            overviewLayoutLoadError = nil
+            if backendError == message {
+                backendError = ""
+                scheduleLayoutUpdate()
+            }
+        }
+        guard !overviewLayoutSaving,
+              !overviewLayoutReady || revision > overviewLayoutRevision else { return }
+        overviewLayout = layout
+        overviewLayoutRevision = revision
+        overviewLayoutReady = true
+        scheduleLayoutUpdate()
+    }
+
+    private func reportOverviewLayoutLoadFailure(_ error: Error) {
+        guard !overviewLayoutReady else { return }
+        let message = "Could not load the layout: \(error.localizedDescription)"
+        overviewLayoutLoadError = message
+        backendError = message
+        scheduleLayoutUpdate()
     }
 
     private func saveOverviewLayout(_ layout: OverviewLayout) {
@@ -5498,7 +5447,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         )
         recordMatchedIcon(
             key: key,
-            frame: rootLayer.convert(iconFrame, from: activeAppsContentLayer),
+            frame: iconFrame,
             image: image,
             symbolName: symbolName,
             symbolColor: .controlAccentColor,
@@ -5514,7 +5463,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         )
         recordMatchedText(
             key: key,
-            frame: rootLayer.convert(textFrame, from: activeAppsContentLayer),
+            frame: textFrame,
             title: title,
             fontSize: 13,
             weight: .regular,
@@ -6850,7 +6799,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         )
         recordMatchedIcon(
             key: item.iconKey,
-            frame: rootLayer.convert(iconFrame, from: activeAppsContentLayer),
+            frame: iconFrame,
             image: launcherIconImage(for: item),
             symbolName: launcherIconSymbolName(for: item),
             symbolColor: appIconTintColor(for: item.backend),
@@ -6867,7 +6816,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         )
         recordMatchedText(
             key: item.iconKey,
-            frame: rootLayer.convert(textFrame, from: activeAppsContentLayer),
+            frame: textFrame,
             title: item.displayName,
             fontSize: 13,
             weight: .medium,
@@ -7114,16 +7063,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                           title: title,
                                           iconSize: frame.width)
         }
-        if layer.superlayer == nil {
-            iconTransitionLayer.addSublayer(layer)
-        }
+        addAppsSublayer(layer)
         layer.frame = frame
         layer.isHidden = false
         layer.opacity = 1
-        iconMatchStates[key] = IconMatchState(frame: frame,
-                                              image: image,
-                                              symbolName: symbolName,
-                                              title: title)
         iconMatchLayers[key] = layer
     }
 
@@ -7141,9 +7084,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                                    color: .labelColor,
                                                    alignment: alignment,
                                                    italic: italic)
-        if layer.superlayer == nil {
-            iconTransitionLayer.addSublayer(layer)
-        }
+        addAppsSublayer(layer)
         configureTextLayer(layer,
                            title: title,
                            fontSize: fontSize,
@@ -7155,12 +7096,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         layer.frame = frame
         layer.isHidden = false
         layer.opacity = 1
-        textMatchStates[key] = TextMatchState(frame: frame,
-                                              title: title,
-                                              fontSize: fontSize,
-                                              weight: weight,
-                                              alignment: alignment,
-                                              isWrapped: isWrapped)
         textMatchLayers[key] = layer
     }
 
@@ -7179,8 +7114,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
     private func hideAllMatchedLayers() {
         hideUnrenderedMatchedLayers(visibleIconKeys: [], visibleTextKeys: [])
-        iconMatchStates.removeAll()
-        textMatchStates.removeAll()
     }
 
     private func installsBundledPlaceholderAsSystemOnly(_ backend: BackendRecord) -> Bool {
@@ -10600,7 +10533,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                         return
                     }
                 }
-                guard attempt < 30 else {
+                guard attempt < 120 else {
                     self.launchingEndpoints.remove(self.launchKey(endpoint))
                         self.backendError = "Timed out waiting for \(displayName)."
                     self.updateLayout()
@@ -14139,20 +14072,20 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                        attributedText: attributedText)
     }
 
-    private func handleScroll(at point: CGPoint, delta: CGPoint, precise: Bool) {
+    private func handleScroll(at point: CGPoint, delta: CGPoint, precise: Bool, phase: NSEvent.Phase = [], momentumPhase: NSEvent.Phase = []) {
+        defer { elasticScrolling.present() }
         let multiplier: CGFloat = precise ? 1 : wheelScrollLineHeight
         if managementPanel != nil {
-            managementScroll = min(max(managementScroll - delta.y * multiplier, 0), managementScrollLimit)
+            managementScroll = elasticScrolling.scroll("management", by: -delta.y * multiplier, offset: managementScroll, maximum: managementScrollLimit, viewport: max(managementPanelFrame.height - 108, 1), phase: phase, momentumPhase: momentumPhase, precise: precise, direction: 1) { [weak self] in self.map { [$0.managementScrollLayer].compactMap { $0 } } ?? [] }
             updateLayout()
             return
         }
         if pendingFilePicker != nil {
-            if filePickerListFrame.contains(point) { setFilePickerScroll(filePickerScroll - delta.y * multiplier) }
+            if filePickerListFrame.contains(point) { setFilePickerScroll(elasticScrolling.scroll("picker", by: -delta.y * multiplier, offset: filePickerScroll, maximum: max(filePickerContentHeight - filePickerListFrame.height, 0), viewport: filePickerListFrame.height, phase: phase, momentumPhase: momentumPhase, precise: precise, direction: 1) { [weak self] in self.map { [$0.filePickerRowsContentLayer] } ?? [] }) }
             return
         }
         if isContainerConfigurationEditorVisible, containerConfigurationTab == .codingAgent, containerConfigurationContentFrame.contains(point) {
-            scrollCodingAgent(to: min(max(codingAgentScroll - delta.y * multiplier, 0),
-                                      max(codingAgentContentHeight - containerConfigurationContentFrame.height, 0)))
+            scrollCodingAgent(to: elasticScrolling.scroll("agent", by: -delta.y * multiplier, offset: codingAgentScroll, maximum: max(codingAgentContentHeight - containerConfigurationContentFrame.height, 0), viewport: containerConfigurationContentFrame.height, phase: phase, momentumPhase: momentumPhase, precise: precise, direction: 1) { [weak self] in self.map { [$0.codingAgentContentLayer].compactMap { $0 } } ?? [] })
             return
         }
         if containerConfigurationBuildError != nil,
@@ -14162,10 +14095,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                     containerConfigurationBuildErrorTextFrame.height,
                 0
             )
-            let nextScroll = min(
-                max(containerConfigurationBuildErrorScroll - delta.y * multiplier, 0),
-                maximum
-            )
+            let nextScroll = elasticScrolling.scroll("error", by: -delta.y * multiplier, offset: containerConfigurationBuildErrorScroll, maximum: maximum, viewport: containerConfigurationBuildErrorTextFrame.height, phase: phase, momentumPhase: momentumPhase, precise: precise, direction: 1) { [weak self] in self.map { [$0.containerConfigurationBuildErrorViewportLayer].compactMap { $0 } } ?? [] }
             scrollContainerConfigurationBuildError(to: nextScroll)
             return
         }
@@ -14175,10 +14105,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             let listHeight = max(containerConfigurationContentFrame.height - 76, 0)
             let contentHeight = containerConfigurationMountContentHeight
             let maximum = max(contentHeight - listHeight, 0)
-            containerConfigurationMountScroll = min(
-                max(containerConfigurationMountScroll - delta.y * multiplier, 0),
-                maximum
-            )
+            containerConfigurationMountScroll = elasticScrolling.scroll("mounts", by: -delta.y * multiplier, offset: containerConfigurationMountScroll, maximum: maximum, viewport: listHeight, phase: phase, momentumPhase: momentumPhase, precise: precise, direction: 1) { [weak self] in self.map { [$0.mountScrollLayer].compactMap { $0 } } ?? [] }
             updateLayout()
             return
         }
@@ -14204,10 +14131,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             ).count
             let contentHeight = CGFloat(lineCount) * editorLineHeight + 8
             let maximum = max(contentHeight - visibleFrame.height, 0)
-            let nextScroll = min(
-                max(containerConfigurationTextScroll - delta.y * multiplier, 0),
-                maximum
-            )
+            let nextScroll = elasticScrolling.scroll("editor", by: -delta.y * multiplier, offset: containerConfigurationTextScroll, maximum: maximum, viewport: visibleFrame.height, phase: phase, momentumPhase: momentumPhase, precise: precise, direction: 1) { [weak self] in self.map { [$0.containerConfigurationTextViewportLayer?.superlayer].compactMap { $0 } } ?? [] }
             if usesUnwrappedDockerfile {
                 let nextX = min(max(containerConfigurationHorizontalScroll - delta.x * multiplier, 0),
                     max(containerConfigurationTextWidth - visibleFrame.width, 0))
@@ -14225,7 +14149,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             if selectedServiceID != nil && logRowsClipLayer.frame.contains(contentPoint) {
                 logScrollbarController?.cancelAnimation()
                 shouldScrollLogToBottomOnNextLayout = false
-                logScroll -= delta.y * (precise ? 1 : logScrollLineHeight)
+                logScroll = elasticScrolling.scroll("logs", by: -delta.y * (precise ? 1 : logScrollLineHeight), offset: logScroll, maximum: max(logContentHeight() - logRowsClipLayer.bounds.height, 0), viewport: logRowsClipLayer.bounds.height, phase: phase, momentumPhase: momentumPhase, precise: precise, direction: 1) { [weak self] in self.map { [$0.logTextContentLayer] } ?? [] }
                 logScroll = clampedLogScroll(logScroll)
                 updateLogTextViewport()
                 updateLogTextSelectionLayers()
@@ -14234,20 +14158,20 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                       workspacePaneFrame.contains(
                         appsLayer.convert(contentPoint, from: contentLayer)
                       ) {
-                workspaceScroll -= delta.y * multiplier
+                workspaceScroll = elasticScrolling.scroll("workspace", by: -delta.y * multiplier, offset: workspaceScroll, maximum: max(createBottomInset - workspaceContentBottom, 0), viewport: workspacePaneFrame.height, phase: phase, momentumPhase: momentumPhase, precise: precise, direction: 1) { [weak self] in self.map { [$0.workspaceScrollContentLayer] } ?? [] }
             } else {
-                appsScroll -= delta.y * multiplier
+                appsScroll = elasticScrolling.scroll("apps", by: -delta.y * multiplier, offset: appsScroll, maximum: max(createBottomInset - appsContentBottom, 0), viewport: appsLayer.bounds.height, phase: phase, momentumPhase: momentumPhase, precise: precise, direction: 1) { [weak self] in self.map { [$0.appsScrollContentLayer] } ?? [] }
             }
         } else if mode == .create {
             if pendingFilePicker != nil {
                 let contentPoint = contentLayer.convert(point, from: rootLayer)
                 let createPoint = createLayer.convert(contentPoint, from: contentLayer)
                 if filePickerListFrame.contains(createPoint) {
-                    setFilePickerScroll(filePickerScroll - delta.y * multiplier)
+                    setFilePickerScroll(elasticScrolling.scroll("picker", by: -delta.y * multiplier, offset: filePickerScroll, maximum: max(filePickerContentHeight - filePickerListFrame.height, 0), viewport: filePickerListFrame.height, phase: phase, momentumPhase: momentumPhase, precise: precise, direction: 1) { [weak self] in self.map { [$0.filePickerRowsContentLayer] } ?? [] })
                     return
                 }
             } else {
-                createScroll -= delta.y * multiplier
+                createScroll = elasticScrolling.scroll("create", by: -delta.y * multiplier, offset: createScroll, maximum: max(createScroll + (createContentClipFrame.isEmpty ? createBottomInset : createContentClipFrame.minY + createBottomInset) - createContentBottom, 0), viewport: createContentClipFrame.height, phase: phase, momentumPhase: momentumPhase, precise: precise, direction: 1) { [weak self] in self.map { [$0.createFormContentLayer] } ?? [] }
                 didScrollCreateForm = true
             }
         }
@@ -14255,7 +14179,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         if mode == .apps {
             let workspaceDelta = workspaceScroll - previousWorkspaceScroll
             if abs(workspaceDelta) > 0.1 {
-                scrollWorkspaceWithoutRerender(deltaY: workspaceDelta)
+                scrollWorkspaceWithoutRerender()
             } else {
                 scrollCurrentModeWithoutRerender(deltaY: appsScroll - previousAppsScroll)
             }
@@ -17795,6 +17719,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private var managementPanelFrame = CGRect.zero
     private let managementOverlayLayer = CALayer()
     private var managementActions: [(frame: CGRect, id: String, title: String)] = []
+    private var managementScrollLayer: CALayer?
+    private var mountScrollLayer: CALayer?
     private var managementScroll: CGFloat = 0
     private var managementScrollLimit: CGFloat = 0
 
@@ -17849,6 +17775,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         viewport.frame = CGRect(x: 24, y: 24, width: panelWidth - 48, height: panelHeight - 108)
         viewport.masksToBounds = true
         panel.addSublayer(viewport)
+        managementScrollLayer = viewport
         var y = viewport.bounds.height + managementScroll
         y = agentText(model.detail, in: viewport, left: 0, top: y, width: viewport.bounds.width, size: 13) - 24
         for item in model.items {
@@ -20762,6 +20689,12 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                y: contentFrame.minY + 42,
                                width: contentFrame.width,
                                height: max(contentFrame.height - 76, 0))
+        let scrollLayer = CALayer()
+        scrollLayer.frame = listFrame
+        scrollLayer.bounds = listFrame
+        scrollLayer.masksToBounds = true
+        workspacePanelLayer.addSublayer(scrollLayer)
+        mountScrollLayer = scrollLayer
         var cursor = listFrame.maxY + containerConfigurationMountScroll
 
         func addSectionTitle(_ value: String) {
@@ -20779,7 +20712,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                       color: .secondaryLabelColor)
             title.string = value.uppercased()
             title.frame = frame
-            workspacePanelLayer.addSublayer(title)
+            scrollLayer.addSublayer(title)
         }
 
         func addEmptyMessage(_ value: String) {
@@ -20797,7 +20730,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                         color: .tertiaryLabelColor)
             message.string = value
             message.frame = frame
-            workspacePanelLayer.addSublayer(message)
+            scrollLayer.addSublayer(message)
         }
 
         addSectionTitle("Folder Mounts")
@@ -20820,7 +20753,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             row.backgroundColor = resolvedCGColor(
                 NSColor.controlBackgroundColor.withAlphaComponent(0.55)
             )
-            workspacePanelLayer.addSublayer(row)
+            scrollLayer.addSublayer(row)
 
             let pathWidth = max((row.bounds.width - 230) / 2, 80)
             let hostPathFrame = CGRect(x: 12, y: 8, width: pathWidth, height: 18)
@@ -20912,7 +20845,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             row.backgroundColor = resolvedCGColor(
                 NSColor.controlBackgroundColor.withAlphaComponent(0.55)
             )
-            workspacePanelLayer.addSublayer(row)
+            scrollLayer.addSublayer(row)
 
             let pathWidth = max(row.bounds.width - 210, 1)
             let destinationFrame = CGRect(x: 12, y: 29, width: pathWidth, height: 16)

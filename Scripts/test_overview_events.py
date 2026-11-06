@@ -23,8 +23,12 @@ def events(path, versions=(0, 0, 0)):
         reply = exact(sock, struct.unpack('<I', exact(sock, 4))[0])
     offset, length = struct.unpack_from('<II', reply, 16)
     body = reply[offset:offset+length]
-    assert len(body) == 32
-    return struct.unpack_from('<I', body)[0], struct.unpack_from('<QQQ', body, 8)
+    assert len(body) >= 40
+    flags = struct.unpack_from('<I', body)[0]
+    layout_offset, layout_length = struct.unpack_from('<II', body, 32)
+    layout = body[layout_offset:layout_offset+layout_length]
+    assert bool(layout) == bool(flags & 8), 'Layout must accompany exactly the overview notifications'
+    return flags, struct.unpack_from('<QQQ', body, 8), layout
 
 with tempfile.TemporaryDirectory(prefix='shell-events-') as directory:
     root = Path(directory)
@@ -47,21 +51,24 @@ print(json.dumps({'workspaces':[{'id':(Path(os.environ['TEST_ROOT'])/'version').
                     request(api, 13)
                     break
                 except (OSError, RuntimeError): time.sleep(.02)
-            flags, versions = events(api)
+            flags, versions, layout = events(api)
             assert flags & 8
+            assert layout.startswith(b'OSLAY001') and struct.unpack_from('<Q', layout, 8)[0] == 0
             with concurrent.futures.ThreadPoolExecutor() as pool:
                 pending = pool.submit(events, api, versions)
                 time.sleep(3)
                 assert not pending.done(), 'Unchanged snapshot generated a notification'
                 assert request(api, 12, document(0, {'version': 1}))[0] == 200
-                flags, versions = pending.result()
+                flags, versions, layout = pending.result()
                 assert flags & 8
+                assert struct.unpack_from('<Q', layout, 8)[0] == 1
+                assert json.loads(layout[16:]) == {'version': 1}
                 pending = pool.submit(events, api, versions)
                 (root / 'version').write_text('2')
-                flags, versions = pending.result()
+                flags, versions, layout = pending.result()
                 assert flags & 8
                 assert json.loads(request(api, 13)[1])['workspaces'][0]['id'] == '2'
-            print('PASS: unchanged discovery stays quiet; layout and container changes notify')
+            print('PASS: unchanged discovery stays quiet; layout and container changes notify with the layout attached')
         finally:
             daemon.terminate()
             daemon.wait(timeout=5)

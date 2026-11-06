@@ -111,6 +111,7 @@ if [ "$(uname -s)" = "Linux" ]; then
     : > "$stage_root/app-icon.png"
     printf 'bundled web resource\n' > "$stage_root/web/index.html"
     printf 'nested web resource\n' > "$stage_root/web/assets/example.txt"
+    printf '1.2.3\n' > "$stage_root/version"
 
     OUTERSHELLD_API_SOCKET="$api_socket" "$build_dir/outerctl" \
         bundled-app install \
@@ -120,6 +121,7 @@ if [ "$(uname -s)" = "Linux" ]; then
 
     cmp "$stage_root/web/index.html" "$build_dir/home/apps/org.outershell.Top/web/index.html"
     cmp "$stage_root/web/assets/example.txt" "$build_dir/home/apps/org.outershell.Top/web/assets/example.txt"
+    [ "$(cat "$build_dir/home/apps/org.outershell.Top/version")" = "1.2.3" ]
 
     printf 'stale web resource\n' > "$build_dir/home/apps/org.outershell.Top/web/stale.txt"
     rm "$stage_root/web/assets/example.txt"
@@ -135,12 +137,14 @@ if [ "$(uname -s)" = "Linux" ]; then
     [ ! -e "$build_dir/home/apps/org.outershell.Top/web/assets/example.txt" ]
 
     rm -rf "$stage_root/web"
+    rm "$stage_root/version"
     OUTERSHELLD_API_SOCKET="$api_socket" "$build_dir/outerctl" \
         bundled-app install \
         --backend org.outershell.Top \
         --scope user \
         --stage-root "$stage_root" >/dev/null
     [ ! -e "$build_dir/home/apps/org.outershell.Top/web" ]
+    [ ! -e "$build_dir/home/apps/org.outershell.Top/version" ]
 
     mkdir -p "$stage_root/web"
     printf 'bundled web resource\n' > "$stage_root/web/index.html"

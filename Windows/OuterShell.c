@@ -560,11 +560,18 @@ static void serve_http(Connection *c, void *context) {
                 break;
             SleepConditionVariableCS(&s->changed, &s->gate, 250);
         }
-        body = payload(32);
+        body = payload(40);
         payload_u32(&body, 0, (previous == s->version ? 4 : 1) |
                     (prior_overview != current_overview ? 8 : 0));
         payload_u64(&body, 8, s->version);
         payload_u64(&body, 24, current_overview);
+        if (prior_overview != current_overview) {
+            HttpRequest read = {.method = (char[]){"GET"}};
+            int layout_status = 200;
+            StringBuilder document = layout(s, &read, &layout_status);
+            payload_data(&body, 32, document.data, document.length);
+            free(document.data);
+        }
     } else if (!strcmp(r.path, "/api/control")) {
         if (strcmp(r.method, "POST"))
             status = 405;

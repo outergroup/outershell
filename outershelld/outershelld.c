@@ -1171,7 +1171,6 @@ typedef struct {
     bool supports_root;
     bool root_only;
     bool supports_macos;
-    const char *version;
     const BundledAppOpenerDefinition *openers;
     size_t opener_count;
 } BundledAppDefinition;
@@ -1217,7 +1216,6 @@ static const BundledAppDefinition kBundledApps[] = {
         .supports_root = true,
         .root_only = false,
         .supports_macos = true,
-        .version = "1"
     },
     {
         .service_id = "org.outershell.Files",
@@ -1235,7 +1233,6 @@ static const BundledAppDefinition kBundledApps[] = {
         .supports_root = true,
         .root_only = false,
         .supports_macos = true,
-        .version = "1"
     },
     {
         .service_id = "org.outershell.Plaintext",
@@ -1253,7 +1250,6 @@ static const BundledAppDefinition kBundledApps[] = {
         .supports_root = true,
         .root_only = false,
         .supports_macos = true,
-        .version = "1",
         .openers = kPlaintextOpeners,
         .opener_count = sizeof(kPlaintextOpeners) / sizeof(kPlaintextOpeners[0])
     },
@@ -1281,7 +1277,6 @@ static const BundledAppDefinition kBundledApps[] = {
         .root_only = true,
 #endif
         .supports_macos = true,
-        .version = "1"
     },
     {
         .service_id = "org.outershell.Profile",
@@ -1303,7 +1298,6 @@ static const BundledAppDefinition kBundledApps[] = {
 #endif
         .root_only = false,
         .supports_macos = true,
-        .version = "1"
     },
     {
         .service_id = "org.outershell.Terminal",
@@ -1321,7 +1315,6 @@ static const BundledAppDefinition kBundledApps[] = {
         .supports_root = false,
         .root_only = false,
         .supports_macos = true,
-        .version = "1"
     }
 };
 
@@ -1898,6 +1891,7 @@ static void send_events_response(int fd,
                                  bool timed_out,
                                  uint64_t backends_version,
                                  uint64_t log_version, bool overview_changed, uint64_t overview_version);
+static bool read_layout_document(StringBuilder *data);
 static bool ensure_root_helper_installed(const char *sudo_password, bool *needs_password, char *message, size_t message_size);
 static bool root_helper_outerctl(int argc,
                                  char **argv,
@@ -1978,6 +1972,47 @@ static bool bundled_app_is_available_on_platform(const BundledAppDefinition *app
 #else
     return true;
 #endif
+}
+
+static bool bundled_app_version_is_valid(const char *version) {
+    if (!version || !version[0] || strlen(version) > 64) return false;
+    for (const char *c = version; *c; c++) {
+        if (!isalnum((unsigned char)*c) && *c != '.' && *c != '-' && *c != '+' && *c != '_') return false;
+    }
+    return true;
+}
+
+// Each app release archive carries a top-level version file holding the app's
+// own release version. Installs copy it to <install-root>/version so later
+// Outer Shell versions can compare it with the published apps/<App>/version.txt.
+static bool bundled_app_payload_version(const char *stage_root, char *out, size_t out_size) {
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s/version", stage_root);
+    if (read_first_line_file(path, out, out_size) && bundled_app_version_is_valid(out)) return true;
+    if (out && out_size) out[0] = '\0';
+    return false;
+}
+
+static void bundled_app_install_root(const BundledAppDefinition *app, bool system_scope, char *out, size_t out_size) {
+    if (system_scope) {
+#ifdef __APPLE__
+        snprintf(out, out_size, "%s/apps/%s", kSystemOuterShellRoot, app->install_directory_name);
+#else
+        snprintf(out, out_size, "/opt/outershell/%s", app->install_directory_name);
+#endif
+        return;
+    }
+    default_user_outershell_app_root(app->install_directory_name, out, out_size);
+}
+
+static bool installed_bundled_app_version(const BundledAppDefinition *app, bool system_scope, char *out, size_t out_size) {
+    char install_root[PATH_MAX];
+    char path[PATH_MAX];
+    bundled_app_install_root(app, system_scope, install_root, sizeof(install_root));
+    snprintf(path, sizeof(path), "%s/version", install_root);
+    if (read_first_line_file(path, out, out_size) && bundled_app_version_is_valid(out)) return true;
+    if (out && out_size) out[0] = '\0';
+    return false;
 }
 
 static void systemd_socket_unit_name(const char *unit_name, char *out, size_t out_size) {
@@ -4016,7 +4051,7 @@ static bool uninstall_local_home_screen(const char *sudo_password,
                                         bool remove_user_state,
                                         char *message,
                                         size_t message_size);
-static bool frontend_endpoint_is_passively_ready(int port, const char *socket_path);
+static bool frontend_endpoint_is_passively_ready(int port, const char *socket_path, const char *url);
 static uint64_t frontend_endpoint_readiness_state_token(void);
 
 static uint64_t frontend_icon_path_hash(const char *path) {
@@ -4243,7 +4278,8 @@ static bool build_frontends_array_payload(const RegistryStore *database,
         bool frontend_running = is_running;
         if (is_running && (record->port > 0 || (record->socket_path && record->socket_path[0]))) {
             frontend_running = frontend_endpoint_is_passively_ready(record->port,
-                                                                    record->socket_path ? record->socket_path : "");
+                                                                    record->socket_path ? record->socket_path : "",
+                                                                    url);
         }
         ok = build_frontend_payload(record->display_name,
                                     frontend_id,
@@ -4452,6 +4488,12 @@ static bool append_registered_backend_payloads(const RegistryStore *database,
             }
         }
         if (bundled_app) flags |= BACKEND_FLAG_IS_BUNDLED;
+        if (bundled_app) {
+            (void)installed_bundled_app_version(bundled_app,
+                                                strcmp(effective_service_scope, "system") == 0,
+                                                installed_version,
+                                                sizeof(installed_version));
+        }
         if (bundled_app && bundled_app->supports_root &&
             (!g_internal_service_manager || direct_root_session_uses_system_scope())) {
             flags |= BACKEND_FLAG_SUPPORTS_ROOT;
@@ -4512,7 +4554,7 @@ static bool append_bundled_backend_placeholder_payload(BinaryPayloadList *payloa
                                         (app->root_only ? BACKEND_FLAG_ROOT_ONLY : 0),
                                     app->icon_symbol_name ? app->icon_symbol_name : "",
                                     "",
-                                    app->version ? app->version : "",
+                                    "",
                                     "",
                                     "",
                                     "",
@@ -4835,9 +4877,172 @@ static bool try_connect_tcp_port(int port) {
     return ok;
 }
 
-static bool frontend_endpoint_is_passively_ready(int port, const char *socket_path) {
+enum {
+    HTTP_READINESS_MAX_PORTS = 128,
+    HTTP_READINESS_PROBE_INTERVAL_MS = 500,
+    HTTP_READINESS_RESPONSE_TIMEOUT_MS = 2000,
+    HTTP_READINESS_IDLE_EXPIRY_MS = 30000
+};
+
+typedef struct {
+    int port;
+    bool probed;
+    bool ready;
+    int64_t last_requested_ms;
+} HttpReadinessEntry;
+
+static pthread_mutex_t g_http_readiness_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_http_readiness_wake = PTHREAD_COND_INITIALIZER;
+static HttpReadinessEntry g_http_readiness[HTTP_READINESS_MAX_PORTS];
+static size_t g_http_readiness_count = 0;
+static pthread_once_t g_http_readiness_once = PTHREAD_ONCE_INIT;
+static bool g_http_readiness_thread_running = false;
+
+/* Docker and other port forwarders accept TCP connections before the app behind
+ * them listens, so a TCP connect alone reports apps as ready too early. Any HTTP
+ * status line, including errors such as 401 or 404, shows the server is answering. */
+static bool tcp_port_answers_http(int port) {
+    if (port <= 0 || port > 65535) return false;
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return false;
+#ifdef SO_NOSIGPIPE
+    int no_sigpipe = 1;
+    setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &no_sigpipe, sizeof(no_sigpipe));
+#endif
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = htons((uint16_t)port);
+
+    bool connected = false;
+    if (set_fd_nonblocking(fd, true)) {
+        int result = connect(fd, (struct sockaddr *)&addr, sizeof(addr));
+        if (result == 0) {
+            connected = true;
+        } else if (errno == EINPROGRESS) {
+            struct pollfd pfd = {.fd = fd, .events = POLLOUT, .revents = 0};
+            int socket_error = 0;
+            socklen_t socket_error_size = sizeof(socket_error);
+            connected = poll(&pfd, 1, 250) > 0 && (pfd.revents & POLLOUT) &&
+                        getsockopt(fd, SOL_SOCKET, SO_ERROR, &socket_error, &socket_error_size) == 0 &&
+                        socket_error == 0;
+        }
+    }
+
+    bool ready = false;
+    if (connected) {
+        char request[96];
+        int length = snprintf(request, sizeof(request),
+                              "HEAD / HTTP/1.1\r\nHost: 127.0.0.1:%d\r\nConnection: close\r\n\r\n", port);
+        int send_flags = 0;
+#ifdef MSG_NOSIGNAL
+        send_flags = MSG_NOSIGNAL;
+#endif
+        if (length > 0 && send(fd, request, (size_t)length, send_flags) == length) {
+            char response[5];
+            size_t received = 0;
+            int64_t deadline = monotonic_milliseconds() + HTTP_READINESS_RESPONSE_TIMEOUT_MS;
+            while (received < sizeof(response)) {
+                int64_t remaining = deadline - monotonic_milliseconds();
+                if (remaining <= 0) break;
+                struct pollfd pfd = {.fd = fd, .events = POLLIN, .revents = 0};
+                int polled = poll(&pfd, 1, (int)remaining);
+                if (polled < 0 && errno == EINTR) continue;
+                if (polled <= 0) break;
+                ssize_t count = recv(fd, response + received, sizeof(response) - received, 0);
+                if (count < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) continue;
+                if (count <= 0) break;
+                received += (size_t)count;
+            }
+            ready = received == sizeof(response) && memcmp(response, "HTTP/", sizeof(response)) == 0;
+        }
+    }
+    close(fd);
+    return ready;
+}
+
+static void *http_readiness_main(void *unused) {
+    (void)unused;
+    pthread_mutex_lock(&g_http_readiness_mutex);
+    for (;;) {
+        int64_t now = monotonic_milliseconds();
+        size_t kept = 0;
+        for (size_t i = 0; i < g_http_readiness_count; i++) {
+            if (now - g_http_readiness[i].last_requested_ms <= HTTP_READINESS_IDLE_EXPIRY_MS) {
+                g_http_readiness[kept++] = g_http_readiness[i];
+            }
+        }
+        g_http_readiness_count = kept;
+
+        int ports[HTTP_READINESS_MAX_PORTS];
+        size_t port_count = g_http_readiness_count;
+        for (size_t i = 0; i < port_count; i++) ports[i] = g_http_readiness[i].port;
+        pthread_mutex_unlock(&g_http_readiness_mutex);
+
+        for (size_t i = 0; i < port_count; i++) {
+            bool ready = tcp_port_answers_http(ports[i]);
+            pthread_mutex_lock(&g_http_readiness_mutex);
+            for (size_t j = 0; j < g_http_readiness_count; j++) {
+                if (g_http_readiness[j].port != ports[i]) continue;
+                g_http_readiness[j].ready = ready;
+                g_http_readiness[j].probed = true;
+                break;
+            }
+            pthread_mutex_unlock(&g_http_readiness_mutex);
+        }
+
+        pthread_mutex_lock(&g_http_readiness_mutex);
+        struct timespec wake;
+        clock_gettime(CLOCK_REALTIME, &wake);
+        wake.tv_nsec += (long)HTTP_READINESS_PROBE_INTERVAL_MS * 1000000L;
+        wake.tv_sec += wake.tv_nsec / 1000000000L;
+        wake.tv_nsec %= 1000000000L;
+        pthread_cond_timedwait(&g_http_readiness_wake, &g_http_readiness_mutex, &wake);
+    }
+    return NULL;
+}
+
+static void start_http_readiness_thread(void) {
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, http_readiness_main, NULL) == 0) {
+        pthread_detach(thread);
+        g_http_readiness_thread_running = true;
+    }
+}
+
+static bool http_endpoint_is_ready(int port) {
+    pthread_once(&g_http_readiness_once, start_http_readiness_thread);
+    if (!g_http_readiness_thread_running) return try_connect_tcp_port(port);
+
+    pthread_mutex_lock(&g_http_readiness_mutex);
+    HttpReadinessEntry *entry = NULL;
+    for (size_t i = 0; i < g_http_readiness_count; i++) {
+        if (g_http_readiness[i].port == port) {
+            entry = &g_http_readiness[i];
+            break;
+        }
+    }
+    if (!entry && g_http_readiness_count < HTTP_READINESS_MAX_PORTS) {
+        entry = &g_http_readiness[g_http_readiness_count++];
+        *entry = (HttpReadinessEntry){.port = port};
+        pthread_cond_signal(&g_http_readiness_wake);
+    }
+    bool ready = false;
+    bool tracked = entry != NULL;
+    if (entry) {
+        entry->last_requested_ms = monotonic_milliseconds();
+        ready = entry->probed && entry->ready;
+    }
+    pthread_mutex_unlock(&g_http_readiness_mutex);
+    return tracked ? ready : try_connect_tcp_port(port);
+}
+
+static bool frontend_endpoint_is_passively_ready(int port, const char *socket_path, const char *url) {
     if (port > 0) {
-        return try_connect_tcp_port(port);
+        if (url && strncasecmp(url, "https://", 8) == 0) return try_connect_tcp_port(port);
+        return http_endpoint_is_ready(port);
     }
     if (socket_path && socket_path[0]) {
 #ifdef __APPLE__
@@ -4863,7 +5068,7 @@ static uint64_t frontend_endpoint_readiness_store_token(const RegistryStore *dat
         token = mix_u64(token, string_state_token(record->service_id ? record->service_id : ""));
         token = mix_u64(token, string_state_token(record->frontend_id ? record->frontend_id : ""));
         token = mix_u64(token, (uint64_t)port);
-        token = mix_u64(token, frontend_endpoint_is_passively_ready(port, socket_path) ? 1 : 0);
+        token = mix_u64(token, frontend_endpoint_is_passively_ready(port, socket_path, record->url) ? 1 : 0);
     }
     return token;
 }
@@ -4893,11 +5098,18 @@ static void send_events_response(int fd,
     uint32_t flags = (backends_changed ? 1u : 0u) |
                      (log_changed ? 2u : 0u) |
                      (timed_out ? 4u : 0u) | (overview_changed ? 8u : 0u);
-    bool ok = binary_append_zero(&builder, 32) &&
+    StringBuilder layout = {0};
+    if (overview_changed && !read_layout_document(&layout)) {
+        free(layout.data);
+        layout = (StringBuilder){0};
+    }
+    bool ok = binary_append_zero(&builder, 40) &&
               binary_write_u32_at(&builder, 0, flags) &&
               binary_write_u64_at(&builder, 8, backends_version) &&
               binary_write_u64_at(&builder, 16, log_version) &&
-              binary_write_u64_at(&builder, 24, overview_version);
+              binary_write_u64_at(&builder, 24, overview_version) &&
+              binary_append_child_ref_at(&builder, 32, &layout);
+    free(layout.data);
     if (!ok) {
         free(builder.data);
         send_text_response(fd, 500, "out of memory\n");
@@ -9367,6 +9579,7 @@ static bool install_bundled_app_internal(const BundledAppDefinition *app,
                                          const char *source_icon,
                                          const char *source_web_dir,
                                          const char *source_helpers_dir,
+                                         const char *version,
                                          char *message,
                                          size_t message_size) {
     bool system_scope = direct_root_session_uses_system_scope();
@@ -9437,11 +9650,11 @@ static bool install_bundled_app_internal(const BundledAppDefinition *app,
         (target_icon[0] && !copy_file(source_icon, target_icon, data_mode, error, sizeof(error))) ||
         !replace_directory_tree(source_web_dir, target_web_dir, data_mode, directory_mode, error, sizeof(error)) ||
         !replace_directory_tree(source_helpers_dir, target_helpers_dir, data_mode, directory_mode, error, sizeof(error)) ||
-        !write_text_file(version_path, app->version, error, sizeof(error))) {
+        (version[0] && !write_text_file(version_path, version, error, sizeof(error)))) {
         snprintf(message, message_size, "%s", error);
         return false;
     }
-    chmod(version_path, data_mode);
+    if (version[0]) chmod(version_path, data_mode);
     if (system_scope) {
         char *command = NULL;
         size_t command_size = 0;
@@ -9598,6 +9811,8 @@ static bool install_bundled_app(const BundledAppDefinition *app,
     if (!resolve_bundled_app_stage_root(app, requested_stage_root, stage_root, sizeof(stage_root), message, message_size)) {
         return false;
     }
+    char version[128];
+    (void)bundled_app_payload_version(stage_root, version, sizeof(version));
     char source_binary[PATH_MAX];
     snprintf(source_binary, sizeof(source_binary), "%s/%s/%s/%s", stage_root, remote_linux_binary_directory(), architecture, app->binary_name);
     char source_bundle_arm[PATH_MAX];
@@ -9668,6 +9883,7 @@ static bool install_bundled_app(const BundledAppDefinition *app,
                                             source_icon,
                                             source_web_dir,
                                             source_helpers_dir,
+                                            version,
                                             message,
                                             message_size);
     }
@@ -9931,18 +10147,23 @@ static bool install_bundled_app(const BundledAppDefinition *app,
         if (quoted_source_icon[0] && quoted_target_icon[0]) {
             fprintf(script, "install -m 0644 %s %s\n", quoted_source_icon, quoted_target_icon);
         }
+        if (version[0]) {
+            fprintf(script,
+                    "cat > %s <<'__BACKENDS_VERSION__'\n%s\n__BACKENDS_VERSION__\n"
+                    "chmod 0644 %s\n",
+                    quoted_version_path,
+                    version,
+                    quoted_version_path);
+        } else {
+            fprintf(script, "rm -f -- %s\n", quoted_version_path);
+        }
         fprintf(script,
-                "cat > %s <<'__BACKENDS_VERSION__'\n%s\n__BACKENDS_VERSION__\n"
-                "chmod 0644 %s\n"
                 "cat > %s <<'__BACKENDS_UNIT__'\n%s__BACKENDS_UNIT__\n"
                 "chmod 0644 %s\n"
                 "touch %s\n"
                 "chmod 0644 %s\n"
                 "chmod 0666 %s/registry.orwa.lock 2>/dev/null || true\n"
                 "systemctl --system daemon-reload\n",
-                quoted_version_path,
-                app->version,
-                quoted_version_path,
                 quoted_unit_path,
                 unit_contents,
                 quoted_unit_path,
@@ -10071,7 +10292,9 @@ static bool install_bundled_app(const BundledAppDefinition *app,
         snprintf(message, message_size, "%s", error);
         return false;
     }
-    if (!write_text_file(version_path, app->version, error, sizeof(error))) {
+    if (!version[0]) {
+        unlink(version_path);
+    } else if (!write_text_file(version_path, version, error, sizeof(error))) {
         snprintf(message, message_size, "%s", error);
         return false;
     }
@@ -10494,6 +10717,8 @@ static bool install_bundled_app_macos(const BundledAppDefinition *app,
     if (!resolve_bundled_app_stage_root(app, requested_stage_root, stage_root, sizeof(stage_root), message, message_size)) {
         return false;
     }
+    char version[128];
+    (void)bundled_app_payload_version(stage_root, version, sizeof(version));
     char source_app_bundle[PATH_MAX];
     bundled_app_macos_app_bundle_path(app, stage_root, source_app_bundle, sizeof(source_app_bundle));
     bool source_is_app_bundle = bundled_app_macos_app_has_expected_files(app, source_app_bundle);
@@ -10685,6 +10910,18 @@ static bool install_bundled_app_macos(const BundledAppDefinition *app,
                 fprintf(script, "install -m 0644 %s %s\n", quoted_source_icon, quoted_target_icon);
             }
         }
+        if (version[0]) {
+            char version_path[PATH_MAX];
+            char quoted_version_path[PATH_MAX + 8];
+            snprintf(version_path, sizeof(version_path), "%s/version", install_root);
+            shell_quote(version_path, quoted_version_path, sizeof(quoted_version_path));
+            fprintf(script,
+                    "cat > %s <<'__BACKENDS_VERSION__'\n%s\n__BACKENDS_VERSION__\n"
+                    "chmod 0644 %s\n",
+                    quoted_version_path,
+                    version,
+                    quoted_version_path);
+        }
         fprintf(script,
                 "rm -f %s/outerctl-system\n"
                 "cat > %s <<'__BACKENDS_PLIST__'\n%s__BACKENDS_PLIST__\n"
@@ -10830,6 +11067,15 @@ static bool install_bundled_app_macos(const BundledAppDefinition *app,
             snprintf(message, message_size, "%s", error);
             return false;
         }
+    }
+    if (version[0]) {
+        char version_path[PATH_MAX];
+        snprintf(version_path, sizeof(version_path), "%s/version", install_root);
+        if (!write_text_file(version_path, version, error, sizeof(error))) {
+            snprintf(message, message_size, "%s", error);
+            return false;
+        }
+        chmod(version_path, 0600);
     }
 
     StringBuilder plist = {0};
@@ -11916,14 +12162,45 @@ static bool run_safe_space_provider(const char *body,
 
 #include "../Backend/OuterShellLayout.h"
 
+static bool layout_storage_paths(char *path, size_t path_size, char *lock_path, size_t lock_path_size) {
+    return snprintf(path, path_size, "%s.layout", g_registry_database_path) < (int)path_size &&
+           snprintf(lock_path, lock_path_size, "%s.lock", path) < (int)lock_path_size;
+}
+
+static bool load_layout_file(const char *path, StringBuilder *data) {
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return errno == ENOENT && sb_append_n(data, "OSLAY001\0\0\0\0\0\0\0\0{}", 18);
+    struct stat st;
+    bool ok = fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_size >= 18 && st.st_size <= LAYOUT_MAX_BYTES;
+    if (ok) ok = sb_reserve(data, (size_t)st.st_size);
+    while (ok && data->length < (size_t)st.st_size) {
+        ssize_t count = read(fd, data->data + data->length, (size_t)st.st_size - data->length);
+        if (count < 0 && errno == EINTR) continue;
+        if (count <= 0) { ok = false; break; }
+        data->length += (size_t)count;
+    }
+    close(fd);
+    return ok && layout_document_valid(data->data, data->length);
+}
+
+static bool read_layout_document(StringBuilder *data) {
+    char path[PATH_MAX], lock_path[PATH_MAX];
+    if (!layout_storage_paths(path, sizeof(path), lock_path, sizeof(lock_path))) return false;
+    int lock_fd = open(lock_path, O_CREAT | O_RDWR | O_CLOEXEC, 0600);
+    if (lock_fd < 0) return false;
+    bool ok = flock(lock_fd, LOCK_SH) == 0 && load_layout_file(path, data);
+    flock(lock_fd, LOCK_UN);
+    close(lock_fd);
+    return ok;
+}
+
 static void send_layout_response(bool write_layout, const char *body, size_t body_length) {
     if (write_layout && !layout_document_valid(body, body_length)) {
         send_text_response(-1, 400, "Invalid layout document or size.\n");
         return;
     }
     char path[PATH_MAX], lock_path[PATH_MAX], temp_path[PATH_MAX] = "";
-    if (snprintf(path, sizeof(path), "%s.layout", g_registry_database_path) >= (int)sizeof(path) ||
-        snprintf(lock_path, sizeof(lock_path), "%s.lock", path) >= (int)sizeof(lock_path)) {
+    if (!layout_storage_paths(path, sizeof(path), lock_path, sizeof(lock_path))) {
         send_text_response(-1, 500, "Layout path is too long.\n");
         return;
     }
@@ -11936,22 +12213,7 @@ static void send_layout_response(bool write_layout, const char *body, size_t bod
     StringBuilder data = {0};
     int status = 500;
     const char *error = "Could not read layout storage.\n";
-    int fd = open(path, O_RDONLY | O_CLOEXEC);
-    if (fd < 0 && errno == ENOENT) {
-        if (!sb_append_n(&data, "OSLAY001\0\0\0\0\0\0\0\0{}", 18)) goto done;
-    } else if (fd >= 0) {
-        struct stat st;
-        bool ok = fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_size >= 18 && st.st_size <= LAYOUT_MAX_BYTES;
-        if (ok) ok = sb_reserve(&data, (size_t)st.st_size);
-        while (ok && data.length < (size_t)st.st_size) {
-            ssize_t count = read(fd, data.data + data.length, (size_t)st.st_size - data.length);
-            if (count < 0 && errno == EINTR) continue;
-            if (count <= 0) { ok = false; break; }
-            data.length += (size_t)count;
-        }
-        close(fd);
-        if (!ok || !layout_document_valid(data.data, data.length)) goto done;
-    } else goto done;
+    if (!load_layout_file(path, &data)) goto done;
     if (write_layout) {
         uint64_t revision = read_uint64_le((const unsigned char *)data.data + 8);
         if (read_uint64_le((const unsigned char *)body + 8) != revision) {
@@ -11966,7 +12228,7 @@ static void send_layout_response(bool write_layout, const char *body, size_t bod
         write_uint64_le((unsigned char *)data.data + 8, revision + 1);
         error = "Could not save layout storage.\n";
         if (snprintf(temp_path, sizeof(temp_path), "%s.tmp.XXXXXX", path) >= (int)sizeof(temp_path)) goto done;
-        fd = mkstemp(temp_path);
+        int fd = mkstemp(temp_path);
         if (fd < 0) goto done;
         bool ok = fchmod(fd, 0600) == 0 && queue_all(fd, data.data, data.length) && fsync(fd) == 0;
         if (close(fd) != 0) ok = false;

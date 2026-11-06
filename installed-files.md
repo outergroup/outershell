@@ -161,6 +161,7 @@ macOS user install:
 - `<user-state>/apps/<service-id>/<app-name>.app/Contents/Resources/bundles/<bundle-prefix>.bundle.macos-arm.aar`
 - `<user-state>/apps/<service-id>/<app-name>.app/Contents/Resources/bundles/<bundle-prefix>.bundle.macos-x86.aar`
 - `<user-state>/apps/<service-id>/<app-name>.app/Contents/Resources/app-icon.png` when the app has a raster icon
+- `<user-state>/apps/<service-id>/version` when the payload has a version
 - `$HOME/Library/LaunchAgents/<service-id>.plist`
 - `$HOME/Library/Logs/<service-id>/output.log`
 - `<user-runtime>/<service-id>` for socket-activated apps
@@ -172,6 +173,7 @@ macOS root install:
 - `<system-state>/apps/<service-id>/<app-name>.app/Contents/Resources/bundles/<bundle-prefix>.bundle.macos-arm.aar`
 - `<system-state>/apps/<service-id>/<app-name>.app/Contents/Resources/bundles/<bundle-prefix>.bundle.macos-x86.aar`
 - `<system-state>/apps/<service-id>/<app-name>.app/Contents/Resources/app-icon.png` when the app has a raster icon
+- `<system-state>/apps/<service-id>/version` when the payload has a version
 - `/Library/LaunchDaemons/<service-id>.plist`
 - `/Library/Logs/<service-id>.log`
 - `/var/run/<service-id>` for socket-activated apps
@@ -187,7 +189,7 @@ Linux user install:
 - `<user-state>/apps/<service-id>/bundles/<bundle-prefix>.bundle.macos-x86.aar`
 - `<user-state>/apps/<service-id>/app-icon.png` when the app has a raster icon
 - `<user-state>/apps/<service-id>/web/` when the staged app includes browser resources
-- `<user-state>/apps/<service-id>/version`
+- `<user-state>/apps/<service-id>/version` when the payload has a version
 - `<user-state>/apps/<service-id>/backend.log`
 - `$HOME/.config/systemd/user/<service-id>.service`
 - `$HOME/.config/systemd/user/<service-id>.socket` for socket-activated apps
@@ -204,7 +206,7 @@ Linux root install:
 - `/opt/outershell/<service-id>/bundles/<bundle-prefix>.bundle.macos-x86.aar`
 - `/opt/outershell/<service-id>/app-icon.png` when the app has a raster icon
 - `/opt/outershell/<service-id>/web/` when the staged app includes browser resources
-- `/opt/outershell/<service-id>/version`
+- `/opt/outershell/<service-id>/version` when the payload has a version
 - `/etc/systemd/system/<service-id>.service`
 - `/etc/systemd/system/<service-id>.socket` for socket-activated apps
 - `/var/log/outershell/<service-id>.log`
@@ -219,6 +221,17 @@ state, and runtime socket paths remain the same.
 Linux root app services use `/opt/outershell/bin/outerctl` directly. A root install initiated from a non-root Outer Shell session first installs Linux root support, then writes the root app systemd unit with `OUTERCTL_PATH=/opt/outershell/bin/outerctl`.
 
 Linux user and root installations also use separate payloads and services. The User and Root catalogs track installation independently, and uninstall removes only the selected scope.
+
+Windows user install:
+
+- `%LOCALAPPDATA%\OuterShell\apps\<service-id>\current`, naming the folder in use
+- `%LOCALAPPDATA%\OuterShell\apps\<service-id>\<folder>\version` when the payload has a version
+
+Each bundled app's `version` file holds its release version, copied from the
+`version` file in its release archive. The latest published version is at
+`<public-base-url>/apps/<app-name>/version.txt`. Linux installs made before
+archives carried versions contain `1`, and older macOS and Windows installs
+have no `version` file; both are older than any published version.
 
 Bundled app table:
 

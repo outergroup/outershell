@@ -54,6 +54,9 @@ if ($App) {
     Copy-Item (Join-Path $CoreDirectory "$($App)Backend.exe") $root -Force
     Copy-Item "$AppRoot/Resources/$($App)Web/*" "$root/web" -Recurse -Force
     Copy-Item "$AppRoot/app-icon.png" "$root/app-icon.png" -Force
+    $version = [IO.File]::ReadAllText((Join-Path $AppRoot 'VERSION')).Trim()
+    if ($version -notmatch '^[0-9A-Za-z.+_-]+$') { throw "$AppRoot/VERSION must hold a version such as 1.1.0" }
+    [IO.File]::WriteAllText((Join-Path $root 'version'), "$version`n")
     if ($App -eq 'Top') {
         $symbols = Join-Path $OutputDirectory "symbols/Top"
         New-Item -ItemType Directory -Force $symbols | Out-Null

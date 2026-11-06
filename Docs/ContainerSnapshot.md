@@ -37,7 +37,9 @@ The web page no longer polls layout or snapshots on a timer. It includes
 adds an overview-changed flag (bit 3) and a 64-bit overview token at offset 24.
 The token combines snapshot content with the layout file state, so unchanged
 discovery does not wake readers, and changes survive daemon restarts. Existing
-backend and log fields remain at their original offsets. A quiet watch times out
+backend and log fields remain at their original offsets. When the overview flag is
+set, a data reference at offset 32 (u32 offset, u32 length) holds the current
+layout record in the `/api/layout` format; it is empty otherwise. A quiet watch times out
 after 25 seconds and reconnects without downloading overview data. Resume and
 reconnection recovery still reconcile state. Active overview watches keep the
 server snapshot refresh alive.

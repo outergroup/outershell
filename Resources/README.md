@@ -62,7 +62,17 @@ expands to:
     <ContentName>.bundle.macos-arm.aar
     <ContentName>.bundle.macos-x86.aar
   app-icon.png
+  version                         # the app's release version
 ```
+
+`version` holds one line: the app's release version, taken from the `VERSION`
+file at the root of the app's repository. Installs copy it to
+`<install-root>/version`. Each app release also publishes the same line at
+`<public-base-url>/apps/<AppName>/version.txt`, so Outer Shell can compare an
+installed app with the latest release without downloading an archive. Archives
+from before this convention have no `version` file. Linux installs of those
+archives have a `version` file containing `1`, which predates real app
+versions; treat both cases as older than any published version.
 
 End users should not need `xcodebuild`, Docker, or a compiler.
 
