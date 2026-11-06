@@ -922,13 +922,23 @@ private struct SafeSpaceSocketAPIRequest: Encodable {
     let socketPath: String
 }
 
-private struct LocalWorkspaceAppLogRecord: Decodable {
-    let path: String
-    let contents: String
-    let isTruncated: Bool
-    let fileSize: UInt64
-    let modified: Double
-    let error: String
+private struct ContainerAppLogRequest: Encodable {
+    let requestID: UUID
+    let operation = "appLogs"
+    let workspaceID: UUID
+    let serviceID: String
+    let logIndex: Int
+    let includeWorkspaceSnapshot = false
+    let includeBackends = false
+}
+
+private struct ContainerAppLogResponse: Decodable {
+    struct AppLog: Decodable {
+        let logPayload: String
+    }
+
+    let appLog: AppLog?
+    let error: String?
 }
 
 private struct OuterShellHostConfiguration: Decodable {
@@ -940,7 +950,6 @@ private struct LocalWorkspaceHostResponse: Decodable {
     let requestID: UUID
     let providers: [LocalSafeSpaceProviderRecord]?
     let workspaces: [LocalWorkspaceRecord]
-    let appLog: LocalWorkspaceAppLogRecord?
     let recipeCommandOutput: String?
     let recipeCommandApplied: Bool?
     let resourcesApplied: Bool?
@@ -9766,18 +9775,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
     private func fetchSelectedLog(quiet: Bool = false, scrollToBottom: Bool = false, didRecoverNetworking: Bool = false) {
         if let context = selectedContainerLogContext {
-            guard !isLoadingLog, !isPerformingWorkspaceOperation else { return }
-            isLoadingLog = true
-            if !quiet {
-                logError = ""
-                logScroll = 0
-                renderLogHeader()
-                renderLogRows()
-            }
-            sendWorkspaceRequest(operation: "appLogs",
-                                 workspaceID: context.container.id,
-                                 serviceID: context.app.serviceID,
-                             serviceScope: context.app.serviceScope)
+            fetchContainerAppLog(context, quiet: quiet, scrollToBottom: scrollToBottom)
             return
         }
         guard let selection = selectedLog, let logsEndpoint, let urlSession else { return }
@@ -9842,6 +9840,70 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                     self.logError = "Could not decode log response."
                     self.updateLayout()
                 }
+            }
+        }.resume()
+    }
+
+    private func fetchContainerAppLog(_ context: ContainerAppLauncherContext, quiet: Bool, scrollToBottom: Bool) {
+        guard !isLoadingLog, let safeSpacesEndpoint, let urlSession, let selection = selectedLog else { return }
+        let request = ContainerAppLogRequest(requestID: UUID(),
+                                             workspaceID: context.container.id,
+                                             serviceID: context.app.serviceID,
+                                             logIndex: selection.logIndex)
+        guard let payload = try? JSONEncoder().encode(request) else {
+            logError = "Could not build log request."
+            updateLayout()
+            return
+        }
+        let shouldFollowLogTail = quiet && isLogScrolledNearBottom()
+        isLoadingLog = true
+        if !quiet {
+            logError = ""
+            logScroll = 0
+            renderLogHeader()
+            renderLogRows()
+        }
+        var urlRequest = URLRequest(url: safeSpacesEndpoint)
+        urlRequest.httpMethod = "POST"
+        urlRequest.httpBody = payload
+        urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        urlSession.dataTask(with: urlRequest) { [weak self] data, _, error in
+            Task { @MainActor in
+                guard let self else { return }
+                guard self.selectedLog == selection,
+                      self.selectedContainerLogContext?.container.id == context.container.id else { return }
+                self.isLoadingLog = false
+                if let error {
+                    self.logError = error.localizedDescription
+                    self.updateLayout()
+                    return
+                }
+                guard let data,
+                      let response = try? JSONDecoder().decode(ContainerAppLogResponse.self, from: data) else {
+                    self.logError = "Outer Shell returned an invalid container log response."
+                    self.updateLayout()
+                    return
+                }
+                if let error = response.error, !error.isEmpty {
+                    self.logError = error
+                    self.updateLayout()
+                    return
+                }
+                guard let encodedLog = response.appLog?.logPayload,
+                      let logData = Data(base64Encoded: encodedLog),
+                      let snapshot = try? LogResponse.decodeBinary(logData) else {
+                    self.logError = "Outer Shell returned no container app logs."
+                    self.updateLayout()
+                    return
+                }
+                if quiet && !scrollToBottom && self.logSnapshot == snapshot && self.logError == snapshot.error { return }
+                self.logSnapshot = snapshot
+                self.logError = snapshot.error
+                if scrollToBottom || shouldFollowLogTail {
+                    self.shouldScrollLogToBottomOnNextLayout = true
+                }
+                self.clampScrollOffsets()
+                self.updateLayout()
             }
         }.resume()
     }
@@ -16772,26 +16834,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 containerConfigurationMounts != containerConfigurationSavedMounts {
                 scheduleContainerConfigurationEnvironmentSave(after: 0.2)
             }
-        }
-        if operation == "appLogs" {
-            isLoadingLog = false
-            if let error = response.error, !error.isEmpty {
-                logError = error
-            } else if let log = response.appLog {
-                logSnapshot = LogResponse(serviceID: selectedServiceID ?? "",
-                                          path: log.path,
-                                          contents: log.contents,
-                                          isTruncated: log.isTruncated,
-                                          fileSize: log.fileSize,
-                                          modified: log.modified,
-                                          error: log.error)
-                logError = log.error
-                shouldScrollLogToBottomOnNextLayout = true
-            } else {
-                logError = "Outer Shell returned no container app logs."
-            }
-            scheduleLayoutUpdate()
-            return
         }
         if operation == "create" {
             pendingWorkspaceCreationNames.removeValue(forKey: effectiveRequestID)
