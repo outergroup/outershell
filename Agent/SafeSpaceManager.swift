@@ -434,10 +434,87 @@ final class SafeSpaceManager: @unchecked Sendable {
 
     private init() {
         do {
+            try migrateLegacyContainerDirectory()
+        } catch {
+            NSLog("Container directory migration failed: %@", error.localizedDescription)
+        }
+        do {
             records = try loadRecords()
             cachedApps = try loadCachedApps()
         } catch {
             NSLog("Container catalog load failed: %@", error.localizedDescription)
+        }
+        let loadedRecords = records
+        imageCleanupQueue.async { [self] in
+            migrateLegacyRecipeImages(for: loadedRecords)
+        }
+    }
+
+    private func migrateLegacyContainerDirectory() throws {
+        let fileManager = FileManager.default
+        let base = try applicationDirectory()
+        let legacy = base.appendingPathComponent("Safe Spaces", isDirectory: true)
+        let current = base.appendingPathComponent("Containers", isDirectory: true)
+        guard (try? fileManager.destinationOfSymbolicLink(atPath: legacy.path)) == nil else {
+            return
+        }
+        var isDirectory: ObjCBool = false
+        guard fileManager.fileExists(atPath: legacy.path, isDirectory: &isDirectory),
+              isDirectory.boolValue else {
+            return
+        }
+        try fileManager.createDirectory(at: current,
+                                        withIntermediateDirectories: true,
+                                        attributes: [.posixPermissions: 0o700])
+        for name in try fileManager.contentsOfDirectory(atPath: legacy.path) {
+            let source = legacy.appendingPathComponent(name, isDirectory: true)
+            let destination = current.appendingPathComponent(name, isDirectory: true)
+            if fileManager.fileExists(atPath: destination.path) {
+                let destinationDockerfile = destination
+                    .appendingPathComponent("Recipe", isDirectory: true)
+                    .appendingPathComponent("Dockerfile")
+                guard !fileManager.fileExists(atPath: destinationDockerfile.path) else {
+                    NSLog("Keeping legacy container directory %@ because %@ already has a Dockerfile",
+                          source.path, destination.path)
+                    continue
+                }
+                try fileManager.removeItem(at: destination)
+            }
+            try fileManager.moveItem(at: source, to: destination)
+        }
+        guard try fileManager.contentsOfDirectory(atPath: legacy.path).isEmpty else {
+            return
+        }
+        try fileManager.removeItem(at: legacy)
+        try fileManager.createSymbolicLink(atPath: legacy.path,
+                                           withDestinationPath: current.lastPathComponent)
+    }
+
+    private func migrateLegacyRecipeImages(for records: [SafeSpaceRecord]) {
+        for record in records where recordOwnsContainer(record) {
+            let legacyReference = "outershell/safe-space-\(record.id.uuidString.lowercased()):recipe"
+            let reference = recipeImageReference(record.id)
+            do {
+                containerBaseImageLock.lock()
+                defer { containerBaseImageLock.unlock() }
+                guard try runRuntime(record, ["image", "inspect", legacyReference]).status == 0 else {
+                    continue
+                }
+                if try runRuntime(record, ["image", "inspect", reference]).status != 0 {
+                    try requireSuccess(
+                        try runRuntime(record, ["image", "tag", legacyReference, reference]),
+                        action: "rename the container recipe image"
+                    )
+                }
+                let removal = runtimeProvider(for: record) == .docker
+                    ? ["image", "rm", legacyReference]
+                    : ["image", "delete", legacyReference]
+                try requireSuccess(try runRuntime(record, removal),
+                                   action: "remove the legacy container recipe image name")
+            } catch {
+                NSLog("Container recipe image migration failed for %@: %@",
+                      record.id.uuidString, error.localizedDescription)
+            }
         }
     }
 
