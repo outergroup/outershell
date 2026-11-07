@@ -2645,7 +2645,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             filePickerEndpoint = URL(string: "/api/file-picker", relativeTo: base)?.absoluteURL
             eventsEndpoint = URL(string: "/api/events", relativeTo: base)?.absoluteURL
             nativeAppProjectEndpoint = URL(string: "/api/native-app-projects", relativeTo: base)?.absoluteURL
-            safeSpacesEndpoint = URL(string: "/api/safe-spaces", relativeTo: base)?.absoluteURL
+            safeSpacesEndpoint = URL(string: "/api/containers", relativeTo: base)?.absoluteURL
         }
         let configuration = URLSessionConfiguration.ephemeral
         configuration.timeoutIntervalForRequest = 40
@@ -2750,7 +2750,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         }
         let pathComponents = components.path.split(separator: "/")
         guard pathComponents.count == 2,
-              pathComponents[0].lowercased() == "safe-spaces" else {
+              pathComponents[0].lowercased() == "containers" else {
             return nil
         }
         return UUID(uuidString: String(pathComponents[1]))
@@ -3054,7 +3054,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
         titleLayer.string = ""
         privilegedAppsHeaderLayer.string = "PRIVILEGED APPS"
-        safeSpacesHeaderLayer.string = "SAFE SPACES"
+        safeSpacesHeaderLayer.string = "CONTAINERS"
         privilegedAppsHeaderLayer.isHidden = true
         safeSpacesHeaderLayer.isHidden = true
         installOverlayLayer.isHidden = true

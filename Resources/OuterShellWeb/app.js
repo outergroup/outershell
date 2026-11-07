@@ -1160,7 +1160,7 @@ RUN outerctl image add-command --id codex --name "Codex" --working-directory /ro
     const requestID = makeRequestID();
     const response = operation === "list"
       ? await fetch("/api/container-snapshot", { cache: "no-store", signal })
-      : await fetch("/api/safe-spaces", {
+      : await fetch("/api/containers", {
       method: "POST",
       cache: "no-store",
       headers: { "Content-Type": "application/json" },

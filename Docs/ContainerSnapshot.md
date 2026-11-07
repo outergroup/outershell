@@ -12,7 +12,7 @@ and resumes background discovery. There is at most one snapshot discovery in
 flight. Cold readers wait for that shared discovery rather than spawning their
 own providers.
 
-Container operations still use `/api/safe-spaces` and receive their own result.
+Container operations still use `/api/containers` and receive their own result.
 Starting and completing an operation advances a generation counter and schedules
 a fresh snapshot. Discovery from an older generation cannot replace the cache.
 Background discovery waits for active provider operations to finish.

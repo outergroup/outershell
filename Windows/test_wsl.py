@@ -132,7 +132,7 @@ with Bridge(shell_pipe) as host_client:
     workspace_id = wait_for(lambda w: True)['id']
     def operation(name, **values):
         request_id = str(uuid.uuid4()).upper()
-        result = json.loads(expect(host_client, '/api/safe-spaces', json.dumps(dict(requestID=request_id, operation=name, workspaceID=workspace_id.upper(), **values)).encode(), 'POST'))
+        result = json.loads(expect(host_client, '/api/containers', json.dumps(dict(requestID=request_id, operation=name, workspaceID=workspace_id.upper(), **values)).encode(), 'POST'))
         assert result['requestID'] == request_id
         return result
     operation('start')

@@ -115,7 +115,7 @@ b=Bridge(shell)
 ids=[]
 def op(operation,**values):
  values.update(operation=operation,requestID=str(uuid.uuid4()))
- status,body=b.request('/api/safe-spaces',json.dumps(values).encode(),'POST')
+ status,body=b.request('/api/containers',json.dumps(values).encode(),'POST')
  assert status==200,(status,body[:500]);return json.loads(body)
 def snapshot():
  status,raw=b.request('/api/container-snapshot');assert status==200;return json.loads(raw)
@@ -128,7 +128,7 @@ def wait(id):
  raise TimeoutError(id)
 def binary(t,operation,offset=0,chunk=b'',length=1000000):
  data=struct.pack('<4sHH16sQQII',b'OSCT',1,operation,uuid.UUID(t).bytes,offset,len(chunk) if operation==2 else length,48 if chunk else 0,len(chunk))+chunk
- status,response=b.request('/api/safe-spaces',data,'POST');assert status==200
+ status,response=b.request('/api/containers',data,'POST');assert status==200
  header=struct.unpack_from('<4sHHQQIIII',response)
  assert header[2]==0,response[header[7]:header[7]+header[8]]
  return header,response[header[5]:header[5]+header[6]]
@@ -232,7 +232,7 @@ try:
    tar.addfile(info,io.BytesIO(b'x'))
   upload=op('beginImport');binary(upload['transferID'],2,chunk=memory.getvalue())
   payload={'operation':'finishImport','requestID':str(uuid.uuid4()),'transferID':upload['transferID'],'runtimeProviderID':'docker'}
-  status,response=b.request('/api/safe-spaces',json.dumps(payload).encode(),'POST')
+  status,response=b.request('/api/containers',json.dumps(payload).encode(),'POST')
   assert status==400,(unsafe,status,response)
   op('cancelImport',transferID=upload['transferID'])
  print('PASS archive traversal, symbolic/hard links, and Windows device-name rejection',flush=True)

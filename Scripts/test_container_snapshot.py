@@ -58,7 +58,7 @@ print(json.dumps({'workspaces': [{'id': v}], 'providers': [], 'padding': 'x' * 3
                     c.sock = socket.socket(socket.AF_UNIX)
                     c.sock.settimeout(5)
                     c.sock.connect(str(web_path))
-                    c.request('POST' if route == 9 else 'GET', {9: '/api/safe-spaces', 11: '/api/layout', 13: '/api/container-snapshot'}[route], body=body)
+                    c.request('POST' if route == 9 else 'GET', {9: '/api/containers', 11: '/api/layout', 13: '/api/container-snapshot'}[route], body=body)
                     response = c.getresponse()
                     result = response.status, response.read()
                     c.close()

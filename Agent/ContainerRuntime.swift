@@ -245,7 +245,7 @@ struct ContainerImageStorage {
                       let current = currentBase.split(separator: ":").last.flatMap({ Int($0) }) else { return false }
                 return version < current
             }
-            let prefix = "outershell/safe-space-"
+            let prefix = "outershell/container-"
             guard image.reference.hasPrefix(prefix), image.reference.hasSuffix(":recipe") else { return false }
             return UUID(uuidString: String(image.reference.dropFirst(prefix.count).dropLast(":recipe".count))) != nil
         }.sorted { $0.reference < $1.reference }

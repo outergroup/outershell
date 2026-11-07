@@ -81,7 +81,7 @@ esac
                                 "--created-at-milliseconds", str(index),
                                 "--outershell-owns", "false"], env=env, check=True,
                                stdout=subprocess.DEVNULL)
-            status, body = request("/api/safe-spaces", {"operation": "list", "overview": True})
+            status, body = request("/api/containers", {"operation": "list", "overview": True})
             result = json.loads(body)
             assert status == 200 and not result.get("error"), result
             entries = {item["name"]: item for item in result["workspaces"]}

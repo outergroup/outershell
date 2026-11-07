@@ -265,7 +265,7 @@ final class SafeSpaceSocketRelayConnection: @unchecked Sendable {
     private let errorHandle: FileHandle?
     private let sendsSocketPathWithOpen: Bool
     private let closesAfterSingleStream: Bool
-    private let queue = DispatchQueue(label: "org.outershell.OuterShell.safe-space-socket-relay")
+    private let queue = DispatchQueue(label: "org.outershell.OuterShell.container-socket-relay")
     private let cleanup: @Sendable (SafeSpaceSocketRelayConnection) -> Void
 
     private var parser = SafeSpaceSocketRelayFrameParser()
@@ -836,7 +836,7 @@ final class SafeSpaceSocketRelayForward: @unchecked Sendable {
     private let workspaceSocketPath: String?
     private let workspaceUser: String?
     private let workspaceRuntimeExecutablePath: String?
-    private let queue = DispatchQueue(label: "dev.outergroup.OuterLoop.safe-space-socket-relay-forward")
+    private let queue = DispatchQueue(label: "dev.outergroup.OuterLoop.container-socket-relay-forward")
     private var closed = false
     private var availableWorkspaceBridge: SafeSpaceSocketRelayConnection?
     private var workspaceBridges: [ObjectIdentifier: SafeSpaceSocketRelayConnection] = [:]

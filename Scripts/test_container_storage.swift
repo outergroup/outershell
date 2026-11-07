@@ -5,13 +5,13 @@ struct StorageTests {
     static func main() throws {
         typealias Image = ContainerImageStorage.Image
         let id = "11111111-1111-1111-1111-111111111111"
-        let recipe = "outershell/safe-space-\(id):recipe"
+        let recipe = "outershell/container-\(id):recipe"
         func image(_ name: String, _ digest: String? = nil) -> Image {
             Image(reference: name, digests: [digest ?? name], snapshotDigests: [])
         }
         let images = [image("outershell/container-base:1"), image("outershell/container-base:12"), image("outershell/container-base:18"),
                       image("outerloop/workspace-501:2"), image("outerloop/workspace-501:9"),
-                      image(recipe), image("ubuntu:24.04"), image("outershell/safe-space-not-a-uuid:recipe"),
+                      image(recipe), image("ubuntu:24.04"), image("outershell/container-not-a-uuid:recipe"),
                       image("outerloop/workspace-502:1"), image("outershell/container-base:custom")]
         func candidates(_ protected: Set<String> = [], _ files: [String] = [], _ input: [Image]? = nil) -> [String] {
             ContainerImageStorage.candidates(images: input ?? images, protected: protected,

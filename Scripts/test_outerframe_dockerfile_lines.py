@@ -51,9 +51,9 @@ a = source.index('    private func returnFromRecipeSafeSpace()')
 b = source.index('    private func applyMode(', a)
 assert 'goBackInHistory' not in source[a:b]
 assert 'urlForRecipeSafeSpace' not in source
-assert 'components.path = "/safe-spaces/' not in source
+assert 'components.path = "/containers/' not in source
 with tempfile.TemporaryDirectory() as directory:
     path = Path(directory) / 'main.swift'
     path.write_text(program)
     subprocess.run(['swift', str(path)], check=True)
-print('PASS: container editor does not create a safe-spaces URL')
+print('PASS: container editor does not create a containers URL')

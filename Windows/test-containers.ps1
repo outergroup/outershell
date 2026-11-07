@@ -33,7 +33,7 @@ function Request([string]$Path, [string]$Body = '', [string]$PipeName = $shellPi
 function Operation([string]$Operation, [hashtable]$Values) {
     $Values.operation = $Operation
     $Values.requestID = [guid]::NewGuid().ToString()
-    return (Request '/api/safe-spaces' ($Values | ConvertTo-Json -Compress) | ConvertFrom-Json)
+    return (Request '/api/containers' ($Values | ConvertTo-Json -Compress) | ConvertFrom-Json)
 }
 
 function Wait-Container([string]$Name, [string]$State) {

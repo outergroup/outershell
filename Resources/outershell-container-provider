@@ -1092,13 +1092,13 @@ def storage_operation(function):
 
 
 def storage_image_owned(reference):
-    for prefix in ("outershell/container-", "outershell/safe-space-"):
-        if reference.startswith(prefix) and reference.endswith(":recipe"):
-            try:
-                uuid.UUID(reference[len(prefix):-len(":recipe")])
-                return True
-            except ValueError:
-                return False
+    prefix = "outershell/container-"
+    if reference.startswith(prefix) and reference.endswith(":recipe"):
+        try:
+            uuid.UUID(reference[len(prefix):-len(":recipe")])
+            return True
+        except ValueError:
+            return False
     prefix = "outershell/container-base:"
     if reference.startswith(prefix):
         version = reference[len(prefix):]

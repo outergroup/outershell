@@ -2349,7 +2349,6 @@ final class SafeSpaceManager: @unchecked Sendable {
             "--cpus", String(runnableResources(record).cpus),
             "--memory", "\(runnableResources(record).memoryInMB)M",
             "--init",
-            "--label", "org.outershell.safe-space=\(record.id.uuidString)",
             "--label", "org.outershell.container-id=\(record.id.uuidString)",
             "--volume", "\(try recipeDirectory(record.id).path):/var/lib/outershell/project"
         ]
@@ -2410,7 +2409,6 @@ final class SafeSpaceManager: @unchecked Sendable {
             "--cpus", String(runnableResources(record).cpus),
             "--memory", "\(runnableResources(record).memoryInMB)m",
             "--init",
-            "--label", "org.outershell.safe-space=\(record.id.uuidString)",
             "--label", "org.outershell.container-id=\(record.id.uuidString)",
             "--volume", "\(try recipeDirectory(record.id).path):/var/lib/outershell/project"
         ]
@@ -5669,7 +5667,7 @@ final class SafeSpaceManager: @unchecked Sendable {
     }
 
     private func recipeImageReference(_ id: UUID) -> String {
-        "outershell/safe-space-\(id.uuidString.lowercased()):recipe"
+        "outershell/container-\(id.uuidString.lowercased()):recipe"
     }
 
     private func createManagedDirectories(for record: SafeSpaceRecord) throws {
@@ -5799,7 +5797,7 @@ final class SafeSpaceManager: @unchecked Sendable {
 
     private func safeSpaceDirectory(_ id: UUID) throws -> URL {
         try applicationDirectory()
-            .appendingPathComponent("Safe Spaces", isDirectory: true)
+            .appendingPathComponent("Containers", isDirectory: true)
             .appendingPathComponent(id.uuidString.lowercased(), isDirectory: true)
     }
 
@@ -5817,7 +5815,7 @@ final class SafeSpaceManager: @unchecked Sendable {
         }
         let directory = URL(fileURLWithPath: "/private/tmp/outershell-\(getuid())",
                             isDirectory: true)
-            .appendingPathComponent("safe-space-relays", isDirectory: true)
+            .appendingPathComponent("container-relays", isDirectory: true)
             .appendingPathComponent(String(id.uuidString.lowercased().prefix(8)),
                                     isDirectory: true)
         try FileManager.default.createDirectory(at: directory,
