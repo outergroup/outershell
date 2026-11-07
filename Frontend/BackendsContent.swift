@@ -9741,7 +9741,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                     }
                     self.showAutomaticOuterShellUpdatePromptIfNeeded()
                     if self.selectedLog != nil {
-                        self.fetchSelectedLog()
+                        self.fetchSelectedLog(quiet: true)
                     }
                 } catch {
                     self.backendError = "Could not decode Outer Shell API response."

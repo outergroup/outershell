@@ -3611,15 +3611,24 @@ static bool bootstrap_launchd_capture(const char *command, char *message, size_t
     return false;
 }
 
+static void bootout_launchd_service_and_wait(const char *quoted_target) {
+    char command[512];
+    snprintf(command, sizeof(command), "launchctl bootout %s >/dev/null 2>&1 || true", quoted_target);
+    run_shell_ignored(command);
+    snprintf(command, sizeof(command), "launchctl print %s >/dev/null 2>&1", quoted_target);
+    for (unsigned attempt = 0; attempt < 300; attempt++) {
+        if (system(command) != 0) return;
+        usleep(100000);
+    }
+}
+
 static void unload_launchd_service_if_needed(const char *label, const char *domain) {
     if (!launchd_label_is_safe(label) || launchd_is_system_domain(domain)) return;
     char target[320];
     char quoted_target[384];
     snprintf(target, sizeof(target), "%s/%s", domain, label);
     shell_quote(target, quoted_target, sizeof(quoted_target));
-    char command[512];
-    snprintf(command, sizeof(command), "launchctl bootout %s >/dev/null 2>&1 || true", quoted_target);
-    system(command);
+    bootout_launchd_service_and_wait(quoted_target);
 }
 
 static bool run_launchd_operation_unlocked(const char *label,
@@ -11030,9 +11039,7 @@ static bool install_bundled_app_macos(const BundledAppDefinition *app,
     char quoted_target[384];
     snprintf(target, sizeof(target), "gui/%d/%s", (int)getuid(), app->service_id);
     shell_quote(target, quoted_target, sizeof(quoted_target));
-    char bootout_command[512];
-    snprintf(bootout_command, sizeof(bootout_command), "launchctl bootout %s >/dev/null 2>&1 || true", quoted_target);
-    run_shell_ignored(bootout_command);
+    bootout_launchd_service_and_wait(quoted_target);
 
     char quoted_install_root[PATH_MAX + 8];
     shell_quote(install_root, quoted_install_root, sizeof(quoted_install_root));
