@@ -315,12 +315,20 @@ private enum OuterShellBackendAPI {
                        url: try reader.stringRef(at: 8))
     }
 
+    private static let requestTimeoutSeconds = 5
+
     private static func httpGet(path: String, socketPath: String) throws -> Data {
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else {
             throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
         }
         defer { close(fd) }
+
+        var timeout = timeval(tv_sec: requestTimeoutSeconds, tv_usec: 0)
+        let timeoutSize = socklen_t(MemoryLayout<timeval>.size)
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, timeoutSize)
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, timeoutSize)
+        let deadline = Date().addingTimeInterval(TimeInterval(requestTimeoutSeconds))
 
         let sunPathSize = MemoryLayout.size(ofValue: sockaddr_un().sun_path)
         guard socketPath.utf8.count < sunPathSize else {
@@ -375,6 +383,9 @@ private enum OuterShellBackendAPI {
                 break
             } else if errno != EINTR {
                 throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+            }
+            if Date() >= deadline {
+                throw POSIXError(.ETIMEDOUT)
             }
         }
 
@@ -891,6 +902,8 @@ private final class OuterShellAgentDelegate: NSObject, NSApplicationDelegate, NS
     private var finishedWorkers = 0
     private var activeOperations = 0
     private var refreshingContainers = false
+    private var refreshingServices = false
+    private var serviceRefreshTask: Task<Void, Never>?
     private var followUpRefreshTask: Task<Void, Never>?
     private var containerRefreshTask: Task<Void, Never>?
     private var pendingLifecycleActions: [String: PendingLifecycleAction] = [:]
@@ -927,6 +940,7 @@ private final class OuterShellAgentDelegate: NSObject, NSApplicationDelegate, NS
         refreshTimer?.invalidate()
         followUpRefreshTask?.cancel()
         containerRefreshTask?.cancel()
+        serviceRefreshTask?.cancel()
         cancelAllServiceExitMonitors()
         activeOuterShellAgentDelegate = nil
         OuterShelldSetMenuBarVisibilityCallbacks(nil, nil)
@@ -1065,16 +1079,36 @@ private final class OuterShellAgentDelegate: NSObject, NSApplicationDelegate, NS
 
     private func refresh() {
         guard !isShuttingDown else { return }
+        refreshServices()
+        refreshContainers()
+    }
+
+    private func refreshServices() {
+        guard !refreshingServices else { return }
+        refreshingServices = true
+        serviceRefreshTask = Task.detached(priority: .userInitiated) { [weak self] in
+            let result = Result { try OuterShellRegistry.loadBackends().filter(\.state.isRunning) }
+            guard !Task.isCancelled else { return }
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                self.refreshingServices = false
+                guard !self.isShuttingDown else { return }
+                self.applyServiceRefresh(result)
+            }
+        }
+    }
+
+    private func applyServiceRefresh(_ result: Result<[ManagedBackend], Error>) {
         let previousServices = services
         let previousError = lastError
-        do {
-            services = try OuterShellRegistry.loadBackends().filter(\.state.isRunning)
+        switch result {
+        case .success(let loaded):
+            services = loaded
             lastError = nil
             reconcileServiceExitMonitors()
-        } catch {
+        case .failure(let error):
             lastError = error.localizedDescription
         }
-        refreshContainers()
         guard previousServices != services ||
                 previousError != lastError else {
             return
@@ -1574,16 +1608,11 @@ private final class OuterShellAgentDelegate: NSObject, NSApplicationDelegate, NS
     }
 
     @objc private func openOuterShell(_ sender: Any?) {
-        var frontend = HostedFrontend(serviceID: "org.outershell.OuterShell",
+        let frontend = HostedFrontend(serviceID: "org.outershell.OuterShell",
                                       name: "Outer Shell",
                                       port: 0,
                                       socketPath: "/launchd/user/org.outershell.OuterShell",
                                       url: "/")
-        if let registered = try? OuterShellRegistry.loadBackends()
-            .flatMap(\.frontends)
-            .first(where: { $0.serviceID == "org.outershell.OuterShell" }) {
-            frontend = registered
-        }
         if let url = outerLoopHostedAppURL(frontend) {
             openInOuterLoop(url)
         }

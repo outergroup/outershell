@@ -179,7 +179,84 @@ typedef struct {
     uint64_t container_upload_offset;
     uint64_t container_upload_received;
     uint64_t container_upload_length;
+    char *output;
+    size_t output_length;
+    size_t output_offset;
+    size_t output_capacity;
+    bool close_after_output;
 } ReactorClient;
+
+static ReactorClient *g_reactor_clients = NULL;
+static size_t g_reactor_client_count = 0;
+
+static ReactorClient *reactor_client_for_fd(int fd) {
+    for (size_t i = 0; i < g_reactor_client_count; i++) {
+        if (g_reactor_clients[i].fd == fd) return &g_reactor_clients[i];
+    }
+    return NULL;
+}
+
+static bool reactor_client_has_output(const ReactorClient *client) {
+    return client->output_offset < client->output_length;
+}
+
+static bool flush_reactor_client_output(ReactorClient *client) {
+    while (reactor_client_has_output(client)) {
+        ssize_t written = write(client->fd,
+                                client->output + client->output_offset,
+                                client->output_length - client->output_offset);
+        if (written < 0) {
+            if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) return true;
+            return false;
+        }
+        if (written == 0) return false;
+        client->output_offset += (size_t)written;
+        client->last_activity_ms = monotonic_milliseconds();
+    }
+    client->output_offset = 0;
+    client->output_length = 0;
+    return true;
+}
+
+static bool send_client_bytes(int fd, const void *data, size_t len) {
+    ReactorClient *client = reactor_client_for_fd(fd);
+    if (!client) return queue_all(fd, data, len);
+    const char *bytes = (const char *)data;
+    if (!reactor_client_has_output(client)) {
+        while (len > 0) {
+            ssize_t written = write(fd, bytes, len);
+            if (written < 0) {
+                if (errno == EINTR) continue;
+                if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+                return false;
+            }
+            if (written == 0) return false;
+            bytes += written;
+            len -= (size_t)written;
+            client->last_activity_ms = monotonic_milliseconds();
+        }
+        if (len == 0) return true;
+    }
+    if (client->output_offset > 0) {
+        memmove(client->output,
+                client->output + client->output_offset,
+                client->output_length - client->output_offset);
+        client->output_length -= client->output_offset;
+        client->output_offset = 0;
+    }
+    if (client->output_length + len > client->output_capacity) {
+        size_t capacity = client->output_capacity ? client->output_capacity : READ_BUFFER_SIZE;
+        while (capacity < client->output_length + len) capacity *= 2;
+        char *grown = realloc(client->output, capacity);
+        if (!grown) return false;
+        client->output = grown;
+        client->output_capacity = capacity;
+    }
+    memcpy(client->output + client->output_length, bytes, len);
+    client->output_length += len;
+    return true;
+}
 
 static const char *bundle_arm_path(void) {
     return g_bundle_file_path_macos_arm[0] ? g_bundle_file_path_macos_arm : kBundleFilePathMacosArm;
@@ -323,10 +400,10 @@ static void send_response(int fd, int status, const char *status_text, const cha
                               "\r\n",
                               status, status_text, content_type, body_len);
     if (header_len > 0 && (size_t)header_len < sizeof(header)) {
-        queue_all(fd, header, (size_t)header_len);
+        send_client_bytes(fd, header, (size_t)header_len);
     }
     if (body && body_len > 0) {
-        queue_all(fd, body, body_len);
+        send_client_bytes(fd, body, body_len);
     }
 }
 
@@ -348,7 +425,7 @@ static void send_container_upload_response(int fd, int status, uint64_t offset) 
                               http_status_text(status),
                               (unsigned long long)offset);
     if (header_len > 0 && (size_t)header_len < sizeof(header)) {
-        queue_all(fd, header, (size_t)header_len);
+        send_client_bytes(fd, header, (size_t)header_len);
     }
 }
 
@@ -395,7 +472,7 @@ static void send_cached_response_header(int fd,
                               last_modified_header, vary_header);
     }
     if (header_len > 0 && (size_t)header_len < sizeof(header)) {
-        queue_all(fd, header, (size_t)header_len);
+        send_client_bytes(fd, header, (size_t)header_len);
     }
 }
 
@@ -1291,7 +1368,7 @@ static void send_cached_memory_response(int fd,
     }
     send_cached_response_header(fd, 200, content_type, body_length, etag, last_modified_text,
                                 vary_outerframe_accept);
-    if (send_body && body_length > 0) queue_all(fd, body, body_length);
+    if (send_body && body_length > 0) send_client_bytes(fd, body, body_length);
 }
 
 static void send_cached_file(int fd,
@@ -1353,7 +1430,7 @@ static void send_cached_file(int fd,
     close(file_fd);
     send_cached_response_header(fd, 200, content_type, offset, etag, last_modified,
                                 vary_outerframe_accept);
-    if (offset > 0) queue_all(fd, data, offset);
+    if (offset > 0) send_client_bytes(fd, data, offset);
     free(data);
 }
 
@@ -1411,8 +1488,8 @@ static void send_versioned_web_asset(int fd, const char *filename, const char *c
             "Cache-Control: public, max-age=31536000, immutable\r\nETag: %s\r\nConnection: close\r\n\r\n",
             unchanged ? "304 Not Modified" : "200 OK", content_type,
             body.length, etag);
-        if (length > 0 && (size_t)length < sizeof(header)) queue_all(fd, header, (size_t)length);
-        if (!unchanged && send_body) queue_all(fd, body.data, body.length);
+        if (length > 0 && (size_t)length < sizeof(header)) send_client_bytes(fd, header, (size_t)length);
+        if (!unchanged && send_body) send_client_bytes(fd, body.data, body.length);
     }
     free(body.data);
 }
@@ -2161,7 +2238,7 @@ static ContainerUploadDispatch begin_container_upload_if_ready(ReactorClient *cl
                               "Expect",
                               "100-continue")) {
         static const char continue_response[] = "HTTP/1.1 100 Continue\r\n\r\n";
-        queue_all(client->fd, continue_response, sizeof(continue_response) - 1);
+        send_client_bytes(client->fd, continue_response, sizeof(continue_response) - 1);
     }
     size_t available_body = client->length > header_length ? client->length - header_length : 0;
     if ((uint64_t)available_body > content_length) {
@@ -2228,6 +2305,10 @@ static bool begin_container_download(ReactorClient *client, const char *target, 
 }
 
 static bool write_container_download(ReactorClient *client) {
+    if (reactor_client_has_output(client)) {
+        if (!flush_reactor_client_output(client)) return false;
+        if (reactor_client_has_output(client)) return true;
+    }
     if (client->container_download_offset == client->length) {
         if (!client->container_download_remaining) return false;
         size_t wanted = client->container_download_remaining < READ_BUFFER_SIZE
@@ -2360,7 +2441,7 @@ static bool send_ui_api_response_message_as_http(int client_fd, const char *resp
             "Cache-Control: private, max-age=31536000, immutable\r\n"
             "X-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n", payload_length);
         bool sent = length > 0 && (size_t)length < sizeof(header) &&
-            queue_all(client_fd, header, (size_t)length) && queue_all(client_fd, payload, payload_length);
+            send_client_bytes(client_fd, header, (size_t)length) && send_client_bytes(client_fd, payload, payload_length);
         free(api_error);
         return sent;
     }
@@ -2721,12 +2802,30 @@ static void close_reactor_client(ReactorClient *clients, size_t *client_count, s
     if (clients[index].container_download_fd >= 0) close(clients[index].container_download_fd);
     free(clients[index].request);
     clients[index].request = NULL;
+    free(clients[index].output);
+    clients[index].output = NULL;
     if (index + 1 < *client_count) {
         memmove(&clients[index],
                 &clients[index + 1],
                 (*client_count - index - 1) * sizeof(clients[0]));
     }
     (*client_count)--;
+    g_reactor_client_count = *client_count;
+}
+
+static void finish_reactor_client(ReactorClient *clients, size_t *client_count, size_t index) {
+    ReactorClient *client = &clients[index];
+    if (!reactor_client_has_output(client)) {
+        close_reactor_client(clients, client_count, index);
+        return;
+    }
+    if (client->api_response_fd >= 0) {
+        close(client->api_response_fd);
+        client->api_response_fd = -1;
+    }
+    client->waiting_for_api_response = false;
+    client->streaming_container_upload = false;
+    client->close_after_output = true;
 }
 
 static void add_reactor_client(ReactorClient *clients, size_t *client_count, int client_fd, bool is_api) {
@@ -2749,6 +2848,7 @@ static void add_reactor_client(ReactorClient *clients, size_t *client_count, int
     client->container_upload_fd = -1;
     client->container_download_fd = -1;
     client->is_api = is_api;
+    g_reactor_client_count = *client_count;
 #ifndef __APPLE__
     struct ucred credentials;
     socklen_t credentials_length = sizeof(credentials);
@@ -2892,6 +2992,8 @@ static void run_http_reactor(int listener) {
         return;
     }
     size_t client_count = 0;
+    g_reactor_clients = clients;
+    g_reactor_client_count = 0;
 
     set_fd_nonblocking(listener, true);
     while (!g_shutdown_requested) {
@@ -2899,8 +3001,16 @@ static void run_http_reactor(int listener) {
         size_t polled_client_count = client_count;
         poll_fds[0] = (struct pollfd){.fd = listener, .events = POLLIN, .revents = 0};
         for (size_t i = 0; i < polled_client_count; i++) {
-            int poll_fd = clients[i].waiting_for_api_response ? clients[i].api_response_fd : clients[i].fd;
-            poll_fds[i + 1] = (struct pollfd){.fd = poll_fd, .events = clients[i].container_download_fd >= 0 ? POLLOUT : POLLIN, .revents = 0};
+            int poll_fd = clients[i].fd;
+            short events = POLLIN;
+            if (clients[i].waiting_for_api_response) {
+                poll_fd = clients[i].api_response_fd;
+            } else if (clients[i].container_download_fd >= 0 || clients[i].close_after_output) {
+                events = POLLOUT;
+            } else if (reactor_client_has_output(&clients[i])) {
+                events = POLLIN | POLLOUT;
+            }
+            poll_fds[i + 1] = (struct pollfd){.fd = poll_fd, .events = events, .revents = 0};
         }
 
         int timeout_ms = 1000;
@@ -2931,6 +3041,23 @@ static void run_http_reactor(int listener) {
                 short revents = poll_fds[index + 1].revents;
                 if (revents == 0) continue;
 
+                if (clients[index].close_after_output) {
+                    if ((revents & (POLLERR | POLLHUP | POLLNVAL)) ||
+                        !flush_reactor_client_output(&clients[index]) ||
+                        !reactor_client_has_output(&clients[index])) {
+                        close_reactor_client(clients, &client_count, index);
+                    }
+                    continue;
+                }
+
+                if ((revents & POLLOUT) &&
+                    !clients[index].waiting_for_api_response &&
+                    clients[index].container_download_fd < 0 &&
+                    !flush_reactor_client_output(&clients[index])) {
+                    close_reactor_client(clients, &client_count, index);
+                    continue;
+                }
+
                 if (clients[index].container_download_fd >= 0) {
                     if ((revents & (POLLERR | POLLHUP | POLLNVAL)) ||
                         ((revents & POLLOUT) && !write_container_download(&clients[index]))) {
@@ -2957,9 +3084,9 @@ static void run_http_reactor(int listener) {
                             } else {
                                 send_text_response(clients[index].fd, 500, "outershelld API response is too large\n");
                             }
-                            close_reactor_client(clients, &client_count, index);
+                            finish_reactor_client(clients, &client_count, index);
                         } else if (should_close) {
-                            close_reactor_client(clients, &client_count, index);
+                            finish_reactor_client(clients, &client_count, index);
                         }
                     } else if (revents & (POLLERR | POLLHUP | POLLNVAL)) {
                         close_reactor_client(clients, &client_count, index);
@@ -2972,20 +3099,19 @@ static void run_http_reactor(int listener) {
                     bool should_close = false;
                     bool complete = read_reactor_client(&clients[index], &complete_length, &should_close);
                     if (complete) {
-                        set_fd_nonblocking(clients[index].fd, false);
                         if (complete_length > MAX_HTTP_REQUEST_SIZE) {
                             send_text_response(clients[index].fd, 400, "request too large\n");
-                            close_reactor_client(clients, &client_count, index);
+                            finish_reactor_client(clients, &client_count, index);
                         } else {
                             bool keep_open = process_http_client_request(&clients[index],
                                                                          clients[index].request,
                                                                          complete_length);
                             if (!keep_open) {
-                                close_reactor_client(clients, &client_count, index);
+                                finish_reactor_client(clients, &client_count, index);
                             }
                         }
                     } else if (should_close) {
-                        close_reactor_client(clients, &client_count, index);
+                        finish_reactor_client(clients, &client_count, index);
                     }
                 } else if (revents & (POLLERR | POLLHUP | POLLNVAL)) {
                     close_reactor_client(clients, &client_count, index);
@@ -3013,7 +3139,10 @@ static void run_http_reactor(int listener) {
         if (clients[i].container_download_fd >= 0) close(clients[i].container_download_fd);
         if (clients[i].container_upload_fd >= 0) close(clients[i].container_upload_fd);
         free(clients[i].request);
+        free(clients[i].output);
     }
+    g_reactor_clients = NULL;
+    g_reactor_client_count = 0;
     free(clients);
 }
 
