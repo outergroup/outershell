@@ -263,8 +263,12 @@ RUN outerctl image add-app \
         --ServerApp.sock_mode=0600 \
         --IdentityProvider.token= \
         --ServerApp.password= \
+        --ServerApp.allow_remote_access=True \
         --ServerApp.root_dir=/work
 ```
+
+Browsers reach the socket through Outer Shell's own hostname, not
+`localhost`, so JupyterLab needs `--ServerApp.allow_remote_access=True`.
 
 `outerctl image add-app` writes the portable service declaration and startup
 registration into the image. It chooses the Unix socket and log paths, and it

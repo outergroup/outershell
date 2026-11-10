@@ -134,8 +134,6 @@ private struct SafeSpaceRecipe: Codable {
     var realizedStepIDs: [UUID]
     var hasUntrackedChanges: Bool?
     var mounts: [SafeSpaceMount]?
-    var launchers: [SafeSpaceRecipeLauncher]?
-    var realizedLauncherIDs: [UUID]?
     var realizedEditableStepContents: [String: String]?
     var users: [SafeSpaceRecipeUser]?
     var realizedDockerfileContents: String?
@@ -163,13 +161,6 @@ private struct SafeSpaceRecipeUser: Codable, Equatable {
     var id: UUID
     var name: String
     var homeDirectory: String
-    var workingDirectory: String
-}
-
-private struct SafeSpaceRecipeLauncher: Codable {
-    var id: UUID
-    var kind: String
-    var displayName: String
     var workingDirectory: String
 }
 
@@ -1679,7 +1670,6 @@ final class SafeSpaceManager: @unchecked Sendable {
         duplicatedRecipe.realizedBaseImage = nil
         duplicatedRecipe.realizedInstallsOuterShellSupport = nil
         duplicatedRecipe.realizedStepIDs = []
-        duplicatedRecipe.realizedLauncherIDs = []
         duplicatedRecipe.realizedEditableStepContents = nil
         duplicatedRecipe.realizedDockerfileContents = nil
         duplicatedRecipe.realizedMounts = nil
@@ -4327,8 +4317,6 @@ final class SafeSpaceManager: @unchecked Sendable {
                         realizedStepIDs: [],
                         hasUntrackedChanges: hasUntrackedChanges,
                         mounts: [],
-                        launchers: [],
-                        realizedLauncherIDs: [],
                         realizedEditableStepContents: [:],
                         users: [],
                         realizedDockerfileContents: nil,
@@ -4424,7 +4412,6 @@ final class SafeSpaceManager: @unchecked Sendable {
         value.realizedBaseImage = value.baseImage
         value.realizedInstallsOuterShellSupport = value.installsOuterShellSupport
         value.realizedStepIDs = value.steps.map(\.id)
-        value.realizedLauncherIDs = (value.launchers ?? []).map(\.id)
         value.realizedEditableStepContents = try editableRecipeStepContents(
             for: record,
             users: value.users ?? []
@@ -4483,15 +4470,6 @@ final class SafeSpaceManager: @unchecked Sendable {
                         )
                     } ?? false
                 ]
-            },
-            "launchers": (value.launchers ?? []).map {
-                [
-                    "id": $0.id.uuidString,
-                    "kind": $0.kind,
-                    "displayName": $0.displayName,
-                    "workingDirectory": $0.workingDirectory,
-                    "isApplied": Set(value.realizedLauncherIDs ?? []).contains($0.id)
-                ] as [String: Any]
             },
             "users": [[
                 "id": "root",
@@ -4640,7 +4618,7 @@ final class SafeSpaceManager: @unchecked Sendable {
         """
         /bin/mkdir -p /etc/outershell/apps.d
         /bin/mkdir -p /var/lib/outershell/services /var/lib/outershell/apps
-        /bin/mkdir -p /root/.local/share/jupyter /root/.cache
+        /bin/mkdir -p /root/.cache
         """
     }
 
@@ -4655,7 +4633,6 @@ final class SafeSpaceManager: @unchecked Sendable {
     private func recipeAppRegistrationCommand(displayName: String,
                                               serviceID: String,
                                               socketPath: String,
-                                              frontendURL: String = "/",
                                               iconPath: String?) -> String {
         let iconOption = iconPath.map {
             " \\" + "\n            --icon-path \($0)"
@@ -4681,7 +4658,7 @@ final class SafeSpaceManager: @unchecked Sendable {
             --frontend-id \(serviceID):main \
             --socket-path \(socketPath) \
             --name "\(displayName)" \
-            --url \(frontendURL)\(iconOption)
+            --url /\(iconOption)
         "${outerctl}" log add \
             --backend \(serviceID) \
             --path "${log}"
@@ -4770,286 +4747,6 @@ final class SafeSpaceManager: @unchecked Sendable {
         """
     }
 
-    private func jupyterLabDockerfileFragment() -> String {
-        """
-        RUN apt-get update \\
-            && apt-get install -y --no-install-recommends python3 python3-venv \\
-            && python3 -m venv /opt/outershell/jupyter \\
-            && /opt/outershell/jupyter/bin/pip install --no-cache-dir \\
-                jupyterlab \\
-            && rm -rf /var/lib/apt/lists/*
-        """
-    }
-
-    private func jupyterLabInstallCommand() -> String {
-        """
-        set -eu
-        export DEBIAN_FRONTEND=noninteractive
-        /usr/bin/apt-get update
-        /usr/bin/apt-get install -y --no-install-recommends python3 python3-venv
-        /usr/bin/python3 -m venv /opt/outershell/jupyter
-        /opt/outershell/jupyter/bin/pip install --no-cache-dir jupyterlab
-        /bin/rm -rf /var/lib/apt/lists/*
-        """
-    }
-
-    private func jupyterLabRecipeCommand() -> String {
-        let serviceID = "org.outershell.JupyterLab"
-        let appDirectory = "/var/lib/outershell/apps/\(serviceID)"
-        let serviceFile = "/var/lib/outershell/services/\(serviceID).outerservice"
-        let registration = recipeAppRegistrationCommand(
-            displayName: "JupyterLab",
-            serviceID: serviceID,
-            socketPath: "/run/user/0/\(serviceID)",
-            frontendURL: "/lab",
-            iconPath: nil
-        )
-        return """
-        set -eu
-        /bin/mkdir -p \(appDirectory) "$(/usr/bin/dirname \(serviceFile))"
-        /usr/bin/touch \(appDirectory)/backend.log
-        /bin/cat >\(serviceFile) <<'OUTERSHELL_SERVICE'
-        [Service]
-        Format=1
-        Name=JupyterLab
-        Executable=/opt/outershell/jupyter/bin/jupyter-lab
-        Argument=--no-browser
-        Argument=--ServerApp.sock=/run/user/0/\(serviceID)
-        Argument=--ServerApp.sock_mode=0600
-        Argument=--IdentityProvider.token=
-        Argument=--ServerApp.password=
-        Argument=--ServerApp.root_dir=/root
-        WorkingDirectory=/root
-        Environment=HOME=/root
-        Environment=USER=root
-        Environment=LOGNAME=root
-        Environment=XDG_RUNTIME_DIR=/run/user/0
-        EnvironmentPolicy=clean
-        Start=manual
-        Restart=on-failure
-        RestartDelayMilliseconds=1000
-        LogPath=\(appDirectory)/backend.log
-        OUTERSHELL_SERVICE
-        /bin/cat >/etc/outershell/apps.d/\(serviceID).sh <<'OUTERSHELL_REGISTRATION'
-        \(registration)
-        OUTERSHELL_REGISTRATION
-        /bin/chmod 0755 /etc/outershell/apps.d/\(serviceID).sh
-        """
-    }
-
-    private func rStudioServerDockerfileFragment() -> String {
-        """
-        RUN set -eux; \
-            apt-get update; \
-            apt-get install -y --no-install-recommends ca-certificates curl r-base socat; \
-            case "$(dpkg --print-architecture)" in \
-                arm64) package_url='https://s3.amazonaws.com/rstudio-ide-build/server/jammy/arm64/rstudio-server-2026.07.0-139-arm64.deb' ;; \
-                amd64) package_url='https://download2.rstudio.org/server/jammy/amd64/rstudio-server-2026.07.1-147-amd64.deb' ;; \
-                *) echo 'Unsupported architecture' >&2; exit 1 ;; \
-            esac; \
-            curl --fail --location --retry 4 --retry-delay 2 \
-                --output /tmp/rstudio-server.deb "${package_url}"; \
-            apt-get install -y --no-install-recommends /tmp/rstudio-server.deb; \
-            rm -f /tmp/rstudio-server.deb; \
-            rm -rf /var/lib/apt/lists/*
-        """
-    }
-
-    private func rStudioServerInstallCommand() -> String {
-        """
-        set -eu
-        export DEBIAN_FRONTEND=noninteractive
-        /usr/bin/apt-get update
-        /usr/bin/apt-get install -y --no-install-recommends ca-certificates curl r-base socat
-        case "$(/usr/bin/dpkg --print-architecture)" in
-            arm64)
-                package_url=https://s3.amazonaws.com/rstudio-ide-build/server/jammy/arm64/rstudio-server-2026.07.0-139-arm64.deb
-                ;;
-            amd64)
-                package_url=https://download2.rstudio.org/server/jammy/amd64/rstudio-server-2026.07.1-147-amd64.deb
-                ;;
-            *) /usr/bin/printf 'Unsupported architecture.\n' >&2; exit 1 ;;
-        esac
-        /usr/bin/curl --fail --location --retry 4 --retry-delay 2 \
-            --output /tmp/rstudio-server.deb "${package_url}"
-        /usr/bin/apt-get install -y --no-install-recommends /tmp/rstudio-server.deb
-        /bin/rm -f /tmp/rstudio-server.deb
-        /bin/rm -rf /var/lib/apt/lists/*
-        """
-    }
-
-    private func rStudioServerRecipeCommand() -> String {
-        let serviceID = "org.outershell.RStudio"
-        let appDirectory = "/var/lib/outershell/apps/\(serviceID)"
-        let rootAppDirectory = "/opt/outershell/apps/\(serviceID)"
-        let serviceFile = "/var/lib/outershell/services/\(serviceID).outerservice"
-        let registration = recipeAppRegistrationCommand(
-            displayName: "RStudio Server",
-            serviceID: serviceID,
-            socketPath: "/run/user/0/\(serviceID)",
-            iconPath: nil
-        )
-        return """
-        set -eu
-        /usr/sbin/rstudio-server stop >/dev/null 2>&1 || true
-        /bin/mkdir -p \(appDirectory) \(rootAppDirectory) "$(/usr/bin/dirname \(serviceFile))"
-        /usr/bin/touch \(appDirectory)/backend.log
-        /bin/cat >\(rootAppDirectory)/run-rserver-as-root <<'OUTERSHELL_ROOT_RUNNER'
-        #!/bin/bash
-        set -eu
-        exec /usr/bin/env \
-            HOME=/root \
-            USER=root \
-            LOGNAME=root \
-            XDG_RUNTIME_DIR=/run/user/0 \
-            /usr/lib/rstudio-server/bin/rserver \
-            --server-user=root \
-            --server-daemonize=0 \
-            --server-working-dir=/root \
-            --server-data-dir=/var/lib/outershell/apps/\(serviceID)/rstudio-server \
-            --server-pid-file=\(appDirectory)/rserver.pid \
-            --secure-cookie-key-file=\(appDirectory)/secure-cookie-key \
-            --database-config-file=\(appDirectory)/database.conf \
-            --www-address=127.0.0.1 \
-            --www-port=8787 \
-            --www-thread-pool-size=2 \
-            --auth-none=1 \
-            --auth-minimum-user-id=0
-        OUTERSHELL_ROOT_RUNNER
-        /bin/chown root:root \(rootAppDirectory)/run-rserver-as-root
-        /bin/chmod 0755 \(rootAppDirectory)/run-rserver-as-root
-        /bin/cat >\(appDirectory)/start-rstudio-server <<'OUTERSHELL_RUNNER'
-        #!/bin/bash
-        set -eu
-        state_directory=\(appDirectory)
-        socket_path=/run/user/0/\(serviceID)
-        data_directory=/var/lib/outershell/apps/\(serviceID)/rstudio-server
-        database_config="${state_directory}/database.conf"
-        database_directory="${state_directory}/database"
-        /bin/mkdir -p "${data_directory}" "${database_directory}"
-        /bin/chmod 0700 "${data_directory}" "${database_directory}"
-        /usr/bin/touch "${database_config}"
-        /bin/chmod 0600 "${database_config}"
-        /bin/rm -f "${socket_path}"
-        rserver_pid=
-        proxy_pid=
-        cleanup() {
-            trap - EXIT INT TERM HUP
-            if [ -n "${proxy_pid}" ]; then
-                /bin/kill "${proxy_pid}" 2>/dev/null || true
-                wait "${proxy_pid}" 2>/dev/null || true
-            fi
-            if [ -n "${rserver_pid}" ]; then
-                /bin/kill "${rserver_pid}" 2>/dev/null || true
-                wait "${rserver_pid}" 2>/dev/null || true
-            fi
-            /bin/rm -f "${socket_path}"
-        }
-        trap cleanup EXIT
-        trap 'exit 0' INT TERM HUP
-        \(rootAppDirectory)/run-rserver-as-root &
-        rserver_pid=$!
-        attempts=0
-        until /usr/bin/curl --silent --fail --max-time 1 \
-            --output /dev/null http://127.0.0.1:8787/; do
-            if ! /bin/kill -0 "${rserver_pid}" 2>/dev/null; then
-                wait "${rserver_pid}"
-                exit $?
-            fi
-            attempts=$((attempts + 1))
-            [ "${attempts}" -lt 120 ] || exit 1
-            /bin/sleep 0.1
-        done
-        /usr/bin/socat \
-            UNIX-LISTEN:"${socket_path}",fork,mode=0600 \
-            TCP:127.0.0.1:8787 &
-        proxy_pid=$!
-        wait -n "${rserver_pid}" "${proxy_pid}"
-        OUTERSHELL_RUNNER
-        /bin/chmod 0755 \(appDirectory)/start-rstudio-server
-        /bin/cat >\(serviceFile) <<'OUTERSHELL_SERVICE'
-        [Service]
-        Format=1
-        Name=RStudio Server
-        Executable=\(appDirectory)/start-rstudio-server
-        WorkingDirectory=/root
-        Environment=HOME=/root
-        Environment=USER=root
-        Environment=LOGNAME=root
-        Environment=XDG_RUNTIME_DIR=/run/user/0
-        Environment=OUTERSHELL_SERVICE_STATE_DIR=\(appDirectory)
-        EnvironmentPolicy=clean
-        Start=manual
-        Restart=on-failure
-        RestartDelayMilliseconds=1000
-        StopTimeoutMilliseconds=10000
-        LogPath=\(appDirectory)/backend.log
-        OUTERSHELL_SERVICE
-        /bin/cat >/etc/outershell/apps.d/\(serviceID).sh <<'OUTERSHELL_REGISTRATION'
-        \(registration)
-        OUTERSHELL_REGISTRATION
-        /bin/chmod 0755 /etc/outershell/apps.d/\(serviceID).sh
-        """
-    }
-
-    private func jupyterLabLauncherRecipeCommand(
-        _ launcher: SafeSpaceRecipeLauncher
-    ) -> String {
-        let serviceID = jupyterLabLauncherServiceID(launcher)
-        let appDirectory = "/var/lib/outershell/apps/\(serviceID)"
-        let serviceFile = "/var/lib/outershell/services/\(serviceID).outerservice"
-        let displayName = launcher.displayName
-            .replacingOccurrences(of: "\"", with: "'")
-            .replacingOccurrences(of: "\n", with: " ")
-        let registration = recipeAppRegistrationCommand(
-            displayName: displayName,
-            serviceID: serviceID,
-            socketPath: "/run/user/0/\(serviceID)",
-            frontendURL: "/lab",
-            iconPath: nil
-        )
-        return """
-        set -eu
-        /bin/mkdir -p \(appDirectory) "$(/usr/bin/dirname \(serviceFile))"
-        /usr/bin/touch \(appDirectory)/backend.log
-        /bin/cat >\(serviceFile) <<'OUTERSHELL_SERVICE'
-        [Service]
-        Format=1
-        Name=\(displayName)
-        Executable=/opt/outershell/jupyter/bin/jupyter-lab
-        Argument=--no-browser
-        Argument=--ServerApp.sock=/run/user/0/\(serviceID)
-        Argument=--ServerApp.sock_mode=0600
-        Argument=--IdentityProvider.token=
-        Argument=--ServerApp.password=
-        Argument=--ServerApp.root_dir=\(launcher.workingDirectory)
-        WorkingDirectory=\(launcher.workingDirectory)
-        Environment=HOME=/root
-        Environment=USER=root
-        Environment=LOGNAME=root
-        Environment=XDG_RUNTIME_DIR=/run/user/0
-        EnvironmentPolicy=clean
-        Start=manual
-        Restart=on-failure
-        RestartDelayMilliseconds=1000
-        LogPath=\(appDirectory)/backend.log
-        OUTERSHELL_SERVICE
-        /bin/cat >/etc/outershell/apps.d/\(serviceID).sh <<'OUTERSHELL_REGISTRATION'
-        \(registration)
-        OUTERSHELL_REGISTRATION
-        /bin/chmod 0755 /etc/outershell/apps.d/\(serviceID).sh
-        """
-    }
-
-    private func jupyterLabLauncherServiceID(
-        _ launcher: SafeSpaceRecipeLauncher
-    ) -> String {
-        let identifier = launcher.id.uuidString
-            .replacingOccurrences(of: "-", with: "")
-            .lowercased()
-        return "org.outershell.JupyterLab.\(identifier)"
-    }
-
     private func generatedDockerfile(for value: SafeSpaceRecipe,
                                      record: SafeSpaceRecord) throws -> String {
         let value = normalizedRecipe(value)
@@ -5067,7 +4764,6 @@ final class SafeSpaceManager: @unchecked Sendable {
             lines.append(contentsOf: outerShellBootstrapInstructions())
         }
         let hasGeneratedRecipeContent = !value.steps.isEmpty ||
-            !(value.launchers ?? []).isEmpty ||
             !editableSteps.isEmpty ||
             !(value.users ?? []).isEmpty
         if hasManagedOuterShellSupport || hasGeneratedRecipeContent {
@@ -5096,11 +4792,6 @@ final class SafeSpaceManager: @unchecked Sendable {
                     fileName: recipeStepFileName(index: index, step: step)
                 ))
             }
-        }
-        for (index, launcher) in (value.launchers ?? []).enumerated() {
-            lines.append(contentsOf: recipeStepInstructions(
-                fileName: recipeLauncherFileName(index: index, launcher: launcher)
-            ))
         }
         for step in editableSteps where step.scope == "root" {
             lines.append(contentsOf: editableRecipeStepInstructions(step))
@@ -5169,7 +4860,7 @@ final class SafeSpaceManager: @unchecked Sendable {
         }
         let hasManagedOuterShellSupport = usesManagedOuterShellSupport(value)
         if hasManagedOuterShellSupport || !value.steps.isEmpty ||
-            !(value.launchers ?? []).isEmpty || !(value.users ?? []).isEmpty {
+            !(value.users ?? []).isEmpty {
             fragments.append([
                 "id": "root-environment",
                 "stepID": "",
@@ -5212,19 +4903,6 @@ final class SafeSpaceManager: @unchecked Sendable {
                     "isApplied": realizedIDs.contains(step.id)
                 ])
             }
-        }
-        for (index, launcher) in (value.launchers ?? []).enumerated() {
-            fragments.append([
-                "id": launcher.id.uuidString,
-                "stepID": "",
-                "displayName": "Add \(launcher.displayName) app",
-                "contents": recipeStepInstructions(
-                    fileName: recipeLauncherFileName(index: index, launcher: launcher)
-                ).joined(separator: "\n"),
-                "isEditable": false,
-                "isRemovable": false,
-                "isApplied": Set(value.realizedLauncherIDs ?? []).contains(launcher.id)
-            ])
         }
         let editableSteps = try editableRecipeSteps(
             for: record,
@@ -5295,16 +4973,6 @@ final class SafeSpaceManager: @unchecked Sendable {
             .joined(separator: "-")
         return String(format: "%03d-%@.sh", index + 1,
                       slug.isEmpty ? "run-command" : slug)
-    }
-
-    private func recipeLauncherFileName(index: Int,
-                                        launcher: SafeSpaceRecipeLauncher) -> String {
-        let slug = launcher.displayName.lowercased()
-            .components(separatedBy: CharacterSet.alphanumerics.inverted)
-            .filter { !$0.isEmpty }
-            .joined(separator: "-")
-        return String(format: "%03d-add-%@.sh", index + 501,
-                      slug.isEmpty ? "app" : slug)
     }
 
     private func recipeStepInstructions(fileName: String) -> [String] {
@@ -5455,14 +5123,6 @@ final class SafeSpaceManager: @unchecked Sendable {
                                       to: stepsDirectory)
             }
         }
-        for (index, launcher) in (value.launchers ?? []).enumerated() {
-            guard launcher.kind == "jupyterLab" else { continue }
-            try writeRecipeScript(
-                jupyterLabLauncherRecipeCommand(launcher),
-                named: recipeLauncherFileName(index: index, launcher: launcher),
-                to: stepsDirectory
-            )
-        }
     }
 
     private func writeOuterShellBootstrap(to directory: URL,
@@ -5521,7 +5181,7 @@ final class SafeSpaceManager: @unchecked Sendable {
 
         Mounted folders are runtime configuration. They intentionally do not appear in the Dockerfile or become part of the image. Recreate those mounts separately when moving the container to another host.
 
-        The portable bootstrap expects a Linux image with `/bin/sh` and standard file utilities. Software snippets may have narrower requirements; for example, the supplied JupyterLab and RStudio Server snippets target Debian-family images.
+        The portable bootstrap expects a Linux image with `/bin/sh` and standard file utilities. Software snippets may have narrower requirements, such as a Debian-family image.
         """
         try guide.write(
             to: directory.appendingPathComponent("README.md"),
@@ -5570,7 +5230,7 @@ final class SafeSpaceManager: @unchecked Sendable {
         test -x "${source_directory}/outershell-socket-bridge"
         /bin/mkdir -p /usr/local/bin /run/user/0 /var/lib/outershell/services \
             /var/lib/outershell/apps /etc/outershell/apps.d /root/.config/outerssh \
-            /root/.local/share/jupyter /root/.cache
+            /root/.cache
         /bin/cp "${source_directory}/outershelld" /usr/local/bin/outershelld
         /bin/cp "${source_directory}/outerctl" /usr/local/bin/outerctl
         /bin/cp "${source_directory}/outershell-socket-bridge" \
@@ -5590,8 +5250,7 @@ final class SafeSpaceManager: @unchecked Sendable {
         set -eu
         umask 022
         /bin/mkdir -p /run/user/0 /root/.config/outerssh /var/lib/outershell/services \
-            /var/lib/outershell/apps /etc/outershell/apps.d /root/.local/share/jupyter \
-            /root/.cache
+            /var/lib/outershell/apps /etc/outershell/apps.d /root/.cache
         /bin/chmod 0700 /run/user/0 /root/.config/outerssh
         /usr/bin/printf '%s\n' '%t/outershelld-api' \
             >/root/.config/outerssh/http-unix.allow

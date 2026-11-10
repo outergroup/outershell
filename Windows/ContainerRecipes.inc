@@ -453,7 +453,7 @@ static void container_recipe_snapshot(Distribution *d, StringBuilder *json) {
     append(json, ","); field(json, "definitionDirectory", directory ? directory : "");
     append(json, ",\"dockerfileGuestPath\":\"/var/lib/outershell/project/Dockerfile\","
                  "\"installsOuterShellSupport\":false,\"outerShellSupportSnippet\":\"\","
-                 "\"steps\":[],\"fragments\":[],\"catalog\":[],\"launchers\":[],\"scriptFiles\":[],"
+                 "\"steps\":[],\"fragments\":[],\"catalog\":[],\"scriptFiles\":[],"
                  "\"users\":[{\"id\":\"root\",\"name\":\"root\",\"homeDirectory\":\"/root\",\"workingDirectory\":\"/\",\"isRoot\":true}],"
                  "\"buildEngineAvailable\":true,\"transferItems\":[],\"hasUntrackedChanges\":false,\"workingDirectory\":\"/\",\"needsRebuild\":");
     append(json, strcmp(dockerfile, realized) || strcmp(config, prior) ? "true" : "false");

@@ -2398,7 +2398,6 @@ def recipe_dictionary(record, recipe):
         "steps": [],
         "fragments": [],
         "catalog": [],
-        "launchers": [],
         "users": [{
             "id": "root", "name": "root", "homeDirectory": "/root",
             "workingDirectory": "/", "isRoot": True,

@@ -2,8 +2,7 @@
 set -eu
 umask 022
 /bin/mkdir -p /run/user/0 /root/.config/outerssh /var/lib/outershell/services \
-    /var/lib/outershell/apps /etc/outershell/apps.d /root/.local/share/jupyter \
-    /root/.cache
+    /var/lib/outershell/apps /etc/outershell/apps.d /root/.cache
 /bin/chmod 0700 /run/user/0 /root/.config/outerssh
 /usr/bin/printf '%s\n' '%t/outershelld-api' \
     >/root/.config/outerssh/http-unix.allow

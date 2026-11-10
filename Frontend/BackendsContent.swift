@@ -704,14 +704,6 @@ private struct LocalWorkspaceRecord: Decodable, Equatable {
             let isInstalled: Bool
         }
 
-        struct Launcher: Decodable, Equatable {
-            let id: UUID
-            let kind: String
-            let displayName: String
-            let workingDirectory: String
-            let isApplied: Bool
-        }
-
         struct TransferItem: Decodable, Equatable {
             let name: String
             let detail: String
@@ -734,7 +726,6 @@ private struct LocalWorkspaceRecord: Decodable, Equatable {
         let steps: [Step]
         let fragments: [Fragment]
         let catalog: [CatalogItem]
-        let launchers: [Launcher]
         let users: [User]
         let scriptFiles: [ScriptFile]
         let containerfile: String
@@ -884,8 +875,6 @@ private struct LocalWorkspaceHostRequest: Encodable {
     let baseImage: String?
     let installsOuterShellSupport: Bool?
     let rebuild: Bool?
-    let launcherKind: String?
-    let workingDirectory: String?
     let recipeUserID: UUID?
     let recipeScriptPath: String?
     let dockerfile: String?
@@ -1971,8 +1960,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private var pendingRecipeScriptWorkspace: LocalWorkspaceRecord?
     private var pendingRecipeScriptUserID: UUID?
     private var pendingRecipeScriptRename: LocalWorkspaceRecord.Recipe.ScriptFile?
-    private var pendingSafeSpaceAppWorkspace: LocalWorkspaceRecord?
-    private var pendingSafeSpaceAppKind: String?
     private var safeSpaceRecipeMessage = ""
     private var containerConfigurationTab = ContainerConfigurationTab.dockerfile
     private var containerConfigurationDockerfile = ""
@@ -2045,7 +2032,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             pendingRecipeBaseImageWorkspace != nil ||
             pendingRecipeEditStep != nil ||
             pendingRecipeScriptWorkspace != nil ||
-            pendingSafeSpaceAppWorkspace != nil ||
             pendingSharedContainerImport != nil
     }
 
@@ -16467,8 +16453,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             pendingRecipeScriptWorkspace = nil
             pendingRecipeScriptUserID = nil
             pendingRecipeScriptRename = nil
-            pendingSafeSpaceAppWorkspace = nil
-            pendingSafeSpaceAppKind = nil
             isCreatingWorkspace = false
             isEditingCreationBaseImage = false
             pendingCreationContainerName = ""
@@ -16494,8 +16478,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                       baseImage: String? = nil,
                                       installsOuterShellSupport: Bool? = nil,
                                       rebuild: Bool? = nil,
-                                      launcherKind: String? = nil,
-                                      workingDirectory: String? = nil,
                                       recipeUserID: UUID? = nil,
                                       recipeScriptPath: String? = nil,
                                       dockerfile: String? = nil,
@@ -16536,8 +16518,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                                 baseImage: baseImage,
                                                 installsOuterShellSupport: installsOuterShellSupport,
                                                 rebuild: rebuild,
-                                                launcherKind: launcherKind,
-                                                workingDirectory: workingDirectory,
                                                 recipeUserID: recipeUserID,
                                                 recipeScriptPath: recipeScriptPath,
                                                 dockerfile: dockerfile,
@@ -16604,8 +16584,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 safeSpaceRecipeMessage = "Saving Dockerfile fragment…"
             case "installRecipeCatalogItem":
                 safeSpaceRecipeMessage = "Installing software…"
-            case "addRecipeApp":
-                safeSpaceRecipeMessage = "Adding app launcher…"
             case "deleteRecipeStep":
                 safeSpaceRecipeMessage = rebuild == true
                     ? "Removing step and rebuilding…"
@@ -16828,7 +16806,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                     operation == "renameRecipeScript" ||
                     operation == "updateRecipeStep" ||
                     operation == "installRecipeCatalogItem" ||
-                    operation == "addRecipeApp" ||
                     operation == "deleteRecipeStep" ||
                     operation == "rebuildRecipe" ||
                     operation == "changeRuntime" {
@@ -16853,13 +16830,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                         operation == "createRecipeScript" ||
                         operation == "renameRecipeScript" ||
                         operation == "updateRecipeStep" ||
-                        operation == "installRecipeCatalogItem" ||
-                        operation == "addRecipeApp" {
+                        operation == "installRecipeCatalogItem" {
                 if response.recipeCommandApplied == true {
                     if operation == "installRecipeCatalogItem" {
                         safeSpaceRecipeMessage = "Software installed and added to the recipe."
-                    } else if operation == "addRecipeApp" {
-                        safeSpaceRecipeMessage = "App launcher added."
                     } else {
                         safeSpaceRecipeMessage = "Dockerfile fragment applied to the running container."
                     }
@@ -16875,8 +16849,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                         }
                     } else if operation == "updateRecipeBaseImage" {
                         safeSpaceRecipeMessage = "Base image updated. Rebuild to use it."
-                    } else if operation == "addRecipeApp" {
-                        safeSpaceRecipeMessage = "App launcher added. Rebuild the container to make it available."
                     } else if operation == "addRecipeUser" {
                         safeSpaceRecipeMessage = "Container user added. Rebuild to create it."
                     } else if operation == "createRecipeScript" {
@@ -18124,8 +18096,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         pendingRecipeScriptWorkspace = nil
         pendingRecipeScriptUserID = nil
         pendingRecipeScriptRename = nil
-        pendingSafeSpaceAppWorkspace = nil
-        pendingSafeSpaceAppKind = nil
         pendingDockerfileWorkspace = workspace
         containerConfigurationTab = .dockerfile
         codingAgentScope = nil
@@ -18695,8 +18665,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         pendingRecipeScriptWorkspace = nil
         pendingRecipeScriptUserID = nil
         pendingRecipeScriptRename = nil
-        pendingSafeSpaceAppWorkspace = nil
-        pendingSafeSpaceAppKind = nil
         pendingRecipeBaseImageWorkspace = workspace
         let defaultBaseImage = outerShellBaseImage(for: workspace.runtime?.providerID)
         if recipe.baseImage == defaultBaseImage {
@@ -18743,8 +18711,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         pendingRecipeScriptWorkspace = nil
         pendingRecipeScriptUserID = nil
         pendingRecipeScriptRename = nil
-        pendingSafeSpaceAppWorkspace = nil
-        pendingSafeSpaceAppKind = nil
         pendingRecipeUserWorkspace = workspace
         workspaceRenameName = ""
         workspacePanelMessage = ""
@@ -18771,8 +18737,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         pendingRecipeScriptWorkspace = nil
         pendingRecipeScriptUserID = nil
         pendingRecipeScriptRename = nil
-        pendingSafeSpaceAppWorkspace = nil
-        pendingSafeSpaceAppKind = nil
         workspaceRenameName = step.dockerfileFragment
         workspacePanelMessage = ""
         focusEditorInput()
@@ -18797,8 +18761,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         pendingRecipeScriptWorkspace = nil
         pendingRecipeScriptUserID = nil
         pendingRecipeScriptRename = nil
-        pendingSafeSpaceAppWorkspace = nil
-        pendingSafeSpaceAppKind = nil
         pendingRecipeScriptWorkspace = workspace
         pendingRecipeScriptUserID = userID
         pendingRecipeScriptRename = nil
@@ -18850,38 +18812,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             return
         }
         outerframeHost.openNewTab(with: url, displayString: script.fileName)
-    }
-
-    private func showSafeSpaceAppPrompt(for workspace: LocalWorkspaceRecord,
-                                        kind: String) {
-        editorInputController.resetUndoHistory()
-        workspaceNamePromptDismissesPanel = true
-        isShowingWorkspacePanel = true
-        isCreatingWorkspace = false
-        pendingWorkspaceRename = nil
-        pendingRecipeCommandWorkspace = nil
-        pendingDockerfileWorkspace = nil
-        pendingRecipeBaseImageWorkspace = nil
-        pendingRecipeUserWorkspace = nil
-        pendingRecipeEditWorkspace = nil
-        pendingRecipeEditStep = nil
-        pendingSafeSpaceAppWorkspace = nil
-        pendingSafeSpaceAppKind = nil
-        pendingSafeSpaceAppWorkspace = workspace
-        pendingSafeSpaceAppKind = kind
-        workspaceRenameName = "/home/workspace/Workspace"
-        workspacePanelMessage = ""
-        focusEditorInput(selectAll: true)
-        updateLayout()
-    }
-
-    private func addSafeSpaceApp(to workspace: LocalWorkspaceRecord,
-                                 kind: String,
-                                 workingDirectory: String) {
-        sendWorkspaceRequest(operation: "addRecipeApp",
-                             workspaceID: workspace.id,
-                             launcherKind: kind,
-                             workingDirectory: workingDirectory)
     }
 
     private func showWorkspaceRename(_ workspace: LocalWorkspaceRecord) {
@@ -19080,8 +19010,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 workspacePanelMessage = "Enter a folder path on the Windows server."
             } else if pendingWorkspaceRename != nil {
                 workspacePanelMessage = "Enter a name for the container."
-            } else if pendingSafeSpaceAppWorkspace != nil {
-                workspacePanelMessage = "Enter a folder path inside the container."
             } else if pendingDockerfileWorkspace != nil {
                 workspacePanelMessage = "The Dockerfile cannot be empty."
             } else if pendingRecipeCommandWorkspace != nil {
@@ -19145,8 +19073,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         let recipeScriptWorkspace = pendingRecipeScriptWorkspace
         let recipeScriptUserID = pendingRecipeScriptUserID
         let recipeScriptRename = pendingRecipeScriptRename
-        let appWorkspace = pendingSafeSpaceAppWorkspace
-        let appKind = pendingSafeSpaceAppKind
         let createsWorkspace = isCreatingWorkspace
         let dismissesPanel = workspaceNamePromptDismissesPanel
         let renamesContainerConfiguration = isRenamingContainerConfiguration
@@ -19163,8 +19089,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         pendingRecipeScriptWorkspace = nil
         pendingRecipeScriptUserID = nil
         pendingRecipeScriptRename = nil
-        pendingSafeSpaceAppWorkspace = nil
-        pendingSafeSpaceAppKind = nil
         isCreatingWorkspace = false
         workspaceNamePromptDismissesPanel = false
         workspaceRenameName = ""
@@ -19182,10 +19106,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             sendWorkspaceRequest(operation: "updateDockerfile",
                                  workspaceID: dockerfileWorkspace.id,
                                  command: submittedText)
-        } else if let appWorkspace, let appKind {
-            addSafeSpaceApp(to: appWorkspace,
-                            kind: appKind,
-                            workingDirectory: name)
         } else if let recipeWorkspace {
             sendWorkspaceRequest(operation: "addRecipeStep",
                                  workspaceID: recipeWorkspace.id,
@@ -21028,8 +20948,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             title.string = "Copy Mounted Folders"
         } else if isCreatingWorkspace && isEditingCreationBaseImage {
             title.string = "Choose Base Image"
-        } else if pendingSafeSpaceAppWorkspace != nil {
-            title.string = "Add JupyterLab App"
         } else if pendingRecipeBaseImageWorkspace != nil {
             title.string = "Change Base Image"
         } else if pendingRecipeUserWorkspace != nil {
@@ -21060,8 +20978,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 "will be copied on this server. Paths inside the container will stay the same."
         } else if isCreatingWorkspace && isEditingCreationBaseImage {
             detail.string = "Start with Outer Shell's image, add visible support steps to another image, or use it unchanged."
-        } else if let workspace = pendingSafeSpaceAppWorkspace {
-            detail.string = "Choose the folder JupyterLab opens in \(workspace.name)."
         } else if isAddingWindowsContainerFolder {
             detail.string = "Enter a folder path on the Windows server. Rebuild the container to apply the mount."
         } else if pendingMountPathEdit != nil {
@@ -21461,14 +21377,12 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             value.string = text.isEmpty
                 ? (pendingSharedContainerImport != nil
                     ? "/path/on/this/server"
-                    : (pendingSafeSpaceAppWorkspace != nil
-                    ? "/home/workspace/Workspace"
                     : (pendingRecipeBaseImageWorkspace != nil ||
                        (isCreatingWorkspace && isEditingCreationBaseImage)
                         ? "debian:bookworm"
                     : (pendingRecipeUserWorkspace != nil
                         ? "Linux username"
-                        : "Container name"))))
+                        : "Container name")))
                 : text
             value.foregroundColor = resolvedCGColor(
                 text.isEmpty ? .placeholderTextColor : .textColor
@@ -21494,8 +21408,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 ? "Import"
                 : (isCreatingWorkspace && isEditingCreationBaseImage
                 ? "Done"
-                : (pendingSafeSpaceAppWorkspace != nil
-                ? "Add App"
                 : (pendingRecipeBaseImageWorkspace != nil
                     ? "Use Image"
                 : (pendingRecipeUserWorkspace != nil
@@ -21506,7 +21418,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                     ? (pendingDockerfileWorkspace != nil || pendingRecipeEditStep != nil
                         ? "Save"
                         : "Add")
-                    : (pendingMountPathEdit != nil ? "Save" : isCreatingWorkspace ? "Create" : "Rename"))))))),
+                    : (pendingMountPathEdit != nil ? "Save" : isCreatingWorkspace ? "Create" : "Rename")))))),
             emphasized: true
         )
         let localConfirmFrame = CGRect(x: promptWidth - 96, y: 18, width: 78, height: 30)
