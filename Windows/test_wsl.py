@@ -140,7 +140,7 @@ with Bridge(shell_pipe) as host_client:
     item = wait_for(lambda w: w['state'] == 'running' and len(w['apps']) >= 2)
     for field in ('cpus', 'memoryInMB', 'shellCommand'): assert field in item
     for app in item['apps']:
-        for field in ('iconPath', 'iconObservationToken', 'publishedPort', 'externalSocketPath'): assert field in app
+        for field in ('iconPath', 'publishedPort', 'externalSocketPath'): assert field in app
     apps = {a['serviceID']: a for a in item['apps']}
     files = apps['org.outershell.Files']
     operation('startApp', serviceID='org.outershell.Files')

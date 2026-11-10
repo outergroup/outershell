@@ -1,16 +1,14 @@
 const fs = require('node:fs'), vm = require('node:vm'), assert = require('node:assert/strict');
 const s = fs.readFileSync(require('node:path').join(__dirname, '../Resources/OuterShellWeb/app.js'), 'utf8');
-const c = {URL, URLSearchParams, window: {location: {href:'http://localhost/'}, outerLoopPageIconObservationSupported:true},
-  safeSpaceAppURL: () => 'http+unix://%2Frun%2Fcontainer.sock/lab?x=1#work'};
+assert.ok(!s.includes('outerloop:'), 'the launcher navigates directly to apps');
+const c = {encodeURIComponent, pathAndQuery: () => '/lab?x=1#work'};
 vm.createContext(c);
-vm.runInContext(s.slice(s.indexOf('  function safeSpaceAppNavigationURL('), s.indexOf('  function safeSpaceAppIsReady(')), c);
-const workspace = {name:'Projects'}, app = {displayName:'Untrusted name', iconObservationToken:'token'};
-const link = new URL(c.safeSpaceAppNavigationURL(workspace, app));
-assert.equal(link.host, 'observe-page-icon');
-assert.equal(link.searchParams.get('display'), null);
-assert.equal(link.searchParams.get('url'), c.safeSpaceAppURL());
-assert.equal(new URL(link.searchParams.get('callback')).searchParams.get('token'), 'token');
-assert.equal(c.safeSpaceAppNavigationURL(workspace, {...app, iconURL:'/icon.png'}), c.safeSpaceAppURL());
-c.window.outerLoopPageIconObservationSupported = false;
-assert.equal(c.safeSpaceAppNavigationURL(workspace, app), c.safeSpaceAppURL());
-console.log('PASS container links contain destinations and icon callbacks, without address labels');
+vm.runInContext(s.slice(s.indexOf('  function safeSpacePathAndQuery('), s.indexOf('  function safeSpaceAppIsReady(')), c);
+assert.equal(c.safeSpaceAppURL({externalSocketPath: '/run/container.sock', displayName: 'Untrusted name'}),
+  'http+unix://%2Frun%2Fcontainer.sock/lab?x=1#work');
+assert.equal(c.safeSpaceAppURL({externalSocketPath: '\\\\.\\pipe\\container', publishedPort: 0}),
+  'http+pipe://%5C%5C.%5Cpipe%5Ccontainer/lab?x=1#work');
+assert.equal(c.safeSpaceAppURL({externalSocketPath: '/run/container.sock', publishedPort: 8080}),
+  'http://127.0.0.1:8080/lab?x=1#work');
+assert.equal(c.safeSpaceAppURL({}), '#');
+console.log('PASS container links navigate directly to their destinations, without address labels');

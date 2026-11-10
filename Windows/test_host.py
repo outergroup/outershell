@@ -1,4 +1,5 @@
 """Integration tests for installed native Windows tasks (no running same-user host)."""
+import hashlib
 import concurrent.futures
 import json
 import os
@@ -124,15 +125,25 @@ with tempfile.TemporaryDirectory(prefix='outer-c-test-') as temporary:
                     return ref(ref(backend, 68), 4)
             raise AssertionError('Missing Outer Shell frontend')
         frontend = shell_frontend()
-        observation_token = ref(frontend, 64).decode()
-        assert len(observation_token) == 32 and not ref(frontend, 32)
-        callback = '/api/icon-observation?token=' + observation_token
-        assert request(pipe, callback)[0] == 405
-        assert request(pipe, '/api/icon-observation?token=invalid', expected_icon, 'POST')[0] == 403
-        assert request(pipe, callback, b'not a PNG', 'POST')[0] == 400
-        assert request(pipe, callback, expected_icon, 'POST', extra=b'Origin: http://evil.invalid\r\n')[0] == 403
-        assert request(pipe, callback, expected_icon, 'POST')[0] == 200
-        assert ref(shell_frontend(), 32) == expected_icon and not ref(shell_frontend(), 64)
+        pipe_path = ref(frontend, 16).decode()
+        assert pipe_path.lower().startswith('\\\\.\\pipe\\')
+        icon_cache = Path(os.environ['LOCALAPPDATA']) / 'OuterSSH/endpoint-icons'
+        cached_icon = icon_cache / (hashlib.sha256(('pipe ' + pipe_path.lower()).encode()).hexdigest() + '.png')
+        original_icon = cached_icon.read_bytes() if cached_icon.exists() else None
+        try:
+            cached_icon.unlink(missing_ok=True)
+            assert not ref(shell_frontend(), 32)
+            icon_cache.mkdir(parents=True, exist_ok=True)
+            cached_icon.write_bytes(b'not a PNG')
+            assert not ref(shell_frontend(), 32)
+            cached_icon.write_bytes(expected_icon)
+            assert ref(shell_frontend(), 32) == expected_icon
+            assert request(pipe, '/api/icon-observation?token=0', expected_icon, 'POST')[0] != 200
+        finally:
+            if original_icon is None:
+                cached_icon.unlink(missing_ok=True)
+            else:
+                cached_icon.write_bytes(original_icon)
         native_header = b'Outerframe-Accept: application/vnd.outerframe\r\n'
         status, descriptor = request(pipe, '/', extra=native_header)
         assert status == 200 and descriptor[:4] == b'OUTR'

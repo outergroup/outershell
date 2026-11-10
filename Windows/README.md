@@ -481,20 +481,14 @@ Unix archive compatibility, included data, and unsafe-archive rejection.
 
 ### Discovered app icons
 
-Native and flattened WSL/container app entries without an icon include an
-endpoint-scoped token for `outerloop://observe-page-icon`. The existing HTML and
-outerframe clients send the discovered PNG to `POST /api/icon-observation`.
-The callback requires the normal origin authorization and an unpredictable token;
-it accepts at most 48 KiB and fully decodes a PNG of at most 4096 pixels per side.
-Icons are cached under the Windows user's `OuterShell/discovered-icons` directory,
-keyed by environment, app identity, and endpoint address. They survive restarts;
-tokens do not. Explicit app icons take precedence and saved discoveries are not
-overwritten. Guest icons are cached by the Windows host, without modifying the
-inner Linux registry. A successful callback refreshes the homepage and guest snapshot.
+Native and WSL app entries without an icon use the PNG that Outer Loop cached for
+the app's endpoint in `%LOCALAPPDATA%\OuterSSH\endpoint-icons`: the named pipe for
+native apps (or the TCP port) and the host-side pipe for WSL apps. Explicit and
+bundled icons take precedence. See `../endpoint-icons.md`.
 
 Build with `-UpdateTests` and run `OuterShellIconTests.exe ..\app-icon.png` for
-cache/token/image validation. `test_host.py` also covers the named-pipe callback,
-origin enforcement, returned icon bytes, and persistence after restarting the host.
+cache naming and validation. `test_host.py` also covers a cached icon reaching the
+Outer Shell frontend over the named pipe.
 
 ### Uninstall from the homepage
 

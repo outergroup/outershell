@@ -513,7 +513,7 @@ class Records:
                 registry_container_upsert(value)
             if legacy:
                 transient_keys = (
-                    "transientState", "lastError", "cachedApps", "observedIcons", "cachedCommands", "buildProgress",
+                    "transientState", "lastError", "cachedApps", "cachedCommands", "buildProgress",
                     "terminalShell",
                 )
                 registry_resource_set(OFFSET_ARCHIVE_RESOURCE_PROVIDER_STATE, {
@@ -566,7 +566,7 @@ class Records:
             CONTAINER_RUNTIME_NAMES[identifier] = value.get("runtimeName", "")
         provider_state = {}
         transient_keys = (
-            "transientState", "lastError", "cachedApps", "observedIcons", "cachedCommands", "buildProgress",
+            "transientState", "lastError", "cachedApps", "cachedCommands", "buildProgress",
             "terminalShell",
         )
         for value in self.values:
@@ -1929,67 +1929,62 @@ def runtime_published_ports(container_id):
     return ports
 
 
-def app_icon_identity(app):
-    return tuple(app.get(key, "") for key in ("serviceID", "frontendID", "socketPath", "url"))
-
-
-def preserve_observed_icons(discovered, previous):
-    previous = {app_icon_identity(app): app for app in previous}
-    for app in discovered:
-        old = previous.get(app_icon_identity(app), {})
-        app["iconObservationToken"] = old.get("iconObservationToken") or uuid.uuid4().hex
-        if not app.get("iconPath") and old.get("observedIconData"):
-            app["observedIconData"] = old["observedIconData"]
-            app["iconData"] = old["observedIconData"]
-
-
-def remember_observed_icons(record):
-    icons = record.setdefault("observedIcons", {})
-    for app in record.get("cachedApps", []):
-        if app.get("observedIconData"):
-            key = json.dumps(app_icon_identity(app), separators=(",", ":"))
-            icons[key] = app["observedIconData"]
-    return icons
-
-
 def update_cached_apps(record, discovered):
-    icons = remember_observed_icons(record)
-    preserve_observed_icons(discovered, record.get("cachedApps", []))
-    for app in discovered:
-        key = json.dumps(app_icon_identity(app), separators=(",", ":"))
-        if not app.get("iconPath") and icons.get(key):
-            app["observedIconData"] = icons[key]
-            app["iconData"] = icons[key]
     record["cachedApps"] = discovered
 
 
-def store_observed_icon(payload):
-    if len(payload) <= 36 or len(payload) > 36 + 48 * 1024:
-        return 400
+def endpoint_icon_directory():
+    config_home = pathlib.Path(os.environ.get("XDG_CONFIG_HOME") or pathlib.Path.home() / ".config")
+    if not config_home.is_absolute():
+        config_home = pathlib.Path.home() / ".config"
+    return config_home / "outerssh" / "endpoint-icons"
+
+
+def endpoint_icon_data(app):
+    """Returns the base64 icon Outer Loop cached for the app's host endpoint in
+    OuterSSH's per-user endpoint icon cache. See endpoint-icons.md."""
+    port = app.get("publishedPort") or 0
+    socket = app.get("externalSocketPath") or ""
+    if 0 < port <= 65535:
+        line = f"tcp localhost {port}"
+    elif socket.startswith("/") and "\n" not in socket and "\r" not in socket:
+        line = f"unix {socket}"
+    else:
+        return None
+    directory = endpoint_icon_directory()
+    path = directory / (hashlib.sha256(line.encode()).hexdigest() + ".png")
     try:
-        token = payload[4:36].decode("ascii")
-        if len(token) != 32 or any(c not in "0123456789abcdef" for c in token):
-            return 403
-    except UnicodeDecodeError:
-        return 403
-    image = payload[36:]
-    if len(image) < 24 or image[:8] != b"\x89PNG\r\n\x1a\n":
-        return 400
-    width, height = struct.unpack(">II", image[16:24])
-    if not (0 < width <= 4096 and 0 < height <= 4096):
-        return 400
-    with Records() as records:
-        for record in records.values:
-            for app in record.get("cachedApps", []):
-                if app.get("iconObservationToken") != token:
-                    continue
-                if not app.get("iconPath"):
-                    app["observedIconData"] = base64.b64encode(image).decode("ascii")
-                    app["iconData"] = app["observedIconData"]
-                    remember_observed_icons(record)
-                    records.save()
-                return 200
-    return 403
+        directory_status = os.lstat(directory)
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except OSError:
+        return None
+    try:
+        status = os.fstat(descriptor)
+        if any(value.st_uid != os.getuid() or value.st_mode & 0o022 for value in (directory_status, status)):
+            return None
+        if not stat_is_directory(directory_status) or not stat_is_regular(status) or not 8 < status.st_size <= 64 * 1024:
+            return None
+        data = os.read(descriptor, status.st_size)
+    finally:
+        os.close(descriptor)
+    if not data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return None
+    return base64.b64encode(data).decode("ascii")
+
+
+def stat_is_directory(status):
+    return (status.st_mode & 0o170000) == 0o040000
+
+
+def stat_is_regular(status):
+    return (status.st_mode & 0o170000) == 0o100000
+
+
+def with_endpoint_icon(app):
+    if app.get("iconData"):
+        return app
+    data = endpoint_icon_data(app)
+    return dict(app, iconData=data) if data else app
 
 
 def app_snapshots(container_id, recipe):
@@ -2038,7 +2033,6 @@ def app_snapshots(container_id, recipe):
             "externalSocketPath": row.get("external_socket_path", ""),
             "url": row.get("url", ""),
             "iconPath": row.get("icon_path", ""),
-            "iconObservationToken": "",
             "isRunning": is_running,
             "publishedPort": published_ports.get(declared.get("port"), 0),
         }
@@ -2495,6 +2489,7 @@ def workspace_dictionary(record, overview=False):
             record["cachedCommands"] = commands
         except Exception:
             pass
+    apps = [with_endpoint_icon(app) for app in apps]
     if state != "running":
         apps = [dict(app, isRunning=False, externalSocketPath=None) for app in apps]
     if owns_container:
@@ -2576,7 +2571,7 @@ def workspace_dictionary(record, overview=False):
 def unavailable_workspace_dictionary(record, error):
     container_id = record["id"]
     owns_container = record_owns_container(record)
-    apps = [dict(app, isRunning=False, externalSocketPath=None)
+    apps = [dict(with_endpoint_icon(app), isRunning=False, externalSocketPath=None)
             for app in record.get("cachedApps", [])]
     return {
         "id": container_id,
@@ -2697,7 +2692,6 @@ def list_workspaces(overview=False):
         for record in sorted(records.values, key=lambda value: value.get("createdAt", 0)):
             before = (
                 offset_archive_encode(record.get("cachedApps", [])),
-                offset_archive_encode(record.get("observedIcons", {})),
                 offset_archive_encode(record.get("cachedCommands", [])),
                 record.get("terminalShell"),
             )
@@ -2707,7 +2701,6 @@ def list_workspaces(overview=False):
                 values.append(unavailable_workspace_dictionary(record, error))
             after = (
                 offset_archive_encode(record.get("cachedApps", [])),
-                offset_archive_encode(record.get("observedIcons", {})),
                 offset_archive_encode(record.get("cachedCommands", [])),
                 record.get("terminalShell"),
             )
@@ -3132,13 +3125,6 @@ def main():
             raw_request = sys.stdin.buffer.read()
             if raw_request == b"OSED\x01\0\0\0":
                 sys.stdout.buffer.write(environment_discovery_response())
-                return 0
-            if raw_request.startswith(b"OSCI"):
-                try:
-                    status = store_observed_icon(raw_request)
-                except Exception:
-                    status = 500
-                sys.stdout.write(str(status))
                 return 0
             if raw_request.startswith(TRANSFER_MAGIC):
                 sys.stdout.buffer.write(handle_transfer_request(raw_request))

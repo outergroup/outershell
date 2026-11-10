@@ -34,11 +34,6 @@ private typealias SafeSpaceRequestCallback = @convention(c) (
     UnsafeMutablePointer<Int>?,
     UnsafeMutablePointer<Int32>?
 ) -> UnsafeMutablePointer<UInt8>?
-private typealias SafeSpaceIconObservationCallback = @convention(c) (
-    UnsafePointer<CChar>?,
-    UnsafePointer<UInt8>?,
-    Int
-) -> Int32
 
 @_silgen_name("OuterShelldSetMenuBarVisibilityCallbacks")
 private func OuterShelldSetMenuBarVisibilityCallbacks(_ callback: MenuBarVisibilityCallback?,
@@ -49,11 +44,6 @@ private func OuterShelldSetBackendEventChangedCallback(_ callback: BackendEventC
 
 @_silgen_name("OuterShelldSetSafeSpaceRequestCallback")
 private func OuterShelldSetSafeSpaceRequestCallback(_ callback: SafeSpaceRequestCallback?)
-
-@_silgen_name("OuterShelldSetSafeSpaceIconObservationCallback")
-private func OuterShelldSetSafeSpaceIconObservationCallback(
-    _ callback: SafeSpaceIconObservationCallback?
-)
 
 @_silgen_name("OuterShelldMarkBackendEventChanged")
 private func OuterShelldMarkBackendEventChanged()
@@ -471,28 +461,6 @@ private let safeSpaceRequestCallback: SafeSpaceRequestCallback = {
     value.data.copyBytes(to: allocation.assumingMemoryBound(to: UInt8.self),
                          count: value.data.count)
     return allocation.assumingMemoryBound(to: UInt8.self)
-}
-
-private let safeSpaceIconObservationCallback: SafeSpaceIconObservationCallback = {
-    token, body, bodyLength in
-    guard let token,
-          let body,
-          bodyLength > 0 else {
-        return 400
-    }
-    let icon = Data(bytes: body, count: bodyLength)
-    do {
-        try SafeSpaceManager.shared.storeDiscoveredIcon(
-            token: String(cString: token),
-            data: icon
-        )
-        return 200
-    } catch SafeSpaceManagerError.safeSpaceAppNotFound {
-        return 404
-    } catch {
-        NSLog("Container icon discovery failed: %@", error.localizedDescription)
-        return 400
-    }
 }
 
 private enum OuterShellRegistry {
@@ -916,7 +884,6 @@ private final class OuterShellAgentDelegate: NSObject, NSApplicationDelegate, NS
         OuterShelldSetMenuBarVisibilityCallbacks(menuBarVisibilityCallback, menuBarVisibilityGetter)
         OuterShelldSetBackendEventChangedCallback(backendEventChangedCallback)
         OuterShelldSetSafeSpaceRequestCallback(safeSpaceRequestCallback)
-        OuterShelldSetSafeSpaceIconObservationCallback(safeSpaceIconObservationCallback)
         NSApplication.shared.setActivationPolicy(.accessory)
         startBackend()
         configureStatusItem()
@@ -946,7 +913,6 @@ private final class OuterShellAgentDelegate: NSObject, NSApplicationDelegate, NS
         OuterShelldSetMenuBarVisibilityCallbacks(nil, nil)
         OuterShelldSetBackendEventChangedCallback(nil)
         OuterShelldSetSafeSpaceRequestCallback(nil)
-        OuterShelldSetSafeSpaceIconObservationCallback(nil)
         DistributedNotificationCenter.default().removeObserver(self)
         OuterShellBackendRequestShutdown()
         OuterShelldRequestShutdown()

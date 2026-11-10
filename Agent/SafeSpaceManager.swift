@@ -243,7 +243,6 @@ private struct SafeSpaceCachedApp: Codable {
     let url: String
     let iconPath: String
     var iconData: Data?
-    let iconObservationToken: String?
     var isRunning: Bool?
     let publishedPort: Int?
 }
@@ -326,7 +325,6 @@ private final class SafeSpaceAppEventMonitor: @unchecked Sendable {
 enum SafeSpaceManagerError: Error, LocalizedError {
     case invalidRequest
     case safeSpaceNotFound
-    case safeSpaceAppNotFound
     case unsupportedProvider
     case commandFailed(String)
 
@@ -336,8 +334,6 @@ enum SafeSpaceManagerError: Error, LocalizedError {
             return "The container request is invalid."
         case .safeSpaceNotFound:
             return "The selected container no longer exists."
-        case .safeSpaceAppNotFound:
-            return "The selected container app no longer exists."
         case .unsupportedProvider:
             return "The selected container provider is unavailable."
         case .commandFailed(let message):
@@ -760,34 +756,6 @@ final class SafeSpaceManager: @unchecked Sendable {
             "error": error.localizedDescription
         ]
         return (try? JSONSerialization.data(withJSONObject: body)) ?? Data()
-    }
-
-    func storeDiscoveredIcon(token: String, data: Data) throws {
-        guard !data.isEmpty,
-              data.count <= 48 * 1024,
-              let image = NSBitmapImageRep(data: data),
-              image.pixelsWide > 0,
-              image.pixelsHigh > 0,
-              image.pixelsWide <= 4096,
-              image.pixelsHigh <= 4096 else {
-            throw SafeSpaceManagerError.invalidRequest
-        }
-        let found = lock.withSafeSpaceLock { () -> Bool in
-            for safeSpaceID in cachedApps.keys {
-                guard let index = cachedApps[safeSpaceID]?.firstIndex(where: {
-                    $0.iconObservationToken == token
-                }) else {
-                    continue
-                }
-                cachedApps[safeSpaceID]?[index].iconData = data
-                return true
-            }
-            return false
-        }
-        guard found else {
-            throw SafeSpaceManagerError.safeSpaceAppNotFound
-        }
-        try saveCachedApps()
     }
 
     func menuBarContainers() async -> [SafeSpaceMenuBarContainer] {
@@ -3948,8 +3916,6 @@ final class SafeSpaceManager: @unchecked Sendable {
                                    url: $0.url,
                                    iconPath: $0.iconPath,
                                    iconData: old[$0.frontendID]?.iconData,
-                                   iconObservationToken: old[$0.frontendID]?.iconObservationToken
-                                       ?? UUID().uuidString,
                                    isRunning: $0.isRunning,
                                    publishedPort: $0.publishedPort)
             }
@@ -4059,14 +4025,45 @@ final class SafeSpaceManager: @unchecked Sendable {
             "externalSocketPath": app.externalSocketPath ?? "",
             "url": app.url,
             "iconPath": app.iconPath,
-            "iconObservationToken": app.iconObservationToken ?? "",
             "isRunning": running && (app.isRunning ?? false),
             "publishedPort": app.publishedPort ?? 0
         ]
-        if let iconData = app.iconData {
+        if let iconData = app.iconData ?? endpointIconData(for: app) {
             value["iconData"] = iconData.base64EncodedString()
         }
         return value
+    }
+
+    /// The icon Outer Loop cached on this Mac for the app's host endpoint, in
+    /// OuterSSH's per-user endpoint icon cache. See endpoint-icons.md.
+    private func endpointIconData(for app: SafeSpaceCachedApp) -> Data? {
+        let line: String
+        if let port = app.publishedPort, port > 0, port <= 65535 {
+            line = "tcp localhost \(port)"
+        } else if let socket = app.externalSocketPath, socket.hasPrefix("/"), !socket.contains("\n") {
+            line = "unix \(socket)"
+        } else {
+            return nil
+        }
+        let name = SHA256.hash(data: Data(line.utf8)).map { String(format: "%02x", $0) }.joined() + ".png"
+        let directory = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/org.outerssh/endpoint-icons", isDirectory: true)
+        let path = directory.appendingPathComponent(name).path
+        guard let directoryAttributes = try? FileManager.default.attributesOfItem(atPath: directory.path),
+              let attributes = try? FileManager.default.attributesOfItem(atPath: path),
+              directoryAttributes[.type] as? FileAttributeType == .typeDirectory,
+              attributes[.type] as? FileAttributeType == .typeRegular,
+              [directoryAttributes, attributes].allSatisfy({
+                  ($0[.ownerAccountID] as? NSNumber)?.uint32Value == getuid() &&
+                      (($0[.posixPermissions] as? NSNumber)?.intValue ?? 0o777) & 0o022 == 0
+              }),
+              let size = (attributes[.size] as? NSNumber)?.intValue,
+              size > 8, size <= 64 * 1024,
+              let data = FileManager.default.contents(atPath: path),
+              data.starts(with: [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]) else {
+            return nil
+        }
+        return data
     }
 
     private func runtimeState(_ record: SafeSpaceRecord, recoverRuntime: Bool = true) throws -> String {

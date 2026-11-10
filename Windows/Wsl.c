@@ -911,19 +911,13 @@ static bool app_list(Distribution *d, StringBuilder *json) {
                 append(json, ",");
                 field(json, "serviceScope", system ? "system" : "user");
                 StringBuilder icon = reference(app, 32), discovered = {0};
-                char token[33] = "";
-                const char *identity[] = {"guest", d->id, service, id, system ? "root" : d->user, socket, url};
-                if (!icon.length) {
-                    icons_describe(identity, sizeof(identity) / sizeof(*identity), &discovered, token);
-                    icon = discovered;
-                }
+                if (!icon.length && icons_endpoint(endpoint->pipe, NULL, 0, &discovered)) icon = discovered;
                 if (icon.length && icon.length <= 512 * 1024 &&
                     !(read_uint32_le((unsigned char *)app.data + 60) & 2)) {
                     append(json, ",\"iconData\":");
                     json_base64(json, icon);
                 }
                 free(discovered.data);
-                append(json, ","); field(json, "iconObservationToken", token);
                 append(json, ",\"iconPath\":\"\",\"publishedPort\":0,\"isRunning\":");
                 append(json, (read_uint32_le((unsigned char *)app.data + 60) & 1)
                                  ? "true"

@@ -176,7 +176,6 @@
       iconURL: flags & 2 ? reader.stringRef(32) : "",
       port: reader.u32(48),
       id: reader.bytes.length >= 60 ? reader.stringRef(52) : "",
-      iconObservationToken: reader.bytes.length >= 72 ? reader.stringRef(64) : "",
       isRunning: Boolean(flags & 0x01)
     };
   }
@@ -331,15 +330,6 @@
     if (socket) target = `http+${socket.startsWith("\\\\.\\pipe\\") ? "pipe" : "unix"}://${encodeURIComponent(socket)}${pathAndQuery(frontend)}`;
     else if (frontend.port > 0) target = `http://127.0.0.1:${frontend.port}${pathAndQuery(frontend)}`;
     else target = String(frontend.url || "").trim() || "#";
-
-    const token = String(frontend.iconObservationToken || "");
-    if (window.outerLoopPageIconObservationSupported === true && !frontend.iconData?.length && !frontend.iconURL && token) {
-      const callback = new URL("/api/icon-observation", window.location.href);
-      callback.search = new URLSearchParams({ token }).toString();
-      const observation = new URL("outerloop://observe-page-icon");
-      observation.search = new URLSearchParams({ url: target, callback: callback.href }).toString();
-      return observation.href;
-    }
     return target;
   }
 
@@ -574,7 +564,7 @@
   }
 
   function overviewEndpoint(entry) {
-    const target = entry.item ? navigationURL(entry.item.frontend) : safeSpaceAppNavigationURL(entry.workspace, entry.app);
+    const target = entry.item ? navigationURL(entry.item.frontend) : safeSpaceAppURL(entry.app);
     const isThisPage = entry.serviceID === "org.outershell.OuterShell" && entry.item?.backend.serviceScope !== "system" && !entry.workspace;
     const icon = listIconHTML(entry.item || { app: entry.app, displayName: entry.name });
     const menu = entry.item
@@ -643,7 +633,7 @@
   function overviewShortcut(entry) {
     const item = entry.item || findItem(entry.key);
     const icon = listIconHTML(item);
-    const target = entry.item ? navigationURL(entry.item.frontend) : safeSpaceAppNavigationURL(entry.workspace, entry.app);
+    const target = entry.item ? navigationURL(entry.item.frontend) : safeSpaceAppURL(entry.app);
     const identity = entry.item?.identity || entry.key;
     return `<div class="overview-shortcut-wrap" data-endpoint-key="${escapeHTML(entry.key)}"><a class="overview-shortcut" href="${escapeHTML(target)}" ${overviewLaunchAttributes(entry)} ${entry.item ? "" : `data-app-key="${escapeHTML(identity)}"`}>${icon}<span class="shortcut-title">${overviewStatus(entry)}${escapeHTML(entry.name)}${entry.failure ? " — Unavailable" : ""}</span></a>${appLaunchFeedback(entry)}</div>`;
   }
@@ -1061,17 +1051,6 @@ RUN outerctl image add-command --id codex --name "Codex" --working-directory /ro
     return socket ? `http+${socket.startsWith("\\\\.\\pipe\\") ? "pipe" : "unix"}://${encodeURIComponent(socket)}${path}` : "#";
   }
 
-  function safeSpaceAppNavigationURL(workspace, app) {
-    const target = safeSpaceAppURL(app);
-    if (target === "#") return target;
-    if (window.outerLoopPageIconObservationSupported === true && !app.iconData && !app.iconURL && app.iconObservationToken) {
-      const callback = new URL("/api/icon-observation", window.location.href);
-      callback.search = new URLSearchParams({ token: app.iconObservationToken }).toString();
-      return `outerloop://observe-page-icon?${new URLSearchParams({ url: target, callback: callback.href }).toString().replace(/\+/g, "%20")}`;
-    }
-    return target;
-  }
-
   function safeSpaceAppIsReady(workspace, app) {
     return safeSpaceIsRunning(workspace) && app.isRunning === true && safeSpaceAppURL(app) !== "#";
   }
@@ -1255,7 +1234,7 @@ RUN outerctl image add-command --id codex --name "Codex" --working-directory /ro
     let app = findSafeSpaceApp(workspace, serviceID, frontendKey);
     if (!workspace || !app) throw new Error("The selected container app no longer exists.");
     if (safeSpaceAppIsReady(workspace, app)) {
-      window.location.assign(safeSpaceAppNavigationURL(workspace, app));
+      window.location.assign(safeSpaceAppURL(app));
       return;
     }
     const launch = { showLogs: false };
@@ -1275,7 +1254,7 @@ RUN outerctl image add-command --id codex --name "Codex" --working-directory /ro
       }
       if (app.isRunning !== true) await safeSpaceRequest("startApp", { workspaceID, serviceID, serviceScope: app.serviceScope });
       const ready = await waitForSafeSpaceApp(workspaceID, serviceID, frontendKey);
-      window.location.assign(safeSpaceAppNavigationURL(ready.workspace, ready.app));
+      window.location.assign(safeSpaceAppURL(ready.app));
     } finally {
       window.clearTimeout(logTimer);
       state.appLaunches.delete(key);
@@ -2724,7 +2703,7 @@ RUN outerctl image add-command --id codex --name "Codex" --working-directory /ro
     const preparing = containerPreparing(workspace);
     const operation = app ? (running ? "stopApp" : "startApp") : (running ? "stop" : "start");
     const attributes = `data-safe-space-id="${escapeHTML(id)}" data-service-id="${escapeHTML(serviceID || "")}" data-frontend-key="${escapeHTML(frontendKey || "")}"`;
-    const url = app ? safeSpaceAppNavigationURL(workspace, app) : "";
+    const url = app ? safeSpaceAppURL(app) : "";
     showContextMenu(`<div class="context-menu-app-heading">${app ? launcherIconHTML(findItem(containerBookmarkKey(workspace, app))) : ""}<strong>${escapeHTML(name)}</strong></div>
       <section class="context-menu-section">
         ${!app && managedContainer(workspace) ? `<button class="context-menu-item" type="button" data-action="configure-container" data-safe-space-id="${escapeHTML(id)}" role="menuitem" ${preparing ? "disabled" : ""}>${contextMenuGlyph("✎")}<span>Edit container…</span></button><button class="context-menu-item" type="button" data-action="share-container" data-safe-space-id="${escapeHTML(id)}" role="menuitem" ${preparing ? "disabled" : ""}>${contextMenuGlyph("↗")}<span>Share Container…</span></button>` : ""}
@@ -3364,7 +3343,7 @@ RUN outerctl image add-command --id codex --name "Codex" --working-directory /ro
     if (action === "copy-container-url") {
       const workspace = findSafeSpace(actionElement.dataset.safeSpaceId);
       const app = findSafeSpaceApp(workspace, actionElement.dataset.serviceId, actionElement.dataset.frontendKey);
-      if (app) { closeDialog(); await copyText(safeSpaceAppNavigationURL(workspace, app)); }
+      if (app) { closeDialog(); await copyText(safeSpaceAppURL(app)); }
       return;
     }
     if (action === "uninstall-wsl-app") {

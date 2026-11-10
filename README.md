@@ -214,6 +214,6 @@ essential-service exits, and shutdown.
 
 - `custom-backend-integration.md`: how custom shell-command apps are generated
   and installed.
-- `outerloop-icon-observation.md`: the Outer Loop/Outer Shell icon-discovery
-  navigation protocol.
+- `endpoint-icons.md`: how iconless apps get icons from OuterSSH's endpoint
+  icon cache, which Outer Loop fills.
 - `Resources/README.md`: release asset and app archive layouts.

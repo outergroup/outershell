@@ -180,7 +180,6 @@ private struct FrontendRecord {
     let iconPath: String?
     let iconByteCount: Int
     let iconCGImage: CGImage?
-    let iconObservationToken: String
     let isRunning: Bool
 
     var hasEndpoint: Bool {
@@ -467,7 +466,6 @@ private extension FrontendRecord {
                               iconPath: emptyToNil(try reader.stringRef(at: 24)),
                               iconByteCount: iconData.count,
                               iconCGImage: decodedIconCGImage(iconData),
-                              iconObservationToken: reader.data.count >= 72 ? try reader.stringRef(at: 64) : "",
                               isRunning: (flags & 0x01) != 0,
                               iconURL: (flags & 2) != 0 ? try reader.stringRef(at: 32) : nil)
     }
@@ -579,7 +577,6 @@ private struct LocalWorkspaceAppRecord: Decodable, Equatable {
     let url: String
     let iconPath: String
     let iconData: Data?
-    let iconObservationToken: String
     let isRunning: Bool
     let publishedPort: Int
     var iconURL: String? = nil
@@ -10345,7 +10342,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             launchingEndpoints.remove(key)
             backendError = ""
             updateLayout()
-            navigateToWorkspaceApp(workspaceAppNavigationURL(url, app: app),
+            navigateToWorkspaceApp(url,
                                    opensInNewTab: opensInNewTab,
                                    opensInNewWindow: opensInNewWindow)
             return
@@ -10362,7 +10359,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             launchingEndpoints.remove(key)
             backendError = ""
             updateLayout()
-            navigateToWorkspaceApp(workspaceAppNavigationURL(url, app: app),
+            navigateToWorkspaceApp(url,
                                    opensInNewTab: opensInNewTab,
                                    opensInNewWindow: opensInNewWindow)
             return
@@ -10389,8 +10386,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             }
             self.backendError = ""
             self.updateLayout()
-            let navigationURL = self.workspaceAppNavigationURL(url, app: app)
-            self.navigateToWorkspaceApp(navigationURL,
+            self.navigateToWorkspaceApp(url,
                                         opensInNewTab: opensInNewTab,
                                         opensInNewWindow: opensInNewWindow)
         })
@@ -10410,41 +10406,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             outerframeHost.navigate(to: url,
                                     displayString: nil)
         }
-    }
-
-    private func workspaceAppNavigationURL(_ targetURL: URL,
-                                           app: LocalWorkspaceAppRecord) -> URL {
-        if app.iconURL != nil || app.iconData?.isEmpty == false {
-            return targetURL
-        }
-        guard !app.iconObservationToken.isEmpty else {
-            return targetURL
-        }
-        guard let backendsEndpoint,
-              var callbackComponents = URLComponents(
-                url: backendsEndpoint,
-                resolvingAgainstBaseURL: false
-              ) else {
-            return targetURL
-        }
-        callbackComponents.path = "/api/icon-observation"
-        callbackComponents.queryItems = [
-            URLQueryItem(name: "token", value: app.iconObservationToken)
-        ]
-        guard let callbackURL = callbackComponents.url,
-              let callbackScheme = callbackURL.scheme?.lowercased(),
-              ["http", "https"].contains(callbackScheme) else {
-            return targetURL
-        }
-
-        var observationComponents = URLComponents()
-        observationComponents.scheme = "outerloop"
-        observationComponents.host = "observe-page-icon"
-        observationComponents.queryItems = [
-            URLQueryItem(name: "url", value: targetURL.absoluteString),
-            URLQueryItem(name: "callback", value: callbackURL.absoluteString)
-        ]
-        return observationComponents.url ?? targetURL
     }
 
     private func handlePublishedWorkspaceSocketResponse(_ payload: Data) {
@@ -16075,7 +16036,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 iconPath: app.iconPath,
                 iconByteCount: app.iconData?.count ?? 0,
                 iconCGImage: app.iconData.flatMap(decodedIconCGImage),
-                iconObservationToken: app.iconObservationToken,
                 isRunning: app.isRunning
             )
             let backend = BackendRecord(
@@ -16298,7 +16258,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 item.frontend.isRunning ? "running" : "stopped",
                 item.frontend.iconPath ?? "",
                 String(iconBytes),
-                item.frontend.iconObservationToken,
                 item.frontend.iconURL ?? "",
                 item.userEndpoint.map { frontendIdentityKey(backend: $0.backend, frontend: $0.frontend, frontendIndex: $0.frontendIndex) } ?? "",
                 item.userEndpoint?.backend.status ?? "",
@@ -22352,25 +22311,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             endpoint.frontend,
             socketPathOverride: socketPathOverride
         ) else { return nil }
-        let token = endpoint.frontend.iconObservationToken
-        guard endpoint.frontend.iconCGImage == nil, endpoint.frontend.iconURL == nil,
-              !token.isEmpty,
-              let backendsEndpoint,
-              var callbackComponents = URLComponents(url: backendsEndpoint, resolvingAgainstBaseURL: false) else {
-            return targetURL
-        }
-        callbackComponents.path = "/api/icon-observation"
-        callbackComponents.queryItems = [URLQueryItem(name: "token", value: token)]
-        guard let callbackURL = callbackComponents.url else { return targetURL }
-
-        var observationComponents = URLComponents()
-        observationComponents.scheme = "outerloop"
-        observationComponents.host = "observe-page-icon"
-        observationComponents.queryItems = [
-            URLQueryItem(name: "url", value: targetURL.absoluteString),
-            URLQueryItem(name: "callback", value: callbackURL.absoluteString)
-        ]
-        return observationComponents.url ?? targetURL
+        return targetURL
     }
 
     private func frontendNavigationURL(_ frontend: FrontendRecord) -> URL? {

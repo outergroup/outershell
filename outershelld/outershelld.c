@@ -46,6 +46,7 @@ extern char **environ;
 #include "../Resources/OuterShellPaths.h"
 #include "../Resources/LaunchdSocket.h"
 #include "OuterService.h"
+#include "EndpointIcons.h"
 
 #ifdef __APPLE__
 #include <mach-o/dyld.h>
@@ -1092,7 +1093,6 @@ typedef struct {
     int api_response_fd;
     bool waiting_for_snapshot;
     bool provider_snapshot;
-    bool provider_icon_observation;
     bool provider_environment_query;
     uint64_t snapshot_generation;
     pid_t provider_pid;
@@ -1331,16 +1331,10 @@ typedef unsigned char *(*OuterShelldSafeSpaceRequestCallback)(
     size_t *response_length,
     int *response_status
 );
-typedef int (*OuterShelldSafeSpaceIconObservationCallback)(
-    const char *token,
-    const unsigned char *body,
-    size_t body_length
-);
 static OuterShelldMenuBarVisibilityCallback g_menu_bar_visibility_callback = NULL;
 static OuterShelldMenuBarVisibilityGetter g_menu_bar_visibility_getter = NULL;
 static OuterShelldBackendEventChangedCallback g_backend_event_changed_callback = NULL;
 static OuterShelldSafeSpaceRequestCallback g_safe_space_request_callback = NULL;
-static OuterShelldSafeSpaceIconObservationCallback g_safe_space_icon_observation_callback = NULL;
 
 void OuterShelldSetMenuBarVisibilityCallbacks(OuterShelldMenuBarVisibilityCallback callback,
                                               OuterShelldMenuBarVisibilityGetter getter) {
@@ -1354,12 +1348,6 @@ void OuterShelldSetBackendEventChangedCallback(OuterShelldBackendEventChangedCal
 
 void OuterShelldSetSafeSpaceRequestCallback(OuterShelldSafeSpaceRequestCallback callback) {
     g_safe_space_request_callback = callback;
-}
-
-void OuterShelldSetSafeSpaceIconObservationCallback(
-    OuterShelldSafeSpaceIconObservationCallback callback
-) {
-    g_safe_space_icon_observation_callback = callback;
 }
 
 void OuterShelldMarkBackendEventChanged(void) {
@@ -2650,89 +2638,6 @@ int OuterShellRegistryRemoveContainer(const char *identifier,
     if (!registry_store_open_user_readwrite(&store, error, error_size)) return 0;
     (void)registry_store_remove_container(&store, identifier);
     return registry_store_close(&store, true, error, error_size) ? 1 : 0;
-}
-
-typedef struct IconObservationCapability {
-    char token[33];
-    char registry_path[PATH_MAX];
-    char service_id[PATH_MAX];
-    char frontend_id[PATH_MAX * 2];
-    struct IconObservationCapability *next;
-} IconObservationCapability;
-
-static IconObservationCapability *g_icon_observation_capabilities = NULL;
-
-static bool fill_random_bytes(unsigned char *bytes, size_t length) {
-    int fd = open("/dev/urandom", O_RDONLY);
-    if (fd < 0) return false;
-    size_t offset = 0;
-    while (offset < length) {
-        ssize_t count = read(fd, bytes + offset, length - offset);
-        if (count > 0) {
-            offset += (size_t)count;
-        } else if (count < 0 && errno == EINTR) {
-            continue;
-        } else {
-            close(fd);
-            return false;
-        }
-    }
-    close(fd);
-    return true;
-}
-
-static bool registry_store_is_primary(const RegistryStore *database) {
-    if (!database || !database->binary_path[0]) return false;
-    char primary_path[PATH_MAX];
-    return registry_binary_output_path(g_registry_database_path, primary_path, sizeof(primary_path)) &&
-           strcmp(database->binary_path, primary_path) == 0;
-}
-
-static const char *icon_observation_capability_token(const RegistryStore *database,
-                                                     const RegistryFrontendRecord *frontend) {
-    if (!database || !frontend || !frontend->frontend_id || !frontend->frontend_id[0] ||
-        (frontend->icon_path && frontend->icon_path[0]) ||
-        !registry_store_is_primary(database)) {
-        return "";
-    }
-    for (IconObservationCapability *capability = g_icon_observation_capabilities;
-         capability;
-         capability = capability->next) {
-        if (strcmp(capability->registry_path, database->binary_path) == 0 &&
-            strcmp(capability->frontend_id, frontend->frontend_id) == 0) {
-            return capability->token;
-        }
-    }
-
-    unsigned char random_bytes[16];
-    if (!fill_random_bytes(random_bytes, sizeof(random_bytes))) return "";
-    IconObservationCapability *capability = calloc(1, sizeof(*capability));
-    if (!capability) return "";
-    static const char hex[] = "0123456789abcdef";
-    for (size_t index = 0; index < sizeof(random_bytes); index++) {
-        capability->token[index * 2] = hex[random_bytes[index] >> 4];
-        capability->token[index * 2 + 1] = hex[random_bytes[index] & 0x0f];
-    }
-    capability->token[32] = '\0';
-    snprintf(capability->registry_path, sizeof(capability->registry_path), "%s", database->binary_path);
-    snprintf(capability->service_id,
-             sizeof(capability->service_id),
-             "%s",
-             frontend->service_id ? frontend->service_id : "");
-    snprintf(capability->frontend_id, sizeof(capability->frontend_id), "%s", frontend->frontend_id);
-    capability->next = g_icon_observation_capabilities;
-    g_icon_observation_capabilities = capability;
-    return capability->token;
-}
-
-static IconObservationCapability *icon_observation_capability_for_token(const char *token) {
-    if (!token || strlen(token) != 32) return NULL;
-    for (IconObservationCapability *capability = g_icon_observation_capabilities;
-         capability;
-         capability = capability->next) {
-        if (strcmp(capability->token, token) == 0) return capability;
-    }
-    return NULL;
 }
 
 static bool registry_store_upgrade_current(char *error, size_t error_size) {
@@ -4228,16 +4133,16 @@ static bool build_frontend_payload(const char *name,
                                    int port,
                                    const char *socket_path,
                                    const char *icon_path,
+                                   const char *icon_source_path,
                                    bool running,
-                                   const char *icon_observation_token,
                                    StringBuilder *payload) {
     char cached_icon_path[PATH_MAX];
-    const char *icon_data_path = frontend_icon_data_path(icon_path,
+    const char *icon_data_path = frontend_icon_data_path(icon_source_path,
                                                          cached_icon_path,
                                                          sizeof(cached_icon_path));
     char icon_url[128] = "";
     bool icon_is_url = g_web_icon_urls && web_icon_url(icon_data_path, icon_url, sizeof(icon_url));
-    if (!binary_append_zero(payload, 72)) return false;
+    if (!binary_append_zero(payload, 64)) return false;
     return binary_append_string_ref_at(payload, 0, name) &&
            binary_append_string_ref_at(payload, 8, url) &&
            binary_append_string_ref_at(payload, 16, socket_path) &&
@@ -4245,8 +4150,7 @@ static bool build_frontend_payload(const char *name,
            (icon_is_url ? binary_append_string_ref_at(payload, 32, icon_url) : binary_append_file_ref_at(payload, 32, icon_data_path)) &&
            binary_write_u32_at(payload, 48, (uint32_t)(port < 0 ? 0 : port)) &&
            binary_append_string_ref_at(payload, 52, frontend_id) &&
-           binary_write_u32_at(payload, 60, (running ? FRONTEND_FLAG_RUNNING : 0) | (icon_is_url ? 2u : 0u)) &&
-           binary_append_string_ref_at(payload, 64, icon_observation_token);
+           binary_write_u32_at(payload, 60, (running ? FRONTEND_FLAG_RUNNING : 0) | (icon_is_url ? 2u : 0u));
 }
 
 static bool build_log_file_payload(const char *service_id,
@@ -4290,14 +4194,25 @@ static bool build_frontends_array_payload(const RegistryStore *database,
                                                                     record->socket_path ? record->socket_path : "",
                                                                     url);
         }
+        const char *icon_source_path = record->icon_path;
+        char endpoint_icon_path[PATH_MAX];
+        if ((!icon_source_path || !icon_source_path[0]) &&
+            endpoint_icon_cached_path(record->external_socket_path && record->external_socket_path[0]
+                                          ? record->external_socket_path : record->socket_path,
+                                      record->host,
+                                      record->port,
+                                      endpoint_icon_path,
+                                      sizeof(endpoint_icon_path))) {
+            icon_source_path = endpoint_icon_path;
+        }
         ok = build_frontend_payload(record->display_name,
                                     frontend_id,
                                     url,
                                     record->port,
                                     record->socket_path,
                                     record->icon_path,
+                                    icon_source_path,
                                     frontend_running,
-                                    icon_observation_capability_token(database, record),
                                     &payload) &&
              binary_payload_list_append(&list, &payload);
         if (!ok) free(payload.data);
@@ -5182,173 +5097,8 @@ static void send_action_response(int fd, int status, bool ok_value, const char *
     send_action_response_ex(fd, status, ok_value, message, false);
 }
 
-static void send_safe_space_icon_observation_response(int fd,
-                                                      const char *query,
-                                                      const char *body,
-                                                      size_t body_length);
-
 static bool run_safe_space_provider(const char *body, size_t body_length,
                                     StringBuilder *output, int *exit_status);
-
-static void send_icon_observation_response(int fd,
-                                           const char *query,
-                                           const char *body,
-                                           size_t body_length) {
-    char token[64] = "";
-    if (!query_value(query, "token", token, sizeof(token))) {
-        send_action_response(fd, 400, false, "Missing icon observation token.");
-        return;
-    }
-    IconObservationCapability *capability = icon_observation_capability_for_token(token);
-    if (!capability) {
-        send_safe_space_icon_observation_response(fd, query, body, body_length);
-        return;
-    }
-    if (!body || body_length == 0 || body_length > 48u * 1024u) {
-        send_action_response(fd, 400, false, "Icon must be a non-empty PNG no larger than 48 KiB.");
-        return;
-    }
-
-    char error[512] = "";
-    RegistryStore database;
-    if (!registry_store_open_at(&database, capability->registry_path, true, error, sizeof(error))) {
-        send_action_response(fd, 500, false, error[0] ? error : "Could not open the app registry.");
-        return;
-    }
-    RegistryFrontendRecord *frontend = registry_store_find_frontend(&database, capability->frontend_id);
-    if (!frontend ||
-        strcmp(frontend->service_id ? frontend->service_id : "", capability->service_id) != 0) {
-        registry_store_close(&database, false, error, sizeof(error));
-        send_action_response(fd, 404, false, "The app for this icon observation no longer exists.");
-        return;
-    }
-    if (frontend->icon_path && frontend->icon_path[0]) {
-        registry_store_close(&database, false, error, sizeof(error));
-        send_action_response(fd, 200, true, "The app already has an icon.");
-        return;
-    }
-
-    char root[PATH_MAX];
-    char icon_directory[PATH_MAX];
-    char destination[PATH_MAX];
-    char temporary_path[PATH_MAX];
-    default_user_outershell_root(root, sizeof(root));
-    int directory_length = snprintf(icon_directory, sizeof(icon_directory), "%s/icons/discovered", root);
-    int destination_length = snprintf(destination, sizeof(destination), "%s/%s.png", icon_directory, token);
-    int temporary_length = snprintf(temporary_path, sizeof(temporary_path), "%s/.%s.XXXXXX", icon_directory, token);
-    if (directory_length < 0 || (size_t)directory_length >= sizeof(icon_directory) ||
-        destination_length < 0 || (size_t)destination_length >= sizeof(destination) ||
-        temporary_length < 0 || (size_t)temporary_length >= sizeof(temporary_path) ||
-        !mkdir_p(icon_directory)) {
-        registry_store_close(&database, false, error, sizeof(error));
-        send_action_response(fd, 500, false, "Could not create the discovered icon directory.");
-        return;
-    }
-
-    int icon_fd = mkstemp(temporary_path);
-    bool wrote_icon = icon_fd >= 0 && queue_all(icon_fd, body, body_length);
-    if (icon_fd >= 0) {
-        if (wrote_icon && fsync(icon_fd) != 0) wrote_icon = false;
-        if (close(icon_fd) != 0) wrote_icon = false;
-    }
-    if (!wrote_icon) {
-        unlink(temporary_path);
-        registry_store_close(&database, false, error, sizeof(error));
-        send_action_response(fd, 500, false, "Could not save the discovered icon.");
-        return;
-    }
-    chmod(temporary_path, 0644);
-
-    size_t width = 0;
-    size_t height = 0;
-    if (!outer_shell_png_dimensions(temporary_path, &width, &height, error, sizeof(error)) ||
-        width == 0 || height == 0 || width > 4096 || height > 4096) {
-        unlink(temporary_path);
-        registry_store_close(&database, false, error, sizeof(error));
-        send_action_response(fd, 400, false, "The observed icon is not a valid PNG of a supported size.");
-        return;
-    }
-    if (rename(temporary_path, destination) != 0) {
-        unlink(temporary_path);
-        registry_store_close(&database, false, error, sizeof(error));
-        send_action_response(fd, 500, false, "Could not install the discovered icon.");
-        return;
-    }
-    if (!registry_assign_string(&frontend->icon_path, destination)) {
-        unlink(destination);
-        registry_store_close(&database, false, error, sizeof(error));
-        send_action_response(fd, 500, false, "Out of memory while assigning the discovered icon.");
-        return;
-    }
-    if (!registry_store_close(&database, true, error, sizeof(error))) {
-        unlink(destination);
-        send_action_response(fd, 500, false, error[0] ? error : "Could not update the app registry.");
-        return;
-    }
-
-    mark_backend_event_changed();
-    send_action_response(fd, 200, true, "Discovered icon saved.");
-}
-
-static int validate_container_icon(const char *token, const char *body, size_t body_length) {
-    if (strlen(token) != 32 || strspn(token, "0123456789abcdef") != 32) return 403;
-    if (!body || !body_length || body_length > 48u * 1024u) return 400;
-    char path[] = "/tmp/outershell-observed-icon-XXXXXX";
-    int fd = mkstemp(path);
-    size_t width = 0, height = 0;
-    char error[256] = "";
-    bool valid = fd >= 0 && queue_all(fd, body, body_length);
-    if (fd >= 0 && close(fd) != 0) valid = false;
-    valid = valid && outer_shell_png_dimensions(path, &width, &height, error, sizeof(error)) &&
-            width > 0 && height > 0 && width <= 4096 && height <= 4096;
-    unlink(path);
-    return valid ? 200 : 400;
-}
-
-static void send_safe_space_icon_observation_response(int fd,
-                                                      const char *query,
-                                                      const char *body,
-                                                      size_t body_length) {
-    char token[64] = "";
-    if (!query_value(query, "token", token, sizeof(token))) {
-        send_action_response(fd, 400, false, "Missing icon observation token.");
-        return;
-    }
-    if (!body || body_length == 0 || body_length > 48u * 1024u) {
-        send_action_response(fd, 400, false, "Icon must be a non-empty PNG no larger than 48 KiB.");
-        return;
-    }
-    int status = 500;
-    if (g_safe_space_icon_observation_callback) {
-        status = g_safe_space_icon_observation_callback(token, (const unsigned char *)body, body_length);
-    } else {
-        status = validate_container_icon(token, body, body_length);
-        if (status != 200) {
-            send_action_response(fd, status, false, "Invalid icon observation token or PNG.");
-            return;
-        }
-        status = 500;
-        StringBuilder request = {0}, output = {0};
-        int exit_status = -1;
-        if (sb_append_n(&request, "OSCI", 4) && sb_append_n(&request, token, 32) &&
-            sb_append_n(&request, body, body_length) &&
-            run_safe_space_provider(request.data, request.length, &output, &exit_status) &&
-            exit_status == 0 && output.length == 3) {
-            if (memcmp(output.data, "200", 3) == 0) status = 200;
-            else if (memcmp(output.data, "403", 3) == 0) status = 403;
-            else if (memcmp(output.data, "400", 3) == 0) status = 400;
-        }
-        free(request.data);
-        free(output.data);
-    }
-    if (status == 200) {
-        send_action_response(fd, 200, true, "Discovered icon saved.");
-    } else if (status == 404) {
-        send_action_response(fd, 404, false, "The container app no longer exists.");
-    } else {
-        send_action_response(fd, status, false, "Could not save the discovered icon.");
-    }
-}
 
 static bool install_bundled_app(const BundledAppDefinition *app,
                                 const char *scope,
@@ -12307,9 +12057,6 @@ static void process_ui_route_request(uint16_t route, const char *query, const ch
     case OUTERSHELLD_UI_ROUTE_FILE_PICKER:
         send_file_picker_response(-1, query);
         break;
-    case OUTERSHELLD_UI_ROUTE_ICON_OBSERVATION:
-        send_icon_observation_response(-1, query, body, body_length);
-        break;
     case OUTERSHELLD_UI_ROUTE_SAFE_SPACES: {
         if (!g_safe_space_request_callback) {
             StringBuilder provider_output = {0};
@@ -12353,9 +12100,6 @@ static void process_ui_route_request(uint16_t route, const char *query, const ch
         free(result);
         break;
     }
-    case OUTERSHELLD_UI_ROUTE_SAFE_SPACE_ICON_OBSERVATION:
-        send_safe_space_icon_observation_response(-1, query, body, body_length);
-        break;
     default:
         send_text_response(-1, 400, "unsupported UI API route\n");
         break;
@@ -12573,27 +12317,6 @@ static bool collect_provider_response(ReactorClient *client) {
         return true;
     }
 
-    if (client->provider_icon_observation) {
-        int status = 500;
-        if (response.status == 200 && response.body.length == 3) {
-            if (!memcmp(response.body.data, "200", 3)) status = 200;
-            else if (!memcmp(response.body.data, "403", 3)) status = 403;
-            else if (!memcmp(response.body.data, "400", 3)) status = 400;
-        }
-        memset(&response.body, 0, sizeof(response.body));
-        UiApiResponse *previous_capture = g_captured_ui_response;
-        g_captured_ui_response = &response;
-        send_action_response(-1, status, status == 200,
-                             status == 200 ? "Discovered icon saved." : "Could not save the discovered icon.");
-        g_captured_ui_response = previous_capture;
-        if (status == 200) {
-            g_snapshot_generation++;
-            g_snapshot_refresh_ms = 0;
-        }
-        api_send_ui_response(client->fd, &response);
-        ui_api_response_free(&response);
-        return true;
-    }
     if (client->provider_snapshot) {
         if (client->snapshot_generation == g_snapshot_generation) {
             g_snapshot_refresh_failed = response.status != 200 || !container_snapshot_valid(&response.body);
@@ -12663,33 +12386,6 @@ static bool process_api_ui_request(ReactorClient *client, const unsigned char *m
             return true;
         }
         ui_api_set_text_response(&response, 503, "Could not start the container provider.\n");
-    } else if (!g_safe_space_icon_observation_callback && !g_safe_space_request_callback &&
-               (route == OUTERSHELLD_UI_ROUTE_ICON_OBSERVATION ||
-                route == OUTERSHELLD_UI_ROUTE_SAFE_SPACE_ICON_OBSERVATION)) {
-        char token[64] = "";
-        bool has_token = query_value(query ? query : "", "token", token, sizeof(token));
-        if (route == OUTERSHELLD_UI_ROUTE_ICON_OBSERVATION && icon_observation_capability_for_token(token)) {
-            process_ui_route_request(route, query ? query : "", (const char *)body, body_length, &response);
-        } else {
-            int status = has_token ? validate_container_icon(token, (const char *)body, body_length) : 400;
-            StringBuilder request = {0};
-            if (status == 200) {
-                if (sb_append_n(&request, "OSCI", 4) && sb_append_n(&request, token, 32) &&
-                    sb_append_n(&request, (const char *)body, body_length) &&
-                    start_provider_request(client, request.data, request.length)) {
-                    client->provider_icon_observation = true;
-                    free(request.data);
-                    free(query);
-                    return true;
-                }
-                status = 503;
-            }
-            free(request.data);
-            UiApiResponse *previous_capture = g_captured_ui_response;
-            g_captured_ui_response = &response;
-            send_action_response(-1, status, false, "Could not save the discovered icon.");
-            g_captured_ui_response = previous_capture;
-        }
     } else {
         process_ui_route_request(route, query ? query : "", (const char *)body, body_length, &response);
     }
