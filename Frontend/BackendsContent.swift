@@ -14085,7 +14085,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         defer { elasticScrolling.present() }
         let multiplier: CGFloat = precise ? 1 : wheelScrollLineHeight
         if managementPanel != nil {
-            managementScroll = elasticScrolling.scroll("management", by: -delta.y * multiplier, offset: managementScroll, maximum: managementScrollLimit, viewport: max(managementPanelFrame.height - 108, 1), phase: phase, momentumPhase: momentumPhase, precise: precise, direction: 1) { [weak self] in self.map { [$0.managementScrollLayer].compactMap { $0 } } ?? [] }
+            managementScroll = elasticScrolling.scroll("management", by: -delta.y * multiplier, offset: managementScroll, maximum: managementScrollLimit, viewport: managementViewportHeight, phase: phase, momentumPhase: momentumPhase, precise: precise, direction: 1) { [weak self] in self.map { [$0.managementScrollLayer].compactMap { $0 } } ?? [] }
             updateLayout()
             return
         }
@@ -17696,6 +17696,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private var mountScrollLayer: CALayer?
     private var managementScroll: CGFloat = 0
     private var managementScrollLimit: CGFloat = 0
+    private var managementViewportHeight: CGFloat = 1
 
     private func showManagementPanel(id: UUID, title: String, detail: String, items: [OuterframeContextMenuItem]) {
         managementPanel = ManagementPanel(id: id, title: title, detail: detail, items: items)
@@ -17719,6 +17720,60 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         updateLayout()
     }
 
+    private func managementRowDetailLines(_ item: OuterframeContextMenuItem, rowWidth: CGFloat) -> [String] {
+        let parts = item.title.components(separatedBy: " — ")
+        guard parts.count > 1 else { return [] }
+        return dockerfileWrappedLines(parts.dropFirst().joined(separator: " — "),
+                                      width: max(rowWidth - 94, 1),
+                                      font: .systemFont(ofSize: 11)).map(\.text)
+    }
+
+    private func managementLabelLines(_ item: OuterframeContextMenuItem, width: CGFloat) -> [String] {
+        dockerfileWrappedLines(item.title, width: max(width, 1), font: .systemFont(ofSize: 13)).map(\.text)
+    }
+
+    private func isManagementSectionHeader(_ item: OuterframeContextMenuItem) -> Bool {
+        if case .label = item.kind { return item.style.fontSize > 0 }
+        return false
+    }
+
+    private func managementItemLayout(_ items: [OuterframeContextMenuItem],
+                                      width: CGFloat) -> (offsets: [CGFloat], heights: [CGFloat], total: CGFloat) {
+        var offsets: [CGFloat] = []
+        var heights: [CGFloat] = []
+        var y: CGFloat = 0
+        var previous: OuterframeContextMenuItem?
+        for item in items {
+            let height: CGFloat
+            var gap: CGFloat = 0
+            switch item.kind {
+            case .separator:
+                height = 0
+                gap = previous == nil ? 0 : 12
+            case .label:
+                if isManagementSectionHeader(item) {
+                    height = 22
+                    gap = previous == nil ? 0 : 18
+                } else {
+                    height = CGFloat(managementLabelLines(item, width: width).count) * ceil(13 * 1.5)
+                    gap = previous == nil ? 0 : 8
+                }
+            default:
+                let lines = managementRowDetailLines(item, rowWidth: width).count
+                height = lines == 0 ? 44 : 42 + CGFloat(lines) * 16
+                if let previous, !isManagementSectionHeader(previous) {
+                    gap = 8
+                }
+            }
+            y += gap
+            offsets.append(y)
+            heights.append(height)
+            y += height
+            previous = item
+        }
+        return (offsets, heights, y)
+    }
+
     private func renderManagementPanel(width: CGFloat, height: CGFloat) {
         managementOverlayLayer.removeFromSuperlayer()
         managementOverlayLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
@@ -17728,40 +17783,58 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         managementOverlayLayer.frame = CGRect(x: 0, y: 0, width: width, height: height)
         managementOverlayLayer.backgroundColor = resolvedCGColor(NSColor.black.withAlphaComponent(0.25))
         rootLayer.addSublayer(managementOverlayLayer)
+        let panelWidth = min(max(width - 40, 260), 560)
+        let contentWidth = panelWidth - 48
+        let headerDetailLines = model.detail.isEmpty
+            ? 0
+            : dockerfileWrappedLines(model.detail, width: contentWidth, font: .systemFont(ofSize: 13)).count
+        let headerHeight: CGFloat = 70 + (headerDetailLines == 0 ? 0 : CGFloat(headerDetailLines) * ceil(13 * 1.5) + 6)
+        let layout = managementItemLayout(model.items, width: contentWidth)
+        let panelHeight = min(max(height - 40, 160), headerHeight + layout.total + 24)
         let panel = CALayer()
-        let panelWidth = min(max(width - 40, 260), 740)
-        let panelHeight = min(max(height - 40, 240), 620)
-        panel.frame = CGRect(x: (width - panelWidth) / 2, y: (height - panelHeight) / 2, width: panelWidth, height: panelHeight)
+        panel.frame = CGRect(x: floor((width - panelWidth) / 2), y: floor((height - panelHeight) / 2), width: panelWidth, height: panelHeight)
         managementPanelFrame = panel.frame
         applyPopoverStyle(panel)
         panel.backgroundColor = resolvedCGColor(.windowBackgroundColor)
         managementOverlayLayer.addSublayer(panel)
-        let title = makeTextLayer(size: 21, weight: .semibold, color: .labelColor)
+        let title = makeTextLayer(size: 19, weight: .semibold, color: .labelColor)
         title.string = model.title
-        title.frame = CGRect(x: 24, y: panelHeight - 57, width: panelWidth - 100, height: 30)
+        title.frame = CGRect(x: 24, y: panelHeight - 52, width: panelWidth - 90, height: 28)
         panel.addSublayer(title)
         let close = makeSymbolButtonLayer(symbolName: "xmark", accessibilityTitle: "Close")
-        close.frame = CGRect(x: panelWidth - 58, y: panelHeight - 58, width: 34, height: 34)
+        close.frame = CGRect(x: panelWidth - 54, y: panelHeight - 55, width: 34, height: 34)
         panel.addSublayer(close)
         managementActions.append((rootLayer.convert(close.frame, from: panel), "close", "Close"))
+        if headerDetailLines > 0 {
+            _ = agentText(model.detail, in: panel, left: 24, top: panelHeight - 58, width: contentWidth, size: 13)
+        }
         let viewport = CALayer()
-        viewport.frame = CGRect(x: 24, y: 24, width: panelWidth - 48, height: panelHeight - 108)
+        viewport.frame = CGRect(x: 24, y: 24, width: contentWidth, height: max(panelHeight - headerHeight - 24, 1))
         viewport.masksToBounds = true
         panel.addSublayer(viewport)
         managementScrollLayer = viewport
-        var y = viewport.bounds.height + managementScroll
-        y = agentText(model.detail, in: viewport, left: 0, top: y, width: viewport.bounds.width, size: 13) - 24
-        for item in model.items {
-            if case .separator = item.kind { y -= 12; continue }
+        managementViewportHeight = viewport.bounds.height
+        let top = viewport.bounds.height + managementScroll
+        for (index, item) in model.items.enumerated() {
+            let rowHeight = layout.heights[index]
+            let rowTop = top - layout.offsets[index]
+            if case .separator = item.kind { continue }
             if case .label = item.kind {
-                y = agentText(item.title, in: viewport, left: 0, top: y, width: viewport.bounds.width, size: 13) - 20
+                if isManagementSectionHeader(item) {
+                    let header = makeTextLayer(size: 11, weight: .semibold, color: .secondaryLabelColor)
+                    header.string = item.title.uppercased()
+                    header.frame = CGRect(x: 2, y: rowTop - 18, width: contentWidth - 4, height: 16)
+                    viewport.addSublayer(header)
+                } else {
+                    _ = agentText(item.title, in: viewport, left: 0, top: rowTop, width: contentWidth, size: 13)
+                }
                 continue
             }
             let parts = item.title.components(separatedBy: " — ")
-            let rowHeight: CGFloat = parts.count > 1 ? 96 : 56
+            let detailLines = managementRowDetailLines(item, rowWidth: contentWidth)
             let row = CALayer()
-            row.frame = CGRect(x: 0, y: y - rowHeight, width: viewport.bounds.width, height: rowHeight)
-            row.cornerRadius = 10
+            row.frame = CGRect(x: 0, y: rowTop - rowHeight, width: contentWidth, height: rowHeight)
+            row.cornerRadius = 9
             row.backgroundColor = resolvedCGColor(.controlBackgroundColor)
             row.borderWidth = 0.5
             row.borderColor = resolvedCGColor(.separatorColor)
@@ -17769,24 +17842,37 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             viewport.addSublayer(row)
             let destructive = item.id == "delete"
             let icon = CALayer()
-            icon.contents = symbolCGImage(named: item.systemImageName, pointSize: 20, color: destructive ? .systemRed : .controlAccentColor)
+            icon.contents = symbolCGImage(named: item.systemImageName, pointSize: 17, color: destructive ? .systemRed : .controlAccentColor)
             icon.contentsGravity = .resizeAspect
-            icon.frame = CGRect(x: 16, y: rowHeight - 40, width: 24, height: 24)
+            icon.frame = CGRect(x: 14, y: floor((rowHeight - 22) / 2), width: 22, height: 22)
             row.addSublayer(icon)
-            let heading = makeTextLayer(size: 14, weight: .medium, color: destructive ? .systemRed : .labelColor)
+            let textHeight = 20 + CGFloat(detailLines.count) * 16
+            let textTop = floor((rowHeight + textHeight) / 2)
+            let heading = makeTextLayer(size: 13, weight: .medium, color: destructive ? .systemRed : .labelColor)
             heading.string = parts[0]
-            heading.frame = CGRect(x: 54, y: rowHeight - 38, width: row.bounds.width - 70, height: 22)
+            heading.frame = CGRect(x: 50, y: textTop - 20, width: contentWidth - 94, height: 20)
             row.addSublayer(heading)
-            if parts.count > 1 {
-                _ = agentText(parts.dropFirst().joined(separator: " — "), in: row, left: 54, top: rowHeight - 42, width: row.bounds.width - 70, size: 11)
+            for (lineIndex, line) in detailLines.enumerated() {
+                let label = makeTextLayer(size: 11, weight: .regular, color: .secondaryLabelColor)
+                label.string = line
+                label.frame = CGRect(x: 50, y: textTop - 20 - CGFloat(lineIndex + 1) * 16, width: contentWidth - 94, height: 16)
+                row.addSublayer(label)
+            }
+            if item.isEnabled {
+                let chevron = CALayer()
+                chevron.contents = symbolCGImage(named: item.id.hasPrefix("setup:") ? "arrow.up.right" : "chevron.right",
+                                                 pointSize: 11,
+                                                 color: .tertiaryLabelColor)
+                chevron.contentsGravity = .resizeAspect
+                chevron.frame = CGRect(x: contentWidth - 30, y: floor((rowHeight - 14) / 2), width: 14, height: 14)
+                row.addSublayer(chevron)
             }
             let visible = row.frame.intersection(viewport.bounds)
             if item.isEnabled, !visible.isEmpty {
                 managementActions.append((rootLayer.convert(visible, from: viewport), item.id, item.title))
             }
-            y -= rowHeight + 12
         }
-        managementScrollLimit = max(managementScroll - y, 0)
+        managementScrollLimit = max(layout.total - viewport.bounds.height, 0)
     }
 
     private func showSafeSpaceProviderMenu(at point: CGPoint) {
@@ -17797,23 +17883,21 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         pendingSafeSpaceProviderMenuSelections[menuID] = Dictionary(
             uniqueKeysWithValues: providers.map { ($0.id, $0.id) }
         )
-        var items = providers.map { provider in
-            OuterframeContextMenuItem(
-                id: provider.id,
-                title: "\(provider.name) — \(provider.detail)",
-                isEnabled: provider.canCreate,
-                systemImageName: provider.capabilities.supportsLiveMounts
-                    ? "server.rack"
-                    : "shippingbox"
-            )
-        }
-        for provider in providers where provider.isAvailable != true {
-            if let setupURL = provider.setupURL, URL(string: setupURL)?.scheme == "https" {
+        let sectionStyle = OuterframeContextMenuItemStyle(fontSize: 11, fontWeight: 0.4)
+        var items = [OuterframeContextMenuItem(id: "section:create", title: "New container", kind: .label, isEnabled: false, style: sectionStyle)]
+        for provider in providers {
+            let symbol = provider.capabilities.supportsLiveMounts ? "server.rack" : "shippingbox"
+            if !provider.canCreate,
+               let setupURL = provider.setupURL,
+               URL(string: setupURL)?.scheme == "https" {
                 let id = "setup:" + provider.id
                 pendingSafeSpaceProviderMenuSelections[menuID]?[id] = setupURL
-                items.append(OuterframeContextMenuItem(id: id, title: "\(provider.name) setup instructions…", isEnabled: true, systemImageName: "book"))
+                items.append(OuterframeContextMenuItem(id: id, title: "\(provider.name) — \(provider.detail) View setup instructions…", isEnabled: true, systemImageName: symbol))
+            } else {
+                items.append(OuterframeContextMenuItem(id: provider.id, title: "\(provider.name) — \(provider.detail)", isEnabled: provider.canCreate, systemImageName: symbol))
             }
         }
+        items.append(OuterframeContextMenuItem(id: "section:manage", title: "Manage", kind: .label, isEnabled: false, style: sectionStyle))
         pendingSafeSpaceProviderMenuSelections[menuID]?["import"] = "import"
         items.append(OuterframeContextMenuItem(id: "import", title: "Import container… — Restore a container from a saved file.", isEnabled: providers.contains(where: \.canCreate), systemImageName: "square.and.arrow.down"))
         if providers.contains(where: { ($0.id == "apple.container" || $0.id == "docker") && $0.isAvailable == true }) {
@@ -17822,7 +17906,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         }
         pendingSafeSpaceProviderMenuSelections[menuID]?["check"] = "check"
         items.append(OuterframeContextMenuItem(id: "check", title: "Check runtimes again", isEnabled: true, systemImageName: "arrow.clockwise"))
-        showManagementPanel(id: menuID, title: "Manage containers", detail: "Choose a runtime to create a container, import a saved container, review setup instructions, or manage container storage.", items: items)
+        showManagementPanel(id: menuID, title: "Manage containers", detail: "", items: items)
     }
 
     private func showContainerPathMenu(at point: CGPoint) {
@@ -19417,7 +19501,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                     ? 184
                     : (isBaseImageChoicePrompt
                         ? 310
-                        : (isCreatingWorkspace && !isEditingCreationBaseImage ? 224 : 174))))
+                        : (isCreatingWorkspace && !isEditingCreationBaseImage ? 274 : 174))))
         workspacePanelFrame = CGRect(x: floor((width - panelWidth) / 2),
                                      y: floor((height - panelHeight) / 2),
                                      width: panelWidth,
