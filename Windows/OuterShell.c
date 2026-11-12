@@ -9,6 +9,8 @@
 static const char *shell_id = "org.outershell.OuterShell", *files_id = "org.outershell.Files";
 typedef struct CommandApp CommandApp;
 typedef struct {
+    bool administrator, elevated, local_setup;
+    ULONGLONG admin_queried, admin_revision;
     CommandApp *commands;
     char *state, *registry, *directory, *web, *service_name;
     HANDLE stop, files, job;
@@ -70,7 +72,8 @@ static bool store_close(ShellHost *s, RegistryStore *store, bool commit) {
     }
     bool saved = registry_store_close(store, commit, error, sizeof(error));
     if (!saved) log_error(s, error);
-    else if (!ok || !win_publish_endpoint_names("outershell", &names)) log_error(s, "Could not publish endpoint names.");
+    else if (!s->elevated && (!ok || !win_publish_endpoint_names(s->administrator ? "outershell-administrator" : "outershell", &names)))
+        log_error(s, "Could not publish endpoint names.");
     free(names.data);
     return saved;
 }
@@ -91,6 +94,7 @@ static bool update_allowlist(ShellHost *s) {
 #include "Commands.inc"
 #include "Updates.inc"
 #include "BundledApps.inc"
+#include "AdminCommands.inc"
 #include "Setup.inc"
 #include "Uninstall.inc"
 static bool legacy_files_running(ShellHost *s) {
@@ -228,18 +232,26 @@ static int compare_backends(const void *a, const void *b) {
     return _stricmp(((const RegistryBackendRecord *)a)->display_name,
                     ((const RegistryBackendRecord *)b)->display_name);
 }
+static StringBuilder bundled_catalog_row(const BundledApp *app, const char *scope) {
+    StringBuilder row = payload(116);
+    payload_text(&row, 0, app->id); payload_text(&row, 8, app->name);
+    payload_text(&row, 32, scope); payload_text(&row, 40, "not installed"); payload_text(&row, 48, app->symbol);
+    payload_u32(&row, 64, 4);
+    uint32_t empty = 0; payload_data(&row, 68, &empty, 4); payload_data(&row, 76, &empty, 4);
+    return row;
+}
 static StringBuilder backends(ShellHost *s) {
     RegistryStore store;
     if (!store_open(s, &store, false))
         return (StringBuilder){0};
     qsort(store.backends, store.backend_count, sizeof(*store.backends), compare_backends);
     size_t catalog_count = 0;
-    for (size_t i = 0; i < sizeof(bundled_apps) / sizeof(*bundled_apps); i++)
+    for (size_t i = 0; !s->administrator && i < sizeof(bundled_apps) / sizeof(*bundled_apps); i++)
         if (!registry_store_find_backend(&store, bundled_apps[i].id)) catalog_count++;
     StringBuilder result = payload(12 + (store.backend_count + catalog_count) * 8);
     payload_u32(&result, 8, (uint32_t)(store.backend_count + catalog_count));
     char *sid = win_sid();
-    const char *scope = (sid && !strcmp(sid, "S-1-5-18")) ? "system" : "user";
+    const char *scope = s->administrator || (sid && !strcmp(sid, "S-1-5-18")) ? "system" : "user";
     free(sid);
     for (size_t i = 0; i < store.backend_count; i++) {
         RegistryBackendRecord *b = &store.backends[i];
@@ -253,7 +265,7 @@ static StringBuilder backends(ShellHost *s) {
             if (win_read_file(result_path, 512, &update_result) && update_result.data && !strncmp(update_result.data, "Update failed", 13)) status = update_result.data;
             free(result_path);
         } else if (bundled_find(b->service_id)) {
-            char *task = bundled_task_name(bundled_find(b->service_id));
+            char *task = bundled_host_task_name(s, bundled_find(b->service_id));
             DWORD state = 0;
             running = SUCCEEDED(command_task(task, "query", NULL, &state)) && state == TASK_STATE_RUNNING;
             free(task);
@@ -306,7 +318,7 @@ static StringBuilder backends(ShellHost *s) {
             free(app.data);
         }
         StringBuilder row = payload(116);
-        if (!strcmp(b->service_id, shell_id)) {
+        if (!strcmp(b->service_id, shell_id) && !s->administrator) {
             payload_text(&row, 84, OUTERSHELL_VERSION);
             EnterCriticalSection(&update_gate);
             payload_text(&row, 92, update_version);
@@ -318,7 +330,7 @@ static StringBuilder backends(ShellHost *s) {
         payload_text(&row, 16, b->unit_name);
         payload_text(&row, 32, scope);
         payload_text(&row, 40, status);
-        payload_u32(&row, 64, 8u | (controls ? 1u : 0u) | (command_find(s, b->service_id) ? 2u : 0u) | (bundled_find(b->service_id) ? 6u : 0u));
+        payload_u32(&row, 64, 8u | (controls ? 1u : 0u) | ((command_find(s, b->service_id) || bundled_find(b->service_id)) && (!s->administrator || s->local_setup) ? 2u : 0u) | (bundled_find(b->service_id) ? 4u : 0u));
         payload_data(&row, 68, apps.data, apps.length);
         uint32_t empty = 0;
         if (command_find(s, b->service_id)) {
@@ -335,14 +347,10 @@ static StringBuilder backends(ShellHost *s) {
         free(apps.data);
     }
     size_t catalog_index = store.backend_count;
-    for (size_t i = 0; i < sizeof(bundled_apps) / sizeof(*bundled_apps); i++) {
+    for (size_t i = 0; !s->administrator && i < sizeof(bundled_apps) / sizeof(*bundled_apps); i++) {
         const BundledApp *app = &bundled_apps[i];
         if (registry_store_find_backend(&store, app->id)) continue;
-        StringBuilder row = payload(116);
-        payload_text(&row, 0, app->id); payload_text(&row, 8, app->name);
-        payload_text(&row, 32, "user"); payload_text(&row, 40, "not installed"); payload_text(&row, 48, app->symbol);
-        payload_u32(&row, 64, 4);
-        uint32_t empty = 0; payload_data(&row, 68, &empty, 4); payload_data(&row, 76, &empty, 4);
+        StringBuilder row = bundled_catalog_row(app, "user");
         payload_data(&result, 12 + catalog_index++ * 8, row.data, row.length); free(row.data);
     }
     if (!store_close(s, &store, false)) {
@@ -351,10 +359,82 @@ static StringBuilder backends(ShellHost *s) {
     }
     return result;
 }
+// Lists the user's backends, then the administrator's, then, for a local
+// client, the bundled apps it may still install as administrator.
+static StringBuilder all_backends(ShellHost *s, bool local_setup) {
+    StringBuilder parts[2] = {backends(s), {0}};
+    if (!parts[0].data) return parts[0];
+    bool installed[sizeof(bundled_apps) / sizeof(*bundled_apps)] = {0};
+    ShellHost admin = {0};
+    bool loaded = admin_host(&admin, false);
+    if (loaded) {
+        admin.local_setup = local_setup;
+        free(admin.web);
+        admin.web = win_strdup(s->web);
+        commands_load(&admin);
+        update_allowlist(&admin);
+        parts[1] = backends(&admin);
+        RegistryStore store;
+        if (store_open(&admin, &store, false)) {
+            for (size_t i = 0; i < sizeof(bundled_apps) / sizeof(*bundled_apps); i++)
+                installed[i] = registry_store_find_backend(&store, bundled_apps[i].id) != NULL;
+            store_close(&admin, &store, false);
+        }
+    }
+    uint32_t counts[2];
+    size_t total = 0;
+    for (size_t j = 0; j < 2; j++) {
+        counts[j] = parts[j].length >= 12 ? read_uint32_le((unsigned char *)parts[j].data + 8) : 0;
+        total += counts[j];
+    }
+    for (size_t i = 0; i < sizeof(bundled_apps) / sizeof(*bundled_apps); i++)
+        if (local_setup && bundled_apps[i].administrator && !installed[i]) total++;
+    StringBuilder result = payload(12 + total * 8);
+    payload_u32(&result, 8, (uint32_t)total);
+    size_t index = 0;
+    for (size_t j = 0; j < 2; j++) {
+        for (uint32_t i = 0; i < counts[j]; i++) {
+            unsigned char *ref = (unsigned char *)parts[j].data + 12 + i * 8;
+            uint32_t offset = read_uint32_le(ref), length = read_uint32_le(ref + 4);
+            payload_data(&result, 12 + index++ * 8, parts[j].data + offset, length);
+        }
+        free(parts[j].data);
+    }
+    for (size_t i = 0; i < sizeof(bundled_apps) / sizeof(*bundled_apps); i++) {
+        if (!local_setup || !bundled_apps[i].administrator || installed[i]) continue;
+        StringBuilder row = bundled_catalog_row(&bundled_apps[i], "system");
+        payload_data(&result, 12 + index++ * 8, row.data, row.length);
+        free(row.data);
+    }
+    if (loaded) admin_host_free(&admin);
+    return result;
+}
 static StringBuilder control(ShellHost *s, HttpRequest *r) {
     char task_error[256];
     char *id = http_query(r, "serviceID"), *operation = http_query(r, "operation");
     bool ok = false;
+    char *scope = http_query(r, "scope");
+    if (scope && !strcmp(scope, "system")) {
+        free(scope);
+        ShellHost admin = {0};
+        if (admin_host(&admin, false)) {
+            commands_load(&admin);
+            CommandApp *app = id ? command_find(&admin, id) : NULL;
+            const BundledApp *bundled = id ? bundled_find(id) : NULL;
+            char *task = app ? win_strdup(app->task_name) : bundled && bundled->administrator ? bundled_admin_task_name(bundled) : NULL;
+            if (task && operation && (!strcmp(operation, "start") || !strcmp(operation, "stop") || !strcmp(operation, "restart")))
+                ok = SUCCEEDED(command_task(task, operation, NULL, NULL));
+            free(task);
+            admin_host_free(&admin);
+        }
+        free(id); free(operation);
+        StringBuilder result = payload(28);
+        payload_u32(&result, 0, ok ? 1 : 0);
+        payload_text(&result, 4, ok ? "Completed." : "Manage this administrator task locally in Windows Task Scheduler.");
+        changed(s);
+        return result;
+    }
+    free(scope);
     const char *message = "This operation is not supported for this backend.";
     if (id && operation && bundled_find(id)) {
         ok = bundled_control(s, bundled_find(id), operation, task_error, sizeof(task_error));
@@ -496,6 +576,10 @@ static void serve_http(Connection *c, void *context) {
         http_free(&r);
         return;
     }
+    if (admin_commands_request(s, c, &r) || admin_control_request(s, c, &r)) {
+        http_free(&r);
+        return;
+    }
     if (serve_outerframe(s, c, &r)) {
         http_free(&r);
         return;
@@ -521,11 +605,12 @@ static void serve_http(Connection *c, void *context) {
         if (handles) { http_free(&r); return; }
     }
     if (!strcmp(r.path, "/api/backends") && !strcmp(r.method, "GET")) update_interacted(s);
+    bool local_setup = admin_local_client(c);
     EnterCriticalSection(&s->gate);
     StringBuilder body = {0};
     int status = 200;
     if (!strcmp(r.path, "/api/backends"))
-        body = backends(s);
+        body = all_backends(s, local_setup);
     else if (!strcmp(r.path, "/api/layout"))
         body = layout(s, &r, &status);
     else if (!strcmp(r.path, "/api/events")) {
@@ -540,6 +625,7 @@ static void serve_http(Connection *c, void *context) {
         while (previous == s->version && GetTickCount64() < deadline &&
                WaitForSingleObject(s->stop, 0) != WAIT_OBJECT_0) {
             bundled_poll(s);
+            admin_refresh(s);
             for (CommandApp *a = s->commands; a; a = a->next) command_running(s, a);
             current_overview = (s->version << 32) ^ wsl_version(s->wsl);
             if (previous != s->version || prior_overview != current_overview)
@@ -565,7 +651,17 @@ static void serve_http(Connection *c, void *context) {
             body = control(s, &r);
     } else if (!strcmp(r.path, "/api/logs")) {
         if (strcmp(r.method, "GET")) status = 405;
-        else body = command_logs(s, &r);
+        else {
+            char *scope = http_query(&r, "scope"), *id = http_query(&r, "serviceID");
+            bool system = scope ? !strcmp(scope, "system") : id && !command_find(s, id);
+            ShellHost admin = {0};
+            if (system && admin_host(&admin, false)) {
+                commands_load(&admin);
+                body = command_logs(&admin, &r);
+                admin_host_free(&admin);
+            } else body = command_logs(s, &r);
+            free(scope); free(id);
+        }
     } else if (!strcmp(r.path, "/api/create")) {
         if (strcmp(r.method, "POST")) status = 405;
         else body = command_create(s, &r);
@@ -641,7 +737,7 @@ static bool shell_start(ShellHost *s) {
     }
     for (size_t i = 0; ok && i < sizeof(bundled_apps) / sizeof(*bundled_apps); i++) {
         char *task = bundled_task_name(&bundled_apps[i]); DWORD task_state = 0;
-        if (SUCCEEDED(command_task(task, "query", NULL, &task_state))) ok = bundled_registered(&store, &bundled_apps[i]);
+        if (SUCCEEDED(command_task(task, "query", NULL, &task_state))) ok = bundled_registered(s, &store, &bundled_apps[i]);
         free(task);
     }
     ok = store_close(s, &store, ok) && ok;
@@ -740,6 +836,7 @@ int wmain(int argc, wchar_t **argv) {
     if (argc == 2 && !wcscmp(argv[1], L"--setup-install")) return setup_tasks("install");
     if (argc == 2 && !wcscmp(argv[1], L"--setup-stop")) return setup_tasks("stop");
     if (argc == 2 && !wcscmp(argv[1], L"--setup-remove")) return setup_tasks("remove");
+    if (argc == 4 && !wcscmp(argv[1], L"--apply-admin-command")) return admin_apply_command(argv[2], argv[3]);
     if (argc == 2 && !wcscmp(argv[1], L"--wsl-list")) return wsl_inspect();
     bool service = false, initialize = false;
     char *run_command_id = NULL;

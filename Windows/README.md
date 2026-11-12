@@ -317,14 +317,84 @@ logs, process-tree cleanup, persistence, restart, and uninstall. Run both as the
 signed-in desktop user, with existing same-user hosts stopped for the latter.
 
 
-### Administrator backends
+### Administrator commands
 
-The built-in Windows experience creates ordinary-user tasks only. It does not
-provide an Administrator card, elevated command setup, or a UAC setup utility.
-Previously created administrator tasks are not deleted or automatically surfaced.
-Custom backends registered explicitly through the registry API remain supported;
-their privileges and named-pipe permissions are the responsibility of their owner.
-Linux root backends inside WSL retain the normal Linux authorization flow.
+Administrator → Add more… → Run commands is available in both frontends.
+Remote sessions explain that setup must be performed locally, because the UAC
+prompt appears on the local desktop. In Windows Localhost mode it uses the usual
+inline command form. Creating the app requests UAC approval and launches a
+short-lived elevated helper to apply the submitted values. Success closes the
+form; cancellation or failure leaves its values intact.
+
+Administrator apps must listen on a named pipe whose name ends in
+`.s-1-5-32-544`, owned by Administrators, which is the default owner for an
+elevated process. The default DACL only lets your unelevated account read the
+pipe, so the server must also grant your account read and write access, such as
+`0x12019b`, without `FILE_CREATE_PIPE_INSTANCE`, `WRITE_DAC`, or `WRITE_OWNER`.
+Outer Loop treats such pipes as elevated and keeps pages from less privileged
+origins from acting on them.
+TCP ports cannot be protected this way, so they are not offered. Ordinary
+commands cannot use that suffix. Administrator pipes are added to the HTTP
+allowlist by the unelevated Outer Shell when it lists them, and they have no
+activation mapping, because Outer Loop activates only non-elevated tasks.
+Start them from the Administrator card.
+
+`GET /api/admin-commands` reports `localSetup`. POST accepts a bounded form only
+when Windows reports that the named-pipe client belongs to the same nonzero
+desktop session as Outer Shell. Windows OpenSSH clients are in session zero and
+receive HTTP 403, even if their SSH token is elevated. `/api/create` continues to
+reject system scope. The helper receives the form and returns the normal action
+result over a private, randomly named, local-only pipe. Outer Shell verifies the
+client PID matches the process launched through UAC before sending any commands.
+The helper requires elevation, the same account, and the same desktop session.
+No command text is passed on the process command line or stored in a staging file.
+
+Approved commands use independent InteractiveToken/HighestAvailable tasks named
+`OuterShell-Admin-App-<SID>-<service-id>`. The registry, script, runner, and output
+are stored beneath `Program Files/OuterShell Commands/<SID>`, with administrator
+ownership and read access for that user. The task grants that user read/execute
+access, not permission to change its definition. Administrator backends appear
+in their own card and support start/stop/restart and output logs. In Windows
+Localhost mode they can also be uninstalled: the backend list marks them
+uninstallable only for clients in Outer Shell's desktop session, and
+`POST /api/control?scope=system&operation=uninstall` sends the service ID to the
+same UAC-approved helper, which stops and deletes the task, its registry entry,
+and its command directory. Outer Shell then removes the app's pipes from the
+HTTP allowlist. Remote sessions cannot uninstall them. To change an app's commands, edit its
+`run.cmd` in Plaintext installed as administrator, then restart the app.
+Scripts invoked by a command must also be protected against unelevated edits.
+The runner does not put Outer Shell's `bin` folder on the command's `PATH`.
+
+### Bundled apps as administrator
+
+Plaintext can also be installed as administrator, for example to edit an
+administrator command's `run.cmd`. A client in Outer Shell's desktop session
+sees it in Administrator → Add more… → Outer Shell app catalog, and **Install as
+administrator** sends `runRoot` with system scope to `/api/control`. The same
+UAC-approved helper downloads and verifies the app into
+`Program Files/OuterShell Commands/<SID>/apps`, registers it in the
+administrator registry, and creates an InteractiveToken/HighestAvailable task
+named `OuterShell-Admin-<App>-<SID>` that your account can run but not change.
+Uninstall uses the same helper. Other bundled apps refuse administrator installs
+until they are reviewed for it; mark them `administrator` in `BundledApps.inc`.
+
+An elevated app serves `win_app_pipe`, its usual pipe name followed by
+`.s-1-5-32-544`, with the administrator pipe security described above. It skips
+container discovery, because that would trust the unelevated Outer Shell, so it
+works with the Windows file system only. It has no activation mapping; start it
+from the Administrator card. Saving keeps the edited file's owner and DACL, so
+protected command scripts stay protected.
+
+For an isolated test machine, build with `OUTERSHELL_ADMIN_TESTS=ON`, run
+`OuterShellAdminFixture.exe` elevated in the signed-in account, then run
+`test_admin_commands.py` unelevated with the installed Outer Shell running. The
+fixture registers only the fixed `admin-regression-fixture` command (whoami,
+a marker, and a timed loopback ping). The Python checks cover high-integrity
+execution, scoped discovery/logs, approved task controls, rejected empty setup
+requests, denied unelevated writes, and denied task-definition changes. Run
+`OuterShellAdminFixture.exe --cleanup-fixture` elevated in the same signed-in
+account afterward to remove its task, registry entry, and command directory, or
+uninstall it from the Administrator card in Windows Localhost mode.
 
 ### Windows beta installer
 

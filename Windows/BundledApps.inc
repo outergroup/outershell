@@ -1,17 +1,21 @@
 #include <shellapi.h>
 typedef struct {
     const char *id, *name, *executable, *symbol;
+    bool administrator;
 } BundledApp;
+// Apps marked administrator can also be installed as administrator. They serve
+// win_app_pipe when elevated and skip anything that would trust the unelevated
+// Outer Shell, such as container discovery.
 static const BundledApp bundled_apps[] = {
-    {"org.outershell.Files", "Files", "FilesBackend.exe", "folder"},
+    {"org.outershell.Files", "Files", "FilesBackend.exe", "folder", false},
     {"org.outershell.Plaintext", "Plaintext", "PlaintextBackend.exe",
-     "doc.plaintext"},
-    {"org.outershell.Top", "Top", "TopBackend.exe", "waveform.path.ecg"},
-    {"org.outershell.Firehose", "Firehose", "FirehoseBackend.exe", "flame"},
+     "doc.plaintext", true},
+    {"org.outershell.Top", "Top", "TopBackend.exe", "waveform.path.ecg", false},
+    {"org.outershell.Firehose", "Firehose", "FirehoseBackend.exe", "flame", false},
     {"org.outershell.Profile", "Profile", "ProfileBackend.exe",
-     "chart.bar.xaxis"},
+     "chart.bar.xaxis", false},
     {"org.outershell.Terminal", "Terminal", "TerminalBackend.exe",
-     "apple.terminal"}};
+     "apple.terminal", false}};
 static const BundledApp *bundled_find(const char *id) {
     for (size_t i = 0; i < sizeof(bundled_apps) / sizeof(*bundled_apps); i++)
         if (!strcmp(id, bundled_apps[i].id))
@@ -28,6 +32,23 @@ static char *bundled_task_name(const BundledApp *app) {
         sb_append(&name, sid);
     free(sid);
     return name.data;
+}
+static char *bundled_admin_task_name(const BundledApp *app) {
+    char *sid = win_sid();
+    StringBuilder name = {0};
+    sb_append(&name, "\\OuterShell-Admin-");
+    sb_append(&name, app->name);
+    sb_append(&name, "-");
+    if (sid)
+        sb_append(&name, sid);
+    free(sid);
+    return name.data;
+}
+static char *bundled_host_task_name(ShellHost *s, const BundledApp *app) {
+    return s->administrator ? bundled_admin_task_name(app) : bundled_task_name(app);
+}
+static char *bundled_pipe(ShellHost *s, const BundledApp *app) {
+    return s->administrator ? win_admin_pipe(app->id) : win_pipe(app->id);
 }
 #ifndef OUTERSHELL_ARCHITECTURE
 #define OUTERSHELL_ARCHITECTURE "x64"
@@ -206,8 +227,8 @@ done:
     free(apps); free(root); free(archive); free(staging); free(extracted); free(folder); free(executable);
     return ok;
 }
-static bool bundled_registered(RegistryStore *store, const BundledApp *app) {
-    char *pipe = win_pipe(app->id);
+static bool bundled_registered(ShellHost *s, RegistryStore *store, const BundledApp *app) {
+    char *pipe = bundled_pipe(s, app);
     char frontend[160];
     snprintf(frontend, sizeof(frontend), "%s:main", app->id);
     bool ok = pipe &&
@@ -222,14 +243,24 @@ static bool bundled_registered(RegistryStore *store, const BundledApp *app) {
 static bool bundled_control(ShellHost *s, const BundledApp *app,
                             const char *operation, char *error,
                             size_t capacity) {
-    char *task = bundled_task_name(app), *pipe = win_pipe(app->id);
+    char *task = bundled_host_task_name(s, app), *pipe = bundled_pipe(s, app);
     HRESULT hr = E_INVALIDARG;
     bool ok = false;
-    bool install = !strcmp(operation, "install") || !strcmp(operation, "installUser") ||
-                   !strcmp(operation, "run") || !strcmp(operation, "runUser"),
+    bool as_root = !strcmp(operation, "installRoot") || !strcmp(operation, "runRoot"),
+         run = !strcmp(operation, "run") || !strcmp(operation, "runUser") || !strcmp(operation, "runRoot"),
+         install = as_root || run || !strcmp(operation, "install") || !strcmp(operation, "installUser"),
          remove = !strcmp(operation, "uninstall");
-    if (!strcmp(operation, "installRoot") || !strcmp(operation, "runRoot")) {
+    if (s->administrator && !app->administrator) {
         snprintf(error, capacity, "%s cannot be installed with administrator privileges on Windows.", app->name);
+        goto done;
+    }
+    if (install && as_root != s->administrator) {
+        if (as_root && app->administrator)
+            snprintf(error, capacity, "Install %s as administrator from the Administrator card in Windows Localhost mode.", app->name);
+        else if (as_root)
+            snprintf(error, capacity, "%s cannot be installed with administrator privileges on Windows.", app->name);
+        else
+            snprintf(error, capacity, "Install %s for your user from the User card.", app->name);
         goto done;
     }
     if (install) {
@@ -256,7 +287,11 @@ static bool bundled_control(ShellHost *s, const BundledApp *app,
         sb_append(
             &xml,
             "</UserId><LogonType>InteractiveToken</"
-            "LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></"
+            "LogonType><RunLevel>");
+        sb_append(&xml, s->administrator ? "HighestAvailable" : "LeastPrivilege");
+        sb_append(
+            &xml,
+            "</RunLevel></Principal></"
             "Principals><Settings><MultipleInstancesPolicy>IgnoreNew</"
             "MultipleInstancesPolicy><DisallowStartIfOnBatteries>false</"
             "DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</"
@@ -269,7 +304,7 @@ static bool bundled_control(ShellHost *s, const BundledApp *app,
         command_xml_text(&xml, directory);
         sb_append(&xml, "</WorkingDirectory></Exec></Actions></Task>");
         hr = command_task(task, "register-core", xml.data, NULL);
-        if (SUCCEEDED(hr) && (!strcmp(operation, "run") || !strcmp(operation, "runUser")))
+        if (SUCCEEDED(hr) && run)
             hr = command_task(task, "start", NULL, NULL);
         free(xml.data);
         free(directory);
@@ -299,14 +334,25 @@ static bool bundled_control(ShellHost *s, const BundledApp *app,
         RegistryStore store;
         ok = store_open(s, &store, true);
         if (ok) {
-            ok = install ? bundled_registered(&store, app)
+            ok = install ? bundled_registered(s, &store, app)
                          : registry_store_remove_backend_and_owned_records(
                                &store, app->id);
             ok = store_close(s, &store, ok) && ok;
         }
+        if (ok && s->administrator) {
+            wchar_t *registry = win_wide(s->registry);
+            ok = registry && admin_secure_file(registry);
+            free(registry);
+        }
         if (!ok)
             snprintf(error, capacity, "Could not update the app registry.");
-        else if (!win_set_pipe_activation(pipe, install ? task : NULL)) {
+        else if (s->administrator) {
+            if (remove) {
+                char *root_directory = bundled_root(s, app);
+                if (root_directory) bundled_remove_tree(root_directory);
+                free(root_directory);
+            }
+        } else if (!win_set_pipe_activation(pipe, install ? task : NULL)) {
             ok = false;
             snprintf(error, capacity, "Could not update the named-pipe activation mapping.");
         } else if (install) {

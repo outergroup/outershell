@@ -142,7 +142,7 @@ int wmain(int argc, wchar_t **argv) {
 #ifdef APP_TOP
     if (!top_start(app_stop)) { top_stop(); return 1; }
 #endif
-    char *name = win_pipe(APP_SERVICE);
+    char *name = win_app_pipe(APP_SERVICE);
     PipeServer *server = pipe_server_start(name, serve_app, NULL);
     free(name);
     if (!server)

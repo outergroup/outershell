@@ -33,7 +33,15 @@ char *win_sid(void);
 // Writes Windows' description of an HRESULT followed by its code, such as
 // "The system cannot find the file specified. (0x80070002)".
 void win_hresult_text(long hr, char *out, size_t capacity);
+#define ADMIN_PIPE_SUFFIX ".s-1-5-32-544"
+bool win_elevated(void);
 char *win_pipe(const char *app);
+// The pipe of an app run as administrator. Its name ends in the Administrators
+// SID, which tells Outer Loop that pages from less privileged origins must not
+// act on it.
+char *win_admin_pipe(const char *app);
+// The pipe an app serves: win_admin_pipe when running elevated, else win_pipe.
+char *win_app_pipe(const char *app);
 bool win_secure_directory(const char *path);
 bool win_atomic_write(const char *path, const void *data, size_t length);
 bool win_read_file(const char *path, size_t limit, StringBuilder *result);

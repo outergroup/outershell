@@ -903,8 +903,8 @@ RUN outerctl image add-command --id codex --name "Codex" --working-directory /ro
     const userName = typeof sessionUsername === "string" ? sessionUsername.trim() : "";
     const isWindows = state.hostPlatform === "windows";
     const groups = [
-      { id: "user", name: userName || "Your user", note: "User", entries: entries.filter(entry => entry.item && (isWindows || entry.item.backend.serviceScope !== "system")) },
-      ...(!isWindows ? [{ id: "root", name: "root", note: "Administrator", entries: entries.filter(entry => entry.item && entry.item.backend.serviceScope === "system") }] : []),
+      { id: "user", name: userName || "Your user", note: "User", entries: entries.filter(entry => entry.item && entry.item.backend.serviceScope !== "system") },
+      { id: "root", name: isWindows ? userName || "Your user" : "root", note: "Administrator", shield: isWindows, entries: entries.filter(entry => entry.item && entry.item.backend.serviceScope === "system") },
       ...state.safeSpaces.flatMap(workspace => {
         const apps = entries.filter(entry => entry.workspace?.id === workspace.id);
         if (workspace.runtimeKind !== "wsl") return [{ id: `container:${workspace.id}`, name: workspace.name || "Container", note: `${workspace.runtimeKind === "wsl" ? "WSL" : "Container"} · ${safeSpaceState(workspace)}`, workspace, entries: apps }];
@@ -1634,6 +1634,7 @@ RUN outerctl image add-command --id codex --name "Codex" --working-directory /ro
     if (!["agent", "catalog", "bash", "dockerfile"].includes(tab)) tab = "agent";
     if ((container && (!managedContainer(container) || !["agent", "dockerfile"].includes(tab))) || (tab === "dockerfile" && (!container || !managedContainer(container)))) tab = "agent";
     const windowsCommands = state.hostPlatform === "windows" && !state.addWorkspace;
+    const windowsAdministrator = windowsCommands && state.addScope === "system";
     state.addTab = tab;
     const apps = (state.addWorkspace ? state.workspaceCatalog || [] : state.backends).filter(backend => backend.serviceID !== "org.outershell.OuterShell" && backend.isBundled && !backend.isMigration && backend.serviceScope === state.addScope)
       .sort((a, b) => a.displayName.localeCompare(b.displayName));
@@ -1650,12 +1651,12 @@ RUN outerctl image add-command --id codex --name "Codex" --working-directory /ro
         <div class="field"><label for="bash-name">Display name</label><input id="bash-name" name="name" placeholder="My server" required></div>
         <div class="field"><label for="bash-id">Identifier</label><input id="bash-id" class="mono" name="identifier" placeholder="my-server" aria-describedby="bash-id-help" required><span id="bash-id-help" class="field-note">Names the app’s service and files.</span></div>
         <div class="field full"><label for="bash-command">${windowsCommands ? "Command Prompt commands (cmd.exe)" : "Bash commands"}</label><textarea id="bash-command" name="command" placeholder="${windowsCommands ? "cd /d C:\\dev\\my-app&#10;npm start" : "cd ~/dev/my-app&#10;npm start"}" required></textarea></div>
-        <div class="field"><label for="bash-transport">Connection</label><select id="bash-transport" name="frontendTransport"><option value="port">TCP port</option>${windowsCommands ? '<option value="namedPipe">Named pipe</option>' : '<option value="unixSocket">Unix socket</option>'}</select></div>
+        <div class="field"><label for="bash-transport">Connection</label><select id="bash-transport" name="frontendTransport">${windowsAdministrator ? "" : '<option value="port">TCP port</option>'}${windowsCommands ? '<option value="namedPipe">Named pipe</option>' : '<option value="unixSocket">Unix socket</option>'}</select></div>
         <div class="field" data-transport="port"><label for="bash-port">Port</label><input id="bash-port" class="mono" name="port" inputmode="numeric" placeholder="4000" required></div>
-        <div class="field" data-transport="${windowsCommands ? "namedPipe" : "unixSocket"}" hidden><label for="bash-socket">${windowsCommands ? "Named pipe path" : "Socket path"}</label><input id="bash-socket" class="mono" name="socketPath" placeholder="${windowsCommands ? String.raw`\\.\pipe\my-app` : "/run/user/1000/my-app.sock"}"></div>
+        <div class="field" data-transport="${windowsCommands ? "namedPipe" : "unixSocket"}" hidden><label for="bash-socket">${windowsCommands ? "Named pipe path" : "Socket path"}</label><input id="bash-socket" class="mono" name="socketPath" placeholder="${windowsAdministrator ? String.raw`\\.\pipe\my-app.s-1-5-32-544` : windowsCommands ? String.raw`\\.\pipe\my-app` : "/run/user/1000/my-app.sock"}"></div>
         <div class="field full" ${windowsCommands ? "hidden" : ""}><label for="bash-icon">Icon path <span class="field-note">(optional, otherwise Outer Loop will try to fetch it)</span></label><input id="bash-icon" class="mono" name="iconPath" placeholder="~/Pictures/my-app.png"></div>
       </div>
-      ${windowsCommands ? "<p>Outer Shell starts these commands as your signed-in user. The command script must keep running until your server exits. For example, use <code>python server.py</code>, not <code>start python server.py</code>. Configure the server to listen on this port or named pipe.</p>" : ""}
+      ${windowsAdministrator ? "<p>Creating this app requires Windows administrator approval. These commands run as your account with administrator privileges. The command script must keep running until your server exits. For example, use <code>python server.py</code>, not <code>start python server.py</code>. The server must listen on a named pipe whose name ends in <code>.s-1-5-32-544</code>, which Outer Loop protects from less privileged pages. Use protected, absolute paths for scripts and programs.</p>" : windowsCommands ? "<p>Outer Shell starts these commands as your signed-in user. The command script must keep running until your server exits. For example, use <code>python server.py</code>, not <code>start python server.py</code>. Configure the server to listen on this port or named pipe.</p>" : ""}
       <p id="bash-message" class="form-message" role="status"></p>
       <footer class="dialog-footer"><button class="secondary-button" type="button" data-action="close-dialog">Cancel</button><button class="primary-button" type="submit">Create app</button></footer>
     </form>`;
@@ -1673,7 +1674,15 @@ RUN outerctl image add-command --id codex --name "Codex" --working-directory /ro
         <nav class="add-categories" aria-label="Add app type">${categories.map(([id, title, paths]) => `<button class="add-category" type="button" data-action="add-tab" data-tab="${id}" aria-pressed="${tab === id}"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${paths}</svg><span>${title}</span></button>`).join("")}</nav>
         <section class="add-content" aria-label="${categories.find(([id]) => id === tab)?.[1] || "Apps"}">${tab === "dockerfile" ? dockerfile : tab === "catalog" ? catalog : tab === "bash" ? bash : codingAgent}</section>
       </div>`, "add-apps-dialog");
-    if (tab === "bash") wireBashForm(dialog);
+    if (tab === "bash" && windowsAdministrator) {
+      const content = dialog.querySelector(".add-content");
+      content.innerHTML = '<p>Set up administrator commands locally on this Windows machine. Open Outer Loop in Localhost mode, choose Administrator → Add more… → Run commands, and approve the Windows UAC prompt.</p>';
+      fetch("/api/admin-commands", { cache: "no-store" }).then(response => response.json()).then(capabilities => {
+        if (!dialog.isConnected || !capabilities.localSetup) return;
+        content.innerHTML = bash;
+        wireBashForm(dialog);
+      }).catch(() => {});
+    } else if (tab === "bash") wireBashForm(dialog);
   }
 
   function wireBashForm(dialog) {
@@ -1720,7 +1729,8 @@ RUN outerctl image add-command --id codex --name "Codex" --working-directory /ro
     submit.textContent = "Creating…";
     message.textContent = "";
     try {
-      const { buffer } = await requestBuffer(windowsCommands ? "/api/create" : `/api/create?${query}`, { method: "POST", ...(windowsCommands ? {headers: {"Content-Type": "application/x-www-form-urlencoded"}, body: query} : {}) }, true);
+      const windowsAdministrator = windowsCommands && state.addScope === "system";
+      const { buffer } = await requestBuffer(windowsCommands ? (windowsAdministrator ? "/api/admin-commands" : "/api/create") : `/api/create?${query}`, { method: "POST", ...(windowsCommands ? {headers: {"Content-Type": "application/x-www-form-urlencoded"}, body: query} : {}) }, !windowsAdministrator);
       const result = decodeAction(buffer);
       if (!result.ok) throw new Error(result.message || "Could not create the app.");
       closeDialog();
@@ -2886,7 +2896,9 @@ RUN outerctl image add-command --id codex --name "Codex" --working-directory /ro
 
   async function uninstallBackend(key, button) {
     const backend = findBackend(key);
-    if (!backend || !window.confirm(`Uninstall ${backend.displayName}?`)) return;
+    if (!backend) return;
+    const approval = state.hostPlatform === "windows" && backend.serviceScope === "system" ? " Windows will ask for administrator approval." : "";
+    if (!window.confirm(`Uninstall ${backend.displayName}?${approval}`)) return;
     await performControl(key, "uninstall", button);
   }
 

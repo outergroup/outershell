@@ -97,6 +97,48 @@ char *win_sid(void) {
     CloseHandle(token);
     return result;
 }
+bool win_elevated(void) {
+    HANDLE token = NULL;
+    TOKEN_ELEVATION elevation = {0};
+    DWORD size = 0;
+    bool elevated = OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token) &&
+        GetTokenInformation(token, TokenElevation, &elevation, sizeof(elevation), &size) && elevation.TokenIsElevated;
+    if (token)
+        CloseHandle(token);
+    return elevated;
+}
+char *win_admin_pipe(const char *app) {
+    char *pipe = win_pipe(app);
+    if (!pipe)
+        return NULL;
+    char *result = win_alloc(strlen(pipe) + sizeof(ADMIN_PIPE_SUFFIX));
+    strcpy(result, pipe);
+    strcat(result, ADMIN_PIPE_SUFFIX);
+    free(pipe);
+    return result;
+}
+char *win_app_pipe(const char *app) {
+    return win_elevated() ? win_admin_pipe(app) : win_pipe(app);
+}
+static bool admin_pipe_name(const char *name) {
+    size_t length = strlen(name), suffix = strlen(ADMIN_PIPE_SUFFIX);
+    return length > suffix && !_stricmp(name + length - suffix, ADMIN_PIPE_SUFFIX);
+}
+// Administrators own an administrator pipe, as Outer Loop requires. The user
+// may read and write it but not create instances or change its security. The
+// medium label lets the user's unelevated processes connect.
+static PSECURITY_DESCRIPTOR admin_pipe_security_descriptor(void) {
+    char *sid = win_sid();
+    if (!sid)
+        return NULL;
+    char text[512];
+    snprintf(text, sizeof(text), "O:BAG:BAD:P(A;;GA;;;BA)(A;;GA;;;SY)(A;;0x12019b;;;%s)S:(ML;;NW;;;ME)", sid);
+    free(sid);
+    PSECURITY_DESCRIPTOR sd = NULL;
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorA(text, SDDL_REVISION_1, &sd, NULL))
+        return NULL;
+    return sd;
+}
 char *win_pipe(const char *app) {
     char *sid = win_sid();
     if (!sid)
@@ -488,7 +530,7 @@ PipeServer *pipe_server_start(const char *name, PipeHandler handler, void *conte
     ReleaseSRWLockExclusive(&pipe_activity_lock);
     PipeServer *s = win_alloc(sizeof(*s));
     s->name = win_wide(name);
-    s->sd = security_descriptor(false);
+    s->sd = admin_pipe_name(name) ? admin_pipe_security_descriptor() : security_descriptor(false);
     s->handler = handler;
     s->context = context;
     s->stop = CreateEventW(NULL, TRUE, FALSE, NULL);

@@ -22,8 +22,12 @@ const entries = [
 ];
 context.renderOverview(entries);
 assert.match(elements.overview.innerHTML, /data-group-id="user"/);
-assert.doesNotMatch(elements.overview.innerHTML, /data-group-id="root"/);
-assert.doesNotMatch(elements.overview.innerHTML, /data-scope="system"/);
+assert.match(elements.overview.innerHTML, /data-group-id="root"/);
+assert.match(elements.overview.innerHTML, /data-action="open-add" data-scope="system"/);
+assert.match(elements.overview.innerHTML, /<h2>test-user<\/h2><p><svg[^>]*>.*Administrator<\/p>/);
+const userCard = elements.overview.innerHTML.slice(0, elements.overview.innerHTML.indexOf('data-group-id="root"'));
+assert.match(userCard, /ordinary-app/);
+assert.doesNotMatch(userCard, /custom-privileged-app/);
 assert.match(elements.overview.innerHTML, /custom-privileged-app/);
 state.safeSpaces = [{ id: "ubuntu", name: "Ubuntu", runtimeKind: "wsl", userName: "linux-user" }];
 context.renderOverview(entries);
@@ -36,4 +40,4 @@ for (const platform of ["linux", "macos"]) {
   assert.match(elements.overview.innerHTML, /data-group-id="root"/);
   assert.match(elements.overview.innerHTML, /data-scope="system"/);
 }
-console.log("PASS: Windows has no Administrator card, custom backends remain visible, Linux/macOS and WSL retain root cards");
+console.log("PASS: Windows has a shielded Administrator card for system backends, Linux/macOS and WSL retain root cards");

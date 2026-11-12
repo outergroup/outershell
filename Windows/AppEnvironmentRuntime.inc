@@ -47,7 +47,8 @@ EnvironmentSnapshot discover_environments(void) {
     s.time_ms = (value.QuadPart - 116444736000000000ULL) / 10000;
     Connection c = {0};
     c.stop = environment_stop;
-    c.pipe = app_open_registry(environment_stop);
+    bool elevated = win_elevated();
+    c.pipe = elevated ? INVALID_HANDLE_VALUE : app_open_registry(environment_stop);
     Bytes b = {0};
     unsigned char request[] = {2, 0, 0, 0, 34, 0}, header[4];
     bool ok = c.pipe != INVALID_HANDLE_VALUE &&
@@ -63,9 +64,10 @@ EnvironmentSnapshot discover_environments(void) {
     if (c.pipe != INVALID_HANDLE_VALUE)
         CloseHandle(c.pipe);
     if (!ok) {
-        environment_error(&s, "Outer Shell",
-                          "Container discovery is unavailable. Open Outer "
-                          "Shell and try again.");
+        if (!elevated)
+            environment_error(&s, "Outer Shell",
+                              "Container discovery is unavailable. Open Outer "
+                              "Shell and try again.");
         goto done;
     }
     size_t count = get_u32(b.data + 12), variable = get_u32(b.data + 24);
