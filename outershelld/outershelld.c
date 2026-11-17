@@ -6479,6 +6479,7 @@ static bool ensure_root_helper_installed(const char *sudo_password, bool *needs_
             "systemctl --system disable --now %s >/dev/null 2>&1 || true\n"
             "rm -f /etc/systemd/system/%s /etc/systemd/system/%s\n"
             "systemctl --system daemon-reload >/dev/null 2>&1 || true\n"
+            "systemctl --system stop outershelld.socket >/dev/null 2>&1 || true\n"
             "systemctl --system stop outershelld.service >/dev/null 2>&1 || true\n"
             "mkdir -p %s %s %s %s /etc/systemd/system /var/log/outershell\n"
             "chmod 1777 %s\n"

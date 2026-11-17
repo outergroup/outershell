@@ -3951,6 +3951,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         localFrame: CGRect,
         contentFrame: CGRect,
         contentSpace: AppsTextContentSpace,
+        wrappedLineHeight: CGFloat? = nil,
         in parentLayer: CALayer
     ) {
         let selectionLayer = CALayer()
@@ -3958,30 +3959,50 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         selectionLayer.masksToBounds = true
         parentLayer.addSublayer(selectionLayer)
 
-        let text = makeTextLayer(size: font.pointSize,
-                                 weight: .regular,
-                                 color: color)
-        text.string = NSAttributedString(
-            string: path,
-            attributes: [
-                .font: font,
-                .foregroundColor: color
-            ]
-        )
-        text.truncationMode = .middle
-        text.frame = localFrame
-        parentLayer.addSublayer(text)
+        func addTextLayer(_ value: String, frame: CGRect) -> CATextLayer {
+            let text = makeTextLayer(size: font.pointSize,
+                                     weight: .regular,
+                                     color: color)
+            text.string = NSAttributedString(
+                string: value,
+                attributes: [
+                    .font: font,
+                    .foregroundColor: color
+                ]
+            )
+            text.frame = frame
+            parentLayer.addSublayer(text)
+            return text
+        }
 
-        let line = DockerfileTextLine(
-            text: path,
-            range: NSRange(location: 0, length: (path as NSString).length),
-            frame: contentFrame
-        )
+        var lines: [DockerfileTextLine] = []
+        if let wrappedLineHeight {
+            let offset = CGPoint(x: contentFrame.minX - localFrame.minX,
+                                 y: contentFrame.minY - localFrame.minY)
+            for (index, wrappedLine) in dockerfileWrappedLines(path, width: localFrame.width, font: font).enumerated() {
+                let lineFrame = CGRect(x: localFrame.minX,
+                                       y: localFrame.maxY - CGFloat(index + 1) * wrappedLineHeight,
+                                       width: localFrame.width,
+                                       height: wrappedLineHeight)
+                _ = addTextLayer(wrappedLine.text, frame: lineFrame)
+                lines.append(DockerfileTextLine(text: wrappedLine.text,
+                                                range: wrappedLine.range,
+                                                frame: lineFrame.offsetBy(dx: offset.x, dy: offset.y)))
+            }
+        } else {
+            addTextLayer(path, frame: localFrame).truncationMode = .middle
+            lines.append(DockerfileTextLine(
+                text: path,
+                range: NSRange(location: 0, length: (path as NSString).length),
+                frame: contentFrame
+            ))
+        }
+
         let block = DockerfileTextBlock(
             fragmentID: identifier,
             text: path,
             frame: contentFrame,
-            lines: [line],
+            lines: lines,
             font: font,
             contentSpace: contentSpace,
             selectionLayer: selectionLayer
@@ -20540,9 +20561,41 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private var containerConfigurationMountContentHeight: CGFloat {
-        let folderHeight = max(CGFloat(containerConfigurationMounts.count) * 60, 28)
+        let rowWidth = containerConfigurationContentFrame.width
+        let folderHeight = max(containerConfigurationMounts.reduce(0) {
+            $0 + containerConfigurationMountRowHeight($1, rowWidth: rowWidth) + 8
+        }, 28)
         let persistentHeight = max(CGFloat(containerConfigurationPersistentData.count) * 60, 28)
         return 24 + folderHeight + 12 + 24 + persistentHeight
+    }
+
+    private var containerConfigurationMountPathFont: NSFont {
+        NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
+    }
+
+    private let containerConfigurationMountPathLineHeight: CGFloat = 16
+
+    private func containerConfigurationMountPathWidth(rowWidth: CGFloat) -> CGFloat {
+        max((rowWidth - 230) / 2, 80)
+    }
+
+    private func containerConfigurationMountPathHeight(
+        _ mount: ContainerConfigurationMountDraft,
+        rowWidth: CGFloat
+    ) -> CGFloat {
+        let width = containerConfigurationMountPathWidth(rowWidth: rowWidth)
+        let font = containerConfigurationMountPathFont
+        let lineCount = [mount.hostPath, mount.guestPath]
+            .map { dockerfileWrappedLines($0, width: width, font: font).count }
+            .max() ?? 1
+        return CGFloat(max(lineCount, 1)) * containerConfigurationMountPathLineHeight + 2
+    }
+
+    private func containerConfigurationMountRowHeight(
+        _ mount: ContainerConfigurationMountDraft,
+        rowWidth: CGFloat
+    ) -> CGFloat {
+        containerConfigurationMountPathHeight(mount, rowWidth: rowWidth) + 34
     }
 
     private func renderContainerConfigurationRuntime(
@@ -20750,11 +20803,13 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             addEmptyMessage("No folders are mounted.")
         }
         for mount in containerConfigurationMounts {
+            let pathHeight = containerConfigurationMountPathHeight(mount, rowWidth: contentFrame.width)
+            let rowHeight = containerConfigurationMountRowHeight(mount, rowWidth: contentFrame.width)
             let rowFrame = CGRect(x: contentFrame.minX,
-                                  y: cursor - 54,
+                                  y: cursor - rowHeight - 2,
                                   width: contentFrame.width,
-                                  height: 52)
-            cursor -= 60
+                                  height: rowHeight)
+            cursor -= rowHeight + 8
             guard rowFrame.minY >= listFrame.minY,
                   rowFrame.maxY <= listFrame.maxY else {
                 continue
@@ -20767,22 +20822,22 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             )
             scrollLayer.addSublayer(row)
 
-            let pathWidth = max((row.bounds.width - 230) / 2, 80)
-            let hostPathFrame = CGRect(x: 12, y: 8, width: pathWidth, height: 18)
-            let guestPathFrame = CGRect(x: 40 + pathWidth, y: 8, width: pathWidth, height: 18)
+            let pathWidth = containerConfigurationMountPathWidth(rowWidth: row.bounds.width)
+            let hostPathFrame = CGRect(x: 12, y: 8, width: pathWidth, height: pathHeight)
+            let guestPathFrame = CGRect(x: 40 + pathWidth, y: 8, width: pathWidth, height: pathHeight)
             for (label, path, field, pathFrame) in [(serverSSHCommand == nil ? "On this computer" : "On server", mount.hostPath, "host", hostPathFrame), ("In container", mount.guestPath, "guest", guestPathFrame)] {
                 let caption = makeTextLayer(size: 10, weight: .medium, color: .secondaryLabelColor)
                 caption.string = label
-                caption.frame = CGRect(x: pathFrame.minX, y: 31, width: pathWidth, height: 14)
+                caption.frame = CGRect(x: pathFrame.minX, y: pathFrame.maxY + 5, width: pathWidth, height: 14)
                 row.addSublayer(caption)
-                renderSelectableMountedFolderPath(path, identifier: "configuration-mount:\(mount.id):\(field)", font: NSFont.monospacedSystemFont(ofSize: 11, weight: .regular), color: .labelColor, localFrame: pathFrame, contentFrame: pathFrame.offsetBy(dx: rowFrame.minX, dy: rowFrame.minY), contentSpace: .workspacePanel, in: row)
+                renderSelectableMountedFolderPath(path, identifier: "configuration-mount:\(mount.id):\(field)", font: containerConfigurationMountPathFont, color: .labelColor, localFrame: pathFrame, contentFrame: pathFrame.offsetBy(dx: rowFrame.minX, dy: rowFrame.minY), contentSpace: .workspacePanel, wrappedLineHeight: containerConfigurationMountPathLineHeight, in: row)
                 if !mount.isInfrastructure {
                     containerConfigurationMountActionFrames.append((rootLayer.convert(pathFrame, from: row), mount.id, field))
                 }
             }
             let arrow = makeTextLayer(size: 13, weight: .regular, color: .tertiaryLabelColor, alignment: .center)
             arrow.string = "→"
-            arrow.frame = CGRect(x: pathWidth + 14, y: 8, width: 24, height: 18)
+            arrow.frame = CGRect(x: pathWidth + 14, y: 8 + pathHeight - 18, width: 24, height: 18)
             row.addSublayer(arrow)
 
             let rootRowFrame = row.frame.offsetBy(dx: workspacePanelFrame.minX,
@@ -20794,13 +20849,13 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                             alignment: .right)
                 managed.string = "Managed by Outer Shell"
                 managed.frame = CGRect(x: row.bounds.width - 172,
-                                       y: 19,
+                                       y: (rowHeight - 14) / 2,
                                        width: 158,
                                        height: 14)
                 row.addSublayer(managed)
             } else {
                 let readOnlyFrame = CGRect(x: row.bounds.width - 180,
-                                           y: 11,
+                                           y: (rowHeight - 30) / 2,
                                            width: 108,
                                            height: 30)
                 let readOnly = makeButtonLayer(
@@ -20817,7 +20872,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 ))
 
                 let removeFrame = CGRect(x: row.bounds.width - 58,
-                                         y: 11,
+                                         y: (rowHeight - 30) / 2,
                                          width: 44,
                                          height: 30)
                 let remove = makeSymbolButtonLayer(
