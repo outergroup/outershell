@@ -17,9 +17,9 @@ container, whether you edit its Dockerfile directly or use a coding agent.
 
 ## Connect to the container
 
-In Outer Shell, choose **Add more… → Coding agent** under the container and
-copy the prompt. Outer Loop includes the SSH command and the command to enter
-that specific container. You can also use the container terminal's **Copy SSH
+In Outer Shell, choose **Add more… → Coding agent** under the container, pick
+**Inside container**, and copy the prompt. Outer Loop includes the SSH command
+and the command to enter that specific container. You can also use the container terminal's **Copy SSH
 command** action. Run that complete command from your computer; a host-only SSH
 connection does not enter the container.
 
@@ -30,10 +30,9 @@ an Outer Shell-enabled image with `outerctl` installed. Host apps use the
 
 """
 body = intro + agent.replace("# Outer Shell container", "## Configure the container", 1)
-body = body.replace("Use the outer-shell skill for app integration.", "Use the publishing reference below for app integration.")
 body = body.replace("Read `/usr/local/share/outershell/OUTERCTL.md` before adding or changing a\npublished tool.", "Read the publishing reference below before adding or changing a published tool.")
 body += "\n---\n\n" + reference
-(args.site / "container-apps.md").write_text("---\nlayout: default\ntitle: Container apps\nparent: API\nnav_order: 1\npermalink: /api/containers/\n---\n\n[Download these instructions as Markdown](/api/containers/instructions.md)\n\n" + body)
+(args.site / "container-apps.md").write_text("---\nlayout: page\ntitle: Container apps\nparent: API\nnav_order: 1\npermalink: /api/containers/\n---\n\n[Download these instructions as Markdown](/api/containers/instructions.md)\n\n" + body)
 output = args.site / "api/containers"
 output.mkdir(parents=True, exist_ok=True)
 (output / "instructions.md").write_text(body)

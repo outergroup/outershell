@@ -55,6 +55,7 @@ static int setup_tasks(const char *operation) {
             char *pipe = win_pipe(index ? bundled_apps[index - 1].id : shell_id);
             bool ok = pipe && win_set_pipe_activation(pipe, install ? name.data : NULL);
             if (remove && pipe) ok = win_disallow_pipe(pipe) && ok;
+            if (remove && pipe && !index) ok = win_remove_outerssh_homepage(pipe) && ok;
             if (!index) {
                 char *api = win_pipe("org.outershell.outershelld");
                 ok = api && win_set_pipe_activation(api, install ? name.data : NULL) && ok;
@@ -69,7 +70,7 @@ static int setup_tasks(const char *operation) {
     if (SUCCEEDED(result) && install) {
         char *a = win_pipe(shell_id);
         const char *paths[] = {a};
-        if (!a || !win_allow_pipes(paths, 1)) result = E_FAIL;
+        if (!a || !win_allow_pipes(paths, 1) || !win_write_outerssh_homepage(a)) result = E_FAIL;
         free(a);
     }
     if (FAILED(result)) {

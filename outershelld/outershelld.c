@@ -4691,6 +4691,25 @@ static bool registry_is_standard_for_home(void) {
         strcmp(resolved_standard, resolved_registry) == 0;
 }
 
+static bool file_has_contents(const char *path, const char *data, size_t length, mode_t mode) {
+    int fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) return false;
+    struct stat status;
+    bool same = fstat(fd, &status) == 0 && S_ISREG(status.st_mode) &&
+        (status.st_mode & 0777) == mode && (size_t)status.st_size == length;
+    char buffer[4096];
+    size_t offset = 0;
+    while (same && offset < length) {
+        size_t wanted = length - offset < sizeof(buffer) ? length - offset : sizeof(buffer);
+        ssize_t n = read(fd, buffer, wanted);
+        if (n < 0 && errno == EINTR) continue;
+        same = n > 0 && memcmp(buffer, data + offset, (size_t)n) == 0;
+        if (same) offset += (size_t)n;
+    }
+    close(fd);
+    return same;
+}
+
 static void publish_endpoint_names(void) {
     if (!registry_is_standard_for_home()) return;
     RegistryStore store;
@@ -4730,6 +4749,10 @@ static void publish_endpoint_names(void) {
     if (ok && text.length <= 65536 && mkdir_p(directory)) {
         if (system && chmod(directory, 0755) != 0) {
             fprintf(stderr, "Could not make system endpoint names readable: %s\n", strerror(errno));
+            free(text.data);
+            return;
+        }
+        if (file_has_contents(path, text.data, text.length, system ? 0644 : 0600)) {
             free(text.data);
             return;
         }

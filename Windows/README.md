@@ -94,6 +94,11 @@ The exact registered HTTP endpoints are added to
 \\.\pipe\org.outershell.files.<lowercase-user-SID>
 ```
 
+Setup also makes the shell endpoint the user's OuterSSH homepage, by writing
+`http+pipe://` and its percent-encoded pipe path to `%LOCALAPPDATA%\OuterSSH\homepage`
+when that file doesn't exist. Removal deletes the file only if it still points
+at Outer Shell.
+
 `OuterShell.exe --pipe` prints the canonical shell endpoint. The binary registry
 API is `\\.\pipe\org.outershell.outershelld.<SID>`, with the existing length-prefixed
 Outer Shell protocol. It is not an HTTP allowlist entry. Backend/app/log

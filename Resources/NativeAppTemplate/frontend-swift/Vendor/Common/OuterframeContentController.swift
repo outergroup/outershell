@@ -1,7 +1,3 @@
-//
-//  PluginProtocol.swift
-//
-
 import Foundation
 import AppKit
 import QuartzCore

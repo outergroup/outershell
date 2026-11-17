@@ -25,25 +25,6 @@ enum OuterframeHostError: LocalizedError {
 typealias OuterframeHostMessageHandler = @MainActor (OuterframeHost, BrowserToContentMessage) -> Void
 typealias OuterframeHostDisconnectHandler = @MainActor (OuterframeHost) -> Void
 
-private struct OuterLoopSSHCommandArgumentsRequest: Codable {
-    let requestID: UUID
-}
-
-private struct OuterLoopSSHCommandArgumentsResponse: Codable {
-    let requestID: UUID
-    let arguments: [String]
-}
-
-private struct OuterLoopOpenFileRequest: Codable {
-    let requestID: UUID
-    let allowedFileExtensions: [String]
-}
-
-private struct OuterLoopOpenFileResponse: Codable {
-    let requestID: UUID
-    let fileURL: String?
-}
-
 private enum OuterframeHostPasteboardPayload {
     static let filePromiseTypeIdentifier = "org.outerframe.file-promise"
 
@@ -174,6 +155,12 @@ protocol OuterframeHostDelegate: AnyObject {
 @MainActor
 final class OuterframeHost: SocketToBrowserDelegate {
     let socket: SocketToBrowser
+    var dataDirectoryURL: URL? {
+        guard let path = ProcessInfo.processInfo.environment["OUTERFRAME_DATA_DIR"],
+              path.hasPrefix("/") else { return nil }
+        return URL(fileURLWithPath: path, isDirectory: true)
+    }
+
     var stagedFileDirectoryURL: URL? {
         guard let path = ProcessInfo.processInfo.environment["OUTERFRAME_STAGING_DIR"],
               !path.isEmpty else {
@@ -204,8 +191,6 @@ final class OuterframeHost: SocketToBrowserDelegate {
     private var callbackIDToBrowserID: [UUID: UUID] = [:]
     private var browserIDToCallbackID: [UUID: UUID] = [:]
     private var pendingPasteboardAccessRequests: [UUID: @MainActor (Bool, [OuterContentPasteboardItem]) -> Void] = [:]
-    private var pendingOuterLoopSSHCommandArgumentsRequests: [UUID: @MainActor ([String]?) -> Void] = [:]
-    private var pendingOuterLoopOpenFileRequests: [UUID: @MainActor (URL?) -> Void] = [:]
 
     /// Creates an OuterframeHost and starts the socket.
     /// Call `configure()` after receiving the initializeContent message to set context and appearance.
@@ -278,38 +263,6 @@ final class OuterframeHost: SocketToBrowserDelegate {
                 completion(granted, items)
             }
             return
-
-        case .hostSpecificMessage(let name, let payload):
-            if name == "sh.outerloop.sshCommandArgumentsResponse",
-               let response = try? JSONDecoder().decode(OuterLoopSSHCommandArgumentsResponse.self, from: payload),
-               let completion = pendingOuterLoopSSHCommandArgumentsRequests.removeValue(forKey: response.requestID) {
-                completion(response.arguments)
-                return
-            }
-            if name == "sh.outerloop.openFileResponse",
-               let response = try? JSONDecoder().decode(OuterLoopOpenFileResponse.self, from: payload),
-               let completion = pendingOuterLoopOpenFileRequests.removeValue(forKey: response.requestID) {
-                completion(response.fileURL.flatMap(URL.init(string:)).flatMap { $0.isFileURL ? $0 : nil })
-                return
-            }
-
-        case .hostSpecificMessageUnrecognized(let name):
-            if name == "sh.outerloop.sshCommandArgumentsRequest" {
-                let pending = pendingOuterLoopSSHCommandArgumentsRequests
-                pendingOuterLoopSSHCommandArgumentsRequests.removeAll()
-                for completion in pending.values {
-                    completion(nil)
-                }
-                return
-            }
-            if name == "sh.outerloop.openFileRequest" {
-                let pending = pendingOuterLoopOpenFileRequests
-                pendingOuterLoopOpenFileRequests.removeAll()
-                for completion in pending.values {
-                    completion(nil)
-                }
-                return
-            }
 
         case .initializeContent(let arguments):
             _currentHistoryEntryID = arguments.historyEntryID
@@ -718,64 +671,6 @@ final class OuterframeHost: SocketToBrowserDelegate {
                 ).encode())
             } catch {
                 print("OuterframeHost: Failed to send host-specific message \(name): \(error)")
-            }
-        }
-    }
-
-    func requestOuterLoopSSHCommandArguments(completion: @escaping @MainActor ([String]?) -> Void) {
-        let requestID = UUID()
-        pendingOuterLoopSSHCommandArgumentsRequests[requestID] = completion
-        guard let payload = try? JSONEncoder().encode(OuterLoopSSHCommandArgumentsRequest(requestID: requestID)) else {
-            pendingOuterLoopSSHCommandArgumentsRequests.removeValue(forKey: requestID)
-            completion(nil)
-            return
-        }
-        Task {
-            try? await Task.sleep(nanoseconds: 1_000_000_000)
-            await MainActor.run {
-                if let pending = self.pendingOuterLoopSSHCommandArgumentsRequests.removeValue(forKey: requestID) {
-                    pending(nil)
-                }
-            }
-        }
-        Task {
-            do {
-                try await socket.send(ContentToBrowserMessage.hostSpecificMessage(
-                    name: "sh.outerloop.sshCommandArgumentsRequest",
-                    payload: payload
-                ).encode())
-            } catch {
-                await MainActor.run {
-                    if let pending = self.pendingOuterLoopSSHCommandArgumentsRequests.removeValue(forKey: requestID) {
-                        pending(nil)
-                    }
-                }
-            }
-        }
-    }
-
-    func requestOuterLoopOpenFile(allowedFileExtensions: [String],
-                                  completion: @escaping @MainActor (URL?) -> Void) {
-        let requestID = UUID()
-        pendingOuterLoopOpenFileRequests[requestID] = completion
-        guard let payload = try? JSONEncoder().encode(OuterLoopOpenFileRequest(requestID: requestID,
-                                                                               allowedFileExtensions: allowedFileExtensions)) else {
-            pendingOuterLoopOpenFileRequests.removeValue(forKey: requestID)
-            completion(nil)
-            return
-        }
-        Task {
-            do {
-                try await socket.send(ContentToBrowserMessage.hostSpecificMessage(
-                    name: "sh.outerloop.openFileRequest",
-                    payload: payload
-                ).encode())
-            } catch {
-                await MainActor.run {
-                    if let pending = self.pendingOuterLoopOpenFileRequests.removeValue(forKey: requestID) {
-                        pending(nil)
-                    }
-                }
             }
         }
     }

@@ -354,6 +354,56 @@ append_outerssh_http_unix_allowlist_entry() {
     fi
 }
 
+outerssh_homepage_path() {
+    if [ "$os_name" = "Darwin" ]; then
+        printf '%s\n' "$HOME/Library/Application Support/org.outerssh/homepage"
+        return
+    fi
+    case "${XDG_CONFIG_HOME:-}" in
+        /*) printf '%s\n' "$XDG_CONFIG_HOME/outerssh/homepage" ;;
+        *) printf '%s\n' "${home_dir:-$HOME}/.config/outerssh/homepage" ;;
+    esac
+}
+
+percent_encode() {
+    printf '%s' "$1" | od -An -v -tx1 | tr -s ' \t' '\n\n' | while read -r byte; do
+        case "$byte" in
+            "") ;;
+            2d|2e|5f|7e|3[0-9]|4[1-9a-f]|5[0-9a]|6[1-9a-f]|7[0-9a]) printf "\\$(printf '%03o' "0x$byte")" ;;
+            *) printf '%%%s' "$(printf '%s' "$byte" | tr 'a-f' 'A-F')" ;;
+        esac
+    done
+}
+
+outer_shell_homepage_url() {
+    printf 'http+unix://%s/\n' "$(percent_encode "$socket_path")"
+}
+
+# Makes Outer Shell the homepage that OuterSSH clients open on this server,
+# unless the user has already chosen one.
+write_outerssh_homepage() {
+    homepage_path="$(outerssh_homepage_path)"
+    if [ -e "$homepage_path" ] || [ -L "$homepage_path" ]; then
+        return 0
+    fi
+    homepage_dir="$(dirname "$homepage_path")"
+    mkdir -p "$homepage_dir"
+    homepage_tmp="$(mktemp "$homepage_dir/.homepage.XXXXXX")"
+    outer_shell_homepage_url > "$homepage_tmp"
+    chmod 0644 "$homepage_tmp"
+    mv "$homepage_tmp" "$homepage_path"
+}
+
+# Removes the OuterSSH homepage that write_outerssh_homepage wrote, if it still
+# points at Outer Shell.
+remove_outerssh_homepage() {
+    homepage_path="$(outerssh_homepage_path)"
+    if [ -f "$homepage_path" ] && [ ! -L "$homepage_path" ] &&
+        [ "$(tr -d ' \t\r\n' < "$homepage_path")" = "$(outer_shell_homepage_url)" ]; then
+        rm -f "$homepage_path"
+    fi
+}
+
 systemd_quote_arg() {
     printf '"'
     printf '%s' "$1" | sed \
@@ -494,6 +544,7 @@ if [ "$os_name" = "Darwin" ]; then
             OUTERSHELL_HOME="$outershell_home" "$outerctl_path" backend remove --backend "$service_id" >/dev/null 2>&1 || true
         fi
         rm -rf "$app_install_root" "$legacy_install_root"
+        remove_outerssh_homepage
         if [ "${OUTERSHELL_UNINSTALL_REMOVE_USER_STATE:-0}" = "1" ]; then
             rm -f "$outershell_home/registry.orwa" "$outershell_home/registry.orwa.lock" "$outerctl_path"
             rm -rf "$tools_install_root"
@@ -639,6 +690,7 @@ EOF
     OUTERSHELL_HOME="$outershell_home" "$outerctl_path" app remove --backend "$service_id" --frontend-id "$service_id:main"
     OUTERSHELL_HOME="$outershell_home" "$outerctl_path" app upsert --backend "$service_id" --socket-path "$socket_path" --name "$display_name" --url "/" --icon-path "$icon_path"
     append_outerssh_http_unix_allowlist_entry user "$socket_path"
+    write_outerssh_homepage
     OUTERSHELL_HOME="$outershell_home" "$outerctl_path" log remove --backend "$service_id" --path "$log_path"
     OUTERSHELL_HOME="$outershell_home" "$outerctl_path" log add --backend "$service_id" --path "$log_path"
     if [ "$command" = "update" ]; then
@@ -1156,6 +1208,7 @@ if [ "$command" = "uninstall" ]; then
     if [ -x "$outerctl_path" ]; then
         run_outerctl backend remove --backend org.outershell.OuterShell >/dev/null 2>&1 || true
     fi
+    remove_outerssh_homepage
     remove_system_binary_user_marker_with_sudo
     cleanup_script="$(mktemp)"
     cat > "$cleanup_script" <<EOF
@@ -1435,6 +1488,7 @@ if [ "$root_install" = true ]; then
 else
     append_outerssh_http_unix_allowlist_entry user "$socket_path"
 fi
+write_outerssh_homepage
 run_outerctl log remove --backend org.outershell.OuterShell --path "$log_path"
 run_outerctl log add --backend org.outershell.OuterShell --path "$log_path"
 

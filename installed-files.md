@@ -272,6 +272,14 @@ Linux direct-root:
 
 Custom backends that use Unix sockets or fixed ports register those frontends in `<system-state>/registry.orwa`.
 
+## OuterSSH Homepage
+
+Installing or updating Outer Shell makes it the homepage that OuterSSH clients, such as Outer Loop, open on the server. It writes the SSH user's OuterSSH homepage file when that file doesn't exist yet, so a homepage the user chose is left alone. Uninstalling Outer Shell removes the file only if it still points at Outer Shell.
+
+- macOS: `$HOME/Library/Application Support/org.outerssh/homepage`, containing `http+unix://%2Flaunchd%2Fuser%2Forg.outershell.OuterShell/`
+- Linux: `$XDG_CONFIG_HOME/outerssh/homepage` when `XDG_CONFIG_HOME` is absolute, otherwise `$HOME/.config/outerssh/homepage`, containing `http+unix://` and the percent-encoded `<user-runtime>/org.outershell.OuterShell`, or `/run/org.outershell.OuterShell` for a direct-root install
+- Windows: `%LOCALAPPDATA%\OuterSSH\homepage`, containing `http+pipe://` and the percent-encoded `\\.\pipe\org.outershell.outershell.<lowercase-user-SID>`
+
 ## Uninstall Cleanup
 
 Uninstalling Outer Shell removes its service unit, socket unit, launch agent, runtime sockets, registry entries, Outer Shell frontend payload, and cached installer files. It does not delete root-installed bundled app payloads. Before shutting down, `outershelld` checks whether the user registry contains anything other than Outer Shell itself; if not, user-scope uninstall also removes the empty user registry, `apps`, `bin`, and `outershell` state directories, plus the user `outer-shell` cache directory. On macOS, that same empty-registry uninstall path also removes an empty `/Library/Application Support/outershell` registry directory when no root app payloads remain, prompting for an administrator password if needed. On Linux, user-scope uninstall removes that user's root-support marker and prompts for a sudo password if elevated cleanup is needed. Direct-root uninstall removes `uid-0`. Shared root support remains while any `system-binary-users` marker is still valid. When the last valid marker is removed and no root app payloads remain, Linux removes the shared root support files, the system registry, and empty root log/state directories.

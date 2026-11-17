@@ -1756,6 +1756,7 @@ private struct OverviewLayout: Codable {
 
 private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLineTextInputControllerDelegate, ScrollbarControllerDelegate {
     private lazy var elasticScrolling = ElasticScrollController(host: outerframeHost)
+    private lazy var outerLoopRequests = OuterLoopHostRequests(host: outerframeHost)
     private let outerframeHost: OuterframeHost
     private let appConnection: OuterframeAppConnection
     private var retainedSelf: BackendsHandler?
@@ -2411,7 +2412,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                     NSPasteboard.PasteboardType.fileURL.rawValue
                 ]
             )
-            outerframeHost.requestOuterLoopSSHCommandArguments { [weak self] arguments in
+            outerLoopRequests.requestSSHCommandArguments { [weak self] arguments in
                 guard let self, let arguments else { return }
                 self.serverSSHCommand = arguments.isEmpty ? nil : arguments.map(Self.shellQuotedArgument).joined(separator: " ")
                 if self.hasBackendUsername {
@@ -2575,11 +2576,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         case .pasteboardContentDropped(let point, let items):
             handlePasteboardItemsForDrop(at: point, items: items)
 
-        case .hostSpecificMessage:
-            break
-
-        case .hostSpecificMessageUnrecognized:
-            break
+        case .hostSpecificMessage, .hostSpecificMessageUnrecognized:
+            outerLoopRequests.handle(message)
 
         case .filePromiseWriteRequest(let requestID, let promiseID):
             handleFilePromiseWriteRequest(requestID: requestID, promiseID: promiseID)
@@ -4999,7 +4997,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                           containerCommand: String,
                                           internalCommand: String?,
                                           at point: CGPoint) {
-        outerframeHost.requestOuterLoopSSHCommandArguments { [weak self] arguments in
+        outerLoopRequests.requestSSHCommandArguments { [weak self] arguments in
             guard let self else { return }
             var commandByItemID: [String: String] = ["container": containerCommand]
             var items: [OuterframeContextMenuItem] = []
@@ -5049,7 +5047,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
     private func copyCommandForCurrentServer(_ command: String,
                                              completion: @escaping @MainActor (String) -> Void) {
-        outerframeHost.requestOuterLoopSSHCommandArguments { arguments in
+        outerLoopRequests.requestSSHCommandArguments { arguments in
             guard let arguments, !arguments.isEmpty else {
                 completion(command)
                 return
@@ -10914,7 +10912,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         isPerformingAction = true
         createMessage = "Installing on server..."
         updateLayout()
-        outerframeHost.requestOuterLoopSSHCommandArguments { [weak self] arguments in
+        outerLoopRequests.requestSSHCommandArguments { [weak self] arguments in
             self?.installGeneratedNativeProject(configuration: configuration,
                                                 iconPNGData: iconPNGData,
                                                 stagingDirectory: stagingDirectory,
@@ -17365,7 +17363,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
     private func chooseSharedContainerToImport() {
         let point = containerImportMenuPoint
-        outerframeHost.requestOuterLoopOpenFile(allowedFileExtensions: ["outershell-container"]) { [weak self] url in
+        outerLoopRequests.requestOpenFile(allowedFileExtensions: ["outershell-container"]) { [weak self] url in
             guard let self, let url else { return }
             guard url.pathExtension == "outershell-container" else {
                 self.workspacePanelMessage = "Choose a .outershell-container file."

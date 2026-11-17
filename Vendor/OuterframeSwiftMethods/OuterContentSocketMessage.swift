@@ -22,6 +22,7 @@ struct InitializeContentArguments {
     var bundleUrl: String?
     var windowIsActive: Bool?
     var historyEntryID: UUID?
+    var sessionUsername: String?
 
     init(data: Data? = nil,
          contentSize: CGSize? = nil,
@@ -30,7 +31,8 @@ struct InitializeContentArguments {
          url: String? = nil,
          bundleUrl: String? = nil,
          windowIsActive: Bool? = nil,
-         historyEntryID: UUID? = nil) {
+         historyEntryID: UUID? = nil,
+         sessionUsername: String? = nil) {
         self.data = data
         self.contentSize = contentSize
         self.appearance = appearance
@@ -39,6 +41,7 @@ struct InitializeContentArguments {
         self.bundleUrl = bundleUrl
         self.windowIsActive = windowIsActive
         self.historyEntryID = historyEntryID
+        self.sessionUsername = sessionUsername
     }
 }
 
@@ -58,6 +61,7 @@ fileprivate enum InitArgKind: UInt8 {
     case bundleUrl = 7
     case windowIsActive = 8
     case historyEntryID = 9
+    case sessionUsername = 10
 }
 
 /// Messages from Browser to Content on the content socket
@@ -211,6 +215,13 @@ enum BrowserToContentMessage {
                 argPayload.append(uint8: InitArgKind.historyEntryID.rawValue)
                 argPayload.append(uuid: historyEntryID)
                 encodedArguments.append(argPayload)
+            }
+
+            if let username = arguments.sessionUsername {
+                var argPayload = OffsetPayloadBuilder(referenceBaseOffset: 0)
+                argPayload.append(uint8: InitArgKind.sessionUsername.rawValue)
+                try argPayload.append(stringReference: username)
+                encodedArguments.append(try argPayload.finalize())
             }
 
             var payload = OffsetPayloadBuilder()
@@ -619,6 +630,12 @@ enum BrowserToContentMessage {
                         throw OuterframeContentSocketMessageError.truncatedPayload
                     }
                     arguments.windowIsActive = windowIsActiveRaw & (1 << 0) != 0
+
+                case .sessionUsername:
+                    guard let username = argCursor.readStringReference() else {
+                        throw OuterframeContentSocketMessageError.truncatedPayload
+                    }
+                    arguments.sessionUsername = username
 
                 case .historyEntryID:
                     guard let historyEntryID = argCursor.readUUID() else {
@@ -1833,8 +1850,6 @@ private enum BrowserToContentMessageKind: UInt16 {
     case setCursorPosition = 1025
     case selectionToPasteboardCopyRequest = 1026
     case pasteboardContentPasted = 1027
-    case accessibilityActionAndSnapshot = 1045
-    case accessibilityTextQuery = 1044
     case accessibilitySnapshotRequest = 1028
     case historyEntryAccepted = 1029
     case historyEntryRejected = 1030
@@ -1850,6 +1865,8 @@ private enum BrowserToContentMessageKind: UInt16 {
     case hostSpecificMessage = 1041
     case hostSpecificMessageUnrecognized = 1042
     case accessibilityAction = 1043
+    case accessibilityTextQuery = 1044
+    case accessibilityActionAndSnapshot = 1045
 
     // Assign new indices in contiguous blocks to make the switch statement more efficient
 }
@@ -1865,7 +1882,6 @@ private enum ContentToBrowserMessageKind: UInt16 {
     case hapticFeedback = 2007
     case selectionToPasteboardResponse = 2008
     case editCommandValidationResponse = 2009
-    case accessibilityTextResponse = 2035
     case accessibilitySnapshotResponse = 2010
     case accessibilityTreeChanged = 2011
     case openNewWindow = 2012
@@ -1887,6 +1903,7 @@ private enum ContentToBrowserMessageKind: UInt16 {
     case hostSpecificMessage = 2032
     case navigateWithDisplayString = 2033
     case openURLExternally = 2034
+    case accessibilityTextResponse = 2035
 
     // Assign new indices in contiguous blocks to make the switch statement more efficient
 }

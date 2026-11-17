@@ -22,6 +22,7 @@ struct InitializeContentArguments {
     var bundleUrl: String?
     var windowIsActive: Bool?
     var historyEntryID: UUID?
+    var sessionUsername: String?
 
     init(data: Data? = nil,
          contentSize: CGSize? = nil,
@@ -30,7 +31,8 @@ struct InitializeContentArguments {
          url: String? = nil,
          bundleUrl: String? = nil,
          windowIsActive: Bool? = nil,
-         historyEntryID: UUID? = nil) {
+         historyEntryID: UUID? = nil,
+         sessionUsername: String? = nil) {
         self.data = data
         self.contentSize = contentSize
         self.appearance = appearance
@@ -39,6 +41,7 @@ struct InitializeContentArguments {
         self.bundleUrl = bundleUrl
         self.windowIsActive = windowIsActive
         self.historyEntryID = historyEntryID
+        self.sessionUsername = sessionUsername
     }
 }
 
@@ -58,6 +61,7 @@ fileprivate enum InitArgKind: UInt8 {
     case bundleUrl = 7
     case windowIsActive = 8
     case historyEntryID = 9
+    case sessionUsername = 10
 }
 
 /// Messages from Browser to Content on the content socket
@@ -122,6 +126,9 @@ enum BrowserToContentMessage {
     case filePromiseWriteRequest(requestID: UUID, promiseID: UUID)
     case hostSpecificMessage(name: String, payload: Data)
     case hostSpecificMessageUnrecognized(name: String)
+    case accessibilityAction(identifier: UInt32, action: OuterframeAccessibilityAction, value: String)
+    case accessibilityActionAndSnapshot(requestID: UUID, identifier: UInt32, action: OuterframeAccessibilityAction, value: String)
+    case accessibilityTextQuery(requestID: UUID, identifier: UInt32, query: OuterframeAccessibilityTextQuery, range: NSRange, point: CGPoint)
     case accessibilitySnapshotRequest(requestID: UUID)
     case historyEntryAccepted(entryID: UUID, url: String)
     case historyEntryRejected(entryID: UUID, errorMessage: String)
@@ -208,6 +215,13 @@ enum BrowserToContentMessage {
                 argPayload.append(uint8: InitArgKind.historyEntryID.rawValue)
                 argPayload.append(uuid: historyEntryID)
                 encodedArguments.append(argPayload)
+            }
+
+            if let username = arguments.sessionUsername {
+                var argPayload = OffsetPayloadBuilder(referenceBaseOffset: 0)
+                argPayload.append(uint8: InitArgKind.sessionUsername.rawValue)
+                try argPayload.append(stringReference: username)
+                encodedArguments.append(try argPayload.finalize())
             }
 
             var payload = OffsetPayloadBuilder()
@@ -440,6 +454,32 @@ enum BrowserToContentMessage {
             try payload.append(stringReference: name)
             return makeBrowserToContentFrame(type: .hostSpecificMessageUnrecognized, payload: try payload.finalize())
 
+        case .accessibilityAction(let identifier, let action, let value):
+            var payload = OffsetPayloadBuilder()
+            payload.append(uint32: identifier)
+            payload.append(uint8: action.rawValue)
+            try payload.append(stringReference: value)
+            return makeBrowserToContentFrame(type: .accessibilityAction, payload: try payload.finalize())
+
+        case .accessibilityActionAndSnapshot(let requestID, let identifier, let action, let value):
+            var payload = OffsetPayloadBuilder()
+            payload.append(uuid: requestID)
+            payload.append(uint32: identifier)
+            payload.append(uint8: action.rawValue)
+            try payload.append(stringReference: value)
+            return makeBrowserToContentFrame(type: .accessibilityActionAndSnapshot, payload: try payload.finalize())
+
+        case .accessibilityTextQuery(let requestID, let identifier, let query, let range, let point):
+            var payload = Data()
+            payload.append(uuid: requestID)
+            payload.append(uint32: identifier)
+            payload.append(uint8: query.rawValue)
+            payload.append(uint64: UInt64(clamping: range.location))
+            payload.append(uint64: UInt64(clamping: range.length))
+            payload.append(float64: point.x)
+            payload.append(float64: point.y)
+            return makeBrowserToContentFrame(type: .accessibilityTextQuery, payload: payload)
+
         case .accessibilitySnapshotRequest(let requestID):
             var payload = Data(capacity: 16)
             payload.append(uuid: requestID)
@@ -590,6 +630,12 @@ enum BrowserToContentMessage {
                         throw OuterframeContentSocketMessageError.truncatedPayload
                     }
                     arguments.windowIsActive = windowIsActiveRaw & (1 << 0) != 0
+
+                case .sessionUsername:
+                    guard let username = argCursor.readStringReference() else {
+                        throw OuterframeContentSocketMessageError.truncatedPayload
+                    }
+                    arguments.sessionUsername = username
 
                 case .historyEntryID:
                     guard let historyEntryID = argCursor.readUUID() else {
@@ -882,6 +928,35 @@ enum BrowserToContentMessage {
             }
             return .hostSpecificMessageUnrecognized(name: name)
 
+        case .accessibilityAction:
+            guard let identifier = cursor.readUInt32(),
+                  let rawAction = cursor.readUInt8(),
+                  let action = OuterframeAccessibilityAction(rawValue: rawAction),
+                  let value = cursor.readStringReference() else {
+                throw OuterframeContentSocketMessageError.truncatedPayload
+            }
+            return .accessibilityAction(identifier: identifier, action: action, value: value)
+
+        case .accessibilityActionAndSnapshot:
+            guard let requestID = cursor.readUUID(), let identifier = cursor.readUInt32(),
+                  let rawAction = cursor.readUInt8(),
+                  let action = OuterframeAccessibilityAction(rawValue: rawAction),
+                  let value = cursor.readStringReference() else {
+                throw OuterframeContentSocketMessageError.truncatedPayload
+            }
+            return .accessibilityActionAndSnapshot(requestID: requestID, identifier: identifier, action: action, value: value)
+
+        case .accessibilityTextQuery:
+            guard let requestID = cursor.readUUID(), let identifier = cursor.readUInt32(),
+                  let raw = cursor.readUInt8(), let query = OuterframeAccessibilityTextQuery(rawValue: raw),
+                  let location = cursor.readUInt64(), let length = cursor.readUInt64(),
+                  let x = cursor.readFloat64(), let y = cursor.readFloat64(), x.isFinite, y.isFinite,
+                  let start = Int(exactly: location), let count = Int(exactly: length), count <= Int.max - start else {
+                throw OuterframeContentSocketMessageError.truncatedPayload
+            }
+            return .accessibilityTextQuery(requestID: requestID, identifier: identifier, query: query,
+                range: NSRange(location: start, length: count), point: CGPoint(x: x, y: y))
+
         case .accessibilitySnapshotRequest:
             guard let requestID = cursor.readUUID() else {
                 throw OuterframeContentSocketMessageError.truncatedPayload
@@ -970,6 +1045,7 @@ enum ContentToBrowserMessage {
     case setAcceptedPasteboardPasteTypes([String])
     case setPasteboardDropBehaviorHitTest
     case pasteboardDropHitTestResponse(requestID: UUID, operationMask: UInt32)
+    case accessibilityTextResponse(requestID: UUID, result: OuterframeAccessibilityTextResult?)
     case accessibilitySnapshotResponse(requestID: UUID, snapshotData: Data?)
     case accessibilityTreeChanged(notificationMask: UInt8)
     case hapticFeedback(style: UInt8)
@@ -1153,6 +1229,20 @@ enum ContentToBrowserMessage {
             payload.append(uuid: requestID)
             payload.append(uint32: operationMask)
             return makeContentToBrowserFrame(type: .pasteboardDropHitTestResponse, payload: payload)
+
+        case .accessibilityTextResponse(let requestID, let result):
+            var payload = Data()
+            payload.append(uuid: requestID)
+            payload.append(uint8: result == nil ? 0 : 1)
+            let value = result ?? OuterframeAccessibilityTextResult()
+            payload.append(uint64: UInt64(clamping: value.range.location))
+            payload.append(uint64: UInt64(clamping: value.range.length))
+            payload.append(float64: value.frame.origin.x)
+            payload.append(float64: value.frame.origin.y)
+            payload.append(float64: value.frame.width)
+            payload.append(float64: value.frame.height)
+            payload.append(uint64: UInt64(clamping: value.index))
+            return makeContentToBrowserFrame(type: .accessibilityTextResponse, payload: payload)
 
         case .accessibilitySnapshotResponse(let requestID, let snapshotData):
             var payload = OffsetPayloadBuilder()
@@ -1413,6 +1503,20 @@ enum ContentToBrowserMessage {
             }
             return .pasteboardDropHitTestResponse(requestID: requestID, operationMask: operationMask)
 
+        case .accessibilityTextResponse:
+            guard let requestID = cursor.readUUID(), let present = cursor.readUInt8(), present <= 1,
+                  let location = cursor.readUInt64(), let length = cursor.readUInt64(),
+                  let x = cursor.readFloat64(), let y = cursor.readFloat64(),
+                  let width = cursor.readFloat64(), let height = cursor.readFloat64(),
+                  let index = cursor.readUInt64(), let start = Int(exactly: location), let count = Int(exactly: length),
+                  let integer = Int(exactly: index), count <= Int.max - start,
+                  x.isFinite, y.isFinite, width.isFinite, height.isFinite, width >= 0, height >= 0 else {
+                throw OuterframeContentSocketMessageError.truncatedPayload
+            }
+            let result = OuterframeAccessibilityTextResult(range: NSRange(location: start, length: count),
+                frame: CGRect(x: x, y: y, width: width, height: height), index: integer)
+            return .accessibilityTextResponse(requestID: requestID, result: present == 1 ? result : nil)
+
         case .accessibilitySnapshotResponse:
             guard let requestID = cursor.readUUID(),
                   let flags = cursor.readUInt8(),
@@ -1601,7 +1705,9 @@ public struct OuterframeEditCommandSet: OptionSet, Sendable {
     public static let find = OuterframeEditCommandSet(rawValue: 1 << 4)
     public static let findNext = OuterframeEditCommandSet(rawValue: 1 << 5)
     public static let findPrevious = OuterframeEditCommandSet(rawValue: 1 << 6)
-    public static let standard: OuterframeEditCommandSet = [.copy, .cut, .paste, .selectAll, .find, .findNext, .findPrevious]
+    public static let undo = OuterframeEditCommandSet(rawValue: 1 << 7)
+    public static let redo = OuterframeEditCommandSet(rawValue: 1 << 8)
+    public static let standard: OuterframeEditCommandSet = [.copy, .cut, .paste, .selectAll, .find, .findNext, .findPrevious, .undo, .redo]
 }
 
 public enum OuterframeContextMenuItemAction: UInt8, Sendable {
@@ -1758,6 +1864,9 @@ private enum BrowserToContentMessageKind: UInt16 {
     case editCommandValidationRequest = 1040
     case hostSpecificMessage = 1041
     case hostSpecificMessageUnrecognized = 1042
+    case accessibilityAction = 1043
+    case accessibilityTextQuery = 1044
+    case accessibilityActionAndSnapshot = 1045
 
     // Assign new indices in contiguous blocks to make the switch statement more efficient
 }
@@ -1794,6 +1903,7 @@ private enum ContentToBrowserMessageKind: UInt16 {
     case hostSpecificMessage = 2032
     case navigateWithDisplayString = 2033
     case openURLExternally = 2034
+    case accessibilityTextResponse = 2035
 
     // Assign new indices in contiguous blocks to make the switch statement more efficient
 }

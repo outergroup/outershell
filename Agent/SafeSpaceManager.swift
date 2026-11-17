@@ -1268,7 +1268,9 @@ final class SafeSpaceManager: @unchecked Sendable {
             .appendingPathComponent("Library/Application Support/org.outerssh/endpoints.d", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true,
                                                attributes: [.posixPermissions: 0o700])
-        try data.write(to: directory.appendingPathComponent("outershell-containers"), options: .atomic)
+        let file = directory.appendingPathComponent("outershell-containers")
+        if (try? Data(contentsOf: file)) == data { return }
+        try data.write(to: file, options: .atomic)
     }
 
     private func overviewIconURL(_ data: Data) throws -> String {

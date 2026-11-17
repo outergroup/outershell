@@ -111,7 +111,7 @@ the container boundary, identify the mounted Dockerfile as the reproducible
 source of truth, and document how tools are published with `outerctl`.
 
 Copy the files from `ContainerAgentInstructions` into the Dockerfile build
-context, following symlinks (for example, with `cp -L`), then include them in the image:
+context, then include them in the image:
 
 ```dockerfile
 RUN mkdir -p /work /usr/local/share/outershell

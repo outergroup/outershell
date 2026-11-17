@@ -359,6 +359,75 @@ bool win_allow_pipes(const char *const *paths, size_t count) {
     return ok;
 }
 
+static char *outerssh_directory(void) {
+    char *base = win_folder(CSIDL_LOCAL_APPDATA);
+    if (!base)
+        return NULL;
+    char *directory = win_join(base, "OuterSSH");
+    free(base);
+    return directory;
+}
+
+static char *outerssh_homepage_path(void) {
+    char *directory = outerssh_directory();
+    char *path = directory ? win_join(directory, "homepage") : NULL;
+    free(directory);
+    return path;
+}
+
+static bool pipe_homepage_url(const char *pipe, StringBuilder *url) {
+    bool ok = sb_append(url, "http+pipe://");
+    for (const unsigned char *p = (const unsigned char *)pipe; ok && *p; p++) {
+        if (isalnum(*p) || strchr("-._~", *p)) {
+            ok = sb_append_n(url, (const char *)p, 1);
+        } else {
+            char escaped[4];
+            snprintf(escaped, sizeof(escaped), "%%%02X", *p);
+            ok = sb_append(url, escaped);
+        }
+    }
+    return ok && sb_append(url, "/");
+}
+
+bool win_write_outerssh_homepage(const char *pipe) {
+    char *path = outerssh_homepage_path();
+    wchar_t *wide = path ? win_wide(path) : NULL;
+    StringBuilder url = {0};
+    bool ok = wide && pipe_homepage_url(pipe, &url);
+    if (ok && GetFileAttributesW(wide) == INVALID_FILE_ATTRIBUTES) {
+        DWORD error = GetLastError();
+        if (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND) {
+            char *directory = outerssh_directory();
+            ok = directory && win_secure_directory(directory) && sb_append(&url, "\n") &&
+                 win_atomic_write(path, url.data, url.length);
+            free(directory);
+        } else {
+            ok = false;
+        }
+    }
+    free(path); free(wide); free(url.data);
+    return ok;
+}
+
+bool win_remove_outerssh_homepage(const char *pipe) {
+    char *path = outerssh_homepage_path();
+    wchar_t *wide = path ? win_wide(path) : NULL;
+    StringBuilder url = {0}, text = {0};
+    bool ok = wide && pipe_homepage_url(pipe, &url);
+    DWORD attributes = ok ? GetFileAttributesW(wide) : INVALID_FILE_ATTRIBUTES;
+    if (ok && attributes != INVALID_FILE_ATTRIBUTES &&
+        !(attributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY))) {
+        ok = win_read_file(path, HTTP_BODY_LIMIT, &text);
+        size_t start = 0, end = text.length;
+        while (start < end && strchr(" \t\r\n", text.data[start])) start++;
+        while (end > start && strchr(" \t\r\n", text.data[end - 1])) end--;
+        if (ok && end - start == url.length && !memcmp(text.data + start, url.data, url.length))
+            ok = DeleteFileW(wide) || GetLastError() == ERROR_FILE_NOT_FOUND;
+    }
+    free(path); free(wide); free(url.data); free(text.data);
+    return ok;
+}
+
 static SRWLOCK pipe_activity_lock = SRWLOCK_INIT;
 static ULONGLONG pipe_last_activity;
 static unsigned pipe_active_connections;
@@ -1061,8 +1130,19 @@ bool win_publish_endpoint_names(const char *publisher, const StringBuilder *name
     char *parent = win_join(base, "OuterSSH");
     char *directory = win_join(parent, "endpoints.d");
     char *path = win_join(directory, publisher);
-    bool ok = secure_directory(parent, system) && secure_directory(directory, system) &&
-        win_atomic_write(path, names->data, names->length);
+    bool ok = secure_directory(parent, system) && secure_directory(directory, system);
+    if (ok) {
+        wchar_t *wide = win_wide(path);
+        DWORD attributes = wide ? GetFileAttributesW(wide) : INVALID_FILE_ATTRIBUTES;
+        free(wide);
+        StringBuilder existing = {0};
+        bool unchanged = attributes != INVALID_FILE_ATTRIBUTES &&
+            !(attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) &&
+            win_read_file(path, names->length, &existing) && existing.length == names->length &&
+            (names->length == 0 || memcmp(existing.data, names->data, names->length) == 0);
+        free(existing.data);
+        if (!unchanged) ok = win_atomic_write(path, names->data, names->length);
+    }
     free(path); free(directory); free(parent); free(base);
     return ok;
 }

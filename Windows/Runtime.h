@@ -48,6 +48,12 @@ bool win_read_file(const char *path, size_t limit, StringBuilder *result);
 bool win_pipe_is_allowed(const char *pipe);
 bool win_disallow_pipe(const char *pipe);
 bool win_allow_pipes(const char *const *paths, size_t count);
+// Makes PIPE the homepage that OuterSSH clients open on this computer, by writing
+// the user's %LOCALAPPDATA%\OuterSSH\homepage, unless the user already has one.
+bool win_write_outerssh_homepage(const char *pipe);
+// Removes the homepage that win_write_outerssh_homepage wrote, if it still
+// points at PIPE.
+bool win_remove_outerssh_homepage(const char *pipe);
 PipeServer *pipe_server_start(const char *name, PipeHandler handler, void *context);
 void pipe_server_stop(PipeServer *server);
 bool connection_read_some(Connection *connection, void *data, size_t capacity, size_t *length);
