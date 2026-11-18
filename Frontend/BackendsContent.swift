@@ -1793,6 +1793,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private var backends: [BackendRecord] = []
     private var launchingEndpoints: Set<String> = []
     private var stoppingEndpoints: Set<String> = []
+    private var updatingEndpoints: Set<String> = []
     private var backendError = ""
     private var overviewLayoutLoadError: String?
     private var selectedServiceID: String?
@@ -4642,6 +4643,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         return stoppingEndpoints.contains(launchKey(item.primaryEndpoint))
     }
 
+    private func isUpdating(_ item: AppLauncherItem) -> Bool {
+        item.containerContext == nil && updatingEndpoints.contains(launchKey(item.primaryEndpoint))
+    }
+
     private func addLaunchSpinner(at point: CGPoint, stopping: Bool = false) {
         let spinner = CAShapeLayer()
         spinner.frame = CGRect(x: point.x - 7, y: point.y - 7, width: 14, height: 14)
@@ -4674,6 +4679,17 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                           image: launcherIconImage(for: item), symbolName: launcherIconSymbolName(for: item),
                           symbolColor: appIconTintColor(for: item.backend), title: title)
         visibleIconKeys.insert(item.iconKey)
+        if item.containerContext == nil, !isUpdating(item), availableAppUpdate(for: item.backend) != nil {
+            let diameter: CGFloat = pinned ? 12 : 9
+            let badge = CALayer()
+            badge.backgroundColor = resolvedCGColor(.controlAccentColor)
+            badge.borderColor = resolvedCGColor(.windowBackgroundColor)
+            badge.borderWidth = 2
+            badge.cornerRadius = diameter / 2
+            badge.frame = CGRect(x: iconFrame.maxX - diameter + 3, y: iconFrame.maxY - diameter + 3,
+                                 width: diameter, height: diameter)
+            addAppsSublayer(badge)
+        }
         let isThisPage = item.backend.isBackendsSelf && item.backend.serviceScope == "user"
         let textFrame = pinned
             ? CGRect(x: frame.minX + 12, y: frame.minY + 8, width: frame.width - 24, height: 32)
@@ -4685,7 +4701,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         let titleWidth = (title as NSString).size(withAttributes: [.font: NSFont.systemFont(ofSize: 13)]).width
         let statusX = pinned ? max(frame.minX + 2, frame.midX - min(titleWidth, textFrame.width) / 2 - 11) : frame.minX
         let statusCenter = CGPoint(x: statusX + 2.5, y: pinned ? textFrame.maxY - 8.5 : frame.midY)
-        if isLaunching(item) || isStopping(item) {
+        if isLaunching(item) || isStopping(item) || isUpdating(item) {
             addLaunchSpinner(at: statusCenter, stopping: isStopping(item))
         } else if failed || endpointIsRunning(item.primaryEndpoint) {
             let dot = CALayer()
@@ -6736,7 +6752,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         name.frame = CGRect(x: frame.minX, y: frame.minY + 20, width: frame.width, height: 28)
         addCreateFormSublayer(name)
 
-        if installed {
+        if installed, availableAppUpdate(for: backend) != nil {
+            renderCatalogInstallButton("Update", in: frame)
+            bundledAppInstallFrames.append((frame, backend))
+        } else if installed {
             let installedLayer = makeTextLayer(size: 10, weight: .medium, color: .secondaryLabelColor, alignment: .center)
             installedLayer.string = "Installed"
             installedLayer.frame = CGRect(x: frame.minX, y: frame.minY + 3, width: frame.width, height: 14)
@@ -6749,7 +6768,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
     private func renderCatalogInstallButton(_ title: String, in frame: CGRect) {
         let button = makeButtonLayer(title: title, emphasized: false)
-        let width: CGFloat = title == "Install" ? 64 : 88
+        let width: CGFloat = title == "Install" || title == "Update" ? 64 : 88
         button.frame = CGRect(x: frame.midX - width / 2, y: frame.minY - 2, width: width, height: 22)
         button.cornerRadius = 11
         addCreateFormSublayer(button)
@@ -9287,7 +9306,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             nodes.append(accessibilityNode(nextIdentifier: &nextIdentifier,
                                            role: .button,
                                            frame: frame,
-                                           label: "Install \(app.backend.displayName)"))
+                                           label: availableAppUpdate(for: app.backend).map { "Update \(app.backend.displayName) to \($0)" }
+                                            ?? "Install \(app.backend.displayName)"))
         }
 
 
@@ -9927,7 +9947,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         isPerformingAction = true
         let stopKeys = Set(backend.frontends.map { backend.serviceScope + ":" + backend.serviceID + ":" + $0.id })
         if operation == "stop" { stoppingEndpoints.formUnion(stopKeys) }
-        backendError = operation == "stop" ? "" : actionProgressText(operation: operation, backend: backend)
+        if operation == "updateApp" { updatingEndpoints.formUnion(stopKeys) }
+        backendError = operation == "stop" || operation == "updateApp" ? "" : actionProgressText(operation: operation, backend: backend)
         if sudoPassword != nil {
             blurPasswordField()
             pendingPasswordAction = nil
@@ -9945,6 +9966,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         guard let url = components?.url else {
             isPerformingAction = false
             stoppingEndpoints.subtract(stopKeys)
+            updatingEndpoints.subtract(stopKeys)
             backendError = "Could not build control request."
             updateLayout()
             return
@@ -9960,6 +9982,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 guard let self else { return }
                 self.isPerformingAction = false
                 self.stoppingEndpoints.subtract(stopKeys)
+                self.updatingEndpoints.subtract(stopKeys)
                 var actionCompleted = false
                 if let error {
                     if !didRecoverNetworking, self.recoverNetworkingIfNeeded(after: error) {
@@ -13404,7 +13427,12 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                  displayName: displayName,
                                  opensInNewTab: opensInNewTab)
         case .bundledInstall(let backend):
-            showInstallPrompt(for: backend)
+            if backend.isInstalled ?? false, availableAppUpdate(for: backend) != nil {
+                dismissCreateOverlay()
+                performControlAction(for: backend, operation: "updateApp")
+            } else {
+                showInstallPrompt(for: backend)
+            }
         case .createCancel:
             dismissCreateOverlay()
         case .createChoice(let key, let value):
@@ -21849,6 +21877,12 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                                        title: (backend.rootOnly ?? false) && !systemOnlyPlaceholder ? "Run as \(administrativeRoleName)" : "Run",
                                                        isEnabled: true))
             }
+            if let available = availableAppUpdate(for: backend) {
+                operationByItemID["updateApp"] = "updateApp"
+                items.append(OuterframeContextMenuItem(id: "updateApp",
+                                                       title: "Update to \(available)",
+                                                       isEnabled: !isPerformingAction))
+            }
         }
         if backend.canUninstallBackend {
             operationByItemID["uninstall"] = "uninstall"
@@ -21857,6 +21891,12 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                                    isEnabled: true))
         }
         return (operationByItemID, items)
+    }
+
+    private func availableAppUpdate(for backend: BackendRecord) -> String? {
+        guard backend.isBundled ?? false, !backend.isBundledPlaceholder, !backend.isBackendsSelf else { return nil }
+        let available = backend.availableVersion?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return available.isEmpty ? nil : available
     }
 
     private func showBackendActionsMenu(for backend: BackendRecord, at point: CGPoint) {

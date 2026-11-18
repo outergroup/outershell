@@ -346,6 +346,12 @@ static StringBuilder backends(ShellHost *s) {
             payload_text(&row, 92, update_version);
             LeaveCriticalSection(&update_gate);
             payload_text(&row, 108, UPDATE_SOURCE);
+        } else if (bundled_find(b->service_id) && !s->administrator) {
+            char installed[128], available[128];
+            bundled_installed_version(s, bundled_find(b->service_id), installed, sizeof(installed));
+            bundled_available_update(s, bundled_find(b->service_id), available, sizeof(available));
+            payload_text(&row, 84, installed);
+            payload_text(&row, 92, available);
         }
         payload_text(&row, 0, b->service_id);
         payload_text(&row, 8, b->display_name);
@@ -476,8 +482,18 @@ static StringBuilder control(ShellHost *s, HttpRequest *r) {
             }
         }
     }
+    char updated[256];
     if (ok) {
         message = "Completed.";
+        if (!strcmp(operation, "updateApp") && bundled_find(id)) {
+            char version[128];
+            const BundledApp *app = bundled_find(id);
+            if (bundled_installed_version(s, app, version, sizeof(version)))
+                snprintf(updated, sizeof(updated), "Updated %s to %s.", app->name, version);
+            else
+                snprintf(updated, sizeof(updated), "Updated %s.", app->name);
+            message = updated;
+        }
         changed(s);
     }
     free(id);
@@ -615,7 +631,7 @@ static void serve_http(Connection *c, void *context) {
         char *id = http_query(&r, "serviceID"), *operation = http_query(&r, "operation"), *scope = http_query(&r, "scope");
         bool handles = id && !strcmp(id, shell_id) && operation && (!scope || !strcmp(scope, "user"));
         if (handles) {
-            StringBuilder response = !strcmp(operation, "uninstallOuterShell") ? uninstall_control(s) : update_control(operation);
+            StringBuilder response = !strcmp(operation, "uninstallOuterShell") ? uninstall_control(s) : update_control(s, operation);
             http_send(c, &r, 200, "application/octet-stream", response.data, response.length);
             bool uninstalling = !strcmp(operation, "uninstallOuterShell") && response.length >= 4 &&
                 (read_uint32_le((const unsigned char *)response.data) & 1);

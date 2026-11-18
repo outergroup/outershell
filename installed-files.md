@@ -233,6 +233,14 @@ Each bundled app's `version` file holds its release version, copied from the
 archives carried versions contain `1`, and older macOS and Windows installs
 have no `version` file; both are older than any published version.
 
+Outer Shell checks the published app versions alongside its own update checks
+and when the user chooses Check for Updates, and caches them in
+`<user-state>/app-versions` (`%LOCALAPPDATA%\OuterShell\app-versions` on
+Windows), one `<service-id>` tab `<version>` line per app. An installed app
+older than its cached version offers Update in its menu and in the app catalog.
+Updating downloads the published archive and reinstalls the app in the same
+scope. Windows administrator apps are not updated this way yet.
+
 Bundled app table:
 
 | App | Service ID | Binary | Bundle Prefix | Root |

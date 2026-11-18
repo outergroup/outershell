@@ -11,6 +11,8 @@
 #define OUTERSHELL_PUBLIC_BASE_URL "https://outershell.org/outer-shell"
 #endif
 #define UPDATE_SOURCE OUTERSHELL_PUBLIC_BASE_URL
+static bool bundled_check_versions(ShellHost *s);
+static void bundled_updates_text(ShellHost *s, char *out, size_t capacity);
 static CRITICAL_SECTION update_gate;
 static HANDLE update_thread;
 static char update_version[128];
@@ -271,7 +273,7 @@ static bool update_stage(UpdateFetch fetch, char *error, size_t capacity) {
     free(xml.data); free(sid); free(runner_w); free(setup_w); free(runner); free(setup); free(directory); free(name); free(root); free(local); free(task);
     return ok;
 }
-static StringBuilder update_control(const char *operation) {
+static StringBuilder update_control(ShellHost *s, const char *operation) {
     char error[512] = "", available[128] = "";
     bool check = !strcmp(operation, "checkUpdate") || !strcmp(operation, "checkOuterShellUpdate");
     bool install = !strcmp(operation, "update") || !strcmp(operation, "updateOuterShell");
@@ -287,9 +289,19 @@ static StringBuilder update_control(const char *operation) {
     bool newer = update_newer(available, OUTERSHELL_VERSION);
     if (ok && install && newer) ok = update_stage(update_fetch, error, sizeof(error));
     if (install) { EnterCriticalSection(&update_gate); if (!busy) update_installing = false; LeaveCriticalSection(&update_gate); }
+    char message[1024], app_updates[512] = "";
+    snprintf(message, sizeof(message), "%s", !ok ? error : !newer ? "Outer Shell is up to date." : install ? "Installing update. Outer Shell will reconnect shortly." : "A newer version of Outer Shell is available.");
+    if (check && !s->administrator) {
+        bundled_check_versions(s);
+        bundled_updates_text(s, app_updates, sizeof(app_updates));
+    }
+    if (ok && app_updates[0]) {
+        size_t used = strlen(message);
+        snprintf(message + used, sizeof(message) - used, " App updates are available: %s.", app_updates);
+    }
     StringBuilder result = payload(28);
     payload_u32(&result, 0, (ok ? 1u : 0u) | (ok && newer ? 4u : 0u));
-    payload_text(&result, 4, !ok ? error : !newer ? "Outer Shell is up to date." : install ? "Installing update. Outer Shell will reconnect shortly." : "A newer version of Outer Shell is available.");
+    payload_text(&result, 4, message);
     payload_text(&result, 12, OUTERSHELL_VERSION); payload_text(&result, 20, available);
     return result;
 }
@@ -336,6 +348,7 @@ static DWORD WINAPI update_monitor(void *context) {
     bool ok = update_mark_heartbeat(s->state, monitor->heartbeat) &&
         update_check(update_heartbeats[monitor->heartbeat], error, sizeof(error));
     free(monitor);
+    if (ok && !s->administrator) bundled_check_versions(s);
     if (ok) {
         EnterCriticalSection(&s->gate); changed(s); LeaveCriticalSection(&s->gate);
     }

@@ -277,6 +277,12 @@
     return `<span class="launcher-icon" aria-hidden="true">${content}</span>`;
   }
 
+  function withUpdateBadge(icon, backend) {
+    if (!appUpdateOffered(backend)) return icon;
+    const label = `Update to ${escapeHTML(backend.availableVersion)} available`;
+    return `<span class="update-badge-anchor" title="${label}">${icon}<span class="update-badge" role="img" aria-label="${label}"></span></span>`;
+  }
+
   function listIconHTML(item) {
     const source = dataURL(item.backend?.iconData) || item.app?.iconURL || (item.app?.iconData
       ? `data:image/png;base64,${escapeHTML(item.app.iconData)}`
@@ -566,7 +572,7 @@
   function overviewEndpoint(entry) {
     const target = entry.item ? navigationURL(entry.item.frontend) : safeSpaceAppURL(entry.app);
     const isThisPage = entry.serviceID === "org.outershell.OuterShell" && entry.item?.backend.serviceScope !== "system" && !entry.workspace;
-    const icon = listIconHTML(entry.item || { app: entry.app, displayName: entry.name });
+    const icon = withUpdateBadge(listIconHTML(entry.item || { app: entry.app, displayName: entry.name }), entry.item?.backend);
     const menu = entry.item
       ? `data-action="edit-bookmark" data-app-key="${escapeHTML(entry.item.identity)}"`
       : `data-action="edit-container-bookmark" data-safe-space-id="${escapeHTML(entry.workspace.id)}" data-service-id="${escapeHTML(entry.app.serviceID)}" data-frontend-key="${escapeHTML(containerFrontendKey(entry.app))}"`;
@@ -632,7 +638,7 @@
 
   function overviewShortcut(entry) {
     const item = entry.item || findItem(entry.key);
-    const icon = listIconHTML(item);
+    const icon = withUpdateBadge(listIconHTML(item), entry.item?.backend);
     const target = entry.item ? navigationURL(entry.item.frontend) : safeSpaceAppURL(entry.app);
     const identity = entry.item?.identity || entry.key;
     return `<div class="overview-shortcut-wrap" data-endpoint-key="${escapeHTML(entry.key)}"><a class="overview-shortcut" href="${escapeHTML(target)}" ${overviewLaunchAttributes(entry)} ${entry.item ? "" : `data-app-key="${escapeHTML(identity)}"`}>${icon}<span class="shortcut-title">${overviewStatus(entry)}${escapeHTML(entry.name)}${entry.failure ? " — Unavailable" : ""}</span></a>${appLaunchFeedback(entry)}</div>`;
@@ -1642,7 +1648,7 @@ RUN outerctl image add-command --id codex --name "Codex" --working-directory /ro
       const item = { backend, frontend: backend.frontends?.[0], displayName: backend.displayName };
       return { name: backend.displayName, html: `<article class="add-catalog-app ${backend.isInstalled ? "installed" : ""}">
         ${iconHTML(item)}<h3>${escapeHTML(backend.displayName)}</h3>
-        ${backend.isInstalled ? '<span class="catalog-installed">Installed</span>' : `<button class="secondary-button" type="button" data-action="install" data-backend-key="${escapeHTML(backendKey(backend))}">${backend.serviceScope === "system" ? (state.hostPlatform === "windows" && !state.addWorkspace ? "Install as administrator" : "Install as root") : "Install"}</button>`}
+        ${appUpdateOffered(backend) ? `<button class="secondary-button" type="button" data-action="update-app" data-backend-key="${escapeHTML(backendKey(backend))}">Update to ${escapeHTML(backend.availableVersion)}</button>` : backend.isInstalled ? '<span class="catalog-installed">Installed</span>' : `<button class="secondary-button" type="button" data-action="install" data-backend-key="${escapeHTML(backendKey(backend))}">${backend.serviceScope === "system" ? (state.hostPlatform === "windows" && !state.addWorkspace ? "Install as administrator" : "Install as root") : "Install"}</button>`}
       </article>` };
     });
     const catalog = catalogEntries.length ? `<div class="add-catalog">${catalogEntries.sort((a, b) => a.name.localeCompare(b.name)).map(entry => entry.html).join("")}</div>` : `<p class="add-empty">No bundled apps are available for this account.</p>`;
@@ -1787,6 +1793,9 @@ RUN outerctl image add-command --id codex --name "Codex" --working-directory /ro
       renameEndpointMenuHTML(item),
       `<button class="context-menu-item" type="button" data-action="copy-url" data-app-key="${escapeHTML(item.identity)}" role="menuitem">${contextMenuGlyph("⧉")}<span>Copy URL</span></button>`
     ];
+    if (appUpdateOffered(backend)) {
+      management.push(`<button class="context-menu-item" type="button" data-action="update-app" data-backend-key="${escapeHTML(backendKey(backend))}" role="menuitem">${contextMenuGlyph("↻")}<span>Update to ${escapeHTML(backend.availableVersion)}</span></button>`);
+    }
     const isOuterShell = backend.serviceID === "org.outershell.OuterShell" && backend.serviceScope !== "system";
     if (isOuterShell) {
       const key = escapeHTML(backendKey(backend));
@@ -2842,7 +2851,7 @@ RUN outerctl image add-command --id codex --name "Codex" --working-directory /ro
 
   async function performEndpointControl(key, operation, run) {
     if (state.endpointControls.has(key)) return;
-    state.endpointControls.set(key, operation.startsWith("stop") ? "Stopping" : operation.startsWith("restart") ? "Restarting" : "Starting");
+    state.endpointControls.set(key, operation.startsWith("stop") ? "Stopping" : operation.startsWith("restart") ? "Restarting" : operation === "update" ? "Updating" : "Starting");
     closeDialog();
     renderSafeSpaces();
     try {
@@ -2892,6 +2901,26 @@ RUN outerctl image add-command --id codex --name "Codex" --working-directory /ro
       button.disabled = false;
       button.textContent = backend.serviceScope === "system" ? (state.hostPlatform === "windows" && !state.addWorkspace ? "Install as administrator" : "Install as root") : "Install";
     }
+  }
+
+  function appUpdateAvailable(backend) {
+    return Boolean(backend?.isBundled && backend.isInstalled && backend.serviceID !== "org.outershell.OuterShell" &&
+      String(backend.availableVersion || "").trim());
+  }
+
+  function appUpdateOffered(backend) {
+    return appUpdateAvailable(backend) && !state.endpointControls.has(`host:${backendKey(backend)}`);
+  }
+
+  async function updateApp(key) {
+    const backend = findBackend(key);
+    if (!backend) return;
+    await performEndpointControl(`host:${key}`, "update", async () => {
+      const result = await control(backend, "updateApp");
+      if (!result.ok) throw new Error(result.message || `Could not update ${backend.displayName}.`);
+      toast(result.message || `Updated ${backend.displayName}.`);
+      await refreshBackends({ quiet: true });
+    });
   }
 
   async function uninstallBackend(key, button) {
@@ -3447,6 +3476,7 @@ RUN outerctl image add-command --id codex --name "Codex" --working-directory /ro
       return;
     }
     if (action === "install") { await installBackend(actionElement.dataset.backendKey, actionElement); return; }
+    if (action === "update-app") { await updateApp(actionElement.dataset.backendKey); return; }
     if (action === "control") { await performControl(actionElement.dataset.backendKey, actionElement.dataset.operation, actionElement); return; }
     if (action === "uninstall") { await uninstallBackend(actionElement.dataset.backendKey, actionElement); return; }
     if (action === "copy-script") { const script = actionElement.dataset.script; closeDialog(); await copyText(script); return; }

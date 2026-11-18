@@ -227,6 +227,97 @@ done:
     free(apps); free(root); free(archive); free(staging); free(extracted); free(folder); free(executable);
     return ok;
 }
+// Each app publishes its latest version at <source>/apps/<App>/version.txt, so
+// apps can be updated without an Outer Shell release. Checks cache the versions
+// in app-versions, one "<id>\t<version>" line per app. An app's archive carries
+// its own version, at <App>\version in the installed folder.
+static bool bundled_read_version(const char *path, char *out, size_t capacity) {
+    StringBuilder text = {0};
+    bool ok = path && win_read_file(path, 128, &text) && text.data;
+    while (ok && text.length && isspace((unsigned char)text.data[text.length - 1])) text.data[--text.length] = 0;
+    ok = ok && update_valid_version(text.data);
+    snprintf(out, capacity, "%s", ok ? text.data : "");
+    free(text.data);
+    return ok;
+}
+static bool bundled_installed_version(ShellHost *s, const BundledApp *app, char *out, size_t capacity) {
+    char *root = bundled_root(s, app), *current = root ? win_join(root, "current") : NULL, *path = NULL;
+    StringBuilder name = {0};
+    if (current && win_read_file(current, 64, &name) && name.data && name.length && !strpbrk(name.data, "\\/.:")) {
+        char *folder = win_join(root, name.data);
+        path = folder ? win_join(folder, "version") : NULL;
+        free(folder);
+    }
+    bool ok = bundled_read_version(path, out, capacity);
+    free(path); free(name.data); free(current); free(root);
+    return ok;
+}
+static bool bundled_cached_version(ShellHost *s, const BundledApp *app, char *out, size_t capacity) {
+    char *path = win_join(s->state, "app-versions");
+    StringBuilder text = {0};
+    bool found = false;
+    if (path && win_read_file(path, 16384, &text) && text.data) {
+        for (char *line = strtok(text.data, "\r\n"); line && !found; line = strtok(NULL, "\r\n")) {
+            char *tab = strchr(line, '\t');
+            if (!tab) continue;
+            *tab = 0;
+            if (!strcmp(line, app->id) && update_valid_version(tab + 1)) {
+                snprintf(out, capacity, "%s", tab + 1);
+                found = true;
+            }
+        }
+    }
+    free(text.data); free(path);
+    return found;
+}
+static bool bundled_available_update(ShellHost *s, const BundledApp *app, char *out, size_t capacity) {
+    char installed[128], latest[128];
+    bundled_installed_version(s, app, installed, sizeof(installed));
+    bool newer = bundled_cached_version(s, app, latest, sizeof(latest)) &&
+                 (!installed[0] || update_newer(latest, installed));
+    snprintf(out, capacity, "%s", newer ? latest : "");
+    return newer;
+}
+static bool bundled_check_versions(ShellHost *s) {
+    char host[256], source[512];
+    if (!update_source_parts(UPDATE_SOURCE, host, sizeof(host), source, sizeof(source))) return false;
+    StringBuilder versions = {0};
+    for (size_t i = 0; i < sizeof(bundled_apps) / sizeof(*bundled_apps); i++) {
+        const BundledApp *app = &bundled_apps[i];
+        StringBuilder url = {0}, text = {0};
+        char error[256] = "", version[128] = "";
+        sb_append(&url, source); sb_append(&url, "/apps/"); sb_append(&url, app->name); sb_append(&url, "/version.txt");
+        wchar_t *url_w = url.data ? win_wide(url.data) : NULL;
+        if (url_w && update_fetch(url_w, INVALID_HANDLE_VALUE, &text, error, sizeof(error)) && text.data) {
+            while (text.length && isspace((unsigned char)text.data[text.length - 1])) text.data[--text.length] = 0;
+            if (update_valid_version(text.data)) snprintf(version, sizeof(version), "%s", text.data);
+        }
+        if (!version[0]) bundled_cached_version(s, app, version, sizeof(version));
+        if (version[0]) {
+            sb_append(&versions, app->id); sb_append(&versions, "\t");
+            sb_append(&versions, version); sb_append(&versions, "\n");
+        }
+        free(url_w); free(url.data); free(text.data);
+    }
+    char *path = win_join(s->state, "app-versions");
+    bool ok = path && versions.data && win_atomic_write(path, versions.data, versions.length);
+    free(path); free(versions.data);
+    return ok;
+}
+// Lists the installed apps that have a newer cached version, separated by ", ".
+static void bundled_updates_text(ShellHost *s, char *out, size_t capacity) {
+    out[0] = '\0';
+    RegistryStore store;
+    if (!store_open(s, &store, false)) return;
+    for (size_t i = 0; i < sizeof(bundled_apps) / sizeof(*bundled_apps); i++) {
+        char available[128];
+        if (!registry_store_find_backend(&store, bundled_apps[i].id) ||
+            !bundled_available_update(s, &bundled_apps[i], available, sizeof(available))) continue;
+        size_t used = strlen(out);
+        snprintf(out + used, capacity - used, "%s%s", used ? ", " : "", bundled_apps[i].name);
+    }
+    store_close(s, &store, false);
+}
 static bool bundled_registered(ShellHost *s, RegistryStore *store, const BundledApp *app) {
     char *pipe = bundled_pipe(s, app);
     char frontend[160];
@@ -246,9 +337,10 @@ static bool bundled_control(ShellHost *s, const BundledApp *app,
     char *task = bundled_host_task_name(s, app), *pipe = bundled_pipe(s, app);
     HRESULT hr = E_INVALIDARG;
     bool ok = false;
-    bool as_root = !strcmp(operation, "installRoot") || !strcmp(operation, "runRoot"),
+    bool update = !strcmp(operation, "updateApp"),
+         as_root = !strcmp(operation, "installRoot") || !strcmp(operation, "runRoot") || (update && s->administrator),
          run = !strcmp(operation, "run") || !strcmp(operation, "runUser") || !strcmp(operation, "runRoot"),
-         install = as_root || run || !strcmp(operation, "install") || !strcmp(operation, "installUser"),
+         install = as_root || run || update || !strcmp(operation, "install") || !strcmp(operation, "installUser"),
          remove = !strcmp(operation, "uninstall");
     if (s->administrator && !app->administrator) {
         snprintf(error, capacity, "%s cannot be installed with administrator privileges on Windows.", app->name);

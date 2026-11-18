@@ -1054,6 +1054,7 @@ static bool operation_installs_bundled_app(const char *operation) {
            strcmp(operation, "installRoot") == 0 ||
            strcmp(operation, "runUser") == 0 ||
            strcmp(operation, "installUser") == 0 ||
+           strcmp(operation, "updateApp") == 0 ||
            strcmp(operation, "addRootSupport") == 0;
 }
 

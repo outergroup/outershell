@@ -1394,10 +1394,15 @@ static bool is_outerservice_path(const char *path) {
     return length > suffix_length && strcmp(path + length - suffix_length, suffix) == 0;
 }
 
+static atomic_bool g_endpoint_names_stale;
+
+// The service manager calls this while holding its lock, and publishing endpoint
+// names queries service status, so the main loop publishes them instead.
 static void outer_service_event(void *context, const char *service_id) {
     (void)context;
     (void)service_id;
-    mark_backend_event_changed();
+    atomic_store(&g_endpoint_names_stale, true);
+    publish_backend_event_changed();
 }
 
 void OuterShelldRequestShutdown(void) {
@@ -3954,6 +3959,12 @@ static bool installed_home_screen_version(char *out, size_t out_size);
 static bool fetch_home_screen_available_version(const char *heartbeat, char *out, size_t out_size, char *message, size_t message_size);
 static int compare_versions(const char *installed, const char *available);
 static bool home_screen_update_available(char *available, size_t available_size);
+static bool bundled_app_available_update(const BundledAppDefinition *app,
+                                         const char *installed,
+                                         char *available,
+                                         size_t available_size);
+static bool refresh_bundled_app_versions(void);
+static void installed_bundled_app_updates(char *out, size_t out_size);
 static bool run_home_screen_install_script(const char *subcommand,
                                            const char *script_path,
                                            const char *archive_path,
@@ -4450,6 +4461,8 @@ static bool append_registered_backend_payloads(const RegistryStore *database,
                                                 strcmp(effective_service_scope, "system") == 0,
                                                 installed_version,
                                                 sizeof(installed_version));
+            (void)bundled_app_available_update(bundled_app, installed_version,
+                                               available_version, sizeof(available_version));
         }
         if (bundled_app && bundled_app->supports_root &&
             (!g_internal_service_manager || direct_root_session_uses_system_scope())) {
@@ -5248,6 +5261,14 @@ static void send_control_response(int fd, const char *query, const char *body) {
                              installed[0] ? installed : latest);
                 }
             }
+            if (refresh_bundled_app_versions()) mark_backend_event_changed();
+            char app_updates[1024] = "";
+            installed_bundled_app_updates(app_updates, sizeof(app_updates));
+            if (ok && app_updates[0]) {
+                size_t used = strlen(message);
+                snprintf(message + used, sizeof(message) - used,
+                         " App updates are available: %s.", app_updates);
+            }
             log_event("%s Outer Shell update check: %s", ok ? "Completed" : "Failed", message);
             send_action_response_full(fd,
                                       ok ? 200 : 500,
@@ -5312,7 +5333,9 @@ static void send_control_response(int fd, const char *query, const char *body) {
 
     if (strcmp(operation, "run") == 0 || strcmp(operation, "install") == 0 ||
         strcmp(operation, "runRoot") == 0 || strcmp(operation, "installRoot") == 0 ||
-        strcmp(operation, "runUser") == 0 || strcmp(operation, "installUser") == 0) {
+        strcmp(operation, "runUser") == 0 || strcmp(operation, "installUser") == 0 ||
+        strcmp(operation, "updateApp") == 0) {
+        bool update = strcmp(operation, "updateApp") == 0;
         const BundledAppDefinition *app = bundled_app_for_service_id(service_id);
         if (!app) {
             send_action_response(fd, 404, false, "This app cannot be installed by Outer Shell.");
@@ -5341,13 +5364,19 @@ static void send_control_response(int fd, const char *query, const char *body) {
         }
         bool ok = install_bundled_app(app, scope, bundled_stage_root, sudo_password, &needs_password, message, sizeof(message));
 	        log_event("%s app %s as %s: %s",
-	                  ok ? "Installed" : "Failed to install",
+	                  ok ? (update ? "Updated" : "Installed") : (update ? "Failed to update" : "Failed to install"),
 	                  app->service_id,
 	                  scope,
 	                  message);
 	        if (ok) {
 	            cleanup_bundled_app_cache_if_stage_root_is_download_cache(app, bundled_stage_root);
 	            mark_backend_event_changed();
+	            char version[128] = "";
+	            if (update && installed_bundled_app_version(app, strcmp(scope, "system") == 0, version, sizeof(version))) {
+	                snprintf(message, sizeof(message), "Updated %s to %s.", app->display_name, version);
+	            } else if (update) {
+	                snprintf(message, sizeof(message), "Updated %s.", app->display_name);
+	            }
 	        }
 	        send_action_response_ex(fd, ok ? 200 : (needs_password ? 401 : 500), ok, message, needs_password);
 	        return;
@@ -5765,6 +5794,142 @@ static bool fetch_home_screen_available_version(const char *heartbeat, char *out
     return capture_url_contents(url, out, out_size, message, message_size);
 }
 
+// Each bundled app publishes its latest version at <public base>/apps/<App>/version.txt,
+// so apps can be updated without an Outer Shell release. Checks cache the versions
+// in app-versions, one "<service id>\t<version>" line per app.
+static void bundled_app_versions_path(char *out, size_t out_size) {
+    char root[PATH_MAX];
+    default_user_outershell_root(root, sizeof(root));
+    snprintf(out, out_size, "%s/app-versions", root);
+}
+
+static bool fetch_bundled_app_version(const BundledAppDefinition *app, char *out, size_t out_size) {
+    if (out && out_size) out[0] = '\0';
+    if (!g_home_screen_public_base_url[0]) return false;
+    char base_url[2048];
+    snprintf(base_url, sizeof(base_url), "%s", g_home_screen_public_base_url);
+    size_t length = strlen(base_url);
+    while (length > 0 && base_url[length - 1] == '/') base_url[--length] = '\0';
+    char url[4096];
+    snprintf(url, sizeof(url), "%s/apps/%s/version.txt", base_url, app->stage_directory_name);
+    char message[512] = "";
+    if (!capture_url_contents(url, out, out_size, message, sizeof(message))) {
+        log_event("Could not check for %s updates: %s", app->display_name, message);
+        return false;
+    }
+    trim_whitespace_in_place(out);
+    return bundled_app_version_is_valid(out);
+}
+
+static bool cached_bundled_app_version(const BundledAppDefinition *app, char *out, size_t out_size) {
+    if (out && out_size) out[0] = '\0';
+    char path[PATH_MAX];
+    bundled_app_versions_path(path, sizeof(path));
+    FILE *file = fopen(path, "r");
+    if (!file) return false;
+    char line[512];
+    bool found = false;
+    while (!found && fgets(line, sizeof(line), file)) {
+        line[strcspn(line, "\r\n")] = '\0';
+        char *tab = strchr(line, '\t');
+        if (!tab) continue;
+        *tab = '\0';
+        if (strcmp(line, app->service_id) == 0 && bundled_app_version_is_valid(tab + 1)) {
+            snprintf(out, out_size, "%s", tab + 1);
+            found = true;
+        }
+    }
+    fclose(file);
+    return found;
+}
+
+static bool bundled_app_available_update(const BundledAppDefinition *app,
+                                         const char *installed,
+                                         char *available,
+                                         size_t available_size) {
+    char latest[128];
+    if (!cached_bundled_app_version(app, latest, sizeof(latest)) ||
+        compare_versions(installed ? installed : "", latest) >= 0) {
+        if (available && available_size) available[0] = '\0';
+        return false;
+    }
+    snprintf(available, available_size, "%s", latest);
+    return true;
+}
+
+static bool refresh_bundled_app_versions(void) {
+    StringBuilder text = {0};
+    bool any = false;
+    for (size_t i = 0; i < sizeof(kBundledApps) / sizeof(kBundledApps[0]); i++) {
+        const BundledAppDefinition *app = &kBundledApps[i];
+        if (!bundled_app_is_available_on_platform(app)) continue;
+        char version[128];
+        if (!fetch_bundled_app_version(app, version, sizeof(version)) &&
+            !cached_bundled_app_version(app, version, sizeof(version))) continue;
+        if (!sb_append(&text, app->service_id) || !sb_append(&text, "\t") ||
+            !sb_append(&text, version) || !sb_append(&text, "\n")) {
+            free(text.data);
+            return false;
+        }
+        any = true;
+    }
+    char path[PATH_MAX], temporary[PATH_MAX + 8], directory[PATH_MAX];
+    bundled_app_versions_path(path, sizeof(path));
+    snprintf(temporary, sizeof(temporary), "%s.tmp", path);
+    bool ok = any && parent_directory(path, directory, sizeof(directory)) && mkdir_p(directory);
+    FILE *file = ok ? fopen(temporary, "w") : NULL;
+    if (file) {
+        ok = fwrite(text.data, 1, text.length, file) == text.length;
+        ok = fclose(file) == 0 && ok;
+        ok = ok && rename(temporary, path) == 0;
+        if (!ok) unlink(temporary);
+    } else {
+        ok = false;
+    }
+    free(text.data);
+    return ok;
+}
+
+// Lists the installed bundled apps that have a newer cached version, separated by ", ".
+static void installed_bundled_app_updates(char *out, size_t out_size) {
+    if (out_size) out[0] = '\0';
+    RegistryStore stores[2];
+    bool system_scopes[2] = {direct_root_session_uses_system_scope(), true};
+    char error[512] = "";
+    bool opened[2] = {
+        registry_store_open_user_readonly(&stores[0], error, sizeof(error)),
+        strcmp(g_registry_database_path, g_system_registry_database_path) != 0 &&
+            registry_store_open_system_readonly(&stores[1], error, sizeof(error))
+    };
+    for (size_t i = 0; i < sizeof(kBundledApps) / sizeof(kBundledApps[0]); i++) {
+        const BundledAppDefinition *app = &kBundledApps[i];
+        bool has_update = false;
+        for (size_t s = 0; s < 2 && !has_update; s++) {
+            if (!opened[s] || !registry_store_find_backend(&stores[s], app->service_id)) continue;
+            char installed[128] = "", available[128] = "";
+            installed_bundled_app_version(app, system_scopes[s], installed, sizeof(installed));
+            has_update = bundled_app_available_update(app, installed, available, sizeof(available));
+        }
+        if (!has_update) continue;
+        size_t used = strlen(out);
+        snprintf(out + used, out_size - used, "%s%s", used ? ", " : "", app->display_name);
+    }
+    for (size_t s = 0; s < 2; s++) {
+        if (opened[s]) registry_store_free(&stores[s]);
+    }
+}
+
+static void *refresh_bundled_app_versions_main(void *context) {
+    (void)context;
+    if (refresh_bundled_app_versions()) mark_backend_event_changed();
+    return NULL;
+}
+
+static void refresh_bundled_app_versions_in_background(void) {
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, refresh_bundled_app_versions_main, NULL) == 0) pthread_detach(thread);
+}
+
 static bool home_screen_update_available(char *available, size_t available_size) {
     const char *heartbeat = due_update_heartbeat();
     if (!heartbeat) return false;
@@ -5776,6 +5941,7 @@ static bool home_screen_update_available(char *available, size_t available_size)
         return false;
     }
     mark_update_heartbeat_completed(heartbeat);
+    refresh_bundled_app_versions_in_background();
     char installed[128] = "";
     installed_home_screen_version(installed, sizeof(installed));
     if (compare_versions(installed, latest) < 0) {
@@ -14321,6 +14487,7 @@ static void run_api_reactor(int api_listener) {
     set_fd_nonblocking(api_listener, true);
     while (!g_shutdown_requested && !outer_service_manager_exit_requested(g_outer_service_manager)) {
         flush_ready_event_clients(clients, &client_count);
+        if (atomic_exchange(&g_endpoint_names_stale, false)) publish_endpoint_names();
 #ifdef __APPLE__
         maintain_launchd_status();
 #endif
