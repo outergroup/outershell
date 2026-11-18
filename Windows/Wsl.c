@@ -876,6 +876,9 @@ static bool app_list(Distribution *d, StringBuilder *json) {
         char *scope = string_reference(backend, 32);
         bool system = !strcmp(scope, "system");
         free(scope);
+        char *status = string_reference(backend, 40);
+        bool connectable = !strcmp(status, "running") || !strcmp(status, "available");
+        free(status);
         char *service = string_reference(backend, 0);
         StringBuilder apps = reference(backend, 68);
         uint32_t n = apps.length >= 4 ? read_uint32_le((unsigned char *)apps.data) : 0;
@@ -890,8 +893,9 @@ static bool app_list(Distribution *d, StringBuilder *json) {
             Endpoint *endpoint = socket[0] == '/' ? publish(d, socket, system) : NULL;
             if (endpoint) {
                 if (d->container) publish_external_endpoint(endpoint, service, id);
-                endpoint_name_append(&names, "pipe", endpoint->pipe, 0, d->name,
-                                     name);
+                if (connectable)
+                    endpoint_name_append(&names, "pipe", endpoint->pipe, 0, d->name,
+                                         name);
                 if (added++)
                     append(json, ",");
                 append(json, "{");

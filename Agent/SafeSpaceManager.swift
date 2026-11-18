@@ -759,12 +759,14 @@ final class SafeSpaceManager: @unchecked Sendable {
         let currentRecords = lock.withSafeSpaceLock { records }
             .sorted { $0.createdAt < $1.createdAt }
         var containers: [SafeSpaceMenuBarContainer] = []
+        var listedRecordIDs: Set<UUID> = []
         for record in currentRecords {
             guard (try? runtimeState(record)) == "running" else { continue }
             let snapshots: [SafeSpaceAppSnapshot]
             do {
                 snapshots = await publishExternalAppEndpoints(try await appSnapshots(for: record), for: record)
                 updateCachedApps(snapshots, for: record.id)
+                listedRecordIDs.insert(record.id)
             } catch {
                 NSLog("Could not list menu bar apps for container %@: %@",
                       record.name,
@@ -793,8 +795,10 @@ final class SafeSpaceManager: @unchecked Sendable {
             try saveCachedApps()
             let workspaces: [[String: Any]] = lock.withSafeSpaceLock {
                 currentRecords.map { record in
-                    ["name": record.name,
-                     "apps": (cachedApps[record.id] ?? []).map { appDictionary($0, running: false) }]
+                    let running = listedRecordIDs.contains(record.id)
+                    return ["id": record.id.uuidString,
+                            "name": record.name,
+                            "apps": (cachedApps[record.id] ?? []).map { appDictionary($0, running: running) }]
                 }
             }
             try publishEndpointNames(workspaces)
@@ -1242,7 +1246,7 @@ final class SafeSpaceManager: @unchecked Sendable {
             guard let container = workspace["name"] as? String,
                   let apps = workspace["apps"] as? [[String: Any]] else { continue }
             let workspaceID = workspace["id"] as? String ?? ""
-            for app in apps {
+            for app in apps where app["isRunning"] as? Bool == true {
                 let socket = app["externalSocketPath"] as? String ?? ""
                 let renamed = containerEndpointLayoutKey(workspaceID: workspaceID, app: app).flatMap { names[$0] }
                 let name = renamed ?? app["displayName"] as? String ?? app["serviceID"] as? String ?? ""

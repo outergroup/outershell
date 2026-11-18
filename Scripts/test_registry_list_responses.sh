@@ -228,8 +228,7 @@ lines = (base / "endpoints.d/outershell").read_text().splitlines()
 assert lines.pop(0) == "outerssh-endpoints-v2"
 assert len(lines) % 3 == 0
 records = [lines[i:i+3] for i in range(0, len(lines), 3)]
-assert any(r[0] == "unix /tmp/test-app-1.sock" and r[2] == "App 1" for r in records)
-assert any(r[0] == "tcp localhost 8002" and r[2] == "App 2" for r in records)
+assert not any(r[2] in ("App 1", "App 2", "App 3") for r in records), records
 assert not any(r[2] == "Legacy app" for r in records)
 PYNAMES
 outerctl app list --backend test.backend.1 >"$build_dir/before-external.tsv"

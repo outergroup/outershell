@@ -3424,7 +3424,7 @@ static void *refresh_launchd_status(void *context) {
         free(entry);
     }
     free(refresh);
-    if (changed) publish_backend_event_changed();
+    if (changed) mark_backend_event_changed();
     return NULL;
 }
 
@@ -4328,6 +4328,66 @@ static void managed_backend_script_path(const char *service_id,
     }
 }
 
+typedef struct {
+    bool launchd;
+    bool systemd;
+    bool outerservice;
+} BackendUnitKinds;
+
+static BackendUnitKinds backend_unit_kinds(const RegistryBackendRecord *record) {
+    const char *plist_path = record->unit_path ? record->unit_path : "";
+    BackendUnitKinds units = {
+        .launchd = plist_path[0] != '\0',
+        .systemd = record->unit_name && record->unit_name[0],
+        .outerservice = is_outerservice_path(plist_path)
+    };
+    if (units.outerservice) units.launchd = false;
+#ifdef __APPLE__
+    units.systemd = false;
+#endif
+    return units;
+}
+
+static void registered_backend_status(const RegistryBackendRecord *record,
+                                      const char *registry_scope,
+                                      char *effective_scope,
+                                      size_t effective_scope_size,
+                                      char *status,
+                                      size_t status_size) {
+    const char *service_id = record->service_id ? record->service_id : "";
+    const char *service_unit = record->unit_name ? record->unit_name : "";
+    BackendUnitKinds units = backend_unit_kinds(record);
+    snprintf(effective_scope, effective_scope_size, "%s", registry_scope && registry_scope[0] ? registry_scope : "user");
+#ifndef __APPLE__
+    if (registry_scope && strcmp(registry_scope, "system") == 0) {
+        snprintf(effective_scope, effective_scope_size, "system");
+    }
+#endif
+    snprintf(status, status_size, "unknown");
+#ifdef __APPLE__
+    const char *plist_path = record->unit_path ? record->unit_path : "";
+    if (units.launchd) {
+        snprintf(effective_scope,
+                 effective_scope_size,
+                 "%s",
+                 strncmp(plist_path, "/Library/LaunchDaemons/", 23) == 0 ? "system" : "user");
+        launchd_status(service_id, plist_path, record->owns_unit && !is_home_screen_service_id(service_id),
+                       status, status_size);
+    } else
+#endif
+    if (units.systemd) {
+        systemd_status(service_unit, effective_scope, status, status_size);
+    } else if (units.outerservice && g_outer_service_manager) {
+        OuterServiceStatus service_status = {0};
+        if (outer_service_manager_status(g_outer_service_manager, service_id, &service_status)) {
+            snprintf(status, status_size, "%s",
+                     service_status.running ? "running" :
+                     (service_status.available ? "available" :
+                      (service_status.failed ? "failed" : "stopped")));
+        }
+    }
+}
+
 static bool append_registered_backend_payloads(const RegistryStore *database,
                                                BinaryPayloadList *payloads,
                                                bool *bundled_installed,
@@ -4341,48 +4401,21 @@ static bool append_registered_backend_payloads(const RegistryStore *database,
         const char *service_unit = record->unit_name ? record->unit_name : "";
         const char *plist_path = record->unit_path ? record->unit_path : "";
         int owns_plist = record->owns_unit ? 1 : 0;
-        char effective_service_scope[32];
-        snprintf(effective_service_scope, sizeof(effective_service_scope), "%s", registry_scope && registry_scope[0] ? registry_scope : "user");
-#ifndef __APPLE__
-        if (registry_scope && strcmp(registry_scope, "system") == 0) {
-            snprintf(effective_service_scope, sizeof(effective_service_scope), "system");
-        }
-#endif
         bool is_self = is_home_screen_service_id(service_id);
         const BundledAppDefinition *bundled_app = bundled_app_for_service_id(service_id);
 
-        char status[32] = "unknown";
-        bool has_launchd_unit = plist_path[0];
-        bool has_systemd_unit = service_unit[0];
-        bool has_outerservice = is_outerservice_path(plist_path);
-        if (has_outerservice) has_launchd_unit = false;
-#ifdef __APPLE__
-        has_systemd_unit = false;
-#endif
+        BackendUnitKinds units = backend_unit_kinds(record);
+        bool has_launchd_unit = units.launchd;
+        bool has_systemd_unit = units.systemd;
+        bool has_outerservice = units.outerservice;
         if (bundled_app && (has_launchd_unit || has_systemd_unit || has_outerservice)) {
             size_t bundled_index = (size_t)(bundled_app - kBundledApps);
             if (bundled_index < bundled_installed_count) bundled_installed[bundled_index] = true;
         }
-#ifdef __APPLE__
-        if (has_launchd_unit) {
-            snprintf(effective_service_scope,
-                     sizeof(effective_service_scope),
-                     "%s",
-                     strncmp(plist_path, "/Library/LaunchDaemons/", 23) == 0 ? "system" : "user");
-            launchd_status(service_id, plist_path, owns_plist && !is_self, status, sizeof(status));
-        } else
-#endif
-        if (has_systemd_unit) {
-            systemd_status(service_unit, effective_service_scope, status, sizeof(status));
-        } else if (has_outerservice && g_outer_service_manager) {
-            OuterServiceStatus service_status = {0};
-            if (outer_service_manager_status(g_outer_service_manager, service_id, &service_status)) {
-                snprintf(status, sizeof(status), "%s",
-                         service_status.running ? "running" :
-                         (service_status.available ? "available" :
-                          (service_status.failed ? "failed" : "stopped")));
-            }
-        }
+        char effective_service_scope[32];
+        char status[32];
+        registered_backend_status(record, registry_scope, effective_service_scope, sizeof(effective_service_scope),
+                                  status, sizeof(status));
 
         char service_unit_path[PATH_MAX] = "";
 #ifdef __APPLE__
@@ -4710,6 +4743,24 @@ static bool file_has_contents(const char *path, const char *data, size_t length,
     return same;
 }
 
+/* OuterSSH clients treat every endpoints.d record as connectable, so only
+ * endpoints whose backend is running or socket-activated are published. A
+ * frontend whose backend has no service unit has no lifecycle here and is kept. */
+static bool frontend_is_connectable(const RegistryStore *store, const RegistryFrontendRecord *app) {
+    const char *service_id = app->service_id ? app->service_id : "";
+    for (size_t i = 0; i < store->backend_count; i++) {
+        const RegistryBackendRecord *backend = &store->backends[i];
+        if (!backend->service_id || strcmp(backend->service_id, service_id) != 0) continue;
+        BackendUnitKinds units = backend_unit_kinds(backend);
+        if (!units.launchd && !units.systemd && !units.outerservice) return true;
+        char scope[32], status[32];
+        registered_backend_status(backend, direct_root_session_uses_system_scope() ? "system" : "user",
+                                  scope, sizeof(scope), status, sizeof(status));
+        return strcmp(status, "running") == 0 || strcmp(status, "available") == 0;
+    }
+    return true;
+}
+
 static void publish_endpoint_names(void) {
     if (!registry_is_standard_for_home()) return;
     RegistryStore store;
@@ -4731,6 +4782,7 @@ static void publish_endpoint_names(void) {
     bool ok = sb_append(&text, "outerssh-endpoints-v2\n");
     for (size_t i = 0; ok && i < store.frontend_count; i++) {
         const RegistryFrontendRecord *app = &store.frontends[i];
+        if (!frontend_is_connectable(&store, app)) continue;
         const char *display_name = host_endpoint_display_name(&names, scope, app);
         if (app->socket_path && app->socket_path[0]) {
             ok = endpoint_name_append(&text, "unix", app->socket_path, 0, "", display_name);

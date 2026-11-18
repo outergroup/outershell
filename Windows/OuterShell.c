@@ -52,12 +52,14 @@ static bool store_open(ShellHost *s, RegistryStore *store, bool write) {
     log_error(s, error);
     return false;
 }
+static bool frontend_connectable(ShellHost *s, RegistryStore *store, const RegistryFrontendRecord *app);
 static bool store_close(ShellHost *s, RegistryStore *store, bool commit) {
     char error[1024] = "Registry save failed.";
     StringBuilder names = {0};
     bool ok = sb_append(&names, "outerssh-endpoints-v2\n");
     for (size_t i = 0; ok && i < store->frontend_count; i++) {
         const RegistryFrontendRecord *app = &store->frontends[i];
+        if (!frontend_connectable(s, store, app)) continue;
         if (app->socket_path && app->socket_path[0]) {
             ok = endpoint_name_append(&names, "pipe", app->socket_path, 0, "", app->display_name);
         } else if (app->port > 0) {
@@ -228,6 +230,40 @@ static const char *service_label(DWORD status) {
         return "service unavailable";
     }
 }
+static const char *backend_status(ShellHost *s, const RegistryBackendRecord *b, bool *running, bool *controls) {
+    *running = false;
+    *controls = false;
+    if (bundled_find(b->service_id)) {
+        char *task = bundled_host_task_name(s, bundled_find(b->service_id));
+        DWORD state = 0;
+        *running = SUCCEEDED(command_task(task, "query", NULL, &state)) && state == TASK_STATE_RUNNING;
+        free(task);
+        *controls = true;
+        return *running ? "running" : "stopped";
+    }
+    if (command_find(s, b->service_id)) {
+        *running = command_running(s, command_find(s, b->service_id));
+        *controls = true;
+        return *running ? "running" : "stopped";
+    }
+    if (b->unit_name[0]) {
+        DWORD state = service_query(b->unit_name);
+        *running = state == SERVICE_RUNNING;
+        *controls = b->owns_unit;
+        return service_label(state);
+    }
+    return "registered";
+}
+/* OuterSSH clients treat every endpoints.d record as connectable. Outer Shell
+ * and unelevated bundled apps have pipe activation mappings; other managed apps
+ * are published only while running. Apps Outer Shell can't control are kept. */
+static bool frontend_connectable(ShellHost *s, RegistryStore *store, const RegistryFrontendRecord *app) {
+    const RegistryBackendRecord *b = registry_store_find_backend(store, app->service_id);
+    if (!b || !strcmp(b->service_id, shell_id) || (bundled_find(b->service_id) && !s->administrator)) return true;
+    bool running, controls;
+    backend_status(s, b, &running, &controls);
+    return running || !controls;
+}
 static int compare_backends(const void *a, const void *b) {
     return _stricmp(((const RegistryBackendRecord *)a)->display_name,
                     ((const RegistryBackendRecord *)b)->display_name);
@@ -264,22 +300,8 @@ static StringBuilder backends(ShellHost *s) {
             char *result_path = win_join(s->state, "update-result.txt");
             if (win_read_file(result_path, 512, &update_result) && update_result.data && !strncmp(update_result.data, "Update failed", 13)) status = update_result.data;
             free(result_path);
-        } else if (bundled_find(b->service_id)) {
-            char *task = bundled_host_task_name(s, bundled_find(b->service_id));
-            DWORD state = 0;
-            running = SUCCEEDED(command_task(task, "query", NULL, &state)) && state == TASK_STATE_RUNNING;
-            free(task);
-            status = running ? "running" : "stopped";
-            controls = true;
-        } else if (command_find(s, b->service_id)) {
-            running = command_running(s, command_find(s, b->service_id));
-            status = running ? "running" : "stopped";
-            controls = true;
-        } else if (b->unit_name[0]) {
-            DWORD state = service_query(b->unit_name);
-            running = state == SERVICE_RUNNING;
-            status = service_label(state);
-            controls = b->owns_unit;
+        } else {
+            status = backend_status(s, b, &running, &controls);
         }
         size_t count = 0;
         for (size_t j = 0; j < store.frontend_count; j++)
