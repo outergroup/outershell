@@ -2767,14 +2767,6 @@ RUN outerctl image add-command --id codex --name "Codex" --working-directory /ro
   async function checkOuterShellUpdate(key, button) {
     const backend = findBackend(key);
     if (!backend) return;
-    if (["start", "stop", "restart"].includes(operation)) {
-      await performEndpointControl(`host:${key}`, operation, async () => {
-        const result = await control(backend, operation);
-        if (!result.ok) throw new Error(result.message || "The action failed.");
-        await refreshBackends({ quiet: true });
-      });
-      return;
-    }
     button.disabled = true;
     const label = button.querySelector(":scope > span:not(.context-menu-glyph)") || button;
     const original = label.textContent;
@@ -2867,6 +2859,14 @@ RUN outerctl image add-command --id codex --name "Codex" --working-directory /ro
   async function performControl(key, operation, button) {
     const backend = findBackend(key);
     if (!backend) return;
+    if (["start", "stop", "restart"].includes(operation)) {
+      await performEndpointControl(`host:${key}`, operation, async () => {
+        const result = await control(backend, operation);
+        if (!result.ok) throw new Error(result.message || "The action failed.");
+        await refreshBackends({ quiet: true });
+      });
+      return;
+    }
     button.disabled = true;
     const label = button.querySelector(":scope > span:not(.context-menu-glyph)") || button;
     const original = label.textContent;
