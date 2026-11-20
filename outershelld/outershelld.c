@@ -499,7 +499,13 @@ static bool copy_file(const char *source, const char *destination, mode_t mode, 
         }
     }
 
-    int out_fd = open(destination, O_WRONLY | O_CREAT | O_TRUNC, mode);
+    char temporary[PATH_MAX];
+    if (snprintf(temporary, sizeof(temporary), "%s.XXXXXX", destination) >= (int)sizeof(temporary)) {
+        close(in_fd);
+        snprintf(error, error_size, "Path is too long: %s", destination);
+        return false;
+    }
+    int out_fd = mkstemp(temporary);
     if (out_fd < 0) {
         close(in_fd);
         snprintf(error, error_size, "Failed to open %s: %s", destination, strerror(errno));
@@ -523,12 +529,20 @@ static bool copy_file(const char *source, const char *destination, mode_t mode, 
             break;
         }
     }
+    if (ok && fchmod(out_fd, mode) != 0) {
+        snprintf(error, error_size, "Failed to set permissions on %s: %s", destination, strerror(errno));
+        ok = false;
+    }
     if (close(out_fd) != 0 && ok) {
         snprintf(error, error_size, "Failed to close %s: %s", destination, strerror(errno));
         ok = false;
     }
     close(in_fd);
-    chmod(destination, mode);
+    if (ok && rename(temporary, destination) != 0) {
+        snprintf(error, error_size, "Failed to replace %s: %s", destination, strerror(errno));
+        ok = false;
+    }
+    if (!ok) unlink(temporary);
     return ok;
 }
 

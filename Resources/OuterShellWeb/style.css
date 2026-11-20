@@ -786,7 +786,6 @@ h1 { margin: 0; font-size: clamp(30px, 5vw, 45px); line-height: 1.05; letter-spa
 [hidden] { display: none !important; }
 
 @media (max-width: 680px) {
-  html.outerloop-host { --outerloop-overlay-clearance: 72px; }
   main { width: 100%; padding: 12px max(16px, env(safe-area-inset-right)) calc(46px + var(--outerloop-overlay-clearance)) max(16px, env(safe-area-inset-left)); }
   .safe-space-header { padding: 15px 14px 10px; }
   .safe-space-title-wrap h3 { font-size: 17px; }
@@ -820,7 +819,6 @@ h1 { margin: 0; font-size: clamp(30px, 5vw, 45px); line-height: 1.05; letter-spa
 }
 
 @media (min-width: 681px) and (max-width: 950px) and (orientation: landscape) {
-  html.outerloop-host { --outerloop-overlay-clearance: 58px; }
   main { padding: 8px max(18px, env(safe-area-inset-right)) calc(30px + var(--outerloop-overlay-clearance)) max(18px, env(safe-area-inset-left)); }
   .dialog-backdrop { padding: max(8px, env(safe-area-inset-top)) max(8px, env(safe-area-inset-right)) calc(max(8px, env(safe-area-inset-bottom)) + var(--outerloop-overlay-clearance)) max(8px, env(safe-area-inset-left)); align-items: end; }
   .dialog { max-height: calc(100dvh - 16px - var(--outerloop-overlay-clearance)); }
