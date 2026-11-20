@@ -2527,13 +2527,19 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             handleSetCursorPosition(fieldID: fieldID, position: Int(position), modifySelection: modifySelection)
 
         case .viewFocusChanged(let isFocused):
+            guard viewHasFocus != isFocused else { return }
             viewHasFocus = isFocused
-            if !isFocused {
+            if isFocused {
+                if !editorInputController.isFocused && !createInputController.isFocused {
+                    focusPasswordField()
+                }
+            } else {
                 blurCreateField()
                 blurPasswordField()
                 blurEditorInput()
             }
             updateEditingAndPasteboardState()
+            updateLayout()
 
         case .windowActiveUpdate(let isActive):
             guard windowIsActive != isActive else { return }
@@ -11824,7 +11830,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func focusPasswordField(selectAll: Bool = false, cursorPosition: Int? = nil) {
-        guard pendingPasswordAction != nil else { return }
+        guard pendingPasswordAction != nil, viewHasFocus else { return }
         blurCreateField()
         isSynchronizingPasswordInput = true
         passwordInputController.setText(sudoPasswordInput)
