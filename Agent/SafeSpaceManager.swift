@@ -1737,6 +1737,12 @@ final class SafeSpaceManager: @unchecked Sendable {
         try FileManager.default.createDirectory(at: transferRoot,
                                                 withIntermediateDirectories: true,
                                                 attributes: [.posixPermissions: 0o700])
+        var keepTransfer = false
+        defer {
+            if !keepTransfer {
+                try? FileManager.default.removeItem(at: transferRoot)
+            }
+        }
         let recipe = try recipe(for: record)
         let persistentData = (recipe.persistentData ?? []).filter(\.isDeclared)
         let sharedRecipeDirectory = transferRoot.appendingPathComponent(
@@ -1764,7 +1770,17 @@ final class SafeSpaceManager: @unchecked Sendable {
         if includePersistentData {
             for item in persistentData {
                 let archive = transferRoot.appendingPathComponent(item.id.uuidString.lowercased() + ".tar")
-                try exportPersistentVolume(record, item: item, archive: archive)
+                do {
+                    try exportPersistentVolume(record, item: item, archive: archive)
+                } catch {
+                    if runtimeProvider(for: record) == .appleContainer,
+                       (try? runtimeState(record)) == "running" {
+                        throw SafeSpaceManagerError.commandFailed(
+                            "Could not export persistent data from the running Apple container. Stop the container and share it again.\n" + error.localizedDescription
+                        )
+                    }
+                    throw error
+                }
                 archiveSources.append((archive, "Volume Archives/\(archive.lastPathComponent)"))
             }
         }
@@ -1798,29 +1814,23 @@ final class SafeSpaceManager: @unchecked Sendable {
         let stagedArchive = validatedShareStagingURL(request["stagingPath"] as? String)
         let archive = stagedArchive
             ?? transferRoot.appendingPathComponent("container.outershell-container")
-        var arguments = [
-            "-czf", archive.path,
-            "--options", "gzip:compression-level=1"
-        ]
+        let archiveRoot = transferRoot.appendingPathComponent("Archive Sources", isDirectory: true)
         for item in archiveSources {
-            let sourcePath = item.source.standardizedFileURL.path
-            guard sourcePath.hasPrefix("/"), sourcePath.count > 1 else {
+            let source = item.source.resolvingSymlinksInPath().standardizedFileURL
+            guard source.path != "/" else {
                 throw SafeSpaceManagerError.commandFailed(
                     "The root of the server cannot be included in a shared container."
                 )
             }
-            let relativeSourcePath = String(sourcePath.dropFirst())
-            var escapedSourcePath = NSRegularExpression.escapedPattern(for: relativeSourcePath)
-            escapedSourcePath = escapedSourcePath.replacingOccurrences(of: "#", with: "\\#")
-            let escapedDestination = item.destination.replacingOccurrences(of: "#", with: "\\#")
-            arguments.append(contentsOf: [
-                "-s", "#^\(escapedSourcePath)#\(escapedDestination)#"
-            ])
+            let entry = archiveRoot.appendingPathComponent(item.destination)
+            try FileManager.default.createDirectory(at: entry.deletingLastPathComponent(),
+                                                    withIntermediateDirectories: true)
+            try FileManager.default.createSymbolicLink(at: entry, withDestinationURL: source)
         }
-        arguments.append(contentsOf: ["-C", "/"])
-        arguments.append(contentsOf: archiveSources.map {
-            String($0.source.standardizedFileURL.path.dropFirst())
-        })
+        let arguments = [
+            "-czf", archive.path, "-H", "--no-mac-metadata",
+            "--options", "gzip:compression-level=1", "-C", archiveRoot.path
+        ] + archiveSources.map { $0.destination }
         let result = try runCommand(
             executable: "/usr/bin/tar",
             arguments: arguments
@@ -1828,9 +1838,7 @@ final class SafeSpaceManager: @unchecked Sendable {
         try? FileManager.default.removeItem(at: manifestURL)
         try requireSuccess(result, action: "prepare the shared container")
         let size = try archive.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
-        if stagedArchive != nil {
-            try? FileManager.default.removeItem(at: transferRoot)
-        }
+        keepTransfer = stagedArchive == nil
         return [
             "transferID": transferID.uuidString.lowercased(),
             "fileName": safeTransferFileName(record.name),

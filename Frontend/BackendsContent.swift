@@ -1909,7 +1909,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private var pendingWorkspaceOperations: [UUID: String] = [:]
     private var pendingWorkspaceOperationWorkspaceIDs: [UUID: UUID] = [:]
     private var pendingWorkspaceCreationNames: [UUID: String] = [:]
-    private var pendingWorkspaceSocketPublications: [UUID: (String?, String?) -> Void] = [:]
     private var workspaceContextID: UUID?
     private var workspaceOverviewAvailable = false
     private var workspaceRefreshGeneration = 0
@@ -8990,7 +8989,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         var fieldFrame = editorInputFieldFrame
         var dialogFrame = workspacePanelFrame
         var title = "Container"
-        if containerConfigurationBuildError != nil {
+        if sharedContainerFile != nil {
+            title = "Share Container"
+            controls = [(sharedContainerCloseFrame, "Close Share Container")]
+        } else if containerConfigurationBuildError != nil {
             controls = [(containerConfigurationBuildErrorCopyFrame, "Copy error"), (containerConfigurationBuildErrorDismissFrame, "Dismiss error")]
             dialogFrame = containerConfigurationBuildErrorTextFrame.union(containerConfigurationBuildErrorDismissFrame)
             title = "Build error"
@@ -10254,11 +10256,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
     private func requestPublishedWorkspaceSocket(socketPath: String,
                                                  workspaceID: UUID? = nil,
-                                                 completion: @escaping (String?, String?) -> Void) {
+                                                 completion: @escaping @MainActor @Sendable (String?, String?) -> Void) {
         let requestID = UUID()
-        pendingWorkspaceSocketPublications[requestID] = completion
         guard let safeSpacesEndpoint, let urlSession else {
-            pendingWorkspaceSocketPublications.removeValue(forKey: requestID)
             completion(nil, "Outer Shell's container service is unavailable.")
             return
         }
@@ -10267,7 +10267,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                                    workspaceID: workspaceID,
                                                    socketPath: socketPath)
         guard let body = try? JSONEncoder().encode(apiRequest) else {
-            pendingWorkspaceSocketPublications.removeValue(forKey: requestID)
             completion(nil, "Outer Shell could not encode the container socket request.")
             return
         }
@@ -10275,24 +10274,25 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         urlRequest.httpMethod = "POST"
         urlRequest.httpBody = body
         urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        urlSession.dataTask(with: urlRequest) { [weak self] data, response, error in
-            Task { @MainActor [weak self] in
-                guard let self else { return }
+        urlSession.dataTask(with: urlRequest) { data, response, error in
+            Task { @MainActor in
                 if let error {
-                    let callback = self.pendingWorkspaceSocketPublications
-                        .removeValue(forKey: requestID)
-                    callback?(nil, error.localizedDescription)
+                    completion(nil, error.localizedDescription)
                     return
                 }
-                if
-                    (response as? HTTPURLResponse).map({ !(200..<300).contains($0.statusCode) }) == true ||
-                    data == nil {
-                    let callback = self.pendingWorkspaceSocketPublications
-                        .removeValue(forKey: requestID)
-                    callback?(nil, "Outer Shell's container service returned an invalid response.")
+                guard let data,
+                      let publication = try? JSONDecoder().decode(PublishWorkspaceSocketHostResponse.self, from: data),
+                      publication.requestID == requestID else {
+                    completion(nil, "Outer Shell returned an invalid socket publication response.")
                     return
                 }
-                self.handlePublishedWorkspaceSocketResponse(data ?? Data())
+                guard (response as? HTTPURLResponse)?.statusCode == 200,
+                      let path = publication.publishedSocketPath, !path.isEmpty,
+                      publication.error?.isEmpty != false else {
+                    completion(nil, publication.error ?? "Outer Shell could not publish the app socket.")
+                    return
+                }
+                completion(path, nil)
             }
         }.resume()
     }
@@ -10340,7 +10340,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                     if let current = response.workspaces.first(where: { $0.id == workspace.id }),
                        let ready = current.apps.first(where: { $0.serviceID == app.serviceID && $0.frontendID == app.frontendID }),
                        self.displayedWorkspaceState(for: current) == "running", ready.isRunning,
-                       ready.publishedPort > 0 || ready.externalSocketPath?.isEmpty == false {
+                       ready.publishedPort > 0 || ready.externalSocketPath?.isEmpty == false || !ready.socketPath.isEmpty {
                         self.launchingEndpoints.remove(key)
                         self.openWorkspaceApp(ready, in: current, opensInNewTab: opensInNewTab, opensInNewWindow: opensInNewWindow)
                         return
@@ -10350,8 +10350,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 throw ContainerConfigurationInputError(message: "The app is still not ready after two minutes. Check its logs for startup errors, then try again.")
             } catch {
                 self.launchingEndpoints.remove(key)
-                self.backendError = error.localizedDescription
-                self.updateLayout()
+                self.showMessageDialog(title: "Could not open " + app.displayName, text: error.localizedDescription)
             }
         }
     }
@@ -10361,7 +10360,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                   opensInNewTab: Bool,
                                   opensInNewWindow: Bool = false) {
         if !app.isRunning || displayedWorkspaceState(for: workspace) != "running" ||
-            (app.publishedPort <= 0 && app.externalSocketPath?.isEmpty != false) {
+            (app.publishedPort <= 0 && app.externalSocketPath?.isEmpty != false && app.socketPath.isEmpty) {
             prepareAndOpenWorkspaceApp(app, in: workspace, opensInNewTab: opensInNewTab, opensInNewWindow: opensInNewWindow)
             return
         }
@@ -10411,9 +10410,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             guard let self else { return }
             self.launchingEndpoints.remove(key)
             guard let publishedSocketPath else {
-                self.backendError = publicationError ??
-                    "Could not open \(displayName) in \(workspace.name)."
-                self.updateLayout()
+                self.showMessageDialog(title: "Could not open " + displayName,
+                                       text: publicationError ?? "The container socket could not be published.")
                 return
             }
             let path = self.pathAndQuery(fromFrontendURL: app.url,
@@ -10447,16 +10445,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             outerframeHost.navigate(to: url,
                                     displayString: nil)
         }
-    }
-
-    private func handlePublishedWorkspaceSocketResponse(_ payload: Data) {
-        guard let response = try? JSONDecoder().decode(
-            PublishWorkspaceSocketHostResponse.self,
-            from: payload
-        ), let completion = pendingWorkspaceSocketPublications.removeValue(forKey: response.requestID) else {
-            return
-        }
-        completion(response.publishedSocketPath, response.error)
     }
 
     private func scheduleEndpointActivationStateInvalidationIfNeeded(for endpoint: AppLauncherEndpoint) {
@@ -16926,7 +16914,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             } else if operation != "rebuildRecipe" && operation != "changeRuntime" {
                 containerConfigurationBuildError = nil
                 containerConfigurationBuildErrorScroll = 0
-                safeSpaceRecipeMessage = "Container rebuilt. Apps are ready to use."
+                safeSpaceRecipeMessage = "Container operation completed."
             }
         } else if let error = response.error, !error.isEmpty {
             if operation == "start",
@@ -17011,10 +16999,13 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             return
         }
         guard let progress = workspace.buildProgress else {
-            if workspace.state != "rebuilding" {
+            if workspace.state == "running" {
                 containerConfigurationRebuildWorkspaceID = nil
                 containerConfigurationRequiresRebuild = false
-                safeSpaceRecipeMessage = "Container rebuilt. Apps are ready to use."
+                safeSpaceRecipeMessage = "Container rebuilt and running."
+            } else if workspace.state == "stopped" {
+                containerConfigurationRebuildWorkspaceID = nil
+                safeSpaceRecipeMessage = "The container is stopped after the rebuild."
             }
             return
         }
@@ -17240,8 +17231,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 attributes: [.posixPermissions: 0o700]
             )
         } catch {
-            workspacePanelMessage = error.localizedDescription
-            updateLayout()
+            showMessageDialog(title: "Could not share container", text: error.localizedDescription)
             return
         }
         isPerformingWorkspaceOperation = true
@@ -17261,22 +17251,19 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             case .failure(let error):
                 try? FileManager.default.removeItem(at: directory)
                 self.isPerformingWorkspaceOperation = false
-                self.workspacePanelMessage = error.localizedDescription
-                self.updateLayout()
+                self.showMessageDialog(title: "Could not share container", text: error.localizedDescription)
             case .success(let response):
                 guard let transferID = response.transferID,
-                      let responseFileName = response.fileName,
-                      let byteCount = response.byteCount else {
+                      let byteCount = response.byteCount, byteCount > 0 else {
                     try? FileManager.default.removeItem(at: directory)
                     self.isPerformingWorkspaceOperation = false
-                    self.workspacePanelMessage = "Outer Shell did not return a usable shared container."
-                    self.updateLayout()
+                    self.showMessageDialog(title: "Could not share container", text: "Outer Shell did not return a usable shared container.")
                     return
                 }
                 if response.stagedDirectly == true {
                     self.isPerformingWorkspaceOperation = false
                     self.workspacePanelMessage = ""
-                    self.sharedContainerFile = (destination, responseFileName, byteCount)
+                    self.sharedContainerFile = (destination, fileName, byteCount)
                     self.isShowingWorkspacePanel = true
                     self.updateLayout()
                     return
@@ -17286,15 +17273,14 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                     self.downloadSharedContainer(
                         transferID: transferID,
                         destination: destination,
-                        fileName: responseFileName,
+                        fileName: fileName,
                         byteCount: byteCount,
                         offset: 0
                     )
                 } catch {
                     try? FileManager.default.removeItem(at: directory)
                     self.isPerformingWorkspaceOperation = false
-                    self.workspacePanelMessage = error.localizedDescription
-                    self.updateLayout()
+                    self.showMessageDialog(title: "Could not share container", text: error.localizedDescription)
                 }
             }
         }
@@ -17315,8 +17301,13 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                          fileName: String,
                                          byteCount: Int,
                                          offset: Int) {
+        func fail(_ message: String) {
+            try? FileManager.default.removeItem(at: destination.deletingLastPathComponent())
+            isPerformingWorkspaceOperation = false
+            showMessageDialog(title: "Could not share container", text: message)
+        }
         guard let transferUUID = UUID(uuidString: transferID) else {
-            finishSharedContainerImport(message: "The shared container transfer identifier is invalid.")
+            fail("The shared container transfer identifier is invalid.")
             return
         }
         let request = ContainerTransferBinaryCodec.request(
@@ -17329,24 +17320,27 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             guard let self else { return }
             switch result {
             case .failure(let error):
-                self.isPerformingWorkspaceOperation = false
-                self.workspacePanelMessage = error.localizedDescription
-                self.updateLayout()
+                fail(error.localizedDescription)
             case .success(let response):
                 let data = response.data
-                let nextOffset = Int(response.nextOffset)
+                guard !data.isEmpty, data.count <= ContainerTransferBinaryCodec.chunkSize,
+                      data.count <= byteCount - offset,
+                      response.totalLength == UInt64(byteCount),
+                      response.nextOffset == UInt64(offset + data.count) else {
+                    fail("The container service returned an incomplete or inconsistent archive.")
+                    return
+                }
+                let nextOffset = offset + data.count
                 do {
                     let handle = try FileHandle(forWritingTo: destination)
                     defer { try? handle.close() }
                     try handle.seekToEnd()
                     try handle.write(contentsOf: data)
                 } catch {
-                    self.isPerformingWorkspaceOperation = false
-                    self.workspacePanelMessage = error.localizedDescription
-                    self.updateLayout()
+                    fail(error.localizedDescription)
                     return
                 }
-                if response.nextOffset >= response.totalLength {
+                if nextOffset == byteCount {
                     self.isPerformingWorkspaceOperation = false
                     self.workspacePanelMessage = ""
                     self.sharedContainerFile = (destination, fileName, byteCount)
@@ -18452,7 +18446,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         containerConfigurationRequiresRebuild = true
         sendWorkspaceRequest(operation: "updateDockerfile",
                              workspaceID: workspace.id,
-                             command: dockerfile)
+                             command: dockerfile,
+                             dockerfile: dockerfile)
         return true
     }
 
@@ -19249,7 +19244,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         } else if let dockerfileWorkspace {
             sendWorkspaceRequest(operation: "updateDockerfile",
                                  workspaceID: dockerfileWorkspace.id,
-                                 command: submittedText)
+                                 command: submittedText,
+                                 dockerfile: submittedText)
         } else if let recipeWorkspace {
             sendWorkspaceRequest(operation: "addRecipeStep",
                                  workspaceID: recipeWorkspace.id,

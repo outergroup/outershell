@@ -815,6 +815,7 @@ daemon_pid=$!
 trap 'kill "$daemon_pid" 2>/dev/null || true; wait "$daemon_pid" 2>/dev/null || true' EXIT INT TERM
 attempt=0
 while [ ! -S /run/user/0/outershelld-api ]; do
+    kill -0 "$daemon_pid" 2>/dev/null || { wait "$daemon_pid"; exit 1; }
     attempt=$((attempt + 1))
     if [ "$attempt" -ge 200 ]; then
         echo "Outer Shell's container daemon did not start." >&2
@@ -846,12 +847,21 @@ CMD ["/usr/local/bin/outershell-container-init"]
 
 
 def ensure_base_image(log_path):
-    inspect = docker(["image", "inspect", DEFAULT_BASE_IMAGE])
-    if inspect.returncode == 0:
-        return
     with tempfile.TemporaryDirectory(prefix="outershell-base-") as temporary:
         context = pathlib.Path(temporary)
         base_image_context(context)
+        digest = hashlib.sha256()
+        for path in sorted(context.rglob("*")):
+            if path.is_file():
+                digest.update(path.relative_to(context).as_posix().encode() + b"\0")
+                digest.update(hashlib.sha256(path.read_bytes()).digest())
+        label = "org.outershell.base-context"
+        fingerprint = digest.hexdigest()
+        inspect = docker(["image", "inspect", "--format", '{{index .Config.Labels "' + label + '"}}', DEFAULT_BASE_IMAGE])
+        if inspect.returncode == 0 and inspect.stdout.strip() == fingerprint:
+            return
+        with (context / "Dockerfile").open("a") as dockerfile:
+            dockerfile.write(f"LABEL {label}={fingerprint}\n")
         build_image(context, DEFAULT_BASE_IMAGE, log_path, base_build=True)
 
 
@@ -1247,7 +1257,7 @@ def rebuild(container_id):
         reconcile_image_volumes(container_id)
         remove_runtime_container(container_id)
         create_runtime_container(container_id)
-        docker(["start", container_name(container_id)], check=True)
+        start_and_check_runtime(container_id)
         mark_realized(container_id)
         update_record(container_id, transientState=None, buildProgress=None, lastError="")
     except Exception as error:
@@ -1269,6 +1279,23 @@ def rebuild(container_id):
         )
 
 
+def start_and_check_runtime(container_id):
+    name = container_name(container_id)
+    docker(["start", name], check=True)
+    result = docker(["inspect", "--format", "{{.State.Status}} {{.Path}}", name], check=True)
+    state, _, entrypoint = result.stdout.strip().partition(" ")
+    if state == "running":
+        if entrypoint != "/usr/local/bin/outershell-container-init":
+            return
+        probe = docker(["exec", "--user", "0", name, "/bin/sh", "-c",
+                        'i=0; while [ "$i" -lt 150 ]; do i=$((i + 1)); [ -S /run/user/0/outershelld-api ] && exit 0; sleep 0.1; done; exit 1'])
+        if probe.returncode == 0:
+            return
+    logs = docker(["logs", "--tail", "40", name])
+    detail = (logs.stdout + logs.stderr).strip()
+    raise RuntimeError("Container startup failed." + ("\n" + detail if detail else ""))
+
+
 def start_container(container_id):
     state = docker_state(container_id)
     if state == "running":
@@ -1276,7 +1303,7 @@ def start_container(container_id):
     if state == "absent":
         rebuild(container_id)
         return
-    docker(["start", container_name(container_id)], check=True)
+    start_and_check_runtime(container_id)
 
 
 def operation_create(request):
@@ -1445,7 +1472,7 @@ def operation_start(request):
                 )
         operation_rebuild(request)
     else:
-        docker(["start", container_name(container_id)], check=True)
+        start_and_check_runtime(container_id)
 
 
 def operation_stop(request):
@@ -1659,19 +1686,22 @@ def operation_finish_import(request):
     archive = root / "upload.outershell-container"
     extracted = root / "Extracted"
     if not extracted.exists():
-        extracted.mkdir(mode=0o700)
-        extracted_root = extracted.resolve()
-        with tarfile.open(archive, "r|gz") as source:
-            for member in source:
-                if not (member.isfile() or member.isdir()):
-                    raise ValueError(
-                        "The shared container contains symbolic or hard links, "
-                        "which cannot be imported safely."
-                    )
-                destination = (extracted / member.name).resolve()
-                if extracted_root not in [destination, *destination.parents]:
-                    raise ValueError("The shared container contains unsafe paths.")
-                source.extract(member, extracted)
+        with tempfile.TemporaryDirectory(dir=root) as temporary:
+            staging = pathlib.Path(temporary) / "contents"
+            staging.mkdir(mode=0o700)
+            extracted_root = staging.resolve()
+            with tarfile.open(archive, "r|gz") as source:
+                for member in source:
+                    if not (member.isfile() or member.isdir()):
+                        raise ValueError(
+                            "The shared container contains symbolic or hard links, "
+                            "which cannot be imported safely."
+                        )
+                    destination = (staging / member.name).resolve()
+                    if extracted_root not in [destination, *destination.parents]:
+                        raise ValueError("The shared container contains unsafe paths.")
+                    source.extract(member, staging)
+            staging.rename(extracted)
     manifest = offset_archive_decode((extracted / "manifest.orwv").read_bytes())
     if manifest.get("version") != 2:
         raise ValueError("This shared container uses an unsupported format.")

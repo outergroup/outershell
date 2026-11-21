@@ -3,8 +3,9 @@ import os
 from pathlib import Path
 import runpy
 import subprocess
+import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 provider = runpy.run_path(str(Path(__file__).resolve().parents[1] / "Resources/outershell-container-provider"))
 g = provider["probe_docker_readiness"].__globals__
@@ -30,6 +31,48 @@ class ReadinessTests(unittest.TestCase):
         self.assertEqual(self.probe(output="invalid JSON")[0], "failed")
         self.assertEqual(self.probe(code=1, error="permission denied")[0], "failed")
         self.assertEqual(self.probe(host="tcp://test:123", socket=False)[0], "ready")
+
+    def test_start_reports_daemon_failure_with_logs(self):
+        docker = Mock(side_effect=[
+            subprocess.CompletedProcess([], 0, "", ""),
+            subprocess.CompletedProcess([], 0, "running /usr/local/bin/outershell-container-init", ""),
+            subprocess.CompletedProcess([], 1, "", ""),
+            subprocess.CompletedProcess([], 0, "", "daemon could not load libc"),
+        ])
+        with patch.dict(g, docker=docker, container_name=lambda _: "qa"):
+            with self.assertRaisesRegex(RuntimeError, "daemon could not load libc"):
+                g["start_and_check_runtime"]("qa")
+        self.assertEqual([call.args[0][0] for call in docker.call_args_list],
+                         ["start", "inspect", "exec", "logs"])
+
+    def test_custom_entrypoint_can_start_without_daemon(self):
+        docker = Mock(side_effect=[
+            subprocess.CompletedProcess([], 0, "", ""),
+            subprocess.CompletedProcess([], 0, "running /bin/sleep", ""),
+        ])
+        with patch.dict(g, docker=docker, container_name=lambda _: "qa"):
+            g["start_and_check_runtime"]("qa")
+
+    def test_changed_bootstrap_invalidates_base(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            daemon = root / "outershelld"
+            daemon.write_bytes(b"one")
+            labels = []
+
+            def build(context, *args, **kwargs):
+                labels.append((context / "Dockerfile").read_text().splitlines()[-1].split("=")[1])
+
+            def inspect(*args, **kwargs):
+                return subprocess.CompletedProcess([], 0, labels[-1] if labels else "", "")
+
+            with patch.dict(g, provider_resources=lambda: root, docker=inspect, build_image=build):
+                g["ensure_base_image"](None)
+                g["ensure_base_image"](None)
+                daemon.write_bytes(b"two")
+                g["ensure_base_image"](None)
+            self.assertEqual(len(labels), 2)
+            self.assertNotEqual(*labels)
 
     def test_timeout(self):
         def timeout(*args, **kwargs):
