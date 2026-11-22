@@ -127,7 +127,7 @@ static bool container_share(Distribution *d, HttpRequest *request, StringBuilder
     bool persistent_included = include_data && !strcmp(include_data, "true");
     free(include_data);
     char *dockerfile = container_read(d->id, "Dockerfile", ""), *base_image = container_base_image(dockerfile);
-    StringBuilder shared_recipe = {0}; append(&shared_recipe, "{\"version\":1,\"steps\":[],\"realizedStepIDs\":[],");
+    StringBuilder shared_recipe = {0}; append(&shared_recipe, "{\"version\":1,");
     field(&shared_recipe, "baseImage", base_image); append(&shared_recipe, ","); append(&shared_recipe, config + 1);
     bool ok = root && context && recipe && container_tree(context, recipe, 0) &&
               container_write_value_file(recipe, "recipe.orwv", shared_recipe.data);

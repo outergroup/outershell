@@ -656,54 +656,6 @@ private struct LocalWorkspaceRecord: Decodable, Equatable {
     }
 
     struct Recipe: Decodable, Equatable {
-        struct User: Decodable, Equatable {
-            let id: String
-            let name: String
-            let homeDirectory: String
-            let workingDirectory: String
-            let isRoot: Bool
-        }
-
-        struct Step: Decodable, Equatable {
-            let id: UUID
-            let command: String
-            let createdAt: Double
-            let isApplied: Bool
-            let catalogItemID: String?
-            let displayName: String?
-            let dockerfileFragment: String
-            let isEditable: Bool
-        }
-
-        struct Fragment: Decodable, Equatable {
-            let id: String
-            let stepID: String
-            let displayName: String
-            let contents: String
-            let isEditable: Bool
-            let isRemovable: Bool
-            let isApplied: Bool
-        }
-
-        struct ScriptFile: Decodable, Equatable {
-            let relativePath: String
-            let scope: String
-            let userID: String
-            let fileName: String
-            let hostPath: String
-            let guestPath: String
-            let isApplied: Bool
-        }
-
-        struct CatalogItem: Decodable, Equatable {
-            let id: String
-            let displayName: String
-            let summary: String
-            let kind: String
-            let serviceID: String
-            let isInstalled: Bool
-        }
-
         struct TransferItem: Decodable, Equatable {
             let name: String
             let detail: String
@@ -722,12 +674,6 @@ private struct LocalWorkspaceRecord: Decodable, Equatable {
 
         let baseImage: String
         let installsOuterShellSupport: Bool
-        let outerShellSupportSnippet: String
-        let steps: [Step]
-        let fragments: [Fragment]
-        let catalog: [CatalogItem]
-        let users: [User]
-        let scriptFiles: [ScriptFile]
         let containerfile: String
         let dockerfileHostPath: String
         let dockerfileGuestPath: String
@@ -736,7 +682,6 @@ private struct LocalWorkspaceRecord: Decodable, Equatable {
         let transferItems: [TransferItem]
         let needsRebuild: Bool
         let hasUntrackedChanges: Bool
-        let workingDirectory: String
         let environment: [EnvironmentVariable]
         let publishedPorts: [PublishedPort]
     }
@@ -869,14 +814,9 @@ private struct LocalWorkspaceHostRequest: Encodable {
     let runtimeProviderID: String?
     let mountID: UUID?
     let readOnly: Bool?
-    let recipeStepID: UUID?
-    let catalogItemID: String?
     let command: String?
     let baseImage: String?
     let installsOuterShellSupport: Bool?
-    let rebuild: Bool?
-    let recipeUserID: UUID?
-    let recipeScriptPath: String?
     let dockerfile: String?
     let mounts: [ContainerConfigurationMountRequest]?
     let environment: [ContainerConfigurationEnvironmentRequest]?
@@ -936,8 +876,6 @@ private struct LocalWorkspaceHostResponse: Decodable {
     let requestID: UUID
     let providers: [LocalSafeSpaceProviderRecord]?
     let workspaces: [LocalWorkspaceRecord]
-    let recipeCommandOutput: String?
-    let recipeCommandApplied: Bool?
     let resourcesApplied: Bool?
     let resourcesDetail: String?
     let selectedFolderPath: String?
@@ -1952,15 +1890,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private var isSynchronizingEditorInput = false
     private var pendingSharedContainerImport: PendingSharedContainerImport?
     private var selectedRecipeSafeSpaceID: UUID?
-    private var pendingRecipeCommandWorkspace: LocalWorkspaceRecord?
     private var pendingDockerfileWorkspace: LocalWorkspaceRecord?
-    private var pendingRecipeBaseImageWorkspace: LocalWorkspaceRecord?
-    private var pendingRecipeUserWorkspace: LocalWorkspaceRecord?
-    private var pendingRecipeEditWorkspace: LocalWorkspaceRecord?
-    private var pendingRecipeEditStep: LocalWorkspaceRecord.Recipe.Step?
-    private var pendingRecipeScriptWorkspace: LocalWorkspaceRecord?
-    private var pendingRecipeScriptUserID: UUID?
-    private var pendingRecipeScriptRename: LocalWorkspaceRecord.Recipe.ScriptFile?
     private var safeSpaceRecipeMessage = ""
     private var containerConfigurationTab = ContainerConfigurationTab.dockerfile
     private var containerConfigurationDockerfile = ""
@@ -2028,11 +1958,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
     private var isWorkspaceNamePromptVisible: Bool {
         pendingEndpointRename != nil || isCreatingWorkspace || pendingWorkspaceRename != nil ||
-            pendingRecipeCommandWorkspace != nil || pendingRecipeUserWorkspace != nil ||
             pendingDockerfileWorkspace != nil ||
-            pendingRecipeBaseImageWorkspace != nil ||
-            pendingRecipeEditStep != nil ||
-            pendingRecipeScriptWorkspace != nil ||
             pendingSharedContainerImport != nil
     }
 
@@ -2044,17 +1970,15 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         return pendingWorkspaceRename.id == pendingDockerfileWorkspace.id
     }
 
-    private var isDockerfileFragmentPrompt: Bool {
+    private var isDockerfilePrompt: Bool {
         if isRenamingContainerConfiguration || editingResource != nil {
             return false
         }
-        return pendingRecipeCommandWorkspace != nil || pendingRecipeEditStep != nil ||
-            pendingDockerfileWorkspace != nil
+        return pendingDockerfileWorkspace != nil
     }
 
     private var isBaseImageChoicePrompt: Bool {
-        pendingRecipeBaseImageWorkspace != nil ||
-            (isCreatingWorkspace && isEditingCreationBaseImage)
+        isCreatingWorkspace && isEditingCreationBaseImage
     }
 
     private let rootLayer = CALayer()
@@ -2156,15 +2080,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private var runtimeMenuPoint: CGPoint?
     private var pendingSafeSpaceProviderMenuSelections: [UUID: [String: String]] = [:]
     private var pendingContainerPathMenuSelections: [UUID: [String: String]] = [:]
-    private var pendingSafeSpaceAppMenuSelections: [UUID: (
-        workspace: LocalWorkspaceRecord,
-        kindByItemID: [String: String]
-    )] = [:]
-    private var pendingRecipeStepMenuSelections: [UUID: (
-        workspaceID: UUID,
-        stepID: UUID,
-        rebuildByItemID: [String: Bool]
-    )] = [:]
     private var pendingLogMenuSelections: [UUID: (serviceID: String, serviceScope: String, logIndexByItemID: [String: Int])] = [:]
     private var logSelectorFrame = CGRect.zero
     private var serverSSHCommand: String?
@@ -2257,23 +2172,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private var overviewLayoutSaving = false
     private var overviewLayoutRequestPending = false
     private var workspaceOverviewCreateFrame = CGRect.zero
-    private var safeSpaceDetailBackFrame = CGRect.zero
-    private var safeSpaceDetailAddAppFrames: [CGRect] = []
-    private var safeSpaceDetailAddStepFrame = CGRect.zero
-    private var safeSpaceDetailAddUserFrame = CGRect.zero
-    private var safeSpaceDetailRebuildFrame = CGRect.zero
-    private var safeSpaceDetailCopyContainerfileFrame = CGRect.zero
-    private var safeSpaceDetailEditDockerfileFrame = CGRect.zero
-    private var safeSpaceDetailOpenDockerfileFrame = CGRect.zero
-    private var safeSpaceDetailCopySupportSnippetFrame = CGRect.zero
-    private var safeSpaceDetailCopyRecipeMessageFrame = CGRect.zero
-    private var safeSpaceDetailEditBaseImageFrame = CGRect.zero
-    private var safeSpaceDetailStepFrames: [(frame: CGRect, step: LocalWorkspaceRecord.Recipe.Step)] = []
-    private var safeSpaceDetailEditStepFrames: [(frame: CGRect, step: LocalWorkspaceRecord.Recipe.Step)] = []
-    private var safeSpaceDetailAddScriptFrames: [(frame: CGRect, userID: UUID?)] = []
-    private var safeSpaceDetailEditScriptFrames: [(frame: CGRect, script: LocalWorkspaceRecord.Recipe.ScriptFile)] = []
-    private var safeSpaceDetailRenameScriptFrames: [(frame: CGRect, script: LocalWorkspaceRecord.Recipe.ScriptFile)] = []
-    private var safeSpaceDetailCatalogFrames: [(frame: CGRect, item: LocalWorkspaceRecord.Recipe.CatalogItem)] = []
     private var safeSpaceDockerfileTextBlocks: [DockerfileTextBlock] = []
     private var selectedDockerfileFragmentID: String?
     private var dockerfileSelectionRange: NSRange?
@@ -3431,23 +3329,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         workspaceOverviewActionFrames.removeAll()
         workspaceOverviewAppFrames.removeAll()
         workspaceOverviewCreateFrame = .zero
-        safeSpaceDetailBackFrame = .zero
-        safeSpaceDetailAddAppFrames.removeAll()
-        safeSpaceDetailAddStepFrame = .zero
-        safeSpaceDetailAddUserFrame = .zero
-        safeSpaceDetailRebuildFrame = .zero
-        safeSpaceDetailCopyContainerfileFrame = .zero
-        safeSpaceDetailEditDockerfileFrame = .zero
-        safeSpaceDetailOpenDockerfileFrame = .zero
-        safeSpaceDetailCopySupportSnippetFrame = .zero
-        safeSpaceDetailCopyRecipeMessageFrame = .zero
-        safeSpaceDetailEditBaseImageFrame = .zero
-        safeSpaceDetailStepFrames.removeAll()
-        safeSpaceDetailEditStepFrames.removeAll()
-        safeSpaceDetailAddScriptFrames.removeAll()
-        safeSpaceDetailEditScriptFrames.removeAll()
-        safeSpaceDetailRenameScriptFrames.removeAll()
-        safeSpaceDetailCatalogFrames.removeAll()
         safeSpaceDockerfileTextBlocks.removeAll()
         addAppFrame = .zero
         var visibleIconKeys = Set<String>()
@@ -3472,479 +3353,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         }
     }
 
-    private func renderSafeSpaceDockerfileFragments(
-        _ recipe: LocalWorkspaceRecord.Recipe,
-        area: CGRect,
-        top: CGFloat
-    ) -> CGFloat {
-        var cursor = top
-        let footerFragments = recipe.fragments.filter { $0.id == "footer" }
-        let users = recipe.users.filter { !$0.isRoot }
-        let userFragmentIDs = Set(users.map { "user-\($0.id)" })
-        let userSetupPrefixes = users.map { "\($0.name) setup · " }
-        let rootFragments = recipe.fragments.filter { fragment in
-            fragment.id != "footer" &&
-                !fragment.id.hasPrefix("recipe-file-") &&
-                !userFragmentIDs.contains(fragment.id) &&
-                !userSetupPrefixes.contains(where: {
-                    fragment.displayName.hasPrefix($0)
-                })
-        }
-
-        cursor = renderDockerfileSectionHeading(
-            title: "ROOT",
-            detail: "/root · administrative user",
-            area: area,
-            top: cursor
-        )
-        cursor = renderDockerfileFragmentBlocks(rootFragments,
-                                                recipe: recipe,
-                                                area: area,
-                                                top: cursor)
-        cursor = renderRecipeScriptSection(recipe,
-                                           userID: nil,
-                                           area: area,
-                                           top: cursor)
-        cursor = renderInlineDockerfileAddApp(area: area,
-                                              top: cursor)
-        cursor = renderInlineDockerfileAddFragment(area: area, top: cursor)
-
-        for user in users {
-            cursor -= 14
-            cursor = renderDockerfileSectionHeading(
-                title: user.name.uppercased(),
-                detail: "\(user.homeDirectory) · \(user.workingDirectory)",
-                area: area,
-                top: cursor
-            )
-            let userFragments = recipe.fragments.filter {
-                $0.id == "user-\(user.id)"
-            }
-            cursor = renderDockerfileFragmentBlocks(userFragments,
-                                                    recipe: recipe,
-                                                    area: area,
-                                                    top: cursor)
-            cursor = renderRecipeScriptSection(recipe,
-                                               userID: UUID(uuidString: user.id),
-                                               area: area,
-                                               top: cursor)
-            cursor = renderInlineDockerfileAddApp(area: area,
-                                                  top: cursor)
-        }
-
-        cursor = renderInlineDockerfileAddUser(area: area, top: cursor)
-
-        if !footerFragments.isEmpty {
-            cursor -= 14
-            cursor = renderDockerfileSectionHeading(
-                title: "CONTAINER STARTUP",
-                detail: "Default process and execution user",
-                area: area,
-                top: cursor
-            )
-            cursor = renderDockerfileFragmentBlocks(footerFragments,
-                                                    recipe: recipe,
-                                                    area: area,
-                                                    top: cursor)
-        }
-        return cursor - 8
-    }
-
-    private func renderRecipeScriptSection(
-        _ recipe: LocalWorkspaceRecord.Recipe,
-        userID: UUID?,
-        area: CGRect,
-        top: CGFloat
-    ) -> CGFloat {
-        let scripts = recipe.scriptFiles.filter { script in
-            if let userID {
-                return script.userID == userID.uuidString
-            }
-            return script.userID.isEmpty
-        }.sorted { $0.fileName.localizedStandardCompare($1.fileName) == .orderedAscending }
-        let scriptIDs = Set(scripts.map { "recipe-file-\($0.relativePath)" })
-        let fragments = recipe.fragments.filter { scriptIDs.contains($0.id) }
-
-        var cursor = top - 2
-        let heading = makeTextLayer(size: 9,
-                                    weight: .semibold,
-                                    color: .secondaryLabelColor)
-        heading.string = "SETUP SCRIPTS"
-        heading.frame = CGRect(x: area.minX,
-                               y: cursor - 17,
-                               width: 110,
-                               height: 13)
-        addAppsSublayer(heading)
-
-        let location = makeTextLayer(size: 9,
-                                     weight: .regular,
-                                     color: .tertiaryLabelColor,
-                                     alignment: .right)
-        let directory = userID.flatMap { identifier in
-            recipe.users.first(where: { $0.id == identifier.uuidString })
-        }.map { "steps/users/\($0.name)" } ?? "steps/root"
-        location.string = "\(directory) · runs alphabetically"
-        location.truncationMode = .middle
-        location.frame = CGRect(x: area.minX + 112,
-                                y: cursor - 17,
-                                width: max(area.width - 112, 1),
-                                height: 13)
-        addAppsSublayer(location)
-        cursor -= 28
-
-        if scripts.isEmpty {
-            let empty = makeTextLayer(size: 10,
-                                      weight: .regular,
-                                      color: .tertiaryLabelColor)
-            empty.string = "No setup scripts. These mounted files can be changed inside the container or with a host text editor."
-            empty.isWrapped = true
-            empty.frame = CGRect(x: area.minX,
-                                 y: cursor - 32,
-                                 width: area.width,
-                                 height: 30)
-            addAppsSublayer(empty)
-            cursor -= 38
-        } else {
-            cursor = renderDockerfileFragmentBlocks(fragments,
-                                                    recipe: recipe,
-                                                    area: area,
-                                                    top: cursor)
-        }
-
-        let addFrame = CGRect(x: area.minX,
-                              y: cursor - 36,
-                              width: area.width,
-                              height: 32)
-        safeSpaceDetailAddScriptFrames.append((addFrame, userID))
-        renderInlineDockerfileAction(frame: addFrame,
-                                     symbolName: "doc.badge.plus",
-                                     title: "Add setup script…")
-        return cursor - 44
-    }
-
-    private func renderDockerfileSectionHeading(
-        title: String,
-        detail: String,
-        area: CGRect,
-        top: CGFloat
-    ) -> CGFloat {
-        let divider = CALayer()
-        divider.frame = CGRect(x: area.minX,
-                               y: top - 2,
-                               width: area.width,
-                               height: 0.5)
-        divider.backgroundColor = resolvedCGColor(.separatorColor)
-        addAppsSublayer(divider)
-
-        let titleLayer = makeTextLayer(size: 11,
-                                       weight: .semibold,
-                                       color: .secondaryLabelColor)
-        titleLayer.string = title
-        titleLayer.frame = CGRect(x: area.minX,
-                                  y: top - 28,
-                                  width: max(area.width * 0.34, 100),
-                                  height: 16)
-        addAppsSublayer(titleLayer)
-
-        let detailLayer = makeTextLayer(size: 10,
-                                        weight: .regular,
-                                        color: .tertiaryLabelColor,
-                                        alignment: .right)
-        detailLayer.string = detail
-        detailLayer.truncationMode = .middle
-        detailLayer.frame = CGRect(x: area.minX + area.width * 0.34,
-                                   y: top - 28,
-                                   width: area.width * 0.66,
-                                   height: 16)
-        addAppsSublayer(detailLayer)
-        return top - 40
-    }
-
-    private func renderDockerfileFragmentBlocks(
-        _ fragments: [LocalWorkspaceRecord.Recipe.Fragment],
-        recipe: LocalWorkspaceRecord.Recipe,
-        area: CGRect,
-        top: CGFloat
-    ) -> CGFloat {
-        var cursor = top
-        for fragment in fragments {
-            let script = recipe.scriptFiles.first {
-                fragment.id == "recipe-file-\($0.relativePath)"
-            }
-            let textWidth = max(area.width - 18, 1)
-            let wrappedLines = dockerfileWrappedLines(fragment.contents, width: textWidth)
-            let codeHeight = max(CGFloat(wrappedLines.count) * dockerfileLineHeight() + 16, 46)
-            let headerHeight: CGFloat = script == nil ? 34 : 62
-            let blockHeight = codeHeight + headerHeight
-            let blockFrame = CGRect(x: area.minX,
-                                    y: cursor - blockHeight,
-                                    width: area.width,
-                                    height: blockHeight)
-
-            let title = makeTextLayer(size: 10,
-                                      weight: .medium,
-                                      color: .secondaryLabelColor)
-            title.string = script?.fileName ?? fragment.displayName
-            title.truncationMode = .end
-            title.frame = CGRect(x: blockFrame.minX,
-                                 y: blockFrame.maxY - 18,
-                                 width: max(blockFrame.width - (script == nil ? 72 : 112), 1),
-                                 height: 14)
-            addAppsSublayer(title)
-
-            if let script {
-                let inside = makeTextLayer(size: 8.5,
-                                           weight: .regular,
-                                           color: .tertiaryLabelColor)
-                inside.string = "Inside  \(script.guestPath)"
-                inside.truncationMode = .middle
-                inside.frame = CGRect(x: blockFrame.minX,
-                                      y: blockFrame.maxY - 34,
-                                      width: max(blockFrame.width - 112, 1),
-                                      height: 12)
-                addAppsSublayer(inside)
-
-                let outside = makeTextLayer(size: 8.5,
-                                            weight: .regular,
-                                            color: .tertiaryLabelColor)
-                outside.string = "Outside  \(script.hostPath)"
-                outside.truncationMode = .middle
-                outside.frame = CGRect(x: blockFrame.minX,
-                                       y: blockFrame.maxY - 47,
-                                       width: max(blockFrame.width - 112, 1),
-                                       height: 12)
-                addAppsSublayer(outside)
-            }
-
-            var actionX = blockFrame.maxX - 25
-            if let script {
-                let renameFrame = CGRect(x: actionX,
-                                         y: blockFrame.maxY - 24,
-                                         width: 22,
-                                         height: 22)
-                let rename = makeSymbolButtonLayer(
-                    symbolName: "character.cursor.ibeam",
-                    accessibilityTitle: "Rename \(script.fileName)"
-                )
-                rename.frame = renameFrame
-                addAppsSublayer(rename)
-                safeSpaceDetailRenameScriptFrames.append((renameFrame, script))
-                actionX -= 27
-
-                let editFrame = CGRect(x: actionX,
-                                       y: blockFrame.maxY - 24,
-                                       width: 22,
-                                       height: 22)
-                let edit = makeSymbolButtonLayer(
-                    symbolName: "square.and.pencil",
-                    accessibilityTitle: "Edit \(script.fileName) in Plaintext"
-                )
-                edit.frame = editFrame
-                addAppsSublayer(edit)
-                safeSpaceDetailEditScriptFrames.append((editFrame, script))
-            } else if fragment.isRemovable,
-               let stepID = UUID(uuidString: fragment.stepID),
-               let step = recipe.steps.first(where: { $0.id == stepID }) {
-                let removeFrame = CGRect(x: actionX,
-                                         y: blockFrame.maxY - 24,
-                                         width: 22,
-                                         height: 22)
-                let remove = makeSymbolButtonLayer(
-                    symbolName: "trash",
-                    accessibilityTitle: "Remove \(fragment.displayName)"
-                )
-                remove.frame = removeFrame
-                addAppsSublayer(remove)
-                safeSpaceDetailStepFrames.append((removeFrame, step))
-                actionX -= 27
-                if fragment.isEditable {
-                    let editFrame = CGRect(x: actionX,
-                                           y: blockFrame.maxY - 24,
-                                           width: 22,
-                                           height: 22)
-                    let edit = makeSymbolButtonLayer(
-                        symbolName: "pencil",
-                        accessibilityTitle: "Edit \(fragment.displayName)"
-                    )
-                    edit.frame = editFrame
-                    addAppsSublayer(edit)
-                    safeSpaceDetailEditStepFrames.append((editFrame, step))
-                }
-            } else if fragment.id == "header", fragment.isEditable {
-                let editFrame = CGRect(x: actionX,
-                                       y: blockFrame.maxY - 24,
-                                       width: 22,
-                                       height: 22)
-                let edit = makeSymbolButtonLayer(
-                    symbolName: "pencil",
-                    accessibilityTitle: "Change base image"
-                )
-                edit.frame = editFrame
-                addAppsSublayer(edit)
-                safeSpaceDetailEditBaseImageFrame = editFrame
-            } else if fragment.id != "dockerfile" {
-                let lock = CALayer()
-                lock.frame = CGRect(x: actionX,
-                                    y: blockFrame.maxY - 22,
-                                    width: 16,
-                                    height: 16)
-                lock.contentsGravity = .resizeAspect
-                lock.contents = symbolCGImage(named: "lock.fill", pointSize: 10)
-                lock.opacity = 0.45
-                addAppsSublayer(lock)
-            }
-
-            let codeFrame = CGRect(x: blockFrame.minX,
-                                   y: blockFrame.minY,
-                                   width: blockFrame.width,
-                                   height: codeHeight)
-            let background = CALayer()
-            background.frame = codeFrame
-            background.cornerRadius = 6
-            background.backgroundColor = resolvedCGColor(
-                NSColor.textBackgroundColor.withAlphaComponent(0.62)
-            )
-            background.borderWidth = fragment.isEditable ? 1 : 0.5
-            background.borderColor = resolvedCGColor(
-                fragment.isEditable ? .controlAccentColor : .separatorColor
-            )
-            addAppsSublayer(background)
-
-            let selectionLayer = CALayer()
-            selectionLayer.frame = background.bounds
-            background.addSublayer(selectionLayer)
-
-            let lineHeight = dockerfileLineHeight()
-            var renderedLines: [DockerfileTextLine] = []
-            renderedLines.reserveCapacity(wrappedLines.count)
-            for (index, wrappedLine) in wrappedLines.enumerated() {
-                let localFrame = CGRect(
-                    x: 9,
-                    y: codeHeight - 8 - CGFloat(index + 1) * lineHeight,
-                    width: textWidth,
-                    height: lineHeight
-                )
-                let code = makeTextLayer(size: 10,
-                                         weight: .regular,
-                                         color: .labelColor,
-                                         monospaced: true)
-                code.string = wrappedLine.text
-                code.frame = localFrame
-                background.addSublayer(code)
-                renderedLines.append(
-                    DockerfileTextLine(
-                        text: wrappedLine.text,
-                        range: wrappedLine.range,
-                        frame: localFrame.offsetBy(dx: codeFrame.minX, dy: codeFrame.minY)
-                    )
-                )
-            }
-            let textBlock = DockerfileTextBlock(
-                fragmentID: fragment.id,
-                text: fragment.contents,
-                frame: codeFrame,
-                lines: renderedLines,
-                font: dockerfileFont(),
-                contentSpace: .apps,
-                selectionLayer: selectionLayer
-            )
-            safeSpaceDockerfileTextBlocks.append(textBlock)
-            renderDockerfileSelection(in: textBlock)
-            cursor -= blockHeight + 10
-        }
-        return cursor
-    }
-
-    private func renderInlineDockerfileAddFragment(
-        area: CGRect,
-        top: CGFloat
-    ) -> CGFloat {
-        safeSpaceDetailAddStepFrame = CGRect(x: area.minX,
-                                             y: top - 36,
-                                             width: area.width,
-                                             height: 32)
-        renderInlineDockerfileAction(
-            frame: safeSpaceDetailAddStepFrame,
-            symbolName: "plus.square",
-            title: "Add root Dockerfile fragment…"
-        )
-        return top - 44
-    }
-
-    private func renderInlineDockerfileAddApp(
-        area: CGRect,
-        top: CGFloat
-    ) -> CGFloat {
-        let frame = CGRect(x: area.minX,
-                           y: top - 36,
-                           width: area.width,
-                           height: 32)
-        safeSpaceDetailAddAppFrames.append(frame)
-        renderInlineDockerfileAction(
-            frame: frame,
-            symbolName: "app.badge.plus",
-            title: "Add app…"
-        )
-        return top - 44
-    }
-
-    private func renderInlineDockerfileAddUser(
-        area: CGRect,
-        top: CGFloat
-    ) -> CGFloat {
-        safeSpaceDetailAddUserFrame = CGRect(x: area.minX,
-                                             y: top - 36,
-                                             width: area.width,
-                                             height: 32)
-        renderInlineDockerfileAction(
-            frame: safeSpaceDetailAddUserFrame,
-            symbolName: "person.crop.circle.badge.plus",
-            title: "Add user…"
-        )
-        return top - 44
-    }
-
-    private func renderInlineDockerfileAction(
-        frame: CGRect,
-        symbolName: String,
-        title: String
-    ) {
-        let background = CALayer()
-        background.frame = frame
-        background.cornerRadius = 6
-        background.borderWidth = 0.5
-        background.borderColor = resolvedCGColor(.separatorColor)
-        background.backgroundColor = resolvedCGColor(
-            NSColor.controlBackgroundColor.withAlphaComponent(0.32)
-        )
-        addAppsSublayer(background)
-
-        let icon = CALayer()
-        icon.frame = CGRect(x: frame.minX + 10,
-                            y: frame.minY + 7,
-                            width: 18,
-                            height: 18)
-        icon.contentsGravity = .resizeAspect
-        icon.contents = symbolCGImage(named: symbolName, pointSize: 13)
-        addAppsSublayer(icon)
-
-        let titleLayer = makeTextLayer(size: 11,
-                                       weight: .medium,
-                                       color: .controlAccentColor)
-        titleLayer.string = title
-        titleLayer.frame = CGRect(x: frame.minX + 37,
-                                  y: frame.minY + 7,
-                                  width: max(frame.width - 47, 1),
-                                  height: 18)
-        addAppsSublayer(titleLayer)
-    }
-
     private func dockerfileFont() -> NSFont {
         NSFont.monospacedSystemFont(ofSize: 10, weight: .regular)
-    }
-
-    private func dockerfileLineHeight() -> CGFloat {
-        14
     }
 
     private func renderSelectableMountedFolderPath(
@@ -8882,7 +8292,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         let sourceLayer: CALayer
         if target == "workspace" {
             layout = CreateFieldLayout(fieldFrame: editorInputFieldFrame, textFrame: editorInputTextFrame,
-                                       key: target, monospaced: isDockerfileFragmentPrompt, multiline: isDockerfileFragmentPrompt)
+                                       key: target, monospaced: isDockerfilePrompt, multiline: isDockerfilePrompt)
             sourceLayer = rootLayer
         } else {
             guard let field = createFieldLayouts[target] else { return nil }
@@ -9083,7 +8493,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             nodes.append(accessibilityNode(nextIdentifier: &nextIdentifier, role: .button, frame: frame, label: label, value: selectedTab ? "Selected" : nil))
         }
         if let fieldLabel, !fieldFrame.isEmpty {
-            nodes.append(accessibilityNode(nextIdentifier: &nextIdentifier, role: isDockerfileFragmentPrompt ? .textArea : .textField, frame: fieldFrame, label: fieldLabel,
+            nodes.append(accessibilityNode(nextIdentifier: &nextIdentifier, role: isDockerfilePrompt ? .textArea : .textField, frame: fieldFrame, label: fieldLabel,
                                            value: workspaceRenameName, actions: isContainerConfigurationEditorVisible && !isRenamingContainerConfiguration ? [.press, .focus, .setValue, .scrollUp, .scrollDown] : [.press, .focus, .setValue], isFocused: editorInputController.isFocused, textTarget: "workspace"))
         }
         let interactiveFrames = nodes.map(\.frame)
@@ -11653,7 +11063,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             focusEditorInput()
         }
 
-        let cleaned = isDockerfileFragmentPrompt
+        let cleaned = isDockerfilePrompt
             ? cleanBashCommandText(text)
             : cleanSingleLineText(text)
         editorInputController.insertText(cleaned, replacementRange: hasReplacementRange
@@ -11698,7 +11108,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             if !editorInputController.isFocused {
                 focusEditorInput()
             }
-            let cleaned = isDockerfileFragmentPrompt
+            let cleaned = isDockerfilePrompt
                 ? cleanBashCommandText(text)
                 : cleanSingleLineText(text)
             editorInputController.setMarkedText(
@@ -11780,9 +11190,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             historyKey = "prompt"
         }
         editorInputController.setText(workspaceRenameName, historyKey: historyKey)
-        editorInputController.allowsNewlines = editingResource == nil && (
-            pendingRecipeCommandWorkspace != nil || pendingRecipeEditStep != nil ||
-            (pendingDockerfileWorkspace != nil && !isRenamingContainerConfiguration))
+        editorInputController.allowsNewlines = editingResource == nil &&
+            pendingDockerfileWorkspace != nil && !isRenamingContainerConfiguration
         editorInputController.visualLineWidth =
             editorInputController.allowsNewlines && !usesUnwrappedDockerfile
                 ? max(editorInputTextFrame.width, 280)
@@ -11932,7 +11341,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 dismissWorkspaceRename()
                 return
             }
-            if command == "insertTab", isDockerfileFragmentPrompt {
+            if command == "insertTab", isDockerfilePrompt {
                 editorInputController.insertText("    ")
                 return
             }
@@ -12164,7 +11573,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func workspaceNameInputFont() -> NSFont {
-        isDockerfileFragmentPrompt
+        isDockerfilePrompt
             ? NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
             : NSFont.systemFont(ofSize: 13, weight: .regular)
     }
@@ -12308,7 +11717,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
     private func characterIndexForEditorInput(at point: CGPoint) -> Int {
         let text = editorInputController.text
-        if isDockerfileFragmentPrompt {
+        if isDockerfilePrompt {
             let layout = CreateFieldLayout(fieldFrame: editorInputFieldFrame,
                                            textFrame: editorInputTextFrame,
                                            key: "dockerfileFragment",
@@ -12517,7 +11926,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                           y: editorInputTextFrame.maxY - CGFloat(caret.row + 1) * editorLineHeight - 1,
                           width: 1, height: editorLineHeight + 2)
         }
-        if isDockerfileFragmentPrompt {
+        if isDockerfilePrompt {
             let layout = CreateFieldLayout(fieldFrame: editorInputFieldFrame,
                                            textFrame: editorInputTextFrame,
                                            key: "dockerfileFragment",
@@ -12922,7 +12331,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             }),
                let stringValue = String(data: representation.data, encoding: .utf8) {
                 editorInputController.pasteText(
-                    isDockerfileFragmentPrompt
+                    isDockerfilePrompt
                         ? cleanBashCommandText(stringValue)
                         : cleanSingleLineText(stringValue)
                 )
@@ -12937,7 +12346,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                    documentAttributes: nil
                ) {
                 editorInputController.pasteText(
-                    isDockerfileFragmentPrompt
+                    isDockerfilePrompt
                         ? cleanBashCommandText(attributed.string)
                         : cleanSingleLineText(attributed.string)
                 )
@@ -13889,15 +13298,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                             workspaceOverviewCreateFrame.contains(appsPoint) ||
                             workspaceOverviewActionFrames.contains { $0.frame.contains(appsPoint) } ||
                             workspaceOverviewAppFrames.contains { $0.frame.contains(appsPoint) } ||
-                            safeSpaceDetailBackFrame.contains(appsPoint) ||
-                            safeSpaceDetailAddUserFrame.contains(appsPoint) ||
-                            safeSpaceDetailAddStepFrame.contains(appsPoint) ||
-                            safeSpaceDetailRebuildFrame.contains(appsPoint) ||
-                            safeSpaceDetailCopyContainerfileFrame.contains(appsPoint) ||
-                            safeSpaceDetailCopySupportSnippetFrame.contains(appsPoint) ||
-                            safeSpaceDetailCopyRecipeMessageFrame.contains(appsPoint) ||
-                            safeSpaceDetailEditStepFrames.contains { $0.frame.contains(appsPoint) } ||
-                            safeSpaceDetailStepFrames.contains { $0.frame.contains(appsPoint) } ||
                             overviewAddFrames.contains { $0.contains(appsPoint) } ||
                             addAppFrame.contains(appsPoint)
         }
@@ -14902,66 +14302,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 return
             }
             if let selectedRecipeSafeSpaceID,
-               let workspace = localWorkspaces.first(where: {
-                   $0.id == selectedRecipeSafeSpaceID
-                }) {
-                if safeSpaceDetailBackFrame.contains(appsPoint) {
-                    armButtonClick(frame: rootFrame(safeSpaceDetailBackFrame,
-                                                    from: appsScrollContentLayer)) { [weak self] in
-                        self?.returnFromRecipeSafeSpace()
-                    }
-                } else if safeSpaceDetailEditDockerfileFrame.contains(appsPoint) {
-                    armButtonClick(frame: rootFrame(safeSpaceDetailEditDockerfileFrame,
-                                                    from: appsScrollContentLayer)) { [weak self] in
-                        self?.showDockerfileEditor(for: workspace)
-                    }
-                } else if safeSpaceDetailOpenDockerfileFrame.contains(appsPoint) {
-                    armButtonClick(frame: rootFrame(safeSpaceDetailOpenDockerfileFrame,
-                                                    from: appsScrollContentLayer)) { [weak self] in
-                        self?.openDockerfileInTextEditor(for: workspace)
-                    }
-                } else if safeSpaceDetailEditBaseImageFrame.contains(appsPoint) {
-                    armButtonClick(frame: rootFrame(safeSpaceDetailEditBaseImageFrame,
-                                                    from: appsScrollContentLayer)) { [weak self] in
-                        self?.showRecipeBaseImagePrompt(for: workspace)
-                    }
-                } else if let addAppFrame = safeSpaceDetailAddAppFrames.first(where: {
-                    $0.contains(appsPoint)
-                }) {
-                    armButtonClick(frame: rootFrame(addAppFrame,
-                                                    from: appsScrollContentLayer),
-                                   performAtPoint: { [weak self] releasePoint in
-                        self?.showSafeSpaceAddAppMenu(for: workspace, at: releasePoint)
-                    })
-                } else if safeSpaceDetailAddUserFrame.contains(appsPoint) {
-                    armButtonClick(frame: rootFrame(safeSpaceDetailAddUserFrame,
-                                                    from: appsScrollContentLayer)) { [weak self] in
-                        self?.showRecipeUserPrompt(for: workspace)
-                    }
-                } else if let target = safeSpaceDetailAddScriptFrames.first(where: {
-                    $0.frame.contains(appsPoint)
-                }) {
-                    armButtonClick(frame: rootFrame(target.frame,
-                                                    from: appsScrollContentLayer)) { [weak self] in
-                        self?.showRecipeScriptCreationPrompt(for: workspace,
-                                                             userID: target.userID)
-                    }
-                } else if let target = safeSpaceDetailEditScriptFrames.first(where: {
-                    $0.frame.contains(appsPoint)
-                }) {
-                    armButtonClick(frame: rootFrame(target.frame,
-                                                    from: appsScrollContentLayer)) { [weak self] in
-                        self?.editRecipeScript(target.script)
-                    }
-                } else if let target = safeSpaceDetailRenameScriptFrames.first(where: {
-                    $0.frame.contains(appsPoint)
-                }) {
-                    armButtonClick(frame: rootFrame(target.frame,
-                                                    from: appsScrollContentLayer)) { [weak self] in
-                        self?.showRecipeScriptRenamePrompt(for: workspace,
-                                                           script: target.script)
-                    }
-                } else if let action = workspaceOverviewActionFrames.first(where: {
+               localWorkspaces.contains(where: { $0.id == selectedRecipeSafeSpaceID }) {
+                if let action = workspaceOverviewActionFrames.first(where: {
                     $0.frame.contains(appsPoint)
                 }) {
                     armButtonClick(frame: rootFrame(action.frame,
@@ -14970,66 +14312,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                         self?.performWorkspaceOverviewAction(operation: action.operation,
                                                              workspace: action.workspace,
                                                              at: releasePoint)
-                    })
-                } else if let catalogItem = safeSpaceDetailCatalogFrames.first(where: {
-                    $0.frame.contains(appsPoint)
-                }) {
-                    armButtonClick(frame: rootFrame(catalogItem.frame,
-                                                    from: appsScrollContentLayer)) { [weak self] in
-                        self?.sendWorkspaceRequest(operation: "installRecipeCatalogItem",
-                                                   workspaceID: workspace.id,
-                                                   catalogItemID: catalogItem.item.id)
-                    }
-                } else if safeSpaceDetailAddStepFrame.contains(appsPoint) {
-                    armButtonClick(frame: rootFrame(safeSpaceDetailAddStepFrame,
-                                                    from: appsScrollContentLayer)) { [weak self] in
-                        self?.showRecipeCommandPrompt(for: workspace)
-                    }
-                } else if safeSpaceDetailRebuildFrame.contains(appsPoint) {
-                    armButtonClick(frame: rootFrame(safeSpaceDetailRebuildFrame,
-                                                    from: appsScrollContentLayer)) { [weak self] in
-                        self?.sendWorkspaceRequest(operation: "rebuildRecipe",
-                                                   workspaceID: workspace.id)
-                    }
-                } else if safeSpaceDetailCopyContainerfileFrame.contains(appsPoint),
-                          let containerfile = workspace.recipe?.containerfile {
-                    armButtonClick(frame: rootFrame(safeSpaceDetailCopyContainerfileFrame,
-                                                    from: appsScrollContentLayer)) { [weak self] in
-                        self?.copyTextToPasteboard(containerfile)
-                        self?.safeSpaceRecipeMessage = "Copied Dockerfile."
-                        self?.updateLayout()
-                    }
-                } else if safeSpaceDetailCopySupportSnippetFrame.contains(appsPoint),
-                          let snippet = workspace.recipe?.outerShellSupportSnippet {
-                    armButtonClick(frame: rootFrame(safeSpaceDetailCopySupportSnippetFrame,
-                                                    from: appsScrollContentLayer)) { [weak self] in
-                        self?.copyTextToPasteboard(snippet)
-                        self?.safeSpaceRecipeMessage = "Copied the Outer Shell support snippet."
-                        self?.updateLayout()
-                    }
-                } else if safeSpaceDetailCopyRecipeMessageFrame.contains(appsPoint),
-                          !safeSpaceRecipeMessage.isEmpty {
-                    let message = safeSpaceRecipeMessage
-                    armButtonClick(frame: rootFrame(safeSpaceDetailCopyRecipeMessageFrame,
-                                                    from: appsScrollContentLayer)) { [weak self] in
-                        self?.copyTextToPasteboard(message)
-                    }
-                } else if let target = safeSpaceDetailEditStepFrames.first(where: {
-                    $0.frame.contains(appsPoint)
-                }) {
-                    armButtonClick(frame: rootFrame(target.frame,
-                                                    from: appsScrollContentLayer)) { [weak self] in
-                        self?.showRecipeFragmentEditor(for: workspace, step: target.step)
-                    }
-                } else if let target = safeSpaceDetailStepFrames.first(where: {
-                    $0.frame.contains(appsPoint)
-                }) {
-                    armButtonClick(frame: rootFrame(target.frame,
-                                                    from: appsScrollContentLayer),
-                                   performAtPoint: { [weak self] releasePoint in
-                        self?.showRecipeStepRemovalMenu(workspaceID: workspace.id,
-                                                        step: target.step,
-                                                        at: releasePoint)
                     })
                 } else if let overflow = appOverflowFrames.first(where: {
                     $0.frame.contains(appsPoint)
@@ -16492,15 +15774,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         if isWorkspaceNamePromptVisible {
             blurEditorInput()
             pendingWorkspaceRename = nil
-            pendingRecipeCommandWorkspace = nil
             pendingDockerfileWorkspace = nil
-            pendingRecipeBaseImageWorkspace = nil
-            pendingRecipeUserWorkspace = nil
-            pendingRecipeEditWorkspace = nil
-            pendingRecipeEditStep = nil
-            pendingRecipeScriptWorkspace = nil
-            pendingRecipeScriptUserID = nil
-            pendingRecipeScriptRename = nil
             isCreatingWorkspace = false
             isEditingCreationBaseImage = false
             pendingCreationContainerName = ""
@@ -16520,14 +15794,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                       serviceScope: String? = nil,
                                       mountID: UUID? = nil,
                                       readOnly: Bool? = nil,
-                                      recipeStepID: UUID? = nil,
-                                      catalogItemID: String? = nil,
                                       command: String? = nil,
                                       baseImage: String? = nil,
                                       installsOuterShellSupport: Bool? = nil,
-                                      rebuild: Bool? = nil,
-                                      recipeUserID: UUID? = nil,
-                                      recipeScriptPath: String? = nil,
                                       dockerfile: String? = nil,
                                       mounts: [ContainerConfigurationMountRequest]? = nil,
                                       environment: [ContainerConfigurationEnvironmentRequest]? = nil,
@@ -16560,14 +15829,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                                     : nil,
                                                 mountID: mountID,
                                                 readOnly: readOnly,
-                                                recipeStepID: recipeStepID,
-                                                catalogItemID: catalogItemID,
                                                 command: command,
                                                 baseImage: baseImage,
                                                 installsOuterShellSupport: installsOuterShellSupport,
-                                                rebuild: rebuild,
-                                                recipeUserID: recipeUserID,
-                                                recipeScriptPath: recipeScriptPath,
                                                 dockerfile: dockerfile,
                                                 mounts: mounts,
                                                 environment: environment,
@@ -16612,30 +15876,12 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 workspacePanelMessage = "Choosing folder…"
             case "delete":
                 workspacePanelMessage = "Deleting container…"
-            case "addRecipeStep":
-                safeSpaceRecipeMessage = "Adding Dockerfile fragment…"
             case "updateDockerfile":
                 safeSpaceRecipeMessage = "Saving Dockerfile…"
             case "updateContainerConfiguration":
                 safeSpaceRecipeMessage = "Saving container configuration…"
             case "updateResources":
                 safeSpaceRecipeMessage = "Saving resource limits…"
-            case "updateRecipeBaseImage":
-                safeSpaceRecipeMessage = "Updating base image…"
-            case "addRecipeUser":
-                safeSpaceRecipeMessage = "Adding container user…"
-            case "createRecipeScript":
-                safeSpaceRecipeMessage = "Adding setup script…"
-            case "renameRecipeScript":
-                safeSpaceRecipeMessage = "Renaming setup script…"
-            case "updateRecipeStep":
-                safeSpaceRecipeMessage = "Saving Dockerfile fragment…"
-            case "installRecipeCatalogItem":
-                safeSpaceRecipeMessage = "Installing software…"
-            case "deleteRecipeStep":
-                safeSpaceRecipeMessage = rebuild == true
-                    ? "Removing step and rebuilding…"
-                    : "Removing build step…"
             case "rebuildRecipe":
                 safeSpaceRecipeMessage = "Applying changes… This can take several minutes."
             case "changeRuntime":
@@ -16646,8 +15892,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         }
         let operationSession = operation == "start" ||
             operation == "rebuildRecipe" ||
-            operation == "changeRuntime" ||
-            (operation == "deleteRecipeStep" && rebuild == true)
+            operation == "changeRuntime"
             ? safeSpaceOperationSession
             : urlSession
         guard let safeSpacesEndpoint, let operationSession else {
@@ -16845,16 +16090,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 workspacePanelMessage = ""
                 persistContainerRuntimeConfiguration()
             }
-        } else if operation == "addRecipeStep" ||
-                    operation == "updateDockerfile" ||
+        } else if operation == "updateDockerfile" ||
                     operation == "updateContainerConfiguration" ||
-                    operation == "updateRecipeBaseImage" ||
-                    operation == "addRecipeUser" ||
-                    operation == "createRecipeScript" ||
-                    operation == "renameRecipeScript" ||
-                    operation == "updateRecipeStep" ||
-                    operation == "installRecipeCatalogItem" ||
-                    operation == "deleteRecipeStep" ||
                     operation == "rebuildRecipe" ||
                     operation == "changeRuntime" {
             if let error = response.error, !error.isEmpty {
@@ -16870,47 +16107,12 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 } else {
                     safeSpaceRecipeMessage = error
                 }
-            } else if operation == "addRecipeStep" ||
-                        operation == "updateDockerfile" ||
-                        operation == "updateContainerConfiguration" ||
-                        operation == "updateRecipeBaseImage" ||
-                        operation == "addRecipeUser" ||
-                        operation == "createRecipeScript" ||
-                        operation == "renameRecipeScript" ||
-                        operation == "updateRecipeStep" ||
-                        operation == "installRecipeCatalogItem" {
-                if response.recipeCommandApplied == true {
-                    if operation == "installRecipeCatalogItem" {
-                        safeSpaceRecipeMessage = "Software installed and added to the recipe."
-                    } else {
-                        safeSpaceRecipeMessage = "Dockerfile fragment applied to the running container."
-                    }
-                } else if let output = response.recipeCommandOutput,
-                          !output.isEmpty {
-                    safeSpaceRecipeMessage = "Build step saved, but live application failed: \(output)"
-                } else {
-                    if operation == "updateContainerConfiguration" {
-                        safeSpaceRecipeMessage = "Container configuration saved. Rebuild to apply it."
-                    } else if operation == "updateDockerfile" {
-                        if !didBeginRebuildAfterDockerfileSave {
-                            safeSpaceRecipeMessage = "Dockerfile saved. Rebuild when you want to recreate the container."
-                        }
-                    } else if operation == "updateRecipeBaseImage" {
-                        safeSpaceRecipeMessage = "Base image updated. Rebuild to use it."
-                    } else if operation == "addRecipeUser" {
-                        safeSpaceRecipeMessage = "Container user added. Rebuild to create it."
-                    } else if operation == "createRecipeScript" {
-                        safeSpaceRecipeMessage = "Setup script added. Edit it in Plaintext, then rebuild when ready."
-                    } else if operation == "renameRecipeScript" {
-                        safeSpaceRecipeMessage = "Setup script renamed. Its alphabetical run order has been updated."
-                    } else {
-                        safeSpaceRecipeMessage = "Dockerfile fragment saved. Rebuild to update the running container."
-                    }
+            } else if operation == "updateContainerConfiguration" {
+                safeSpaceRecipeMessage = "Container configuration saved. Rebuild to apply it."
+            } else if operation == "updateDockerfile" {
+                if !didBeginRebuildAfterDockerfileSave {
+                    safeSpaceRecipeMessage = "Dockerfile saved. Rebuild when you want to recreate the container."
                 }
-            } else if operation == "deleteRecipeStep" {
-                safeSpaceRecipeMessage = response.recipeCommandApplied == true
-                    ? "Build step removed and the container rebuilt."
-                    : "Build step removed. Rebuild to update the container."
             } else if operation != "rebuildRecipe" && operation != "changeRuntime" {
                 containerConfigurationBuildError = nil
                 containerConfigurationBuildErrorScroll = 0
@@ -18107,39 +17309,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         pendingCreationContainerName = "Container \(index)"
         isEditingCreationBaseImage = false
         pendingWorkspaceRename = nil
-        pendingRecipeBaseImageWorkspace = nil
         workspaceRenameName = pendingCreationContainerName
         workspacePanelMessage = ""
         focusEditorInput(selectAll: true)
-        updateLayout()
-    }
-
-    private func showRecipeCommandPrompt(for workspace: LocalWorkspaceRecord) {
-        editorInputController.resetUndoHistory()
-        workspaceNamePromptDismissesPanel = true
-        isShowingWorkspacePanel = true
-        isCreatingWorkspace = false
-        pendingWorkspaceRename = nil
-        pendingRecipeEditWorkspace = nil
-        pendingRecipeEditStep = nil
-        pendingRecipeScriptWorkspace = nil
-        pendingRecipeScriptUserID = nil
-        pendingRecipeScriptRename = nil
-        pendingRecipeUserWorkspace = nil
-        pendingRecipeBaseImageWorkspace = nil
-        pendingRecipeCommandWorkspace = workspace
-        workspaceRenameName = """
-        RUN apt-get update \\
-            && apt-get install -y --no-install-recommends package-name \\
-            && rm -rf /var/lib/apt/lists/*
-        """
-        workspacePanelMessage = ""
-        focusEditorInput(selectAll: true)
-        updateLayout()
-    }
-
-    private func showDockerfileEditor(for workspace: LocalWorkspaceRecord) {
-        beginContainerConfigurationEditor(for: workspace)
         updateLayout()
     }
 
@@ -18225,15 +17397,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         isShowingWorkspacePanel = true
         isCreatingWorkspace = false
         pendingWorkspaceRename = nil
-        pendingRecipeCommandWorkspace = nil
         pendingDockerfileWorkspace = nil
-        pendingRecipeBaseImageWorkspace = nil
-        pendingRecipeUserWorkspace = nil
-        pendingRecipeEditWorkspace = nil
-        pendingRecipeEditStep = nil
-        pendingRecipeScriptWorkspace = nil
-        pendingRecipeScriptUserID = nil
-        pendingRecipeScriptRename = nil
         pendingDockerfileWorkspace = workspace
         containerConfigurationTab = .dockerfile
         codingAgentScope = nil
@@ -18777,54 +17941,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         )
     }
 
-    private func openDockerfileInTextEditor(for workspace: LocalWorkspaceRecord) {
-        guard let recipe = workspace.recipe else { return }
-        let endpoint = plaintextEndpoint(for: "user") ?? plaintextEndpoint(for: "system")
-        guard let endpoint,
-              let url = plaintextURL(for: endpoint, filePath: recipe.dockerfileHostPath) else {
-            backendError = "Install Plaintext to edit this Dockerfile in a separate tab."
-            updateLayout()
-            return
-        }
-        outerframeHost.openNewTab(with: url, displayString: "\(workspace.name) Dockerfile")
-    }
-
-    private func showRecipeBaseImagePrompt(for workspace: LocalWorkspaceRecord) {
-        editorInputController.resetUndoHistory()
-        guard let recipe = workspace.recipe else { return }
-        workspaceNamePromptDismissesPanel = true
-        isShowingWorkspacePanel = true
-        isCreatingWorkspace = false
-        pendingWorkspaceRename = nil
-        pendingRecipeCommandWorkspace = nil
-        pendingDockerfileWorkspace = nil
-        pendingRecipeUserWorkspace = nil
-        pendingRecipeEditWorkspace = nil
-        pendingRecipeEditStep = nil
-        pendingRecipeScriptWorkspace = nil
-        pendingRecipeScriptUserID = nil
-        pendingRecipeScriptRename = nil
-        pendingRecipeBaseImageWorkspace = workspace
-        let defaultBaseImage = outerShellBaseImage(for: workspace.runtime?.providerID)
-        if recipe.baseImage == defaultBaseImage {
-            baseImageTemplate = .outerShell
-            creationBaseImage = "debian:bookworm"
-        } else {
-            baseImageTemplate = recipe.installsOuterShellSupport
-                ? .customWithSupport
-                : .customAsIs
-            creationBaseImage = recipe.baseImage
-        }
-        workspaceRenameName = creationBaseImage
-        workspacePanelMessage = ""
-        if baseImageTemplate == .outerShell {
-            blurEditorInput()
-        } else {
-            focusEditorInput(selectAll: true)
-        }
-        updateLayout()
-    }
-
     private func outerShellBaseImage(for providerID: String? = nil) -> String {
         let selectedProviderID = providerID ?? selectedSafeSpaceProviderID
         return availableSafeSpaceProviders.first(where: {
@@ -18836,123 +17952,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         baseImageTemplate == .outerShell ? outerShellBaseImage() : creationBaseImage
     }
 
-    private func showRecipeUserPrompt(for workspace: LocalWorkspaceRecord) {
-        editorInputController.resetUndoHistory()
-        workspaceNamePromptDismissesPanel = true
-        isShowingWorkspacePanel = true
-        isCreatingWorkspace = false
-        pendingWorkspaceRename = nil
-        pendingRecipeCommandWorkspace = nil
-        pendingDockerfileWorkspace = nil
-        pendingRecipeBaseImageWorkspace = nil
-        pendingRecipeEditWorkspace = nil
-        pendingRecipeEditStep = nil
-        pendingRecipeScriptWorkspace = nil
-        pendingRecipeScriptUserID = nil
-        pendingRecipeScriptRename = nil
-        pendingRecipeUserWorkspace = workspace
-        workspaceRenameName = ""
-        workspacePanelMessage = ""
-        focusEditorInput()
-        updateLayout()
-    }
-
-    private func showRecipeFragmentEditor(
-        for workspace: LocalWorkspaceRecord,
-        step: LocalWorkspaceRecord.Recipe.Step
-    ) {
-        editorInputController.resetUndoHistory()
-        guard step.isEditable else { return }
-        workspaceNamePromptDismissesPanel = true
-        isShowingWorkspacePanel = true
-        isCreatingWorkspace = false
-        pendingWorkspaceRename = nil
-        pendingRecipeCommandWorkspace = nil
-        pendingDockerfileWorkspace = nil
-        pendingRecipeBaseImageWorkspace = nil
-        pendingRecipeUserWorkspace = nil
-        pendingRecipeEditWorkspace = workspace
-        pendingRecipeEditStep = step
-        pendingRecipeScriptWorkspace = nil
-        pendingRecipeScriptUserID = nil
-        pendingRecipeScriptRename = nil
-        workspaceRenameName = step.dockerfileFragment
-        workspacePanelMessage = ""
-        focusEditorInput()
-        updateLayout()
-    }
-
-    private func showRecipeScriptCreationPrompt(
-        for workspace: LocalWorkspaceRecord,
-        userID: UUID?
-    ) {
-        editorInputController.resetUndoHistory()
-        workspaceNamePromptDismissesPanel = true
-        isShowingWorkspacePanel = true
-        isCreatingWorkspace = false
-        pendingWorkspaceRename = nil
-        pendingRecipeCommandWorkspace = nil
-        pendingDockerfileWorkspace = nil
-        pendingRecipeBaseImageWorkspace = nil
-        pendingRecipeUserWorkspace = nil
-        pendingRecipeEditWorkspace = nil
-        pendingRecipeEditStep = nil
-        pendingRecipeScriptWorkspace = nil
-        pendingRecipeScriptUserID = nil
-        pendingRecipeScriptRename = nil
-        pendingRecipeScriptWorkspace = workspace
-        pendingRecipeScriptUserID = userID
-        pendingRecipeScriptRename = nil
-        workspaceRenameName = nextRecipeScriptName(
-            in: workspace.recipe?.scriptFiles ?? [],
-            userID: userID
-        )
-        workspacePanelMessage = ""
-        focusEditorInput(selectAll: true)
-        updateLayout()
-    }
-
-    private func showRecipeScriptRenamePrompt(
-        for workspace: LocalWorkspaceRecord,
-        script: LocalWorkspaceRecord.Recipe.ScriptFile
-    ) {
-        editorInputController.resetUndoHistory()
-        showRecipeScriptCreationPrompt(
-            for: workspace,
-            userID: UUID(uuidString: script.userID)
-        )
-        pendingRecipeScriptRename = script
-        workspaceRenameName = script.fileName
-        focusEditorInput(selectAll: true)
-        updateLayout()
-    }
-
-    private func nextRecipeScriptName(
-        in scripts: [LocalWorkspaceRecord.Recipe.ScriptFile],
-        userID: UUID?
-    ) -> String {
-        let matching = scripts.filter { script in
-            userID.map { $0.uuidString == script.userID } ?? script.userID.isEmpty
-        }
-        let prefixes = matching.compactMap { script -> Int? in
-            let prefix = script.fileName.prefix { $0.isNumber }
-            return Int(prefix)
-        }
-        let next = ((prefixes.max() ?? 0) / 10 + 1) * 10
-        return String(format: "%03d-setup.sh", max(next, 10))
-    }
-
-    private func editRecipeScript(_ script: LocalWorkspaceRecord.Recipe.ScriptFile) {
-        let endpoint = plaintextEndpoint(for: "user") ?? plaintextEndpoint(for: "system")
-        guard let endpoint,
-              let url = plaintextURL(for: endpoint, filePath: script.hostPath) else {
-            backendError = "Install Plaintext to edit setup scripts outside the container."
-            updateLayout()
-            return
-        }
-        outerframeHost.openNewTab(with: url, displayString: script.fileName)
-    }
-
     private func showWorkspaceRename(_ workspace: LocalWorkspaceRecord) {
         editorInputController.resetUndoHistory()
         isAddingWindowsContainerFolder = false
@@ -18960,10 +17959,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         isCreatingWorkspace = false
         workspaceNamePromptDismissesPanel = false
         pendingWorkspaceRename = workspace
-        pendingRecipeBaseImageWorkspace = nil
-        pendingRecipeScriptWorkspace = nil
-        pendingRecipeScriptUserID = nil
-        pendingRecipeScriptRename = nil
         workspaceRenameName = workspace.name
         workspacePanelMessage = ""
         focusEditorInput(selectAll: true)
@@ -19086,15 +18081,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         let dismissesPanel = workspaceNamePromptDismissesPanel
         blurEditorInput()
         pendingWorkspaceRename = nil
-        pendingRecipeCommandWorkspace = nil
         pendingDockerfileWorkspace = nil
-        pendingRecipeBaseImageWorkspace = nil
-        pendingRecipeUserWorkspace = nil
-        pendingRecipeEditWorkspace = nil
-        pendingRecipeEditStep = nil
-        pendingRecipeScriptWorkspace = nil
-        pendingRecipeScriptUserID = nil
-        pendingRecipeScriptRename = nil
         isCreatingWorkspace = false
         workspaceNamePromptDismissesPanel = false
         workspaceRenameName = ""
@@ -19151,16 +18138,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 workspacePanelMessage = "Enter a name for the container."
             } else if pendingDockerfileWorkspace != nil {
                 workspacePanelMessage = "The Dockerfile cannot be empty."
-            } else if pendingRecipeCommandWorkspace != nil {
-                workspacePanelMessage = "Enter a Dockerfile fragment."
-            } else if pendingRecipeBaseImageWorkspace != nil {
-                workspacePanelMessage = "Enter an OCI base-image reference."
-            } else if pendingRecipeUserWorkspace != nil {
-                workspacePanelMessage = "Enter a Linux username."
-            } else if pendingRecipeScriptWorkspace != nil {
-                workspacePanelMessage = "Enter a setup-script filename."
-            } else if pendingRecipeEditStep != nil {
-                workspacePanelMessage = "A Dockerfile fragment cannot be empty."
             } else {
                 workspacePanelMessage = "Enter a name for the container."
             }
@@ -19204,14 +18181,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         }
         let workspace = pendingWorkspaceRename
         let dockerfileWorkspace = pendingDockerfileWorkspace
-        let recipeWorkspace = pendingRecipeCommandWorkspace
-        let recipeBaseImageWorkspace = pendingRecipeBaseImageWorkspace
-        let recipeUserWorkspace = pendingRecipeUserWorkspace
-        let recipeEditWorkspace = pendingRecipeEditWorkspace
-        let recipeEditStep = pendingRecipeEditStep
-        let recipeScriptWorkspace = pendingRecipeScriptWorkspace
-        let recipeScriptUserID = pendingRecipeScriptUserID
-        let recipeScriptRename = pendingRecipeScriptRename
         let createsWorkspace = isCreatingWorkspace
         let dismissesPanel = workspaceNamePromptDismissesPanel
         let renamesContainerConfiguration = isRenamingContainerConfiguration
@@ -19220,14 +18189,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         if !renamesContainerConfiguration {
             pendingDockerfileWorkspace = nil
         }
-        pendingRecipeCommandWorkspace = nil
-        pendingRecipeBaseImageWorkspace = nil
-        pendingRecipeUserWorkspace = nil
-        pendingRecipeEditWorkspace = nil
-        pendingRecipeEditStep = nil
-        pendingRecipeScriptWorkspace = nil
-        pendingRecipeScriptUserID = nil
-        pendingRecipeScriptRename = nil
         isCreatingWorkspace = false
         workspaceNamePromptDismissesPanel = false
         workspaceRenameName = ""
@@ -19246,38 +18207,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                  workspaceID: dockerfileWorkspace.id,
                                  command: submittedText,
                                  dockerfile: submittedText)
-        } else if let recipeWorkspace {
-            sendWorkspaceRequest(operation: "addRecipeStep",
-                                 workspaceID: recipeWorkspace.id,
-                                 command: name)
-        } else if let recipeBaseImageWorkspace {
-            sendWorkspaceRequest(operation: "updateRecipeBaseImage",
-                                 workspaceID: recipeBaseImageWorkspace.id,
-                                 baseImage: baseImageTemplate == .outerShell
-                                    ? outerShellBaseImage(
-                                        for: recipeBaseImageWorkspace.runtime?.providerID
-                                    )
-                                    : name,
-                                 installsOuterShellSupport: baseImageTemplate == .customWithSupport)
-        } else if let recipeUserWorkspace {
-            sendWorkspaceRequest(operation: "addRecipeUser",
-                                 workspaceID: recipeUserWorkspace.id,
-                                 name: name)
-        } else if let recipeEditWorkspace, let recipeEditStep {
-            sendWorkspaceRequest(operation: "updateRecipeStep",
-                                 workspaceID: recipeEditWorkspace.id,
-                                 recipeStepID: recipeEditStep.id,
-                                 command: name)
-        } else if let recipeScriptWorkspace, let recipeScriptRename {
-            sendWorkspaceRequest(operation: "renameRecipeScript",
-                                 workspaceID: recipeScriptWorkspace.id,
-                                 name: name,
-                                 recipeScriptPath: recipeScriptRename.relativePath)
-        } else if let recipeScriptWorkspace {
-            sendWorkspaceRequest(operation: "createRecipeScript",
-                                 workspaceID: recipeScriptWorkspace.id,
-                                 name: name,
-                                 recipeUserID: recipeScriptUserID)
         } else if createsWorkspace {
             sendWorkspaceRequest(operation: "create",
                                  name: name,
@@ -19543,7 +18472,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         }
         let panelWidth = pendingSharedContainerImport != nil
                 ? min(max(width - 72, 460), 680)
-                : (isDockerfileFragmentPrompt
+                : (isDockerfilePrompt
                 ? min(max(width - 72, 520), 760)
                 : min(max(width - 72, 320), 460))
         let panelHeight = pendingSharedContainerImport != nil
@@ -19551,7 +18480,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                     CGFloat(224 + min(pendingSharedContainerImport?.mounts.count ?? 0, 5) * 50),
                     max(height - 72, 274)
                 )
-                : (isDockerfileFragmentPrompt
+                : (isDockerfilePrompt
                 ? min(max(height - 72, 360), 600)
                 : CGFloat(showsDeletePrompt
                     ? 184
@@ -21122,21 +20051,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             title.string = "Copy Mounted Folders"
         } else if isCreatingWorkspace && isEditingCreationBaseImage {
             title.string = "Choose Base Image"
-        } else if pendingRecipeBaseImageWorkspace != nil {
-            title.string = "Change Base Image"
-        } else if pendingRecipeUserWorkspace != nil {
-            title.string = "Add Container User"
-        } else if pendingRecipeScriptRename != nil {
-            title.string = "Rename Setup Script"
-        } else if pendingRecipeScriptWorkspace != nil {
-            title.string = "Add Setup Script"
         } else if pendingDockerfileWorkspace != nil &&
                     !isRenamingContainerConfiguration {
             title.string = "Edit Dockerfile"
-        } else if pendingRecipeEditStep != nil {
-            title.string = "Edit Dockerfile Fragment"
-        } else if pendingRecipeCommandWorkspace != nil {
-            title.string = "Add Dockerfile Fragment"
         } else {
             title.string = pendingEndpointRename != nil ? "Rename endpoint" : pendingMountPathEdit != nil ? (pendingMountPathEdit?.field == "host" ? (serverSSHCommand == nil ? "On this computer" : "On server") : "In container") : isAddingWindowsContainerFolder ? "Mount Windows Folder" : isCreatingWorkspace ? "Add Container" : "Rename Container"
         }
@@ -21162,18 +20079,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             detail.string = "Choose a new name for \(workspace.name)."
         } else if let workspace = pendingDockerfileWorkspace {
             detail.string = "Edit \(workspace.name)'s complete Dockerfile. This file is the container's source of truth."
-        } else if let workspace = pendingRecipeEditWorkspace {
-            detail.string = "Edit this fragment of \(workspace.name)'s Dockerfile."
-        } else if let workspace = pendingRecipeCommandWorkspace {
-            detail.string = "Add editable Dockerfile instructions to \(workspace.name)."
-        } else if let workspace = pendingRecipeBaseImageWorkspace {
-            detail.string = "Choose the image in \(workspace.name)'s FROM instruction. The resulting Dockerfile stays explicit."
-        } else if let workspace = pendingRecipeUserWorkspace {
-            detail.string = "Create a Linux user and a private setup-script folder in \(workspace.name)."
-        } else if pendingRecipeScriptRename != nil {
-            detail.string = "Rename this mounted script. Its alphabetical position controls when it runs."
-        } else if pendingRecipeScriptWorkspace != nil {
-            detail.string = "Add a mounted .sh file. It can be edited inside the container or with Plaintext outside it."
         } else if isCreatingWorkspace {
             if let provider = availableSafeSpaceProviders.first(where: {
                 $0.id == selectedSafeSpaceProviderID
@@ -21249,7 +20154,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                         ? 80
                                         : (showsCreationOptions ? 162 : 62),
                                      width: promptWidth - 36,
-                                     height: isDockerfileFragmentPrompt
+                                     height: isDockerfilePrompt
                                         ? max(promptHeight - 142, 160)
                                         : 32)
         let field = CALayer()
@@ -21467,7 +20372,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                           height: max(editorInputFieldFrame.height - 14, 18))
         }
 
-        if isDockerfileFragmentPrompt {
+        if isDockerfilePrompt {
             editorInputController.visualLineWidth = editorInputTextFrame.width
         }
 
@@ -21476,7 +20381,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             : (editorInputController.isFocused
                 ? editorInputController.text
                 : workspaceRenameName)
-        if isDockerfileFragmentPrompt {
+        if isDockerfilePrompt {
             let layout = CreateFieldLayout(fieldFrame: editorInputFieldFrame,
                                            textFrame: editorInputTextFrame,
                                            key: "dockerfileFragment",
@@ -21546,17 +20451,14 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             field.addSublayer(selectionLayer)
         }
 
-        if !isDockerfileFragmentPrompt {
+        if !isDockerfilePrompt {
             let value = makeTextLayer(size: 13, weight: .regular, color: .textColor)
             value.string = text.isEmpty
                 ? (pendingSharedContainerImport != nil
                     ? "/path/on/this/server"
-                    : (pendingRecipeBaseImageWorkspace != nil ||
-                       (isCreatingWorkspace && isEditingCreationBaseImage)
+                    : (isCreatingWorkspace && isEditingCreationBaseImage
                         ? "debian:bookworm"
-                    : (pendingRecipeUserWorkspace != nil
-                        ? "Linux username"
-                        : "Container name")))
+                        : "Container name"))
                 : text
             value.foregroundColor = resolvedCGColor(
                 text.isEmpty ? .placeholderTextColor : .textColor
@@ -21582,17 +20484,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 ? "Import"
                 : (isCreatingWorkspace && isEditingCreationBaseImage
                 ? "Done"
-                : (pendingRecipeBaseImageWorkspace != nil
-                    ? "Use Image"
-                : (pendingRecipeUserWorkspace != nil
-                    ? "Add User"
-                : (pendingRecipeScriptWorkspace != nil
-                    ? (pendingRecipeScriptRename == nil ? "Add" : "Rename")
-                : (isDockerfileFragmentPrompt
-                    ? (pendingDockerfileWorkspace != nil || pendingRecipeEditStep != nil
-                        ? "Save"
-                        : "Add")
-                    : (pendingMountPathEdit != nil ? "Save" : isCreatingWorkspace ? "Create" : "Rename")))))),
+                : (isDockerfilePrompt
+                    ? "Save"
+                    : (pendingMountPathEdit != nil ? "Save" : isCreatingWorkspace ? "Create" : "Rename"))),
             emphasized: true
         )
         let localConfirmFrame = CGRect(x: promptWidth - 96, y: 18, width: 78, height: 30)
@@ -21964,63 +20858,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         showManagementPanel(id: menuID, title: "Container: \(workspace.name)", detail: "\(workspace.runtimeDescription) · \(displayedState.capitalized)", items: items)
     }
 
-    private func showRecipeStepRemovalMenu(
-        workspaceID: UUID,
-        step: LocalWorkspaceRecord.Recipe.Step,
-        at point: CGPoint
-    ) {
-        let menuID = UUID()
-        pendingRecipeStepMenuSelections[menuID] = (
-            workspaceID,
-            step.id,
-            ["remove": false, "remove-rebuild": true]
-        )
-        let items = [
-            OuterframeContextMenuItem(
-                id: "remove",
-                title: "Remove from Recipe",
-                isEnabled: !isPerformingWorkspaceOperation,
-                systemImageName: "minus.circle"
-            ),
-            OuterframeContextMenuItem(
-                id: "remove-rebuild",
-                title: "Remove and Rebuild Container",
-                isEnabled: !isPerformingWorkspaceOperation,
-                systemImageName: "arrow.triangle.2.circlepath"
-            )
-        ]
-        outerframeHost.showContextMenu(menuID: menuID, items: items, at: point)
-    }
-
-    private func showSafeSpaceAddAppMenu(for workspace: LocalWorkspaceRecord,
-                                         at point: CGPoint) {
-        guard let catalog = workspace.recipe?.catalog else { return }
-        let menuID = UUID()
-        var actions: [String: String] = [:]
-        var items: [OuterframeContextMenuItem] = []
-
-        let availableCatalogItems = catalog.filter { !$0.isInstalled }
-        if !availableCatalogItems.isEmpty {
-            items.append(OuterframeContextMenuItem(
-                id: "software-heading",
-                title: "Install an App",
-                isEnabled: false
-            ))
-            for item in availableCatalogItems {
-                let itemID = "install-\(item.id)"
-                actions[itemID] = "installCatalog:\(item.id)"
-                items.append(OuterframeContextMenuItem(
-                    id: itemID,
-                    title: item.displayName,
-                    isEnabled: !isPerformingWorkspaceOperation,
-                    systemImageName: "shippingbox"
-                ))
-            }
-        }
-        pendingSafeSpaceAppMenuSelections[menuID] = (workspace, actions)
-        outerframeHost.showContextMenu(menuID: menuID, items: items, at: point)
-    }
-
     private func showAppActionsMenu(for item: AppLauncherItem, at point: CGPoint) {
         if item.backend.isBackendsSelf {
             showBackendActionsMenu(for: item.backend, at: point)
@@ -22301,26 +21138,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 ? "Copied the path on the server."
                 : "Copied the path inside the container."
             updateLayout()
-            return
-        }
-        if let selection = pendingSafeSpaceAppMenuSelections.removeValue(forKey: menuID),
-           let kind = selection.kindByItemID[itemID] {
-            let catalogPrefix = "installCatalog:"
-            if kind.hasPrefix(catalogPrefix) {
-                sendWorkspaceRequest(
-                    operation: "installRecipeCatalogItem",
-                    workspaceID: selection.workspace.id,
-                    catalogItemID: String(kind.dropFirst(catalogPrefix.count))
-                )
-            }
-            return
-        }
-        if let selection = pendingRecipeStepMenuSelections.removeValue(forKey: menuID),
-           let rebuild = selection.rebuildByItemID[itemID] {
-            sendWorkspaceRequest(operation: "deleteRecipeStep",
-                                 workspaceID: selection.workspaceID,
-                                 recipeStepID: selection.stepID,
-                                 rebuild: rebuild)
             return
         }
         if let providers = pendingSafeSpaceProviderMenuSelections.removeValue(forKey: menuID),

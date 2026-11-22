@@ -76,7 +76,6 @@ private let outerShellRegistryContainerOwnedFlag: UInt32 = 0x01
 
 private let currentSafeSpaceRecipeVersion = 14
 private let rootContainerBaseImage = "outershell/container-base:17"
-private let bundledAppOCIImageVersion = "4"
 private let containerTransferMagic = Data([0x4f, 0x53, 0x43, 0x54])
 private let containerTransferVersion: UInt16 = 1
 private let containerTransferRead: UInt16 = 1
@@ -130,12 +129,8 @@ private struct SafeSpaceRecipe: Codable {
     var realizedBaseImage: String?
     var installsOuterShellSupport: Bool?
     var realizedInstallsOuterShellSupport: Bool?
-    var steps: [SafeSpaceRecipeStep]
-    var realizedStepIDs: [UUID]
     var hasUntrackedChanges: Bool?
     var mounts: [SafeSpaceMount]?
-    var realizedEditableStepContents: [String: String]?
-    var users: [SafeSpaceRecipeUser]?
     var realizedDockerfileContents: String?
     var environment: [SafeSpaceEnvironmentVariable]?
     var realizedMounts: [SafeSpaceMount]?
@@ -155,13 +150,6 @@ private struct SafeSpaceEnvironmentVariable: Codable, Equatable {
 private struct SafeSpacePublishedPort: Codable, Equatable {
     var hostPort: Int
     var containerPort: Int
-}
-
-private struct SafeSpaceRecipeUser: Codable, Equatable {
-    var id: UUID
-    var name: String
-    var homeDirectory: String
-    var workingDirectory: String
 }
 
 private struct SafeSpaceMount: Codable, Equatable {
@@ -187,42 +175,6 @@ private struct SafeSpaceTransferManifest: Codable {
     var includesPersistentData: Bool
     var includedMounts: [SafeSpaceMount]
     var omittedMounts: [SafeSpaceMount]
-}
-
-private struct SafeSpaceRecipeStep: Codable, Equatable {
-    var id: UUID
-    var command: String
-    var createdAt: Date
-    var catalogItemID: String?
-    var displayName: String?
-    var dockerfileFragment: String?
-    var isEditable: Bool?
-}
-
-private struct SafeSpaceRecipeCatalogItem {
-    enum Kind: String {
-        case bundledApp
-    }
-
-    let id: String
-    let displayName: String
-    let summary: String
-    let kind: Kind
-    let serviceID: String
-    let command: String
-    let liveCommand: String?
-    let dockerfileFragment: String?
-    let isEditable: Bool
-    let ociImageReference: String?
-    let ociImageBuildCommand: String?
-}
-
-private struct SafeSpaceEditableRecipeStep {
-    let relativePath: String
-    let scope: String
-    let user: SafeSpaceRecipeUser?
-    let fileName: String
-    let contents: String
 }
 
 private struct SafeSpaceCachedApp: Codable {
@@ -1030,7 +982,6 @@ final class SafeSpaceManager: @unchecked Sendable {
 
     private func configurationMounts(for record: SafeSpaceRecord,
                                      recipe: SafeSpaceRecipe) throws -> [[String: Any]] {
-        let base = try safeSpaceDirectory(record.id)
         var mounts: [[String: Any]] = [[
             "id": UUID(uuid: (0, 0, 0, 0, 0, 0, 0x40, 0, 0x80, 0, 0, 0, 0, 0, 0, 2)).uuidString,
             "name": "Container project",
@@ -1040,17 +991,6 @@ final class SafeSpaceManager: @unchecked Sendable {
             "isInfrastructure": true,
             "isRecipeMount": true
         ]]
-        for user in recipe.users ?? [] where user.name == "workspace" {
-            mounts.append([
-                "id": UUID(uuid: (0, 0, 0, 0, 0, 0, 0x40, 0, 0x80, 0, 0, 0, 0, 0, 0, 1)).uuidString,
-                "name": "Workspace",
-                "hostPath": base.appendingPathComponent("Workspace").path,
-                "guestPath": user.workingDirectory,
-                "isReadOnly": false,
-                "isInfrastructure": true,
-                "isRecipeMount": false
-            ])
-        }
         mounts.append(contentsOf: (recipe.mounts ?? []).map {
             [
                 "id": $0.id.uuidString,
@@ -1675,8 +1615,6 @@ final class SafeSpaceManager: @unchecked Sendable {
         var duplicatedRecipe = try recipe(for: source)
         duplicatedRecipe.realizedBaseImage = nil
         duplicatedRecipe.realizedInstallsOuterShellSupport = nil
-        duplicatedRecipe.realizedStepIDs = []
-        duplicatedRecipe.realizedEditableStepContents = nil
         duplicatedRecipe.realizedDockerfileContents = nil
         duplicatedRecipe.realizedMounts = nil
         duplicatedRecipe.realizedEnvironment = nil
@@ -2390,7 +2328,6 @@ final class SafeSpaceManager: @unchecked Sendable {
     private func createAppleContainer(_ record: SafeSpaceRecord,
                                       imageReference: String) throws {
         try createManagedDirectories(for: record)
-        let base = try safeSpaceDirectory(record.id)
         let recipe = try recipe(for: record)
         var arguments = [
             "create",
@@ -2401,14 +2338,6 @@ final class SafeSpaceManager: @unchecked Sendable {
             "--label", "org.outershell.container-id=\(record.id.uuidString)",
             "--volume", "\(try recipeDirectory(record.id).path):/var/lib/outershell/project"
         ]
-        for user in recipe.users ?? [] {
-            if user.name == "workspace" {
-                try createLegacyWorkspaceDirectory(for: record)
-                arguments.append(contentsOf: [
-                    "--volume", "\(base.appendingPathComponent("Workspace").path):\(user.workingDirectory)"
-                ])
-            }
-        }
         for mount in recipe.mounts ?? [] {
             let suffix = mount.isReadOnly ? ":ro" : ""
             arguments.append(contentsOf: [
@@ -2421,9 +2350,6 @@ final class SafeSpaceManager: @unchecked Sendable {
         )
         var occupiedGuestPaths: Set<String> = ["/var/lib/outershell/project"]
         occupiedGuestPaths.formUnion((recipe.mounts ?? []).map(\.guestPath))
-        occupiedGuestPaths.formUnion((recipe.users ?? []).compactMap { user in
-            user.name == "workspace" ? user.workingDirectory : nil
-        })
         for item in persistentData where !occupiedGuestPaths.contains(item.guestPath) {
             try preparePersistentVolume(record, item: item)
             arguments.append(contentsOf: [
@@ -2450,7 +2376,6 @@ final class SafeSpaceManager: @unchecked Sendable {
     private func createDockerContainer(_ record: SafeSpaceRecord,
                                        imageReference: String) throws {
         try createManagedDirectories(for: record)
-        let base = try safeSpaceDirectory(record.id)
         let recipe = try recipe(for: record)
         var arguments = [
             "create",
@@ -2461,12 +2386,6 @@ final class SafeSpaceManager: @unchecked Sendable {
             "--label", "org.outershell.container-id=\(record.id.uuidString)",
             "--volume", "\(try recipeDirectory(record.id).path):/var/lib/outershell/project"
         ]
-        for user in recipe.users ?? [] where user.name == "workspace" {
-            try createLegacyWorkspaceDirectory(for: record)
-            arguments.append(contentsOf: [
-                "--volume", "\(base.appendingPathComponent("Workspace").path):\(user.workingDirectory)"
-            ])
-        }
         for mount in recipe.mounts ?? [] {
             arguments.append(contentsOf: [
                 "--volume", "\(mount.hostPath):\(mount.guestPath)\(mount.isReadOnly ? ":ro" : "")"
@@ -2478,9 +2397,6 @@ final class SafeSpaceManager: @unchecked Sendable {
         )
         var occupiedGuestPaths: Set<String> = ["/var/lib/outershell/project"]
         occupiedGuestPaths.formUnion((recipe.mounts ?? []).map(\.guestPath))
-        occupiedGuestPaths.formUnion((recipe.users ?? []).compactMap {
-            $0.name == "workspace" ? $0.workingDirectory : nil
-        })
         for item in persistentData where !occupiedGuestPaths.contains(item.guestPath) {
             try preparePersistentVolume(record, item: item)
             arguments.append(contentsOf: [
@@ -3113,7 +3029,7 @@ final class SafeSpaceManager: @unchecked Sendable {
                            atomically: true,
                            encoding: .utf8)
         try saveRecipe(try recipe(for: selected), for: selected)
-        return ["recipeCommandOutput": "", "recipeCommandApplied": false]
+        return [:]
     }
 
     private func updateContainerConfiguration(
@@ -3145,7 +3061,7 @@ final class SafeSpaceManager: @unchecked Sendable {
         value.environment = environment
         value.publishedPorts = publishedPorts
         try saveRecipe(value, for: selected)
-        return ["recipeCommandOutput": "", "recipeCommandApplied": false]
+        return [:]
     }
 
     private func updateResources(_ request: [String: Any]) throws -> [String: Any] {
@@ -3382,12 +3298,7 @@ final class SafeSpaceManager: @unchecked Sendable {
             for: selected.id
         )
         try markRecipeRealized(for: selected)
-        return [
-            "recipeCommandOutput": result.stdout.trimmingCharacters(
-                in: .whitespacesAndNewlines
-            ),
-            "recipeCommandApplied": true
-        ]
+        return [:]
     }
 
     private func removeRuntimeContainerForReplacement(_ record: SafeSpaceRecord) throws {
@@ -4266,34 +4177,15 @@ final class SafeSpaceManager: @unchecked Sendable {
         )
     }
 
-    private var legacyWorkspaceRecipeUser: SafeSpaceRecipeUser {
-        SafeSpaceRecipeUser(
-            id: UUID(uuid: (0, 0, 0, 0, 0, 0, 0x40, 0, 0x80, 0, 0, 0, 0, 0, 1, 1)),
-            name: "workspace",
-            homeDirectory: "/home/workspace",
-            workingDirectory: "/home/workspace/Workspace"
-        )
-    }
-
     private func recipe(for record: SafeSpaceRecord) throws -> SafeSpaceRecipe {
         recipeFileLock.lock()
         defer { recipeFileLock.unlock() }
         if let data = try RegistryResourceStore.data(for: recipeResourceKey(record.id)) {
             var value = try OffsetArchive.decode(SafeSpaceRecipe.self, from: data)
-            let storedVersion = value.version
             var needsSave = false
             if value.version < currentSafeSpaceRecipeVersion {
                 value.version = currentSafeSpaceRecipeVersion
                 value.realizedDockerfileContents = nil
-                needsSave = true
-            }
-            if value.users == nil {
-                value.users = storedVersion < 11
-                    ? [legacyWorkspaceRecipeUser]
-                    : []
-                if value.users?.contains(where: { $0.name == "workspace" }) == true {
-                    try createLegacyWorkspaceDirectory(for: record)
-                }
                 needsSave = true
             }
             if FileManager.default.fileExists(atPath: try dockerfileURL(record.id).path),
@@ -4327,12 +4219,8 @@ final class SafeSpaceManager: @unchecked Sendable {
                         realizedBaseImage: nil,
                         installsOuterShellSupport: installsOuterShellSupport,
                         realizedInstallsOuterShellSupport: nil,
-                        steps: [],
-                        realizedStepIDs: [],
                         hasUntrackedChanges: hasUntrackedChanges,
                         mounts: [],
-                        realizedEditableStepContents: [:],
-                        users: [],
                         realizedDockerfileContents: nil,
                         environment: [],
                         realizedMounts: nil,
@@ -4351,18 +4239,14 @@ final class SafeSpaceManager: @unchecked Sendable {
         try FileManager.default.createDirectory(at: directory,
                                                 withIntermediateDirectories: true,
                                                 attributes: [.posixPermissions: 0o700])
-        try createEditableRecipeStepDirectories(
-            in: directory,
-            users: normalizedValue.users ?? []
-        )
         try RegistryResourceStore.set(
             OffsetArchive.encode(normalizedValue),
             for: recipeResourceKey(record.id)
         )
-        try writeRecipeBuildContext(normalizedValue, to: directory)
+        try writeOuterShellBootstrap(to: directory, isRequired: true)
         let dockerfile = try dockerfileURL(record.id)
         if !FileManager.default.fileExists(atPath: dockerfile.path) {
-            try generatedDockerfile(for: normalizedValue, record: record).write(
+            try generatedDockerfile(for: normalizedValue).write(
                 to: dockerfile,
                 atomically: true,
                 encoding: .utf8
@@ -4376,7 +4260,6 @@ final class SafeSpaceManager: @unchecked Sendable {
     }
 
     private func normalizedRecipe(_ value: SafeSpaceRecipe) -> SafeSpaceRecipe {
-        let catalog = Dictionary(uniqueKeysWithValues: recipeCatalog().map { ($0.id, $0) })
         var result = value
         if result.baseImage.hasPrefix("outershell/container-base:") {
             result.baseImage = rootContainerBaseImage
@@ -4385,11 +4268,6 @@ final class SafeSpaceManager: @unchecked Sendable {
             result.installsOuterShellSupport = false
         } else if result.installsOuterShellSupport == nil {
             result.installsOuterShellSupport = true
-        }
-        if result.users == nil {
-            result.users = value.version < currentSafeSpaceRecipeVersion
-                ? [legacyWorkspaceRecipeUser]
-                : []
         }
         if result.environment == nil {
             result.environment = []
@@ -4400,23 +4278,6 @@ final class SafeSpaceManager: @unchecked Sendable {
         if result.publishedPorts == nil {
             result.publishedPorts = []
         }
-        var changedStepIDs = Set<UUID>()
-        result.steps = value.steps.map { step in
-            guard let catalogItemID = step.catalogItemID,
-                  let item = catalog[catalogItemID] else {
-                return step
-            }
-            var normalizedStep = step
-            normalizedStep.command = item.command
-            normalizedStep.displayName = "Install \(item.displayName)"
-            normalizedStep.dockerfileFragment = item.dockerfileFragment
-            normalizedStep.isEditable = item.isEditable
-            if normalizedStep != step {
-                changedStepIDs.insert(step.id)
-            }
-            return normalizedStep
-        }
-        result.realizedStepIDs.removeAll { changedStepIDs.contains($0) }
         return result
     }
 
@@ -4425,11 +4286,6 @@ final class SafeSpaceManager: @unchecked Sendable {
         value.version = currentSafeSpaceRecipeVersion
         value.realizedBaseImage = value.baseImage
         value.realizedInstallsOuterShellSupport = value.installsOuterShellSupport
-        value.realizedStepIDs = value.steps.map(\.id)
-        value.realizedEditableStepContents = try editableRecipeStepContents(
-            for: record,
-            users: value.users ?? []
-        )
         value.realizedDockerfileContents = try dockerfileContents(for: record)
         value.realizedMounts = value.mounts ?? []
         value.realizedEnvironment = value.environment ?? []
@@ -4442,11 +4298,6 @@ final class SafeSpaceManager: @unchecked Sendable {
 
     private func recipeDictionary(for record: SafeSpaceRecord) throws -> [String: Any] {
         let value = normalizedRecipe(try recipe(for: record))
-        let realizedIDs = Set(value.realizedStepIDs)
-        let editableSteps = try editableRecipeSteps(
-            for: record,
-            users: value.users ?? []
-        )
         let dockerfile = try dockerfileContents(for: record)
         let needsRebuild = value.version != currentSafeSpaceRecipeVersion ||
             value.realizedDockerfileContents != dockerfile ||
@@ -4458,72 +4309,6 @@ final class SafeSpaceManager: @unchecked Sendable {
         return [
             "baseImage": value.baseImage,
             "installsOuterShellSupport": value.installsOuterShellSupport ?? false,
-            "outerShellSupportSnippet": outerShellSupportSnippet(),
-            "steps": value.steps.enumerated().map { index, step in
-                [
-                    "id": step.id.uuidString,
-                    "command": step.command,
-                    "createdAt": step.createdAt.timeIntervalSince1970,
-                    "isApplied": realizedIDs.contains(step.id),
-                    "catalogItemID": step.catalogItemID ?? "",
-                    "displayName": step.displayName ?? "",
-                    "dockerfileFragment": dockerfileFragment(for: step, index: index),
-                    "isEditable": step.isEditable ?? false
-                ]
-            },
-            "catalog": recipeCatalog().map { item in
-                [
-                    "id": item.id,
-                    "displayName": item.displayName,
-                    "summary": item.summary,
-                    "kind": item.kind.rawValue,
-                    "serviceID": item.serviceID,
-                    "isInstalled": item.dockerfileFragment.map {
-                        dockerfile.contains(
-                            $0.trimmingCharacters(in: .whitespacesAndNewlines)
-                        )
-                    } ?? false
-                ]
-            },
-            "users": [[
-                "id": "root",
-                "name": "root",
-                "homeDirectory": "/root",
-                "workingDirectory": "/",
-                "isRoot": true
-            ]] + (value.users ?? []).map {
-                [
-                    "id": $0.id.uuidString,
-                    "name": $0.name,
-                    "homeDirectory": $0.homeDirectory,
-                    "workingDirectory": $0.workingDirectory,
-                    "isRoot": false
-                ] as [String: Any]
-            },
-            "scriptFiles": try editableSteps.map { step in
-                let hostDirectory: URL
-                let guestPath: String
-                let userID: String
-                if let user = step.user {
-                    hostDirectory = try userRecipeStepDirectory(for: record, user: user)
-                    guestPath = "/var/lib/outershell/recipe/users/\(user.name)/steps/\(step.fileName)"
-                    userID = user.id.uuidString
-                } else {
-                    hostDirectory = try rootRecipeStepDirectory(for: record)
-                    guestPath = "/var/lib/outershell/recipe/root/\(step.fileName)"
-                    userID = ""
-                }
-                return [
-                    "relativePath": step.relativePath,
-                    "scope": step.scope,
-                    "userID": userID,
-                    "fileName": step.fileName,
-                    "hostPath": hostDirectory.appendingPathComponent(step.fileName).path,
-                    "guestPath": guestPath,
-                    "isApplied": (value.realizedEditableStepContents ?? [:])[step.relativePath] == step.contents
-                ] as [String: Any]
-            },
-            "fragments": try dockerfileFragmentDictionaries(for: value, record: record),
             "containerfile": dockerfile,
             "dockerfileHostPath": try dockerfileURL(record.id).path,
             "dockerfileGuestPath": "/var/lib/outershell/project/Dockerfile",
@@ -4534,7 +4319,6 @@ final class SafeSpaceManager: @unchecked Sendable {
             "transferItems": transferItems(for: record, recipe: value),
             "needsRebuild": needsRebuild,
             "hasUntrackedChanges": value.hasUntrackedChanges ?? true,
-            "workingDirectory": value.users?.first?.workingDirectory ?? "/",
             "environment": (value.environment ?? []).map {
                 ["name": $0.name, "value": $0.value]
             },
@@ -4546,7 +4330,7 @@ final class SafeSpaceManager: @unchecked Sendable {
 
     private func transferItems(for record: SafeSpaceRecord,
                                recipe value: SafeSpaceRecipe) -> [[String: Any]] {
-        var items = [
+        return [
             [
                 "name": "Container definition",
                 "detail": "Dockerfile and its build-context files",
@@ -4568,207 +4352,10 @@ final class SafeSpaceManager: @unchecked Sendable {
                 "status": "Rebuild or push to a registry"
             ]
         ]
-        if value.users?.contains(where: { $0.name == "workspace" }) == true {
-            let workspacePath = (try? safeSpaceDirectory(record.id)
-                .appendingPathComponent("Workspace", isDirectory: true).path) ?? ""
-            items.insert([
-                "name": "Workspace files",
-                "detail": workspacePath,
-                "status": "Transfer separately"
-            ], at: 1)
-        }
-        return items
     }
 
-    private func recipeCatalog() -> [SafeSpaceRecipeCatalogItem] {
-        return [
-            ("files", "Files", "Browse and manage files in this container.",
-             "org.outershell.Files", "Files", "FilesBackend"),
-            ("plaintext", "Plaintext", "Read and edit text files.",
-             "org.outershell.Plaintext", "Plaintext", "PlaintextBackend"),
-            ("top", "Top", "Inspect processes running in this container.",
-             "org.outershell.Top", "Top", "TopBackend"),
-            ("profile", "Profile", "Profile programs running in this container.",
-             "org.outershell.Profile", "Profile", "ProfileBackend"),
-            ("firehose", "Firehose", "Inspect streaming system activity.",
-             "org.outershell.Firehose", "Firehose", "FirehoseBackend")
-        ].map { id, displayName, summary, serviceID, archiveName, binaryName in
-            let installCommand = bundledAppRecipeCommand(
-                displayName: displayName,
-                serviceID: serviceID,
-                archiveName: archiveName,
-                binaryName: binaryName
-            )
-            let imageReference = "ghcr.io/outergroup/outershell-app-\(id):\(bundledAppOCIImageVersion)"
-            return SafeSpaceRecipeCatalogItem(
-                id: "outershell.\(id)",
-                displayName: displayName,
-                summary: summary,
-                kind: .bundledApp,
-                serviceID: serviceID,
-                command: "",
-                liveCommand: recipeAppLiveCommand(
-                    command: installCommand,
-                    registrationID: serviceID
-                ),
-                dockerfileFragment: "COPY --from=\(imageReference) /outershell-rootfs/ /",
-                isEditable: false,
-                ociImageReference: imageReference,
-                ociImageBuildCommand: installCommand
-            )
-        }
-    }
-
-    private func recipeAppLiveCommand(command: String,
-                                      registrationID: String) -> String {
-        """
-        \(recipeAppBootstrapCommand())
-        \(command)
-        \(recipeAppActivationCommand(registrationID: registrationID))
-        """
-    }
-
-    private func recipeAppBootstrapCommand() -> String {
-        """
-        /bin/mkdir -p /etc/outershell/apps.d
-        /bin/mkdir -p /var/lib/outershell/services /var/lib/outershell/apps
-        /bin/mkdir -p /root/.cache
-        """
-    }
-
-    private func recipeAppActivationCommand(registrationID: String) -> String {
-        """
-        if [ -S /run/user/0/outershelld-api ]; then
-            /bin/sh /etc/outershell/apps.d/\(registrationID).sh
-        fi
-        """
-    }
-
-    private func recipeAppRegistrationCommand(displayName: String,
-                                              serviceID: String,
-                                              socketPath: String,
-                                              iconPath: String?) -> String {
-        let iconOption = iconPath.map {
-            " \\" + "\n            --icon-path \($0)"
-        } ?? ""
-        return """
-        #!/bin/sh
-        set -eu
-        export HOME=/root
-        export USER=root
-        export LOGNAME=root
-        export XDG_RUNTIME_DIR=/run/user/0
-        export OUTERSHELLD_API_SOCKET=/run/user/0/outershelld-api
-        outerctl=/usr/local/bin/outerctl
-        service=/var/lib/outershell/services/\(serviceID).outerservice
-        log=/var/lib/outershell/apps/\(serviceID)/backend.log
-        "${outerctl}" backend upsert \
-            --backend \(serviceID) \
-            --name "\(displayName)" \
-            --service-file "${service}" \
-            --outershell-owns true
-        "${outerctl}" app upsert \
-            --backend \(serviceID) \
-            --frontend-id \(serviceID):main \
-            --socket-path \(socketPath) \
-            --name "\(displayName)" \
-            --url /\(iconOption)
-        "${outerctl}" log add \
-            --backend \(serviceID) \
-            --path "${log}"
-        """
-    }
-
-    private func bundledAppRecipeCommand(displayName: String,
-                                         serviceID: String,
-                                         archiveName: String,
-                                         binaryName: String) -> String {
-        let registrationID = serviceID
-        let appDirectory = "/var/lib/outershell/apps/\(serviceID)"
-        let serviceFile = "/var/lib/outershell/services/\(serviceID).outerservice"
-        var registration = recipeAppRegistrationCommand(
-            displayName: displayName,
-            serviceID: serviceID,
-            socketPath: "/run/user/0/\(serviceID)",
-            iconPath: "\(appDirectory)/app-icon.png"
-        )
-        if serviceID == "org.outershell.Plaintext" {
-            registration += """
-
-            "${outerctl}" opener upsert \
-                --backend org.outershell.Plaintext \
-                --content-type public.text \
-                --url-template '?file={file}' \
-                --rank 0 \
-                --capabilities view,edit
-            """
-        }
-        return """
-        set -eu
-        export DEBIAN_FRONTEND=noninteractive
-        /usr/bin/apt-get update
-        /usr/bin/apt-get install -y --no-install-recommends ca-certificates curl
-        case "$(/usr/bin/uname -m)" in
-            aarch64|arm64) platform=linux-aarch64 ; architecture=aarch64 ;;
-            x86_64|amd64) platform=linux-x86_64 ; architecture=x86_64 ;;
-            *) /usr/bin/printf 'Unsupported architecture.\n' >&2; exit 1 ;;
-        esac
-        archive=/tmp/\(archiveName).tar.gz
-        /usr/bin/curl --fail --location --retry 4 --retry-delay 2 \
-            --output "${archive}" \
-            "https://outershell.org/outer-shell/dev/apps/\(archiveName)/${platform}.tar.gz"
-        /bin/rm -rf \(appDirectory)
-        /bin/mkdir -p \(appDirectory) "$(/usr/bin/dirname \(serviceFile))"
-        /bin/tar -xzf "${archive}" --strip-components=1 -C \(appDirectory)
-        /bin/chmod 0755 \(appDirectory)/RemoteLinuxBinaries/${architecture}/\(binaryName)
-        /usr/bin/touch \(appDirectory)/backend.log
-        /bin/cat >\(serviceFile) <<OUTERSHELL_SERVICE
-        [Service]
-        Format=1
-        Name=\(displayName)
-        Executable=\(appDirectory)/RemoteLinuxBinaries/${architecture}/\(binaryName)
-        Argument=--label
-        Argument=\(serviceID)
-        Argument=--socket-path
-        Argument=/run/user/0/\(serviceID)
-        Argument=--bundles-dir
-        Argument=\(appDirectory)/bundles
-        Argument=--icon-file
-        Argument=\(appDirectory)/app-icon.png
-        WorkingDirectory=\(appDirectory)
-        Environment=HOME=/root
-        Environment=USER=root
-        Environment=LOGNAME=root
-        Environment=OUTERSHELL_SERVICE_STATE_DIR=\(appDirectory)
-        Environment=OUTERSHELLD_API_SOCKET=/run/user/0/outershelld-api
-        EnvironmentPolicy=clean
-        Start=socket
-        Restart=on-failure
-        LogPath=\(appDirectory)/backend.log
-
-        [Socket.http]
-        Type=unix
-        Path=/run/user/0/\(serviceID)
-        Mode=0600
-        Backlog=64
-        OUTERSHELL_SERVICE
-        /bin/cat >/etc/outershell/apps.d/\(registrationID).sh <<'OUTERSHELL_REGISTRATION'
-        \(registration)
-        OUTERSHELL_REGISTRATION
-        /bin/chmod 0755 /etc/outershell/apps.d/\(registrationID).sh
-        /bin/rm -f "${archive}"
-        /bin/rm -rf /var/lib/apt/lists/*
-        """
-    }
-
-    private func generatedDockerfile(for value: SafeSpaceRecipe,
-                                     record: SafeSpaceRecord) throws -> String {
+    private func generatedDockerfile(for value: SafeSpaceRecipe) -> String {
         let value = normalizedRecipe(value)
-        let hasManagedOuterShellSupport = usesManagedOuterShellSupport(value)
-        let editableSteps = try editableRecipeSteps(
-            for: record,
-            users: value.users ?? []
-        )
         var lines = [
             "# syntax=docker/dockerfile:1",
             "FROM \(value.baseImage)"
@@ -4777,225 +4364,12 @@ final class SafeSpaceManager: @unchecked Sendable {
             lines.append("")
             lines.append(contentsOf: outerShellBootstrapInstructions())
         }
-        let hasGeneratedRecipeContent = !value.steps.isEmpty ||
-            !editableSteps.isEmpty ||
-            !(value.users ?? []).isEmpty
-        if hasManagedOuterShellSupport || hasGeneratedRecipeContent {
-            lines.append(contentsOf: [
-                "USER root",
-                "WORKDIR /"
-            ])
-        }
-        if !editableSteps.isEmpty || !(value.users ?? []).isEmpty {
-            lines.append("RUN /usr/bin/install -d -m 0700 -o root -g root /var/lib/outershell/recipe && /usr/bin/install -d -m 0700 -o root -g root /var/lib/outershell/recipe/root")
-        }
-        for (index, step) in value.steps.enumerated() {
-            if let fragment = step.dockerfileFragment?.trimmingCharacters(
-                in: .whitespacesAndNewlines
-            ), !fragment.isEmpty {
-                lines.append("")
-                lines.append(fragment)
-                if step.catalogItemID != nil,
-                   !step.command.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    lines.append(contentsOf: recipeStepInstructions(
-                        fileName: recipeStepFileName(index: index, step: step)
-                    ))
-                }
-            } else {
-                lines.append(contentsOf: recipeStepInstructions(
-                    fileName: recipeStepFileName(index: index, step: step)
-                ))
-            }
-        }
-        for step in editableSteps where step.scope == "root" {
-            lines.append(contentsOf: editableRecipeStepInstructions(step))
-        }
-        for user in value.users ?? [] {
-            let userRoot = "/var/lib/outershell/recipe/users/\(user.name)"
-            lines.append(contentsOf: [
-                "",
-                "USER root",
-                "RUN /usr/bin/id -u \(user.name) >/dev/null 2>&1 || /usr/sbin/useradd --create-home --user-group --shell /bin/bash \(user.name)",
-                "RUN /usr/bin/install -d -m 0700 -o \(user.name) -g \(user.name) \(userRoot) && /usr/bin/install -d -m 0700 -o \(user.name) -g \(user.name) \(userRoot)/steps",
-                "ENV HOME=\(user.homeDirectory) USER=\(user.name) LOGNAME=\(user.name)",
-                "USER \(user.name)",
-                "WORKDIR \(user.workingDirectory)"
-            ])
-            for step in editableSteps where step.user?.id == user.id {
-                lines.append(contentsOf: editableRecipeStepInstructions(step))
-            }
-        }
-        if hasManagedOuterShellSupport {
+        if usesManagedOuterShellSupport(value) {
             lines.append("")
             lines.append(contentsOf: outerShellRuntimeInstructions())
         }
         lines.append("")
         return lines.joined(separator: "\n")
-    }
-
-    private func dockerfileFragment(for step: SafeSpaceRecipeStep,
-                                    index: Int) -> String {
-        if let fragment = step.dockerfileFragment?.trimmingCharacters(
-            in: .whitespacesAndNewlines
-        ), !fragment.isEmpty {
-            return fragment
-        }
-        return recipeStepInstructions(
-            fileName: recipeStepFileName(index: index, step: step)
-        ).joined(separator: "\n")
-    }
-
-    private func dockerfileFragmentDictionaries(
-        for value: SafeSpaceRecipe,
-        record: SafeSpaceRecord
-    ) throws -> [[String: Any]] {
-        var fragments: [[String: Any]] = [[
-            "id": "header",
-            "stepID": "",
-            "displayName": "Base image",
-            "contents": [
-                "# syntax=docker/dockerfile:1",
-                "FROM \(value.baseImage)"
-            ].joined(separator: "\n"),
-            "isEditable": true,
-            "isRemovable": false,
-            "isApplied": value.realizedBaseImage == value.baseImage
-        ]]
-        if value.installsOuterShellSupport == true {
-            fragments.append([
-                "id": "outershell-bootstrap",
-                "stepID": "",
-                "displayName": "Install Outer Shell support",
-                "contents": outerShellBootstrapInstructions().joined(separator: "\n"),
-                "isEditable": false,
-                "isRemovable": false,
-                "isApplied": value.realizedInstallsOuterShellSupport == true
-            ])
-        }
-        let hasManagedOuterShellSupport = usesManagedOuterShellSupport(value)
-        if hasManagedOuterShellSupport || !value.steps.isEmpty ||
-            !(value.users ?? []).isEmpty {
-            fragments.append([
-                "id": "root-environment",
-                "stepID": "",
-                "displayName": "Root environment",
-                "contents": [
-                    "USER root",
-                    "WORKDIR /"
-                ].joined(separator: "\n"),
-                "isEditable": false,
-                "isRemovable": false,
-                "isApplied": true
-            ])
-        }
-        let realizedIDs = Set(value.realizedStepIDs)
-        for (index, step) in value.steps.enumerated() {
-            let rawFragment = step.dockerfileFragment?.trimmingCharacters(
-                in: .whitespacesAndNewlines
-            )
-            fragments.append([
-                "id": step.id.uuidString,
-                "stepID": step.id.uuidString,
-                "displayName": step.displayName ?? "Dockerfile fragment",
-                "contents": dockerfileFragment(for: step, index: index),
-                "isEditable": step.isEditable ?? false,
-                "isRemovable": true,
-                "isApplied": realizedIDs.contains(step.id)
-            ])
-            if rawFragment?.isEmpty == false,
-               step.catalogItemID != nil,
-               !step.command.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                fragments.append([
-                    "id": "\(step.id.uuidString)-integration",
-                    "stepID": "",
-                    "displayName": "Connect \(step.displayName ?? "app") to Outer Shell",
-                    "contents": recipeStepInstructions(
-                        fileName: recipeStepFileName(index: index, step: step)
-                    ).joined(separator: "\n"),
-                    "isEditable": false,
-                    "isRemovable": false,
-                    "isApplied": realizedIDs.contains(step.id)
-                ])
-            }
-        }
-        let editableSteps = try editableRecipeSteps(
-            for: record,
-            users: value.users ?? []
-        )
-        let realizedContents = value.realizedEditableStepContents ?? [:]
-        for step in editableSteps where step.scope == "root" {
-            fragments.append([
-                "id": "recipe-file-\(step.relativePath)",
-                "stepID": "",
-                "displayName": "Root setup · \(step.fileName)",
-                "contents": editableRecipeStepInstructions(step).joined(separator: "\n"),
-                "isEditable": false,
-                "isRemovable": false,
-                "isApplied": realizedContents[step.relativePath] == step.contents
-            ])
-        }
-        for user in value.users ?? [] {
-            let userRoot = "/var/lib/outershell/recipe/users/\(user.name)"
-            fragments.append([
-                "id": "user-\(user.id.uuidString)",
-                "stepID": "",
-                "displayName": "User · \(user.name)",
-                "contents": [
-                    "USER root",
-                    "RUN /usr/bin/id -u \(user.name) >/dev/null 2>&1 || /usr/sbin/useradd --create-home --user-group --shell /bin/bash \(user.name)",
-                    "RUN /usr/bin/install -d -m 0700 -o \(user.name) -g \(user.name) \(userRoot) && /usr/bin/install -d -m 0700 -o \(user.name) -g \(user.name) \(userRoot)/steps",
-                    "ENV HOME=\(user.homeDirectory) USER=\(user.name) LOGNAME=\(user.name)",
-                    "USER \(user.name)",
-                    "WORKDIR \(user.workingDirectory)"
-                ].joined(separator: "\n"),
-                "isEditable": false,
-                "isRemovable": false,
-                "isApplied": true
-            ])
-            for step in editableSteps where step.user?.id == user.id {
-                fragments.append([
-                    "id": "recipe-file-\(step.relativePath)",
-                    "stepID": "",
-                    "displayName": "\(user.name) setup · \(step.fileName)",
-                    "contents": editableRecipeStepInstructions(step).joined(separator: "\n"),
-                    "isEditable": false,
-                    "isRemovable": false,
-                    "isApplied": realizedContents[step.relativePath] == step.contents
-                ])
-            }
-        }
-        if hasManagedOuterShellSupport {
-            fragments.append([
-                "id": "footer",
-                "stepID": "",
-                "displayName": "Container default · root",
-                "contents": outerShellRuntimeInstructions().joined(separator: "\n"),
-                "isEditable": false,
-                "isRemovable": false,
-                "isApplied": true
-            ])
-        }
-        return fragments
-    }
-
-    private func recipeStepFileName(index: Int,
-                                    step: SafeSpaceRecipeStep) -> String {
-        let name = step.displayName ?? "Run command"
-        let slug = name.lowercased()
-            .components(separatedBy: CharacterSet.alphanumerics.inverted)
-            .filter { !$0.isEmpty }
-            .joined(separator: "-")
-        return String(format: "%03d-%@.sh", index + 1,
-                      slug.isEmpty ? "run-command" : slug)
-    }
-
-    private func recipeStepInstructions(fileName: String) -> [String] {
-        let source = "managed-steps/\(fileName)"
-        let destination = "/tmp/outershell-recipe/\(fileName)"
-        return [
-            "COPY --chmod=0755 \(source) \(destination)",
-            "RUN \(destination) && rm -f \(destination)"
-        ]
     }
 
     private func usesBuiltInOuterShellImage(_ image: String) -> Bool {
@@ -5021,122 +4395,6 @@ final class SafeSpaceManager: @unchecked Sendable {
             "WORKDIR /root",
             "CMD [\"/usr/local/bin/outershell-container-init\"]"
         ]
-    }
-
-    private func outerShellSupportSnippet() -> String {
-        (outerShellBootstrapInstructions() + [""] + outerShellRuntimeInstructions())
-            .joined(separator: "\n")
-    }
-
-    private func editableRecipeStepInstructions(
-        _ step: SafeSpaceEditableRecipeStep
-    ) -> [String] {
-        if let user = step.user {
-            let source = "steps/users/\(user.name)/\(step.fileName)"
-            let destination = "/var/lib/outershell/recipe/users/\(user.name)/steps/\(step.fileName)"
-            return [
-                "COPY --chown=\(user.name):\(user.name) --chmod=0755 \(source) \(destination)",
-                "RUN \(destination)"
-            ]
-        }
-        let source = "steps/root/\(step.fileName)"
-        let destination = "/var/lib/outershell/recipe/root/\(step.fileName)"
-        return [
-            "COPY --chmod=0755 \(source) \(destination)",
-            "RUN \(destination)"
-        ]
-    }
-
-    private func editableRecipeSteps(
-        for record: SafeSpaceRecord,
-        users: [SafeSpaceRecipeUser]
-    ) throws -> [SafeSpaceEditableRecipeStep] {
-        try createEditableRecipeStepDirectories(
-            in: recipeDirectory(record.id),
-            users: users
-        )
-        var values: [SafeSpaceEditableRecipeStep] = []
-        var identities: [(scope: String, user: SafeSpaceRecipeUser?, directory: URL)] = [
-            ("root", nil, try rootRecipeStepDirectory(for: record))
-        ]
-        for user in users {
-            identities.append((
-                "user:\(user.name)",
-                user,
-                try userRecipeStepDirectory(for: record, user: user)
-            ))
-        }
-        for identity in identities {
-            let urls = try FileManager.default.contentsOfDirectory(
-                at: identity.directory,
-                includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey],
-                options: [.skipsHiddenFiles]
-            ).sorted { $0.lastPathComponent < $1.lastPathComponent }
-            for url in urls where url.pathExtension == "sh" {
-                let name = url.lastPathComponent
-                guard name.unicodeScalars.allSatisfy({
-                    CharacterSet.alphanumerics.contains($0) || "._-".unicodeScalars.contains($0)
-                }) else {
-                    throw SafeSpaceManagerError.commandFailed(
-                        "Recipe step names may contain only letters, numbers, dots, hyphens, and underscores."
-                    )
-                }
-                let resources = try url.resourceValues(
-                    forKeys: [.isRegularFileKey, .isSymbolicLinkKey]
-                )
-                guard resources.isRegularFile == true,
-                      resources.isSymbolicLink != true else {
-                    throw SafeSpaceManagerError.commandFailed(
-                        "Recipe steps must be regular shell-script files."
-                    )
-                }
-                values.append(SafeSpaceEditableRecipeStep(
-                    relativePath: "\(identity.scope)/\(name)",
-                    scope: identity.scope,
-                    user: identity.user,
-                    fileName: name,
-                    contents: try String(contentsOf: url, encoding: .utf8)
-                ))
-            }
-        }
-        return values
-    }
-
-    private func editableRecipeStepContents(
-        for record: SafeSpaceRecord,
-        users: [SafeSpaceRecipeUser]
-    ) throws -> [String: String] {
-        Dictionary(uniqueKeysWithValues: try editableRecipeSteps(
-            for: record,
-            users: users
-        ).map {
-            ($0.relativePath, $0.contents)
-        })
-    }
-
-    private func writeRecipeBuildContext(_ value: SafeSpaceRecipe,
-                                         to directory: URL) throws {
-        try writeOuterShellBootstrap(to: directory, isRequired: true)
-        let legacyAssets = directory.appendingPathComponent("assets", isDirectory: true)
-        if FileManager.default.fileExists(atPath: legacyAssets.path) {
-            try FileManager.default.removeItem(at: legacyAssets)
-        }
-        let stepsDirectory = directory.appendingPathComponent("managed-steps", isDirectory: true)
-        if FileManager.default.fileExists(atPath: stepsDirectory.path) {
-            try FileManager.default.removeItem(at: stepsDirectory)
-        }
-        try FileManager.default.createDirectory(at: stepsDirectory,
-                                                withIntermediateDirectories: true,
-                                                attributes: [.posixPermissions: 0o700])
-        for (index, step) in value.steps.enumerated() {
-            if step.dockerfileFragment == nil ||
-                (step.catalogItemID != nil &&
-                 !step.command.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty) {
-                try writeRecipeScript(step.command,
-                                      named: recipeStepFileName(index: index, step: step),
-                                      to: stepsDirectory)
-            }
-        }
     }
 
     private func writeOuterShellBootstrap(to directory: URL,
@@ -5188,8 +4446,6 @@ final class SafeSpaceManager: @unchecked Sendable {
         ```
 
         The `FROM` instruction is your chosen base image. For a custom image, Outer Shell can use `.outershell/bootstrap` to install the small service-management tools that let apps announce themselves. You can omit that step when the base image already provides compatible Outer Shell support.
-
-        Bundled Outer Shell apps are ordinary OCI image inputs. Their Dockerfile fragments use `COPY --from` to copy the app's `/outershell-rootfs` overlay into this image. Outer Shell pulls those source images when they are available and can prepare the same tagged images locally from its bundled app releases.
 
         Outer Shell treats `Dockerfile` as the source of truth. The same project directory is mounted at `/var/lib/outershell/project` while the container runs, so a root process in the container can edit the Dockerfile and its build-context files directly. Rebuilding recreates the image from those files.
 
@@ -5296,22 +4552,6 @@ final class SafeSpaceManager: @unchecked Sendable {
         """
     }
 
-    private func writeRecipeScript(_ command: String,
-                                   named fileName: String,
-                                   to directory: URL) throws {
-        let contents = """
-        #!/bin/sh
-        set -eu
-        cd /
-        \(command)
-
-        """
-        let url = directory.appendingPathComponent(fileName)
-        try contents.write(to: url, atomically: true, encoding: .utf8)
-        try FileManager.default.setAttributes([.posixPermissions: 0o700],
-                                              ofItemAtPath: url.path)
-    }
-
     private func recipeDirectory(_ id: UUID) throws -> URL {
         try safeSpaceDirectory(id).appendingPathComponent("Recipe", isDirectory: true)
     }
@@ -5333,80 +4573,6 @@ final class SafeSpaceManager: @unchecked Sendable {
             }
         }
         return nil
-    }
-
-    private func appendDockerfileInstructions(_ instructions: String,
-                                              for record: SafeSpaceRecord) throws {
-        let addition = instructions.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !addition.isEmpty else { return }
-        var contents = try dockerfileContents(for: record)
-        if !contents.hasSuffix("\n") {
-            contents += "\n"
-        }
-        contents += "\n\(addition)\n"
-        try contents.write(to: dockerfileURL(record.id),
-                           atomically: true,
-                           encoding: .utf8)
-    }
-
-    private func rootRecipeStepDirectory(for record: SafeSpaceRecord) throws -> URL {
-        return try recipeDirectory(record.id)
-            .appendingPathComponent("steps", isDirectory: true)
-            .appendingPathComponent("root", isDirectory: true)
-    }
-
-    private func userRecipeStepDirectory(for record: SafeSpaceRecord,
-                                         user: SafeSpaceRecipeUser) throws -> URL {
-        try recipeDirectory(record.id)
-            .appendingPathComponent("steps", isDirectory: true)
-            .appendingPathComponent("users", isDirectory: true)
-            .appendingPathComponent(user.name, isDirectory: true)
-    }
-
-    private func createEditableRecipeStepDirectories(
-        in recipeDirectory: URL,
-        users: [SafeSpaceRecipeUser]
-    ) throws {
-        let root = recipeDirectory.appendingPathComponent("steps", isDirectory: true)
-        try FileManager.default.createDirectory(at: root,
-                                                withIntermediateDirectories: true,
-                                                attributes: [.posixPermissions: 0o700])
-        try FileManager.default.createDirectory(
-            at: root.appendingPathComponent("root", isDirectory: true),
-            withIntermediateDirectories: true,
-            attributes: [.posixPermissions: 0o700]
-        )
-        let userRoot = root.appendingPathComponent("users", isDirectory: true)
-        try FileManager.default.createDirectory(at: userRoot,
-                                                withIntermediateDirectories: true,
-                                                attributes: [.posixPermissions: 0o700])
-        for user in users {
-            let destination = userRoot.appendingPathComponent(user.name, isDirectory: true)
-            try FileManager.default.createDirectory(
-                at: destination,
-                withIntermediateDirectories: true,
-                attributes: [.posixPermissions: 0o700]
-            )
-            if user.name == "workspace" {
-                try migrateLegacyWorkspaceSteps(
-                    from: root.appendingPathComponent("workspace", isDirectory: true),
-                    to: destination
-                )
-            }
-        }
-    }
-
-    private func migrateLegacyWorkspaceSteps(from source: URL, to destination: URL) throws {
-        guard FileManager.default.fileExists(atPath: source.path) else { return }
-        for sourceFile in try FileManager.default.contentsOfDirectory(
-            at: source,
-            includingPropertiesForKeys: [.isRegularFileKey],
-            options: [.skipsHiddenFiles]
-        ) where sourceFile.pathExtension == "sh" {
-            let destinationFile = destination.appendingPathComponent(sourceFile.lastPathComponent)
-            guard !FileManager.default.fileExists(atPath: destinationFile.path) else { continue }
-            try FileManager.default.copyItem(at: sourceFile, to: destinationFile)
-        }
     }
 
     private func recipeResourceKey(_ id: UUID) -> String {
@@ -5512,15 +4678,6 @@ final class SafeSpaceManager: @unchecked Sendable {
         }
     }
 
-    private func createLegacyWorkspaceDirectory(for record: SafeSpaceRecord) throws {
-        try FileManager.default.createDirectory(
-            at: try safeSpaceDirectory(record.id)
-                .appendingPathComponent("Workspace", isDirectory: true),
-            withIntermediateDirectories: true,
-            attributes: [.posixPermissions: 0o700]
-        )
-    }
-
     private func applicationDirectory() throws -> URL {
         let base = try FileManager.default.url(for: .applicationSupportDirectory,
                                                in: .userDomainMask,
@@ -5546,14 +4703,6 @@ final class SafeSpaceManager: @unchecked Sendable {
         try applicationDirectory()
             .appendingPathComponent("Containers", isDirectory: true)
             .appendingPathComponent(id.uuidString.lowercased(), isDirectory: true)
-    }
-
-    private func legacyDirectory() throws -> URL {
-        try FileManager.default.url(for: .applicationSupportDirectory,
-                                    in: .userDomainMask,
-                                    appropriateFor: nil,
-                                    create: false)
-            .appendingPathComponent("Outer Loop/Workspaces", isDirectory: true)
     }
 
     private func publishedSocketPath(_ id: UUID, socketPath: String) throws -> String {
@@ -6153,11 +5302,6 @@ final class SafeSpaceManager: @unchecked Sendable {
                 for: runtimeProvider(for: record)
             )
         }
-        try prepareBundledAppOCIImages(
-            for: record,
-            recipe: value,
-            dockerfile: try dockerfileContents(for: record)
-        )
         try saveRecipe(value, for: record)
         let directory = try recipeDirectory(record.id)
         updateBuildProgressPhase(
@@ -6230,101 +5374,6 @@ final class SafeSpaceManager: @unchecked Sendable {
             }
         }
         return found ? context : nil
-    }
-
-    private func prepareBundledAppOCIImages(
-        for record: SafeSpaceRecord,
-        recipe: SafeSpaceRecipe,
-        dockerfile: String
-    ) throws {
-        let catalogItems = recipeCatalog()
-        var requiredItemIDs = Set(recipe.steps.compactMap(\.catalogItemID))
-        for item in catalogItems {
-            guard let imageReference = item.ociImageReference,
-                  dockerfile.contains(imageReference) else {
-                continue
-            }
-            requiredItemIDs.insert(item.id)
-        }
-        let requiredItems = catalogItems.filter {
-            requiredItemIDs.contains($0.id) &&
-                $0.kind == .bundledApp &&
-                $0.ociImageReference != nil
-        }
-        guard !requiredItems.isEmpty else { return }
-
-        var availableImages = try containerImageReferences(
-            provider: runtimeProvider(for: record)
-        )
-        for item in requiredItems {
-            guard let imageReference = item.ociImageReference,
-                  !availableImages.contains(imageReference) else {
-                continue
-            }
-            let pull = try runRuntime(record, ["image", "pull", imageReference])
-            if pull.status != 0 {
-                try buildBundledAppOCIImage(item, for: record)
-            }
-            availableImages.insert(imageReference)
-        }
-    }
-
-    private func buildBundledAppOCIImage(_ item: SafeSpaceRecipeCatalogItem,
-                                         for record: SafeSpaceRecord) throws {
-        guard let imageReference = item.ociImageReference,
-              let installCommand = item.ociImageBuildCommand else {
-            throw SafeSpaceManagerError.commandFailed(
-                "The \(item.displayName) OCI app image is not configured."
-            )
-        }
-        let directory = FileManager.default.temporaryDirectory
-            .appendingPathComponent("outershell-app-image-\(UUID().uuidString)",
-                                    isDirectory: true)
-        try FileManager.default.createDirectory(at: directory,
-                                                withIntermediateDirectories: true,
-                                                attributes: [.posixPermissions: 0o700])
-        defer { try? FileManager.default.removeItem(at: directory) }
-
-        try "#!/bin/sh\n\(recipeAppBootstrapCommand())\n\(installCommand)\n".write(
-            to: directory.appendingPathComponent("install.sh"),
-            atomically: true,
-            encoding: .utf8
-        )
-        var installerInstructions = [
-            "FROM debian:bookworm AS installer",
-            "COPY --chmod=0755 install.sh /tmp/outershell-install-app.sh",
-            "RUN /tmp/outershell-install-app.sh && rm -f /tmp/outershell-install-app.sh",
-            "FROM scratch"
-        ]
-        for path in bundledAppOCIPayloadPaths(item) {
-            installerInstructions.append(
-                "COPY --from=installer \(path) /outershell-rootfs\(path)"
-            )
-        }
-        let dockerfile = (["# syntax=docker/dockerfile:1"] + installerInstructions)
-            .joined(separator: "\n") + "\n"
-        let dockerfileURL = directory.appendingPathComponent("Dockerfile")
-        try dockerfile.write(to: dockerfileURL,
-                             atomically: true,
-                             encoding: .utf8)
-        let result = try runRuntime(record, [
-            "build",
-            "--file", dockerfileURL.path,
-            "--tag", imageReference,
-            "--progress", "plain",
-            directory.path
-        ])
-        try requireSuccess(result, action: "prepare the \(item.displayName) OCI app image")
-    }
-
-    private func bundledAppOCIPayloadPaths(
-        _ item: SafeSpaceRecipeCatalogItem
-    ) -> [String] {
-        [
-            "/var/lib/outershell/apps/\(item.serviceID)",
-            "/var/lib/outershell/services/\(item.serviceID).outerservice",
-            "/etc/outershell/apps.d/\(item.serviceID).sh"
-        ]
     }
 
     private func cpuArchitecture() -> String {

@@ -540,15 +540,16 @@ Local Windows drive paths are supported for mounts; UNC paths are not. Native
 Mac clients enter Windows server paths inline rather than opening a remote folder
 picker. Mounts are applied on rebuild, not dynamically. Terminal launcher
 discovery remains separate from this integration. Custom images can use
-the same `outerctl image add-app` and OCI app payload contract documented in
+the same `outerctl image add-app` contract documented in
 `Docs/ContainerCookbook.md`. Container runtime support should not be confused
 with Windows-kernel containers; these are Linux containers.
 
-For integration coverage, build an image from the prepared base with
-`COPY --from=ghcr.io/outergroup/outershell-app-files:4 /outershell-rootfs/ /`,
-tag it `outershell/windows-test:1`, and run `test-containers.ps1 -Provider docker`
-and `test-containers.ps1 -Provider wsl.container` in an ordinary user session.
-The tests cover native Files content, app/container controls, names, logs, actual
+For integration coverage, run `test-containers.ps1 -Provider docker` and
+`test-containers.ps1 -Provider wsl.container` in an ordinary user session. The
+test builds its container from the provider's default base image, publishes a
+small HTTP server with `outerctl image add-app --tcp-port`, and needs network
+access for `apt-get` during that build. The tests cover named-pipe app
+forwarding, app/container controls, names, logs, actual
 read-only folder access, environment variables, published ports, stable rebuild
 identity, and failed-build recovery. `test_container_sharing.py` runs from a Mac
 or Linux client through the SSH bridge and verifies cross-runtime transfers,

@@ -79,8 +79,8 @@ if ($SystemService) {
 } else {
     $initialization = Start-Process -FilePath $executable -ArgumentList '--initialize' -Wait -PassThru
     if ($initialization.ExitCode) { throw 'Could not initialize the HTTP named-pipe allowlist.' }
-    & $executable --setup-install
-    if ($LASTEXITCODE) { throw 'Could not register the app tasks.' }
+    $setup = Start-Process -FilePath $executable -ArgumentList '--setup-install' -Wait -PassThru
+    if ($setup.ExitCode) { throw 'Could not register the app tasks.' }
     if ($Start) { Start-ScheduledTask -TaskName "OuterShell-$sid" }
 }
 Write-Output "Installed Outer Shell in $destination"

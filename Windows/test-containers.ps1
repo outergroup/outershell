@@ -1,17 +1,16 @@
-param([string]$Image = 'outershell/windows-test:1', [ValidateSet('docker','wsl.container')][string]$Provider = 'wsl.container')
+param([string]$Image = '', [ValidateSet('docker','wsl.container')][string]$Provider = 'wsl.container')
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value.ToLowerInvariant()
 $shellPipe = "org.outershell.outershell.$sid"
 
-function Request([string]$Path, [string]$Body = '', [string]$PipeName = $shellPipe, [switch]$Native) {
+function Request([string]$Path, [string]$Body = '', [string]$PipeName = $shellPipe) {
     $pipe = [IO.Pipes.NamedPipeClientStream]::new('.', $PipeName.Replace('\\.\pipe\', ''), [IO.Pipes.PipeDirection]::InOut, [IO.Pipes.PipeOptions]::Asynchronous)
     try {
         $pipe.Connect(15000)
         $method = if ($Body) { 'POST' } else { 'GET' }
         $data = [Text.Encoding]::UTF8.GetBytes($Body)
-        $accept = if ($Native) { "Outerframe-Accept: application/vnd.outerframe`r`n" } else { '' }
-        $header = [Text.Encoding]::ASCII.GetBytes("$method $Path HTTP/1.1`r`nHost: localhost`r`n${accept}Content-Type: application/json`r`nConnection: close`r`nContent-Length: $($data.Length)`r`n`r`n")
+        $header = [Text.Encoding]::ASCII.GetBytes("$method $Path HTTP/1.1`r`nHost: localhost`r`nContent-Type: application/json`r`nConnection: close`r`nContent-Length: $($data.Length)`r`n`r`n")
         $pipe.Write($header, 0, $header.Length)
         $pipe.Write($data, 0, $data.Length)
         $stream = [IO.MemoryStream]::new()
@@ -25,7 +24,7 @@ function Request([string]$Path, [string]$Body = '', [string]$PipeName = $shellPi
         }
         $text = [Text.Encoding]::UTF8.GetString($stream.ToArray())
         $stream.Dispose()
-        if (!$text.StartsWith('HTTP/1.1 200')) { throw $text }
+        if ($text -notmatch '^HTTP/1\.[01] 200') { throw $text }
         return ($text -split "`r`n`r`n", 2)[1]
     } finally { $pipe.Dispose() }
 }
@@ -36,8 +35,8 @@ function Operation([string]$Operation, [hashtable]$Values) {
     return (Request '/api/containers' ($Values | ConvertTo-Json -Compress) | ConvertFrom-Json)
 }
 
-function Wait-Container([string]$Name, [string]$State) {
-    for ($attempt = 0; $attempt -lt 45; $attempt++) {
+function Wait-Container([string]$Name, [string]$State, [int]$Seconds = 22) {
+    for ($attempt = 0; $attempt -lt $Seconds * 2; $attempt++) {
         $snapshot = Request '/api/container-snapshot' | ConvertFrom-Json
         $container = $snapshot.workspaces | Where-Object name -eq $Name | Select-Object -First 1
         if ($container -and $container.state -eq $State) { return $container }
@@ -46,18 +45,49 @@ function Wait-Container([string]$Name, [string]$State) {
     throw "Container '$Name' did not become $State."
 }
 
+if (!$Image) {
+    $snapshot = Request '/api/container-snapshot' | ConvertFrom-Json
+    $Image = ($snapshot.providers | Where-Object id -eq $Provider | Select-Object -First 1).defaultBaseImage
+    if (!$Image) { throw "The $Provider provider did not report a default base image." }
+}
+$marker = 'outershell-container-test-' + [guid]::NewGuid().ToString('N')
+$testDockerfile = @"
+FROM $Image
+RUN apt-get update && apt-get install -y --no-install-recommends bash curl python3 socat && rm -rf /var/lib/apt/lists/*
+RUN mkdir -p /srv/outershell-test && echo $marker > /srv/outershell-test/index.html
+RUN outerctl image add-app --id outershell-test --name "Container test" --tcp-port 8000 -- /usr/bin/python3 -m http.server 8000 --bind 127.0.0.1 --directory /srv/outershell-test
+"@
+
 $name = "$Provider integration test " + [guid]::NewGuid().ToString('N')
 $id = $null
 try {
-    Operation 'create' @{runtimeProviderID=$Provider; name=$name; baseImage=$Image; cpus=2; memoryInMB=2048} | Out-Null
-    $container = Wait-Container $name 'running'
+    Operation 'create' @{runtimeProviderID=$Provider; name=$name; baseImage=$Image; dockerfile=$testDockerfile; cpus=2; memoryInMB=2048} | Out-Null
+    $container = Wait-Container $name 'running' 600
     $id = $container.id
     if (!$container.ownsContainer -or $container.runtime.providerID -ne $Provider) { throw 'Incorrect ownership/runtime.' }
-    $app = $container.apps | Where-Object serviceID -eq 'org.outershell.Files' | Select-Object -First 1
-    if (!$app) { throw 'The test image must contain the standard Files OCI payload.' }
-    $descriptor = Request '/' '' $app.externalSocketPath -Native
-    if (!$descriptor.StartsWith('OUTR')) { throw 'Files did not return native content.' }
-    Write-Output 'PASS named-pipe forwarding and native Files content'
+    $serviceID = 'org.outershell.image.outershell-test'
+    function Find-TestApp {
+        $snapshot = Request '/api/container-snapshot' | ConvertFrom-Json
+        $current = $snapshot.workspaces | Where-Object id -eq $id | Select-Object -First 1
+        return $current.apps | Where-Object serviceID -eq $serviceID | Select-Object -First 1
+    }
+    $app = $null
+    for ($attempt = 0; $attempt -lt 60 -and !$app; $attempt++) {
+        $app = Find-TestApp
+        if (!$app) { Start-Sleep -Milliseconds 500 }
+    }
+    if (!$app) { throw 'The container did not register the outershell-test app.' }
+    Operation 'startApp' @{workspaceID=$id; serviceID=$serviceID} | Out-Null
+    $page = $null
+    for ($attempt = 0; $attempt -lt 60 -and !$page; $attempt++) {
+        $app = Find-TestApp
+        if ($app.externalSocketPath) {
+            try { $page = Request '/' '' $app.externalSocketPath } catch { $page = $null }
+        }
+        if (!$page) { Start-Sleep -Milliseconds 500 }
+    }
+    if (!$page -or !$page.Contains($marker)) { throw "The test app did not return its marker page: $page" }
+    Write-Output 'PASS named-pipe forwarding to an outerctl image add-app server'
     foreach ($verb in @('stopApp', 'startApp', 'restartApp')) {
         Operation $verb @{workspaceID=$id; serviceID=$app.serviceID} | Out-Null
         Write-Output "PASS $verb"

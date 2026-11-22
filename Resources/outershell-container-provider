@@ -2424,15 +2424,6 @@ def recipe_dictionary(record, recipe):
     return {
         "baseImage": recipe.get("baseImage", DEFAULT_BASE_IMAGE),
         "installsOuterShellSupport": False,
-        "outerShellSupportSnippet": "",
-        "steps": [],
-        "fragments": [],
-        "catalog": [],
-        "users": [{
-            "id": "root", "name": "root", "homeDirectory": "/root",
-            "workingDirectory": "/", "isRoot": True,
-        }],
-        "scriptFiles": [],
         "containerfile": dockerfile,
         "dockerfileHostPath": str(dockerfile_path(container_id)),
         "dockerfileGuestPath": "/var/lib/outershell/project/Dockerfile",
@@ -2446,7 +2437,6 @@ def recipe_dictionary(record, recipe):
         ],
         "needsRebuild": needs_rebuild,
         "hasUntrackedChanges": False,
-        "workingDirectory": "/",
         "environment": recipe.get("environment", []),
         "publishedPorts": recipe.get("publishedPorts", []),
         "supportsRuntimeSettings": True,

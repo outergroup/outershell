@@ -54,11 +54,16 @@ persistent volume may need to be reinstalled.
 
 ## Choose a base image
 
-Outer Shell's prepared image is the shortest path:
+Outer Shell's prepared image is the shortest path. New containers start from
+it, and their Dockerfile begins with a line like:
 
 ```dockerfile
-FROM outershell/container-base:7
+FROM outershell/container-base:21
 ```
+
+Outer Shell builds this image on the server, and its tag differs by container
+runtime. Keep the `FROM` line that Outer Shell generated rather than copying a
+tag from another server.
 
 An ordinary Linux image works too:
 
@@ -81,27 +86,6 @@ the same support already, so it does not need this fragment.
 If a custom image already provides compatible `outershelld`, `outerctl`, and the
 Outer Shell container-init entry point, turn off **Install Outer Shell support**.
 The generated Dockerfile will then rely on the base image's installation.
-
-## Install an Outer Shell app
-
-Bundled apps are distributed as small OCI images whose filesystem payload lives
-under `/outershell-rootfs`. For example, install Files and Plaintext with
-ordinary multi-stage copies:
-
-```dockerfile
-COPY --from=ghcr.io/outergroup/outershell-app-files:4 /outershell-rootfs/ /
-COPY --from=ghcr.io/outergroup/outershell-app-plaintext:4 /outershell-rootfs/ /
-```
-
-This is standard Dockerfile syntax rather than an Outer Shell-only installer.
-The same fragment works with Apple `container`, Docker, and compatible builders.
-An app image can contain its backend, service declaration, and registration
-script without becoming the base image for the rest of the container.
-
-Third-party app publishers can use the same contract: assemble every path that
-the app needs beneath `/outershell-rootfs` in a `scratch` output stage, publish
-that stage as an OCI image, and provide a `COPY --from` snippet like the one
-above.
 
 ## Give container-configuration tools their instructions
 
@@ -403,8 +387,10 @@ docker run --mount \
   my-science-image
 ```
 
-Outer Shell stores the equivalent mapping beside the Dockerfile and reconnects
-it when creating the container. Moving the project to another server requires
+Outer Shell stores the equivalent mapping in its own registry, outside the
+Dockerfile's build context, and reconnects it when creating the container.
+Because it is not in `/var/lib/outershell/project`, tools inside the container
+cannot change their own mounts. Moving the project to another server requires
 choosing the corresponding folder on that server.
 
 ## Runtime setup and readiness

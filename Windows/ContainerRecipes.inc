@@ -452,10 +452,8 @@ static void container_recipe_snapshot(Distribution *d, StringBuilder *json) {
     append(json, ","); field(json, "dockerfileHostPath", path ? path : "");
     append(json, ","); field(json, "definitionDirectory", directory ? directory : "");
     append(json, ",\"dockerfileGuestPath\":\"/var/lib/outershell/project/Dockerfile\","
-                 "\"installsOuterShellSupport\":false,\"outerShellSupportSnippet\":\"\","
-                 "\"steps\":[],\"fragments\":[],\"catalog\":[],\"scriptFiles\":[],"
-                 "\"users\":[{\"id\":\"root\",\"name\":\"root\",\"homeDirectory\":\"/root\",\"workingDirectory\":\"/\",\"isRoot\":true}],"
-                 "\"buildEngineAvailable\":true,\"transferItems\":[],\"hasUntrackedChanges\":false,\"workingDirectory\":\"/\",\"needsRebuild\":");
+                 "\"installsOuterShellSupport\":false,"
+                 "\"buildEngineAvailable\":true,\"transferItems\":[],\"hasUntrackedChanges\":false,\"needsRebuild\":");
     append(json, strcmp(dockerfile, realized) || strcmp(config, prior) ? "true" : "false");
     append(json, ",\"environment\":"); append(json, env ? env : "[]");
     append(json, ",\"publishedPorts\":"); append(json, ports ? ports : "[]"); append(json, "}");
