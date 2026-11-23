@@ -249,17 +249,20 @@ bool win_atomic_write(const char *path, const void *data, size_t length) {
     free(wide);
     return ok;
 }
-bool win_read_file(const char *path, size_t limit, StringBuilder *result) {
+static bool read_file(const char *path, size_t limit, bool regular, StringBuilder *result) {
     wchar_t *wide = win_wide(path);
     if (!wide)
         return false;
     HANDLE h = CreateFileW(wide, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
-                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+                           OPEN_EXISTING, regular ? FILE_FLAG_OPEN_REPARSE_POINT : FILE_ATTRIBUTE_NORMAL, NULL);
     free(wide);
     if (h == INVALID_HANDLE_VALUE)
         return false;
+    BY_HANDLE_FILE_INFORMATION information;
+    bool ok = !regular || (GetFileType(h) == FILE_TYPE_DISK && GetFileInformationByHandle(h, &information) &&
+                           !(information.dwFileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY)));
     LARGE_INTEGER size;
-    bool ok = GetFileSizeEx(h, &size) && size.QuadPart >= 0 && (uint64_t)size.QuadPart <= limit;
+    ok = ok && GetFileSizeEx(h, &size) && size.QuadPart >= 0 && (uint64_t)size.QuadPart <= limit;
     char buffer[65536];
     uint64_t remaining = ok ? (uint64_t)size.QuadPart : 0;
     while (ok && remaining) {
@@ -270,6 +273,14 @@ bool win_read_file(const char *path, size_t limit, StringBuilder *result) {
     }
     CloseHandle(h);
     return ok;
+}
+
+bool win_read_file(const char *path, size_t limit, StringBuilder *result) {
+    return read_file(path, limit, false, result);
+}
+
+bool win_read_regular_file(const char *path, size_t limit, StringBuilder *result) {
+    return read_file(path, limit, true, result);
 }
 static bool allow_pipes(const char *const *paths, size_t count) {
     char *base = win_folder(CSIDL_LOCAL_APPDATA);

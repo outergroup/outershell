@@ -1699,6 +1699,7 @@ final class SafeSpaceManager: @unchecked Sendable {
             at: try recipeDirectory(record.id),
             to: sharedRecipeDirectory
         )
+        try requireUnlinkedTree(sharedRecipeDirectory)
         for name in ["recipe.orwv"] {
             let staleRecipe = sharedRecipeDirectory.appendingPathComponent(name)
             if FileManager.default.fileExists(atPath: staleRecipe.path) {
@@ -2571,7 +2572,7 @@ final class SafeSpaceManager: @unchecked Sendable {
             let value = try recipe(for: record)
             protected.insert(value.baseImage)
             if let realized = value.realizedBaseImage { protected.insert(realized) }
-            files.append(try dockerfileContents(for: record))
+            if let dockerfile = try? dockerfileContents(for: record) { files.append(dockerfile) }
             if let realized = value.realizedDockerfileContents { files.append(realized) }
         }
         let containers = try runDocker(["ps", "--all", "--quiet", "--no-trunc"])
@@ -2626,7 +2627,7 @@ final class SafeSpaceManager: @unchecked Sendable {
             let value = try recipe(for: record)
             protected.insert(value.baseImage)
             if let realized = value.realizedBaseImage { protected.insert(realized) }
-            dockerfiles.append(try dockerfileContents(for: record))
+            if let dockerfile = try? dockerfileContents(for: record) { dockerfiles.append(dockerfile) }
             if let realized = value.realizedDockerfileContents { dockerfiles.append(realized) }
         }
         let containers = try runContainer(["list", "--all", "--format", "json"])
@@ -4379,7 +4380,7 @@ final class SafeSpaceManager: @unchecked Sendable {
     private func upgradeDefinition(for record: SafeSpaceRecord) throws {
         let url = try dockerfileURL(record.id)
         guard FileManager.default.fileExists(atPath: url.path) else { return }
-        let contents = try String(contentsOf: url, encoding: .utf8)
+        let contents = try readRegularTextFile(url)
         let upgraded = upgradedDockerfile(contents)
         if upgraded != contents {
             try upgraded.write(to: url, atomically: true, encoding: .utf8)
@@ -4515,7 +4516,46 @@ final class SafeSpaceManager: @unchecked Sendable {
     }
 
     private func dockerfileContents(for record: SafeSpaceRecord) throws -> String {
-        try String(contentsOf: dockerfileURL(record.id), encoding: .utf8)
+        try readRegularTextFile(dockerfileURL(record.id))
+    }
+
+    private func readRegularTextFile(_ url: URL) throws -> String {
+        let descriptor = open(url.path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK)
+        guard descriptor >= 0 else {
+            let code = errno
+            if code == ELOOP {
+                throw SafeSpaceManagerError.commandFailed(
+                    "\(url.lastPathComponent) must be a regular file, not a symbolic link."
+                )
+            }
+            throw POSIXError(POSIXErrorCode(rawValue: code) ?? .EIO)
+        }
+        let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+        var information = stat()
+        guard fstat(descriptor, &information) == 0,
+              information.st_mode & S_IFMT == S_IFREG else {
+            throw SafeSpaceManagerError.commandFailed("\(url.lastPathComponent) must be a regular file.")
+        }
+        guard let text = String(data: try handle.readToEnd() ?? Data(), encoding: .utf8) else {
+            throw CocoaError(.fileReadInapplicableStringEncoding)
+        }
+        return text
+    }
+
+    private func requireUnlinkedTree(_ directory: URL) throws {
+        let keys: [URLResourceKey] = [.isSymbolicLinkKey]
+        guard let enumerator = FileManager.default.enumerator(
+            at: directory,
+            includingPropertiesForKeys: keys
+        ) else { return }
+        for case let url as URL in enumerator {
+            if try url.resourceValues(forKeys: Set(keys)).isSymbolicLink == true {
+                let path = url.path.dropFirst(directory.path.count + 1)
+                throw SafeSpaceManagerError.commandFailed(
+                    "Linked files and folders cannot be shared: \(path)"
+                )
+            }
+        }
     }
 
     private func dockerfileBaseImage(in contents: String) -> String? {
@@ -5173,19 +5213,17 @@ final class SafeSpaceManager: @unchecked Sendable {
             detail: "Building the container image",
             for: record.id
         )
-        var buildArguments = ["build", "--file", "Dockerfile"]
+        let dockerfile = try safeSpaceDirectory(record.id)
+            .appendingPathComponent("Dockerfile.outershell")
+        var contents = try dockerfileContents(for: record)
+        var buildArguments = ["build", "--file", dockerfile.path]
         if runtimeProvider(for: record) == .docker,
            let helpers = try containerHelpersBuildContext(for: record) {
-            let dockerfile = try safeSpaceDirectory(record.id)
-                .appendingPathComponent("Dockerfile.outershell")
-            let contents = try String(contentsOf: directory.appendingPathComponent("Dockerfile"),
-                                      encoding: .utf8)
-            try (contents.trimmingCharacters(in: .newlines) +
-                 "\nCOPY --from=outershell-helpers / /usr/local/lib/outershell/helpers/\n")
-                .write(to: dockerfile, atomically: true, encoding: .utf8)
-            buildArguments = ["build", "--file", dockerfile.path,
-                              "--build-context", "outershell-helpers=" + helpers.path]
+            contents = contents.trimmingCharacters(in: .newlines) +
+                "\nCOPY --from=outershell-helpers / /usr/local/lib/outershell/helpers/\n"
+            buildArguments += ["--build-context", "outershell-helpers=" + helpers.path]
         }
+        try contents.write(to: dockerfile, atomically: true, encoding: .utf8)
         let result = try runRuntime(record, buildArguments + [
             "--tag", imageReference,
             "--progress", "plain",

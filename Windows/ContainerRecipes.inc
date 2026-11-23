@@ -46,7 +46,8 @@ static bool container_write(const char *id, const char *name, const void *data, 
 static char *container_read(const char *id, const char *name, const char *fallback) {
     char *path = container_file(id, name);
     StringBuilder data = {0};
-    bool ok = path && win_read_file(path, WSL_LIMIT, &data);
+    bool ok = path && (!strcmp(name, "Dockerfile") ? win_read_regular_file(path, WSL_LIMIT, &data)
+                                                   : win_read_file(path, WSL_LIMIT, &data));
     free(path);
     if (ok && data.data) {
         if (strncmp(name, "configuration", 13)) return data.data;
@@ -641,17 +642,17 @@ static bool container_build(Wsl *w, ContainerRuntime runtime, const char *id, co
         return false;
     }
     bool baked = helpers && derived && container_helpers_context(helpers);
+    append(&text, dockerfile);
     if (baked) {
-        append(&text, dockerfile);
         append(&text, "\nCOPY --from=outershell-helpers / /usr/local/lib/outershell/helpers/\n");
         append(&source, "outershell-helpers=");
         append(&source, helpers);
-        baked = win_atomic_write(derived, text.data, text.length);
     }
-    const char *plain[] = {"build", "--progress", "plain", "--tag", image, context, NULL};
+    bool ok = derived && text.data && win_atomic_write(derived, text.data, text.length);
+    const char *plain[] = {"build", "--progress", "plain", "--tag", image, "--file", derived, context, NULL};
     const char *with_helpers[] = {"build", "--progress", "plain", "--tag", image, "--file", derived,
                                   "--build-context", source.data, context, NULL};
-    bool ok = capture_runtime(w, baked ? with_helpers : plain, output, runtime);
+    ok = ok && capture_runtime(w, baked ? with_helpers : plain, output, runtime);
     free(directory); free(helpers); free(derived); free(text.data); free(source.data);
     return ok;
 }

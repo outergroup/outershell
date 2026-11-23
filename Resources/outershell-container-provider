@@ -13,6 +13,7 @@ import shlex
 import shutil
 import signal
 import socket
+import stat
 import struct
 import subprocess
 import sys
@@ -309,6 +310,58 @@ def recipe_directory(container_id):
 
 def dockerfile_path(container_id):
     return recipe_directory(container_id) / "Dockerfile"
+
+
+def read_regular_text(path):
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError as error:
+        if os.path.islink(path):
+            raise RuntimeError(f"{path.name} must be a regular file, not a symbolic link.") from error
+        raise
+    with os.fdopen(descriptor, "rb") as file:
+        if not stat.S_ISREG(os.fstat(file.fileno()).st_mode):
+            raise RuntimeError(f"{path.name} must be a regular file.")
+        return file.read().decode()
+
+
+def write_regular_text(path, contents):
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+    try:
+        with os.fdopen(descriptor, "wb") as file:
+            file.write(contents.encode())
+        os.replace(temporary, path)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def read_dockerfile(container_id):
+    return read_regular_text(dockerfile_path(container_id))
+
+
+def write_dockerfile(container_id, contents):
+    write_regular_text(dockerfile_path(container_id), contents)
+
+
+def copy_recipe_file(source, destination):
+    if not stat.S_ISREG(os.lstat(source).st_mode):
+        raise RuntimeError("The container definition contains a special file: " + os.path.basename(source))
+    shutil.copy2(source, destination, follow_symlinks=False)
+
+
+def copy_recipe_tree(source, destination):
+    shutil.copytree(source, destination, symlinks=True, copy_function=copy_recipe_file)
+
+
+def require_unlinked_tree(directory):
+    for root, directories, files in os.walk(directory):
+        for name in directories + files:
+            path = os.path.join(root, name)
+            if os.path.islink(path):
+                raise RuntimeError("Linked files and folders cannot be shared: " +
+                                   os.path.relpath(path, directory))
 
 
 def runtime_directory(container_id):
@@ -748,11 +801,10 @@ def upgraded_dockerfile(contents):
 
 
 def upgrade_definition(container_id, recipe):
-    path = dockerfile_path(container_id)
-    contents = path.read_text()
+    contents = read_dockerfile(container_id)
     upgraded = upgraded_dockerfile(contents)
     if upgraded != contents:
-        path.write_text(upgraded)
+        write_dockerfile(container_id, upgraded)
     if recipe.get("baseImage", "").startswith(LEGACY_BASE_IMAGE_PREFIX):
         recipe["baseImage"] = DEFAULT_BASE_IMAGE
         save_recipe(container_id, recipe)
@@ -762,7 +814,7 @@ def upgrade_definition(container_id, recipe):
 def write_initial_definition(container_id, base_image=None):
     directory = recipe_directory(container_id)
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-    dockerfile_path(container_id).write_text(default_dockerfile(base_image or DEFAULT_BASE_IMAGE))
+    write_dockerfile(container_id, default_dockerfile(base_image or DEFAULT_BASE_IMAGE))
     save_recipe(container_id, default_recipe() | {"baseImage": base_image or DEFAULT_BASE_IMAGE})
 
 
@@ -883,7 +935,7 @@ def build_image(context, tag, log_path, *, container_id=None, helpers=None):
     command = [docker_path(), "build", "--label", "org.outershell.managed=true", "--progress", "plain", "--tag", tag]
     if helpers:
         dockerfile = helpers.parent / "Dockerfile.outershell"
-        dockerfile.write_text((context / "Dockerfile").read_text().rstrip("\n") +
+        dockerfile.write_text(read_regular_text(context / "Dockerfile").rstrip("\n") +
                               "\nCOPY --from=outershell-helpers / " + CONTAINER_HELPERS_DIRECTORY + "/\n")
         command += ["--build-context", "outershell-helpers=" + str(helpers), "--file", str(dockerfile)]
     command.append(str(context))
@@ -920,7 +972,7 @@ def build_context(container_id):
     context = runtime_directory(container_id) / "BuildContext"
     if context.exists():
         shutil.rmtree(context)
-    shutil.copytree(source, context)
+    copy_recipe_tree(source, context)
     return context
 
 
@@ -1034,7 +1086,7 @@ def create_runtime_container(container_id):
 
 def mark_realized(container_id):
     recipe = load_recipe(container_id)
-    recipe["realizedDockerfile"] = dockerfile_path(container_id).read_text()
+    recipe["realizedDockerfile"] = read_dockerfile(container_id)
     recipe["realizedMounts"] = recipe.get("mounts", [])
     recipe["realizedEnvironment"] = recipe.get("environment", [])
     recipe["realizedPublishedPorts"] = recipe.get("publishedPorts", [])
@@ -1091,7 +1143,10 @@ def storage_inventory(excluding=None):
             protected.add(image_name(record["id"]))
             recipe = load_recipe(record["id"])
             protected.add(recipe.get("baseImage", DEFAULT_BASE_IMAGE))
-            files.append(dockerfile_path(record["id"]).read_text())
+            try:
+                files.append(read_dockerfile(record["id"]))
+            except (OSError, RuntimeError, UnicodeDecodeError):
+                pass
             files.append(recipe.get("realizedDockerfile", ""))
     identifiers = docker(["ps", "--all", "--quiet", "--no-trunc"], check=True).stdout.split()
     for identifier in identifiers:
@@ -1206,7 +1261,7 @@ def rebuild(container_id):
         )
         set_build_progress(container_id, "preparing", "Preparing the container build…")
         upgrade_definition(container_id, load_recipe(container_id))
-        if SUPPORT_IMAGE in dockerfile_path(container_id).read_text():
+        if SUPPORT_IMAGE in read_dockerfile(container_id):
             ensure_support_image(log_path)
         context = build_context(container_id)
         helpers = runtime_directory(container_id) / "Helpers"
@@ -1310,7 +1365,7 @@ def operation_create(request):
         recipe.update(settings)
         save_recipe(container_id, recipe)
     if initial_dockerfile is not None:
-        dockerfile_path(container_id).write_text(initial_dockerfile)
+        write_dockerfile(container_id, initial_dockerfile)
     with Records() as records:
         records.values.append(record)
         records.save()
@@ -1352,7 +1407,7 @@ def operation_update_dockerfile(request):
     contents = request.get("dockerfile")
     if not isinstance(contents, str) or not contents.strip():
         raise ValueError("The Dockerfile cannot be empty.")
-    dockerfile_path(container_id).write_text(contents)
+    write_dockerfile(container_id, contents)
     for line in contents.splitlines():
         fields = line.strip().split()
         if not fields or fields[0].upper() != "FROM":
@@ -1495,7 +1550,8 @@ def operation_prepare_share(request):
     shared_recipe = dict(recipe)
     shared_recipe["persistentData"] = persistent_data
     shared_recipe_directory = root / "Recipe"
-    shutil.copytree(recipe_directory(container_id), shared_recipe_directory)
+    copy_recipe_tree(recipe_directory(container_id), shared_recipe_directory)
+    require_unlinked_tree(shared_recipe_directory)
     for name in ["recipe.orwv"]:
         stale_recipe = shared_recipe_directory / name
         if stale_recipe.exists():
@@ -2367,7 +2423,7 @@ def outer_shell_support(container_id, state):
 
 def recipe_dictionary(record, recipe):
     container_id = record["id"]
-    dockerfile = dockerfile_path(container_id).read_text()
+    dockerfile = read_dockerfile(container_id)
     realized = recipe.get("realizedDockerfile")
     needs_rebuild = (
         realized != dockerfile

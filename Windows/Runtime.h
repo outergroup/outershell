@@ -45,6 +45,7 @@ char *win_app_pipe(const char *app);
 bool win_secure_directory(const char *path);
 bool win_atomic_write(const char *path, const void *data, size_t length);
 bool win_read_file(const char *path, size_t limit, StringBuilder *result);
+bool win_read_regular_file(const char *path, size_t limit, StringBuilder *result);
 bool win_pipe_is_allowed(const char *pipe);
 bool win_disallow_pipe(const char *pipe);
 bool win_allow_pipes(const char *const *paths, size_t count);
