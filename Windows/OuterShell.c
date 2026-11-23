@@ -720,6 +720,11 @@ static void serve_http(Connection *c, void *context) {
     free(body.data);
     http_free(&r);
 }
+static bool shell_registry_request(void *context, const unsigned char *request, uint32_t length,
+                                   unsigned char **response, uint32_t *response_length) {
+    ShellHost *s = context;
+    return OuterShellRegistryRequest(s->registry, request, length, response, response_length) != 0;
+}
 static void serve_registry(Connection *c, void *context) {
     ShellHost *s = context;
     unsigned char prefix[4];
@@ -741,6 +746,9 @@ static void serve_registry(Connection *c, void *context) {
         } else ok = OuterShellRegistryRequest(s->registry, request, length, &response, &response_length) != 0;
         if (ok && response_length >= 22 && read_uint16_le(response) == 100 &&
             read_uint32_le(response + 2) == 0) {
+            uint16_t type = read_uint16_le(request);
+            if (type == 31 || type == 32)
+                wsl_refresh(s->wsl);
             if (!update_allowlist(s))
                 log_error(s, "Could not update the HTTP pipe allowlist.");
             changed(s);
@@ -787,7 +795,7 @@ static bool shell_start(ShellHost *s) {
         if (!s->job || !SetInformationJobObject(s->job, JobObjectExtendedLimitInformation, &limits, sizeof(limits))) return false;
         if (!legacy_start_files(s)) return false;
     }
-    s->wsl = wsl_start(s->stop);
+    s->wsl = wsl_start(s->stop, shell_registry_request, s);
     if (s->wsl) wsl_version(s->wsl);
     char *api = win_pipe("org.outershell.outershelld"), *http = win_pipe(shell_id);
     s->api = api ? pipe_server_start(api, serve_registry, s) : NULL;

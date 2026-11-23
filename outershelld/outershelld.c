@@ -1084,6 +1084,7 @@ static OuterShellIdleState g_idle_state = {.mutex = PTHREAD_MUTEX_INITIALIZER};
 double OuterShelldIdleSeconds(void) { return outer_shell_idle_seconds(&g_idle_state); }
 void OuterShelldRequestIdleShutdown(void) { outer_shell_idle_stop(&g_idle_state); }
 static bool g_stay_alive_when_socket_idle = false;
+static bool g_container_guest = false;
 static volatile sig_atomic_t g_shutdown_requested = 0;
 static volatile sig_atomic_t g_listener_fd = -1;
 static volatile sig_atomic_t g_api_listener_fd = -1;
@@ -1106,8 +1107,10 @@ typedef struct {
     bool waiting_for_api_response;
     int api_response_fd;
     bool waiting_for_snapshot;
+    bool waiting_for_snapshot_message;
     bool provider_snapshot;
     bool provider_environment_query;
+    bool provider_container_query;
     uint64_t snapshot_generation;
     pid_t provider_pid;
     int provider_output_fd;
@@ -2486,6 +2489,8 @@ static bool quarantine_invalid_registry_binary(const char *registry_path, const 
 }
 
 #include "RegistryStore.inc"
+#include "ContainerRegistration.inc"
+#include "../Backend/OffsetArchive.inc"
 
 static bool registry_store_open_user_readonly(RegistryStore *store, char *error, size_t error_size) {
     return registry_store_open_at(store, g_registry_database_path, false, error, error_size);
@@ -2567,9 +2572,13 @@ void OuterShellRegistryFreeContainers(OuterShellRegistryContainer *records, size
         free(records[index].display_name);
         free(records[index].provider_id);
         free(records[index].runtime_name);
-        free(records[index].project_resource_key);
+        free(records[index].build_context_path);
     }
     free(records);
+}
+
+size_t OuterShellRegistryContainerRecordSize(void) {
+    return sizeof(OuterShellRegistryContainer);
 }
 
 int OuterShellRegistryCopyContainers(OuterShellRegistryContainer **records,
@@ -2600,13 +2609,13 @@ int OuterShellRegistryCopyContainers(OuterShellRegistryContainer **records,
         copy[index].display_name = registry_strdup(source->display_name);
         copy[index].provider_id = registry_strdup(source->provider_id);
         copy[index].runtime_name = registry_strdup(source->runtime_name);
-        copy[index].project_resource_key = registry_strdup(source->project_resource_key);
+        copy[index].build_context_path = registry_strdup(source->build_context_path);
         copy[index].created_at_milliseconds = source->created_at_milliseconds;
         copy[index].cpus = source->cpus;
         copy[index].memory_in_mb = source->memory_in_mb;
-        copy[index].flags = source->owns_container ? OUTERSHELL_REGISTRY_CONTAINER_FLAG_OWNED : 0u;
+        copy[index].flags = source->flags;
         ok = copy[index].identifier && copy[index].display_name && copy[index].provider_id &&
-             copy[index].runtime_name && copy[index].project_resource_key;
+             copy[index].runtime_name && copy[index].build_context_path;
     }
     size_t copied_count = store.container_count;
     registry_store_free(&store);
@@ -2620,30 +2629,98 @@ int OuterShellRegistryCopyContainers(OuterShellRegistryContainer **records,
     return 1;
 }
 
+static uint64_t wall_clock_milliseconds(void) {
+    struct timespec now;
+    clock_gettime(CLOCK_REALTIME, &now);
+    return (uint64_t)now.tv_sec * 1000u + (uint64_t)now.tv_nsec / 1000000u;
+}
+
+static size_t container_protected_paths(char paths[][PATH_MAX], size_t capacity) {
+    size_t count = 0;
+    if (g_registry_database_path[0] && count < capacity) {
+        snprintf(paths[count], PATH_MAX, "%s", g_registry_database_path);
+        char *slash = strrchr(paths[count], '/');
+        if (slash && slash != paths[count]) {
+            *slash = 0;
+            count++;
+        }
+    }
+    if (g_api_socket_path[0] && count < capacity) snprintf(paths[count++], PATH_MAX, "%s", g_api_socket_path);
+    const char *runtime = getenv("XDG_RUNTIME_DIR");
+    if (runtime && runtime[0] == '/' && count < capacity) snprintf(paths[count++], PATH_MAX, "%s", runtime);
+    const char *outer_shell_home = getenv("OUTERSHELL_HOME");
+    if (outer_shell_home && outer_shell_home[0] == '/' && count < capacity) {
+        snprintf(paths[count++], PATH_MAX, "%s", outer_shell_home);
+    }
+#ifdef __APPLE__
+    struct passwd *pw = getpwuid(getuid());
+    if (pw && pw->pw_dir && count < capacity) {
+        snprintf(paths[count++], PATH_MAX, "%s/Library/Application Support/Outer Shell", pw->pw_dir);
+    }
+#endif
+    for (size_t index = 0; index < count; index++) {
+        char resolved[PATH_MAX];
+        if (realpath(paths[index], resolved)) {
+            snprintf(paths[index], PATH_MAX, "%s", resolved);
+            continue;
+        }
+        char *slash = strrchr(paths[index], '/');
+        if (!slash || slash == paths[index]) continue;
+        *slash = 0;
+        char parent[PATH_MAX];
+        if (realpath(paths[index], parent)) {
+            char name[PATH_MAX];
+            snprintf(name, sizeof(name), "%s", slash + 1);
+            snprintf(paths[index], PATH_MAX, "%s/%s", parent, name);
+        } else {
+            *slash = '/';
+        }
+    }
+    return count;
+}
+
+static bool container_registry_upsert(const ContainerRegistrationRequest *request,
+                                      char *error,
+                                      size_t error_size) {
+    char protected_storage[8][PATH_MAX];
+    size_t protected_count = container_protected_paths(protected_storage, 8);
+    const char *protected_paths[8];
+    for (size_t index = 0; index < protected_count; index++) protected_paths[index] = protected_storage[index];
+    RegistryStore store;
+    if (!registry_store_open_user_readwrite(&store, error, error_size)) return false;
+    bool ok = container_registration_apply(&store,
+                                           request,
+                                           wall_clock_milliseconds(),
+                                           protected_paths,
+                                           protected_count,
+                                           error,
+                                           error_size);
+    return registry_store_close(&store, ok, error, error_size) && ok;
+}
+
 int OuterShellRegistryUpsertContainer(const OuterShellRegistryContainer *record,
                                       char *error,
                                       size_t error_size) {
-    if (!record || !record->identifier || !record->identifier[0] ||
-        !record->display_name || !record->display_name[0] ||
-        !record->provider_id || !record->provider_id[0] ||
-        !record->runtime_name || !record->runtime_name[0]) {
+    if (!record) {
         if (error && error_size) snprintf(error, error_size, "Invalid container registry record.");
         return 0;
     }
-    RegistryStore store;
-    if (!registry_store_open_user_readwrite(&store, error, error_size)) return 0;
-    bool ok = registry_store_upsert_container(&store,
-                                              record->identifier,
-                                              record->display_name,
-                                              record->provider_id,
-                                              record->runtime_name,
-                                              record->project_resource_key ? record->project_resource_key : "",
-                                              record->created_at_milliseconds,
-                                              record->cpus,
-                                              record->memory_in_mb,
-                                              (record->flags & OUTERSHELL_REGISTRY_CONTAINER_FLAG_OWNED) != 0);
-    if (!ok && error && error_size) snprintf(error, error_size, "Out of memory.");
-    return registry_store_close(&store, ok, error, error_size) ? 1 : 0;
+    ContainerRegistrationRequest request = {
+        .identifier = record->identifier,
+        .display_name = record->display_name,
+        .provider_id = record->provider_id,
+        .runtime_name = record->runtime_name,
+        .build_context_path = record->build_context_path ? record->build_context_path : "",
+        .created_at_milliseconds = record->created_at_milliseconds,
+        .cpus = record->cpus,
+        .memory_in_mb = record->memory_in_mb,
+        .flags = record->flags,
+        .set_mask = OUTERSHELL_CONTAINER_SET_ALL,
+    };
+    char local_error[512] = "";
+    return container_registry_upsert(&request,
+                                     error && error_size ? error : local_error,
+                                     error && error_size ? error_size : sizeof(local_error)) ? 1 : 0;
 }
 
 int OuterShellRegistryRemoveContainer(const char *identifier,
@@ -8014,40 +8091,7 @@ static bool outerctl_print_registry_list(const RegistryStore *database,
                                          char *error,
                                          size_t error_size) {
     bool ok = true;
-    if (strcmp(resource, "container") == 0) {
-        const char *headers[] = {
-            "container_id", "display_name", "provider", "runtime_name", "project_key",
-            "created_at_milliseconds", "cpus", "memory_mb", "owns_container"
-        };
-        ok = outerctl_print_headers(out, headers, sizeof(headers) / sizeof(headers[0]));
-        for (size_t i = 0; ok && i < database->container_count; i++) {
-            const RegistryContainerRecord *record = &database->containers[i];
-            if (backend_filter && backend_filter[0] && strcmp(record->identifier, backend_filter) != 0) continue;
-            char created_buffer[32];
-            char cpus_buffer[16];
-            char memory_buffer[16];
-            snprintf(created_buffer, sizeof(created_buffer), "%llu",
-                     (unsigned long long)record->created_at_milliseconds);
-            snprintf(cpus_buffer, sizeof(cpus_buffer), "%u", record->cpus);
-            snprintf(memory_buffer, sizeof(memory_buffer), "%u", record->memory_in_mb);
-            const char *fields[] = {
-                record->identifier,
-                record->display_name,
-                record->provider_id,
-                record->runtime_name,
-                record->project_resource_key,
-                created_buffer,
-                cpus_buffer,
-                memory_buffer,
-                record->owns_container ? "1" : "0"
-            };
-            for (size_t column = 0; ok && column < sizeof(fields) / sizeof(fields[0]); column++) {
-                if (column > 0 && !sb_append(out, "\t")) ok = false;
-                if (ok && !outerctl_tsv_field(out, fields[column])) ok = false;
-            }
-            if (ok && !sb_append(out, "\n")) ok = false;
-        }
-    } else if (strcmp(resource, "backend") == 0) {
+    if (strcmp(resource, "backend") == 0) {
         const char *headers[] = {"service_id", "display_name", "unit_name", "unit_path", "owns_unit"};
         ok = outerctl_print_headers(out, headers, sizeof(headers) / sizeof(headers[0]));
         for (size_t i = 0; ok && i < database->backend_count; i++) {
@@ -8320,13 +8364,6 @@ static int outershelld_handle_outerctl(int argc, char **argv, StringBuilder *std
     const char *mime_types = NULL;
     const char *url_template = NULL;
     const char *resource_key = NULL;
-    const char *container_identifier = NULL;
-    const char *provider_id = NULL;
-    const char *runtime_name = NULL;
-    const char *project_resource_key = NULL;
-    uint64_t created_at_milliseconds = 0;
-    uint32_t container_cpus = 2;
-    uint32_t container_memory_in_mb = 2048;
     int port = 0;
     int rank = 0;
     uint32_t opener_capabilities = OUTERSHELLD_API_OPENER_CAPABILITY_DEFAULT;
@@ -8384,44 +8421,6 @@ static int outershelld_handle_outerctl(int argc, char **argv, StringBuilder *std
             REQUIRE_VALUE("--url-template", url_template);
         } else if (strcmp(arg, "--key") == 0) {
             REQUIRE_VALUE("--key", resource_key);
-        } else if (strcmp(arg, "--container") == 0) {
-            REQUIRE_VALUE("--container", container_identifier);
-        } else if (strcmp(arg, "--provider") == 0) {
-            REQUIRE_VALUE("--provider", provider_id);
-        } else if (strcmp(arg, "--runtime-name") == 0) {
-            REQUIRE_VALUE("--runtime-name", runtime_name);
-        } else if (strcmp(arg, "--project-key") == 0) {
-            REQUIRE_VALUE("--project-key", project_resource_key);
-        } else if (strcmp(arg, "--cpus") == 0) {
-            const char *raw = NULL;
-            REQUIRE_VALUE("--cpus", raw);
-            char *end = NULL;
-            unsigned long value = strtoul(raw, &end, 10);
-            if (!end || *end != '\0' || value == 0 || value > UINT32_MAX) {
-                sb_append(stderr_buffer, "Invalid --cpus value.\n");
-                return 1;
-            }
-            container_cpus = (uint32_t)value;
-        } else if (strcmp(arg, "--memory-mb") == 0) {
-            const char *raw = NULL;
-            REQUIRE_VALUE("--memory-mb", raw);
-            char *end = NULL;
-            unsigned long value = strtoul(raw, &end, 10);
-            if (!end || *end != '\0' || value == 0 || value > UINT32_MAX) {
-                sb_append(stderr_buffer, "Invalid --memory-mb value.\n");
-                return 1;
-            }
-            container_memory_in_mb = (uint32_t)value;
-        } else if (strcmp(arg, "--created-at-milliseconds") == 0) {
-            const char *raw = NULL;
-            REQUIRE_VALUE("--created-at-milliseconds", raw);
-            char *end = NULL;
-            unsigned long long value = strtoull(raw, &end, 10);
-            if (!end || *end != '\0') {
-                sb_append(stderr_buffer, "Invalid --created-at-milliseconds value.\n");
-                return 1;
-            }
-            created_at_milliseconds = (uint64_t)value;
         } else if (strcmp(arg, "--capabilities") == 0) {
             const char *raw_capabilities = NULL;
             REQUIRE_VALUE("--capabilities", raw_capabilities);
@@ -8461,74 +8460,6 @@ static int outershelld_handle_outerctl(int argc, char **argv, StringBuilder *std
             return 1;
         }
 #undef REQUIRE_VALUE
-    }
-
-    if (strcmp(resource, "container") == 0) {
-        char container_error[2048] = "";
-        if (strcmp(action, "list") == 0) {
-            RegistryStore database;
-            if (!registry_store_open_user_readonly(&database, container_error, sizeof(container_error))) {
-                sb_append(stderr_buffer, container_error[0] ? container_error : "Failed to open registry.");
-                sb_append(stderr_buffer, "\n");
-                return 1;
-            }
-            bool ok = outerctl_print_registry_list(&database,
-                                                   "container",
-                                                   container_identifier,
-                                                   NULL,
-                                                   stdout_buffer,
-                                                   container_error,
-                                                   sizeof(container_error));
-            registry_store_free(&database);
-            if (!ok) {
-                sb_append(stderr_buffer, container_error[0] ? container_error : "Failed to list containers.");
-                sb_append(stderr_buffer, "\n");
-                return 1;
-            }
-            return 0;
-        }
-        if (!container_identifier || !container_identifier[0]) {
-            sb_append(stderr_buffer, "Missing container identifier.\n");
-            return 1;
-        }
-        if (strcmp(action, "upsert") == 0) {
-            if (!display_name || !display_name[0] || !provider_id || !provider_id[0] ||
-                !runtime_name || !runtime_name[0]) {
-                sb_append(stderr_buffer, "Container upsert requires --name, --provider, and --runtime-name.\n");
-                return 1;
-            }
-            OuterShellRegistryContainer record = {
-                .identifier = (char *)container_identifier,
-                .display_name = (char *)display_name,
-                .provider_id = (char *)provider_id,
-                .runtime_name = (char *)runtime_name,
-                .project_resource_key = (char *)(project_resource_key ? project_resource_key : ""),
-                .created_at_milliseconds = created_at_milliseconds,
-                .cpus = container_cpus,
-                .memory_in_mb = container_memory_in_mb,
-                .flags = owns_plist ? OUTERSHELL_REGISTRY_CONTAINER_FLAG_OWNED : 0u
-            };
-            if (!OuterShellRegistryUpsertContainer(&record, container_error, sizeof(container_error))) {
-                sb_append(stderr_buffer, container_error[0] ? container_error : "Failed to register container.");
-                sb_append(stderr_buffer, "\n");
-                return 1;
-            }
-            mark_backend_event_changed();
-            return 0;
-        }
-        if (strcmp(action, "remove") == 0) {
-            if (!OuterShellRegistryRemoveContainer(container_identifier,
-                                                   container_error,
-                                                   sizeof(container_error))) {
-                sb_append(stderr_buffer, container_error[0] ? container_error : "Failed to unregister container.");
-                sb_append(stderr_buffer, "\n");
-                return 1;
-            }
-            mark_backend_event_changed();
-            return 0;
-        }
-        sb_append(stderr_buffer, "Unknown container action.\n");
-        return 1;
     }
 
     if (strcmp(resource, "resource") == 0) {
@@ -12490,39 +12421,26 @@ static bool start_provider_request(ReactorClient *client, const char *body, size
     return true;
 }
 
-static bool container_snapshot_valid(const StringBuilder *body) {
-    const unsigned char *p = (const unsigned char *)body->data;
-    if (!p || !body->length) return false;
-    const unsigned char *end = p + body->length;
-    if (!layout_utf8_valid(p, end)) return false;
-    const unsigned char *check = p;
-    if (!layout_json_value(&check, end, 0)) return false;
-    layout_json_space(&check, end);
-    if (check != end) return false;
-    layout_json_space(&p, end);
-    if (p == end || *p++ != '{') return false;
-    bool workspaces = false;
-    for (;;) {
-        layout_json_space(&p, end);
-        if (p == end || *p == '}') break;
-        const unsigned char *key = p;
-        if (!layout_json_string(&p, end)) return false;
-        size_t key_length = (size_t)(p - key);
-        layout_json_space(&p, end);
-        if (p == end || *p++ != ':') return false;
-        layout_json_space(&p, end);
-        if (p == end) return false;
-        if (key_length == 12 && memcmp(key, "\"workspaces\"", 12) == 0) workspaces = *p == '[';
-        if (key_length == 7 && memcmp(key, "\"error\"", 7) == 0 && *p != 'n') return false;
-        if (!layout_json_value(&p, end, 1)) return false;
-        layout_json_space(&p, end);
-        if (p == end || *p != ',') break;
-        p++;
+static bool container_snapshot_extract(const StringBuilder *reply, StringBuilder *snapshot) {
+    const unsigned char *bytes = (const unsigned char *)reply->data;
+    if (!bytes || reply->length < 30 || read_uint16_le(bytes) != OUTERSHELLD_API_CONTAINER_RESPONSE ||
+        read_uint32_le(bytes + 2) != 0) {
+        return false;
     }
-    return workspaces;
+    uint32_t offset = read_uint32_le(bytes + 22), length = read_uint32_le(bytes + 26);
+    if (offset > reply->length || length > reply->length - offset || length == 0) return false;
+    OrwvValue *root = orwv_decode(bytes + offset, length);
+    const OrwvValue *workspaces = root ? orwv_dictionary_get(root, "workspaces") : NULL;
+    bool valid = workspaces && workspaces->type == ORWV_ARRAY && !orwv_dictionary_get(root, "error");
+    orwv_free(root);
+    if (!valid) return false;
+    *snapshot = (StringBuilder){0};
+    return sb_append_n(snapshot, (const char *)bytes + offset, length);
 }
 
 static void api_send_command_response(int fd, int status, StringBuilder *stdout_buffer, StringBuilder *stderr_buffer);
+static void api_send_container_error(int fd, const char *error);
+static bool container_registry_reply(const unsigned char *message, size_t message_length, StringBuilder *reply);
 
 static bool collect_provider_response(ReactorClient *client) {
     if (!client->provider_output_closed) {
@@ -12561,6 +12479,17 @@ static bool collect_provider_response(ReactorClient *client) {
     client->provider_pid = 0;
     response.content_kind = UI_API_CONTENT_BINARY;
     response.body = client->provider_output;
+    if (client->provider_container_query) {
+        if (response.status == 200 && response.body.length >= 30 &&
+            read_uint16_le((const unsigned char *)response.body.data) == OUTERSHELLD_API_CONTAINER_RESPONSE) {
+            api_send_frame(client->fd, &response.body);
+        } else {
+            api_send_container_error(client->fd, "The container provider did not answer.");
+        }
+        g_snapshot_generation++;
+        g_snapshot_refresh_ms = 0;
+        return true;
+    }
     if (client->provider_environment_query) {
         if (response.status == 200 && response.body.length >= 48 && !memcmp(response.body.data, "OSED", 4)) {
             api_send_frame(client->fd, &response.body);
@@ -12575,20 +12504,20 @@ static bool collect_provider_response(ReactorClient *client) {
 
     if (client->provider_snapshot) {
         if (client->snapshot_generation == g_snapshot_generation) {
-            g_snapshot_refresh_failed = response.status != 200 || !container_snapshot_valid(&response.body);
+            StringBuilder snapshot = {0};
+            g_snapshot_refresh_failed = response.status != 200 || !container_snapshot_extract(&response.body, &snapshot);
             if (!g_snapshot_refresh_failed) {
-                if (g_container_snapshot.length != client->provider_output.length ||
-                    !g_container_snapshot.data || memcmp(g_container_snapshot.data, client->provider_output.data, g_container_snapshot.length) != 0) {
+                if (g_container_snapshot.length != snapshot.length ||
+                    !g_container_snapshot.data || memcmp(g_container_snapshot.data, snapshot.data, g_container_snapshot.length) != 0) {
                     uint64_t token = 14695981039346656037ULL;
-                    for (size_t i = 0; i < client->provider_output.length; i++) {
-                        token ^= (unsigned char)client->provider_output.data[i];
+                    for (size_t i = 0; i < snapshot.length; i++) {
+                        token ^= (unsigned char)snapshot.data[i];
                         token *= 1099511628211ULL;
                     }
                     g_container_snapshot_version = token ? token : 1;
                 }
                 free(g_container_snapshot.data);
-                g_container_snapshot = client->provider_output;
-                memset(&client->provider_output, 0, sizeof(client->provider_output));
+                g_container_snapshot = snapshot;
             }
             g_snapshot_refresh_ms = monotonic_milliseconds();
         }
@@ -12612,6 +12541,9 @@ static bool process_api_ui_request(ReactorClient *client, const unsigned char *m
     UiApiResponse response = {0};
     if (!ok) {
         ui_api_set_text_response(&response, 400, "invalid UI API request\n");
+    } else if (g_container_guest &&
+               (route == OUTERSHELLD_UI_ROUTE_CONTAINER_SNAPSHOT || route == OUTERSHELLD_UI_ROUTE_SAFE_SPACES)) {
+        ui_api_set_text_response(&response, 403, "Container management is only available on the host.\n");
     } else if (route == OUTERSHELLD_UI_ROUTE_EVENTS) {
         UiApiResponse *previous_capture = g_captured_ui_response;
         g_captured_ui_response = &response;
@@ -12633,6 +12565,19 @@ static bool process_api_ui_request(ReactorClient *client, const unsigned char *m
             client->waiting_for_snapshot = true;
             free(query);
             return true;
+        }
+    } else if (route == OUTERSHELLD_UI_ROUTE_SAFE_SPACES && body_length >= 2 &&
+               (read_uint16_le(body) == OUTERSHELLD_API_CONTAINER_UPSERT_REQUEST ||
+                read_uint16_le(body) == OUTERSHELLD_API_CONTAINER_REMOVE_REQUEST ||
+                read_uint16_le(body) == OUTERSHELLD_API_CONTAINER_LIST_REQUEST)) {
+        StringBuilder reply = {0};
+        if (container_registry_reply(body, body_length, &reply)) {
+            response.status = 200;
+            response.content_kind = UI_API_CONTENT_BINARY;
+            response.body = reply;
+        } else {
+            free(reply.data);
+            ui_api_set_text_response(&response, 500, "The container registry request failed.\n");
         }
     } else if (route == OUTERSHELLD_UI_ROUTE_SAFE_SPACES) {
         g_snapshot_generation++;
@@ -12903,6 +12848,9 @@ static bool api_registry_list_row_size(uint16_t response_type, uint32_t *row_siz
         return true;
     case OUTERSHELLD_API_OPENER_LIST_RESPONSE:
         *row_size = 32;
+        return true;
+    case OUTERSHELLD_API_CONTAINER_LIST_RESPONSE:
+        *row_size = CONTAINER_LIST_ROW_SIZE;
         return true;
     default:
         return false;
@@ -13579,18 +13527,11 @@ static bool process_api_command_request(ReactorClient *client, const unsigned ch
     char *extensions = NULL;
     char *mime_types = NULL;
     char *url_template = NULL;
-    char *container_identifier = NULL;
-    char *provider_id = NULL;
-    char *runtime_name = NULL;
-    char *project_resource_key = NULL;
     char *argv[64];
     int argc = 0;
     char port_buffer[32];
     char rank_buffer[32];
     char capabilities_buffer[16];
-    char cpus_buffer[32];
-    char memory_in_mb_buffer[32];
-    char created_at_milliseconds_buffer[32];
     uint16_t flags = 0;
     uint16_t endpoint_kind = OUTERSHELLD_API_FRONTEND_ENDPOINT_NONE;
     uint16_t endpoint_scheme = OUTERSHELLD_API_FRONTEND_SCHEME_HTTP;
@@ -13787,46 +13728,6 @@ static bool process_api_command_request(ReactorClient *client, const unsigned ch
              api_command_append_option(argv, &argc, 64, "--frontend-id", frontend_id) &&
              api_command_append_option(argv, &argc, 64, "--content-type", content_type);
         break;
-    case OUTERSHELLD_API_CONTAINER_UPSERT_REQUEST:
-        ok = ok && message_length >= 60 &&
-             INIT_COMMAND("container", "upsert") &&
-             READ_REF(20, container_identifier) &&
-             READ_REF(28, display_name) &&
-             READ_REF(36, provider_id) &&
-             READ_REF(44, runtime_name) &&
-             READ_REF(52, project_resource_key);
-        flags = ok ? read_uint16_le(message + 2) : 0;
-        if (ok) {
-            snprintf(cpus_buffer, sizeof(cpus_buffer), "%u", read_uint32_le(message + 4));
-            snprintf(memory_in_mb_buffer, sizeof(memory_in_mb_buffer), "%u", read_uint32_le(message + 8));
-            snprintf(created_at_milliseconds_buffer,
-                     sizeof(created_at_milliseconds_buffer),
-                     "%llu",
-                     (unsigned long long)read_uint64_le(message + 12));
-        }
-        ok = ok &&
-             api_command_append_option(argv, &argc, 64, "--container", container_identifier) &&
-             api_command_append_option(argv, &argc, 64, "--name", display_name) &&
-             api_command_append_option(argv, &argc, 64, "--provider", provider_id) &&
-             api_command_append_option(argv, &argc, 64, "--runtime-name", runtime_name) &&
-             api_command_append_option(argv, &argc, 64, "--project-key", project_resource_key) &&
-             api_command_append_option(argv, &argc, 64, "--cpus", cpus_buffer) &&
-             api_command_append_option(argv, &argc, 64, "--memory-mb", memory_in_mb_buffer) &&
-             api_command_append_option(argv, &argc, 64,
-                                       "--created-at-milliseconds",
-                                       created_at_milliseconds_buffer);
-        if (ok && (flags & OUTERSHELL_REGISTRY_CONTAINER_FLAG_OWNED)) {
-            ok = api_command_append_option(argv, &argc, 64, "--outershell-owns", "true");
-        }
-        break;
-    case OUTERSHELLD_API_CONTAINER_REMOVE_REQUEST:
-    case OUTERSHELLD_API_CONTAINER_LIST_REQUEST:
-        ok = ok && message_length >= 10 &&
-             INIT_COMMAND("container",
-                          message_type == OUTERSHELLD_API_CONTAINER_REMOVE_REQUEST ? "remove" : "list") &&
-             READ_REF(2, container_identifier) &&
-             api_command_append_option(argv, &argc, 64, "--container", container_identifier);
-        break;
     default:
         ok = false;
         break;
@@ -13858,10 +13759,6 @@ static bool process_api_command_request(ReactorClient *client, const unsigned ch
     free(extensions);
     free(mime_types);
     free(url_template);
-    free(container_identifier);
-    free(provider_id);
-    free(runtime_name);
-    free(project_resource_key);
     free(stdout_buffer.data);
     free(stderr_buffer.data);
     return false;
@@ -14021,13 +13918,165 @@ static bool api_message_is_command_request(uint16_t message_type) {
     case OUTERSHELLD_API_CONTENT_TYPE_REMOVE_REQUEST:
     case OUTERSHELLD_API_OPENER_UPSERT_REQUEST:
     case OUTERSHELLD_API_OPENER_REMOVE_REQUEST:
-    case OUTERSHELLD_API_CONTAINER_UPSERT_REQUEST:
-    case OUTERSHELLD_API_CONTAINER_REMOVE_REQUEST:
-    case OUTERSHELLD_API_CONTAINER_LIST_REQUEST:
         return true;
     default:
         return false;
     }
+}
+
+static bool api_container_list_response_append_row(ApiListResponseBuilder *response,
+                                                   const RegistryContainerRecord *record) {
+    size_t row_offset = 0;
+    return api_list_response_append_row(response, CONTAINER_LIST_ROW_SIZE, &row_offset) &&
+           binary_write_u32_at(&response->rows, row_offset, record->flags) &&
+           binary_write_u32_at(&response->rows, row_offset + 4, record->cpus) &&
+           binary_write_u32_at(&response->rows, row_offset + 8, record->memory_in_mb) &&
+           binary_write_u32_at(&response->rows, row_offset + 16, (uint32_t)record->created_at_milliseconds) &&
+           binary_write_u32_at(&response->rows, row_offset + 20, (uint32_t)(record->created_at_milliseconds >> 32)) &&
+           api_list_response_append_string_ref_at(response, &response->rows, row_offset + 24, record->identifier) &&
+           api_list_response_append_string_ref_at(response, &response->rows, row_offset + 32, record->display_name) &&
+           api_list_response_append_string_ref_at(response, &response->rows, row_offset + 40, record->provider_id) &&
+           api_list_response_append_string_ref_at(response, &response->rows, row_offset + 48, record->runtime_name) &&
+           api_list_response_append_string_ref_at(response, &response->rows, row_offset + 56, record->build_context_path) &&
+           api_list_response_finish_row(response);
+}
+
+static void container_registry_changed(void) {
+    mark_backend_event_changed();
+    g_snapshot_generation++;
+    g_snapshot_refresh_ms = 0;
+}
+
+static bool api_command_response_message(StringBuilder *message, int status, const char *stderr_text) {
+    *message = (StringBuilder){0};
+    return binary_append_zero(message, 22) &&
+           binary_write_u16_at(message, 0, OUTERSHELLD_API_COMMAND_RESPONSE) &&
+           binary_write_u32_at(message, 2, (uint32_t)status) &&
+           binary_append_data_ref_at(message, 6, NULL, 0) &&
+           binary_append_data_ref_at(message, 14, stderr_text, stderr_text ? strlen(stderr_text) : 0);
+}
+
+static bool container_registry_reply(const unsigned char *message, size_t message_length, StringBuilder *reply) {
+    uint16_t message_type = read_uint16_le(message);
+    char error[1024] = "";
+    if (message_type == OUTERSHELLD_API_CONTAINER_LIST_REQUEST) {
+        char *identifier = NULL;
+        ApiListResponseBuilder response = {0};
+        RegistryStore store;
+        bool ok = message_length >= 10 &&
+                  api_read_string_ref(message, message_length, 2, &identifier) &&
+                  api_list_response_init(&response, OUTERSHELLD_API_CONTAINER_LIST_RESPONSE, 0, "");
+        if (ok && registry_store_open_user_readonly(&store, error, sizeof(error))) {
+            for (size_t index = 0; ok && index < store.container_count; index++) {
+                const RegistryContainerRecord *record = &store.containers[index];
+                if (identifier && identifier[0] && strcmp(record->identifier, identifier) != 0) continue;
+                ok = api_container_list_response_append_row(&response, record);
+            }
+            registry_store_free(&store);
+        } else {
+            ok = false;
+        }
+        free(identifier);
+        ok = ok && api_list_response_finish(&response);
+        if (!ok) {
+            api_list_response_free(&response);
+            ok = api_list_response_init(&response,
+                                        OUTERSHELLD_API_CONTAINER_LIST_RESPONSE,
+                                        1,
+                                        error[0] ? error : "Invalid container list request.") &&
+                 api_list_response_finish(&response);
+        }
+        *reply = response.message;
+        response.message = (StringBuilder){0};
+        api_list_response_free(&response);
+        return ok;
+    }
+
+    int status = 1;
+    if (message_type == OUTERSHELLD_API_CONTAINER_UPSERT_REQUEST) {
+        ContainerRegistrationRequest request;
+        if (!container_registration_decode(message, message_length, &request)) {
+            snprintf(error, sizeof(error), "Invalid container registration.");
+        } else {
+            if (container_registry_upsert(&request, error, sizeof(error))) {
+                container_registry_changed();
+                status = 0;
+            }
+            container_registration_request_free(&request);
+        }
+    } else {
+        char *identifier = NULL;
+        RegistryStore store;
+        if (message_length < 10 || !api_read_string_ref(message, message_length, 2, &identifier) ||
+            !container_identifier_valid(identifier)) {
+            snprintf(error, sizeof(error), "A container identifier must be a UUID.");
+        } else if (registry_store_open_user_readwrite(&store, error, sizeof(error))) {
+            bool removed = registry_store_remove_container(&store, identifier);
+            if (registry_store_close(&store, removed, error, sizeof(error)) && removed) {
+                container_registry_changed();
+                status = 0;
+            } else if (!error[0]) {
+                snprintf(error, sizeof(error), "No container is registered with that identifier.");
+            }
+        }
+        free(identifier);
+    }
+    if (status != 0 && !error[0]) snprintf(error, sizeof(error), "The container registration failed.");
+    if (status != 0) strncat(error, "\n", sizeof(error) - strlen(error) - 1);
+    return api_command_response_message(reply, status, status ? error : NULL);
+}
+
+static bool process_api_container_registry_request(ReactorClient *client,
+                                                   const unsigned char *message,
+                                                   size_t message_length) {
+    StringBuilder reply = {0};
+    if (container_registry_reply(message, message_length, &reply)) api_send_frame(client->fd, &reply);
+    free(reply.data);
+    return false;
+}
+
+static bool container_response_message(StringBuilder *message, int status, const char *error,
+                                       const void *snapshot, size_t snapshot_length) {
+    *message = (StringBuilder){0};
+    return binary_append_zero(message, 30) &&
+           binary_write_u16_at(message, 0, OUTERSHELLD_API_CONTAINER_RESPONSE) &&
+           binary_write_u32_at(message, 2, (uint32_t)status) &&
+           binary_append_data_ref_at(message, 6, error, error ? strlen(error) : 0) &&
+           binary_append_data_ref_at(message, 14, NULL, 0) &&
+           binary_append_data_ref_at(message, 22, snapshot, snapshot_length);
+}
+
+static void api_send_container_error(int fd, const char *error) {
+    StringBuilder message;
+    if (container_response_message(&message, 1, error, NULL, 0)) api_send_frame(fd, &message);
+    free(message.data);
+}
+
+static bool api_message_is_container_management(uint16_t message_type) {
+    switch (message_type) {
+    case OUTERSHELLD_API_CONTAINER_UPSERT_REQUEST:
+    case OUTERSHELLD_API_CONTAINER_REMOVE_REQUEST:
+    case OUTERSHELLD_API_CONTAINER_LIST_REQUEST:
+    case OUTERSHELLD_API_CONTAINER_ENVIRONMENTS_REQUEST:
+    case OUTERSHELLD_API_CONTAINER_REQUEST:
+    case OUTERSHELLD_API_CONTAINER_SNAPSHOT_REQUEST:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool api_client_may_send(const ReactorClient *client, uint16_t message_type, const char **reason) {
+    if (g_container_guest && api_message_is_container_management(message_type)) {
+        *reason = "Container management is only available on the host.";
+        return false;
+    }
+    if (api_message_is_container_management(message_type) && client->has_peer_uid &&
+        client->peer_uid != geteuid() && client->peer_uid != 0) {
+        *reason = "Only this user can manage these containers.";
+        return false;
+    }
+    return true;
 }
 
 static bool process_api_client_request(ReactorClient *client, char *request, size_t n) {
@@ -14035,6 +14084,41 @@ static bool process_api_client_request(ReactorClient *client, char *request, siz
     const unsigned char *message = (const unsigned char *)request + 4;
     size_t message_length = n - 4;
     uint16_t message_type = read_uint16_le(message);
+    const char *refusal = NULL;
+    if (!api_client_may_send(client, message_type, &refusal)) {
+        if (message_type == OUTERSHELLD_API_CONTAINER_LIST_REQUEST) {
+            ApiListResponseBuilder response = {0};
+            api_send_list_response_frame(client->fd, &response, false, OUTERSHELLD_API_CONTAINER_LIST_RESPONSE, refusal);
+            return false;
+        }
+        StringBuilder error = {0};
+        sb_append(&error, refusal);
+        sb_append(&error, "\n");
+        api_send_command_response(client->fd, 1, &(StringBuilder){0}, &error);
+        free(error.data);
+        return false;
+    }
+    if (message_type == OUTERSHELLD_API_CONTAINER_UPSERT_REQUEST ||
+        message_type == OUTERSHELLD_API_CONTAINER_REMOVE_REQUEST ||
+        message_type == OUTERSHELLD_API_CONTAINER_LIST_REQUEST) {
+        return process_api_container_registry_request(client, message, message_length);
+    }
+    if (message_type == OUTERSHELLD_API_CONTAINER_REQUEST) {
+        g_snapshot_generation++;
+        g_snapshot_refresh_ms = 0;
+        if (start_provider_request(client, (const char *)message, message_length)) {
+            client->provider_container_query = true;
+            return true;
+        }
+        api_send_container_error(client->fd, "The registered container provider is unavailable.");
+        return false;
+    }
+    if (message_type == OUTERSHELLD_API_CONTAINER_SNAPSHOT_REQUEST) {
+        g_snapshot_requested_ms = monotonic_milliseconds();
+        client->waiting_for_snapshot = true;
+        client->waiting_for_snapshot_message = true;
+        return true;
+    }
     if (message_type == OUTERSHELLD_API_CONTAINER_ENVIRONMENTS_REQUEST) {
         const unsigned char query[] = {'O', 'S', 'E', 'D', 1, 0, 0, 0};
         if (message_length == 2 && start_provider_request(client, (const char *)query, sizeof(query))) {
@@ -14280,6 +14364,7 @@ static void close_reactor_client(ReactorClient *clients, size_t *client_count, s
 }
 
 static void maintain_container_snapshot(ReactorClient *clients, size_t *count) {
+    if (g_container_guest) return;
     int64_t now = monotonic_milliseconds();
     bool busy = false;
     for (size_t i = 0; i < *count; i++) {
@@ -14289,12 +14374,24 @@ static void maintain_container_snapshot(ReactorClient *clients, size_t *count) {
         ReactorClient *client = &clients[i - 1];
         if (!client->waiting_for_snapshot) continue;
         if (!g_container_snapshot.data && !g_snapshot_refresh_failed) continue;
+        if (client->waiting_for_snapshot_message) {
+            StringBuilder message;
+            if (container_response_message(&message,
+                                           g_container_snapshot.data ? 0 : 1,
+                                           g_container_snapshot.data ? NULL : "Container discovery failed. Retrying…",
+                                           g_container_snapshot.data,
+                                           g_container_snapshot.length)) {
+                api_send_frame(client->fd, &message);
+            }
+            free(message.data);
+            close_reactor_client(clients, count, i - 1);
+            continue;
+        }
         UiApiResponse response = {0};
         response.status = g_container_snapshot.data ? 200 : 503;
-        response.content_kind = UI_API_CONTENT_BINARY;
-        const char *error = "{\"error\":\"Container discovery failed. Retrying…\"}";
+        response.content_kind = g_container_snapshot.data ? UI_API_CONTENT_BINARY : UI_API_CONTENT_TEXT;
         response.body = g_container_snapshot.data ? g_container_snapshot : (StringBuilder){0};
-        if (!g_container_snapshot.data) sb_append(&response.body, error);
+        if (!g_container_snapshot.data) sb_append(&response.body, "Container discovery failed. Retrying…\n");
         api_send_ui_response(client->fd, &response);
         if (!g_container_snapshot.data) free(response.body.data);
         close_reactor_client(clients, count, i - 1);
@@ -14306,8 +14403,8 @@ static void maintain_container_snapshot(ReactorClient *clients, size_t *count) {
     if (!g_safe_space_request_callback && (!provider || !provider[0])) { g_snapshot_refresh_failed = true; return; }
     ReactorClient job = {.fd = -1, .api_response_fd = -1, .provider_output_fd = -1,
                          .provider_snapshot = true, .snapshot_generation = g_snapshot_generation};
-    const char *request = "{\"operation\":\"list\",\"requestID\":\"snapshot\",\"overview\":true}";
-    if (start_provider_request(&job, request, strlen(request))) {
+    unsigned char request[24] = {OUTERSHELLD_API_CONTAINER_REQUEST, 0, 0, 0, OUTERSHELLD_CONTAINER_REQUEST_OVERVIEW};
+    if (start_provider_request(&job, (const char *)request, sizeof(request))) {
         clients[(*count)++] = job;
     } else {
         g_snapshot_refresh_failed = true;
@@ -14596,7 +14693,7 @@ static void run_api_reactor(int api_listener) {
 }
 
 static void outershelld_usage(const char *program) {
-    fprintf(stderr, "Usage: %s [--api-socket-path PATH] [--database PATH] [--system-database PATH] [--bundled-apps-dir DIR] [--web-root DIR] [--public-base-url URL] [--service-manager system|internal] [--services-dir DIR] [--stay-alive]\n", program);
+    fprintf(stderr, "Usage: %s [--api-socket-path PATH] [--database PATH] [--system-database PATH] [--bundled-apps-dir DIR] [--web-root DIR] [--public-base-url URL] [--service-manager system|internal] [--services-dir DIR] [--stay-alive] [--container-guest]\n", program);
 }
 
 static void initialize_runtime_paths(char *api_socket_path, size_t api_socket_path_size) {
@@ -14638,6 +14735,8 @@ int OuterShelldMain(int argc, char **argv) {
             expand_tilde_path(argv[++i], g_system_registry_database_path, sizeof(g_system_registry_database_path));
         } else if (strcmp(argv[i], "--stay-alive") == 0) {
             g_stay_alive_when_socket_idle = true;
+        } else if (strcmp(argv[i], "--container-guest") == 0) {
+            g_container_guest = true;
         } else if (strcmp(argv[i], "--service-manager") == 0 && i + 1 < argc) {
             service_manager = argv[++i];
             if (strcmp(service_manager, "system") != 0 && strcmp(service_manager, "internal") != 0) {

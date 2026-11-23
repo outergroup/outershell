@@ -56,6 +56,15 @@ require_file "${REPO_ROOT}/Resources/OuterShellWeb/style.css"
 require_file "${REPO_ROOT}/Resources/OuterShellWeb/app.js"
 require_file "${REPO_ROOT}/Resources/outershell-container-provider"
 for arch in aarch64 x86_64; do
+    for tool in outershelld outerctl outershell-socket-bridge; do
+        built="${PACKAGE_ROOT}/RemoteLinuxBinariesMusl/${arch}/${tool}"
+        staged="${RUN_ROOT}/container-bootstrap/bin/${arch}/${tool}"
+        if [[ -x "${built}" && -e "${staged}" && "${built}" -nt "${staged}" ]]; then
+            install -m 0755 "${built}" "${staged}"
+        fi
+    done
+done
+for arch in aarch64 x86_64; do
     require_file "${RUN_ROOT}/container-bootstrap/bin/${arch}/outershelld"
     require_file "${RUN_ROOT}/container-bootstrap/bin/${arch}/outerctl"
     require_file "${RUN_ROOT}/container-bootstrap/bin/${arch}/outershell-socket-bridge"

@@ -331,10 +331,16 @@ outerctl resource get --key test/binary >"$build_dir/resource-removed.bin"
 [ ! -s "$build_dir/resource-removed.bin" ]
 
 legacy_container_id="b1d7e6a4-0c55-4a51-9d0c-2f6f1f0e6a31"
+python3 - "$state_dir/registry.orwa" <<'PYROWS'
+import struct, sys
+data = open(sys.argv[1], 'rb').read()
+assert struct.unpack_from('<I', data, 8 + 7 * 20 + 16)[0] == 120, 'container rows were not rewritten'
+PYROWS
 outerctl container list >"$build_dir/legacy-container.tsv"
 awk -F '\t' -v id="$legacy_container_id" '
-    NR == 1 && $8 == "memory_mb" { header = 1 }
-    $1 == id && $7 == "2" && $8 == "3072" && $9 == "1" { found = 1 }
+    NR == 1 && $5 == "build_context" && $8 == "self_modifying" && $10 == "memory_mb" { header = 1 }
+    $1 == id && $4 == "legacy-runtime" && $5 == "" && $6 == "1" && $7 == "1" && $8 == "1" &&
+        $9 == "2" && $10 == "3072" && $11 == "1787616000000" { found = 1 }
     END { exit !(header && found) }
 ' "$build_dir/legacy-container.tsv"
 outerctl container remove --container "$legacy_container_id"
@@ -345,19 +351,123 @@ outerctl container upsert \
     --name Science \
     --provider docker \
     --runtime-name science-runtime \
-    --project-key containers/science/configuration \
     --created-at-milliseconds 1787616000000 \
     --cpus 6 \
     --memory-mb 1536 \
-    --outershell-owns false
+    --outershell-owns-runtime false
 outerctl container list >"$build_dir/container.tsv"
 awk -F '\t' -v id="$container_id" '
-    NR == 2 && $1 == id && $2 == "Science" && $3 == "docker" &&
-        $4 == "science-runtime" && $5 == "containers/science/configuration" &&
-        $7 == "6" && $8 == "1536" && $9 == "0" { found = 1 }
+    NR == 2 && $1 == id && $2 == "Science" && $3 == "docker" && $4 == "science-runtime" && $5 == "" &&
+        $6 == "0" && $7 == "0" && $8 == "0" && $9 == "6" && $10 == "1536" { found = 1 }
     END { exit !found }
 ' "$build_dir/container.tsv"
+
+outerctl container upsert --container "$container_id" --name "Science renamed"
+outerctl container list --container "$container_id" >"$build_dir/renamed.tsv"
+awk -F '\t' 'NR == 2 && $2 == "Science renamed" && $4 == "science-runtime" && $9 == "6" { found = 1 } END { exit !found }' \
+    "$build_dir/renamed.tsv"
+
+mkdir -p "$build_dir/context"
+context="$(cd "$build_dir/context" && pwd -P)"
+outerctl container upsert --container "$container_id" --build-context "$build_dir/context"
+outerctl container list --container "$container_id" >"$build_dir/sealed.tsv"
+awk -F '\t' -v path="$context" 'NR == 2 && $5 == path && $7 == "0" && $8 == "0" { found = 1 } END { exit !found }' \
+    "$build_dir/sealed.tsv"
+outerctl container upsert --container "$container_id" --build-context "$build_dir/context" --self-modifying \
+    2>"$build_dir/warning.txt"
+grep -q "will be able to modify $context" "$build_dir/warning.txt"
+outerctl container list --container "$container_id" >"$build_dir/self-modifying.tsv"
+awk -F '\t' -v path="$context" 'NR == 2 && $5 == path && $8 == "1" { found = 1 } END { exit !found }' \
+    "$build_dir/self-modifying.tsv"
+
+expect_refusal() {
+    message="$1"
+    shift
+    if "$@" >"$build_dir/refusal.out" 2>&1; then
+        printf 'expected refusal (%s) but the command succeeded\n' "$message" >&2
+        exit 1
+    fi
+    grep -q "$message" "$build_dir/refusal.out" || {
+        printf 'expected "%s", got:\n' "$message" >&2
+        cat "$build_dir/refusal.out" >&2
+        exit 1
+    }
+}
+expect_refusal "cannot include or be inside Outer Shell" \
+    outerctl container upsert --container "$container_id" --build-context "$build_dir/home" --self-modifying
+expect_refusal "cannot include or be inside Outer Shell" \
+    outerctl container upsert --container "$container_id" --build-context "$state_dir" --self-modifying
+expect_refusal "not both" \
+    outerctl container upsert --container "$container_id" --build-context "$build_dir/context" --outershell-build-context
+expect_refusal "needs a provider and runtime" \
+    outerctl container upsert --container 6f1c1a52-8a35-4f0e-9b43-2a9c1b7e5d10 --name Orphan
+expect_refusal "must be a UUID" \
+    outerctl container upsert --container not-a-uuid --name Bad --provider docker --runtime-name bad
+outerctl container list --container "$container_id" >"$build_dir/after-refusals.tsv"
+cmp "$build_dir/self-modifying.tsv" "$build_dir/after-refusals.tsv"
+
+ln -s "$context" "$build_dir/context-link"
+python3 - "$api_socket" "$container_id" "$build_dir/context-link" "$context" <<'PYRAW'
+import socket, struct, sys
+api, identifier, link, context = sys.argv[1:]
+
+def upsert(flags, mask, path):
+    refs = [identifier, "", "", "", path]
+    head = struct.pack('<HHIIIIQ', 31, 0, flags, mask, 0, 0, 0)
+    message = bytearray(head + bytes(8 * len(refs)))
+    for index, value in enumerate(refs):
+        value = value.encode()
+        struct.pack_into('<II', message, len(head) + index * 8, len(message), len(value))
+        message.extend(value)
+    with socket.socket(socket.AF_UNIX) as connection:
+        connection.settimeout(5)
+        connection.connect(api)
+        connection.sendall(struct.pack('<I', len(message)) + message)
+        def exact(count):
+            data = b''
+            while len(data) < count:
+                block = connection.recv(count - len(data))
+                assert block
+                data += block
+            return data
+        reply = exact(struct.unpack('<I', exact(4))[0])
+    offset, length = struct.unpack_from('<II', reply, 14)
+    return struct.unpack_from('<I', reply, 2)[0], reply[offset:offset + length].decode()
+
+status, error = upsert(0, 0x04, link)
+assert status == 1 and 'canonical path' in error, (status, error)
+status, error = upsert(0x04, 0x04, context)
+assert status == 1 and 'Outer Shell chooses it' in error, (status, error)
+status, error = upsert(0x08, 0x04, '')
+assert status == 1 and 'needs a build context' in error, (status, error)
+status, error = upsert(0, 0x80, '')
+assert status == 1 and 'unknown fields' in error, (status, error)
+PYRAW
+
 outerctl container remove --container "$container_id"
+expect_refusal "No container is registered" outerctl container remove --container "$container_id"
 [ "$(outerctl container list | wc -l | tr -d ' ')" -eq 1 ]
+
+guest_socket="$build_dir/guest.socket"
+mkdir -p "$build_dir/guest/services"
+HOME="$build_dir/guest" OUTERSHELL_HOME="$build_dir/guest" "$build_dir/outershelld" \
+    --service-manager internal \
+    --services-dir "$build_dir/guest/services" \
+    --api-socket-path "$guest_socket" \
+    --stay-alive --container-guest >"$build_dir/guest.log" 2>&1 &
+guest_pid=$!
+attempts=100
+while [ "$attempts" -gt 0 ] && [ ! -S "$guest_socket" ]; do
+    sleep 0.05
+    attempts=$((attempts - 1))
+done
+guest_outerctl() {
+    OUTERSHELLD_API_SOCKET="$guest_socket" "$build_dir/outerctl" "$@"
+}
+expect_refusal "only available on the host" \
+    guest_outerctl container upsert --container "$container_id" --name Guest --provider docker --runtime-name guest
+expect_refusal "only available on the host" guest_outerctl container list
+kill -TERM "$guest_pid" >/dev/null 2>&1 || true
+wait "$guest_pid" >/dev/null 2>&1 || true
 
 printf 'multi-row registry list response round-trip test passed\n'

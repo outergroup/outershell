@@ -29,6 +29,36 @@ For any other agent, add it to the Dockerfile:
 These snippets are ordinary Dockerfile instructions. They can be used in Outer
 Shell, `docker build`, or any OCI builder that supports Dockerfile syntax.
 
+## Use a build context from anywhere
+
+A container's build context does not have to live in Outer Shell's folder. Any
+folder with a Dockerfile can be one, such as a folder in a project you keep
+under version control. Build or create the container however you like, then
+register it from a terminal on the server:
+
+```sh
+outerctl container upsert --container "$(uuidgen | tr A-Z a-z)" \
+  --name Science --provider docker --runtime-name science \
+  --build-context ~/projects/science-env --outershell-owns-runtime true
+outerctl container rebuild --container ID --wait
+```
+
+Outer Shell then builds, runs, and rebuilds it from that folder, the same as
+a container it created. It never deletes a folder you registered.
+
+By default a registered folder is sealed: the container cannot see it. Add
+`--self-modifying` to mount it read-write at `/var/lib/outershell/project`, so
+coding agents in the container can edit the Dockerfile and the files beside it.
+Only do this for a folder you are comfortable letting the container change;
+`outerctl` prints a warning, and Outer Shell refuses folders that contain its
+own state. Containers Outer Shell creates are self-modifying, and you can turn
+this off or on in the container's Runtime settings.
+
+`outerctl container list` shows every registered container with its build
+context, and `outerctl container describe --container ID` shows one
+container's state. Registration commands work only on the host; inside a
+container, `outerctl` cannot register or change containers.
+
 ## Persistent storage and sharing
 
 New containers store Dockerfile `VOLUME` paths in named Linux volumes managed by

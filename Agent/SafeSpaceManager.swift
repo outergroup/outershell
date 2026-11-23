@@ -37,7 +37,7 @@ private struct OuterShellRegistryContainerRecord {
     var displayName: UnsafeMutablePointer<CChar>?
     var providerID: UnsafeMutablePointer<CChar>?
     var runtimeName: UnsafeMutablePointer<CChar>?
-    var projectResourceKey: UnsafeMutablePointer<CChar>?
+    var buildContextPath: UnsafeMutablePointer<CChar>?
     var createdAtMilliseconds: UInt64
     var cpus: UInt32
     var memoryInMB: UInt32
@@ -72,7 +72,12 @@ private func outerShellRegistryFreeContainers(
     _ count: Int
 )
 
-private let outerShellRegistryContainerOwnedFlag: UInt32 = 0x01
+@_silgen_name("OuterShellRegistryContainerRecordSize")
+private func outerShellRegistryContainerRecordSize() -> Int
+
+private let outerShellRegistryContainerOwnsRuntimeFlag: UInt32 = 0x01
+private let outerShellRegistryContainerOwnsBuildContextFlag: UInt32 = 0x04
+private let outerShellRegistryContainerSelfModifyingFlag: UInt32 = 0x08
 
 private let currentSafeSpaceConfigurationVersion = 14
 private let defaultContainerBaseImage = "debian:bookworm"
@@ -98,6 +103,16 @@ private let containerTransferAppend: UInt16 = 2
 private let containerTransferRequestHeaderSize = 48
 private let containerTransferResponseHeaderSize = 40
 private let containerTransferMaximumChunkSize = 16_000_000
+private let containerRequestMessageType: UInt16 = 35
+private let containerResponseMessageType: UInt16 = 109
+private let containerRequestOverviewFlag: UInt32 = 0x01
+private let containerOperations = [
+    "list", "checkRuntimes", "containerStorage", "cleanContainerStorage", "cleanContainerBuildCache",
+    "create", "duplicate", "changeRuntime", "rename", "start", "stop", "restart", "delete",
+    "mountFolder", "unmountFolder", "chooseFolder", "updateDockerfile", "updateContainerConfiguration",
+    "updateResources", "rebuild", "startApp", "stopApp", "restartApp", "appLogs", "publishSocket",
+    "prepareShare", "beginImport", "cancelImport", "finishImport",
+]
 
 private struct SafeSpaceRecord: Codable {
     var id: UUID
@@ -107,8 +122,10 @@ private struct SafeSpaceRecord: Codable {
     var memoryInMB: Int
     var runtimeProviderID: String?
     var runtimeName: String? = nil
-    var projectResourceKey: String? = nil
     var ownsContainer: Bool? = nil
+    var buildContextPath: String? = nil
+    var ownsBuildContext: Bool? = nil
+    var selfModifying: Bool? = nil
 }
 
 private enum SafeSpaceRuntimeProviderID: String {
@@ -153,6 +170,8 @@ private struct SafeSpaceConfiguration: Codable {
     var persistentData: [SafeSpacePersistentData]?
     var realizedCPUs: Int?
     var realizedMemoryInMB: Int?
+    var realizedBuildContextPath: String?
+    var realizedSelfModifying: Bool?
 }
 
 private struct SafeSpaceEnvironmentVariable: Codable, Equatable {
@@ -332,7 +351,18 @@ final class SafeSpaceManager: @unchecked Sendable {
     private let containerBaseImageLock = NSRecursiveLock()
     private let imageCleanupQueue = DispatchQueue(label: "org.outershell.image-cleanup")
     private var imageCleanupWork: DispatchWorkItem?
-    private var records: [SafeSpaceRecord] = []
+    private var records: [SafeSpaceRecord] = [] {
+        didSet {
+            let values = Dictionary(uniqueKeysWithValues: records.map {
+                ($0.id, (path: $0.buildContextPath ?? "", selfModifying: recordIsSelfModifying($0)))
+            })
+            buildContextLock.lock()
+            buildContexts = values
+            buildContextLock.unlock()
+        }
+    }
+    private let buildContextLock = NSLock()
+    private var buildContexts: [UUID: (path: String, selfModifying: Bool)] = [:]
     private var cachedApps: [UUID: [SafeSpaceCachedApp]] = [:]
     private var publishedForwards: [String: SafeSpaceSocketRelayForward] = [:]
     private let configurationLock = NSRecursiveLock()
@@ -385,6 +415,10 @@ final class SafeSpaceManager: @unchecked Sendable {
     }
 
     private init() {
+        precondition(
+            outerShellRegistryContainerRecordSize() == MemoryLayout<OuterShellRegistryContainerRecord>.stride,
+            "The container registry record layout differs between outershelld and the agent."
+        )
         do {
             try migrateLegacyContainerDirectory()
         } catch {
@@ -457,7 +491,7 @@ final class SafeSpaceManager: @unchecked Sendable {
     private func migrateLegacyDefinition(_ record: inout SafeSpaceRecord) throws {
         let fileManager = FileManager.default
         let legacyDirectory = try legacyBuildContextDirectory(record.id)
-        let directory = try buildContextDirectory(record.id)
+        let directory = try ownedBuildContextDirectory(record.id)
         var isDirectory: ObjCBool = false
         if (try? fileManager.destinationOfSymbolicLink(atPath: legacyDirectory.path)) == nil,
            fileManager.fileExists(atPath: legacyDirectory.path, isDirectory: &isDirectory),
@@ -474,10 +508,6 @@ final class SafeSpaceManager: @unchecked Sendable {
                 try RegistryResourceStore.set(data, for: key)
             }
             try RegistryResourceStore.remove(legacyKey)
-        }
-        if record.projectResourceKey == legacyKey {
-            record.projectResourceKey = key
-            try saveRecord(record)
         }
     }
 
@@ -590,37 +620,90 @@ final class SafeSpaceManager: @unchecked Sendable {
            data.prefix(containerTransferMagic.count) == containerTransferMagic {
             return handleContainerTransfer(data)
         }
-        let requestID: String
+        guard data.count >= 24, data.safeSpaceUInt16(at: 0) == containerRequestMessageType else {
+            return (200, containerResponseMessage(error: SafeSpaceManagerError.invalidRequest))
+        }
+        let operationCode = Int(data.safeSpaceUInt16(at: 2))
+        let flags = data.safeSpaceUInt32(at: 4)
         do {
-            guard let request = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let operation = request["operation"] as? String else {
-                throw SafeSpaceManagerError.invalidRequest
+            guard operationCode < containerOperations.count else {
+                throw SafeSpaceManagerError.commandFailed(
+                    "This container operation is not supported on this Mac."
+                )
             }
-            requestID = request["requestID"] as? String ?? UUID().uuidString
+            let operation = containerOperations[operationCode]
+            let workspaceData = try data.safeSpaceReferencedData(at: 8)
+            let argumentData = try data.safeSpaceReferencedData(at: 16)
+            var request: [String: Any] = [:]
+            if !argumentData.isEmpty {
+                guard let arguments = try OffsetArchive.decodePropertyList(argumentData) as? [String: Any] else {
+                    throw SafeSpaceManagerError.invalidRequest
+                }
+                request = arguments
+            }
+            request["operation"] = operation
+            if !workspaceData.isEmpty {
+                request["workspaceID"] = String(decoding: workspaceData, as: UTF8.self)
+            }
+            let overview = flags & containerRequestOverviewFlag != 0
             if operation == "list", request["configurationOnly"] as? Bool == true {
                 try refreshRecords()
                 let selected = try record(from: request)
-                let body: [String: Any] = [
-                    "requestID": requestID,
-                    "workspaces": [try configurationDictionary(for: selected)]
-                ]
-                return (200, try JSONSerialization.data(withJSONObject: body))
+                return (200, containerResponseMessage(
+                    snapshot: ["workspaces": [try configurationDictionary(for: selected)]]
+                ))
             }
             let extra = try await perform(operation: operation, request: request)
             if operationChangesMenuBarState(operation) {
                 notifyOuterShellSafeSpacesChanged()
             }
             if operation == "appLogs", request["includeWorkspaceSnapshot"] as? Bool == false {
-                var body = extra
-                body["requestID"] = requestID
-                return (200, try JSONSerialization.data(withJSONObject: body))
+                return (200, containerResponseMessage(result: extra))
             }
-            return (200, try await response(requestID: requestID, extra: extra, overview: request["overview"] as? Bool == true))
+            return (200, containerResponseMessage(result: extra, snapshot: [
+                "providers": providerDictionaries(),
+                "workspaces": try await safeSpaceDictionaries(overview: overview)
+            ]))
         } catch {
-            let fallbackRequestID = (try? JSONSerialization.jsonObject(with: data))
-                .flatMap { $0 as? [String: Any] }?["requestID"] as? String ?? UUID().uuidString
-            return (200, errorResponse(requestID: fallbackRequestID, error: error))
+            return (200, containerResponseMessage(error: error))
         }
+    }
+
+    private func containerResponseMessage(error: Error? = nil,
+                                          result: [String: Any] = [:],
+                                          snapshot: [String: Any]? = nil) -> Data {
+        var message = Data()
+        message.safeSpaceAppend(containerResponseMessageType)
+        message.safeSpaceAppend(UInt32(error == nil ? 0 : 1))
+        message.append(Data(repeating: 0, count: 24))
+        let encodedResult = result.isEmpty
+            ? Data()
+            : ((try? OffsetArchive.encodePropertyList(propertyListValue(result) ?? [:])) ?? Data())
+        let encodedSnapshot = snapshot
+            .flatMap { propertyListValue($0) }
+            .flatMap { try? OffsetArchive.encodePropertyList($0) } ?? Data()
+        message.safeSpaceAppendReference(Data((error?.localizedDescription ?? "").utf8), at: 6)
+        message.safeSpaceAppendReference(encodedResult, at: 14)
+        message.safeSpaceAppendReference(encodedSnapshot, at: 22)
+        return message
+    }
+
+    private func propertyListValue(_ value: Any) -> Any? {
+        if value is NSNull { return nil }
+        if let dictionary = value as? [String: Any] {
+            return dictionary.compactMapValues { propertyListValue($0) }
+        }
+        if let array = value as? [Any] {
+            return array.compactMap { propertyListValue($0) }
+        }
+        if value is String || value is Data || value is Date || value is NSNumber || value is Bool ||
+            value is Int || value is Double {
+            return value
+        }
+        if let url = value as? URL {
+            return url.path
+        }
+        return String(describing: value)
     }
 
     private func handleContainerTransfer(_ data: Data) -> (status: Int, data: Data) {
@@ -741,16 +824,6 @@ final class SafeSpaceManager: @unchecked Sendable {
         default:
             return false
         }
-    }
-
-    private func errorResponse(requestID: String, error: Error) -> Data {
-        let body: [String: Any] = [
-            "requestID": requestID,
-            "providers": providerDictionaries(),
-            "workspaces": [],
-            "error": error.localizedDescription
-        ]
-        return (try? JSONSerialization.data(withJSONObject: body)) ?? Data()
     }
 
     func menuBarContainers() async -> [SafeSpaceMenuBarContainer] {
@@ -923,19 +996,6 @@ final class SafeSpaceManager: @unchecked Sendable {
         return [:]
     }
 
-    private func response(requestID: String,
-                          extra: [String: Any] = [:], overview: Bool = false) async throws -> Data {
-        var body: [String: Any] = [
-            "requestID": requestID,
-            "providers": providerDictionaries(),
-            "workspaces": try await safeSpaceDictionaries(overview: overview)
-        ]
-        for (key, value) in extra {
-            body[key] = value
-        }
-        return try JSONSerialization.data(withJSONObject: body, options: [.sortedKeys])
-    }
-
     private let runtimeReadinessLock = NSLock()
     private var runtimeReadinessCache: (date: Date, values: [String: ContainerRuntimeReadiness])?
 
@@ -1034,7 +1094,7 @@ final class SafeSpaceManager: @unchecked Sendable {
 
     private func configurationMounts(for record: SafeSpaceRecord,
                                      configuration: SafeSpaceConfiguration) throws -> [[String: Any]] {
-        var mounts: [[String: Any]] = [[
+        var mounts: [[String: Any]] = recordIsSelfModifying(record) ? [[
             "id": UUID(uuid: (0, 0, 0, 0, 0, 0, 0x40, 0, 0x80, 0, 0, 0, 0, 0, 0, 2)).uuidString,
             "name": "Container project",
             "hostPath": try buildContextDirectory(record.id).path,
@@ -1042,7 +1102,7 @@ final class SafeSpaceManager: @unchecked Sendable {
             "isReadOnly": false,
             "isInfrastructure": true,
             "isBuildContextMount": true
-        ]]
+        ]] : []
         mounts.append(contentsOf: (configuration.mounts ?? []).map {
             [
                 "id": $0.id.uuidString,
@@ -1156,6 +1216,9 @@ final class SafeSpaceManager: @unchecked Sendable {
                 "memoryInMB": record.memoryInMB,
                 "managementKind": ownsContainer ? "managed" : "attached",
                 "ownsContainer": ownsContainer,
+                "ownsBuildContext": ownsContainer && recordOwnsBuildContext(record),
+                "selfModifying": ownsContainer && recordIsSelfModifying(record),
+                "buildContextPath": ownsContainer ? ((try? buildContextDirectory(record.id).path) ?? "") : "",
                 "runtimeName": registeredRuntimeName(for: record),
                 "runtimeKind": runtimeProvider(for: record).runtimeKind,
                 "supportsLiveMounts": runtimeProvider(for: record).supportsLiveMounts,
@@ -1593,8 +1656,9 @@ final class SafeSpaceManager: @unchecked Sendable {
                                      memoryInMB: resources.memoryInMB,
                                      runtimeProviderID: provider.rawValue,
                                      runtimeName: managedContainerName(id),
-                                     projectResourceKey: configurationResourceKey(id),
-                                     ownsContainer: true)
+                                     ownsContainer: true,
+                                     ownsBuildContext: true,
+                                     selfModifying: true)
         try createManagedDirectories(for: record)
         if let requestedBaseImage {
             try saveConfiguration(
@@ -1651,8 +1715,9 @@ final class SafeSpaceManager: @unchecked Sendable {
             memoryInMB: duplicateResources.memoryInMB,
             runtimeProviderID: provider.rawValue,
             runtimeName: managedContainerName(duplicateID),
-            projectResourceKey: configurationResourceKey(duplicateID),
-            ownsContainer: true
+            ownsContainer: true,
+            ownsBuildContext: true,
+            selfModifying: true
         )
         try createManagedDirectories(for: duplicate)
         let sourceBuildContext = try buildContextDirectory(source.id)
@@ -2024,8 +2089,9 @@ final class SafeSpaceManager: @unchecked Sendable {
             cpus: importedResources.cpus, memoryInMB: importedResources.memoryInMB,
             runtimeProviderID: provider.rawValue,
             runtimeName: managedContainerName(importedID),
-            projectResourceKey: configurationResourceKey(importedID),
-            ownsContainer: true
+            ownsContainer: true,
+            ownsBuildContext: true,
+            selfModifying: true
         )
         try createManagedDirectories(for: record)
         let destinationBuildContext = try buildContextDirectory(record.id)
@@ -2383,9 +2449,13 @@ final class SafeSpaceManager: @unchecked Sendable {
             "--memory", "\(runnableResources(record).memoryInMB)M",
             "--init",
         ] + containerRuntimeArguments + [
-            "--label", "org.outershell.container-id=\(record.id.uuidString)",
-            "--volume", "\(try buildContextDirectory(record.id).path):/var/lib/outershell/project"
+            "--label", "org.outershell.container-id=\(record.id.uuidString)"
         ]
+        if recordIsSelfModifying(record) {
+            arguments.append(contentsOf: [
+                "--volume", "\(try checkedBuildContextDirectory(record).path):/var/lib/outershell/project"
+            ])
+        }
         for mount in configuration.mounts ?? [] {
             let suffix = mount.isReadOnly ? ":ro" : ""
             arguments.append(contentsOf: [
@@ -2396,7 +2466,7 @@ final class SafeSpaceManager: @unchecked Sendable {
             for: record,
             imageReference: imageReference
         )
-        var occupiedGuestPaths: Set<String> = ["/var/lib/outershell/project"]
+        var occupiedGuestPaths: Set<String> = recordIsSelfModifying(record) ? ["/var/lib/outershell/project"] : []
         occupiedGuestPaths.formUnion((configuration.mounts ?? []).map(\.guestPath))
         for item in persistentData where !occupiedGuestPaths.contains(item.guestPath) {
             try preparePersistentVolume(record, item: item)
@@ -2432,9 +2502,13 @@ final class SafeSpaceManager: @unchecked Sendable {
             "--memory", "\(runnableResources(record).memoryInMB)m",
             "--init",
         ] + containerRuntimeArguments + [
-            "--label", "org.outershell.container-id=\(record.id.uuidString)",
-            "--volume", "\(try buildContextDirectory(record.id).path):/var/lib/outershell/project"
+            "--label", "org.outershell.container-id=\(record.id.uuidString)"
         ]
+        if recordIsSelfModifying(record) {
+            arguments.append(contentsOf: [
+                "--volume", "\(try checkedBuildContextDirectory(record).path):/var/lib/outershell/project"
+            ])
+        }
         for mount in configuration.mounts ?? [] {
             arguments.append(contentsOf: [
                 "--volume", "\(mount.hostPath):\(mount.guestPath)\(mount.isReadOnly ? ":ro" : "")"
@@ -2444,7 +2518,7 @@ final class SafeSpaceManager: @unchecked Sendable {
             for: record,
             imageReference: imageReference
         )
-        var occupiedGuestPaths: Set<String> = ["/var/lib/outershell/project"]
+        var occupiedGuestPaths: Set<String> = recordIsSelfModifying(record) ? ["/var/lib/outershell/project"] : []
         occupiedGuestPaths.formUnion((configuration.mounts ?? []).map(\.guestPath))
         for item in persistentData where !occupiedGuestPaths.contains(item.guestPath) {
             try preparePersistentVolume(record, item: item)
@@ -3079,7 +3153,7 @@ final class SafeSpaceManager: @unchecked Sendable {
 
     private func updateDockerfile(_ request: [String: Any]) throws -> [String: Any] {
         let selected = try record(from: request)
-        guard let contents = request["command"] as? String else {
+        guard let contents = request["dockerfile"] as? String else {
             throw SafeSpaceManagerError.invalidRequest
         }
         try validateDockerfile(contents)
@@ -3197,6 +3271,9 @@ final class SafeSpaceManager: @unchecked Sendable {
             }
             let hostURL = URL(fileURLWithPath: hostPath, isDirectory: true)
                 .standardizedFileURL
+            if !isReadOnly {
+                try requireUnprotectedPath(hostURL.path, description: "A writable folder mount")
+            }
             var isDirectory: ObjCBool = false
             guard FileManager.default.fileExists(atPath: hostURL.path,
                                                  isDirectory: &isDirectory),
@@ -4113,8 +4190,9 @@ final class SafeSpaceManager: @unchecked Sendable {
             var migrated = try OffsetArchive.decode([SafeSpaceRecord].self, from: legacyData)
             for index in migrated.indices {
                 migrated[index].runtimeName = managedContainerName(migrated[index].id)
-                migrated[index].projectResourceKey = configurationResourceKey(migrated[index].id)
                 migrated[index].ownsContainer = true
+                migrated[index].ownsBuildContext = true
+                migrated[index].selfModifying = true
                 try saveRecord(migrated[index])
             }
             try RegistryResourceStore.remove("containers/records")
@@ -4136,8 +4214,10 @@ final class SafeSpaceManager: @unchecked Sendable {
                 memoryInMB: max(Int(value.memoryInMB), 1),
                 runtimeProviderID: value.providerID.map { String(cString: $0) },
                 runtimeName: value.runtimeName.map { String(cString: $0) },
-                projectResourceKey: value.projectResourceKey.map { String(cString: $0) },
-                ownsContainer: value.flags & outerShellRegistryContainerOwnedFlag != 0
+                ownsContainer: value.flags & outerShellRegistryContainerOwnsRuntimeFlag != 0,
+                buildContextPath: value.buildContextPath.map { String(cString: $0) },
+                ownsBuildContext: value.flags & outerShellRegistryContainerOwnsBuildContextFlag != 0,
+                selfModifying: value.flags & outerShellRegistryContainerSelfModifyingFlag != 0
             )
         }
     }
@@ -4184,29 +4264,30 @@ final class SafeSpaceManager: @unchecked Sendable {
         let identifier = value.id.uuidString.lowercased()
         let providerID = value.runtimeProviderID ?? SafeSpaceRuntimeProviderID.appleContainer.rawValue
         let runtimeName = registeredRuntimeName(for: value)
-        let projectResourceKey = value.projectResourceKey
-            ?? (recordOwnsContainer(value) ? configurationResourceKey(value.id) : "")
+        let buildContextPath = value.buildContextPath ?? ""
+        var flags: UInt32 = 0
+        if recordOwnsContainer(value) { flags |= outerShellRegistryContainerOwnsRuntimeFlag }
+        if recordOwnsBuildContext(value) { flags |= outerShellRegistryContainerOwnsBuildContextFlag }
+        if recordIsSelfModifying(value) { flags |= outerShellRegistryContainerSelfModifyingFlag }
         var error = [CChar](repeating: 0, count: 2048)
         let saved = identifier.withCString { identifierPointer in
             value.name.withCString { displayNamePointer in
                 providerID.withCString { providerPointer in
                     runtimeName.withCString { runtimeNamePointer in
-                        projectResourceKey.withCString { projectKeyPointer in
+                        buildContextPath.withCString { buildContextPointer in
                             var record = OuterShellRegistryContainerRecord(
                                 identifier: UnsafeMutablePointer(mutating: identifierPointer),
                                 displayName: UnsafeMutablePointer(mutating: displayNamePointer),
                                 providerID: UnsafeMutablePointer(mutating: providerPointer),
                                 runtimeName: UnsafeMutablePointer(mutating: runtimeNamePointer),
-                                projectResourceKey: UnsafeMutablePointer(mutating: projectKeyPointer),
+                                buildContextPath: UnsafeMutablePointer(mutating: buildContextPointer),
                                 createdAtMilliseconds: UInt64(max(
                                     value.createdAt.timeIntervalSince1970 * 1000,
                                     0
                                 )),
                                 cpus: UInt32(clamping: value.cpus),
                                 memoryInMB: UInt32(clamping: value.memoryInMB),
-                                flags: recordOwnsContainer(value)
-                                    ? outerShellRegistryContainerOwnedFlag
-                                    : 0
+                                flags: flags
                             )
                             return outerShellRegistryUpsertContainer(
                                 &record,
@@ -4288,9 +4369,11 @@ final class SafeSpaceManager: @unchecked Sendable {
         defer { configurationLock.unlock() }
         let directory = try buildContextDirectory(record.id)
         let normalizedValue = normalizedConfiguration(value)
-        try FileManager.default.createDirectory(at: directory,
-                                                withIntermediateDirectories: true,
-                                                attributes: [.posixPermissions: 0o700])
+        if recordOwnsBuildContext(record) {
+            try FileManager.default.createDirectory(at: directory,
+                                                    withIntermediateDirectories: true,
+                                                    attributes: [.posixPermissions: 0o700])
+        }
         try RegistryResourceStore.set(
             OffsetArchive.encode(normalizedValue),
             for: configurationResourceKey(record.id)
@@ -4303,7 +4386,9 @@ final class SafeSpaceManager: @unchecked Sendable {
                 encoding: .utf8
             )
         }
-        try writeContainerProjectGuide(to: directory)
+        if recordOwnsBuildContext(record) {
+            try writeContainerProjectGuide(to: directory)
+        }
         let legacyContainerfile = directory.appendingPathComponent("Containerfile")
         if FileManager.default.fileExists(atPath: legacyContainerfile.path) {
             try FileManager.default.removeItem(at: legacyContainerfile)
@@ -4337,6 +4422,8 @@ final class SafeSpaceManager: @unchecked Sendable {
         value.realizedPublishedPorts = value.publishedPorts ?? []
         value.realizedCPUs = record.cpus
         value.realizedMemoryInMB = record.memoryInMB
+        value.realizedBuildContextPath = try buildContextDirectory(record.id).path
+        value.realizedSelfModifying = recordIsSelfModifying(record)
         value.hasUntrackedChanges = false
         try saveConfiguration(value, for: record)
         let legacyDirectory = try legacyBuildContextDirectory(record.id)
@@ -4354,12 +4441,14 @@ final class SafeSpaceManager: @unchecked Sendable {
             value.realizedEnvironment.map { $0 != (value.environment ?? []) } == true ||
             value.realizedPublishedPorts.map { $0 != (value.publishedPorts ?? []) } == true ||
             value.realizedCPUs.map { $0 != record.cpus } == true ||
-            value.realizedMemoryInMB.map { $0 != record.memoryInMB } == true
+            value.realizedMemoryInMB.map { $0 != record.memoryInMB } == true ||
+            value.realizedBuildContextPath.map { $0 != (try? buildContextDirectory(record.id).path) } == true ||
+            value.realizedSelfModifying.map { $0 != recordIsSelfModifying(record) } == true
         return [
             "baseImage": value.baseImage,
             "containerfile": dockerfile,
             "dockerfileHostPath": try dockerfileURL(record.id).path,
-            "dockerfileGuestPath": "/var/lib/outershell/project/Dockerfile",
+            "dockerfileGuestPath": recordIsSelfModifying(record) ? "/var/lib/outershell/project/Dockerfile" : "",
             "buildEngineAvailable": runtimeExecutableURL(
                 for: runtimeProvider(for: record)
             ) != nil,
@@ -4559,8 +4648,65 @@ final class SafeSpaceManager: @unchecked Sendable {
         }
     }
 
-    private func buildContextDirectory(_ id: UUID) throws -> URL {
+    private func ownedBuildContextDirectory(_ id: UUID) throws -> URL {
         try safeSpaceDirectory(id).appendingPathComponent("BuildContext", isDirectory: true)
+    }
+
+    private func buildContextDirectory(_ id: UUID) throws -> URL {
+        buildContextLock.lock()
+        let external = buildContexts[id]?.path ?? ""
+        buildContextLock.unlock()
+        return external.isEmpty
+            ? try ownedBuildContextDirectory(id)
+            : URL(fileURLWithPath: external, isDirectory: true)
+    }
+
+    private func checkedBuildContextDirectory(_ record: SafeSpaceRecord) throws -> URL {
+        let directory = try buildContextDirectory(record.id)
+        guard let path = record.buildContextPath, !path.isEmpty else {
+            return directory
+        }
+        var status = stat()
+        let resolved = realpath(path, nil).map { pointer -> String in
+            defer { free(pointer) }
+            return String(cString: pointer)
+        }
+        guard lstat(path, &status) == 0, (status.st_mode & S_IFMT) == S_IFDIR, resolved == path else {
+            throw SafeSpaceManagerError.commandFailed(
+                "The registered build context must be an existing folder that is not a link."
+            )
+        }
+        if recordIsSelfModifying(record) {
+            try requireUnprotectedPath(path, description: "A self-modifying build context")
+        }
+        return directory
+    }
+
+    private func protectedPaths() -> [String] {
+        var paths = [(try? applicationDirectory().path) ?? ""]
+        if let home = getpwuid(getuid())?.pointee.pw_dir {
+            paths.append(String(cString: home) + "/Library/Application Support/outershell")
+        }
+        return paths.filter { !$0.isEmpty }.map { path in
+            realpath(path, nil).map { pointer -> String in
+                defer { free(pointer) }
+                return String(cString: pointer)
+            } ?? path
+        }
+    }
+
+    private func requireUnprotectedPath(_ path: String, description: String) throws {
+        let resolved = realpath(path, nil).map { pointer -> String in
+            defer { free(pointer) }
+            return String(cString: pointer)
+        } ?? path
+        for protected in protectedPaths() where
+            resolved == protected || resolved.hasPrefix(protected + "/") || protected.hasPrefix(resolved + "/") ||
+            resolved == "/" {
+            throw SafeSpaceManagerError.commandFailed(
+                "\(description) cannot include or be inside Outer Shell's own folders."
+            )
+        }
     }
 
     private func dockerfileURL(_ id: UUID) throws -> URL {
@@ -5079,6 +5225,14 @@ final class SafeSpaceManager: @unchecked Sendable {
         record.ownsContainer ?? true
     }
 
+    private func recordOwnsBuildContext(_ record: SafeSpaceRecord) -> Bool {
+        record.ownsBuildContext ?? recordOwnsContainer(record)
+    }
+
+    private func recordIsSelfModifying(_ record: SafeSpaceRecord) -> Bool {
+        record.selfModifying ?? recordOwnsBuildContext(record)
+    }
+
     private func requireManagedContainer(_ record: SafeSpaceRecord) throws {
         guard recordOwnsContainer(record) else {
             throw SafeSpaceManagerError.commandFailed(
@@ -5259,7 +5413,7 @@ final class SafeSpaceManager: @unchecked Sendable {
             try ensureSupportImage(for: runtimeProvider(for: record))
         }
         try saveConfiguration(value, for: record)
-        let directory = try buildContextDirectory(record.id)
+        let directory = try checkedBuildContextDirectory(record)
         updateBuildProgressPhase(
             "building",
             detail: "Building the container image",
@@ -5606,227 +5760,6 @@ final class SafeSpaceManager: @unchecked Sendable {
             throw SafeSpaceManagerError.commandFailed(
                 message.isEmpty ? "Could not \(action)." : message
             )
-        }
-    }
-}
-
-private enum OffsetArchiveError: Error, LocalizedError {
-    case invalidFormat
-    case unsupportedValue
-
-    var errorDescription: String? {
-        switch self {
-        case .invalidFormat:
-            return "The binary catalog resource is invalid."
-        case .unsupportedValue:
-            return "The binary catalog contains an unsupported value."
-        }
-    }
-}
-
-private enum OffsetArchive {
-    private static let headerSize = 16
-    private static let nodeSize = 24
-
-    static func encode<Value: Encodable>(_ value: Value) throws -> Data {
-        let encoder = PropertyListEncoder()
-        encoder.outputFormat = .binary
-        let propertyListData = try encoder.encode(value)
-        let propertyList = try PropertyListSerialization.propertyList(
-            from: propertyListData,
-            options: [],
-            format: nil
-        )
-        var writer = Writer()
-        let rootOffset = try writer.append(propertyList)
-        writer.data.safeSpaceWrite(rootOffset, at: 8)
-        return writer.data
-    }
-
-    static func decode<Value: Decodable>(_ type: Value.Type, from data: Data) throws -> Value {
-        let propertyList = try Reader(data: data).root()
-        let propertyListData = try PropertyListSerialization.data(
-            fromPropertyList: propertyList,
-            format: .binary,
-            options: 0
-        )
-        return try PropertyListDecoder().decode(type, from: propertyListData)
-    }
-
-    private struct Writer {
-        var data: Data = {
-            var value = Data("ORWV".utf8)
-            value.safeSpaceAppend(UInt32(1))
-            value.safeSpaceAppend(UInt64(0))
-            return value
-        }()
-
-        mutating func append(_ value: Any) throws -> UInt64 {
-            if let dictionary = value as? [String: Any] {
-                var entries: [(UInt64, UInt64)] = []
-                for key in dictionary.keys.sorted() {
-                    guard let item = dictionary[key] else {
-                        throw OffsetArchiveError.invalidFormat
-                    }
-                    entries.append((try append(key), try append(item)))
-                }
-                let payloadOffset = UInt64(data.count)
-                for entry in entries {
-                    data.safeSpaceAppend(entry.0)
-                    data.safeSpaceAppend(entry.1)
-                }
-                return appendNode(type: 8, value: payloadOffset, count: UInt64(entries.count))
-            }
-            if let array = value as? [Any] {
-                let offsets = try array.map { try append($0) }
-                let payloadOffset = UInt64(data.count)
-                for offset in offsets {
-                    data.safeSpaceAppend(offset)
-                }
-                return appendNode(type: 7, value: payloadOffset, count: UInt64(offsets.count))
-            }
-            if let string = value as? String {
-                let bytes = Data(string.utf8)
-                let payloadOffset = UInt64(data.count)
-                data.append(bytes)
-                return appendNode(type: 5, value: payloadOffset, count: UInt64(bytes.count))
-            }
-            if let bytes = value as? Data {
-                let payloadOffset = UInt64(data.count)
-                data.append(bytes)
-                return appendNode(type: 6, value: payloadOffset, count: UInt64(bytes.count))
-            }
-            if let date = value as? Date {
-                return appendNode(type: 9,
-                                  value: date.timeIntervalSince1970.bitPattern,
-                                  count: 0)
-            }
-            if let number = value as? NSNumber {
-                if CFGetTypeID(number) == CFBooleanGetTypeID() {
-                    return appendNode(type: 2, value: number.boolValue ? 1 : 0, count: 0)
-                }
-                let encoding = String(cString: number.objCType)
-                if "csilqCSILQ".contains(encoding) {
-                    return appendNode(type: 3,
-                                      value: UInt64(bitPattern: number.int64Value),
-                                      count: 0)
-                }
-                return appendNode(type: 4, value: number.doubleValue.bitPattern, count: 0)
-            }
-            throw OffsetArchiveError.unsupportedValue
-        }
-
-        private mutating func appendNode(type: UInt8,
-                                         value: UInt64,
-                                         count: UInt64) -> UInt64 {
-            let offset = UInt64(data.count)
-            data.append(type)
-            data.append(contentsOf: [UInt8](repeating: 0, count: 7))
-            data.safeSpaceAppend(value)
-            data.safeSpaceAppend(count)
-            return offset
-        }
-    }
-
-    private struct Reader {
-        let data: Data
-
-        func root() throws -> Any {
-            guard data.count >= OffsetArchive.headerSize,
-                  data.prefix(4) == Data("ORWV".utf8),
-                  data.safeSpaceUInt32(at: 4) == 1 else {
-                throw OffsetArchiveError.invalidFormat
-            }
-            return try value(at: data.safeSpaceUInt64(at: 8), depth: 0)
-        }
-
-        private func value(at rawOffset: UInt64, depth: Int) throws -> Any {
-            guard depth < 128,
-                  rawOffset <= UInt64(Int.max) else {
-                throw OffsetArchiveError.invalidFormat
-            }
-            let offset = Int(rawOffset)
-            guard offset >= OffsetArchive.headerSize,
-                  offset <= data.count,
-                  OffsetArchive.nodeSize <= data.count - offset else {
-                throw OffsetArchiveError.invalidFormat
-            }
-            let type = data[data.index(data.startIndex, offsetBy: offset)]
-            let payload = data.safeSpaceUInt64(at: offset + 8)
-            let count = data.safeSpaceUInt64(at: offset + 16)
-            switch type {
-            case 2:
-                return payload != 0
-            case 3:
-                return NSNumber(value: Int64(bitPattern: payload))
-            case 4:
-                return NSNumber(value: Double(bitPattern: payload))
-            case 5:
-                let bytes = try referencedData(offset: payload, length: count)
-                guard let text = String(data: bytes, encoding: .utf8) else {
-                    throw OffsetArchiveError.invalidFormat
-                }
-                return text
-            case 6:
-                return try referencedData(offset: payload, length: count)
-            case 7:
-                guard count <= UInt64(Int.max),
-                      payload <= UInt64(Int.max) else {
-                    throw OffsetArchiveError.invalidFormat
-                }
-                let arrayOffset = Int(payload)
-                let arrayCount = Int(count)
-                guard arrayOffset <= data.count,
-                      arrayCount <= (data.count - arrayOffset) / 8 else {
-                    throw OffsetArchiveError.invalidFormat
-                }
-                return try (0..<arrayCount).map {
-                    try value(at: data.safeSpaceUInt64(at: arrayOffset + $0 * 8),
-                              depth: depth + 1)
-                }
-            case 8:
-                guard count <= UInt64(Int.max),
-                      payload <= UInt64(Int.max) else {
-                    throw OffsetArchiveError.invalidFormat
-                }
-                let dictionaryOffset = Int(payload)
-                let dictionaryCount = Int(count)
-                guard dictionaryOffset <= data.count,
-                      dictionaryCount <= (data.count - dictionaryOffset) / 16 else {
-                    throw OffsetArchiveError.invalidFormat
-                }
-                var dictionary: [String: Any] = [:]
-                for index in 0..<dictionaryCount {
-                    let entryOffset = dictionaryOffset + index * 16
-                    guard let key = try value(
-                        at: data.safeSpaceUInt64(at: entryOffset),
-                        depth: depth + 1
-                    ) as? String else {
-                        throw OffsetArchiveError.invalidFormat
-                    }
-                    dictionary[key] = try value(
-                        at: data.safeSpaceUInt64(at: entryOffset + 8),
-                        depth: depth + 1
-                    )
-                }
-                return dictionary
-            case 9:
-                return Date(timeIntervalSince1970: Double(bitPattern: payload))
-            default:
-                throw OffsetArchiveError.invalidFormat
-            }
-        }
-
-        private func referencedData(offset: UInt64, length: UInt64) throws -> Data {
-            guard offset <= UInt64(Int.max), length <= UInt64(Int.max) else {
-                throw OffsetArchiveError.invalidFormat
-            }
-            let start = Int(offset)
-            let count = Int(length)
-            guard start <= data.count, count <= data.count - start else {
-                throw OffsetArchiveError.invalidFormat
-            }
-            return data.subdata(in: start..<(start + count))
         }
     }
 }

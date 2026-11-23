@@ -932,6 +932,9 @@ h1 { margin: 0; font-size: clamp(30px, 5vw, 45px); line-height: 1.05; letter-spa
 .configuration-row > button { min-height: 28px; margin-bottom: 2px; }
 .container-check { display: flex; align-items: center; gap: 8px; margin: 12px 0; font-size: 12px; }
 .container-check input { width: auto; min-height: 0; }
+.build-context { margin-bottom: 16px; }
+.build-context h3 { margin: 0 0 4px; font-size: 13px; }
+.build-context p { margin: 0; overflow-wrap: anywhere; }
 .container-message { font-size: 12px; white-space: pre-wrap; overflow-wrap: anywhere; }
 .managed-mounts { margin-top: 14px; font-size: 11px; overflow-wrap: anywhere; }
 .container-download { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; overflow-wrap: anywhere; }

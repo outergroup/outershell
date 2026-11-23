@@ -28,6 +28,16 @@ static bool container_path_exists(const char *path);
 // A container whose runtime mount still names the legacy "Recipe" folder keeps
 // using it until its next rebuild moves the folder to "BuildContext".
 static char *container_build_context_directory(const char *id) {
+    char *external = container_registered_build_context(id);
+    if (external) {
+        wchar_t *wide = win_wide(external);
+        DWORD attributes = wide ? GetFileAttributesW(wide) : INVALID_FILE_ATTRIBUTES;
+        free(wide);
+        if (attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY) &&
+            !(attributes & FILE_ATTRIBUTE_REPARSE_POINT)) return external;
+        free(external);
+        return NULL;
+    }
     char *legacy = container_legacy_build_context_directory(id);
     if (legacy && container_path_exists(legacy)) return legacy;
     free(legacy);
@@ -98,30 +108,34 @@ static char *container_file(const char *id, const char *name) {
 }
 
 static bool container_write(const char *id, const char *name, const void *data, size_t size) {
+    if (!strncmp(name, "configuration", 13)) {
+        StringBuilder encoded = {0};
+        bool ok = container_value_encode((const char *)data, &encoded) &&
+                  container_resource_set(id, name, encoded.data, encoded.length);
+        free(encoded.data);
+        return ok;
+    }
     char *path = container_file(id, name);
-    StringBuilder encoded = {0};
-    bool binary = !strncmp(name, "configuration", 13);
-    bool ok = !binary || container_value_encode((const char *)data, &encoded);
-    ok = ok && path && win_atomic_write(path, binary ? encoded.data : data, binary ? encoded.length : size);
-    free(encoded.data);
+    bool ok = path && win_atomic_write(path, data, size);
     free(path);
     return ok;
 }
 
 static char *container_read(const char *id, const char *name, const char *fallback) {
-    char *path = container_file(id, name);
     StringBuilder data = {0};
+    if (!strncmp(name, "configuration", 13)) {
+        StringBuilder decoded = {0};
+        bool valid = container_resource_get(id, name, &data) && container_value_decode(&data, &decoded);
+        free(data.data);
+        if (valid) return decoded.data;
+        free(decoded.data);
+        return win_strdup(fallback);
+    }
+    char *path = container_file(id, name);
     bool ok = path && (!strcmp(name, "Dockerfile") ? win_read_regular_file(path, WSL_LIMIT, &data)
                                                    : win_read_file(path, WSL_LIMIT, &data));
     free(path);
-    if (ok && data.data) {
-        if (strncmp(name, "configuration", 13)) return data.data;
-        StringBuilder decoded = {0};
-        bool valid = container_value_decode(&data, &decoded);
-        free(data.data); data = (StringBuilder){0};
-        if (valid) return decoded.data;
-        free(decoded.data);
-    }
+    if (ok && data.data) return data.data;
     free(data.data);
     return win_strdup(fallback);
 }
@@ -773,8 +787,9 @@ static DWORD WINAPI container_rebuild_thread(void *context) {
             ok = container_argument(&args, container_runtime_arguments[i]) && ok;
         StringBuilder mount = {0}; append(&mount, "type=bind,source="); append(&mount, directory);
         append(&mount, ",target=/var/lib/outershell/project");
-        ok = ok && container_argument(&args, "--mount") && container_argument(&args, mount.data) &&
-             container_configuration(config, &args) && container_persistent_arguments(w, d->container, d->id, config, &args) && container_argument(&args, image);
+        if (d->self_modifying || !d->build_context)
+            ok = ok && container_argument(&args, "--mount") && container_argument(&args, mount.data);
+        ok = ok && container_configuration(config, &args) && container_persistent_arguments(w, d->container, d->id, config, &args) && container_argument(&args, image);
         free(mount.data); free(output.data); output = (StringBuilder){0};
         error = "Could not create the replacement container. The existing container was retained.";
         ok = ok && capture_runtime(w, (const char *const *)args.values, &output, d->container);

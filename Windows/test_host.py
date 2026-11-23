@@ -4,6 +4,7 @@ import concurrent.futures
 import json
 import os
 from pathlib import Path
+import runpy
 import struct
 import subprocess
 import sys
@@ -154,7 +155,8 @@ with tempfile.TemporaryDirectory(prefix='outer-c-test-') as temporary:
         assert json.loads(descriptor[data_offset:])['backendsAPIPath'] == '/api/backends'
         assert json.loads(descriptor[data_offset:])['hostPlatform'] == 'windows'
         snapshot_status, snapshot = request(pipe, '/api/container-snapshot')
-        assert snapshot_status == 200 and json.loads(snapshot)['hostPlatform'] == 'windows'
+        codec = runpy.run_path(str(Path(__file__).resolve().parents[1] / 'Resources' / 'outershell-container-provider'))
+        assert snapshot_status == 200 and codec['offset_archive_decode'](snapshot)['hostPlatform'] == 'windows'
         assert request(pipe, '/', method='HEAD', extra=native_header) == (200, b'')
         assert request(pipe, '/backends.outer') == (200, descriptor)
         assert request(pipe, bundle) == (200, b'macos-arm\nmacos-x86\n')

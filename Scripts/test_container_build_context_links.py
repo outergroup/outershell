@@ -93,8 +93,7 @@ class LegacyDefinitionMigrationTests(unittest.TestCase):
                     images.discard(arguments[2])
                 return subprocess.CompletedProcess(arguments, 0, "", "")
 
-            record = {"id": identifier, "ownsContainer": True,
-                      "projectResourceKey": f"containers/{identifier}/recipe"}
+            record = {"id": identifier, "ownsContainer": True}
             with patch.dict(g, container_directory=lambda _: root, docker=docker,
                             registry_resource_get=lambda key: resources.get(key),
                             registry_resource_set=lambda key, value: resources.__setitem__(key, g["offset_archive_encode"](value)),
@@ -106,7 +105,6 @@ class LegacyDefinitionMigrationTests(unittest.TestCase):
             self.assertEqual((legacy / "Dockerfile").read_text(), "FROM debian:bookworm\n")
             self.assertEqual(list(resources), [f"containers/{identifier}/configuration"])
             self.assertEqual(g["offset_archive_decode"](resources[f"containers/{identifier}/configuration"]), {"mounts": [{"id": "m"}]})
-            self.assertEqual(record["projectResourceKey"], f"containers/{identifier}/configuration")
             self.assertEqual(images, {f"outershell/container-{identifier}:latest"})
 
 

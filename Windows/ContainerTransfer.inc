@@ -91,15 +91,7 @@ static bool container_extract(Wsl *w, const char *archive, const char *destinati
 }
 
 static void container_extra_response(Wsl *w, Connection *client, HttpRequest *request, const char *extra) {
-    StringBuilder json = {0}; append(&json, "{");
-    char *request_id = request_string(request, "requestID");
-    if (request_id) { field(&json, "requestID", request_id); append(&json, ","); }
-    if (extra && *extra) { append(&json, extra); append(&json, ","); }
-    EnterCriticalSection(&w->gate);
-    append(&json, w->snapshot.data ? w->snapshot.data + 1 : "\"workspaces\":[]}");
-    LeaveCriticalSection(&w->gate);
-    http_send(client, request, 200, "application/json", json.data, json.length);
-    free(request_id); free(json.data);
+    container_send_reply(w, client, request, NULL, extra, true);
 }
 
 static bool container_write_value_file(const char *directory, const char *name, const char *json) {
@@ -379,7 +371,11 @@ static bool container_import(Wsl *w, HttpRequest *request, StringBuilder *extra,
     }
     if (ok) {
         unsigned cpus = container_number(&record, "cpus", 4), memory = container_number(&record, "memoryInMB", 8192);
-        ok = cpus && cpus <= 128 && memory >= 128 && memory <= 1048576 && save_container_metadata(id, name, cpus, memory);
+        char runtime_name[64];
+        snprintf(runtime_name, sizeof(runtime_name), "outershell-%s", id);
+        ok = cpus && cpus <= 128 && memory >= 128 && memory <= 1048576 &&
+             container_registry_upsert(id, name, !strcmp(provider, "docker") ? RUNTIME_DOCKER : RUNTIME_WSLC,
+                                       runtime_name, cpus, memory, CONTAINER_MANAGED_FLAGS, CONTAINER_SET_ALL);
         if (ok) {
             Distribution *d = win_alloc(sizeof(*d)); d->owner = w; d->id = win_strdup(id); d->name = win_strdup(name);
             d->user = win_strdup("root"); d->runtime_id = win_strdup(""); d->managed = true; d->present = true;
@@ -414,7 +410,7 @@ static bool container_transfer_operation(Wsl *w, Connection *client, HttpRequest
         ok = root && container_tree(root, NULL, 0); free(root); free(id);
     } else if (!strcmp(operation, "finishImport")) ok = container_import(w, request, &extra, &error);
     if (ok) container_extra_response(w, client, request, extra.data);
-    else http_text(client, request, 400, error);
+    else container_send_reply(w, client, request, error, NULL, false);
     free(extra.data); return ok;
 }
 

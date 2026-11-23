@@ -3,7 +3,6 @@
 Builds from the provider's default base image. Creates and removes disposable containers.
 """
 import argparse
-import json
 import os
 import pathlib
 import selectors
@@ -95,8 +94,7 @@ def check_mac_archive(archive):
  if sys.platform != 'darwin':return
  source=(pathlib.Path(__file__).resolve().parents[1]/'Agent'/'SafeSpaceManager.swift').read_text()
  records=source[source.index('private struct SafeSpaceConfiguration: Codable'):source.index('private struct SafeSpaceCachedApp')]
- decoder=source[source.index('private enum OffsetArchiveError:'):source.index('private enum RegistryResourceStore')]
- data=source[source.index('private extension Data {'):source.index('    func safeSpaceReferencedData')]+"}\n"
+ decoder=(pathlib.Path(__file__).resolve().parents[1]/'SharedSwift'/'OffsetArchive.swift').read_text().replace('import Foundation\n','',1)
  main="""do {
  let configuration = try OffsetArchive.decode(SafeSpaceConfiguration.self, from: Data(contentsOf: URL(fileURLWithPath: CommandLine.arguments[1])))
  let manifest = try OffsetArchive.decode(SafeSpaceTransferManifest.self, from: Data(contentsOf: URL(fileURLWithPath: CommandLine.arguments[2])))
@@ -106,22 +104,30 @@ def check_mac_archive(archive):
 """
  with tempfile.TemporaryDirectory(prefix='outershell-archive-test-') as directory:
   root=pathlib.Path(directory)
-  (root/'Check.swift').write_text('import Foundation\nimport CoreFoundation\n'+records+decoder+data+main)
+  (root/'Check.swift').write_text('import Foundation\nimport CoreFoundation\n'+records+decoder+main)
   (root/'configuration.orwv').write_bytes(configuration);(root/'manifest.orwv').write_bytes(manifest)
   subprocess.run(['swiftc','-module-cache-path',str(root/'cache'),str(root/'Check.swift'),'-o',str(root/'check')],check=True)
   subprocess.run([str(root/'check'),str(root/'configuration.orwv'),str(root/'manifest.orwv')],check=True)
 
 b=Bridge(shell)
 ids=[]
+def message(operation,values):
+ workspace=values.pop('workspaceID','')
+ return codec['api_message'](struct.pack('<HHI',35,codec['CONTAINER_OPERATIONS'].index(operation),0),[workspace,codec['offset_archive_encode'](values) if values else b''])
+def reply(body):
+ status=struct.unpack_from('<I',body,2)[0]
+ result=codec['api_reference'](body,14);state=codec['api_reference'](body,22)
+ value=dict(codec['offset_archive_decode'](state) if state else {},**(codec['offset_archive_decode'](result) if result else {}))
+ if status:value['error']=codec['api_reference'](body,6).decode()
+ return value
 status,raw=b.request('/api/container-snapshot');assert status==200
-base=next(p['defaultBaseImage'] for p in json.loads(raw)['providers'] if p['id']=='docker')
+base=next(p['defaultBaseImage'] for p in codec['offset_archive_decode'](raw)['providers'] if p['id']=='docker')
 support='COPY --from=outershell/support /outershell-rootfs/ /'
 def op(operation,**values):
- values.update(operation=operation,requestID=str(uuid.uuid4()))
- status,body=b.request('/api/containers',json.dumps(values).encode(),'POST')
- assert status==200,(status,body[:500]);return json.loads(body)
+ status,body=b.request('/api/containers',message(operation,values),'POST')
+ assert status==200,(status,body[:500]);value=reply(body);assert not value.get('error'),value['error'];return value
 def snapshot():
- status,raw=b.request('/api/container-snapshot');assert status==200;return json.loads(raw)
+ status,raw=b.request('/api/container-snapshot');assert status==200;return codec['offset_archive_decode'](raw)
 def wait(id):
  for _ in range(150):
   w=next((w for w in snapshot()['workspaces'] if w['id']==id),None)
@@ -246,9 +252,8 @@ try:
    else: info.size=1
    tar.addfile(info,io.BytesIO(b'x'))
   upload=op('beginImport');binary(upload['transferID'],2,chunk=memory.getvalue())
-  payload={'operation':'finishImport','requestID':str(uuid.uuid4()),'transferID':upload['transferID'],'runtimeProviderID':'docker'}
-  status,response=b.request('/api/containers',json.dumps(payload).encode(),'POST')
-  assert status==400,(unsafe,status,response)
+  status,response=b.request('/api/containers',message('finishImport',{'transferID':upload['transferID'],'runtimeProviderID':'docker'}),'POST')
+  assert status==200 and reply(response).get('error'),(unsafe,status,response[:200])
   op('cancelImport',transferID=upload['transferID'])
  print('PASS archive traversal, symbolic/hard links, and Windows device-name rejection',flush=True)
 finally:

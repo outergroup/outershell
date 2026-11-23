@@ -37,8 +37,8 @@ Every message begins with:
 bytes 0..1: UInt16 messageType
 ```
 
-Request message types are allocated contiguously from `10` through `33`.
-Dedicated responses are allocated contiguously from `100` through `107`.
+Request message types are allocated contiguously from `10` through `36`.
+Dedicated responses are allocated contiguously from `100` through `109`.
 
 Strings are encoded as offset-based references into the same message:
 
@@ -700,10 +700,15 @@ bytes 40..43:  UInt32 capability flags
 
 ## Container Commands
 
-Container rows register runtimes that Outer Shell should expose. The ownership
-flag follows the same convention as a backend's `owns_unit`: it distinguishes
-a runtime that Outer Shell may rebuild and delete from one managed by another
-tool.
+Container rows register containers that Outer Shell should show. A row names
+the runtime container, optionally a build context, and who owns what. These
+commands only change the registry; they never create, build, or delete a
+runtime container.
+
+These messages are accepted only by the host's `outershelld`. The daemon inside
+a container runs with `--container-guest` and refuses every container message,
+and the host's API socket is never mounted into containers, so `outerctl`
+inside a container cannot register or reconfigure containers.
 
 ### `outerctl container upsert`
 
@@ -713,22 +718,50 @@ outerctl container upsert \
   --name Science \
   --provider docker \
   --runtime-name science \
-  --outershell-owns false
+  --build-context ~/projects/science-env \
+  --self-modifying
 ```
+
+Only the fields you pass change; the rest keep their registered values. A new
+row needs `--provider` and `--runtime-name` (the runtime name may be left empty
+only when Outer Shell owns the runtime).
+
+```text
+--name NAME                       display name
+--provider ID --runtime-name NAME the runtime container (docker, apple.container, wsl.container)
+--build-context PATH              an existing folder; outerctl sends its canonical path
+--outershell-build-context        Outer Shell's own folder for this container
+--self-modifying | --sealed       whether the build context is mounted read-write inside;
+                                  needs one of the two options above. Outer Shell's folder
+                                  defaults to self-modifying, an external folder to sealed.
+--outershell-owns-runtime true|false
+--cpus N --memory-mb N --created-at-milliseconds N
+```
+
+`--self-modifying` on an external folder prints a warning that processes in the
+container will be able to modify that folder. The daemon refuses a
+self-modifying build context that contains or sits inside Outer Shell's own
+folders or its API socket.
 
 Socket message: `containerUpsertRequest` (`messageType = 31`).
 
 ```text
-bytes 2..3:    UInt16 flags; bit 0 = owns runtime
-bytes 4..7:    UInt32 CPU ceiling
-bytes 8..11:   UInt32 memory ceiling in GiB
-bytes 12..19:  UInt64 creation time in Unix milliseconds
-bytes 20..27:  StringRef32 stable container identifier
-bytes 28..35:  StringRef32 display name
-bytes 36..43:  StringRef32 provider identifier
-bytes 44..51:  StringRef32 provider runtime name
-bytes 52..59:  StringRef32 optional project resource key
+bytes 2..3:    reserved, 0
+bytes 4..7:    UInt32 flags: 0x01 owns runtime, 0x04 owns build context, 0x08 self-modifying
+bytes 8..11:   UInt32 fields to set: 0x01 name, 0x02 provider and runtime name,
+               0x04 build context (path, 0x04, and 0x08), 0x08 owns runtime,
+               0x10 CPUs, 0x20 memory, 0x40 creation time
+bytes 12..15:  UInt32 CPU ceiling
+bytes 16..19:  UInt32 memory ceiling in MiB
+bytes 20..27:  UInt64 creation time in Unix milliseconds
+bytes 28..35:  StringRef32 container identifier (a UUID)
+bytes 36..43:  StringRef32 display name
+bytes 44..51:  StringRef32 provider identifier
+bytes 52..59:  StringRef32 provider runtime name
+bytes 60..67:  StringRef32 build-context path; empty with flag 0x04 means Outer Shell's folder
 ```
+
+The reply is a `commandResponse`.
 
 ### `outerctl container remove`
 
@@ -736,22 +769,40 @@ bytes 52..59:  StringRef32 optional project resource key
 outerctl container remove --container 54a0a9ae-71f2-4dfa-a69e-3b875ca20a0f
 ```
 
-Socket message: `containerRemoveRequest` (`messageType = 32`). Removing an
-attached row only unregisters it. Runtime deletion is an Outer Shell provider
-operation and is permitted only for owned rows.
+Socket message: `containerRemoveRequest` (`messageType = 32`). Removing a row
+only unregisters it; it never deletes a runtime container or a folder.
 
 ```text
-bytes 2..9: StringRef32 stable container identifier
+bytes 2..9: StringRef32 container identifier
 ```
 
 ### `outerctl container list`
 
 ```bash
-outerctl container list
+outerctl container list [--container ID]
 ```
 
-Socket message: `containerListRequest` (`messageType = 33`). `outerctl` prints
-the dedicated binary response as TSV.
+Socket message: `containerListRequest` (`messageType = 33`), with an optional
+identifier filter at bytes 2..9. The reply is `containerListResponse`
+(`messageType = 108`), using the common list header and 64-byte rows:
+
+```text
+bytes 0..3:    UInt32 flags
+bytes 4..7:    UInt32 CPU ceiling
+bytes 8..11:   UInt32 memory ceiling in MiB
+bytes 12..15:  reserved
+bytes 16..23:  UInt64 creation time in Unix milliseconds
+bytes 24..31:  StringRef32 container identifier
+bytes 32..39:  StringRef32 display name
+bytes 40..47:  StringRef32 provider identifier
+bytes 48..55:  StringRef32 provider runtime name
+bytes 56..63:  StringRef32 build-context path
+```
+
+`outerctl` prints it as TSV with the columns `container_id`, `display_name`,
+`provider`, `runtime_name`, `build_context`, `owns_runtime`,
+`owns_build_context`, `self_modifying`, `cpus`, `memory_mb`, and
+`created_at_milliseconds`.
 
 ## Private Resource Commands
 

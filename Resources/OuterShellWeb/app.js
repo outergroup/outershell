@@ -118,6 +118,181 @@
     }
   }
 
+  const Orwv = (() => {
+    const utf8 = new TextEncoder();
+    const strictUTF8 = new TextDecoder("utf-8", { fatal: true });
+    const maximumDepth = 128;
+
+    function invalid() {
+      return new Error("Outer Shell returned an invalid binary value.");
+    }
+
+    function compareBytes(left, right) {
+      const length = Math.min(left.length, right.length);
+      for (let index = 0; index < length; index += 1) {
+        if (left[index] !== right[index]) return left[index] - right[index];
+      }
+      return left.length - right.length;
+    }
+
+    function doubleBits(number) {
+      const scratch = new DataView(new ArrayBuffer(8));
+      scratch.setFloat64(0, number, true);
+      return scratch.getBigUint64(0, true);
+    }
+
+    function encode(root) {
+      let bytes = new Uint8Array(256);
+      let view = new DataView(bytes.buffer);
+      let length = 0;
+      function reserve(extra) {
+        if (length + extra <= bytes.length) return;
+        let capacity = bytes.length * 2;
+        while (capacity < length + extra) capacity *= 2;
+        const grown = new Uint8Array(capacity);
+        grown.set(bytes.subarray(0, length));
+        bytes = grown;
+        view = new DataView(bytes.buffer);
+      }
+      function appendBytes(value) {
+        reserve(value.length);
+        bytes.set(value, length);
+        length += value.length;
+      }
+      function appendU64(value) {
+        reserve(8);
+        view.setBigUint64(length, BigInt.asUintN(64, BigInt(value)), true);
+        length += 8;
+      }
+      function appendNode(type, payload, count) {
+        const offset = length;
+        reserve(24);
+        bytes.fill(0, length, length + 24);
+        bytes[length] = type;
+        view.setBigUint64(length + 8, payload, true);
+        view.setBigUint64(length + 16, BigInt(count), true);
+        length += 24;
+        return offset;
+      }
+      function appendPayload(type, value) {
+        const payload = BigInt(length);
+        appendBytes(value);
+        return appendNode(type, payload, value.length);
+      }
+      function appendValue(value, depth) {
+        if (depth >= maximumDepth) throw new Error("The value is too deeply nested.");
+        if (typeof value === "string") return appendPayload(5, utf8.encode(value));
+        if (value instanceof Uint8Array) return appendPayload(6, value);
+        if (typeof value === "boolean") return appendNode(2, value ? 1n : 0n, 0);
+        if (typeof value === "bigint") return appendNode(3, BigInt.asUintN(64, value), 0);
+        if (typeof value === "number") {
+          if (Number.isSafeInteger(value)) return appendNode(3, BigInt.asUintN(64, BigInt(value)), 0);
+          return appendNode(4, doubleBits(value), 0);
+        }
+        if (value instanceof Date) return appendNode(9, doubleBits(value.getTime() / 1000), 0);
+        if (Array.isArray(value)) {
+          const offsets = value
+            .filter(item => item !== undefined && item !== null)
+            .map(item => appendValue(item, depth + 1));
+          const payload = BigInt(length);
+          offsets.forEach(appendU64);
+          return appendNode(7, payload, offsets.length);
+        }
+        if (value && typeof value === "object") {
+          const keys = Object.keys(value)
+            .filter(key => value[key] !== undefined && value[key] !== null)
+            .map(key => ({ key, bytes: utf8.encode(key) }))
+            .sort((left, right) => compareBytes(left.bytes, right.bytes));
+          const offsets = [];
+          for (const entry of keys) offsets.push(appendPayload(5, entry.bytes), appendValue(value[entry.key], depth + 1));
+          const payload = BigInt(length);
+          offsets.forEach(appendU64);
+          return appendNode(8, payload, keys.length);
+        }
+        throw new Error("The value cannot be encoded.");
+      }
+      appendBytes(new Uint8Array([0x4f, 0x52, 0x57, 0x56, 1, 0, 0, 0]));
+      appendU64(0);
+      const rootOffset = appendValue(root, 0);
+      view.setBigUint64(8, BigInt(rootOffset), true);
+      return bytes.slice(0, length);
+    }
+
+    function decode(value) {
+      const bytes = value instanceof Uint8Array ? value : new Uint8Array(value);
+      const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+      const size = BigInt(bytes.length);
+      function start(offset, count) {
+        if (offset > size || count > size - offset) throw invalid();
+        return Number(offset);
+      }
+      function readValue(offset, depth) {
+        if (depth >= maximumDepth || offset < 16n) throw invalid();
+        const node = start(offset, 24n);
+        const type = bytes[node];
+        const payload = view.getBigUint64(node + 8, true);
+        const count = view.getBigUint64(node + 16, true);
+        if (type === 2) {
+          if (payload > 1n) throw invalid();
+          return payload === 1n;
+        }
+        if (type === 3) {
+          const number = BigInt.asIntN(64, payload);
+          if (number > BigInt(Number.MAX_SAFE_INTEGER) || number < BigInt(Number.MIN_SAFE_INTEGER)) throw invalid();
+          return Number(number);
+        }
+        if (type === 4 || type === 9) {
+          const scratch = new DataView(new ArrayBuffer(8));
+          scratch.setBigUint64(0, payload, true);
+          const number = scratch.getFloat64(0, true);
+          return type === 9 ? new Date(number * 1000) : number;
+        }
+        if (type === 5 || type === 6) {
+          const dataStart = start(payload, count);
+          const data = bytes.slice(dataStart, dataStart + Number(count));
+          if (type === 6) return data;
+          try {
+            return strictUTF8.decode(data);
+          } catch (_) {
+            throw invalid();
+          }
+        }
+        if (type === 7 || type === 8) {
+          const stride = type === 8 ? 16n : 8n;
+          if (count > size / stride) throw invalid();
+          const table = start(payload, count * stride);
+          const entries = Number(count);
+          if (type === 7) {
+            const result = [];
+            for (let index = 0; index < entries; index += 1) {
+              result.push(readValue(view.getBigUint64(table + index * 8, true), depth + 1));
+            }
+            return result;
+          }
+          const result = {};
+          for (let index = 0; index < entries; index += 1) {
+            const key = readValue(view.getBigUint64(table + index * 16, true), depth + 1);
+            if (typeof key !== "string" || Object.prototype.hasOwnProperty.call(result, key)) throw invalid();
+            Object.defineProperty(result, key, {
+              value: readValue(view.getBigUint64(table + index * 16 + 8, true), depth + 1),
+              enumerable: true,
+              writable: true,
+              configurable: true,
+            });
+          }
+          return result;
+        }
+        throw invalid();
+      }
+      if (bytes.length < 16 || compareBytes(bytes.subarray(0, 8), new Uint8Array([0x4f, 0x52, 0x57, 0x56, 1, 0, 0, 0])) !== 0) {
+        throw invalid();
+      }
+      return readValue(view.getBigUint64(8, true), 0);
+    }
+
+    return { encode, decode };
+  })();
+
   function decodeBackends(buffer) {
     const reader = new PayloadReader(buffer);
     const count = reader.u32(8);
@@ -1141,25 +1316,92 @@ RUN outerctl image add-command --id codex --name "Codex" --working-directory /ro
     return `${hex[0]}${hex[1]}${hex[2]}${hex[3]}-${hex[4]}${hex[5]}-${hex[6]}${hex[7]}-${hex[8]}${hex[9]}-${hex[10]}${hex[11]}${hex[12]}${hex[13]}${hex[14]}${hex[15]}`;
   }
 
+  const containerOperations = [
+    "list", "checkRuntimes", "containerStorage", "cleanContainerStorage", "cleanContainerBuildCache",
+    "create", "duplicate", "changeRuntime", "rename", "start", "stop", "restart", "delete",
+    "mountFolder", "unmountFolder", "chooseFolder", "updateDockerfile", "updateContainerConfiguration",
+    "updateResources", "rebuild", "startApp", "stopApp", "restartApp", "appLogs", "publishSocket",
+    "prepareShare", "beginImport", "cancelImport", "finishImport",
+  ];
+
+  function encodeContainerRequest(operation, values) {
+    const code = containerOperations.indexOf(operation);
+    if (code < 0) throw new Error("This container operation is not supported.");
+    const { workspaceID, ...argumentValues } = values;
+    const identifier = new TextEncoder().encode(workspaceID || "");
+    const encodedArguments = Object.keys(argumentValues).length ? Orwv.encode(argumentValues) : new Uint8Array();
+    const message = new Uint8Array(24 + identifier.length + encodedArguments.length);
+    const view = new DataView(message.buffer);
+    view.setUint16(0, 35, true);
+    view.setUint16(2, code, true);
+    view.setUint32(8, 24, true);
+    view.setUint32(12, identifier.length, true);
+    view.setUint32(16, 24 + identifier.length, true);
+    view.setUint32(20, encodedArguments.length, true);
+    message.set(identifier, 24);
+    message.set(encodedArguments, 24 + identifier.length);
+    return message;
+  }
+
+  function decodeContainerResponse(buffer) {
+    const reader = new PayloadReader(buffer);
+    if (reader.bytes.length < 30 || reader.view.getUint16(0, true) !== 109) {
+      throw new Error("Outer Shell returned an invalid container response.");
+    }
+    if (reader.u32(2) !== 0) throw new Error(reader.stringRef(6) || "The container operation failed.");
+    const result = reader.u32(18) ? Orwv.decode(reader.bytesRef(14)) : {};
+    const snapshot = reader.u32(26) ? Orwv.decode(reader.bytesRef(22)) : {};
+    return { ...snapshot, ...result };
+  }
+
+  function encodeContainerRegistration(identifier, flags, setMask, buildContextPath = "") {
+    const strings = [identifier, "", "", "", buildContextPath].map(value => new TextEncoder().encode(value));
+    const message = new Uint8Array(68 + strings.reduce((total, value) => total + value.length, 0));
+    const view = new DataView(message.buffer);
+    view.setUint16(0, 31, true);
+    view.setUint32(4, flags, true);
+    view.setUint32(8, setMask, true);
+    let offset = 68;
+    strings.forEach((value, index) => {
+      view.setUint32(28 + index * 8, offset, true);
+      view.setUint32(32 + index * 8, value.length, true);
+      message.set(value, offset);
+      offset += value.length;
+    });
+    return message;
+  }
+
+  async function setContainerSelfModifying(workspace, selfModifying) {
+    const ownsBuildContext = workspace.ownsBuildContext !== false;
+    const flags = (ownsBuildContext ? 0x04 : 0) | (selfModifying ? 0x08 : 0);
+    const response = await fetch("/api/containers", {
+      method: "POST",
+      cache: "no-store",
+      headers: { "Content-Type": "application/vnd.outershell.message" },
+      body: encodeContainerRegistration(String(workspace.id).toLowerCase(), flags, 0x04, ownsBuildContext ? "" : workspace.buildContextPath || ""),
+    });
+    if (!response.ok) throw new Error((await response.text()).trim() || `Outer Shell returned HTTP ${response.status}.`);
+    const reader = new PayloadReader(await response.arrayBuffer());
+    if (reader.bytes.length < 22 || reader.view.getUint16(0, true) !== 100) throw new Error("Outer Shell returned an invalid registry response.");
+    if (reader.u32(2) !== 0) throw new Error(reader.stringRef(14).trim() || "Outer Shell could not change the build context.");
+  }
+
   async function safeSpaceRequest(operation, values = {}, signal) {
-    const requestID = makeRequestID();
     const response = operation === "list"
       ? await fetch("/api/container-snapshot", { cache: "no-store", signal })
       : await fetch("/api/containers", {
       method: "POST",
       cache: "no-store",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/vnd.outershell.message" },
       signal,
-      body: JSON.stringify({ requestID, operation: operation === "listDetails" ? "list" : operation, ...values })
+      body: encodeContainerRequest(operation === "listDetails" ? "list" : operation, values)
     });
     if (!response.ok) {
       const text = await response.text();
-      let detail = text.trim();
-      try { detail = JSON.parse(text).error || detail; } catch (_) {}
-      throw new Error(detail || `Outer Shell returned HTTP ${response.status}.`);
+      throw new Error(text.trim() || `Outer Shell returned HTTP ${response.status}.`);
     }
-    const result = await response.json();
-    if (result.error) throw new Error(result.error);
+    const buffer = await response.arrayBuffer();
+    const result = operation === "list" ? Orwv.decode(buffer) : decodeContainerResponse(buffer);
     if (!signal?.aborted && typeof result.hostPlatform === "string") state.hostPlatform = result.hostPlatform;
     if (!signal?.aborted && Array.isArray(result.providers)) state.providers = result.providers;
     return result;
@@ -2450,7 +2692,7 @@ RUN outerctl image add-command --id codex --name "Codex" --working-directory /ro
         <section role="tabpanel" id="config-panel-mounts" aria-labelledby="config-tab-mounts" data-config-panel="mounts" hidden><div class="mounts-heading"><div><h3>Folder mounts</h3><p>${agentConnection().local ? "Share a folder with this container." : "Make an existing server folder available inside this container."}</p></div><button class="secondary-button" type="button" data-add-row="mounts"><span aria-hidden="true">＋</span> Add folder mount</button></div><div class="mount-list" data-rows="mounts">${(workspace.mounts || []).filter(mount => !mount.isInfrastructure).map(mount => configurationRow("mounts", mount)).join("")}</div><p class="mount-empty">No folder mounts yet. Add a folder to share files with this container.</p>${infrastructure.length ? `<details class="managed-mounts"><summary>Managed by Outer Shell <span>(${infrastructure.length})</span></summary><p>These folders support the container and are managed automatically.</p><div class="managed-mount-list">${infrastructure.map(mount => `<div><code>${escapeHTML(mount.hostPath)}</code><span aria-hidden="true">→</span><code>${escapeHTML(mount.guestPath)}</code></div>`).join("")}</div></details>` : ""}</section>
         <section role="tabpanel" id="config-panel-environment" aria-labelledby="config-tab-environment" data-config-panel="environment" hidden><div data-rows="environment">${(definition.environment || []).map(value => configurationRow("environment", value)).join("")}</div><button type="button" data-add-row="environment">Add variable</button></section>
         <section role="tabpanel" id="config-panel-ports" aria-labelledby="config-tab-ports" data-config-panel="ports" hidden>${definition.supportsRuntimeSettings ? `<label class="field">Network mode<select name="networkMode"><option value="bridge" ${definition.networkMode !== "host" ? "selected" : ""}>Isolated network</option><option value="host" ${definition.networkMode === "host" ? "selected" : ""}>Host network</option></select></label><p class="field-note">Host networking shares the server’s network for LAN device discovery. Apps listen directly on server ports and may be reachable from other devices. Port mappings are not used.</p>` : ""}<p class="field-note">Publish a container TCP port on this server when using an isolated network.</p><div data-rows="ports">${(definition.publishedPorts || []).map(value => configurationRow("ports", value)).join("")}</div><button type="button" data-add-row="ports">Add port</button></section>
-        <section role="tabpanel" id="config-panel-runtime" aria-labelledby="config-tab-runtime" data-config-panel="runtime" hidden><p>${escapeHTML(safeSpaceRuntimeDescription(workspace))} · ${escapeHTML(workspace.cpus)} CPUs · ${escapeHTML(formatMemoryMB(workspace.memoryInMB))}</p>${resourceProvider?.capabilities?.supportsResourceUpdates ? `<div class="form-grid"><label class="field">Max CPUs<input name="cpus" type="number" min="1" step="1" required></label><label class="field">Max Memory<input name="memoryInMB" type="text" inputmode="decimal" autocomplete="off" spellcheck="false" required></label><p class="field-note full" data-resource-note hidden></p><p class="field-note full">${resourceProvider.id === "docker" ? "Saving applies new limits to the running container." : "New limits take effect when the container is rebuilt."}</p></div>` : ""}<label class="field">Runtime<select name="runtimeProviderID">${runtimeOptions(workspace.runtime?.providerID)}</select></label>${definition.supportsRuntimeSettings ? `<label class="container-check"><input name="useInit" type="checkbox" ${definition.useInit !== false ? "checked" : ""}>Use Docker’s init process</label><p class="field-note">Turn this off for images that provide their own init process, such as Home Assistant and Homebridge.</p><label class="container-check"><input name="restartUnlessStopped" type="checkbox" ${definition.restartPolicy === "unless-stopped" ? "checked" : ""}>Restart automatically unless manually stopped</label>` : ""}<p class="field-note">Changing runtime saves the configuration and rebuilds the container with the selected provider.</p><button type="submit" value="runtime">Save &amp; change runtime</button></section>
+        <section role="tabpanel" id="config-panel-runtime" aria-labelledby="config-tab-runtime" data-config-panel="runtime" hidden><p>${escapeHTML(safeSpaceRuntimeDescription(workspace))} · ${escapeHTML(workspace.cpus)} CPUs · ${escapeHTML(formatMemoryMB(workspace.memoryInMB))}</p>${resourceProvider?.capabilities?.supportsResourceUpdates ? `<div class="form-grid"><label class="field">Max CPUs<input name="cpus" type="number" min="1" step="1" required></label><label class="field">Max Memory<input name="memoryInMB" type="text" inputmode="decimal" autocomplete="off" spellcheck="false" required></label><p class="field-note full" data-resource-note hidden></p><p class="field-note full">${resourceProvider.id === "docker" ? "Saving applies new limits to the running container." : "New limits take effect when the container is rebuilt."}</p></div>` : ""}<div class="build-context"><h3>Build context</h3><p><code>${escapeHTML(workspace.buildContextPath || definition.definitionDirectory || "")}</code> · ${workspace.ownsBuildContext === false ? "External folder" : "Outer Shell folder"}</p><label class="container-check"><input name="selfModifying" type="checkbox" ${workspace.selfModifying !== false ? "checked" : ""}>Self-modifying</label><p class="field-note">The container can edit its own Dockerfile and build context at /var/lib/outershell/project. Changes take effect at the next rebuild.</p></div><label class="field">Runtime<select name="runtimeProviderID">${runtimeOptions(workspace.runtime?.providerID)}</select></label>${definition.supportsRuntimeSettings ? `<label class="container-check"><input name="useInit" type="checkbox" ${definition.useInit !== false ? "checked" : ""}>Use Docker’s init process</label><p class="field-note">Turn this off for images that provide their own init process, such as Home Assistant and Homebridge.</p><label class="container-check"><input name="restartUnlessStopped" type="checkbox" ${definition.restartPolicy === "unless-stopped" ? "checked" : ""}>Restart automatically unless manually stopped</label>` : ""}<p class="field-note">Changing runtime saves the configuration and rebuilds the container with the selected provider.</p><button type="submit" value="runtime">Save &amp; change runtime</button></section>
         <p class="container-message" role="status">${escapeHTML(definition.needsRebuild ? "Saved changes need a rebuild." : "")}</p>
         </div>
       </div><footer class="dialog-footer"><p class="field-note container-rebuild-note">Rebuilding restarts the container. Changes outside its Dockerfile, persistent data, and mounted folders are not retained.</p><button type="button" data-action="close-dialog">Close</button><button type="submit" value="save">Save</button><button class="primary-button" type="submit" value="rebuild">Save &amp; rebuild</button></footer></form>`, "wide container-editor");
@@ -2514,8 +2756,7 @@ RUN outerctl image add-command --id codex --name "Codex" --working-directory /ro
       message.textContent = "Saving…";
       try {
         if (values.dockerfile !== savedDockerfile) {
-          // macOS reads command; the Linux provider reads dockerfile.
-          await containerOperation("updateDockerfile", { workspaceID: id, command: values.dockerfile, dockerfile: values.dockerfile });
+          await containerOperation("updateDockerfile", { workspaceID: id, dockerfile: values.dockerfile });
           savedDockerfile = values.dockerfile;
           saved = true;
         }
@@ -2527,6 +2768,16 @@ RUN outerctl image add-command --id codex --name "Codex" --working-directory /ro
           savedResources = resources;
         }
         if (name !== savedName) { await containerOperation("rename", { workspaceID: id, name }); savedName = name; }
+        const selfModifying = form.elements.selfModifying?.checked;
+        if (selfModifying !== undefined && selfModifying !== (workspace.selfModifying !== false)) {
+          if (selfModifying && workspace.ownsBuildContext === false &&
+              !window.confirm(`Processes in this container will be able to modify ${workspace.buildContextPath} and everything in it. Continue?`)) {
+            throw new Error("Self-modifying was not turned on.");
+          }
+          await setContainerSelfModifying(workspace, selfModifying);
+          workspace = { ...workspace, selfModifying };
+          saved = true;
+        }
         if (action === "runtime" && provider !== currentProvider) {
           message.textContent = "Changing runtime…";
           await containerOperation("changeRuntime", { workspaceID: id, runtimeProviderID: provider });

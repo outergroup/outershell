@@ -67,8 +67,33 @@ OFFSET_ARCHIVE_VERSION = 1
 OFFSET_ARCHIVE_HEADER = struct.Struct("<4sIQ")
 OFFSET_ARCHIVE_NODE = struct.Struct("<B7xQQ")
 OFFSET_ARCHIVE_RESOURCE_RECORDS = "containers/records"
+API_RESOURCE_GET_REQUEST = 28
+API_RESOURCE_SET_REQUEST = 29
+API_RESOURCE_REMOVE_REQUEST = 30
+API_CONTAINER_UPSERT_REQUEST = 31
+API_CONTAINER_REMOVE_REQUEST = 32
+API_CONTAINER_LIST_REQUEST = 33
+API_CONTAINER_REQUEST = 35
+API_COMMAND_RESPONSE = 100
+API_CONTAINER_LIST_RESPONSE = 108
+API_CONTAINER_RESPONSE = 109
+CONTAINER_REQUEST_OVERVIEW = 0x01
+CONTAINER_OPERATIONS = (
+    "list", "checkRuntimes", "containerStorage", "cleanContainerStorage", "cleanContainerBuildCache",
+    "create", "duplicate", "changeRuntime", "rename", "start", "stop", "restart", "delete",
+    "mountFolder", "unmountFolder", "chooseFolder", "updateDockerfile", "updateContainerConfiguration",
+    "updateResources", "rebuild", "startApp", "stopApp", "restartApp", "appLogs", "publishSocket",
+    "prepareShare", "beginImport", "cancelImport", "finishImport",
+)
+CONTAINER_LIST_ROW_SIZE = 64
+CONTAINER_OWNS_RUNTIME = 0x01
+CONTAINER_OWNS_BUILD_CONTEXT = 0x04
+CONTAINER_SELF_MODIFYING = 0x08
+CONTAINER_SET_ALL = 0x7f
 OFFSET_ARCHIVE_RESOURCE_PROVIDER_STATE = "containers/docker-provider-state"
 CONTAINER_RUNTIME_NAMES = {}
+CONTAINER_BUILD_CONTEXTS = {}
+SELF_MODIFYING_CONTAINERS = {}
 
 
 def outer_shell_home():
@@ -80,16 +105,6 @@ def outer_shell_home():
 
 def provider_root():
     return outer_shell_home() / "containers"
-
-
-def outerctl_path():
-    configured = os.environ.get("OUTERSHELL_OUTERCTL")
-    if configured:
-        return configured
-    installed = outer_shell_home() / "bin" / "outerctl"
-    if installed.is_file():
-        return str(installed)
-    return shutil.which("outerctl") or "/usr/local/bin/outerctl"
 
 
 def offset_archive_encode(value):
@@ -107,7 +122,7 @@ def offset_archive_encode(value):
     def append_value(item):
         if isinstance(item, dict):
             entries = []
-            for key in sorted(item):
+            for key in sorted(item, key=lambda name: str(name).encode("utf-8")):
                 if item[key] is None:
                     continue
                 entries.append((append_value(str(key)), append_value(item[key])))
@@ -156,12 +171,14 @@ def offset_archive_decode(data):
         return data[offset:offset + length]
 
     def decode_value(offset, depth=0):
-        if depth >= 128:
+        if depth >= 128 or offset < OFFSET_ARCHIVE_HEADER.size:
             raise ValueError("The binary catalog resource is invalid.")
         checked_range(offset, OFFSET_ARCHIVE_NODE.size)
         node_type, payload, count = OFFSET_ARCHIVE_NODE.unpack_from(data, offset)
         if node_type == 2:
-            return bool(payload)
+            if payload > 1:
+                raise ValueError("The binary catalog resource is invalid.")
+            return payload == 1
         if node_type == 3:
             return struct.unpack("<q", struct.pack("<Q", payload))[0]
         if node_type == 4:
@@ -183,7 +200,7 @@ def offset_archive_decode(data):
                 entry = payload + index * 16
                 key_offset, value_offset = struct.unpack_from("<QQ", data, entry)
                 key = decode_value(key_offset, depth + 1)
-                if not isinstance(key, str):
+                if not isinstance(key, str) or key in value:
                     raise ValueError("The binary catalog resource is invalid.")
                 value[key] = decode_value(value_offset, depth + 1)
             return value
@@ -194,106 +211,143 @@ def offset_archive_decode(data):
     return decode_value(root)
 
 
+def api_socket_path():
+    configured = os.environ.get("OUTERSHELLD_API_SOCKET")
+    if configured:
+        return os.path.expanduser(configured)
+    runtime = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+    return os.path.join(runtime, "outershelld-api")
+
+
+def api_message(prefix, references=()):
+    references = [value.encode("utf-8") if isinstance(value, str) else bytes(value) for value in references]
+    message = bytearray(prefix)
+    reference_offset = len(message)
+    message.extend(bytes(8 * len(references)))
+    for index, value in enumerate(references):
+        struct.pack_into("<II", message, reference_offset + index * 8, len(message), len(value))
+        message.extend(value)
+    return bytes(message)
+
+
+def api_exchange(message):
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+        connection.settimeout(60)
+        connection.connect(api_socket_path())
+        connection.sendall(struct.pack("<I", len(message)) + message)
+
+        def exact(count):
+            data = bytearray()
+            while len(data) < count:
+                part = connection.recv(count - len(data))
+                if not part:
+                    raise RuntimeError("Outer Shell closed the registry connection.")
+                data.extend(part)
+            return bytes(data)
+
+        length = struct.unpack("<I", exact(4))[0]
+        if length > 16 * 1024 * 1024:
+            raise RuntimeError("Outer Shell returned an oversized registry response.")
+        return exact(length)
+
+
+def api_reference(message, offset):
+    start, length = struct.unpack_from("<II", message, offset)
+    if start > len(message) or length > len(message) - start:
+        raise RuntimeError("Outer Shell returned an invalid registry response.")
+    return message[start:start + length]
+
+
+def api_command(prefix, references=()):
+    response = api_exchange(api_message(prefix, references))
+    if len(response) < 22 or struct.unpack_from("<H", response)[0] != API_COMMAND_RESPONSE:
+        raise RuntimeError("Outer Shell returned an invalid registry response.")
+    if struct.unpack_from("<I", response, 2)[0] != 0:
+        raise RuntimeError(api_reference(response, 14).decode("utf-8", errors="replace").strip()
+                           or "The Outer Shell registry request failed.")
+    return api_reference(response, 6)
+
+
 def registry_resource_get(key):
-    result = subprocess.run(
-        [outerctl_path(), "resource", "get", "--key", key],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(result.stderr.decode(errors="replace").strip())
-    return result.stdout or None
+    return api_command(struct.pack("<H", API_RESOURCE_GET_REQUEST), [key]) or None
 
 
 def registry_resource_set(key, value):
-    result = subprocess.run(
-        [outerctl_path(), "resource", "set", "--key", key],
-        input=offset_archive_encode(value),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(result.stderr.decode(errors="replace").strip())
+    api_command(struct.pack("<H", API_RESOURCE_SET_REQUEST), [key, offset_archive_encode(value)])
 
 
 def registry_resource_remove(key):
-    result = subprocess.run(
-        [outerctl_path(), "resource", "remove", "--key", key],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(result.stderr.decode(errors="replace").strip())
+    api_command(struct.pack("<H", API_RESOURCE_REMOVE_REQUEST), [key])
 
 
 def registry_container_list():
-    result = subprocess.run(
-        [outerctl_path(), "container", "list"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(result.stderr.strip())
+    response = api_exchange(api_message(struct.pack("<H", API_CONTAINER_LIST_REQUEST), [""]))
+    if len(response) < 22 or struct.unpack_from("<H", response)[0] != API_CONTAINER_LIST_RESPONSE:
+        raise RuntimeError("Outer Shell returned an invalid container list.")
+    if struct.unpack_from("<I", response, 2)[0] != 0:
+        raise RuntimeError(api_reference(response, 6).decode("utf-8", errors="replace"))
+    count, row_size = struct.unpack_from("<II", response, 14)
+    if row_size != CONTAINER_LIST_ROW_SIZE or count > (len(response) - 22) // row_size:
+        raise RuntimeError("Outer Shell returned an invalid container list.")
     values = []
-    lines = [line for line in result.stdout.splitlines() if line]
-    for line in lines[1:]:
-        fields = percent_decode_fields(line)
-        if len(fields) != 9:
-            continue
-        (
-            identifier, name, provider, runtime_name, project_key,
-            created_at, cpus, memory_in_mb, owns_container,
-        ) = fields
+    for index in range(count):
+        row = 22 + index * row_size
+        flags, cpus, memory_in_mb = struct.unpack_from("<III", response, row)
+        created_at = struct.unpack_from("<Q", response, row + 16)[0]
+        identifier, name, provider, runtime_name, build_context_path = (
+            api_reference(response, row + offset).decode("utf-8")
+            for offset in (24, 32, 40, 48, 56)
+        )
         try:
             identifier = canonical_container_id(identifier)
-            created_at_seconds = int(created_at) / 1000
-            cpu_count = int(cpus)
-            memory_count = int(memory_in_mb)
-        except (ValueError, TypeError):
+        except ValueError:
             continue
         values.append({
             "id": identifier,
             "name": name or "Container",
-            "createdAt": created_at_seconds,
-            "cpus": cpu_count,
-            "memoryInMB": memory_count,
+            "createdAt": created_at / 1000,
+            "cpus": cpus,
+            "memoryInMB": memory_in_mb,
             "runtimeProviderID": provider,
             "runtimeName": runtime_name,
-            "projectResourceKey": project_key,
-            "ownsContainer": owns_container in ("1", "true", "yes"),
+            "buildContextPath": build_context_path,
+            "ownsContainer": bool(flags & CONTAINER_OWNS_RUNTIME),
+            "ownsBuildContext": bool(flags & CONTAINER_OWNS_BUILD_CONTEXT),
+            "selfModifying": bool(flags & CONTAINER_SELF_MODIFYING),
         })
     return values
 
 
+def registry_container_flags(record):
+    return (
+        (CONTAINER_OWNS_RUNTIME if record.get("ownsContainer") else 0)
+        | (CONTAINER_OWNS_BUILD_CONTEXT if record.get("ownsBuildContext") else 0)
+        | (CONTAINER_SELF_MODIFYING if record.get("selfModifying") else 0)
+    )
+
+
 def registry_container_upsert(record):
-    arguments = [
-        outerctl_path(), "container", "upsert",
-        "--container", canonical_container_id(record["id"]),
-        "--name", record.get("name", "Container"),
-        "--provider", record.get("runtimeProviderID") or PROVIDER_ID,
-        "--runtime-name", record.get("runtimeName") or container_name(record["id"]),
-        "--project-key", record.get("projectResourceKey", ""),
-        "--created-at-milliseconds", str(round(record.get("createdAt", time.time()) * 1000)),
-        "--cpus", str(record.get("cpus", 0)),
-        "--memory-mb", str(record.get("memoryInMB", 0)),
-        "--outershell-owns", "true" if record.get("ownsContainer", False) else "false",
-    ]
-    result = subprocess.run(arguments, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    if result.returncode != 0:
-        raise RuntimeError(result.stderr.strip())
+    prefix = struct.pack(
+        "<HHIIIIQ",
+        API_CONTAINER_UPSERT_REQUEST,
+        0,
+        registry_container_flags(record),
+        CONTAINER_SET_ALL,
+        int(record.get("cpus", 0)),
+        int(record.get("memoryInMB", 0)),
+        round(record.get("createdAt", time.time()) * 1000),
+    )
+    api_command(prefix, [
+        canonical_container_id(record["id"]),
+        record.get("name", "Container"),
+        record.get("runtimeProviderID") or PROVIDER_ID,
+        record.get("runtimeName") or container_name(record["id"]),
+        record.get("buildContextPath", ""),
+    ])
 
 
 def registry_container_remove(container_id):
-    result = subprocess.run(
-        [outerctl_path(), "container", "remove", "--container",
-         canonical_container_id(container_id)],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(result.stderr.strip())
+    api_command(struct.pack("<H", API_CONTAINER_REMOVE_REQUEST), [canonical_container_id(container_id)])
 
 
 def configuration_resource_key(container_id):
@@ -305,7 +359,41 @@ def container_directory(container_id):
 
 
 def build_context_directory(container_id):
-    return container_directory(container_id) / "BuildContext"
+    external = CONTAINER_BUILD_CONTEXTS.get(container_id)
+    return pathlib.Path(external) if external else container_directory(container_id) / "BuildContext"
+
+
+def container_self_modifying(container_id):
+    return SELF_MODIFYING_CONTAINERS.get(container_id, True)
+
+
+def protected_paths():
+    paths = [outer_shell_home(), pathlib.Path(api_socket_path())]
+    runtime = os.environ.get("XDG_RUNTIME_DIR")
+    if runtime:
+        paths.append(pathlib.Path(runtime))
+    return [pathlib.Path(os.path.realpath(path)) for path in paths]
+
+
+def paths_overlap(path, other):
+    return path == other or path in other.parents or other in path.parents
+
+
+def require_unprotected_path(path, description):
+    resolved = pathlib.Path(os.path.realpath(path))
+    if any(paths_overlap(resolved, protected) for protected in protected_paths()):
+        raise ValueError(f"{description} cannot include or be inside Outer Shell's own folders.")
+
+
+def checked_build_context_directory(container_id):
+    directory = build_context_directory(container_id)
+    if CONTAINER_BUILD_CONTEXTS.get(container_id):
+        status = os.lstat(directory)
+        if stat.S_ISLNK(status.st_mode) or not stat.S_ISDIR(status.st_mode) or os.path.realpath(directory) != str(directory):
+            raise ValueError("The registered build context must be an existing folder that is not a link.")
+        if container_self_modifying(container_id):
+            require_unprotected_path(directory, "A self-modifying build context")
+    return directory
 
 
 def legacy_build_context_directory(container_id):
@@ -316,7 +404,7 @@ def migrate_legacy_definition(record):
     container_id = record["id"]
     migrated = False
     legacy_directory = legacy_build_context_directory(container_id)
-    directory = build_context_directory(container_id)
+    directory = container_directory(container_id) / "BuildContext"
     if legacy_directory.is_dir() and not legacy_directory.is_symlink() and not directory.exists():
         legacy_directory.rename(directory)
         legacy_directory.symlink_to(directory.name)
@@ -328,9 +416,6 @@ def migrate_legacy_definition(record):
         if not registry_resource_get(key):
             registry_resource_set(key, offset_archive_decode(encoded))
         registry_resource_remove(legacy_key)
-        migrated = True
-    if record.get("projectResourceKey") == legacy_key:
-        record["projectResourceKey"] = key
         migrated = True
     legacy_image = "outershell/container-" + container_id.lower() + ":recipe"
     if migrated and record_owns_container(record):
@@ -596,6 +681,13 @@ class Records:
         provider_root().mkdir(parents=True, exist_ok=True, mode=0o700)
         self.lock_file = open(provider_root() / "records.lock", "a+")
         fcntl.flock(self.lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            return self.load()
+        except BaseException:
+            self.__exit__(None, None, None)
+            raise
+
+    def load(self):
         self.values = [
             value for value in registry_container_list()
             if value.get("runtimeProviderID") == PROVIDER_ID
@@ -608,8 +700,10 @@ class Records:
                 value["id"] = identifier
                 value["runtimeProviderID"] = PROVIDER_ID
                 value["runtimeName"] = "outershell-container-" + identifier.lower()
-                value["projectResourceKey"] = configuration_resource_key(identifier)
                 value["ownsContainer"] = True
+                value["ownsBuildContext"] = True
+                value["selfModifying"] = True
+                value["buildContextPath"] = ""
                 registry_container_upsert(value)
             if legacy:
                 transient_keys = (
@@ -631,8 +725,7 @@ class Records:
                 ]
         for value in self.values:
             try:
-                if migrate_legacy_definition(value):
-                    registry_container_upsert(value)
+                migrate_legacy_definition(value)
             except (OSError, RuntimeError, subprocess.SubprocessError) as error:
                 print(f"Could not migrate container {value.get('id')}: {error}", file=sys.stderr)
         encoded = registry_resource_get(OFFSET_ARCHIVE_RESOURCE_PROVIDER_STATE)
@@ -644,6 +737,8 @@ class Records:
             if isinstance(state, dict):
                 value.update(state)
             CONTAINER_RUNTIME_NAMES[value["id"]] = value.get("runtimeName", "")
+            CONTAINER_BUILD_CONTEXTS[value["id"]] = value.get("buildContextPath", "")
+            SELF_MODIFYING_CONTAINERS[value["id"]] = bool(value.get("selfModifying", True))
         self.registered_values = {
             value["id"]: self.registration_tuple(value)
             for value in self.values
@@ -656,11 +751,11 @@ class Records:
             value.get("name", "Container"),
             value.get("runtimeProviderID", PROVIDER_ID),
             value.get("runtimeName", ""),
-            value.get("projectResourceKey", ""),
+            value.get("buildContextPath", ""),
             value.get("createdAt", 0),
             value.get("cpus", 0),
             value.get("memoryInMB", 0),
-            bool(value.get("ownsContainer", False)),
+            registry_container_flags(value),
         )
 
     def save(self):
@@ -670,6 +765,8 @@ class Records:
                 registry_container_upsert(value)
                 self.registered_values[identifier] = self.registration_tuple(value)
             CONTAINER_RUNTIME_NAMES[identifier] = value.get("runtimeName", "")
+            CONTAINER_BUILD_CONTEXTS[identifier] = value.get("buildContextPath", "")
+            SELF_MODIFYING_CONTAINERS[identifier] = bool(value.get("selfModifying", True))
         provider_state = {}
         transient_keys = (
             "transientState", "lastError", "cachedApps", "cachedCommands", "buildProgress",
@@ -814,8 +911,8 @@ def runtime_settings(configuration):
 
 def save_configuration(container_id, value):
     runtime_settings(value)
-    directory = build_context_directory(container_id)
-    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if not CONTAINER_BUILD_CONTEXTS.get(container_id):
+        build_context_directory(container_id).mkdir(parents=True, exist_ok=True, mode=0o700)
     registry_resource_set(configuration_resource_key(container_id), value)
 
 
@@ -1010,7 +1107,7 @@ def build_image(context, tag, log_path, *, container_id=None, helpers=None):
 
 
 def stage_build_context(container_id):
-    source = build_context_directory(container_id)
+    source = checked_build_context_directory(container_id)
     context = runtime_directory(container_id) / "StagedBuildContext"
     if context.exists():
         shutil.rmtree(context)
@@ -1105,8 +1202,9 @@ def create_runtime_container(container_id):
         arguments += ["--cpus", str(runnable_cpus(cpus))]
     if memory:
         arguments += ["--memory", f"{runnable_memory(memory)}m"]
-    project = build_context_directory(container_id)
-    arguments += ["--mount", f"type=bind,src={project},dst=/var/lib/outershell/project"]
+    if container_self_modifying(container_id):
+        project = checked_build_context_directory(container_id)
+        arguments += ["--mount", f"type=bind,src={project},dst=/var/lib/outershell/project"]
     for mount in configuration.get("mounts", []):
         host = pathlib.Path(mount["hostPath"]).expanduser().resolve()
         option = f"type=bind,src={host},dst={mount['guestPath']}"
@@ -1133,6 +1231,8 @@ def mark_realized(container_id):
     configuration["realizedEnvironment"] = configuration.get("environment", [])
     configuration["realizedPublishedPorts"] = configuration.get("publishedPorts", [])
     configuration["realizedRuntimeSettings"] = runtime_settings(configuration)
+    configuration["realizedBuildContextPath"] = str(build_context_directory(container_id))
+    configuration["realizedSelfModifying"] = container_self_modifying(container_id)
     configuration["realizedResources"] = record_resources(container_id)
     save_configuration(container_id, configuration)
 
@@ -1386,8 +1486,10 @@ def operation_create(request):
         "memoryInMB": memory,
         "runtimeProviderID": PROVIDER_ID,
         "runtimeName": "outershell-container-" + container_id.lower(),
-        "projectResourceKey": configuration_resource_key(container_id),
+        "buildContextPath": "",
         "ownsContainer": True,
+        "ownsBuildContext": True,
+        "selfModifying": True,
         "transientState": "creating",
         "lastError": "",
         "cachedApps": [],
@@ -1470,6 +1572,9 @@ def operation_update_configuration(request):
         require_managed_container(find_record(records.values, container_id))
     configuration = load_configuration(container_id)
     configuration["mounts"] = request.get("mounts") or []
+    for mount in configuration["mounts"]:
+        if not mount.get("isReadOnly"):
+            require_unprotected_path(pathlib.Path(mount["hostPath"]).expanduser(), "A writable folder mount")
     configuration["environment"] = request.get("environment") or []
     configuration["publishedPorts"] = request.get("publishedPorts") or []
     for key in ("networkMode", "useInit", "restartPolicy"):
@@ -1829,8 +1934,10 @@ def operation_finish_import(request):
         "memoryInMB": runnable_memory(manifest.get("memoryInMB", DEFAULT_MEMORY_IN_MB)),
         "runtimeProviderID": PROVIDER_ID,
         "runtimeName": "outershell-container-" + container_id.lower(),
-        "projectResourceKey": configuration_resource_key(container_id),
+        "buildContextPath": "",
         "ownsContainer": True,
+        "ownsBuildContext": True,
+        "selfModifying": True,
         "transientState": "creating",
         "lastError": "",
         "cachedApps": [],
@@ -2477,12 +2584,15 @@ def definition_dictionary(record, configuration):
         or (configuration.get("realizedRuntimeSettings") or runtime_settings({})) != runtime_settings(configuration)
         or configuration.get("realizedResources", {"cpus": record.get("cpus"), "memoryInMB": record.get("memoryInMB")})
         != {"cpus": record.get("cpus"), "memoryInMB": record.get("memoryInMB")}
+        or configuration.get("realizedBuildContextPath", str(build_context_directory(container_id)))
+        != str(build_context_directory(container_id))
+        or configuration.get("realizedSelfModifying", True) != container_self_modifying(container_id)
     )
     return {
         "baseImage": configuration.get("baseImage", DEFAULT_BASE_IMAGE),
         "containerfile": dockerfile,
         "dockerfileHostPath": str(dockerfile_path(container_id)),
-        "dockerfileGuestPath": "/var/lib/outershell/project/Dockerfile",
+        "dockerfileGuestPath": "/var/lib/outershell/project/Dockerfile" if container_self_modifying(container_id) else None,
         "buildEngineAvailable": docker_path() is not None,
         "definitionDirectory": str(build_context_directory(container_id)),
         "transferItems": [
@@ -2572,7 +2682,7 @@ def workspace_dictionary(record, overview=False):
     else:
         operating_system, version = attached_runtime_description(container_id)
     mounts = []
-    if owns_container:
+    if owns_container and container_self_modifying(container_id):
         mounts.append({
             "id": "00000000-0000-4000-8000-000000000002",
             "name": "Container project",
@@ -2582,6 +2692,7 @@ def workspace_dictionary(record, overview=False):
             "isInfrastructure": True,
             "isBuildContextMount": True,
         })
+    if owns_container:
         mounts += [dict(value, isInfrastructure=False, isBuildContextMount=False)
                    for value in configuration.get("mounts", [])]
     persistent = []
@@ -2604,6 +2715,9 @@ def workspace_dictionary(record, overview=False):
         "runtimeKind": "docker",
         "managementKind": "managed" if owns_container else "attached",
         "ownsContainer": owns_container,
+        "ownsBuildContext": owns_container and not CONTAINER_BUILD_CONTEXTS.get(container_id),
+        "selfModifying": owns_container and container_self_modifying(container_id),
+        "buildContextPath": str(build_context_directory(container_id)) if owns_container else None,
         "runtimeName": container_name(container_id),
         "supportsLiveMounts": owns_container,
         "runtime": {
@@ -2657,6 +2771,9 @@ def unavailable_workspace_dictionary(record, error):
         "runtimeKind": "docker",
         "managementKind": "managed" if owns_container else "attached",
         "ownsContainer": owns_container,
+        "ownsBuildContext": owns_container and not CONTAINER_BUILD_CONTEXTS.get(container_id),
+        "selfModifying": owns_container and container_self_modifying(container_id),
+        "buildContextPath": str(build_context_directory(container_id)) if owns_container else None,
         "runtimeName": container_name(container_id),
         "supportsLiveMounts": owns_container,
         "runtime": {
@@ -2808,6 +2925,44 @@ def response(request_id, extra=None, error=None, include_state=True, overview=Fa
     if error:
         value["error"] = str(error)
     return value
+
+
+def container_response_message(error=None, result=None, snapshot=None):
+    return api_message(
+        struct.pack("<HI", API_CONTAINER_RESPONSE, 1 if error else 0),
+        [
+            str(error) if error else "",
+            offset_archive_encode(result) if result else b"",
+            offset_archive_encode(snapshot) if snapshot else b"",
+        ],
+    )
+
+
+def handle_container_message(message):
+    if len(message) < 24 or struct.unpack_from("<H", message)[0] != API_CONTAINER_REQUEST:
+        return container_response_message(error="The container request is invalid.")
+    operation_code, flags = struct.unpack_from("<HI", message, 2)
+    if operation_code >= len(CONTAINER_OPERATIONS):
+        return container_response_message(error="This container operation is not supported on this server.")
+    try:
+        workspace_id = api_reference(message, 8).decode("utf-8")
+        encoded_arguments = api_reference(message, 16)
+        arguments = offset_archive_decode(encoded_arguments) if encoded_arguments else {}
+        if not isinstance(arguments, dict):
+            raise ValueError("The container request arguments are invalid.")
+    except (RuntimeError, ValueError, UnicodeDecodeError, struct.error) as error:
+        return container_response_message(error=error)
+    request = dict(arguments)
+    request["operation"] = CONTAINER_OPERATIONS[operation_code]
+    if workspace_id:
+        request["workspaceID"] = workspace_id
+    if flags & CONTAINER_REQUEST_OVERVIEW:
+        request["overview"] = True
+    value = handle_request(request)
+    error = value.pop("error", None)
+    value.pop("requestID", None)
+    snapshot = {key: value.pop(key) for key in ("providers", "workspaces") if key in value}
+    return container_response_message(error=error, result=value, snapshot=snapshot)
 
 
 def handle_request(request):
@@ -3211,11 +3366,9 @@ def main():
             if raw_request.startswith(TRANSFER_MAGIC):
                 sys.stdout.buffer.write(handle_transfer_request(raw_request))
                 return 0
-            request = json.loads(raw_request)
-            value = handle_request(request)
+            sys.stdout.buffer.write(handle_container_message(raw_request))
         except Exception as error:
-            value = response(str(uuid.uuid4()), error=error)
-        json.dump(value, sys.stdout, separators=(",", ":"))
+            sys.stdout.buffer.write(container_response_message(error=error))
         return 0
     if sys.argv[1] == "job" and len(sys.argv) == 4:
         if sys.argv[2] == "rebuild":

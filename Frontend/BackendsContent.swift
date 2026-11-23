@@ -694,6 +694,9 @@ private struct LocalWorkspaceRecord: Decodable, Equatable {
     let runtimeKind: String?
     let managementKind: String?
     let ownsContainer: Bool?
+    var ownsBuildContext: Bool? = nil
+    var selfModifying: Bool? = nil
+    var buildContextPath: String? = nil
     let runtimeName: String?
     let supportsLiveMounts: Bool?
     var runtime: Runtime?
@@ -892,18 +895,11 @@ private struct LocalWorkspaceHostResponse: Decodable {
 }
 
 private extension LocalWorkspaceHostResponse {
-    static func decode(_ data: Data, snapshotRequestID: UUID? = nil) throws -> LocalWorkspaceHostResponse {
-        let payload: Data
-        if let snapshotRequestID {
-            guard var object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-                throw URLError(.cannotParseResponse)
-            }
-            object["requestID"] = snapshotRequestID.uuidString
-            payload = try JSONSerialization.data(withJSONObject: object)
-        } else {
-            payload = data
-        }
-        return try JSONDecoder().decode(LocalWorkspaceHostResponse.self, from: payload)
+    static func decode(_ data: Data, requestID: UUID = UUID(), fromSnapshot: Bool = false) throws -> LocalWorkspaceHostResponse {
+        let defaults: [String: Any] = ["requestID": requestID.uuidString, "workspaces": [Any]()]
+        return fromSnapshot
+            ? try ContainerMessage.decodeSnapshot(LocalWorkspaceHostResponse.self, from: data, defaults: defaults)
+            : try ContainerMessage.decode(LocalWorkspaceHostResponse.self, from: data, defaults: defaults)
     }
 }
 
@@ -2184,6 +2180,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private var containerConfigurationPortsTabFrame = CGRect.zero
     private var containerConfigurationRuntimeTabFrame = CGRect.zero
     private var containerConfigurationChangeRuntimeFrame = CGRect.zero
+    private var containerConfigurationSelfModifyingFrame = CGRect.zero
     private var containerConfigurationResourceFrames: [(frame: CGRect, resource: ContainerCreationResource, delta: Int)] = []
     private var containerConfigurationApplyResourcesFrame = CGRect.zero
     private var containerConfigurationCPUs = 4
@@ -8443,6 +8440,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 controls += visibleCodingAgentActions.map { ($0.frame, $0.title) }
             case .runtime:
                 controls.append((containerConfigurationChangeRuntimeFrame, "Change runtime"))
+                controls.append((containerConfigurationSelfModifyingFrame, "Self-modifying"))
                 controls.append((containerConfigurationApplyResourcesFrame, "Apply resource limits"))
                 controls += containerConfigurationResourceFrames.map {
                     ($0.frame, "\($0.delta < 0 ? "Decrease" : "Increase") \($0.resource == .cpus ? "CPUs, currently \(containerConfigurationCPUs)" : "memory, currently \(ContainerResourceText.formatMemory(containerConfigurationMemoryInMB))")")
@@ -9284,7 +9282,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                              workspaceID: context.container.id,
                                              serviceID: context.app.serviceID,
                                              logIndex: selection.logIndex)
-        guard let payload = try? JSONEncoder().encode(request) else {
+        guard let payload = try? ContainerMessage.request(request) else {
             logError = "Could not build log request."
             updateLayout()
             return
@@ -9300,7 +9298,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         var urlRequest = URLRequest(url: safeSpacesEndpoint)
         urlRequest.httpMethod = "POST"
         urlRequest.httpBody = payload
-        urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        urlRequest.setValue(ContainerMessage.contentType, forHTTPHeaderField: "Content-Type")
         urlSession.dataTask(with: urlRequest) { [weak self] data, _, error in
             Task { @MainActor in
                 guard let self else { return }
@@ -9313,7 +9311,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                     return
                 }
                 guard let data,
-                      let response = try? JSONDecoder().decode(ContainerAppLogResponse.self, from: data) else {
+                      let response = try? ContainerMessage.decode(ContainerAppLogResponse.self, from: data) else {
                     self.logError = "Outer Shell returned an invalid container log response."
                     self.updateLayout()
                     return
@@ -9498,7 +9496,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 let deadline = ProcessInfo.processInfo.systemUptime + 30
                 while ProcessInfo.processInfo.systemUptime < deadline {
                     let data = try await self.webResourceData("/api/container-snapshot")
-                    let response = try LocalWorkspaceHostResponse.decode(data, snapshotRequestID: UUID())
+                    let response = try LocalWorkspaceHostResponse.decode(data, fromSnapshot: true)
                     if let workspace = response.workspaces.first(where: { $0.id == context.container.id }),
                        let app = workspace.apps.first(where: { $0.serviceID == context.app.serviceID && $0.frontendID == context.app.frontendID }),
                        app.isRunning == (operation != "stopApp") {
@@ -9663,14 +9661,14 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                                    operation: "publishSocket",
                                                    workspaceID: workspaceID,
                                                    socketPath: socketPath)
-        guard let body = try? JSONEncoder().encode(apiRequest) else {
+        guard let body = try? ContainerMessage.request(apiRequest) else {
             completion(nil, "Outer Shell could not encode the container socket request.")
             return
         }
         var urlRequest = URLRequest(url: safeSpacesEndpoint)
         urlRequest.httpMethod = "POST"
         urlRequest.httpBody = body
-        urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        urlRequest.setValue(ContainerMessage.contentType, forHTTPHeaderField: "Content-Type")
         urlSession.dataTask(with: urlRequest) { data, response, error in
             Task { @MainActor in
                 if let error {
@@ -9678,7 +9676,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                     return
                 }
                 guard let data,
-                      let publication = try? JSONDecoder().decode(PublishWorkspaceSocketHostResponse.self, from: data),
+                      let publication = try? ContainerMessage.decode(PublishWorkspaceSocketHostResponse.self,
+                                                                     from: data,
+                                                                     defaults: ["requestID": requestID.uuidString]),
                       publication.requestID == requestID else {
                     completion(nil, "Outer Shell returned an invalid socket publication response.")
                     return
@@ -9698,15 +9698,17 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         guard let endpoint = safeSpacesEndpoint, let session = safeSpaceOperationSession else {
             throw ContainerConfigurationInputError(message: "Outer Shell’s container service is unavailable.")
         }
-        var values: [String: Any] = ["requestID": UUID().uuidString, "operation": operation, "workspaceID": workspaceID.uuidString]
+        var values: [String: Any] = [:]
         if let app {
             values["serviceID"] = app.serviceID
             if let scope = app.serviceScope { values["serviceScope"] = scope }
         }
         var request = URLRequest(url: endpoint)
         request.httpMethod = "POST"
-        request.httpBody = try JSONSerialization.data(withJSONObject: values)
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try ContainerMessage.request(operation: operation,
+                                                        workspaceID: workspaceID.uuidString,
+                                                        arguments: values)
+        request.setValue(ContainerMessage.contentType, forHTTPHeaderField: "Content-Type")
         let (data, response) = try await session.data(for: request)
         let result = try LocalWorkspaceHostResponse.decode(data)
         if let error = result.error, !error.isEmpty { throw ContainerConfigurationInputError(message: error) }
@@ -9733,7 +9735,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 let deadline = ProcessInfo.processInfo.systemUptime + 120
                 while ProcessInfo.processInfo.systemUptime < deadline {
                     let data = try await self.webResourceData("/api/container-snapshot")
-                    let response = try LocalWorkspaceHostResponse.decode(data, snapshotRequestID: UUID())
+                    let response = try LocalWorkspaceHostResponse.decode(data, fromSnapshot: true)
                     if let current = response.workspaces.first(where: { $0.id == workspace.id }),
                        let ready = current.apps.first(where: { $0.serviceID == app.serviceID && $0.frontendID == app.frontendID }),
                        self.displayedWorkspaceState(for: current) == "running", ready.isRunning,
@@ -13173,6 +13175,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                         containerConfigurationPortsTabFrame.contains(point) ||
                         containerConfigurationRuntimeTabFrame.contains(point) ||
                         containerConfigurationChangeRuntimeFrame.contains(point) ||
+                        containerConfigurationSelfModifyingFrame.contains(point) ||
                         containerConfigurationApplyResourcesFrame.contains(point) ||
                         containerConfigurationResourceFrames.contains(where: { $0.frame.contains(point) }) ||
                         containerConfigurationCookbookFrame.contains(point) ||
@@ -13965,6 +13968,12 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                       let workspace = pendingDockerfileWorkspace {
                 armButtonClick(frame: containerConfigurationApplyResourcesFrame) { [weak self] in
                     self?.sendWorkspaceRequest(operation: "updateResources", workspaceID: workspace.id)
+                }
+            } else if containerConfigurationSelfModifyingFrame.contains(point),
+                      !isPerformingWorkspaceOperation,
+                      let workspace = pendingDockerfileWorkspace {
+                armButtonClick(frame: containerConfigurationSelfModifyingFrame) { [weak self] in
+                    self?.setContainerSelfModifying(workspace, enabled: workspace.selfModifying == false)
                 }
             } else if containerConfigurationChangeRuntimeFrame.contains(point),
                       containerConfigurationRebuildWorkspaceID == nil,
@@ -15792,7 +15801,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                                 mounts: mounts,
                                                 environment: environment,
                                                 publishedPorts: publishedPorts)
-        guard let payload = try? JSONEncoder().encode(request) else {
+        guard let payload = try? ContainerMessage.request(request) else {
             if operation == "rebuild" || operation == "changeRuntime" {
                 containerConfigurationRebuildWorkspaceID = nil
             }
@@ -15872,7 +15881,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         if !usesSnapshot {
             urlRequest.httpMethod = "POST"
             urlRequest.httpBody = payload
-            urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            urlRequest.setValue(ContainerMessage.contentType, forHTTPHeaderField: "Content-Type")
         }
         operationSession.dataTask(with: urlRequest) { [weak self] data, response, error in
             Task { @MainActor [weak self] in
@@ -15923,7 +15932,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
     private func handleWorkspaceResponse(_ payload: Data, requestID: UUID? = nil, fromSnapshot: Bool = false) {
         guard let response = try? LocalWorkspaceHostResponse.decode(payload,
-            snapshotRequestID: fromSnapshot ? requestID : nil) else {
+            requestID: requestID ?? UUID(),
+            fromSnapshot: fromSnapshot) else {
             if pendingWorkspaceOperations.values.contains("rebuild") ||
                 pendingWorkspaceOperations.values.contains("changeRuntime") {
                 containerConfigurationRebuildWorkspaceID = nil
@@ -16220,12 +16230,11 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             )))
             return
         }
-        var requestValue = values
-        requestValue["requestID"] = UUID().uuidString.lowercased()
-        requestValue["operation"] = operation
+        var arguments = values
+        let workspaceID = arguments.removeValue(forKey: "workspaceID") as? String
         let payload: Data
         do {
-            payload = try JSONSerialization.data(withJSONObject: requestValue)
+            payload = try ContainerMessage.request(operation: operation, workspaceID: workspaceID, arguments: arguments)
         } catch {
             completion(.failure(error))
             return
@@ -16233,7 +16242,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         var request = URLRequest(url: safeSpacesEndpoint)
         request.httpMethod = "POST"
         request.httpBody = payload
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue(ContainerMessage.contentType, forHTTPHeaderField: "Content-Type")
         safeSpaceOperationSession.dataTask(with: request) { data, response, error in
             Task { @MainActor in
                 if let error {
@@ -16248,7 +16257,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                     )))
                     return
                 }
-                let decoded = try? JSONDecoder().decode(LocalWorkspaceHostResponse.self, from: data)
+                let decoded = try? LocalWorkspaceHostResponse.decode(data)
                 if let message = decoded?.error, !message.isEmpty {
                     completion(.failure(NSError(
                         domain: "org.outershell.transfer",
@@ -16271,10 +16280,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                     return
                 }
                 do {
-                    let value = try decoded ?? JSONDecoder().decode(
-                        LocalWorkspaceHostResponse.self,
-                        from: data
-                    )
+                    let value = try decoded ?? LocalWorkspaceHostResponse.decode(data)
                     completion(.success(value))
                 } catch {
                     completion(.failure(error))
@@ -17286,13 +17292,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 }
                 var request = URLRequest(url: endpoint)
                 request.httpMethod = "POST"
-                request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-                request.httpBody = try JSONSerialization.data(withJSONObject: [
-                    "requestID": requestID.uuidString,
-                    "operation": "list",
-                    "workspaceID": workspace.id.uuidString,
-                    "configurationOnly": true
-                ])
+                request.setValue(ContainerMessage.contentType, forHTTPHeaderField: "Content-Type")
+                request.httpBody = try ContainerMessage.request(operation: "list",
+                                                                workspaceID: workspace.id.uuidString,
+                                                                arguments: ["configurationOnly": true])
                 let (data, response) = try await session.data(for: request)
                 struct ConfigurationResponse: Decodable {
                     struct Configuration: Decodable {
@@ -17304,7 +17307,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                     let workspaces: [Configuration]
                     let error: String?
                 }
-                let result = try JSONDecoder().decode(ConfigurationResponse.self, from: data)
+                let result = try ContainerMessage.decode(ConfigurationResponse.self,
+                                                         from: data,
+                                                         defaults: ["workspaces": [Any]()])
                 guard (response as? HTTPURLResponse).map({ (200..<300).contains($0.statusCode) }) != false,
                       result.error == nil,
                       let configuration = result.workspaces.first(where: { $0.id == workspace.id }) else {
@@ -18492,6 +18497,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         containerConfigurationPortsTabFrame = .zero
         containerConfigurationRuntimeTabFrame = .zero
         containerConfigurationChangeRuntimeFrame = .zero
+        containerConfigurationSelfModifyingFrame = .zero
         containerConfigurationResourceFrames.removeAll()
         containerConfigurationResourceValueFrames.removeAll()
         containerConfigurationApplyResourcesFrame = .zero
@@ -19540,6 +19546,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                                   top: sectionTop)
             sectionTop -= 96
         }
+        sectionTop = renderContainerConfigurationBuildContext(workspace, in: contentFrame, top: sectionTop)
 
         guard let destination else {
             let unavailable = makeTextLayer(size: 11,
@@ -19571,6 +19578,82 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             dy: workspacePanelFrame.minY
         )
 
+    }
+
+    private func renderContainerConfigurationBuildContext(_ workspace: LocalWorkspaceRecord,
+                                                          in contentFrame: CGRect,
+                                                          top: CGFloat) -> CGFloat {
+        let title = makeTextLayer(size: 10, weight: .semibold, color: .secondaryLabelColor)
+        title.string = "BUILD CONTEXT"
+        title.frame = CGRect(x: contentFrame.minX, y: top - 16, width: contentFrame.width, height: 14)
+        workspacePanelLayer.addSublayer(title)
+
+        let external = workspace.ownsBuildContext == false
+        let path = workspace.buildContextPath ?? workspace.definition?.definitionDirectory ?? ""
+        let location = makeTextLayer(size: 11, weight: .regular, color: .secondaryLabelColor)
+        location.string = path + (external ? " · External folder" : " · Outer Shell folder")
+        location.truncationMode = .middle
+        location.frame = CGRect(x: contentFrame.minX, y: top - 36, width: contentFrame.width, height: 16)
+        workspacePanelLayer.addSublayer(location)
+
+        let selfModifying = workspace.selfModifying != false
+        let status = makeTextLayer(size: 11, weight: .regular, color: .secondaryLabelColor)
+        status.string = selfModifying
+            ? "Self-modifying: the container can edit this folder at /var/lib/outershell/project."
+            : "Sealed: the container cannot see or edit this folder."
+        status.frame = CGRect(x: contentFrame.minX, y: top - 54, width: contentFrame.width, height: 16)
+        workspacePanelLayer.addSublayer(status)
+
+        let buttonTitle = selfModifying
+            ? "Turn self-modifying off"
+            : (external ? "Let the container edit \((path as NSString).lastPathComponent)" : "Turn self-modifying on")
+        let button = makeButtonLayer(title: buttonTitle, emphasized: false)
+        let buttonFrame = CGRect(x: contentFrame.minX,
+                                 y: top - 96,
+                                 width: min(max(CGFloat(buttonTitle.count * 7 + 40), 200), contentFrame.width),
+                                 height: 32)
+        button.frame = buttonFrame
+        button.opacity = isPerformingWorkspaceOperation ? 0.45 : 1
+        workspacePanelLayer.addSublayer(button)
+        containerConfigurationSelfModifyingFrame = buttonFrame.offsetBy(dx: workspacePanelFrame.minX,
+                                                                        dy: workspacePanelFrame.minY)
+        return top - 108
+    }
+
+    private func setContainerSelfModifying(_ workspace: LocalWorkspaceRecord, enabled: Bool) {
+        guard let safeSpacesEndpoint, let urlSession else { return }
+        let ownsBuildContext = workspace.ownsBuildContext != false
+        let flags: UInt32 = (ownsBuildContext ? 0x04 : 0) | (enabled ? 0x08 : 0)
+        var request = URLRequest(url: safeSpacesEndpoint)
+        request.httpMethod = "POST"
+        request.setValue(ContainerMessage.contentType, forHTTPHeaderField: "Content-Type")
+        request.httpBody = ContainerMessage.registration(
+            identifier: workspace.id.uuidString.lowercased(),
+            flags: flags,
+            setMask: 0x04,
+            buildContextPath: ownsBuildContext ? "" : (workspace.buildContextPath ?? "")
+        )
+        isPerformingWorkspaceOperation = true
+        safeSpaceDefinitionMessage = enabled ? "Turning self-modifying on…" : "Turning self-modifying off…"
+        updateLayout()
+        urlSession.dataTask(with: request) { [weak self] data, _, error in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.isPerformingWorkspaceOperation = false
+                let failure = error?.localizedDescription ?? data.flatMap { ContainerMessage.commandError($0) }
+                if let failure {
+                    self.safeSpaceDefinitionMessage = failure
+                } else {
+                    self.safeSpaceDefinitionMessage = "Saved. Rebuild to apply this change."
+                    if var updated = self.pendingDockerfileWorkspace, updated.id == workspace.id {
+                        updated.selfModifying = enabled
+                        self.pendingDockerfileWorkspace = updated
+                    }
+                    self.sendWorkspaceRequest(operation: "list")
+                }
+                self.updateLayout()
+            }
+        }.resume()
     }
 
     private func renderContainerConfigurationResources(_ workspace: LocalWorkspaceRecord,

@@ -30,7 +30,8 @@ enum {
     ORWA_CONTENT_TYPES_ROW_SIZE = 96,
     ORWA_FILE_OPENERS_ROW_SIZE = 56,
     ORWA_RESOURCES_ROW_SIZE = 32,
-    ORWA_CONTAINERS_ROW_SIZE = 104
+    ORWA_LEGACY_CONTAINERS_ROW_SIZE = 104,
+    ORWA_CONTAINERS_ROW_SIZE = 120
 };
 
 typedef struct {
@@ -352,16 +353,21 @@ typedef struct {
     char *display_name;
     char *provider_id;
     char *runtime_name;
-    char *project_resource_key;
+    char *build_context_path;
     uint64_t created_at_milliseconds;
     uint32_t cpus;
     uint32_t memory_in_mb;
-    bool owns_container;
+    uint32_t flags;
 } RegistryContainerRecord;
 
 enum {
-    REGISTRY_CONTAINER_ROW_OWNED = 0x01u,
-    REGISTRY_CONTAINER_ROW_MEMORY_IN_MB = 0x02u
+    REGISTRY_CONTAINER_OWNS_RUNTIME = 0x01u,
+    REGISTRY_CONTAINER_LEGACY_MEMORY_IN_MB = 0x02u,
+    REGISTRY_CONTAINER_OWNS_BUILD_CONTEXT = 0x04u,
+    REGISTRY_CONTAINER_SELF_MODIFYING = 0x08u,
+    REGISTRY_CONTAINER_FLAGS = REGISTRY_CONTAINER_OWNS_RUNTIME |
+                               REGISTRY_CONTAINER_OWNS_BUILD_CONTEXT |
+                               REGISTRY_CONTAINER_SELF_MODIFYING
 };
 
 typedef struct {
@@ -736,7 +742,7 @@ static void registry_store_free(RegistryStore *store) {
         free(store->containers[i].display_name);
         free(store->containers[i].provider_id);
         free(store->containers[i].runtime_name);
-        free(store->containers[i].project_resource_key);
+        free(store->containers[i].build_context_path);
     }
     free(store->containers);
     if (store->lock_fd >= 0) {
@@ -894,10 +900,16 @@ static RegistryContainerRecord *registry_store_find_container(RegistryStore *sto
     return NULL;
 }
 
-static uint32_t registry_container_row_memory_in_mb(const unsigned char *row_bytes) {
+static uint32_t registry_legacy_container_row_memory_in_mb(const unsigned char *row_bytes) {
     uint32_t memory = read_uint32_le(row_bytes + 92);
-    if (read_uint32_le(row_bytes + 96) & REGISTRY_CONTAINER_ROW_MEMORY_IN_MB) return memory;
+    if (read_uint32_le(row_bytes + 96) & REGISTRY_CONTAINER_LEGACY_MEMORY_IN_MB) return memory;
     return memory > UINT32_MAX / 1024u ? UINT32_MAX : memory * 1024u;
+}
+
+static uint32_t registry_legacy_container_row_flags(const unsigned char *row_bytes) {
+    return (read_uint32_le(row_bytes + 96) & REGISTRY_CONTAINER_OWNS_RUNTIME)
+        ? REGISTRY_CONTAINER_FLAGS
+        : 0u;
 }
 
 static bool registry_store_upsert_container(RegistryStore *store,
@@ -905,11 +917,11 @@ static bool registry_store_upsert_container(RegistryStore *store,
                                             const char *display_name,
                                             const char *provider_id,
                                             const char *runtime_name,
-                                            const char *project_resource_key,
+                                            const char *build_context_path,
                                             uint64_t created_at_milliseconds,
                                             uint32_t cpus,
                                             uint32_t memory_in_mb,
-                                            bool owns_container) {
+                                            uint32_t flags) {
     RegistryContainerRecord *record = registry_store_find_container(store, identifier);
     if (!record) {
         REGISTRY_ENSURE_CAPACITY(store, container, RegistryContainerRecord);
@@ -920,13 +932,13 @@ static bool registry_store_upsert_container(RegistryStore *store,
     if (!registry_assign_string(&record->display_name, display_name) ||
         !registry_assign_string(&record->provider_id, provider_id) ||
         !registry_assign_string(&record->runtime_name, runtime_name) ||
-        !registry_assign_string(&record->project_resource_key, project_resource_key)) {
+        !registry_assign_string(&record->build_context_path, build_context_path)) {
         return false;
     }
     record->created_at_milliseconds = created_at_milliseconds;
     record->cpus = cpus;
     record->memory_in_mb = memory_in_mb;
-    record->owns_container = owns_container;
+    record->flags = flags & REGISTRY_CONTAINER_FLAGS;
     return true;
 }
 
@@ -938,7 +950,7 @@ static bool registry_store_remove_container(RegistryStore *store, const char *id
         free(record->display_name);
         free(record->provider_id);
         free(record->runtime_name);
-        free(record->project_resource_key);
+        free(record->build_context_path);
         memmove(record,
                 record + 1,
                 (store->container_count - index - 1) * sizeof(*record));
@@ -1422,7 +1434,7 @@ static bool registry_store_load_orwa_file(RegistryStore *store, const char *path
                                      i == ORWA_TABLE_CONTENT_TYPES ? descriptors[i].row_size :
                                      i == ORWA_TABLE_FILE_OPENERS ? ORWA_FILE_OPENERS_ROW_SIZE :
                                      i == ORWA_TABLE_RESOURCES ? ORWA_RESOURCES_ROW_SIZE :
-                                     i == ORWA_TABLE_CONTAINERS ? ORWA_CONTAINERS_ROW_SIZE :
+                                     i == ORWA_TABLE_CONTAINERS ? descriptors[i].row_size :
                                      ORWA_LOG_FILES_ROW_SIZE;
         bool row_size_supported = descriptors[i].row_size == expected_row_size;
         bool bounds_valid = descriptors[i].offset <= (uint64_t)file_size &&
@@ -1446,6 +1458,9 @@ static bool registry_store_load_orwa_file(RegistryStore *store, const char *path
                    descriptors[i].row_size != ORWA_LEGACY_CONTENT_TYPES_ROW_SIZE)
                 : i == ORWA_TABLE_FILE_OPENERS
                 ? false
+                : i == ORWA_TABLE_CONTAINERS
+                ? (descriptors[i].row_size != ORWA_CONTAINERS_ROW_SIZE &&
+                   descriptors[i].row_size != ORWA_LEGACY_CONTAINERS_ROW_SIZE)
                 : !row_size_supported) ||
             (i != ORWA_TABLE_CONTENT_TYPES && !bounds_valid)) {
             snprintf(error, error_size, "Registry binary table descriptor is invalid.");
@@ -1717,13 +1732,14 @@ static bool registry_store_load_orwa_file(RegistryStore *store, const char *path
 
     if (ok && table_count == ORWA_TABLE_COUNT) {
         for (uint64_t row = 0; ok && row < descriptors[ORWA_TABLE_CONTAINERS].row_count; row++) {
+            bool legacy_row = descriptors[ORWA_TABLE_CONTAINERS].row_size == ORWA_LEGACY_CONTAINERS_ROW_SIZE;
             const unsigned char *row_bytes = bytes + descriptors[ORWA_TABLE_CONTAINERS].offset +
-                row * ORWA_CONTAINERS_ROW_SIZE;
+                row * descriptors[ORWA_TABLE_CONTAINERS].row_size;
             char *identifier = NULL;
             char *display_name = NULL;
             char *provider_id = NULL;
             char *runtime_name = NULL;
-            char *project_resource_key = NULL;
+            char *build_context_path = NULL;
             ok = registry_store_read_string(bytes, file_size, variable_offset, row_bytes, 0,
                                             &identifier, error, error_size) &&
                  registry_store_read_string(bytes, file_size, variable_offset, row_bytes, 16,
@@ -1732,26 +1748,32 @@ static bool registry_store_load_orwa_file(RegistryStore *store, const char *path
                                             &provider_id, error, error_size) &&
                  registry_store_read_string(bytes, file_size, variable_offset, row_bytes, 48,
                                             &runtime_name, error, error_size) &&
-                 registry_store_read_string(bytes, file_size, variable_offset, row_bytes, 64,
-                                            &project_resource_key, error, error_size);
+                 (legacy_row ||
+                  registry_store_read_string(bytes, file_size, variable_offset, row_bytes, 104,
+                                             &build_context_path, error, error_size));
             if (ok) {
                 ok = registry_store_upsert_container(store,
                                                      identifier,
                                                      display_name,
                                                      provider_id,
                                                      runtime_name,
-                                                     project_resource_key,
+                                                     build_context_path ? build_context_path : "",
                                                      read_uint64_le(row_bytes + 80),
                                                      read_uint32_le(row_bytes + 88),
-                                                     registry_container_row_memory_in_mb(row_bytes),
-                                                     (read_uint32_le(row_bytes + 96) & REGISTRY_CONTAINER_ROW_OWNED) != 0);
+                                                     legacy_row
+                                                         ? registry_legacy_container_row_memory_in_mb(row_bytes)
+                                                         : read_uint32_le(row_bytes + 92),
+                                                     legacy_row
+                                                         ? registry_legacy_container_row_flags(row_bytes)
+                                                         : read_uint32_le(row_bytes + 96));
                 if (!ok) snprintf(error, error_size, "Out of memory.");
+                if (legacy_row) store->needs_rewrite = true;
             }
             free(identifier);
             free(display_name);
             free(provider_id);
             free(runtime_name);
-            free(project_resource_key);
+            free(build_context_path);
         }
     }
 
@@ -1855,13 +1877,13 @@ static bool registry_store_write_orwa_file(RegistryStore *store, const char *pat
              registry_binary_append_string_ref(&pool, &variable_region, &rows, record->display_name) &&
              registry_binary_append_string_ref(&pool, &variable_region, &rows, record->provider_id) &&
              registry_binary_append_string_ref(&pool, &variable_region, &rows, record->runtime_name) &&
-             registry_binary_append_string_ref(&pool, &variable_region, &rows, record->project_resource_key) &&
+             registry_binary_append_string_ref(&pool, &variable_region, &rows, "") &&
              binary_append_u64(&rows, record->created_at_milliseconds) &&
              binary_append_u32(&rows, record->cpus) &&
              binary_append_u32(&rows, record->memory_in_mb) &&
-             binary_append_u32(&rows, REGISTRY_CONTAINER_ROW_MEMORY_IN_MB |
-                                      (record->owns_container ? REGISTRY_CONTAINER_ROW_OWNED : 0u)) &&
-             binary_append_u32(&rows, 0u);
+             binary_append_u32(&rows, record->flags & REGISTRY_CONTAINER_FLAGS) &&
+             binary_append_u32(&rows, 0u) &&
+             registry_binary_append_string_ref(&pool, &variable_region, &rows, record->build_context_path);
     }
     if (ok && rows.length != variable_region_offset - ORWA_HEADER_SIZE) {
         snprintf(error, error_size, "Registry binary row length mismatch.");

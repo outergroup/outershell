@@ -161,27 +161,51 @@ typed offset archives.
 
 ### `containers`
 
-Row size: 104 bytes.
+Row size: 120 bytes.
 
 ```text
-bytes 0..15:    StringRef64 stable identifier
-bytes 16..31:   StringRef64 display name
-bytes 32..47:   StringRef64 provider identifier
-bytes 48..63:   StringRef64 provider runtime name
-bytes 64..79:   StringRef64 optional project resource key
-bytes 80..87:   UInt64 creation time in Unix milliseconds
-bytes 88..91:   UInt32 CPU ceiling
-bytes 92..95:   UInt32 memory ceiling in GiB
-bytes 96..99:   UInt32 flags; bit 0 = owns_container
-bytes 100..103: reserved
+bytes 0..15:     StringRef64 stable identifier (a UUID)
+bytes 16..31:    StringRef64 display name
+bytes 32..47:    StringRef64 provider identifier
+bytes 48..63:    StringRef64 provider runtime name
+bytes 64..79:    reserved, written as an empty StringRef64
+bytes 80..87:    UInt64 creation time in Unix milliseconds
+bytes 88..91:    UInt32 CPU ceiling (0 = provider default)
+bytes 92..95:    UInt32 memory ceiling in MiB (0 = provider default)
+bytes 96..99:    UInt32 flags
+bytes 100..103:  reserved
+bytes 104..119:  StringRef64 build-context path (empty = none, or Outer Shell's folder)
 ```
 
-The provider and runtime name locate the real container. An owned record lets
+Flags:
+
+```text
+0x01 owns runtime        Outer Shell creates, rebuilds, and deletes the runtime container
+0x04 owns build context  the build context is Outer Shell's folder for this container
+0x08 self-modifying      the build context is mounted read-write at /var/lib/outershell/project
+```
+
+Bit `0x02` is reserved.
+
+The provider and runtime name locate the real container. An owned runtime lets
 Outer Shell create, rebuild, migrate, and delete that runtime. An attached
 record is observational: Outer Shell may start or stop it through its provider,
 discover its apps, and relay its sockets, but unregistering it never deletes
 the runtime or its data. This is the container equivalent of `owns_unit` on a
 backend row.
+
+A build context is either Outer Shell's own folder for the container (flag
+`0x04` with an empty path) or an existing folder named by its absolute,
+canonical path. Deleting a container removes only a build context Outer Shell
+owns. A self-modifying build context may not contain or sit inside Outer
+Shell's own folders or its API socket. The container's configuration (mounts,
+environment, ports, persistent data) is the resource
+`containers/<id>/configuration`, outside the build context, so a container can
+never change how it is attached to the host.
+
+Older registries used 104-byte rows, with bytes 104..119 absent and memory in
+GiB unless bit `0x02` was set. Reading one converts an owned row to an owned,
+self-modifying build context in Outer Shell's folder and rewrites the table.
 
 ## Typed Resource Archive
 

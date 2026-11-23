@@ -32,7 +32,8 @@ struct Distribution {
     struct Wsl *owner;
     char *id, *name, *user;
     DWORD uid;
-    bool present, running, managed, building;
+    bool present, running, managed, building, owns_build_context, self_modifying;
+    char *build_context;
     HANDLE build_thread;
     char *build_error;
     ContainerRuntime container;
@@ -1145,7 +1146,9 @@ static DWORD WINAPI discovery_thread(void *context) {
     }
     return 0;
 }
-Wsl *wsl_start(HANDLE stop) {
+Wsl *wsl_start(HANDLE stop, WslRegistryRequest registry, void *registry_context) {
+    g_container_registry = registry;
+    g_container_registry_context = registry_context;
     Wsl *w = win_alloc(sizeof(*w));
     w->stop = stop;
     w->version = 1;
@@ -1196,6 +1199,7 @@ void wsl_stop(Wsl *w) {
         free(d->id);
         free(d->name);
         free(d->user);
+        free(d->build_context);
         free(d->apps.data);
         free(d);
     }
@@ -1296,20 +1300,80 @@ static void send_snapshot(Wsl *w, Connection *c, HttpRequest *r) {
     const char *json = w->snapshot.data ? w->snapshot.data : "{\"hostPlatform\":\"windows\",\"providers\":[],\"workspaces\":[]}";
     char *copy = win_strdup(json);
     LeaveCriticalSection(&w->gate);
-    char *request_id = r->body.length ? request_string(r, "requestID") : NULL;
-    if (request_id) {
-        StringBuilder response = {0};
-        append(&response, "{");
-        field(&response, "requestID", request_id);
-        append(&response, ",");
-        append(&response, copy + 1);
-        http_send(c, r, 200, "application/json", response.data, response.length);
-        free(response.data);
-    } else {
-        http_send(c, r, 200, "application/json", copy, strlen(copy));
-    }
-    free(request_id);
+    StringBuilder snapshot = {0};
+    if (container_value_encode(copy, &snapshot))
+        http_send(c, r, 200, "application/octet-stream", snapshot.data, snapshot.length);
+    else
+        http_text(c, r, 503, "Container discovery failed. Retrying…");
+    free(snapshot.data);
     free(copy);
+}
+static const char *const container_operations[] = {
+    "list", "checkRuntimes", "containerStorage", "cleanContainerStorage", "cleanContainerBuildCache",
+    "create", "duplicate", "changeRuntime", "rename", "start", "stop", "restart", "delete",
+    "mountFolder", "unmountFolder", "chooseFolder", "updateDockerfile", "updateContainerConfiguration",
+    "updateResources", "rebuild", "startApp", "stopApp", "restartApp", "appLogs", "publishSocket",
+    "prepareShare", "beginImport", "cancelImport", "finishImport",
+};
+static bool container_message_reference(const HttpRequest *r, size_t at, const unsigned char **data, uint32_t *length) {
+    const unsigned char *body = (const unsigned char *)r->body.data;
+    uint32_t offset = read_uint32_le(body + at);
+    *length = read_uint32_le(body + at + 4);
+    if (offset > r->body.length || *length > r->body.length - offset) return false;
+    *data = body + offset;
+    return true;
+}
+static bool container_message_request(HttpRequest *r) {
+    const unsigned char *body = (const unsigned char *)r->body.data;
+    if (r->body.length < 24 || read_uint16_le(body) != 35) return false;
+    uint16_t operation = read_uint16_le(body + 2);
+    const unsigned char *id = NULL, *arguments = NULL;
+    uint32_t id_length = 0, arguments_length = 0;
+    if (operation >= sizeof(container_operations) / sizeof(*container_operations) ||
+        !container_message_reference(r, 8, &id, &id_length) || id_length > 64 ||
+        !container_message_reference(r, 16, &arguments, &arguments_length))
+        return false;
+    StringBuilder json = {0}, decoded = {0};
+    if (arguments_length) {
+        StringBuilder encoded = {(char *)arguments, arguments_length, 0};
+        if (!container_value_decode(&encoded, &decoded) || !decoded.data || decoded.data[0] != '{') {
+            free(decoded.data);
+            return false;
+        }
+    }
+    append(&json, "{");
+    field(&json, "operation", container_operations[operation]);
+    if (id_length) {
+        char identifier[65];
+        memcpy(identifier, id, id_length);
+        identifier[id_length] = 0;
+        append(&json, ",");
+        field(&json, "workspaceID", identifier);
+    }
+    if (decoded.data && strcmp(decoded.data, "{}")) {
+        append(&json, ",");
+        append(&json, decoded.data + 1);
+    } else {
+        append(&json, "}");
+    }
+    free(decoded.data);
+    free(r->body.data);
+    r->body = json;
+    return true;
+}
+static void container_registry_passthrough(Wsl *w, Connection *c, HttpRequest *r) {
+    StringBuilder request = {0}, response = {0};
+    bytes(&request, r->body.data, r->body.length);
+    uint16_t type = read_uint16_le((const unsigned char *)r->body.data);
+    if (!container_registry_exchange(&request, &response)) {
+        http_text(c, r, 503, "The Outer Shell registry is unavailable.");
+        return;
+    }
+    if ((type == 31 || type == 32) && response.length >= 22 &&
+        read_uint16_le((const unsigned char *)response.data) == 100 && read_uint32_le((const unsigned char *)response.data + 2) == 0)
+        SetEvent(w->refresh);
+    http_send(c, r, 200, "application/octet-stream", response.data, response.length);
+    free(response.data);
 }
 static void serve_workspace_api(Wsl *w, Connection *c, HttpRequest *r) {
     const char *id = r->path + strlen("/api/wsl/");
@@ -1423,6 +1487,19 @@ void wsl_serve(Wsl *w, Connection *c, HttpRequest *r) {
         container_transfer(w, c, r);
         return;
     }
+    if (strcmp(r->method, "POST") || r->body.length < 2) {
+        http_text(c, r, 400, "Send a container message.");
+        return;
+    }
+    uint16_t message_type = read_uint16_le((const unsigned char *)r->body.data);
+    if (message_type == 31 || message_type == 32 || message_type == 33) {
+        container_registry_passthrough(w, c, r);
+        return;
+    }
+    if (!container_message_request(r)) {
+        container_send_reply(w, c, r, "The container request is invalid.", NULL, false);
+        return;
+    }
     const char *error = "This container operation is not supported.";
     char *operation = request_string(r, "operation"), *id = request_string(r, "workspaceID");
     bool ok = false, locked = false;
@@ -1437,7 +1514,7 @@ void wsl_serve(Wsl *w, Connection *c, HttpRequest *r) {
     if (!strcmp(operation, "containerStorage") || !strcmp(operation, "cleanContainerStorage") || !strcmp(operation, "cleanContainerBuildCache")) {
         StringBuilder extra = {0};
         if (storage_request(w, r, operation, &extra)) container_extra_response(w, c, r, extra.data);
-        else http_text(c, r, 400, "Storage inventory changed or cleanup failed. Refresh storage and check the runtime log before retrying.");
+        else container_send_reply(w, c, r, "Storage inventory changed or cleanup failed. Refresh storage and check the runtime log before retrying.", NULL, false);
         free(extra.data); LeaveCriticalSection(&w->commands); free(operation); free(id); return;
     }
     if (!strcmp(operation, "beginImport") || !strcmp(operation, "cancelImport") || !strcmp(operation, "finishImport")) {
@@ -1462,7 +1539,7 @@ void wsl_serve(Wsl *w, Connection *c, HttpRequest *r) {
         StringBuilder extra = {0};
         ok = container_share(d, r, &extra);
         if (ok) container_extra_response(w, c, r, extra.data);
-        else http_text(c, r, 400, "Could not share the container. Linked folders and files cannot be included.");
+        else container_send_reply(w, c, r, "Could not share the container. Linked folders and files cannot be included.", NULL, false);
         free(extra.data); LeaveCriticalSection(&w->commands); free(operation); free(id); return;
     }
     if (d->container && !strcmp(operation, "appLogs")) {
@@ -1481,8 +1558,14 @@ void wsl_serve(Wsl *w, Connection *c, HttpRequest *r) {
         error = "A rebuild is already running or this container is not managed by Outer Shell.";
     } else if (d->container && !strcmp(operation, "rename")) {
         char *name = request_string(r, "name");
-        if (d->managed && valid_container_name(name)) {
-            ok = save_container_metadata(d->id, name, d->cpus, d->memory_mb);
+        if (valid_container_name(name)) {
+            ok = container_registry_upsert(d->id, name, d->container, "", 0, 0, 0, CONTAINER_SET_NAME);
+            if (ok) {
+                EnterCriticalSection(&w->gate);
+                free(d->name);
+                d->name = win_strdup(name);
+                LeaveCriticalSection(&w->gate);
+            }
         }
         free(name);
         error = "The container name could not be saved.";
@@ -1510,17 +1593,18 @@ void wsl_serve(Wsl *w, Connection *c, HttpRequest *r) {
                     win_disallow_pipe(endpoint->pipe);
                 }
                 LeaveCriticalSection(&w->gate);
-                char *path = container_metadata_path(d->id);
-                wchar_t *wide = path ? win_wide(path) : NULL;
-                if (wide) DeleteFileW(wide);
-                free(wide);
-                free(path);
+                container_resource_remove(d->id, "configuration");
+                container_resource_remove(d->id, "configuration.realized");
+                container_registry_remove(d->id);
                 if (!container_remove_directory(d->id))
                     fprintf(stderr, "Could not remove the folder of container %s: %lu\n", d->id, GetLastError());
                 d->present = false;
             }
+        } else {
+            ok = container_registry_remove(d->id);
+            if (ok) d->present = false;
         }
-        error = d->managed ? "Container deletion or image cleanup failed. The registration was retained; check the runtime log and retry." : "Only containers created by Outer Shell can be deleted here.";
+        error = d->managed ? "Container deletion or image cleanup failed. The registration was retained; check the runtime log and retry." : "The container could not be removed from Outer Shell.";
     } else if (d->container && (!strcmp(operation, "start") || !strcmp(operation, "stop") ||
                          !strcmp(operation, "restart"))) {
         StringBuilder output = {0};
@@ -1573,14 +1657,10 @@ done:
     free(id);
     if (ok) {
         SetEvent(w->refresh);
-        send_snapshot(w, c, r);
+        wsl_version(w);
+        container_send_reply(w, c, r, NULL, NULL, true);
     } else {
-        StringBuilder json = {0};
-        append(&json, "{");
-        field(&json, "error", error);
-        append(&json, "}");
-        http_send(c, r, 400, "application/json", json.data, json.length);
-        free(json.data);
+        container_send_reply(w, c, r, error, NULL, false);
     }
 }
 
@@ -1588,7 +1668,7 @@ int wsl_inspect(void) {
     HANDLE stop = CreateEventW(NULL, TRUE, FALSE, NULL);
     if (!stop)
         return 1;
-    Wsl *w = wsl_start(stop);
+    Wsl *w = wsl_start(stop, NULL, NULL);
     if (!w) {
         CloseHandle(stop);
         return 1;

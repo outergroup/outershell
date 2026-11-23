@@ -52,11 +52,9 @@ static bool storage_saved_definitions(StringBuilder *definitions, const char *ex
         do {
             char *id = win_utf8(entry.cFileName);
             if (id && container_uuid(id) && (!excluding || _stricmp(id, excluding))) {
-                char *metadata = container_metadata_path(id);
-                if (metadata && container_path_exists(metadata)) {
+                if (container_registered(id)) {
                     append(definitions, "\noutershell/managed-"); append(definitions, id); append(definitions, ":latest\n");
                 }
-                free(metadata);
                 const char *names[] = {"Dockerfile", "Dockerfile.realized"};
                 for (size_t i = 0; ok && i < 2; i++) {
                     char *path = container_file(id, names[i]);

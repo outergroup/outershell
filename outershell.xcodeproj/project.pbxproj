@@ -26,6 +26,8 @@
 		AG0000000000000000000021 /* OuterShellDownloader.c in Sources */ = {isa = PBXBuildFile; fileRef = 37B4F9F12FA1B00100873894 /* OuterShellDownloader.c */; };
 		AG0000000000000000000022 /* OuterShellDownloaderApple.m in Sources */ = {isa = PBXBuildFile; fileRef = 37B4F9F22FA1B00100873894 /* OuterShellDownloaderApple.m */; };
 		C011DA7A0000000000000001 /* ContainerRuntime.swift in Sources */ = {isa = PBXBuildFile; fileRef = C011DA7A0000000000000002 /* ContainerRuntime.swift */; };
+		OA0000000000000000000002 /* OffsetArchive.swift in Sources */ = {isa = PBXBuildFile; fileRef = OA0000000000000000000001 /* OffsetArchive.swift */; };
+		OA0000000000000000000003 /* OffsetArchive.swift in Sources */ = {isa = PBXBuildFile; fileRef = OA0000000000000000000001 /* OffsetArchive.swift */; };
 		SS0000000000000000000001 /* SafeSpaceManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = SS0000000000000000000011 /* SafeSpaceManager.swift */; };
 		SS0000000000000000000005 /* SafeSpaceSocketRelay.swift in Sources */ = {isa = PBXBuildFile; fileRef = SS0000000000000000000015 /* SafeSpaceSocketRelay.swift */; };
 /* End PBXBuildFile section */
@@ -73,6 +75,7 @@
 		AG0000000000000000000003 /* OuterShellAgent.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OuterShellAgent.swift; sourceTree = "<group>"; };
 		AG0000000000000000000023 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		C011DA7A0000000000000002 /* ContainerRuntime.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContainerRuntime.swift; sourceTree = "<group>"; };
+		OA0000000000000000000001 /* OffsetArchive.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OffsetArchive.swift; sourceTree = "<group>"; };
 		SS0000000000000000000011 /* SafeSpaceManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SafeSpaceManager.swift; sourceTree = "<group>"; };
 		SS0000000000000000000015 /* SafeSpaceSocketRelay.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SafeSpaceSocketRelay.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
@@ -125,6 +128,7 @@
 			children = (
 				AG0000000000000000000002 /* Agent */,
 				0F0000000000000000000004 /* Frontend */,
+				OA0000000000000000000004 /* SharedSwift */,
 				37B4F9CE2FA1B00100873894 /* Backend */,
 				37B4F9EA2FA1B00100873894 /* outershelld */,
 				0F0000000000000000000005 /* Vendor */,
@@ -190,6 +194,14 @@
 				AG0000000000000000000023 /* Info.plist */,
 			);
 			path = Agent;
+			sourceTree = "<group>";
+		};
+		OA0000000000000000000004 /* SharedSwift */ = {
+			isa = PBXGroup;
+			children = (
+				OA0000000000000000000001 /* OffsetArchive.swift */,
+			);
+			path = SharedSwift;
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */
@@ -325,6 +337,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				OA0000000000000000000003 /* OffsetArchive.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -358,6 +371,7 @@
 				SS0000000000000000000001 /* SafeSpaceManager.swift in Sources */,
 				C011DA7A0000000000000001 /* ContainerRuntime.swift in Sources */,
 				SS0000000000000000000005 /* SafeSpaceSocketRelay.swift in Sources */,
+				OA0000000000000000000002 /* OffsetArchive.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

@@ -73,7 +73,21 @@ Request message types are allocated in one contiguous block:
 24 openerListRequest
 25 fileOpenersQuery
 26 uiRequest
+27 bundledAppControlRequest
+28 resourceGetRequest
+29 resourceSetRequest
+30 resourceRemoveRequest
+31 containerUpsertRequest
+32 containerRemoveRequest
+33 containerListRequest
+34 containerEnvironmentsRequest
+35 containerRequest
+36 containerSnapshotRequest
 ```
+
+Container messages are described in `outerctl-socket-messages.md`. The daemon
+inside a container runs with `--container-guest` and refuses messages 31-36, and
+the host daemon accepts them only from its own user or root.
 
 Response message types are allocated in one contiguous block:
 
@@ -86,6 +100,8 @@ Response message types are allocated in one contiguous block:
 105 openerListResponse
 106 fileOpenersResponse
 107 uiResponse
+108 containerListResponse
+109 containerResponse
 ```
 
 Flags:

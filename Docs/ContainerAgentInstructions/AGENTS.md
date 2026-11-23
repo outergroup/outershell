@@ -10,6 +10,15 @@ persistent directory.
 
 ## Preserve the result
 
+First check whether `/var/lib/outershell/project` exists. If it does, this is a
+self-modifying container: its build context is mounted there and you can edit
+it. If it does not, this is a sealed container: its build context lives on the
+host where you cannot see it. In a sealed container, make the change in the
+running container, then give the user the exact Dockerfile lines (and any
+files to place beside the Dockerfile) that would make it survive a rebuild,
+and say that the live change will be lost on the next rebuild until they add
+them. The rest of this section is for self-modifying containers.
+
 The reproducible source of truth is the ordinary Docker build context mounted
 at `/var/lib/outershell/project`. Its Dockerfile is:
 

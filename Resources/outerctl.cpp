@@ -19,6 +19,7 @@
 #include <glob.h>
 #endif
 
+#include <ctype.h>
 #include <errno.h>
 #include <limits.h>
 #include <stdint.h>
@@ -33,6 +34,7 @@
 #else
 #include "OuterShellPaths.h"
 #endif
+#include "../Backend/OffsetArchive.inc"
 
 namespace {
 
@@ -550,7 +552,21 @@ enum : uint16_t {
     kMessageAppListResponse = 102,
     kMessageLogListResponse = 103,
     kMessageContentTypeListResponse = 104,
-    kMessageOpenerListResponse = 105
+    kMessageOpenerListResponse = 105,
+    kMessageContainerListResponse = 108
+};
+
+enum : uint32_t {
+    kContainerOwnsRuntime = 0x01,
+    kContainerOwnsBuildContext = 0x04,
+    kContainerSelfModifying = 0x08,
+    kContainerSetName = 0x01,
+    kContainerSetRuntime = 0x02,
+    kContainerSetBuildContext = 0x04,
+    kContainerSetOwnsRuntime = 0x08,
+    kContainerSetCPUs = 0x10,
+    kContainerSetMemory = 0x20,
+    kContainerSetCreatedAt = 0x40
 };
 
 enum : uint16_t {
@@ -613,10 +629,15 @@ struct CommandRequest {
     const char *containerIdentifier = "";
     const char *providerId = "";
     const char *runtimeName = "";
-    const char *projectResourceKey = "";
+    const char *buildContextPath = "";
+    char resolvedBuildContextPath[4096] = "";
+    bool outerShellBuildContext = false;
+    int selfModifying = -1;
     uint64_t createdAtMilliseconds = 0;
-    uint32_t cpus = 2;
-    uint32_t memoryInMB = 2048;
+    uint32_t cpus = 0;
+    uint32_t memoryInMB = 0;
+    uint32_t containerFlags = 0;
+    uint32_t containerSetMask = 0;
     bool usedDeprecatedIcons = false;
     bool readSudoPasswordFromStdin = false;
 };
@@ -826,6 +847,56 @@ bool mapCommand(const char *resource, const char *action, uint16_t &messageType)
     return true;
 }
 
+bool prepareContainerRegistration(CommandRequest &request, Buffer &errorMessage) {
+    if (request.displayName[0]) request.containerSetMask |= kContainerSetName;
+    if (request.providerId[0] || request.runtimeName[0]) {
+        if (!request.providerId[0]) {
+            assignCString(errorMessage, "Use --provider together with --runtime-name.");
+            return false;
+        }
+        request.containerSetMask |= kContainerSetRuntime;
+    }
+    const bool external = request.buildContextPath[0] != '\0';
+    if (external && request.outerShellBuildContext) {
+        assignCString(errorMessage, "Use either --build-context or --outershell-build-context, not both.");
+        return false;
+    }
+    if (request.selfModifying >= 0 && !external && !request.outerShellBuildContext) {
+        assignCString(errorMessage, "--self-modifying and --sealed need --build-context or --outershell-build-context.");
+        return false;
+    }
+    if (request.outerShellBuildContext) {
+        request.containerSetMask |= kContainerSetBuildContext;
+        request.containerFlags |= kContainerOwnsBuildContext;
+        if (request.selfModifying != 0) request.containerFlags |= kContainerSelfModifying;
+    } else if (external) {
+#ifdef _WIN32
+        if (!_fullpath(request.resolvedBuildContextPath,
+                       request.buildContextPath,
+                       sizeof(request.resolvedBuildContextPath))) {
+#else
+        if (!realpath(request.buildContextPath, request.resolvedBuildContextPath)) {
+#endif
+            assignCString(errorMessage, "The build context folder does not exist: ");
+            appendCString(errorMessage, request.buildContextPath);
+            return false;
+        }
+        request.buildContextPath = request.resolvedBuildContextPath;
+        request.containerSetMask |= kContainerSetBuildContext;
+        if (request.selfModifying == 1) {
+            request.containerFlags |= kContainerSelfModifying;
+            fprintf(stderr,
+                    "Warning: processes in this container will be able to modify %s and everything in it.\n",
+                    request.buildContextPath);
+        }
+    }
+    if (request.containerSetMask == 0) {
+        assignCString(errorMessage, "Nothing to register; pass --name, --provider, --build-context, or another container field.");
+        return false;
+    }
+    return true;
+}
+
 bool parseCommandRequest(int argc, char *argv[], CommandRequest &request, Buffer &errorMessage) {
     if (argc < 3) {
         assignCString(errorMessage, "Usage: outerctl <resource> <action> [options]");
@@ -958,8 +1029,19 @@ bool parseCommandRequest(int argc, char *argv[], CommandRequest &request, Buffer
             REQUIRE_VALUE("--provider", request.providerId);
         } else if (strcmp(arg, "--runtime-name") == 0) {
             REQUIRE_VALUE("--runtime-name", request.runtimeName);
-        } else if (strcmp(arg, "--project-key") == 0) {
-            REQUIRE_VALUE("--project-key", request.projectResourceKey);
+        } else if (strcmp(arg, "--build-context") == 0) {
+            REQUIRE_VALUE("--build-context", request.buildContextPath);
+        } else if (strcmp(arg, "--outershell-build-context") == 0) {
+            request.outerShellBuildContext = true;
+        } else if (strcmp(arg, "--self-modifying") == 0) {
+            request.selfModifying = 1;
+        } else if (strcmp(arg, "--sealed") == 0) {
+            request.selfModifying = 0;
+        } else if (strcmp(arg, "--outershell-owns-runtime") == 0) {
+            const char *raw = nullptr;
+            REQUIRE_VALUE("--outershell-owns-runtime", raw);
+            if (truthy(raw)) request.containerFlags |= kContainerOwnsRuntime;
+            request.containerSetMask |= kContainerSetOwnsRuntime;
         } else if (strcmp(arg, "--cpus") == 0) {
             const char *raw = nullptr;
             REQUIRE_VALUE("--cpus", raw);
@@ -967,6 +1049,7 @@ bool parseCommandRequest(int argc, char *argv[], CommandRequest &request, Buffer
                 assignCString(errorMessage, "Invalid --cpus value.");
                 return false;
             }
+            request.containerSetMask |= kContainerSetCPUs;
         } else if (strcmp(arg, "--memory-mb") == 0) {
             const char *raw = nullptr;
             REQUIRE_VALUE("--memory-mb", raw);
@@ -974,6 +1057,7 @@ bool parseCommandRequest(int argc, char *argv[], CommandRequest &request, Buffer
                 assignCString(errorMessage, "Invalid --memory-mb value.");
                 return false;
             }
+            request.containerSetMask |= kContainerSetMemory;
         } else if (strcmp(arg, "--created-at-milliseconds") == 0) {
             const char *raw = nullptr;
             REQUIRE_VALUE("--created-at-milliseconds", raw);
@@ -984,6 +1068,7 @@ bool parseCommandRequest(int argc, char *argv[], CommandRequest &request, Buffer
                 return false;
             }
             request.createdAtMilliseconds = static_cast<uint64_t>(value);
+            request.containerSetMask |= kContainerSetCreatedAt;
         } else {
             errorMessage.size = 0;
             if (errorMessage.data) errorMessage.data[0] = '\0';
@@ -1018,8 +1103,7 @@ bool parseCommandRequest(int argc, char *argv[], CommandRequest &request, Buffer
         return false;
     }
     if (request.messageType == kMessageContainerUpsertRequest &&
-        (!request.displayName[0] || !request.providerId[0] || !request.runtimeName[0])) {
-        assignCString(errorMessage, "Container upsert requires --name, --provider, and --runtime-name.");
+        !prepareContainerRegistration(request, errorMessage)) {
         return false;
     }
     return true;
@@ -1131,10 +1215,12 @@ bool appendCommandRequestMessage(Buffer &message, const CommandRequest &request)
             request.displayName,
             request.providerId,
             request.runtimeName,
-            request.projectResourceKey
+            request.buildContextPath
         };
         ok = ok &&
-            appendLittleEndianUInt16(message, request.flags) &&
+            appendLittleEndianUInt16(message, 0) &&
+            appendLittleEndianUInt32(message, request.containerFlags) &&
+            appendLittleEndianUInt32(message, request.containerSetMask) &&
             appendLittleEndianUInt32(message, request.cpus) &&
             appendLittleEndianUInt32(message, request.memoryInMB) &&
             appendLittleEndianUInt64(message, request.createdAtMilliseconds) &&
@@ -1166,6 +1252,8 @@ uint16_t listResponseTypeForRequest(uint16_t messageType) {
         return kMessageContentTypeListResponse;
     case kMessageOpenerListRequest:
         return kMessageOpenerListResponse;
+    case kMessageContainerListRequest:
+        return kMessageContainerListResponse;
     default:
         return 0;
     }
@@ -1207,6 +1295,10 @@ bool writeRegistryListResponse(const CommandRequest &request, const Buffer &resp
     const char *logHeaders[] = {"path", "service_id"};
     const char *contentTypeHeaders[] = {"service_id", "identifier", "display_name", "conforms_to", "extensions", "mime_types"};
     const char *openerHeaders[] = {"content_type", "frontend_id", "url_template", "rank", "capabilities"};
+    const char *containerHeaders[] = {
+        "container_id", "display_name", "provider", "runtime_name", "build_context",
+        "owns_runtime", "owns_build_context", "self_modifying", "cpus", "memory_mb", "created_at_milliseconds"
+    };
 
     size_t minimumRowSize = 0;
     size_t rowBase = 22;
@@ -1328,6 +1420,44 @@ bool writeRegistryListResponse(const CommandRequest &request, const Buffer &resp
                 fputc('\t', stdout) != EOF &&
                 writeOpenerCapabilities(readLittleEndianUInt32(bytes + offset + 28)) &&
                 fputc('\n', stdout) != EOF;
+        }
+        break;
+    case kMessageContainerListResponse:
+        minimumRowSize = 64;
+        if (responseRowSize < minimumRowSize) {
+            ok = false;
+            break;
+        }
+        ok = writeTsvHeaders(containerHeaders, sizeof(containerHeaders) / sizeof(containerHeaders[0]));
+        for (uint32_t row = 0; ok && row < rowCount; row += 1) {
+            const size_t offset = rowBase + static_cast<size_t>(row) * responseRowSize;
+            if (offset + minimumRowSize > response.size) {
+                ok = false;
+                break;
+            }
+            const uint32_t flags = readLittleEndianUInt32(bytes + offset);
+            char cpusBuffer[16];
+            char memoryBuffer[16];
+            char createdBuffer[32];
+            snprintf(cpusBuffer, sizeof(cpusBuffer), "%u", readLittleEndianUInt32(bytes + offset + 4));
+            snprintf(memoryBuffer, sizeof(memoryBuffer), "%u", readLittleEndianUInt32(bytes + offset + 8));
+            snprintf(createdBuffer, sizeof(createdBuffer), "%llu",
+                     static_cast<unsigned long long>(readLittleEndianUInt32(bytes + offset + 16)) |
+                     (static_cast<unsigned long long>(readLittleEndianUInt32(bytes + offset + 20)) << 32));
+            const char *fields[] = {
+                flags & kContainerOwnsRuntime ? "1" : "0",
+                flags & kContainerOwnsBuildContext ? "1" : "0",
+                flags & kContainerSelfModifying ? "1" : "0",
+                cpusBuffer,
+                memoryBuffer,
+                createdBuffer
+            };
+            const size_t refs[] = {24, 32, 40, 48, 56};
+            ok = writeTsvRefs(response, offset, refs, sizeof(refs) / sizeof(refs[0]));
+            for (size_t field = 0; ok && field < sizeof(fields) / sizeof(fields[0]); field += 1) {
+                ok = fputc('\t', stdout) != EOF && writeTsvString(fields[field]);
+            }
+            if (ok) ok = fputc('\n', stdout) != EOF;
         }
         break;
     default:
@@ -2654,10 +2784,183 @@ int handleRelay(int argc, char *argv[]) {
 }
 #endif
 
+const char *const kContainerOperations[] = {
+    "list", "checkRuntimes", "containerStorage", "cleanContainerStorage", "cleanContainerBuildCache",
+    "create", "duplicate", "changeRuntime", "rename", "start", "stop", "restart", "delete",
+    "mountFolder", "unmountFolder", "chooseFolder", "updateDockerfile", "updateContainerConfiguration",
+    "updateResources", "rebuild", "startApp", "stopApp", "restartApp", "appLogs", "publishSocket",
+    "prepareShare", "beginImport", "cancelImport", "finishImport",
+};
+
+bool isContainerAction(const char *action) {
+    return strcmp(action, "rebuild") == 0 || strcmp(action, "start") == 0 || strcmp(action, "stop") == 0 ||
+        strcmp(action, "restart") == 0 || strcmp(action, "delete") == 0 || strcmp(action, "describe") == 0;
+}
+
+bool exchangeOuterctlApi(const Buffer &message, Buffer &response, Buffer &errorMessage) {
+    ApiConnection fd = kInvalidApiConnection;
+    if (!openOuterctlApi(fd, errorMessage)) return false;
+    uint8_t lengthPrefix[4];
+    writeLittleEndianUInt32(lengthPrefix, static_cast<uint32_t>(message.size));
+    bool ok = writeExact(fd, lengthPrefix, sizeof(lengthPrefix)) && writeExact(fd, message.data, message.size);
+    uint8_t responseLengthBytes[4];
+    ok = ok && readExact(fd, responseLengthBytes, sizeof(responseLengthBytes));
+    const uint32_t responseLength = ok ? readLittleEndianUInt32(responseLengthBytes) : 0;
+    ok = ok && responseLength >= 2 && responseLength <= kOuterctlApiMaxFrameLength &&
+        reserveBuffer(response, responseLength) && readExact(fd, response.data, responseLength);
+    closeApiConnection(fd);
+    if (!ok) {
+        setTransportError(errorMessage, "Failed to exchange an outershelld API message: ");
+        return false;
+    }
+    response.size = responseLength;
+    response.data[response.size] = '\0';
+    return true;
+}
+
+const OrwvValue *containerWorkspace(const OrwvValue *snapshot, const char *identifier) {
+    const OrwvValue *workspaces = orwv_dictionary_get(snapshot, "workspaces");
+    for (size_t index = 0; index < orwv_count(workspaces); index += 1) {
+        const OrwvValue *workspace = orwv_array_at(workspaces, index);
+        char *id = orwv_copy_string(orwv_dictionary_get(workspace, "id"));
+        bool match = id && strlen(id) == strlen(identifier);
+        for (size_t character = 0; match && id[character]; character += 1) {
+            match = tolower(static_cast<unsigned char>(id[character])) ==
+                tolower(static_cast<unsigned char>(identifier[character]));
+        }
+        free(id);
+        if (match) return workspace;
+    }
+    return nullptr;
+}
+
+void printContainerField(const OrwvValue *value, const char *key, const char *label) {
+    char *text = orwv_copy_string(orwv_dictionary_get(value, key));
+    if (text && text[0]) printf("%s: %s\n", label, text);
+    free(text);
+}
+
+int containerRequest(const char *operation, const char *identifier, OrwvValue **snapshot, Buffer &errorMessage) {
+    size_t code = 0;
+    while (code < sizeof(kContainerOperations) / sizeof(kContainerOperations[0]) &&
+           strcmp(kContainerOperations[code], operation) != 0) code += 1;
+    Buffer message;
+    const size_t identifierLength = strlen(identifier);
+    bool ok = appendLittleEndianUInt16(message, 35) &&
+        appendLittleEndianUInt16(message, static_cast<uint16_t>(code)) &&
+        appendLittleEndianUInt32(message, 0) &&
+        appendLittleEndianUInt32(message, 24) &&
+        appendLittleEndianUInt32(message, static_cast<uint32_t>(identifierLength)) &&
+        appendLittleEndianUInt32(message, static_cast<uint32_t>(24 + identifierLength)) &&
+        appendLittleEndianUInt32(message, 0) &&
+        appendBuffer(message, identifier, identifierLength);
+    Buffer response;
+    ok = ok && exchangeOuterctlApi(message, response, errorMessage);
+    freeBuffer(message);
+    if (!ok) {
+        freeBuffer(response);
+        return -1;
+    }
+    const uint8_t *bytes = reinterpret_cast<const uint8_t *>(response.data);
+    if (response.size < 30 || readLittleEndianUInt16(bytes) != 109) {
+        freeBuffer(response);
+        assignCString(errorMessage, "outershelld returned an invalid container response.");
+        return -1;
+    }
+    const uint32_t status = readLittleEndianUInt32(bytes + 2);
+    if (status != 0) {
+        Buffer error;
+        readOuterctlApiStringRef(response, 6, error);
+        assignCString(errorMessage, error.size ? error.data : "The container operation failed.");
+        freeBuffer(error);
+        freeBuffer(response);
+        return 1;
+    }
+    const uint32_t snapshotOffset = readLittleEndianUInt32(bytes + 22);
+    const uint32_t snapshotLength = readLittleEndianUInt32(bytes + 26);
+    if (snapshot && snapshotLength && snapshotOffset <= response.size && snapshotLength <= response.size - snapshotOffset) {
+        *snapshot = orwv_decode(bytes + snapshotOffset, snapshotLength);
+    }
+    freeBuffer(response);
+    return 0;
+}
+
+int handleContainerAction(int argc, char *argv[]) {
+    const char *action = argv[2];
+    const char *identifier = "";
+    bool wait = false;
+    for (int index = 3; index < argc; index += 1) {
+        if (strcmp(argv[index], "--container") == 0 && index + 1 < argc) identifier = argv[++index];
+        else if (strcmp(argv[index], "--wait") == 0) wait = true;
+        else {
+            fprintf(stderr, "Unknown argument: %s\n", argv[index]);
+            return 1;
+        }
+    }
+    if (!identifier[0]) {
+        fputs("Missing container identifier.\n", stderr);
+        return 1;
+    }
+    Buffer errorMessage;
+    OrwvValue *snapshot = nullptr;
+    int status = containerRequest(strcmp(action, "describe") == 0 ? "list" : action, identifier, &snapshot, errorMessage);
+    if (status == 0 && wait) {
+        for (;;) {
+            const OrwvValue *workspace = snapshot ? containerWorkspace(snapshot, identifier) : nullptr;
+            char *state = workspace ? orwv_copy_string(orwv_dictionary_get(workspace, "state")) : nullptr;
+            bool busy = state && (strcmp(state, "creating") == 0 || strcmp(state, "rebuilding") == 0 ||
+                                  strcmp(state, "starting") == 0);
+            free(state);
+            if (!busy) break;
+#ifdef _WIN32
+            Sleep(2000);
+#else
+            sleep(2);
+#endif
+            orwv_free(snapshot);
+            snapshot = nullptr;
+            status = containerRequest("list", identifier, &snapshot, errorMessage);
+            if (status != 0) break;
+        }
+    }
+    const OrwvValue *workspace = status == 0 && snapshot ? containerWorkspace(snapshot, identifier) : nullptr;
+    if (status == 0 && (wait || strcmp(action, "describe") == 0)) {
+        if (!workspace) {
+            assignCString(errorMessage, "No container is registered with that identifier.");
+            status = 1;
+        } else {
+            printContainerField(workspace, "name", "name");
+            printContainerField(workspace, "state", "state");
+            const OrwvValue *progress = orwv_dictionary_get(workspace, "buildProgress");
+            char *phase = orwv_copy_string(orwv_dictionary_get(progress, "phase"));
+            if (phase && phase[0]) {
+                printContainerField(progress, "phase", "build");
+                printContainerField(progress, "detail", "detail");
+                if (strcmp(phase, "failed") == 0) {
+                    printContainerField(progress, "log", "log");
+                    status = 1;
+                }
+            }
+            free(phase);
+            const OrwvValue *definition = orwv_dictionary_get(workspace, "definition");
+            bool needsRebuild = false;
+            if (orwv_get_bool(orwv_dictionary_get(definition, "needsRebuild"), &needsRebuild) && needsRebuild) {
+                puts("needs rebuild: yes");
+            }
+        }
+    }
+    orwv_free(snapshot);
+    if (status != 0) {
+        fprintf(stderr, "%s\n", errorMessage.data ? errorMessage.data : "The container operation failed.");
+    }
+    freeBuffer(errorMessage);
+    return status == 0 ? 0 : 1;
+}
+
 #ifdef _WIN32
 bool isSupportedOnWindows(uint16_t messageType) {
     return (messageType >= kMessageBackendUpsertRequest && messageType <= kMessageLogListRequest) ||
-        (messageType >= kMessageResourceGetRequest && messageType <= kMessageResourceRemoveRequest);
+        (messageType >= kMessageResourceGetRequest && messageType <= kMessageContainerListRequest);
 }
 
 char **utf8Arguments(int &argc) {
@@ -2706,6 +3009,11 @@ int main(int argc, char *argv[]) {
     if (argc >= 2 && strcmp(argv[1], "relay") == 0) {
         return handleRelay(argc, argv);
     }
+#ifndef _WIN32
+    if (argc >= 3 && strcmp(argv[1], "container") == 0 && isContainerAction(argv[2])) {
+        return handleContainerAction(argc, argv);
+    }
+#endif
     int apiExitStatus = 1;
     Buffer apiError;
     CommandRequest request;

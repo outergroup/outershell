@@ -35,12 +35,11 @@ static bool container_identity(ContainerRuntime runtime, const char *runtime_id,
     return true;
 }
 
-static char *container_metadata_path(const char *id) {
+static char *container_legacy_names_path(const char *folder, const char *id) {
     char *local = win_folder(CSIDL_LOCAL_APPDATA);
     char *root = local ? win_join(local, "OuterShell") : NULL;
-    char *directory = root ? win_join(root, "container-names") : NULL;
-    bool ok = directory && win_secure_directory(directory);
-    char *path = ok ? win_join(directory, id) : NULL;
+    char *directory = root ? win_join(root, folder) : NULL;
+    char *path = directory && (!id || win_secure_directory(directory)) ? (id ? win_join(directory, id) : win_strdup(directory)) : NULL;
     free(local);
     free(root);
     free(directory);
@@ -51,18 +50,7 @@ static bool valid_container_name(const char *name) {
     return name && *name && strlen(name) <= 200 && !strpbrk(name, "\r\n\t");
 }
 
-static bool save_container_metadata(const char *id, const char *name, unsigned cpus, unsigned memory) {
-    char *path = container_metadata_path(id);
-    StringBuilder data = {0};
-    append(&data, name);
-    char limits[64];
-    snprintf(limits, sizeof(limits), "\n%u\n%u\nmb\n", cpus, memory);
-    append(&data, limits);
-    bool ok = path && win_atomic_write(path, data.data, data.length);
-    free(path);
-    free(data.data);
-    return ok;
-}
+#include "ContainerRegistry.inc"
 
 static unsigned container_number(const HttpRequest *request, const char *key, unsigned fallback) {
     const unsigned char *p = (const unsigned char *)request->body.data;
@@ -127,7 +115,8 @@ static bool create_container(Wsl *w, HttpRequest *request, const char **error) {
     snprintf(runtime_name, sizeof(runtime_name), "outershell-%s", id);
     free(uuid);
     *error = "Could not save the container definition.";
-    if (!save_container_metadata(id, name, cpus, memory) || !container_definition_create(id, image)) goto done;
+    if (!container_registry_upsert(id, name, runtime, runtime_name, cpus, memory, CONTAINER_MANAGED_FLAGS, CONTAINER_SET_ALL) ||
+        !container_definition_create(id, image)) goto done;
     char *context = container_build_context_directory(id);
     char run_image[100];
     if (!context || !container_write(id, "Dockerfile", dockerfile, strlen(dockerfile))) { free(context); goto done; }
@@ -165,6 +154,95 @@ done:
     return ok;
 }
 
+static Distribution *container_distribution_for_row(Wsl *w, ContainerRuntime runtime, const ContainerRow *row) {
+    Distribution *d;
+    for (d = w->distributions; d; d = d->next)
+        if (d->container && !strcmp(d->id, row->id))
+            break;
+    if (!d) {
+        d = win_alloc(sizeof(*d));
+        d->owner = w;
+        d->container = runtime;
+        d->id = win_strdup(row->id);
+        d->runtime_id = win_strdup("");
+        d->user = win_strdup("root");
+        d->next = w->distributions;
+        w->distributions = d;
+    }
+    free(d->name);
+    d->name = win_strdup(row->name);
+    d->managed = (row->flags & CONTAINER_OWNS_RUNTIME) != 0;
+    d->owns_build_context = (row->flags & CONTAINER_OWNS_BUILD_CONTEXT) != 0;
+    d->self_modifying = (row->flags & CONTAINER_SELF_MODIFYING) != 0;
+    free(d->build_context);
+    d->build_context = win_strdup(row->build_context);
+    d->cpus = row->cpus ? row->cpus : 4;
+    d->memory_mb = row->memory_mb ? row->memory_mb : 8192;
+    return d;
+}
+
+static bool container_move_legacy_file(const char *from, const char *id, const char *suffix) {
+    char *folder = container_legacy_names_path("container-names.migrated", NULL);
+    bool ok = folder && win_secure_directory(folder);
+    StringBuilder name = {0};
+    append(&name, id);
+    append(&name, suffix);
+    char *to = ok ? win_join(folder, name.data) : NULL;
+    wchar_t *wide_from = win_wide(from), *wide_to = to ? win_wide(to) : NULL;
+    ok = wide_from && wide_to && MoveFileExW(wide_from, wide_to, MOVEFILE_REPLACE_EXISTING);
+    free(folder); free(name.data); free(to); free(wide_from); free(wide_to);
+    return ok;
+}
+
+static bool container_migrate_legacy(ContainerRuntime runtime, const char *runtime_name) {
+    if (strncmp(runtime_name, "outershell-", 11) || strlen(runtime_name) != 47) return false;
+    char id[37];
+    memcpy(id, runtime_name + 11, 36);
+    id[36] = 0;
+    if (!container_uuid(id)) return false;
+    char *path = container_legacy_names_path("container-names", id);
+    StringBuilder metadata = {0};
+    bool ok = path && container_path_exists(path) && win_read_file(path, 1024, &metadata) && metadata.data;
+    char *newline = ok ? strchr(metadata.data, '\n') : NULL;
+    ok = newline != NULL;
+    unsigned cpus = 4, memory = 8192;
+    if (ok) {
+        *newline = 0;
+        char unit[3] = {0};
+        sscanf(newline + 1, "%u\n%u\n%2s", &cpus, &memory, unit);
+        if (strcmp(unit, "mb") != 0) memory *= 1024;
+        ok = valid_container_name(metadata.data) &&
+             container_registry_upsert(id, metadata.data, runtime, runtime_name, cpus, memory,
+                                       CONTAINER_MANAGED_FLAGS, CONTAINER_SET_ALL);
+    }
+    char *directory = ok ? container_directory(id) : NULL;
+    const char *names[] = {"configuration", "configuration.realized"};
+    for (size_t i = 0; ok && directory && i < 2; i++) {
+        char *file = win_join(directory, names[i]);
+        StringBuilder value = {0};
+        if (file && container_path_exists(file)) {
+            OrwvValue *decoded = win_read_file(file, WSL_LIMIT, &value) && value.data
+                ? orwv_decode(value.data, value.length) : NULL;
+            unsigned char *encoded = NULL;
+            size_t encoded_length = 0;
+            ok = decoded && orwv_encode(decoded, &encoded, &encoded_length) &&
+                 container_resource_set(id, names[i], encoded, encoded_length);
+            orwv_free(decoded);
+            free(encoded);
+            char suffix[40];
+            snprintf(suffix, sizeof(suffix), ".%s", names[i]);
+            if (ok) container_move_legacy_file(file, id, suffix);
+        }
+        free(value.data);
+        free(file);
+    }
+    if (ok) container_move_legacy_file(path, id, "");
+    free(directory);
+    free(metadata.data);
+    free(path);
+    return ok;
+}
+
 static void discover_containers(Wsl *w, ContainerRuntime runtime) {
     const char *args[] = {runtime == RUNTIME_DOCKER ? "ps" : "list", "--all", "--no-trunc", "--format", runtime == RUNTIME_DOCKER ? "{{json .}}" : "json", NULL};
     StringBuilder output = {0};
@@ -184,6 +262,14 @@ static void discover_containers(Wsl *w, ContainerRuntime runtime) {
         free(output.data);
         return;
     }
+    ContainerRow *rows = NULL;
+    size_t row_count = 0;
+    if (!container_registry_rows(NULL, &rows, &row_count)) {
+        rows = NULL;
+        row_count = 0;
+    }
+    char **seen = NULL;
+    size_t seen_count = 0;
     EnterCriticalSection(&w->gate);
     for (Distribution *d = w->distributions; d; d = d->next)
         if (d->container == runtime && !d->building && *d->runtime_id)
@@ -204,51 +290,31 @@ static void discover_containers(Wsl *w, ContainerRuntime runtime) {
             label = comma ? comma + 1 : NULL;
         }
         free(labels);
-        char id[37];
         bool valid = !internal && runtime_id && strlen(runtime_id) == 64 &&
                      strspn(runtime_id, "0123456789abcdef") == 64 && name && *name && state;
-        if (valid && container_identity(runtime, runtime_id, id)) {
-            if (!strncmp(name, "outershell-", 11) && strlen(name) >= 47) {
-                char owned_id[37]; memcpy(owned_id, name + 11, 36); owned_id[36] = 0;
-                char *metadata_path = container_uuid(owned_id) ? container_metadata_path(owned_id) : NULL;
-                wchar_t *wide = metadata_path ? win_wide(metadata_path) : NULL;
-                if (wide && GetFileAttributesW(wide) != INVALID_FILE_ATTRIBUTES) strcpy_s(id, sizeof(id), owned_id);
-                free(wide); free(metadata_path);
+        const ContainerRow *row = NULL;
+        if (valid) {
+            for (size_t i = 0; i < row_count && !row; i++)
+                if (!strcmp(rows[i].provider, container_provider_id(runtime)) && !strcmp(rows[i].runtime_name, name))
+                    row = &rows[i];
+            if (!row && container_migrate_legacy(runtime, name)) {
+                container_rows_free(rows, row_count);
+                if (!container_registry_rows(NULL, &rows, &row_count)) { rows = NULL; row_count = 0; }
+                for (size_t i = 0; i < row_count && !row; i++)
+                    if (!strcmp(rows[i].provider, container_provider_id(runtime)) && !strcmp(rows[i].runtime_name, name))
+                        row = &rows[i];
+            }
+        }
+        if (row) {
+            char **grown = realloc(seen, (seen_count + 1) * sizeof(*seen));
+            if (grown) {
+                seen = grown;
+                seen[seen_count++] = win_strdup(row->id);
             }
             EnterCriticalSection(&w->gate);
-            Distribution *d;
-            for (d = w->distributions; d; d = d->next)
-                if (d->container && !strcmp(d->id, id))
-                    break;
-            if (!d) {
-                d = win_alloc(sizeof(*d));
-                d->owner = w;
-                d->container = runtime;
-                d->id = win_strdup(id);
-                d->runtime_id = win_strdup(runtime_id);
-                d->user = win_strdup("root");
-                d->next = w->distributions;
-                w->distributions = d;
-            }
+            Distribution *d = container_distribution_for_row(w, runtime, row);
             free(d->runtime_id);
             d->runtime_id = win_strdup(runtime_id);
-            free(d->name);
-            d->name = win_strdup(name);
-            char *path = container_metadata_path(id);
-            StringBuilder metadata = {0};
-            d->managed = path && win_read_file(path, 1024, &metadata) && metadata.data &&
-                         strchr(metadata.data, '\n');
-            if (d->managed) {
-                char *newline = strchr(metadata.data, '\n');
-                *newline = 0;
-                free(d->name);
-                d->name = win_strdup(metadata.data);
-                char unit[3] = {0};
-                sscanf(newline + 1, "%u\n%u\n%2s", &d->cpus, &d->memory_mb, unit);
-                if (strcmp(unit, "mb") != 0) d->memory_mb *= 1024;
-            }
-            free(metadata.data);
-            free(path);
             if (d->managed) {
                 char *definition = container_read(d->id, "Dockerfile", "");
                 if (!*definition) {
@@ -277,6 +343,29 @@ static void discover_containers(Wsl *w, ContainerRuntime runtime) {
         line = end ? end + 1 : NULL;
     }
     free(output.data);
+    EnterCriticalSection(&w->gate);
+    for (size_t i = 0; i < row_count; i++) {
+        if (strcmp(rows[i].provider, container_provider_id(runtime))) continue;
+        bool found = false;
+        for (size_t j = 0; j < seen_count && !found; j++) found = !strcmp(seen[j], rows[i].id);
+        if (found) continue;
+        Distribution *d = container_distribution_for_row(w, runtime, &rows[i]);
+        if (d->building) continue;
+        free(d->runtime_id);
+        d->runtime_id = win_strdup("");
+        d->present = true;
+        d->running = false;
+    }
+    for (Distribution *d = w->distributions; d; d = d->next) {
+        if (d->container != runtime || d->building) continue;
+        bool registered = false;
+        for (size_t i = 0; i < row_count && !registered; i++) registered = !strcmp(rows[i].id, d->id);
+        if (!registered) d->present = false;
+    }
+    LeaveCriticalSection(&w->gate);
+    for (size_t j = 0; j < seen_count; j++) free(seen[j]);
+    free(seen);
+    container_rows_free(rows, row_count);
 }
 
 static void container_provider(Wsl *w, StringBuilder *json, ContainerRuntime runtime) {
@@ -320,6 +409,16 @@ static void container_snapshot(Distribution *d, StringBuilder *json) {
     json_string(json, d->managed ? "managed" : "attached");
     append(json, ",\"ownsContainer\":");
     append(json, d->managed ? "true" : "false");
+    append(json, ",\"ownsBuildContext\":");
+    append(json, d->managed && d->owns_build_context ? "true" : "false");
+    append(json, ",\"selfModifying\":");
+    append(json, d->managed && d->self_modifying ? "true" : "false");
+    if (d->managed) {
+        char *context = d->build_context && *d->build_context ? win_strdup(d->build_context) : container_build_context_directory(d->id);
+        append(json, ",");
+        field(json, "buildContextPath", context ? context : "");
+        free(context);
+    }
     char limits[100];
     snprintf(limits, sizeof(limits), ",\"userName\":\"root\",\"cpus\":%u,\"memoryInMB\":%u,", d->cpus, d->memory_mb);
     append(json, limits);
@@ -372,7 +471,7 @@ static void container_logs(Distribution *d, Connection *client, HttpRequest *req
     char *service = request_string(request, "serviceID");
     if (!container_service_id(service)) {
         free(service);
-        http_text(client, request, 400, "Invalid app identifier.");
+        container_send_reply(d->owner, client, request, "Invalid app identifier.", NULL, false);
         return;
     }
     StringBuilder path = {0}, output = {0}, json = {0};
@@ -382,12 +481,6 @@ static void container_logs(Distribution *d, Connection *client, HttpRequest *req
     const char *args[] = {"exec", "--user", "0", d->runtime_id,
                           "/usr/bin/tail", "-c", "1048576", path.data, NULL};
     bool ok = capture_runtime(d->owner, args, &output, d->container);
-    append(&json, "{");
-    char *request_id = request_string(request, "requestID");
-    if (request_id) {
-        field(&json, "requestID", request_id);
-        append(&json, ",");
-    }
     append(&json, "\"appLog\":{");
     field(&json, "path", path.data);
     append(&json, ",");
@@ -395,14 +488,10 @@ static void container_logs(Distribution *d, Connection *client, HttpRequest *req
     append(&json, ",");
     field(&json, "error", ok ? "" : "The app log is not available yet.");
     char numbers[120];
-    snprintf(numbers, sizeof(numbers), ",\"isTruncated\":%s,\"fileSize\":%zu,\"modified\":0},",
+    snprintf(numbers, sizeof(numbers), ",\"isTruncated\":%s,\"fileSize\":%zu,\"modified\":0}",
              output.length >= 1048576 ? "true" : "false", output.length);
     append(&json, numbers);
-    EnterCriticalSection(&d->owner->gate);
-    append(&json, d->owner->snapshot.data ? d->owner->snapshot.data + 1 : "\"workspaces\":[]}");
-    LeaveCriticalSection(&d->owner->gate);
-    http_send(client, request, 200, "application/json", json.data, json.length);
-    free(request_id);
+    container_send_reply(d->owner, client, request, NULL, json.data, true);
     free(service);
     free(path.data);
     free(output.data);

@@ -91,6 +91,7 @@ static bool quarantine_invalid_registry_binary(const char *path, const char *rea
     return false;
 }
 #include "../outershelld/RegistryStore.inc"
+#include "../outershelld/ContainerRegistration.inc"
 
 static bool request_text(const unsigned char *request, size_t length, size_t ref, char **value) {
     *value = NULL;
@@ -150,6 +151,55 @@ static bool build_list(RegistryStore *store, uint16_t type, const char *filter, 
     return ok;
 }
 
+static bool build_container_list(RegistryStore *store, const char *filter, StringBuilder *response) {
+    size_t count = 0;
+    for (size_t i = 0; i < store->container_count; i++) if (!filter[0] || !strcmp(filter, store->containers[i].identifier)) count++;
+    if (count > (OUTERSHELL_API_MAX_FRAME_SIZE - 22) / CONTAINER_LIST_ROW_SIZE ||
+        !binary_append_zero(response, 22 + count * CONTAINER_LIST_ROW_SIZE)) return false;
+    binary_write_u16_at(response, 0, OUTERSHELLD_API_CONTAINER_LIST_RESPONSE);
+    binary_write_u32_at(response, 14, (uint32_t)count); binary_write_u32_at(response, 18, CONTAINER_LIST_ROW_SIZE);
+    size_t row = 22;
+    bool ok = true;
+    for (size_t i = 0; ok && i < store->container_count; i++) {
+        RegistryContainerRecord *record = &store->containers[i];
+        if (filter[0] && strcmp(filter, record->identifier)) continue;
+        binary_write_u32_at(response, row, record->flags); binary_write_u32_at(response, row + 4, record->cpus);
+        binary_write_u32_at(response, row + 8, record->memory_in_mb);
+        binary_write_u32_at(response, row + 16, (uint32_t)record->created_at_milliseconds);
+        binary_write_u32_at(response, row + 20, (uint32_t)(record->created_at_milliseconds >> 32));
+        const char *fields[] = {record->identifier, record->display_name, record->provider_id, record->runtime_name, record->build_context_path};
+        for (size_t field = 0; ok && field < 5; field++) ok = response_text(response, row + 24 + field * 8, fields[field]);
+        row += CONTAINER_LIST_ROW_SIZE;
+    }
+    return ok;
+}
+static uint64_t windows_wall_clock_milliseconds(void) {
+    FILETIME now;
+    GetSystemTimeAsFileTime(&now);
+    uint64_t ticks = ((uint64_t)now.dwHighDateTime << 32) | now.dwLowDateTime;
+    return ticks / 10000u - 11644473600000ull;
+}
+static bool register_container(RegistryStore *store, const char *registry_path, const unsigned char *request,
+                               uint32_t length, char *error, size_t error_size) {
+    ContainerRegistrationRequest registration;
+    if (!container_registration_decode(request, length, &registration)) {
+        snprintf(error, error_size, "Invalid container registration.");
+        return false;
+    }
+    char registry_directory[PATH_MAX];
+    snprintf(registry_directory, sizeof(registry_directory), "%s", registry_path);
+    char *slash = strrchr(registry_directory, '/');
+    if (slash) *slash = 0;
+    char local_data[PATH_MAX] = "";
+    const char *local = getenv("LOCALAPPDATA");
+    if (local && local[0]) snprintf(local_data, sizeof(local_data), "%s\\OuterShell", local);
+    const char *protected_paths[] = {registry_directory, local_data};
+    bool ok = container_registration_apply(store, &registration, windows_wall_clock_milliseconds(),
+                                           protected_paths, 2, error, error_size);
+    container_registration_request_free(&registration);
+    return ok;
+}
+
 __declspec(dllexport) void __cdecl OuterShellRegistryFree(void *bytes) { free(bytes); }
 __declspec(dllexport) int __cdecl OuterShellRegistryRequest(const char *path, const unsigned char *request,
     uint32_t length, unsigned char **bytes, uint32_t *byte_count)
@@ -163,7 +213,7 @@ __declspec(dllexport) int __cdecl OuterShellRegistryRequest(const char *path, co
     path = normalized_path;
     AcquireSRWLockExclusive(&registry_mutex);
     uint16_t type = read_uint16_le(request);
-    bool writable = type != 12 && type != 15 && type != 18 && type != 28;
+    bool writable = type != 12 && type != 15 && type != 18 && type != 28 && type != 33;
     bool opened = false, ok = false;
     char error[1024] = "Invalid registry request.";
     char *fields[10] = {0};
@@ -230,6 +280,16 @@ __declspec(dllexport) int __cdecl OuterShellRegistryRequest(const char *path, co
                 }
             } else if (ok && type == 30) registry_store_remove_resource(&store, fields[0]);
             break;
+        case 31:
+            ok = register_container(&store, path, request, length, error, sizeof(error));
+            break;
+        case 32:
+            ok = READ_REF(0, 2) && container_identifier_valid(fields[0]) && registry_store_remove_container(&store, fields[0]);
+            if (!ok) snprintf(error, sizeof(error), "No container is registered with that identifier.");
+            break;
+        case 33:
+            ok = READ_REF(0, 2) && build_container_list(&store, fields[0], &response);
+            break;
         default: snprintf(error, sizeof(error), "This registry operation is not supported on Windows."); break;
         }
 #undef READ_REF
@@ -238,12 +298,12 @@ __declspec(dllexport) int __cdecl OuterShellRegistryRequest(const char *path, co
     }
     if (!ok || !response.length) {
         free(response.data); response = (StringBuilder){0};
-        bool list = type == 12 || type == 15 || type == 18;
-        uint16_t response_type = list ? (type == 12 ? 101 : type == 15 ? 102 : 103) : 100;
+        bool list = type == 12 || type == 15 || type == 18 || type == 33;
+        uint16_t response_type = list ? (type == 12 ? 101 : type == 15 ? 102 : type == 18 ? 103 : 108) : 100;
         bool built = binary_append_zero(&response, 22) && binary_write_u16_at(&response, 0, response_type) &&
             binary_write_u32_at(&response, 2, ok ? 0 : 1);
         if (built && list) built = response_text(&response, 6, ok ? "" : error) &&
-            binary_write_u32_at(&response, 18, type == 12 ? 36 : type == 15 ? 88 : 16);
+            binary_write_u32_at(&response, 18, type == 12 ? 36 : type == 15 ? 88 : type == 18 ? 16 : CONTAINER_LIST_ROW_SIZE);
         else if (built) built = binary_append_data_ref_at(&response, 6, output.data, output.length) &&
             response_text(&response, 14, ok ? "" : error);
         if (!built) { free(response.data); response = (StringBuilder){0}; }

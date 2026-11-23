@@ -4,16 +4,19 @@
 Usage: test_macos_container_discovery.py "/path/to/Outer Shell.app/Contents/MacOS/Outer Shell"
 """
 import http.client
-import json
 import os
 from pathlib import Path
+import runpy
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
 import time
 
 repo = Path(__file__).resolve().parents[1]
+codec = runpy.run_path(str(repo / "Resources" / "outershell-container-provider"))
+list_overview = codec["api_message"](struct.pack("<HHI", 35, 0, 1), ["", b""])
 with tempfile.TemporaryDirectory(prefix="shell-discovery-", dir="/tmp") as directory:
     root = Path(directory)
     api = root / "api"
@@ -52,9 +55,8 @@ esac
         connection.sock.settimeout(10)
         connection.sock.connect(str(web))
         try:
-            connection.request("POST" if body else "GET", path,
-                               body=json.dumps(body) if body else None,
-                               headers={"Content-Type": "application/json"})
+            connection.request("POST" if body else "GET", path, body=body,
+                               headers={"Content-Type": "application/vnd.outershell.message"})
             response = connection.getresponse()
             return response.status, response.read()
         finally:
@@ -79,11 +81,11 @@ esac
                                 f"00000000-0000-4000-8000-{index:012d}", "--name", name,
                                 "--provider", "docker", "--runtime-name", name,
                                 "--created-at-milliseconds", str(index),
-                                "--outershell-owns", "false"], env=env, check=True,
+                                "--outershell-owns-runtime", "false"], env=env, check=True,
                                stdout=subprocess.DEVNULL)
-            status, body = request("/api/containers", {"operation": "list", "overview": True})
-            result = json.loads(body)
-            assert status == 200 and not result.get("error"), result
+            status, body = request("/api/containers", list_overview)
+            assert status == 200 and struct.unpack_from("<HI", body) == (109, 0), body[:200]
+            result = codec["offset_archive_decode"](codec["api_reference"](body, 22))
             entries = {item["name"]: item for item in result["workspaces"]}
             assert entries["broken"]["state"] == "unavailable", entries
             assert "Cannot connect to the Docker daemon" in entries["broken"]["outerShellSupport"]["detail"]
@@ -95,7 +97,7 @@ esac
                 while time.monotonic() < deadline:
                     status, body = request("/api/container-snapshot")
                     if status == 200:
-                        entries = {item["name"]: item for item in json.loads(body)["workspaces"]}
+                        entries = {item["name"]: item for item in codec["offset_archive_decode"](body)["workspaces"]}
                         if entries.get("broken", {}).get("state") == expected:
                             assert len(entries) == 3, entries
                             return

@@ -12,7 +12,7 @@ export OUTERSHELL_HOME=/var/lib/outershell
 export OUTERSHELLD_API_SOCKET=/run/user/0/outershelld-api
 /usr/local/bin/outershelld --service-manager internal \
     --services-dir /var/lib/outershell/services \
-    --api-socket-path /run/user/0/outershelld-api --stay-alive &
+    --api-socket-path /run/user/0/outershelld-api --stay-alive --container-guest &
 daemon_pid=$!
 /usr/bin/printf '%s\n' "${daemon_pid}" >/run/user/0/outershelld.pid
 cleanup() {
