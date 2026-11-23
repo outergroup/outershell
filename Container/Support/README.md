@@ -1,7 +1,7 @@
 # Outer Shell container support image
 
 Managed containers get Outer Shell's in-container tools from a small local
-image named `outershell/support`. Recipes copy it in right after `FROM`:
+image named `outershell/support`. Dockerfiles copy it in right after `FROM`:
 
 ```dockerfile
 FROM debian:bookworm

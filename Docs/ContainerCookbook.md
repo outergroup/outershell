@@ -36,7 +36,8 @@ Docker, Apple container, or WSLC. Rebuilding reuses those volumes. Deleting a
 container deletes its named volumes. Existing containers with host-directory
 storage continue using their existing data.
 
-Version 2 `.outershell-container` exports contain `manifest.orwv`, `Recipe/`,
+Version 3 `.outershell-container` exports contain `manifest.orwv`, `BuildContext/`
+(the Dockerfile, the files beside it, and `configuration.orwv`),
 and, when persistent data is included, `Volume Archives/<volume-id>.tar`.
 Each inner tar preserves Linux ownership, permissions, symlinks, hard links,
 and filenames. The destination restores it inside a temporary Linux container
@@ -45,7 +46,7 @@ A failed restore retains the archive for retry and removes the incomplete volume
 The restore helper can write only its own filesystem and the destination volume;
 the archive directory is mounted read-only.
 
-Older exports must be recreated with the current Outer Shell. Recipes and optional
+Older exports must be recreated with the current Outer Shell. Build contexts and optional
 host-mounted folders are still host files and must be compatible with the
 destination filesystem. Persistent-volume archives do not have that limitation.
 Exports preserve files, not CPU architecture: software installed by the Dockerfile
@@ -73,7 +74,7 @@ binaries that need only `/bin/sh` and standard file utilities.
 A plain `docker build` elsewhere needs an `outershell/support` image on that
 machine too.
 
-Recipes from before this change, which start `FROM outershell/container-base:<N>`
+Dockerfiles from before this change, which start `FROM outershell/container-base:<N>`
 or install `.outershell/bootstrap`, are rewritten to this form on their next
 rebuild or import.
 

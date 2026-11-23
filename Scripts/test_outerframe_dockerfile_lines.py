@@ -44,13 +44,13 @@ _ = h.createTextAreaLineFragments(text: text, layout: narrow)
 assert(h.wrapCalls == 4)
 print("PASS: long Unicode lines, blank/trailing lines, character offsets, caret layout, wrapping isolation")
 '''
-a = source.index('    private func navigateToRecipeSafeSpace(')
+a = source.index('    private func navigateToDefinitionSafeSpace(')
 b = source.index('    private func applyNavigation(', a)
 assert 'pushHistoryEntry' not in source[a:b]
-a = source.index('    private func returnFromRecipeSafeSpace()')
+a = source.index('    private func returnFromDefinitionSafeSpace()')
 b = source.index('    private func applyMode(', a)
 assert 'goBackInHistory' not in source[a:b]
-assert 'urlForRecipeSafeSpace' not in source
+assert 'urlForDefinitionSafeSpace' not in source
 assert 'components.path = "/containers/' not in source
 with tempfile.TemporaryDirectory() as directory:
     path = Path(directory) / 'main.swift'

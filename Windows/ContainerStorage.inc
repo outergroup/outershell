@@ -139,7 +139,7 @@ static bool storage_candidate(StorageImage *images, const char *reference) {
     return false;
 }
 
-static bool storage_remove_recipe(Distribution *d) {
+static bool storage_remove_container_image(Distribution *d) {
     StorageImage *images = NULL;
     if (!storage_inventory(d->owner, d->container, d->id, &images)) return false;
     char reference[100]; snprintf(reference, sizeof(reference), "outershell/managed-%s:latest", d->id);

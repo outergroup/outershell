@@ -74,7 +74,7 @@ private func outerShellRegistryFreeContainers(
 
 private let outerShellRegistryContainerOwnedFlag: UInt32 = 0x01
 
-private let currentSafeSpaceRecipeVersion = 14
+private let currentSafeSpaceConfigurationVersion = 14
 private let defaultContainerBaseImage = "debian:bookworm"
 private let containerSupportImage = "outershell/support"
 private let containerSupportImageReferences: Set<String> = [
@@ -138,7 +138,7 @@ private enum SafeSpaceRuntimeProviderID: String {
     }
 }
 
-private struct SafeSpaceRecipe: Codable {
+private struct SafeSpaceConfiguration: Codable {
     var version: Int
     var baseImage: String
     var realizedBaseImage: String?
@@ -335,7 +335,7 @@ final class SafeSpaceManager: @unchecked Sendable {
     private var records: [SafeSpaceRecord] = []
     private var cachedApps: [UUID: [SafeSpaceCachedApp]] = [:]
     private var publishedForwards: [String: SafeSpaceSocketRelayForward] = [:]
-    private let recipeFileLock = NSRecursiveLock()
+    private let configurationLock = NSRecursiveLock()
     private var endpointPublicationFailures = SafeSpaceEndpointPublicationFailures()
     private var socketPublications: [String: Task<String, Error>] = [:]
     private var transientStates: [UUID: String] = [:]
@@ -396,9 +396,17 @@ final class SafeSpaceManager: @unchecked Sendable {
         } catch {
             NSLog("Container catalog load failed: %@", error.localizedDescription)
         }
+        for index in records.indices {
+            do {
+                try migrateLegacyDefinition(&records[index])
+            } catch {
+                NSLog("Container definition migration failed for %@: %@",
+                      records[index].id.uuidString, error.localizedDescription)
+            }
+        }
         let loadedRecords = records
         imageCleanupQueue.async { [self] in
-            migrateLegacyRecipeImages(for: loadedRecords)
+            migrateLegacyContainerImages(for: loadedRecords)
         }
     }
 
@@ -423,7 +431,7 @@ final class SafeSpaceManager: @unchecked Sendable {
             let destination = current.appendingPathComponent(name, isDirectory: true)
             if fileManager.fileExists(atPath: destination.path) {
                 let destinationDockerfile = destination
-                    .appendingPathComponent("Recipe", isDirectory: true)
+                    .appendingPathComponent("BuildContext", isDirectory: true)
                     .appendingPathComponent("Dockerfile")
                 guard !fileManager.fileExists(atPath: destinationDockerfile.path) else {
                     NSLog("Keeping legacy container directory %@ because %@ already has a Dockerfile",
@@ -442,10 +450,41 @@ final class SafeSpaceManager: @unchecked Sendable {
                                            withDestinationPath: current.lastPathComponent)
     }
 
-    private func migrateLegacyRecipeImages(for records: [SafeSpaceRecord]) {
+    private func legacyBuildContextDirectory(_ id: UUID) throws -> URL {
+        try safeSpaceDirectory(id).appendingPathComponent("Recipe", isDirectory: true)
+    }
+
+    private func migrateLegacyDefinition(_ record: inout SafeSpaceRecord) throws {
+        let fileManager = FileManager.default
+        let legacyDirectory = try legacyBuildContextDirectory(record.id)
+        let directory = try buildContextDirectory(record.id)
+        var isDirectory: ObjCBool = false
+        if (try? fileManager.destinationOfSymbolicLink(atPath: legacyDirectory.path)) == nil,
+           fileManager.fileExists(atPath: legacyDirectory.path, isDirectory: &isDirectory),
+           isDirectory.boolValue,
+           !fileManager.fileExists(atPath: directory.path) {
+            try fileManager.moveItem(at: legacyDirectory, to: directory)
+            try fileManager.createSymbolicLink(atPath: legacyDirectory.path,
+                                               withDestinationPath: directory.lastPathComponent)
+        }
+        let legacyKey = "containers/\(record.id.uuidString.lowercased())/recipe"
+        let key = configurationResourceKey(record.id)
+        if let data = try RegistryResourceStore.data(for: legacyKey) {
+            if try RegistryResourceStore.data(for: key) == nil {
+                try RegistryResourceStore.set(data, for: key)
+            }
+            try RegistryResourceStore.remove(legacyKey)
+        }
+        if record.projectResourceKey == legacyKey {
+            record.projectResourceKey = key
+            try saveRecord(record)
+        }
+    }
+
+    private func migrateLegacyContainerImages(for records: [SafeSpaceRecord]) {
         for record in records where recordOwnsContainer(record) {
-            let legacyReference = "outershell/safe-space-\(record.id.uuidString.lowercased()):recipe"
-            let reference = recipeImageReference(record.id)
+            let legacyReference = "outershell/container-\(record.id.uuidString.lowercased()):recipe"
+            let reference = containerImageReference(record.id)
             do {
                 containerBaseImageLock.lock()
                 defer { containerBaseImageLock.unlock() }
@@ -455,16 +494,16 @@ final class SafeSpaceManager: @unchecked Sendable {
                 if try runRuntime(record, ["image", "inspect", reference]).status != 0 {
                     try requireSuccess(
                         try runRuntime(record, ["image", "tag", legacyReference, reference]),
-                        action: "rename the container recipe image"
+                        action: "rename the container image"
                     )
                 }
                 let removal = runtimeProvider(for: record) == .docker
                     ? ["image", "rm", legacyReference]
                     : ["image", "delete", legacyReference]
                 try requireSuccess(try runRuntime(record, removal),
-                                   action: "remove the legacy container recipe image name")
+                                   action: "remove the legacy container image name")
             } catch {
-                NSLog("Container recipe image migration failed for %@: %@",
+                NSLog("Container image migration failed for %@: %@",
                       record.id.uuidString, error.localizedDescription)
             }
         }
@@ -697,7 +736,7 @@ final class SafeSpaceManager: @unchecked Sendable {
     private func operationChangesMenuBarState(_ operation: String) -> Bool {
         switch operation {
         case "create", "duplicate", "changeRuntime", "rename", "start", "stop", "delete",
-             "startApp", "stopApp", "restartApp", "rebuildRecipe", "finishImport":
+             "startApp", "stopApp", "restartApp", "rebuild", "finishImport":
             return true
         default:
             return false
@@ -859,9 +898,9 @@ final class SafeSpaceManager: @unchecked Sendable {
         case "updateResources":
             try requireManagedContainer(try record(from: request))
             return try updateResources(request)
-        case "rebuildRecipe":
+        case "rebuild":
             try requireManagedContainer(try record(from: request))
-            return try beginRebuildRecipe(request)
+            return try beginRebuild(request)
         case "publishSocket":
             let record = try record(from: request)
             guard let socketPath = request["socketPath"] as? String else {
@@ -949,7 +988,7 @@ final class SafeSpaceManager: @unchecked Sendable {
                     "supportsShell": true,
                     "supportsLiveMounts": false,
                     "supportsMounts": true,
-                    "supportsRecipes": true,
+                    "supportsDefinitions": true,
                     "supportsStorageCleanup": true,
                     "supportsResourceUpdates": true
                 ]
@@ -969,7 +1008,7 @@ final class SafeSpaceManager: @unchecked Sendable {
                     "supportsShell": true,
                     "supportsLiveMounts": true,
                     "supportsMounts": true,
-                    "supportsRecipes": true,
+                    "supportsDefinitions": true,
                     "supportsStorageCleanup": true,
                     "supportsResourceUpdates": true
                 ]
@@ -979,7 +1018,7 @@ final class SafeSpaceManager: @unchecked Sendable {
 
     private func configurationDictionary(for record: SafeSpaceRecord) throws -> [String: Any] {
         guard recordOwnsContainer(record) else { throw SafeSpaceManagerError.invalidRequest }
-        let recipe = try recipe(for: record)
+        let configuration = try configuration(for: record)
         return [
             "id": record.id.uuidString,
             "name": record.name,
@@ -988,23 +1027,23 @@ final class SafeSpaceManager: @unchecked Sendable {
             "ownsContainer": true,
             "managementKind": "managed",
             "runtime": try runtimeDictionary(for: record),
-            "recipe": try recipeDictionary(for: record),
-            "mounts": try configurationMounts(for: record, recipe: recipe)
+            "definition": try definitionDictionary(for: record),
+            "mounts": try configurationMounts(for: record, configuration: configuration)
         ]
     }
 
     private func configurationMounts(for record: SafeSpaceRecord,
-                                     recipe: SafeSpaceRecipe) throws -> [[String: Any]] {
+                                     configuration: SafeSpaceConfiguration) throws -> [[String: Any]] {
         var mounts: [[String: Any]] = [[
             "id": UUID(uuid: (0, 0, 0, 0, 0, 0, 0x40, 0, 0x80, 0, 0, 0, 0, 0, 0, 2)).uuidString,
             "name": "Container project",
-            "hostPath": try recipeDirectory(record.id).path,
+            "hostPath": try buildContextDirectory(record.id).path,
             "guestPath": "/var/lib/outershell/project",
             "isReadOnly": false,
             "isInfrastructure": true,
-            "isRecipeMount": true
+            "isBuildContextMount": true
         ]]
-        mounts.append(contentsOf: (recipe.mounts ?? []).map {
+        mounts.append(contentsOf: (configuration.mounts ?? []).map {
             [
                 "id": $0.id.uuidString,
                 "name": $0.name,
@@ -1012,7 +1051,7 @@ final class SafeSpaceManager: @unchecked Sendable {
                 "guestPath": $0.guestPath,
                 "isReadOnly": $0.isReadOnly,
                 "isInfrastructure": false,
-                "isRecipeMount": false
+                "isBuildContextMount": false
             ] as [String: Any]
         })
         return mounts
@@ -1094,9 +1133,9 @@ final class SafeSpaceManager: @unchecked Sendable {
             var mounts: [[String: Any]] = []
             var persistentData: [[String: Any]] = []
             if ownsContainer && !overview {
-                let recipe = try recipe(for: record)
-                mounts = try configurationMounts(for: record, recipe: recipe)
-                persistentData = try (recipe.persistentData ?? [])
+                let configuration = try configuration(for: record)
+                mounts = try configurationMounts(for: record, configuration: configuration)
+                persistentData = try (configuration.persistentData ?? [])
                     .filter(\.isDeclared)
                     .sorted {
                         $0.guestPath.localizedStandardCompare($1.guestPath) == .orderedAscending
@@ -1130,13 +1169,13 @@ final class SafeSpaceManager: @unchecked Sendable {
                 "persistentData": persistentData
             ]
             if ownsContainer && !overview {
-                value["recipe"] = try recipeDictionary(for: record)
+                value["definition"] = try definitionDictionary(for: record)
             }
             if let progress = lock.withSafeSpaceLock({ buildProgress[record.id] }) {
                 value["buildProgress"] = progress.dictionary
             }
             if overview {
-                for key in ["recipe", "mounts", "persistentData"] { value.removeValue(forKey: key) }
+                for key in ["definition", "mounts", "persistentData"] { value.removeValue(forKey: key) }
                 for key in ["apps", "commands"] {
                     value[key] = try (value[key] as? [[String: Any]] ?? []).map { item in
                         var item = item
@@ -1246,7 +1285,7 @@ final class SafeSpaceManager: @unchecked Sendable {
 
     private func runtimeDictionary(for record: SafeSpaceRecord) throws -> [String: Any] {
         let provider = runtimeProvider(for: record)
-        let baseImage = recordOwnsContainer(record) ? try recipe(for: record).baseImage : "Linux"
+        let baseImage = recordOwnsContainer(record) ? try configuration(for: record).baseImage : "Linux"
         let operatingSystem = operatingSystemDescription(for: baseImage)
         return [
             "providerID": provider.rawValue,
@@ -1470,7 +1509,7 @@ final class SafeSpaceManager: @unchecked Sendable {
             "supportsShell": true,
             "supportsLiveMounts": ownsContainer && provider.supportsLiveMounts,
             "supportsMounts": ownsContainer,
-            "supportsRecipes": ownsContainer,
+            "supportsDefinitions": ownsContainer,
             "canChangeRuntime": ownsContainer,
             "canShare": ownsContainer,
             "canDeleteRuntime": ownsContainer
@@ -1554,17 +1593,17 @@ final class SafeSpaceManager: @unchecked Sendable {
                                      memoryInMB: resources.memoryInMB,
                                      runtimeProviderID: provider.rawValue,
                                      runtimeName: managedContainerName(id),
-                                     projectResourceKey: recipeResourceKey(id),
+                                     projectResourceKey: configurationResourceKey(id),
                                      ownsContainer: true)
         try createManagedDirectories(for: record)
         if let requestedBaseImage {
-            try saveRecipe(
-                newRecipe(baseImage: requestedBaseImage,
+            try saveConfiguration(
+                newConfiguration(baseImage: requestedBaseImage,
                           hasUntrackedChanges: false),
                 for: record
             )
         } else {
-            _ = try recipe(for: record)
+            _ = try configuration(for: record)
         }
         if let requestedDockerfile {
             try requestedDockerfile.write(to: dockerfileURL(record.id), atomically: true, encoding: .utf8)
@@ -1577,11 +1616,11 @@ final class SafeSpaceManager: @unchecked Sendable {
         Task.detached(priority: .userInitiated) { [weak self] in
             guard let self else { return }
             do {
-                let imageReference = self.recipeImageReference(record.id)
+                let imageReference = self.containerImageReference(record.id)
                 _ = try self.runContainerBuild(record,
                                                imageReference: imageReference)
                 try self.createRuntimeContainer(record, imageReference: imageReference)
-                try self.markRecipeRealized(for: record)
+                try self.markRealized(for: record)
                 self.setTransientState(nil, for: record.id)
             } catch {
                 NSLog("Container creation failed: %@", error.localizedDescription)
@@ -1612,26 +1651,26 @@ final class SafeSpaceManager: @unchecked Sendable {
             memoryInMB: duplicateResources.memoryInMB,
             runtimeProviderID: provider.rawValue,
             runtimeName: managedContainerName(duplicateID),
-            projectResourceKey: recipeResourceKey(duplicateID),
+            projectResourceKey: configurationResourceKey(duplicateID),
             ownsContainer: true
         )
         try createManagedDirectories(for: duplicate)
-        let sourceRecipe = try recipeDirectory(source.id)
-        let destinationRecipe = try recipeDirectory(duplicate.id)
-        if FileManager.default.fileExists(atPath: destinationRecipe.path) {
-            try FileManager.default.removeItem(at: destinationRecipe)
+        let sourceBuildContext = try buildContextDirectory(source.id)
+        let destinationBuildContext = try buildContextDirectory(duplicate.id)
+        if FileManager.default.fileExists(atPath: destinationBuildContext.path) {
+            try FileManager.default.removeItem(at: destinationBuildContext)
         }
-        try FileManager.default.copyItem(at: sourceRecipe, to: destinationRecipe)
-        var duplicatedRecipe = try recipe(for: source)
-        duplicatedRecipe.realizedBaseImage = nil
-        duplicatedRecipe.realizedDockerfileContents = nil
-        duplicatedRecipe.realizedMounts = nil
-        duplicatedRecipe.realizedEnvironment = nil
-        duplicatedRecipe.realizedPublishedPorts = nil
-        duplicatedRecipe.realizedCPUs = nil
-        duplicatedRecipe.realizedMemoryInMB = nil
-        duplicatedRecipe.hasUntrackedChanges = false
-        try saveRecipe(duplicatedRecipe, for: duplicate)
+        try FileManager.default.copyItem(at: sourceBuildContext, to: destinationBuildContext)
+        var duplicatedConfiguration = try configuration(for: source)
+        duplicatedConfiguration.realizedBaseImage = nil
+        duplicatedConfiguration.realizedDockerfileContents = nil
+        duplicatedConfiguration.realizedMounts = nil
+        duplicatedConfiguration.realizedEnvironment = nil
+        duplicatedConfiguration.realizedPublishedPorts = nil
+        duplicatedConfiguration.realizedCPUs = nil
+        duplicatedConfiguration.realizedMemoryInMB = nil
+        duplicatedConfiguration.hasUntrackedChanges = false
+        try saveConfiguration(duplicatedConfiguration, for: duplicate)
         lock.withSafeSpaceLock {
             records.append(duplicate)
             transientStates[duplicate.id] = "creating"
@@ -1657,14 +1696,14 @@ final class SafeSpaceManager: @unchecked Sendable {
                         )
                     }
                 }
-                for item in duplicatedRecipe.persistentData ?? [] where item.isDeclared {
+                for item in duplicatedConfiguration.persistentData ?? [] where item.isDeclared {
                     let archive = try self.volumeArchiveURL(duplicate, item: item)
                     try self.exportPersistentVolume(source, item: item, archive: archive)
                 }
-                let imageReference = self.recipeImageReference(duplicate.id)
+                let imageReference = self.containerImageReference(duplicate.id)
                 _ = try self.runContainerBuild(duplicate, imageReference: imageReference)
                 try self.createRuntimeContainer(duplicate, imageReference: imageReference)
-                try self.markRecipeRealized(for: duplicate)
+                try self.markRealized(for: duplicate)
                 self.setTransientState(nil, for: duplicate.id)
             } catch {
                 NSLog("Container duplication failed: %@", error.localizedDescription)
@@ -1690,30 +1729,30 @@ final class SafeSpaceManager: @unchecked Sendable {
                 try? FileManager.default.removeItem(at: transferRoot)
             }
         }
-        let recipe = try recipe(for: record)
-        let persistentData = (recipe.persistentData ?? []).filter(\.isDeclared)
-        let sharedRecipeDirectory = transferRoot.appendingPathComponent(
-            "Recipe", isDirectory: true
+        let configuration = try configuration(for: record)
+        let persistentData = (configuration.persistentData ?? []).filter(\.isDeclared)
+        let sharedBuildContext = transferRoot.appendingPathComponent(
+            "BuildContext", isDirectory: true
         )
         try FileManager.default.copyItem(
-            at: try recipeDirectory(record.id),
-            to: sharedRecipeDirectory
+            at: try buildContextDirectory(record.id),
+            to: sharedBuildContext
         )
-        try requireUnlinkedTree(sharedRecipeDirectory)
-        for name in ["recipe.orwv"] {
-            let staleRecipe = sharedRecipeDirectory.appendingPathComponent(name)
-            if FileManager.default.fileExists(atPath: staleRecipe.path) {
-                try FileManager.default.removeItem(at: staleRecipe)
+        try requireUnlinkedTree(sharedBuildContext)
+        for name in ["configuration.orwv"] {
+            let staleConfiguration = sharedBuildContext.appendingPathComponent(name)
+            if FileManager.default.fileExists(atPath: staleConfiguration.path) {
+                try FileManager.default.removeItem(at: staleConfiguration)
             }
         }
-        var sharedRecipe = recipe
-        sharedRecipe.persistentData = persistentData
-        try OffsetArchive.encode(sharedRecipe).write(
-            to: sharedRecipeDirectory.appendingPathComponent("recipe.orwv"),
+        var sharedConfiguration = configuration
+        sharedConfiguration.persistentData = persistentData
+        try OffsetArchive.encode(sharedConfiguration).write(
+            to: sharedBuildContext.appendingPathComponent("configuration.orwv"),
             options: .atomic
         )
         var archiveSources: [(source: URL, destination: String)] = [
-            (sharedRecipeDirectory, "Recipe")
+            (sharedBuildContext, "BuildContext")
         ]
         if includePersistentData {
             for item in persistentData {
@@ -1732,7 +1771,7 @@ final class SafeSpaceManager: @unchecked Sendable {
                 archiveSources.append((archive, "Volume Archives/\(archive.lastPathComponent)"))
             }
         }
-        let mounts = recipe.mounts ?? []
+        let mounts = configuration.mounts ?? []
         var includedMounts: [SafeSpaceMount] = []
         if includeMountedFolders {
             for mount in mounts {
@@ -1745,7 +1784,7 @@ final class SafeSpaceManager: @unchecked Sendable {
             }
         }
         let manifest = SafeSpaceTransferManifest(
-            version: 2,
+            version: 3,
             name: record.name,
             cpus: record.cpus,
             memoryInMB: record.memoryInMB,
@@ -1898,7 +1937,7 @@ final class SafeSpaceManager: @unchecked Sendable {
             SafeSpaceTransferManifest.self,
             from: manifestData
         )
-        guard manifest.version == 2 else {
+        guard manifest.version == 3 else {
             throw SafeSpaceManagerError.commandFailed("This shared container uses an unsupported format.")
         }
         let providerText = request["runtimeProviderID"] as? String
@@ -1985,24 +2024,24 @@ final class SafeSpaceManager: @unchecked Sendable {
             cpus: importedResources.cpus, memoryInMB: importedResources.memoryInMB,
             runtimeProviderID: provider.rawValue,
             runtimeName: managedContainerName(importedID),
-            projectResourceKey: recipeResourceKey(importedID),
+            projectResourceKey: configurationResourceKey(importedID),
             ownsContainer: true
         )
         try createManagedDirectories(for: record)
-        let destinationRecipe = try recipeDirectory(record.id)
-        if FileManager.default.fileExists(atPath: destinationRecipe.path) {
-            try FileManager.default.removeItem(at: destinationRecipe)
+        let destinationBuildContext = try buildContextDirectory(record.id)
+        if FileManager.default.fileExists(atPath: destinationBuildContext.path) {
+            try FileManager.default.removeItem(at: destinationBuildContext)
         }
         try FileManager.default.moveItem(
-            at: extracted.appendingPathComponent("Recipe", isDirectory: true),
-            to: destinationRecipe
+            at: extracted.appendingPathComponent("BuildContext", isDirectory: true),
+            to: destinationBuildContext
         )
-        let transferredRecipeURL = destinationRecipe.appendingPathComponent("recipe.orwv")
-        let transferredRecipeData = try Data(contentsOf: transferredRecipeURL)
-        try FileManager.default.removeItem(at: transferredRecipeURL)
-        var importedRecipe = try OffsetArchive.decode(
-            SafeSpaceRecipe.self,
-            from: transferredRecipeData
+        let transferredConfigurationURL = destinationBuildContext.appendingPathComponent("configuration.orwv")
+        let transferredConfigurationData = try Data(contentsOf: transferredConfigurationURL)
+        try FileManager.default.removeItem(at: transferredConfigurationURL)
+        var importedConfiguration = try OffsetArchive.decode(
+            SafeSpaceConfiguration.self,
+            from: transferredConfigurationData
         )
         let importedDockerfileURL = try dockerfileURL(record.id)
         var importedDockerfile = try String(
@@ -2018,7 +2057,7 @@ final class SafeSpaceManager: @unchecked Sendable {
                 encoding: .utf8
             )
         }
-        importedRecipe.baseImage = dockerfileBaseImage(in: importedDockerfile) ?? defaultContainerBaseImage
+        importedConfiguration.baseImage = dockerfileBaseImage(in: importedDockerfile) ?? defaultContainerBaseImage
         var importedMounts: [SafeSpaceMount] = []
         for mount in manifest.includedMounts {
             let source = extracted.appendingPathComponent("Mounted Folders", isDirectory: true)
@@ -2052,15 +2091,15 @@ final class SafeSpaceManager: @unchecked Sendable {
             imported.hostPath = destination.path
             importedMounts.append(imported)
         }
-        importedRecipe.mounts = importedMounts
-        importedRecipe.realizedMounts = nil
-        importedRecipe.realizedDockerfileContents = nil
-        importedRecipe.realizedEnvironment = nil
-        importedRecipe.realizedPublishedPorts = nil
-        importedRecipe.realizedCPUs = nil
-        importedRecipe.realizedMemoryInMB = nil
-        importedRecipe.hasUntrackedChanges = false
-        try saveRecipe(importedRecipe, for: record)
+        importedConfiguration.mounts = importedMounts
+        importedConfiguration.realizedMounts = nil
+        importedConfiguration.realizedDockerfileContents = nil
+        importedConfiguration.realizedEnvironment = nil
+        importedConfiguration.realizedPublishedPorts = nil
+        importedConfiguration.realizedCPUs = nil
+        importedConfiguration.realizedMemoryInMB = nil
+        importedConfiguration.hasUntrackedChanges = false
+        try saveConfiguration(importedConfiguration, for: record)
         let persistentSource = extracted.appendingPathComponent("Volume Archives", isDirectory: true)
         let persistentDestination = try safeSpaceDirectory(record.id)
             .appendingPathComponent("Volume Archives", isDirectory: true)
@@ -2078,10 +2117,10 @@ final class SafeSpaceManager: @unchecked Sendable {
         Task.detached(priority: .userInitiated) { [weak self] in
             guard let self else { return }
             do {
-                let imageReference = self.recipeImageReference(record.id)
+                let imageReference = self.containerImageReference(record.id)
                 _ = try self.runContainerBuild(record, imageReference: imageReference)
                 try self.createRuntimeContainer(record, imageReference: imageReference)
-                try self.markRecipeRealized(for: record)
+                try self.markRealized(for: record)
                 self.setTransientState(nil, for: record.id)
             } catch {
                 NSLog("Container import failed: %@", error.localizedDescription)
@@ -2199,7 +2238,7 @@ final class SafeSpaceManager: @unchecked Sendable {
                 try requireSuccess(staleTarget, action: "remove a previous target container")
             }
 
-            let imageReference = recipeImageReference(source.id)
+            let imageReference = containerImageReference(source.id)
             _ = try runContainerBuild(target, imageReference: imageReference)
             updateBuildProgressPhase(
                 "replacing",
@@ -2219,7 +2258,7 @@ final class SafeSpaceManager: @unchecked Sendable {
                 sourceWasStopped = true
             }
 
-            for item in try recipe(for: source).persistentData ?? [] where item.isDeclared {
+            for item in try configuration(for: source).persistentData ?? [] where item.isDeclared {
                 let legacy = try persistentDataDirectory(source, item: item)
                 if FileManager.default.fileExists(atPath: legacy.path) { continue }
                 let archive = try volumeArchiveURL(source, item: item)
@@ -2266,7 +2305,7 @@ final class SafeSpaceManager: @unchecked Sendable {
             }
             providerWasChanged = true
             try saveRecords()
-            try markRecipeRealized(for: target)
+            try markRealized(for: target)
             _ = lock.withSafeSpaceLock {
                 cachedCommandIcons.removeValue(forKey: source.id)
             }
@@ -2336,7 +2375,7 @@ final class SafeSpaceManager: @unchecked Sendable {
     private func createAppleContainer(_ record: SafeSpaceRecord,
                                       imageReference: String) throws {
         try createManagedDirectories(for: record)
-        let recipe = try recipe(for: record)
+        let configuration = try configuration(for: record)
         var arguments = [
             "create",
             "--name", containerName(record.id),
@@ -2345,9 +2384,9 @@ final class SafeSpaceManager: @unchecked Sendable {
             "--init",
         ] + containerRuntimeArguments + [
             "--label", "org.outershell.container-id=\(record.id.uuidString)",
-            "--volume", "\(try recipeDirectory(record.id).path):/var/lib/outershell/project"
+            "--volume", "\(try buildContextDirectory(record.id).path):/var/lib/outershell/project"
         ]
-        for mount in recipe.mounts ?? [] {
+        for mount in configuration.mounts ?? [] {
             let suffix = mount.isReadOnly ? ":ro" : ""
             arguments.append(contentsOf: [
                 "--volume", "\(mount.hostPath):\(mount.guestPath)\(suffix)"
@@ -2358,19 +2397,19 @@ final class SafeSpaceManager: @unchecked Sendable {
             imageReference: imageReference
         )
         var occupiedGuestPaths: Set<String> = ["/var/lib/outershell/project"]
-        occupiedGuestPaths.formUnion((recipe.mounts ?? []).map(\.guestPath))
+        occupiedGuestPaths.formUnion((configuration.mounts ?? []).map(\.guestPath))
         for item in persistentData where !occupiedGuestPaths.contains(item.guestPath) {
             try preparePersistentVolume(record, item: item)
             arguments.append(contentsOf: [
                 "--mount", try persistentMount(record, item: item) + ",target=" + item.guestPath
             ])
         }
-        for variable in recipe.environment ?? [] {
+        for variable in configuration.environment ?? [] {
             arguments.append(contentsOf: [
                 "--env", "\(variable.name)=\(variable.value)"
             ])
         }
-        for port in recipe.publishedPorts ?? [] {
+        for port in configuration.publishedPorts ?? [] {
             arguments.append(contentsOf: [
                 "--publish", "127.0.0.1:\(port.hostPort):\(port.containerPort)/tcp"
             ])
@@ -2385,7 +2424,7 @@ final class SafeSpaceManager: @unchecked Sendable {
     private func createDockerContainer(_ record: SafeSpaceRecord,
                                        imageReference: String) throws {
         try createManagedDirectories(for: record)
-        let recipe = try recipe(for: record)
+        let configuration = try configuration(for: record)
         var arguments = [
             "create",
             "--name", containerName(record.id),
@@ -2394,9 +2433,9 @@ final class SafeSpaceManager: @unchecked Sendable {
             "--init",
         ] + containerRuntimeArguments + [
             "--label", "org.outershell.container-id=\(record.id.uuidString)",
-            "--volume", "\(try recipeDirectory(record.id).path):/var/lib/outershell/project"
+            "--volume", "\(try buildContextDirectory(record.id).path):/var/lib/outershell/project"
         ]
-        for mount in recipe.mounts ?? [] {
+        for mount in configuration.mounts ?? [] {
             arguments.append(contentsOf: [
                 "--volume", "\(mount.hostPath):\(mount.guestPath)\(mount.isReadOnly ? ":ro" : "")"
             ])
@@ -2406,17 +2445,17 @@ final class SafeSpaceManager: @unchecked Sendable {
             imageReference: imageReference
         )
         var occupiedGuestPaths: Set<String> = ["/var/lib/outershell/project"]
-        occupiedGuestPaths.formUnion((recipe.mounts ?? []).map(\.guestPath))
+        occupiedGuestPaths.formUnion((configuration.mounts ?? []).map(\.guestPath))
         for item in persistentData where !occupiedGuestPaths.contains(item.guestPath) {
             try preparePersistentVolume(record, item: item)
             arguments.append(contentsOf: [
                 "--mount", try persistentMount(record, item: item) + ",target=" + item.guestPath
             ])
         }
-        for variable in recipe.environment ?? [] {
+        for variable in configuration.environment ?? [] {
             arguments.append(contentsOf: ["--env", "\(variable.name)=\(variable.value)"])
         }
-        for port in recipe.publishedPorts ?? [] {
+        for port in configuration.publishedPorts ?? [] {
             arguments.append(contentsOf: [
                 "--publish", "127.0.0.1:\(port.hostPort):\(port.containerPort)/tcp"
             ])
@@ -2450,12 +2489,12 @@ final class SafeSpaceManager: @unchecked Sendable {
     }
 
     private func realizedImageReference(for record: SafeSpaceRecord) throws -> String {
-        let value = normalizedRecipe(try recipe(for: record))
-        guard value.version == currentSafeSpaceRecipeVersion,
+        let value = normalizedConfiguration(try configuration(for: record))
+        guard value.version == currentSafeSpaceConfigurationVersion,
               value.realizedDockerfileContents == (try? dockerfileContents(for: record)) else {
             return value.baseImage
         }
-        return recipeImageReference(record.id)
+        return containerImageReference(record.id)
     }
 
     private func sanitizedMountComponent(_ name: String,
@@ -2536,10 +2575,10 @@ final class SafeSpaceManager: @unchecked Sendable {
                     "The attached container is not present in \(runtimeProvider(for: record).displayName). Outer Shell will reconnect when a container named \(registeredRuntimeName(for: record)) appears."
                 )
             }
-            let imageReference = recipeImageReference(record.id)
+            let imageReference = containerImageReference(record.id)
             _ = try runContainerBuild(record, imageReference: imageReference)
             try createRuntimeContainer(record, imageReference: imageReference)
-            try markRecipeRealized(for: record)
+            try markRealized(for: record)
         } else {
             try requireSuccess(try runRuntime(record, ["start", containerName(record.id)]),
                                action: "start the container")
@@ -2568,8 +2607,8 @@ final class SafeSpaceManager: @unchecked Sendable {
         var protected = containerSupportImageReferences
         var files: [String] = []
         for record in try loadRecords() where record.id != id && recordOwnsContainer(record) {
-            if runtimeProvider(for: record) == .docker { protected.insert(recipeImageReference(record.id)) }
-            let value = try recipe(for: record)
+            if runtimeProvider(for: record) == .docker { protected.insert(containerImageReference(record.id)) }
+            let value = try configuration(for: record)
             protected.insert(value.baseImage)
             if let realized = value.realizedBaseImage { protected.insert(realized) }
             if let dockerfile = try? dockerfileContents(for: record) { files.append(dockerfile) }
@@ -2622,9 +2661,9 @@ final class SafeSpaceManager: @unchecked Sendable {
         var dockerfiles: [String] = []
         for record in try loadRecords() where record.id != id && recordOwnsContainer(record) {
             if runtimeProvider(for: record) == .appleContainer {
-                protected.insert(recipeImageReference(record.id))
+                protected.insert(containerImageReference(record.id))
             }
-            let value = try recipe(for: record)
+            let value = try configuration(for: record)
             protected.insert(value.baseImage)
             if let realized = value.realizedBaseImage { protected.insert(realized) }
             if let dockerfile = try? dockerfileContents(for: record) { dockerfiles.append(dockerfile) }
@@ -2713,18 +2752,18 @@ final class SafeSpaceManager: @unchecked Sendable {
         }
     }
 
-    private func removeOwnedRecipeImage(_ record: SafeSpaceRecord) throws {
+    private func removeOwnedContainerImage(_ record: SafeSpaceRecord) throws {
         containerBaseImageLock.lock()
         defer { containerBaseImageLock.unlock() }
-        let reference = recipeImageReference(record.id)
+        let reference = containerImageReference(record.id)
         if runtimeProvider(for: record) == .docker {
             if try dockerStorageCandidates(excluding: record.id).contains(where: { $0.reference == reference }) {
-                try requireSuccess(try runDocker(["image", "rm", reference]), action: "delete the container recipe image")
+                try requireSuccess(try runDocker(["image", "rm", reference]), action: "delete the container image")
             }
             return
         }
         if try appleStorageCandidates(excluding: record.id).contains(where: { $0.reference == reference }) {
-            try requireSuccess(try runContainer(["image", "delete", reference]), action: "delete the container recipe image")
+            try requireSuccess(try runContainer(["image", "delete", reference]), action: "delete the container image")
         }
         scheduleAppleImageCleanup()
     }
@@ -2737,7 +2776,7 @@ final class SafeSpaceManager: @unchecked Sendable {
             if result.status != 0 && !runtimeObjectIsMissing(result) {
                 try requireSuccess(result, action: "delete the container")
             }
-            for item in try recipe(for: record).persistentData ?? [] {
+            for item in try configuration(for: record).persistentData ?? [] {
                 let name = persistentVolumeName(record, item: item)
                 if try runRuntime(record, ["volume", "inspect", name]).status == 0 {
                     try requireSuccess(try runRuntime(record, ["volume", "rm", name]), action: "delete persistent storage")
@@ -2745,7 +2784,7 @@ final class SafeSpaceManager: @unchecked Sendable {
             }
         }
         if recordOwnsContainer(record) {
-            try removeOwnedRecipeImage(record)
+            try removeOwnedContainerImage(record)
         }
         lock.withSafeSpaceLock {
             records.removeAll { $0.id == record.id }
@@ -2757,7 +2796,7 @@ final class SafeSpaceManager: @unchecked Sendable {
         try removeRecordRegistration(record.id)
         try saveCachedApps()
         if recordOwnsContainer(record) {
-            try RegistryResourceStore.remove(recipeResourceKey(record.id))
+            try RegistryResourceStore.remove(configurationResourceKey(record.id))
         }
     }
 
@@ -2772,7 +2811,7 @@ final class SafeSpaceManager: @unchecked Sendable {
             return
         }
         let url = URL(fileURLWithPath: hostPath, isDirectory: true)
-        var value = try recipe(for: selected)
+        var value = try configuration(for: selected)
         if value.realizedMounts == nil {
             value.realizedMounts = value.mounts ?? []
         }
@@ -2785,7 +2824,7 @@ final class SafeSpaceManager: @unchecked Sendable {
                            guestPath: "/workspaces/mounts/\(component)",
                            isReadOnly: request["readOnly"] as? Bool ?? false)
         ]
-        try saveRecipe(value, for: selected)
+        try saveConfiguration(value, for: selected)
     }
 
     @MainActor
@@ -2808,12 +2847,12 @@ final class SafeSpaceManager: @unchecked Sendable {
               let mountID = UUID(uuidString: text) else {
             throw SafeSpaceManagerError.invalidRequest
         }
-        var value = try recipe(for: selected)
+        var value = try configuration(for: selected)
         if value.realizedMounts == nil {
             value.realizedMounts = value.mounts ?? []
         }
         value.mounts = (value.mounts ?? []).filter { $0.id != mountID }
-        try saveRecipe(value, for: selected)
+        try saveConfiguration(value, for: selected)
     }
 
     private func controlApp(_ request: [String: Any], operation: String) async throws {
@@ -3038,7 +3077,7 @@ final class SafeSpaceManager: @unchecked Sendable {
         try contents.write(to: try dockerfileURL(selected.id),
                            atomically: true,
                            encoding: .utf8)
-        try saveRecipe(try recipe(for: selected), for: selected)
+        try saveConfiguration(try configuration(for: selected), for: selected)
         return [:]
     }
 
@@ -3053,7 +3092,7 @@ final class SafeSpaceManager: @unchecked Sendable {
         let mounts = try configurationMounts(request["mounts"])
         let environment = try configurationEnvironment(request["environment"])
         let publishedPorts = try configurationPublishedPorts(request["publishedPorts"])
-        var value = try recipe(for: selected)
+        var value = try configuration(for: selected)
         if value.realizedMounts == nil {
             value.realizedMounts = value.mounts ?? []
         }
@@ -3070,7 +3109,7 @@ final class SafeSpaceManager: @unchecked Sendable {
         value.mounts = mounts
         value.environment = environment
         value.publishedPorts = publishedPorts
-        try saveRecipe(value, for: selected)
+        try saveConfiguration(value, for: selected)
         return [:]
     }
 
@@ -3085,11 +3124,11 @@ final class SafeSpaceManager: @unchecked Sendable {
         case .failure(let error):
             throw SafeSpaceManagerError.commandFailed(error.message)
         }
-        var value = try recipe(for: selected)
+        var value = try configuration(for: selected)
         if value.realizedCPUs == nil || value.realizedMemoryInMB == nil {
             value.realizedCPUs = selected.cpus
             value.realizedMemoryInMB = selected.memoryInMB
-            try saveRecipe(value, for: selected)
+            try saveConfiguration(value, for: selected)
         }
         var updated = selected
         updated.cpus = resources.cpus
@@ -3116,10 +3155,10 @@ final class SafeSpaceManager: @unchecked Sendable {
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             return ["resourcesApplied": false, "resourcesDetail": String(detail.prefix(400))]
         }
-        value = try recipe(for: updated)
+        value = try configuration(for: updated)
         value.realizedCPUs = updated.cpus
         value.realizedMemoryInMB = updated.memoryInMB
-        try saveRecipe(value, for: updated)
+        try saveConfiguration(value, for: updated)
         return ["resourcesApplied": true]
     }
 
@@ -3241,9 +3280,9 @@ final class SafeSpaceManager: @unchecked Sendable {
         return baseImage
     }
 
-    private func beginRebuildRecipe(_ request: [String: Any]) throws -> [String: Any] {
+    private func beginRebuild(_ request: [String: Any]) throws -> [String: Any] {
         let selected = try record(from: request)
-        let value = try recipe(for: selected)
+        let value = try configuration(for: selected)
         let isAlreadyBuilding = lock.withSafeSpaceLock {
             guard let progress = buildProgress[selected.id] else { return false }
             return progress.phase != "complete" && progress.phase != "failed"
@@ -3262,7 +3301,7 @@ final class SafeSpaceManager: @unchecked Sendable {
         Task.detached(priority: .userInitiated) { [weak self] in
             guard let self else { return }
             do {
-                _ = try await self.rebuild(selected, recipe: value)
+                _ = try await self.rebuild(selected, configuration: value)
                 self.finishBuild(
                     phase: "complete",
                     detail: "Container rebuilt. Apps are ready to use.",
@@ -3280,11 +3319,11 @@ final class SafeSpaceManager: @unchecked Sendable {
     }
 
     private func rebuild(_ selected: SafeSpaceRecord,
-                         recipe value: SafeSpaceRecipe) async throws -> [String: Any] {
-        try saveRecipe(value, for: selected)
-        let imageReference = recipeImageReference(selected.id)
+                         configuration value: SafeSpaceConfiguration) async throws -> [String: Any] {
+        try saveConfiguration(value, for: selected)
+        let imageReference = containerImageReference(selected.id)
         let result = try runContainerBuild(selected, imageReference: imageReference)
-        try requireSuccess(result, action: "build the container recipe")
+        try requireSuccess(result, action: "build the container image")
 
         updateBuildProgressPhase(
             "replacing",
@@ -3307,7 +3346,7 @@ final class SafeSpaceManager: @unchecked Sendable {
             detail: "Finishing the rebuild",
             for: selected.id
         )
-        try markRecipeRealized(for: selected)
+        try markRealized(for: selected)
         return [:]
     }
 
@@ -3525,7 +3564,7 @@ final class SafeSpaceManager: @unchecked Sendable {
         ])
         try requireSuccess(result, action: "list container apps")
         let declaredPorts = try declaredAppTCPPorts(for: record)
-        let publishedPorts = Dictionary(uniqueKeysWithValues: (try recipe(for: record).publishedPorts ?? []).map {
+        let publishedPorts = Dictionary(uniqueKeysWithValues: (try configuration(for: record).publishedPorts ?? []).map {
             ($0.containerPort, $0.hostPort)
         })
         return try parseAppSnapshots(result.stdout,
@@ -4065,7 +4104,7 @@ final class SafeSpaceManager: @unchecked Sendable {
             var migrated = try OffsetArchive.decode([SafeSpaceRecord].self, from: legacyData)
             for index in migrated.indices {
                 migrated[index].runtimeName = managedContainerName(migrated[index].id)
-                migrated[index].projectResourceKey = recipeResourceKey(migrated[index].id)
+                migrated[index].projectResourceKey = configurationResourceKey(migrated[index].id)
                 migrated[index].ownsContainer = true
                 try saveRecord(migrated[index])
             }
@@ -4137,7 +4176,7 @@ final class SafeSpaceManager: @unchecked Sendable {
         let providerID = value.runtimeProviderID ?? SafeSpaceRuntimeProviderID.appleContainer.rawValue
         let runtimeName = registeredRuntimeName(for: value)
         let projectResourceKey = value.projectResourceKey
-            ?? (recordOwnsContainer(value) ? recipeResourceKey(value.id) : "")
+            ?? (recordOwnsContainer(value) ? configurationResourceKey(value.id) : "")
         var error = [CChar](repeating: 0, count: 2048)
         let saved = identifier.withCString { identifierPointer in
             value.name.withCString { displayNamePointer in
@@ -4187,14 +4226,14 @@ final class SafeSpaceManager: @unchecked Sendable {
         )
     }
 
-    private func recipe(for record: SafeSpaceRecord) throws -> SafeSpaceRecipe {
-        recipeFileLock.lock()
-        defer { recipeFileLock.unlock() }
-        if let data = try RegistryResourceStore.data(for: recipeResourceKey(record.id)) {
-            var value = try OffsetArchive.decode(SafeSpaceRecipe.self, from: data)
+    private func configuration(for record: SafeSpaceRecord) throws -> SafeSpaceConfiguration {
+        configurationLock.lock()
+        defer { configurationLock.unlock() }
+        if let data = try RegistryResourceStore.data(for: configurationResourceKey(record.id)) {
+            var value = try OffsetArchive.decode(SafeSpaceConfiguration.self, from: data)
             var needsSave = false
-            if value.version < currentSafeSpaceRecipeVersion {
-                value.version = currentSafeSpaceRecipeVersion
+            if value.version < currentSafeSpaceConfigurationVersion {
+                value.version = currentSafeSpaceConfigurationVersion
                 value.realizedDockerfileContents = nil
                 needsSave = true
             }
@@ -4206,21 +4245,21 @@ final class SafeSpaceManager: @unchecked Sendable {
                 needsSave = true
             }
             if needsSave {
-                try saveRecipe(value, for: record)
+                try saveConfiguration(value, for: record)
             }
             return value
         }
-        let value = newRecipe(
+        let value = newConfiguration(
             baseImage: defaultContainerBaseImage,
             hasUntrackedChanges: (try? runtimeState(record)) != "absent"
         )
-        try saveRecipe(value, for: record)
+        try saveConfiguration(value, for: record)
         return value
     }
 
-    private func newRecipe(baseImage: String,
-                           hasUntrackedChanges: Bool) -> SafeSpaceRecipe {
-        SafeSpaceRecipe(version: currentSafeSpaceRecipeVersion,
+    private func newConfiguration(baseImage: String,
+                           hasUntrackedChanges: Bool) -> SafeSpaceConfiguration {
+        SafeSpaceConfiguration(version: currentSafeSpaceConfigurationVersion,
                         baseImage: baseImage,
                         realizedBaseImage: nil,
                         hasUntrackedChanges: hasUntrackedChanges,
@@ -4234,18 +4273,18 @@ final class SafeSpaceManager: @unchecked Sendable {
                         persistentData: [])
     }
 
-    private func saveRecipe(_ value: SafeSpaceRecipe,
+    private func saveConfiguration(_ value: SafeSpaceConfiguration,
                             for record: SafeSpaceRecord) throws {
-        recipeFileLock.lock()
-        defer { recipeFileLock.unlock() }
-        let directory = try recipeDirectory(record.id)
-        let normalizedValue = normalizedRecipe(value)
+        configurationLock.lock()
+        defer { configurationLock.unlock() }
+        let directory = try buildContextDirectory(record.id)
+        let normalizedValue = normalizedConfiguration(value)
         try FileManager.default.createDirectory(at: directory,
                                                 withIntermediateDirectories: true,
                                                 attributes: [.posixPermissions: 0o700])
         try RegistryResourceStore.set(
             OffsetArchive.encode(normalizedValue),
-            for: recipeResourceKey(record.id)
+            for: configurationResourceKey(record.id)
         )
         let dockerfile = try dockerfileURL(record.id)
         if !FileManager.default.fileExists(atPath: dockerfile.path) {
@@ -4262,7 +4301,7 @@ final class SafeSpaceManager: @unchecked Sendable {
         }
     }
 
-    private func normalizedRecipe(_ value: SafeSpaceRecipe) -> SafeSpaceRecipe {
+    private func normalizedConfiguration(_ value: SafeSpaceConfiguration) -> SafeSpaceConfiguration {
         var result = value
         if result.baseImage.hasPrefix(legacyContainerBaseImagePrefix) {
             result.baseImage = defaultContainerBaseImage
@@ -4279,9 +4318,9 @@ final class SafeSpaceManager: @unchecked Sendable {
         return result
     }
 
-    private func markRecipeRealized(for record: SafeSpaceRecord) throws {
-        var value = normalizedRecipe(try recipe(for: record))
-        value.version = currentSafeSpaceRecipeVersion
+    private func markRealized(for record: SafeSpaceRecord) throws {
+        var value = normalizedConfiguration(try configuration(for: record))
+        value.version = currentSafeSpaceConfigurationVersion
         value.realizedBaseImage = value.baseImage
         value.realizedDockerfileContents = try dockerfileContents(for: record)
         value.realizedMounts = value.mounts ?? []
@@ -4290,13 +4329,17 @@ final class SafeSpaceManager: @unchecked Sendable {
         value.realizedCPUs = record.cpus
         value.realizedMemoryInMB = record.memoryInMB
         value.hasUntrackedChanges = false
-        try saveRecipe(value, for: record)
+        try saveConfiguration(value, for: record)
+        let legacyDirectory = try legacyBuildContextDirectory(record.id)
+        if (try? FileManager.default.destinationOfSymbolicLink(atPath: legacyDirectory.path)) != nil {
+            try FileManager.default.removeItem(at: legacyDirectory)
+        }
     }
 
-    private func recipeDictionary(for record: SafeSpaceRecord) throws -> [String: Any] {
-        let value = normalizedRecipe(try recipe(for: record))
+    private func definitionDictionary(for record: SafeSpaceRecord) throws -> [String: Any] {
+        let value = normalizedConfiguration(try configuration(for: record))
         let dockerfile = try dockerfileContents(for: record)
-        let needsRebuild = value.version != currentSafeSpaceRecipeVersion ||
+        let needsRebuild = value.version != currentSafeSpaceConfigurationVersion ||
             value.realizedDockerfileContents != dockerfile ||
             value.realizedMounts.map { $0 != (value.mounts ?? []) } == true ||
             value.realizedEnvironment.map { $0 != (value.environment ?? []) } == true ||
@@ -4311,8 +4354,8 @@ final class SafeSpaceManager: @unchecked Sendable {
             "buildEngineAvailable": runtimeExecutableURL(
                 for: runtimeProvider(for: record)
             ) != nil,
-            "definitionDirectory": try recipeDirectory(record.id).path,
-            "transferItems": transferItems(for: record, recipe: value),
+            "definitionDirectory": try buildContextDirectory(record.id).path,
+            "transferItems": transferItems(for: record, configuration: value),
             "needsRebuild": needsRebuild,
             "hasUntrackedChanges": value.hasUntrackedChanges ?? true,
             "environment": (value.environment ?? []).map {
@@ -4325,7 +4368,7 @@ final class SafeSpaceManager: @unchecked Sendable {
     }
 
     private func transferItems(for record: SafeSpaceRecord,
-                               recipe value: SafeSpaceRecipe) -> [[String: Any]] {
+                               configuration value: SafeSpaceConfiguration) -> [[String: Any]] {
         return [
             [
                 "name": "Container definition",
@@ -4344,14 +4387,14 @@ final class SafeSpaceManager: @unchecked Sendable {
             ],
             [
                 "name": "OCI image",
-                "detail": recipeImageReference(record.id),
+                "detail": containerImageReference(record.id),
                 "status": "Rebuild or push to a registry"
             ]
         ]
     }
 
-    private func generatedDockerfile(for value: SafeSpaceRecipe) -> String {
-        "FROM \(normalizedRecipe(value).baseImage)\n\(containerSupportLine)\n"
+    private func generatedDockerfile(for value: SafeSpaceConfiguration) -> String {
+        "FROM \(normalizedConfiguration(value).baseImage)\n\(containerSupportLine)\n"
     }
 
     private func upgradedDockerfile(_ contents: String) -> String {
@@ -4507,12 +4550,12 @@ final class SafeSpaceManager: @unchecked Sendable {
         }
     }
 
-    private func recipeDirectory(_ id: UUID) throws -> URL {
-        try safeSpaceDirectory(id).appendingPathComponent("Recipe", isDirectory: true)
+    private func buildContextDirectory(_ id: UUID) throws -> URL {
+        try safeSpaceDirectory(id).appendingPathComponent("BuildContext", isDirectory: true)
     }
 
     private func dockerfileURL(_ id: UUID) throws -> URL {
-        try recipeDirectory(id).appendingPathComponent("Dockerfile")
+        try buildContextDirectory(id).appendingPathComponent("Dockerfile")
     }
 
     private func dockerfileContents(for record: SafeSpaceRecord) throws -> String {
@@ -4569,12 +4612,12 @@ final class SafeSpaceManager: @unchecked Sendable {
         return nil
     }
 
-    private func recipeResourceKey(_ id: UUID) -> String {
-        "containers/\(id.uuidString.lowercased())/recipe"
+    private func configurationResourceKey(_ id: UUID) -> String {
+        "containers/\(id.uuidString.lowercased())/configuration"
     }
 
-    private func recipeImageReference(_ id: UUID) -> String {
-        "outershell/container-\(id.uuidString.lowercased()):recipe"
+    private func containerImageReference(_ id: UUID) -> String {
+        "outershell/container-\(id.uuidString.lowercased()):latest"
     }
 
     private func createManagedDirectories(for record: SafeSpaceRecord) throws {
@@ -5078,7 +5121,7 @@ final class SafeSpaceManager: @unchecked Sendable {
         imageReference: String
     ) throws -> [SafeSpacePersistentData] {
         let declaredPaths = try containerImageVolumePaths(record, imageReference)
-        var value = try recipe(for: record)
+        var value = try configuration(for: record)
         var items = value.persistentData ?? []
         for index in items.indices {
             items[index].isDeclared = declaredPaths.contains(items[index].guestPath)
@@ -5092,7 +5135,7 @@ final class SafeSpaceManager: @unchecked Sendable {
         }
         if items != value.persistentData ?? [] {
             value.persistentData = items
-            try saveRecipe(value, for: record)
+            try saveConfiguration(value, for: record)
         }
         return items.filter(\.isDeclared)
     }
@@ -5202,12 +5245,12 @@ final class SafeSpaceManager: @unchecked Sendable {
             if runtimeProvider(for: record) == .appleContainer { scheduleAppleImageCleanup() }
         }
         try upgradeDefinition(for: record)
-        let value = normalizedRecipe(try recipe(for: record))
+        let value = normalizedConfiguration(try configuration(for: record))
         if try dockerfileContents(for: record).contains(containerSupportImage) {
             try ensureSupportImage(for: runtimeProvider(for: record))
         }
-        try saveRecipe(value, for: record)
-        let directory = try recipeDirectory(record.id)
+        try saveConfiguration(value, for: record)
+        let directory = try buildContextDirectory(record.id)
         updateBuildProgressPhase(
             "building",
             detail: "Building the container image",

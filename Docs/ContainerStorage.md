@@ -1,7 +1,7 @@
 # Container storage cleanup
 
-Outer Shell removes an owned Apple container's recipe image when deleting the
-container, unless another container or saved recipe still references that image.
+Outer Shell removes an owned Apple container's image when deleting the
+container, unless another container or saved configuration still references that image.
 Image deletion errors are reported before the registration is removed, so deletion
 can be retried. Externally managed containers keep their images.
 
@@ -17,12 +17,12 @@ Use **Container storage…** in the web overview or the native runtime menu for
 explicit cleanup. The native menu opens the same web screen in a new tab.
 No tagged images are selected by default. Cleanup with no selections only prunes
 orphaned cache data. The screen offers legacy `outershell/container-base:<N>`
-images, legacy workspace images for this user, and unreferenced recipe images.
+images, legacy workspace images for this user, and unreferenced container images.
 It preserves:
 
 - The `outershell/support` image.
 - Images used by running or stopped Apple containers, including digest aliases.
-- Current Apple recipe images and base/Dockerfile references from saved recipes,
+- Current Apple container images and base/Dockerfile references from saved definitions,
   including their last realized definitions.
 - Unrelated images, custom base tags, builder storage, volumes, and mounted folders.
 
@@ -50,13 +50,13 @@ node Scripts/test_web_container_delete.cjs
 
 The same storage screen supports Docker on macOS, Linux, and Windows, and WSLC
 on Windows. Select a runtime to inspect its unused Outer Shell images. Deleting
-an owned container also attempts to remove its unused recipe image, without
+an owned container also attempts to remove its unused image, without
 forcing deletion. Failures retain the registration so deletion can be retried.
 Externally managed containers keep their images.
 
-Cleanup protects running and stopped containers, registered recipes, saved
+Cleanup protects running and stopped containers, registered definitions, saved
 Dockerfile dependencies, shared image aliases, and the `outershell/support` image.
-Only recognized Outer Shell recipe names and legacy numbered base images are
+Only recognized Outer Shell container image names and legacy numbered base images are
 offered. macOS also offers legacy workspace images. Selections are validated
 before cleanup and checked again immediately before each removal. Partial failures
 are reported. Windows conservatively skips named-image cleanup when saved

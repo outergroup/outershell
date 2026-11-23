@@ -20,7 +20,7 @@ at `/var/lib/outershell/project`. Its Dockerfile is:
 When a requested change should survive a rebuild or move to another server,
 edit that Dockerfile and any files beside it. Prefer portable, noninteractive,
 idempotent Dockerfile instructions. A root process may edit this project
-directly. Do not create a second recipe or initialization system.
+directly. Do not create a second build definition or initialization system.
 
 Keep the line `COPY --from=outershell/support /outershell-rootfs/ /` directly
 after the Dockerfile's final `FROM`. It installs Outer Shell's in-container

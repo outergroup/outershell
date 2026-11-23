@@ -619,14 +619,14 @@ private struct LocalWorkspaceRecord: Decodable, Equatable {
         let guestPath: String
         let isReadOnly: Bool
         let isInfrastructure: Bool?
-        let isRecipeMount: Bool?
+        let isBuildContextMount: Bool?
 
         var isInfrastructureMount: Bool {
             isInfrastructure == true
         }
 
-        var isRecipeInfrastructureMount: Bool {
-            isRecipeMount == true
+        var isBuildContextInfrastructureMount: Bool {
+            isBuildContextMount == true
         }
     }
 
@@ -651,11 +651,11 @@ private struct LocalWorkspaceRecord: Decodable, Equatable {
         let supportsShell: Bool
         let supportsLiveMounts: Bool
         let supportsMounts: Bool?
-        let supportsRecipes: Bool?
+        let supportsDefinitions: Bool?
         let supportsResourceUpdates: Bool?
     }
 
-    struct Recipe: Decodable, Equatable {
+    struct Definition: Decodable, Equatable {
         struct TransferItem: Decodable, Equatable {
             let name: String
             let detail: String
@@ -703,7 +703,7 @@ private struct LocalWorkspaceRecord: Decodable, Equatable {
     let commands: [LocalWorkspaceCommandRecord]?
     var mounts: [Mount]?
     let persistentData: [PersistentData]?
-    var recipe: Recipe?
+    var definition: Definition?
     let outerShellSupport: OuterShellSupport?
     let buildProgress: BuildProgress?
 
@@ -720,11 +720,11 @@ private struct LocalWorkspaceRecord: Decodable, Equatable {
     }
 
     var overviewMounts: [Mount] {
-        visibleMounts.filter { !$0.isRecipeInfrastructureMount }
+        visibleMounts.filter { !$0.isBuildContextInfrastructureMount }
     }
 
     var appWorkingDirectoryMounts: [Mount] {
-        visibleMounts.filter { !$0.isRecipeInfrastructureMount }
+        visibleMounts.filter { !$0.isBuildContextInfrastructureMount }
     }
 
     var runtimeDescription: String {
@@ -1880,9 +1880,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private var workspaceRenameName = ""
     private var isSynchronizingEditorInput = false
     private var pendingSharedContainerImport: PendingSharedContainerImport?
-    private var selectedRecipeSafeSpaceID: UUID?
+    private var selectedDefinitionSafeSpaceID: UUID?
     private var pendingDockerfileWorkspace: LocalWorkspaceRecord?
-    private var safeSpaceRecipeMessage = ""
+    private var safeSpaceDefinitionMessage = ""
     private var containerConfigurationTab = ContainerConfigurationTab.dockerfile
     private var containerConfigurationDockerfile = ""
     private var containerConfigurationSavedDockerfile = ""
@@ -2214,7 +2214,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
     private var isContainerConfigurationEditorVisible: Bool {
         isShowingWorkspacePanel && pendingDockerfileWorkspace != nil &&
-            selectedRecipeSafeSpaceID == pendingDockerfileWorkspace?.id
+            selectedDefinitionSafeSpaceID == pendingDockerfileWorkspace?.id
     }
 
     private let toolbarHeight: CGFloat = 48
@@ -2283,7 +2283,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             mode = modeFromURL(initialURL)
             restoreCatalogContext(initialURL)
             workspaceContextID = workspaceIDFromURL(initialURL)
-            selectedRecipeSafeSpaceID = recipeSafeSpaceIDFromURL(initialURL)
+            selectedDefinitionSafeSpaceID = definitionSafeSpaceIDFromURL(initialURL)
             didReceiveSystemAppearanceUpdate = false
             appearance = arguments.appearance ?? NSAppearance.currentDrawing()
             currentSize = arguments.contentSize ?? currentSize
@@ -2617,7 +2617,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         return UUID(uuidString: value)
     }
 
-    private func recipeSafeSpaceIDFromURL(_ urlString: String?) -> UUID? {
+    private func definitionSafeSpaceIDFromURL(_ urlString: String?) -> UUID? {
         guard let urlString,
               let components = URLComponents(string: urlString) else {
             return nil
@@ -2663,13 +2663,13 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         applyMode(nextMode)
     }
 
-    private func navigateToRecipeSafeSpace(_ workspaceID: UUID?) {
-        guard selectedRecipeSafeSpaceID != workspaceID || mode != .apps else { return }
+    private func navigateToDefinitionSafeSpace(_ workspaceID: UUID?) {
+        guard selectedDefinitionSafeSpaceID != workspaceID || mode != .apps else { return }
         if mode != .apps, let url = urlForMode(.apps) {
             outerframeHost.replaceHistoryEntry(url: url)
         }
-        selectedRecipeSafeSpaceID = workspaceID
-        safeSpaceRecipeMessage = ""
+        selectedDefinitionSafeSpaceID = workspaceID
+        safeSpaceDefinitionMessage = ""
         appsScroll = 0
         if let workspaceID,
            let workspace = localWorkspaces.first(where: { $0.id == workspaceID }) {
@@ -2683,16 +2683,16 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private func applyNavigation(_ urlString: String) {
         let nextMode = modeFromURL(urlString)
         restoreCatalogContext(urlString)
-        selectedRecipeSafeSpaceID = nextMode == .apps
-            ? recipeSafeSpaceIDFromURL(urlString)
+        selectedDefinitionSafeSpaceID = nextMode == .apps
+            ? definitionSafeSpaceIDFromURL(urlString)
             : nil
-        safeSpaceRecipeMessage = ""
+        safeSpaceDefinitionMessage = ""
         appsScroll = 0
-        if let selectedRecipeSafeSpaceID,
+        if let selectedDefinitionSafeSpaceID,
            let workspace = localWorkspaces.first(where: {
-               $0.id == selectedRecipeSafeSpaceID
+               $0.id == selectedDefinitionSafeSpaceID
            }) {
-            if pendingDockerfileWorkspace?.id != selectedRecipeSafeSpaceID {
+            if pendingDockerfileWorkspace?.id != selectedDefinitionSafeSpaceID {
                 beginContainerConfigurationEditor(for: workspace)
             }
         } else {
@@ -2702,8 +2702,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         if nextMode == .create { fetchWorkspaceCatalog() }
     }
 
-    private func returnFromRecipeSafeSpace() {
-        navigateToRecipeSafeSpace(nil)
+    private func returnFromDefinitionSafeSpace() {
+        navigateToDefinitionSafeSpace(nil)
     }
 
     private func applyMode(_ nextMode: BackendsViewMode) {
@@ -4616,10 +4616,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         if operation == "menu" {
             showWorkspaceOverviewActionsMenu(for: workspace, at: point)
         } else if operation == "editContainer" {
-            navigateToRecipeSafeSpace(workspace.id)
+            navigateToDefinitionSafeSpace(workspace.id)
         } else if operation == "viewBuildLog" {
             containerBuildLogRequestWorkspaceID = workspace.id
-            navigateToRecipeSafeSpace(workspace.id)
+            navigateToDefinitionSafeSpace(workspace.id)
         } else if operation == "openShell" {
             openInTerminal(workspace)
         } else if operation.hasPrefix("openCommand:") {
@@ -5545,7 +5545,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                   in: layer, left: innerLeft, top: y, width: innerWidth) - 10
                     agentButton("Edit the Dockerfile…", in: layer,
                                 frame: CGRect(x: innerLeft, y: y - 32, width: min(innerWidth, 260), height: 32)) { [weak self] in
-                        self?.navigateToRecipeSafeSpace(workspace.id)
+                        self?.navigateToDefinitionSafeSpace(workspace.id)
                     }
                     y -= 40
                 }
@@ -14259,8 +14259,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 }
                 return
             }
-            if let selectedRecipeSafeSpaceID,
-               localWorkspaces.contains(where: { $0.id == selectedRecipeSafeSpaceID }) {
+            if let selectedDefinitionSafeSpaceID,
+               localWorkspaces.contains(where: { $0.id == selectedDefinitionSafeSpaceID }) {
                 if let action = workspaceOverviewActionFrames.first(where: {
                     $0.frame.contains(appsPoint)
                 }) {
@@ -15793,7 +15793,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                                 environment: environment,
                                                 publishedPorts: publishedPorts)
         guard let payload = try? JSONEncoder().encode(request) else {
-            if operation == "rebuildRecipe" || operation == "changeRuntime" {
+            if operation == "rebuild" || operation == "changeRuntime" {
                 containerConfigurationRebuildWorkspaceID = nil
             }
             workspacePanelMessage = "Could not prepare the container request."
@@ -15833,28 +15833,28 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             case "delete":
                 workspacePanelMessage = "Deleting container…"
             case "updateDockerfile":
-                safeSpaceRecipeMessage = "Saving Dockerfile…"
+                safeSpaceDefinitionMessage = "Saving Dockerfile…"
             case "updateContainerConfiguration":
-                safeSpaceRecipeMessage = "Saving container configuration…"
+                safeSpaceDefinitionMessage = "Saving container configuration…"
             case "updateResources":
-                safeSpaceRecipeMessage = "Saving resource limits…"
-            case "rebuildRecipe":
-                safeSpaceRecipeMessage = "Applying changes… This can take several minutes."
+                safeSpaceDefinitionMessage = "Saving resource limits…"
+            case "rebuild":
+                safeSpaceDefinitionMessage = "Applying changes… This can take several minutes."
             case "changeRuntime":
-                safeSpaceRecipeMessage = "Changing container runtime…"
+                safeSpaceDefinitionMessage = "Changing container runtime…"
             default:
                 workspacePanelMessage = "Working…"
             }
         }
         let operationSession = operation == "start" ||
-            operation == "rebuildRecipe" ||
+            operation == "rebuild" ||
             operation == "changeRuntime"
             ? safeSpaceOperationSession
             : urlSession
         guard let safeSpacesEndpoint, let operationSession else {
             pendingWorkspaceOperations.removeValue(forKey: requestID)
             pendingWorkspaceOperationWorkspaceIDs.removeValue(forKey: requestID)
-            if operation == "rebuildRecipe" || operation == "changeRuntime" {
+            if operation == "rebuild" || operation == "changeRuntime" {
                 containerConfigurationRebuildWorkspaceID = nil
             }
             isPerformingWorkspaceOperation = false
@@ -15864,7 +15864,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             return
         }
         let usesSnapshot = operation == "list" && !includeDetails &&
-            !isShowingWorkspacePanel && selectedRecipeSafeSpaceID == nil
+            !isShowingWorkspacePanel && selectedDefinitionSafeSpaceID == nil
         let endpoint = usesSnapshot
             ? safeSpacesEndpoint.deletingLastPathComponent().appendingPathComponent("container-snapshot")
             : safeSpacesEndpoint
@@ -15885,7 +15885,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                     if operation == "updateDockerfile" {
                         self.restoreContainerConfigurationDockerfileSave()
                     }
-                    if operation == "rebuildRecipe" || operation == "changeRuntime" {
+                    if operation == "rebuild" || operation == "changeRuntime" {
                         self.containerConfigurationRebuildWorkspaceID = nil
                     }
                     self.pendingWorkspaceOperations.removeValue(forKey: requestID)
@@ -15895,13 +15895,13 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                     self.isRefreshingWorkspaces = false
                     let message = error?.localizedDescription
                         ?? "Outer Shell could not reach its container service."
-                    if operation == "rebuildRecipe" || operation == "changeRuntime",
+                    if operation == "rebuild" || operation == "changeRuntime",
                        self.isContainerConfigurationEditorVisible {
                         self.containerConfigurationBuildError = message
                         self.containerConfigurationBuildErrorScroll = 0
                         self.containerConfigurationBuildErrorRenderedScroll = 0
                         self.containerConfigurationBuildErrorCopyConfirmationID = nil
-                        self.safeSpaceRecipeMessage = ""
+                        self.safeSpaceDefinitionMessage = ""
                         self.workspacePanelMessage = ""
                         self.blurEditorInput()
                     } else {
@@ -15913,7 +15913,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 self.handleWorkspaceResponse(data, requestID: requestID, fromSnapshot: usesSnapshot)
             }
         }.resume()
-        if operation == "rebuildRecipe" || operation == "changeRuntime" {
+        if operation == "rebuild" || operation == "changeRuntime" {
             scheduleContainerBuildProgressRefresh()
         }
         if operation != "list" {
@@ -15924,7 +15924,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private func handleWorkspaceResponse(_ payload: Data, requestID: UUID? = nil, fromSnapshot: Bool = false) {
         guard let response = try? LocalWorkspaceHostResponse.decode(payload,
             snapshotRequestID: fromSnapshot ? requestID : nil) else {
-            if pendingWorkspaceOperations.values.contains("rebuildRecipe") ||
+            if pendingWorkspaceOperations.values.contains("rebuild") ||
                 pendingWorkspaceOperations.values.contains("changeRuntime") {
                 containerConfigurationRebuildWorkspaceID = nil
             }
@@ -15953,15 +15953,15 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
            let updatedWorkspace = localWorkspaces.first(where: { $0.id == pendingID }) {
             pendingDockerfileWorkspace = updatedWorkspace
         }
-        if let selectedRecipeSafeSpaceID,
-           !localWorkspaces.contains(where: { $0.id == selectedRecipeSafeSpaceID }) {
-            navigateToRecipeSafeSpace(nil)
-        } else if let selectedRecipeSafeSpaceID,
+        if let selectedDefinitionSafeSpaceID,
+           !localWorkspaces.contains(where: { $0.id == selectedDefinitionSafeSpaceID }) {
+            navigateToDefinitionSafeSpace(nil)
+        } else if let selectedDefinitionSafeSpaceID,
                   pendingDockerfileWorkspace == nil,
                   let workspace = localWorkspaces.first(where: {
-                      $0.id == selectedRecipeSafeSpaceID
+                      $0.id == selectedDefinitionSafeSpaceID
                   }) {
-            if workspace.recipe != nil || fromSnapshot {
+            if workspace.definition != nil || fromSnapshot {
                 beginContainerConfigurationEditor(for: workspace)
             }
         }
@@ -16026,17 +16026,17 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             addWorkspaceMessage = response.error ?? ""
         } else if operation == "updateResources" {
             if let error = response.error, !error.isEmpty {
-                safeSpaceRecipeMessage = error
+                safeSpaceDefinitionMessage = error
             } else if response.resourcesApplied == true {
-                safeSpaceRecipeMessage = "New CPU and memory limits are in effect."
+                safeSpaceDefinitionMessage = "New CPU and memory limits are in effect."
             } else if let detail = response.resourcesDetail, !detail.isEmpty {
-                safeSpaceRecipeMessage = "Limits saved, but the running container could not take them (\(detail)). Rebuild to apply them."
+                safeSpaceDefinitionMessage = "Limits saved, but the running container could not take them (\(detail)). Rebuild to apply them."
             } else {
-                safeSpaceRecipeMessage = "Limits saved. Rebuild to apply them."
+                safeSpaceDefinitionMessage = "Limits saved. Rebuild to apply them."
             }
             if let workspace = localWorkspaces.first(where: { $0.id == operationWorkspaceID }),
-               let recipe = workspace.recipe {
-                containerConfigurationRequiresRebuild = recipe.needsRebuild
+               let definition = workspace.definition {
+                containerConfigurationRequiresRebuild = definition.needsRebuild
             }
         } else if operation == "chooseFolder" {
             if let error = response.error, !error.isEmpty {
@@ -16048,31 +16048,31 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             }
         } else if operation == "updateDockerfile" ||
                     operation == "updateContainerConfiguration" ||
-                    operation == "rebuildRecipe" ||
+                    operation == "rebuild" ||
                     operation == "changeRuntime" {
             if let error = response.error, !error.isEmpty {
-                if operation == "rebuildRecipe" || operation == "changeRuntime",
+                if operation == "rebuild" || operation == "changeRuntime",
                    isContainerConfigurationEditorVisible {
                     containerConfigurationBuildError = error
                     containerConfigurationBuildErrorScroll = 0
                     containerConfigurationBuildErrorRenderedScroll = 0
                     containerConfigurationBuildErrorCopyConfirmationID = nil
-                    safeSpaceRecipeMessage = ""
+                    safeSpaceDefinitionMessage = ""
                     workspacePanelMessage = ""
                     blurEditorInput()
                 } else {
-                    safeSpaceRecipeMessage = error
+                    safeSpaceDefinitionMessage = error
                 }
             } else if operation == "updateContainerConfiguration" {
-                safeSpaceRecipeMessage = "Container configuration saved. Rebuild to apply it."
+                safeSpaceDefinitionMessage = "Container configuration saved. Rebuild to apply it."
             } else if operation == "updateDockerfile" {
                 if !didBeginRebuildAfterDockerfileSave {
-                    safeSpaceRecipeMessage = "Dockerfile saved. Rebuild when you want to recreate the container."
+                    safeSpaceDefinitionMessage = "Dockerfile saved. Rebuild when you want to recreate the container."
                 }
-            } else if operation != "rebuildRecipe" && operation != "changeRuntime" {
+            } else if operation != "rebuild" && operation != "changeRuntime" {
                 containerConfigurationBuildError = nil
                 containerConfigurationBuildErrorScroll = 0
-                safeSpaceRecipeMessage = "Container operation completed."
+                safeSpaceDefinitionMessage = "Container operation completed."
             }
         } else if let error = response.error, !error.isEmpty {
             if operation == "start",
@@ -16080,7 +16080,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                let workspace = localWorkspaces.first(where: {
                    $0.id == operationWorkspaceID
                }) {
-                navigateToRecipeSafeSpace(workspace.id)
+                navigateToDefinitionSafeSpace(workspace.id)
                 containerConfigurationBuildError = error
                 containerConfigurationBuildErrorScroll = 0
                 containerConfigurationBuildErrorRenderedScroll = 0
@@ -16094,7 +16094,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             workspacePanelMessage = ""
         }
         if shouldDismissContainerConfiguration {
-            returnFromRecipeSafeSpace()
+            returnFromDefinitionSafeSpace()
         }
         if operation != "list" ||
             workspacesChanged ||
@@ -16144,10 +16144,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private func updateContainerBuildMonitoring(operation: String?,
                                                 responseError: String?) {
         guard let workspaceID = containerConfigurationRebuildWorkspaceID else { return }
-        guard operation == "rebuildRecipe" ||
+        guard operation == "rebuild" ||
                 operation == "changeRuntime" ||
                 operation == "list" else { return }
-        if operation == "rebuildRecipe" || operation == "changeRuntime",
+        if operation == "rebuild" || operation == "changeRuntime",
            let responseError,
            !responseError.isEmpty {
             containerConfigurationRebuildWorkspaceID = nil
@@ -16160,10 +16160,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             if workspace.state == "running" {
                 containerConfigurationRebuildWorkspaceID = nil
                 containerConfigurationRequiresRebuild = false
-                safeSpaceRecipeMessage = "Container rebuilt and running."
+                safeSpaceDefinitionMessage = "Container rebuilt and running."
             } else if workspace.state == "stopped" {
                 containerConfigurationRebuildWorkspaceID = nil
-                safeSpaceRecipeMessage = "The container is stopped after the rebuild."
+                safeSpaceDefinitionMessage = "The container is stopped after the rebuild."
             }
             return
         }
@@ -16171,7 +16171,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         case "complete":
             containerConfigurationRebuildWorkspaceID = nil
             containerConfigurationRequiresRebuild = false
-            safeSpaceRecipeMessage = progress.detail
+            safeSpaceDefinitionMessage = progress.detail
             updateLayout()
         case "failed":
             containerConfigurationRebuildWorkspaceID = nil
@@ -16182,7 +16182,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             containerConfigurationBuildErrorScroll = 0
             containerConfigurationBuildErrorRenderedScroll = 0
             containerConfigurationBuildErrorCopyConfirmationID = nil
-            safeSpaceRecipeMessage = ""
+            safeSpaceDefinitionMessage = ""
             workspacePanelMessage = ""
             blurEditorInput()
             updateLayout()
@@ -16921,7 +16921,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private func dismissManagementPanel() {
         if loadingContainerConfigurationID != nil {
             loadingContainerConfigurationID = nil
-            selectedRecipeSafeSpaceID = nil
+            selectedDefinitionSafeSpaceID = nil
         }
         if let panel = managementPanel {
             pendingWorkspaceOverviewMenuActions.removeValue(forKey: panel.id)
@@ -17122,11 +17122,11 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     }
 
     private func showContainerPathMenu(at point: CGPoint) {
-        guard let recipe = pendingDockerfileWorkspace?.recipe else { return }
+        guard let definition = pendingDockerfileWorkspace?.definition else { return }
         let menuID = UUID()
         pendingContainerPathMenuSelections[menuID] = [
-            "server": recipe.dockerfileHostPath,
-            "container": recipe.dockerfileGuestPath
+            "server": definition.dockerfileHostPath,
+            "container": definition.dockerfileGuestPath
         ]
         let items = [
             OuterframeContextMenuItem(id: "server",
@@ -17217,7 +17217,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             message = "Enter memory from \(ContainerResourceText.formatMemory(ContainerResourceText.minimumMemoryInMB)) to \(ContainerResourceText.formatMemory(maximum)), such as 512 MB or 1.5 GB."
         }
         if value == nil && keepsEditingWhenInvalid {
-            if creating { workspacePanelMessage = message } else { safeSpaceRecipeMessage = message }
+            if creating { workspacePanelMessage = message } else { safeSpaceDefinitionMessage = message }
             updateLayout()
             return false
         }
@@ -17235,7 +17235,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             workspaceRenameName = resourceEditStashedText
             focusEditorInput()
         } else {
-            if value == nil { safeSpaceRecipeMessage = message }
+            if value == nil { safeSpaceDefinitionMessage = message }
             workspaceRenameName = ""
             blurEditorInput()
         }
@@ -17297,7 +17297,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 struct ConfigurationResponse: Decodable {
                     struct Configuration: Decodable {
                         let id: UUID
-                        let recipe: LocalWorkspaceRecord.Recipe
+                        let definition: LocalWorkspaceRecord.Definition
                         let mounts: [LocalWorkspaceRecord.Mount]
                         let runtime: LocalWorkspaceRecord.Runtime?
                     }
@@ -17313,11 +17313,11 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                     ])
                 }
                 guard self.loadingContainerConfigurationID == requestID,
-                      self.selectedRecipeSafeSpaceID == workspace.id else { return }
+                      self.selectedDefinitionSafeSpaceID == workspace.id else { return }
                 self.loadingContainerConfigurationID = nil
                 self.managementPanel = nil
                 var updated = self.localWorkspaces.first(where: { $0.id == workspace.id }) ?? workspace
-                updated.recipe = configuration.recipe
+                updated.definition = configuration.definition
                 updated.mounts = configuration.mounts
                 updated.runtime = configuration.runtime
                 if let index = self.localWorkspaces.firstIndex(where: { $0.id == workspace.id }) {
@@ -17328,7 +17328,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             } catch {
                 guard self.loadingContainerConfigurationID == requestID else { return }
                 self.loadingContainerConfigurationID = nil
-                self.selectedRecipeSafeSpaceID = nil
+                self.selectedDefinitionSafeSpaceID = nil
                 self.showManagementPanel(id: requestID, title: "Container: \(workspace.name)",
                                          detail: error.localizedDescription, items: [])
             }
@@ -17338,8 +17338,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private func beginContainerConfigurationEditor(
         for workspace: LocalWorkspaceRecord
     ) {
-        guard let recipe = workspace.recipe else {
-            selectedRecipeSafeSpaceID = workspace.id
+        guard let definition = workspace.definition else {
+            selectedDefinitionSafeSpaceID = workspace.id
             loadContainerConfiguration(for: workspace)
             return
         }
@@ -17358,13 +17358,13 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         codingAgentScope = nil
         codingAgentScroll = 0
         codingAgentMessage = ""
-        containerConfigurationDockerfile = recipe.containerfile
-        containerConfigurationSavedDockerfile = recipe.containerfile
-        containerConfigurationEnvironment = recipe.environment.map {
+        containerConfigurationDockerfile = definition.containerfile
+        containerConfigurationSavedDockerfile = definition.containerfile
+        containerConfigurationEnvironment = definition.environment.map {
             "\($0.name)=\($0.value)"
         }.joined(separator: "\n")
         containerConfigurationSavedEnvironment = containerConfigurationEnvironment
-        containerConfigurationPorts = recipe.publishedPorts.map {
+        containerConfigurationPorts = definition.publishedPorts.map {
             "\($0.hostPort):\($0.containerPort)"
         }.joined(separator: "\n")
         containerConfigurationSavedPorts = containerConfigurationPorts
@@ -17379,7 +17379,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             )
         }
         containerConfigurationSavedMounts = containerConfigurationMounts
-        containerConfigurationRequiresRebuild = recipe.needsRebuild
+        containerConfigurationRequiresRebuild = definition.needsRebuild
         containerConfigurationCPUs = workspace.cpus
         containerConfigurationMemoryInMB = workspace.memoryInMB
         editingResource = nil
@@ -17681,11 +17681,11 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         containerConfigurationBuildErrorRenderedScroll = 0
         containerConfigurationBuildErrorViewportLayer = nil
         containerConfigurationBuildErrorCopyConfirmationID = nil
-        safeSpaceRecipeMessage = ""
+        safeSpaceDefinitionMessage = ""
         workspacePanelMessage = ""
         setDockerfileSelection(fragmentID: nil, range: nil)
         containerConfigurationRebuildWorkspaceID = workspace.id
-        sendWorkspaceRequest(operation: "rebuildRecipe",
+        sendWorkspaceRequest(operation: "rebuild",
                              workspaceID: workspace.id)
     }
 
@@ -17763,7 +17763,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             return
         }
         guard hasUnsavedContainerConfigurationDockerfile else {
-            returnFromRecipeSafeSpace()
+            returnFromDefinitionSafeSpace()
             return
         }
         isConfirmingContainerConfigurationDismissal = true
@@ -17788,7 +17788,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         if !saveContainerConfigurationDockerfile() {
             containerConfigurationDismissAfterDockerfileSave = false
             if !hasUnsavedContainerConfigurationDockerfile {
-                returnFromRecipeSafeSpace()
+                returnFromDefinitionSafeSpace()
             }
         }
     }
@@ -17798,7 +17798,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         isConfirmingContainerConfigurationDismissal = false
         containerConfigurationDismissAfterDockerfileSave = false
         containerConfigurationDockerfile = containerConfigurationSavedDockerfile
-        returnFromRecipeSafeSpace()
+        returnFromDefinitionSafeSpace()
     }
 
     private func parsedContainerConfigurationEnvironment() throws
@@ -18676,10 +18676,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         }
 
         if isActiveContainerBuildProgress(workspace.buildProgress) ||
-            !workspacePanelMessage.isEmpty || !safeSpaceRecipeMessage.isEmpty {
+            !workspacePanelMessage.isEmpty || !safeSpaceDefinitionMessage.isEmpty {
             let value = workspace.buildProgress?.detail ?? (
                 workspacePanelMessage.isEmpty
-                    ? safeSpaceRecipeMessage
+                    ? safeSpaceDefinitionMessage
                     : workspacePanelMessage
             )
             let message = makeTextLayer(
@@ -20616,7 +20616,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             "delete": "delete"
         ]
         var items: [OuterframeContextMenuItem] = []
-        if let image = workspace.recipe?.baseImage ?? workspace.runtime?.operatingSystemName, !image.isEmpty {
+        if let image = workspace.definition?.baseImage ?? workspace.runtime?.operatingSystemName, !image.isEmpty {
             items.append(OuterframeContextMenuItem(id: "image", title: image, kind: .label, isEnabled: false))
         }
         items.append(
@@ -20962,7 +20962,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             case "delete":
                 showWorkspaceDeletionConfirmation(action.workspace)
             case "editContainer":
-                navigateToRecipeSafeSpace(action.workspace.id)
+                navigateToDefinitionSafeSpace(action.workspace.id)
             case "share":
                 showShareContainerOptions(for: action.workspace, at: action.anchor)
             case let value where value.hasPrefix("unmountFolder:"):

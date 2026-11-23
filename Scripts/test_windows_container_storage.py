@@ -15,9 +15,9 @@ wsl = (root/'Windows/Wsl.c').read_text()
 request = wsl[wsl.index('static char *request_string(const HttpRequest *request, const char *name) {'):wsl.index('static void send_snapshot(')]
 containers = (root/'Windows/WslContainers.inc').read_text()
 container_string = containers[:containers.index('static const char *container_provider_id(')]
-recipes = (root/'Windows/ContainerRecipes.inc').read_text()
-uuid = recipes[:recipes.index('static char *container_directory(')]
-arguments = recipes[recipes.index('static char *container_json_field('):recipes.index('static bool container_configuration_array(')]
+definitions = (root/'Windows/ContainerDefinitions.inc').read_text()
+uuid = definitions[:definitions.index('static char *container_directory(')]
+arguments = definitions[definitions.index('static char *container_json_field('):definitions.index('static bool container_configuration_array(')]
 preamble = r'''
 #include <assert.h>
 #include <stdio.h>
@@ -106,7 +106,7 @@ int main(void) {
     assert(storage_request(&w,&r,"cleanContainerStorage",&extra));assert(removed==2);free(extra.data);
     assert(storage_owned_reference("outershell/container-base:18"));assert(storage_owned_reference("outershell/container-base:20"));assert(storage_owned_reference("outershell/container-base:21"));assert(storage_owned_reference("outershell/container-base:24"));assert(!storage_owned_reference("outershell/container-base:custom"));assert(!storage_owned_reference("outershell/support:latest"));
     assert(storage_owned_reference("outershell/container-base:17"));assert(!storage_owned_reference("outershell/managed-invalid:latest"));
-    Distribution d={&w,RUNTIME_DOCKER,ID};removal_ok=false;assert(!storage_remove_recipe(&d));
+    Distribution d={&w,RUNTIME_DOCKER,ID};removal_ok=false;assert(!storage_remove_container_image(&d));
     puts("PASS: Windows Docker/WSLC inventories, namespaces, saved references, aliases, malformed inventories, revalidation, failure reporting, non-forced deletion, and bounded Docker cache cleanup");
 }
 '''

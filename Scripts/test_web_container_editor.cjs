@@ -33,7 +33,7 @@ function setup() {
   return {context, dialogs, requests, resolve, reject};
 }
 (async () => {
-  const result = {workspaces: [{id: 'selected', name: 'Fresh name', ownsContainer: true, recipe: {containerfile: 'FROM fresh'}, mounts: []}]};
+  const result = {workspaces: [{id: 'selected', name: 'Fresh name', ownsContainer: true, definition: {containerfile: 'FROM fresh'}, mounts: []}]};
   const ready = setup();
   const pending = ready.context.openContainerConfiguration('selected');
   assert.equal(ready.dialogs.length, 1);

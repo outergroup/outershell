@@ -524,12 +524,12 @@ writable folder mounts, environment variables, and localhost port mappings.
 Rebuilds prepare the image and replacement container before stopping the old
 container; failed builds retain the existing container. The editor reports build
 failures and logs. Folder/port changes take effect after rebuilding. Definitions
-live in `containers/<id>/Recipe`; runtime configuration is stored in ORWV binary
+live in `containers/<id>/BuildContext`; runtime configuration is stored in ORWV binary
 archives outside the build context. Deletion removes the runtime container and
 registration and named persistent volumes, but retains saved definitions and legacy host-directory data on disk.
 
-Sharing uses version 2 of the gzip tar `.outershell-container` format and ORWV
-manifest/recipe records. It supports optional mounted-folder and persistent-data
+Sharing uses version 3 of the gzip tar `.outershell-container` format and ORWV
+manifest/configuration records. It supports optional mounted-folder and persistent-data
 contents, import destination selection, and the existing chunked binary transfer
 protocol, plus resumable HTTP uploads with 64 MiB segments for the native Mac
 client. Persistent data travels as opaque `Volume Archives/<id>.tar` files and is

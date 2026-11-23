@@ -1,7 +1,7 @@
 # Outer Shell Registry Binary Format
 
 `registry.orwa` is the source of truth for Outer Shell's service registry and
-private durable resources. Catalogs and container recipes are stored here
+private durable resources. Catalogs and container configurations are stored here
 rather than in parallel JSON files.
 
 The backend `unit_path` field can contain either a launchd plist path or a
@@ -156,7 +156,7 @@ bytes 16..31:  DataRef64 opaque payload
 
 Resources let subsystems keep typed private state in the same atomic registry
 without coupling every field to the daemon's core schema. Container provider
-caches and recipes use keys under `containers/` and encode their payloads as
+caches and configurations use keys under `containers/` and encode their payloads as
 typed offset archives.
 
 ### `containers`

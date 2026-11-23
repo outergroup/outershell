@@ -43,23 +43,23 @@ import copy
 import json
 from types import SimpleNamespace
 reconcile = provider['reconcile_image_volumes']
-recipe = {'mounts': [], 'persistentData': []}
+configuration = {'mounts': [], 'persistentData': []}
 volumes = {'/work': {}, '/var/lib/codex': {}}
-def save_recipe(_, value):
-    recipe.clear()
-    recipe.update(copy.deepcopy(value))
+def save_configuration(_, value):
+    configuration.clear()
+    configuration.update(copy.deepcopy(value))
 with patch.dict(reconcile.__globals__,
                 docker=lambda *args, **kwargs: SimpleNamespace(stdout=json.dumps([{'Config': {'Volumes': volumes}}])),
-                load_recipe=lambda _: copy.deepcopy(recipe), save_recipe=save_recipe):
+                load_configuration=lambda _: copy.deepcopy(configuration), save_configuration=save_configuration):
     reconcile('test')
-    identities = {item['guestPath']: item['id'] for item in recipe['persistentData']}
+    identities = {item['guestPath']: item['id'] for item in configuration['persistentData']}
     assert set(identities) == {'/work', '/var/lib/codex'}
     reconcile('test')
-    assert {item['guestPath']: item['id'] for item in recipe['persistentData']} == identities
+    assert {item['guestPath']: item['id'] for item in configuration['persistentData']} == identities
     del volumes['/work']
     reconcile('test')
-    assert next(item for item in recipe['persistentData'] if item['guestPath'] == '/work')['isDeclared'] is False
+    assert next(item for item in configuration['persistentData'] if item['guestPath'] == '/work')['isDeclared'] is False
     volumes['/work'] = {}
     reconcile('test')
-    assert {item['guestPath']: item['id'] for item in recipe['persistentData']} == identities
-print('PASS: declared image volumes retain their storage identities across rebuilds and recipe changes')
+    assert {item['guestPath']: item['id'] for item in configuration['persistentData']} == identities
+print('PASS: declared image volumes retain their storage identities across rebuilds and configuration changes')

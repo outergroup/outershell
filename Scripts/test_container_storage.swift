@@ -5,13 +5,13 @@ struct StorageTests {
     static func main() throws {
         typealias Image = ContainerImageStorage.Image
         let id = "11111111-1111-1111-1111-111111111111"
-        let recipe = "outershell/container-\(id):recipe"
+        let containerImage = "outershell/container-\(id):latest"
         func image(_ name: String, _ digest: String? = nil) -> Image {
             Image(reference: name, digests: [digest ?? name], snapshotDigests: [])
         }
         let images = [image("outershell/container-base:1"), image("outershell/container-base:12"), image("outershell/container-base:18"),
                       image("outerloop/workspace-501:2"), image("outerloop/workspace-501:9"),
-                      image(recipe), image("ubuntu:24.04"), image("outershell/container-not-a-uuid:recipe"),
+                      image(containerImage), image("ubuntu:24.04"), image("outershell/container-not-a-uuid:latest"),
                       image("outerloop/workspace-502:1"), image("outershell/container-base:custom")]
         func candidates(_ protected: Set<String> = [], _ files: [String] = [], _ input: [Image]? = nil) -> [String] {
             ContainerImageStorage.candidates(images: input ?? images, protected: protected,
@@ -19,16 +19,16 @@ struct StorageTests {
         }
         precondition(Set(candidates()) == ["outershell/container-base:1", "outershell/container-base:12",
                                            "outershell/container-base:18", "outerloop/workspace-501:2",
-                                           "outerloop/workspace-501:9", recipe])
+                                           "outerloop/workspace-501:9", containerImage])
         precondition(!candidates(["outershell/support:latest"], [], [image("outershell/support:latest")])
             .contains("outershell/support:latest"))
-        precondition(!candidates([recipe]).contains(recipe))
+        precondition(!candidates([containerImage]).contains(containerImage))
         precondition(!candidates([], ["FROM outershell/container-base:1\nRUN echo $HOME"]).contains("outershell/container-base:1"))
         precondition(candidates([], ["ARG BASE\nFROM ${BASE}"]).isEmpty)
         precondition(candidates([], ["ARG BASE\nFROM\t${BASE}"]).isEmpty)
         precondition(candidates([], ["FROM \\\n ${BASE}"]).isEmpty)
         precondition(candidates([], ["COPY --chown=root --from=${SOURCE} /bin /bin"]).isEmpty)
-        let shared = [image(recipe, "sha256:shared"), image("another:tag", "sha256:shared")]
+        let shared = [image(containerImage, "sha256:shared"), image("another:tag", "sha256:shared")]
         precondition(candidates(["another:tag"], [], shared).isEmpty)
         precondition(candidates(["sha256:shared"], [], shared).isEmpty)
         precondition(candidates([], ["FROM example@sha256:shared"], shared).isEmpty)
@@ -43,20 +43,20 @@ struct StorageTests {
         }
         var deleted: [String] = []
         do {
-            _ = try ContainerImageStorage.deleteSelected(["ubuntu:24.04"], candidates: { images.filter { $0.reference == recipe } }, delete: { deleted.append($0) })
+            _ = try ContainerImageStorage.deleteSelected(["ubuntu:24.04"], candidates: { images.filter { $0.reference == containerImage } }, delete: { deleted.append($0) })
             preconditionFailure("Accepted an unreviewed image")
         } catch {}
         precondition(deleted.isEmpty)
         var reads = 0
-        let changed = try ContainerImageStorage.deleteSelected([recipe], candidates: {
+        let changed = try ContainerImageStorage.deleteSelected([containerImage], candidates: {
             reads += 1
-            return reads == 1 ? [image(recipe)] : []
+            return reads == 1 ? [image(containerImage)] : []
         }, delete: { deleted.append($0) })
         precondition(deleted.isEmpty && changed.failures.count == 1)
-        let failed = try ContainerImageStorage.deleteSelected([recipe], candidates: { [image(recipe)] }, delete: { _ in throw CocoaError(.fileWriteNoPermission) })
+        let failed = try ContainerImageStorage.deleteSelected([containerImage], candidates: { [image(containerImage)] }, delete: { _ in throw CocoaError(.fileWriteNoPermission) })
         precondition(failed.deleted.isEmpty && failed.failures.count == 1)
-        let success = try ContainerImageStorage.deleteSelected([recipe, recipe], candidates: { [image(recipe)] }, delete: { deleted.append($0) })
-        precondition(deleted == [recipe] && success.deleted == [recipe])
+        let success = try ContainerImageStorage.deleteSelected([containerImage, containerImage], candidates: { [image(containerImage)] }, delete: { deleted.append($0) })
+        precondition(deleted == [containerImage] && success.deleted == [containerImage])
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("storage-test-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: root) }
         let indexDigest = String(repeating: "a", count: 64)
@@ -91,6 +91,6 @@ struct StorageTests {
         precondition(candidates([], ["FROM alias@sha256:manifest"], dockerImages).isEmpty)
         let unlabelled = try ContainerImageStorage.dockerImages(from: Data("[{\"Id\":\"sha256:other\",\"Config\":{}}]".utf8))
         precondition(candidates([], [], unlabelled).isEmpty)
-        print("PASS: legacy bases, workspace images, support image protection, owned namespaces, recipes, variable references, digest aliases, malformed inventories, stale selections, deletion failures, and deduplication")
+        print("PASS: legacy bases, workspace images, support image protection, owned namespaces, container images, variable references, digest aliases, malformed inventories, stale selections, deletion failures, and deduplication")
     }
 }

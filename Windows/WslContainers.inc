@@ -95,7 +95,7 @@ static unsigned container_number(const HttpRequest *request, const char *key, un
 }
 
 #include "ContainerValue.inc"
-#include "ContainerRecipes.inc"
+#include "ContainerDefinitions.inc"
 
 static bool create_container(Wsl *w, HttpRequest *request, const char **error) {
     char *name = request_string(request, "name");
@@ -128,7 +128,7 @@ static bool create_container(Wsl *w, HttpRequest *request, const char **error) {
     free(uuid);
     *error = "Could not save the container definition.";
     if (!save_container_metadata(id, name, cpus, memory) || !container_definition_create(id, image)) goto done;
-    char *context = container_recipe_directory(id);
+    char *context = container_build_context_directory(id);
     char run_image[100];
     if (!context || !container_write(id, "Dockerfile", dockerfile, strlen(dockerfile))) { free(context); goto done; }
     snprintf(run_image, sizeof(run_image), "outershell/managed-%s:latest", id);
@@ -287,7 +287,7 @@ static void container_provider(Wsl *w, StringBuilder *json, ContainerRuntime run
     append(json, ",\"isAvailable\":");
     append(json, w->containers_available[runtime] ? "true" : "false");
     append(json, ",\"isolationName\":\"Linux containers\",\"capabilities\":{"
-                 "\"supportsApps\":true,\"supportsShell\":true,\"supportsRecipes\":true,"
+                 "\"supportsApps\":true,\"supportsShell\":true,\"supportsDefinitions\":true,"
                  "\"supportsMounts\":true,\"supportsLiveMounts\":false,\"supportsStorageCleanup\":true},\"status\":");
     json_string(json, w->containers_available[runtime] ? "ready" : "unavailable");
     append(json, ",\"detail\":");
@@ -331,7 +331,7 @@ static void container_snapshot(Distribution *d, StringBuilder *json) {
                  "\"operatingSystemName\":\"Linux\",\"operatingSystemVersion\":\"\","
                  "\"architecture\":\"\",\"isolationKind\":");
     json_string(json, d->container == RUNTIME_DOCKER ? "container" : "wslContainer");
-    append(json, ",\"isolationName\":\"\"},\"capabilities\":{\"supportsApps\":true,\"supportsShell\":true,\"supportsRecipes\":");
+    append(json, ",\"isolationName\":\"\"},\"capabilities\":{\"supportsApps\":true,\"supportsShell\":true,\"supportsDefinitions\":");
     append(json, d->managed ? "true" : "false");
     append(json, ",\"supportsMounts\":"); append(json, d->managed ? "true" : "false");
     append(json, ",\"supportsLiveMounts\":false},\"shellCommand\":");
@@ -358,7 +358,7 @@ static void container_snapshot(Distribution *d, StringBuilder *json) {
     }
     append(json, apps);
     append(json, ",\"commands\":[]");
-    if (d->managed) container_recipe_snapshot(d, json);
+    if (d->managed) container_definition_snapshot(d, json);
     else append(json, ",\"mounts\":[],\"persistentData\":[]");
     append(json, "}");
 }

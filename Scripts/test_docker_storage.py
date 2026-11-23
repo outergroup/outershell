@@ -10,7 +10,7 @@ from unittest.mock import patch
 provider = runpy.run_path(str(Path(__file__).resolve().parents[1] / 'Resources/outershell-container-provider'))
 g = provider['storage_inventory'].__globals__
 ID = '11111111-1111-1111-1111-111111111111'
-REFERENCE = 'outershell/container-' + ID + ':recipe'
+REFERENCE = 'outershell/container-' + ID + ':latest'
 
 class Records:
     values = []
@@ -29,7 +29,7 @@ class StorageTests(unittest.TestCase):
         self.fail_remove = False
         Records.values = []
         self.patch = patch.dict(g, docker=self.docker, Records=Records, provider_root=lambda:self.root,
-                               dockerfile_path=lambda _: self.root/'Dockerfile', load_recipe=lambda _: {'baseImage':'debian:bookworm'})
+                               dockerfile_path=lambda _: self.root/'Dockerfile', load_configuration=lambda _: {'baseImage':'debian:bookworm'})
         self.patch.start(); self.addCleanup(self.patch.stop)
         (self.root/'Dockerfile').write_text('FROM debian:bookworm\nRUN echo $HOME\n')
     def docker(self, args, **kwargs):
@@ -52,7 +52,7 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(self.candidates(), [REFERENCE])
         self.containers=[{'Image':'sha256:one'}]
         self.assertEqual(self.candidates(), [])
-    def test_saved_recipe_and_alias(self):
+    def test_saved_configuration_and_alias(self):
         Records.values=[{'id':ID,'ownsContainer':True}]
         self.assertEqual(self.candidates(), [])
         Records.values=[{'id':'22222222-2222-2222-2222-222222222222','ownsContainer':True}]

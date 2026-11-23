@@ -108,16 +108,16 @@ try {
     New-Item -ItemType Directory -Force $folder | Out-Null
     Set-Content "$folder\probe.txt" 'mount works'
     Operation 'updateContainerConfiguration' @{workspaceID=$id; mounts=@(@{id=[guid]::NewGuid().ToString();name='Test folder';hostPath=$folder;guestPath='/test-mount';isReadOnly=$true});environment=@(@{name='OUTER_TEST';value='configured'});publishedPorts=@(@{hostPort=47621;containerPort=8888})} | Out-Null
-    Operation 'rebuildRecipe' @{workspaceID=$id} | Out-Null
+    Operation 'rebuild' @{workspaceID=$id} | Out-Null
     Start-Sleep -Seconds 3
     for($i=0;$i -lt 120;$i++) {
         $snapshot=Request '/api/container-snapshot' | ConvertFrom-Json
         $container=$snapshot.workspaces | Where-Object id -eq $id | Select-Object -First 1
         if($container.buildProgress.phase -eq 'failed'){throw $container.buildProgress.detail}
-        if($container.state -eq 'running' -and !$container.recipe.needsRebuild){break}
+        if($container.state -eq 'running' -and !$container.definition.needsRebuild){break}
         Start-Sleep -Seconds 1
     }
-    if($container.recipe.needsRebuild){throw 'Rebuild did not complete'}
+    if($container.definition.needsRebuild){throw 'Rebuild did not complete'}
     $runtime = if($Provider -eq 'docker'){"$env:LOCALAPPDATA\Programs\DockerDesktop\resources\bin\docker.exe"}else{'C:\Program Files\WSL\wslc.exe'}
     $list = if($Provider -eq 'docker'){'ps'}else{'list'}
     $format = if($Provider -eq 'docker'){'{{json .}}'}else{'json'}
@@ -133,7 +133,7 @@ try {
     if(!$writeExit){throw 'Read-only mount allowed a write'}
     Write-Output 'PASS Dockerfile/configuration update, rebuild, read-only mount, environment, port mapping, and stable identity'
     Operation 'updateDockerfile' @{workspaceID=$id;dockerfile="FROM $Image`n$support`nRUN exit 37`n"} | Out-Null
-    Operation 'rebuildRecipe' @{workspaceID=$id} | Out-Null
+    Operation 'rebuild' @{workspaceID=$id} | Out-Null
     for($i=0;$i -lt 60;$i++) {
         $snapshot=Request '/api/container-snapshot' | ConvertFrom-Json
         $container=$snapshot.workspaces | Where-Object id -eq $id | Select-Object -First 1

@@ -75,7 +75,7 @@ ref(container, 'b1d7e6a4-0c55-4a51-9d0c-2f6f1f0e6a31', 64)
 ref(container + 16, 'Legacy container', 64)
 ref(container + 32, 'docker', 64)
 ref(container + 48, 'legacy-runtime', 64)
-ref(container + 64, 'containers/legacy/recipe', 64)
+ref(container + 64, 'containers/legacy/configuration', 64)
 struct.pack_into('<QIII', data, container + 80, 1787616000000, 2, 3, 1)
 ref(layout, 'legacy.app', 64)
 ref(layout + 16, 'Retired user group', 64)
@@ -345,7 +345,7 @@ outerctl container upsert \
     --name Science \
     --provider docker \
     --runtime-name science-runtime \
-    --project-key containers/science/recipe \
+    --project-key containers/science/configuration \
     --created-at-milliseconds 1787616000000 \
     --cpus 6 \
     --memory-mb 1536 \
@@ -353,7 +353,7 @@ outerctl container upsert \
 outerctl container list >"$build_dir/container.tsv"
 awk -F '\t' -v id="$container_id" '
     NR == 2 && $1 == id && $2 == "Science" && $3 == "docker" &&
-        $4 == "science-runtime" && $5 == "containers/science/recipe" &&
+        $4 == "science-runtime" && $5 == "containers/science/configuration" &&
         $7 == "6" && $8 == "1536" && $9 == "0" { found = 1 }
     END { exit !found }
 ' "$build_dir/container.tsv"

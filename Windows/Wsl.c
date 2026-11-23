@@ -1101,7 +1101,7 @@ static void publish_snapshot(Wsl *w) {
                           "\"operatingSystemName\":\"Linux\",\"operatingSystemVersion\":\"\","
                           "\"architecture\":\"\",\"isolationKind\":\"wsl\",\"isolationName\":\"\"},"
                           "\"capabilities\":{\"supportsApps\":true,\"supportsShell\":false,"
-                          "\"supportsRecipes\":false,\"supportsMounts\":false,\"supportsLiveMounts\":false},"
+                          "\"supportsDefinitions\":false,\"supportsMounts\":false,\"supportsLiveMounts\":false},"
                           "\"outerShellSupport\":{");
         field(&snapshot, "status", d->apps.data ? "available" : "unknown");
         append(&snapshot, ",");
@@ -1476,7 +1476,7 @@ void wsl_serve(Wsl *w, Connection *c, HttpRequest *r) {
         ok = container_definition_update(d, r, !strcmp(operation, "updateContainerConfiguration"));
         error = "Could not save the definition. Check the Dockerfile, folder paths, environment, and ports.";
         if (ok) publish_snapshot(w);
-    } else if (d->container && !strcmp(operation, "rebuildRecipe")) {
+    } else if (d->container && !strcmp(operation, "rebuild")) {
         ok = container_rebuild(d);
         error = "A rebuild is already running or this container is not managed by Outer Shell.";
     } else if (d->container && !strcmp(operation, "rename")) {
@@ -1500,7 +1500,7 @@ void wsl_serve(Wsl *w, Connection *c, HttpRequest *r) {
             char *config = container_read(d->id, "configuration", container_empty_configuration);
             if (ok) ok = container_volumes_remove(w, d->container, d->id, config);
             free(config);
-            if (ok) ok = storage_remove_recipe(d);
+            if (ok) ok = storage_remove_container_image(d);
             if (ok) {
                 EnterCriticalSection(&w->gate);
                 for (Endpoint *endpoint = w->endpoints; endpoint; endpoint = endpoint->next) {
@@ -1518,7 +1518,7 @@ void wsl_serve(Wsl *w, Connection *c, HttpRequest *r) {
                 d->present = false;
             }
         }
-        error = d->managed ? "Container deletion or recipe image cleanup failed. The registration was retained; check the runtime log and retry." : "Only containers created by Outer Shell can be deleted here.";
+        error = d->managed ? "Container deletion or image cleanup failed. The registration was retained; check the runtime log and retry." : "Only containers created by Outer Shell can be deleted here.";
     } else if (d->container && (!strcmp(operation, "start") || !strcmp(operation, "stop") ||
                          !strcmp(operation, "restart"))) {
         StringBuilder output = {0};

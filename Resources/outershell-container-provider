@@ -296,20 +296,56 @@ def registry_container_remove(container_id):
         raise RuntimeError(result.stderr.strip())
 
 
-def recipe_resource_key(container_id):
-    return "containers/" + canonical_container_id(container_id) + "/recipe"
+def configuration_resource_key(container_id):
+    return "containers/" + canonical_container_id(container_id) + "/configuration"
 
 
 def container_directory(container_id):
     return provider_root() / container_id
 
 
-def recipe_directory(container_id):
+def build_context_directory(container_id):
+    return container_directory(container_id) / "BuildContext"
+
+
+def legacy_build_context_directory(container_id):
     return container_directory(container_id) / "Recipe"
 
 
+def migrate_legacy_definition(record):
+    container_id = record["id"]
+    migrated = False
+    legacy_directory = legacy_build_context_directory(container_id)
+    directory = build_context_directory(container_id)
+    if legacy_directory.is_dir() and not legacy_directory.is_symlink() and not directory.exists():
+        legacy_directory.rename(directory)
+        legacy_directory.symlink_to(directory.name)
+        migrated = True
+    legacy_key = "containers/" + canonical_container_id(container_id) + "/recipe"
+    key = configuration_resource_key(container_id)
+    encoded = registry_resource_get(legacy_key)
+    if encoded:
+        if not registry_resource_get(key):
+            registry_resource_set(key, offset_archive_decode(encoded))
+        registry_resource_remove(legacy_key)
+        migrated = True
+    if record.get("projectResourceKey") == legacy_key:
+        record["projectResourceKey"] = key
+        migrated = True
+    legacy_image = "outershell/container-" + container_id.lower() + ":recipe"
+    if migrated and record_owns_container(record):
+        try:
+            if docker(["image", "inspect", legacy_image]).returncode == 0:
+                if docker(["image", "inspect", image_name(container_id)]).returncode != 0:
+                    docker(["image", "tag", legacy_image, image_name(container_id)], check=True)
+                docker(["image", "rm", legacy_image])
+        except (RuntimeError, subprocess.SubprocessError) as error:
+            print(f"Could not rename the image of container {container_id}: {error}", file=sys.stderr)
+    return migrated
+
+
 def dockerfile_path(container_id):
-    return recipe_directory(container_id) / "Dockerfile"
+    return build_context_directory(container_id) / "Dockerfile"
 
 
 def read_regular_text(path):
@@ -345,14 +381,14 @@ def write_dockerfile(container_id, contents):
     write_regular_text(dockerfile_path(container_id), contents)
 
 
-def copy_recipe_file(source, destination):
+def copy_build_context_file(source, destination):
     if not stat.S_ISREG(os.lstat(source).st_mode):
         raise RuntimeError("The container definition contains a special file: " + os.path.basename(source))
     shutil.copy2(source, destination, follow_symlinks=False)
 
 
-def copy_recipe_tree(source, destination):
-    shutil.copytree(source, destination, symlinks=True, copy_function=copy_recipe_file)
+def copy_build_context_tree(source, destination):
+    shutil.copytree(source, destination, symlinks=True, copy_function=copy_build_context_file)
 
 
 def require_unlinked_tree(directory):
@@ -549,7 +585,7 @@ def capabilities():
         "supportsShell": True,
         "supportsLiveMounts": True,
         "supportsMounts": True,
-        "supportsRecipes": True,
+        "supportsDefinitions": True,
         "supportsStorageCleanup": True,
         "supportsResourceUpdates": True,
     }
@@ -572,7 +608,7 @@ class Records:
                 value["id"] = identifier
                 value["runtimeProviderID"] = PROVIDER_ID
                 value["runtimeName"] = "outershell-container-" + identifier.lower()
-                value["projectResourceKey"] = recipe_resource_key(identifier)
+                value["projectResourceKey"] = configuration_resource_key(identifier)
                 value["ownsContainer"] = True
                 registry_container_upsert(value)
             if legacy:
@@ -593,6 +629,12 @@ class Records:
                     value for value in registry_container_list()
                     if value.get("runtimeProviderID") == PROVIDER_ID
                 ]
+        for value in self.values:
+            try:
+                if migrate_legacy_definition(value):
+                    registry_container_upsert(value)
+            except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+                print(f"Could not migrate container {value.get('id')}: {error}", file=sys.stderr)
         encoded = registry_resource_get(OFFSET_ARCHIVE_RESOURCE_PROVIDER_STATE)
         provider_state = offset_archive_decode(encoded) if encoded else {}
         if not isinstance(provider_state, dict):
@@ -682,7 +724,7 @@ def container_name(container_id):
 
 
 def image_name(container_id):
-    return "outershell/container-" + container_id.lower() + ":recipe"
+    return "outershell/container-" + container_id.lower() + ":latest"
 
 
 def run(arguments, *, input_text=None, check=False, timeout=None, environment=None):
@@ -729,7 +771,7 @@ def default_dockerfile(base_image=DEFAULT_BASE_IMAGE):
     return f"FROM {base_image}\n{SUPPORT_LINE}\n"
 
 
-def default_recipe():
+def default_configuration():
     return {
         "baseImage": DEFAULT_BASE_IMAGE,
         "mounts": [],
@@ -747,34 +789,34 @@ def default_recipe():
     }
 
 
-def load_recipe(container_id):
-    encoded = registry_resource_get(recipe_resource_key(container_id))
-    value = offset_archive_decode(encoded) if encoded else default_recipe()
-    for key, default in default_recipe().items():
+def load_configuration(container_id):
+    encoded = registry_resource_get(configuration_resource_key(container_id))
+    value = offset_archive_decode(encoded) if encoded else default_configuration()
+    for key, default in default_configuration().items():
         value.setdefault(key, default)
     return value
 
 
-def runtime_settings(recipe):
-    mode = recipe.get("networkMode", "bridge")
-    use_init = recipe.get("useInit", True)
-    restart = recipe.get("restartPolicy", "no")
+def runtime_settings(configuration):
+    mode = configuration.get("networkMode", "bridge")
+    use_init = configuration.get("useInit", True)
+    restart = configuration.get("restartPolicy", "no")
     if mode not in ("bridge", "host"):
         raise ValueError("Network mode must be bridge or host.")
     if not isinstance(use_init, bool):
         raise ValueError("Use init must be a boolean.")
     if restart not in ("no", "unless-stopped"):
         raise ValueError("Restart policy must be no or unless-stopped.")
-    if mode == "host" and recipe.get("publishedPorts"):
+    if mode == "host" and configuration.get("publishedPorts"):
         raise ValueError("Host networking uses server ports directly; remove published port mappings.")
     return {"networkMode": mode, "useInit": use_init, "restartPolicy": restart}
 
 
-def save_recipe(container_id, value):
+def save_configuration(container_id, value):
     runtime_settings(value)
-    directory = recipe_directory(container_id)
+    directory = build_context_directory(container_id)
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-    registry_resource_set(recipe_resource_key(container_id), value)
+    registry_resource_set(configuration_resource_key(container_id), value)
 
 
 def upgraded_dockerfile(contents):
@@ -800,22 +842,22 @@ def upgraded_dockerfile(contents):
     return "".join(lines)
 
 
-def upgrade_definition(container_id, recipe):
+def upgrade_definition(container_id, configuration):
     contents = read_dockerfile(container_id)
     upgraded = upgraded_dockerfile(contents)
     if upgraded != contents:
         write_dockerfile(container_id, upgraded)
-    if recipe.get("baseImage", "").startswith(LEGACY_BASE_IMAGE_PREFIX):
-        recipe["baseImage"] = DEFAULT_BASE_IMAGE
-        save_recipe(container_id, recipe)
-    return recipe
+    if configuration.get("baseImage", "").startswith(LEGACY_BASE_IMAGE_PREFIX):
+        configuration["baseImage"] = DEFAULT_BASE_IMAGE
+        save_configuration(container_id, configuration)
+    return configuration
 
 
 def write_initial_definition(container_id, base_image=None):
-    directory = recipe_directory(container_id)
+    directory = build_context_directory(container_id)
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
     write_dockerfile(container_id, default_dockerfile(base_image or DEFAULT_BASE_IMAGE))
-    save_recipe(container_id, default_recipe() | {"baseImage": base_image or DEFAULT_BASE_IMAGE})
+    save_configuration(container_id, default_configuration() | {"baseImage": base_image or DEFAULT_BASE_IMAGE})
 
 
 def update_record(container_id, **changes):
@@ -967,12 +1009,12 @@ def build_image(context, tag, log_path, *, container_id=None, helpers=None):
         raise RuntimeError(pathlib.Path(log_path).read_text()[-1024 * 1024:])
 
 
-def build_context(container_id):
-    source = recipe_directory(container_id)
-    context = runtime_directory(container_id) / "BuildContext"
+def stage_build_context(container_id):
+    source = build_context_directory(container_id)
+    context = runtime_directory(container_id) / "StagedBuildContext"
     if context.exists():
         shutil.rmtree(context)
-    copy_recipe_tree(source, context)
+    copy_build_context_tree(source, context)
     return context
 
 
@@ -984,8 +1026,8 @@ def remove_runtime_container(container_id):
 def reconcile_image_volumes(container_id):
     metadata = json.loads(docker(["image", "inspect", image_name(container_id)], check=True).stdout)
     volumes = (metadata[0].get("Config") or {}).get("Volumes") or {}
-    recipe = load_recipe(container_id)
-    items = recipe.setdefault("persistentData", [])
+    configuration = load_configuration(container_id)
+    items = configuration.setdefault("persistentData", [])
     for path in sorted(volumes):
         if not path.startswith("/") or path == "/" or any(c in path for c in ",\r\n"):
             raise RuntimeError("Unsupported image volume path: " + path)
@@ -993,7 +1035,7 @@ def reconcile_image_volumes(container_id):
             items.append({"id": str(uuid.uuid4()), "guestPath": path})
     for item in items:
         item["isDeclared"] = item["guestPath"] in volumes
-    save_recipe(container_id, recipe)
+    save_configuration(container_id, configuration)
 
 
 def persistent_volume_name(container_id, item_id):
@@ -1043,8 +1085,8 @@ def prepare_persistent_volume(container_id, item_id):
 
 
 def create_runtime_container(container_id):
-    recipe = load_recipe(container_id)
-    settings = runtime_settings(recipe)
+    configuration = load_configuration(container_id)
+    settings = runtime_settings(configuration)
     arguments = [
         "create", "--name", container_name(container_id),
         "--label", "org.outershell.container-id=" + container_id,
@@ -1063,36 +1105,36 @@ def create_runtime_container(container_id):
         arguments += ["--cpus", str(runnable_cpus(cpus))]
     if memory:
         arguments += ["--memory", f"{runnable_memory(memory)}m"]
-    project = recipe_directory(container_id)
+    project = build_context_directory(container_id)
     arguments += ["--mount", f"type=bind,src={project},dst=/var/lib/outershell/project"]
-    for mount in recipe.get("mounts", []):
+    for mount in configuration.get("mounts", []):
         host = pathlib.Path(mount["hostPath"]).expanduser().resolve()
         option = f"type=bind,src={host},dst={mount['guestPath']}"
         if mount.get("isReadOnly"):
             option += ",readonly"
         arguments += ["--mount", option]
-    for item in recipe.get("persistentData", []):
-        if not item.get("isDeclared", True) or any(mount["guestPath"] == item["guestPath"] for mount in recipe.get("mounts", [])):
+    for item in configuration.get("persistentData", []):
+        if not item.get("isDeclared", True) or any(mount["guestPath"] == item["guestPath"] for mount in configuration.get("mounts", [])):
             continue
         prepare_persistent_volume(container_id, item["id"])
         arguments += ["--mount", persistent_mount(container_id, item["id"]) + ",target=" + item["guestPath"]]
-    for variable in recipe.get("environment", []):
+    for variable in configuration.get("environment", []):
         arguments += ["--env", f"{variable['name']}={variable['value']}"]
-    for port in recipe.get("publishedPorts", []):
+    for port in configuration.get("publishedPorts", []):
         arguments += ["--publish", f"{port['hostPort']}:{port['containerPort']}"]
     arguments.append(image_name(container_id))
     docker(arguments, check=True)
 
 
 def mark_realized(container_id):
-    recipe = load_recipe(container_id)
-    recipe["realizedDockerfile"] = read_dockerfile(container_id)
-    recipe["realizedMounts"] = recipe.get("mounts", [])
-    recipe["realizedEnvironment"] = recipe.get("environment", [])
-    recipe["realizedPublishedPorts"] = recipe.get("publishedPorts", [])
-    recipe["realizedRuntimeSettings"] = runtime_settings(recipe)
-    recipe["realizedResources"] = record_resources(container_id)
-    save_recipe(container_id, recipe)
+    configuration = load_configuration(container_id)
+    configuration["realizedDockerfile"] = read_dockerfile(container_id)
+    configuration["realizedMounts"] = configuration.get("mounts", [])
+    configuration["realizedEnvironment"] = configuration.get("environment", [])
+    configuration["realizedPublishedPorts"] = configuration.get("publishedPorts", [])
+    configuration["realizedRuntimeSettings"] = runtime_settings(configuration)
+    configuration["realizedResources"] = record_resources(container_id)
+    save_configuration(container_id, configuration)
 
 
 def record_resources(container_id):
@@ -1117,9 +1159,9 @@ def storage_operation(function):
 
 def storage_image_owned(reference):
     prefix = "outershell/container-"
-    if reference.startswith(prefix) and reference.endswith(":recipe"):
+    if reference.startswith(prefix) and reference.endswith(":latest"):
         try:
-            uuid.UUID(reference[len(prefix):-len(":recipe")])
+            uuid.UUID(reference[len(prefix):-len(":latest")])
             return True
         except ValueError:
             return False
@@ -1141,13 +1183,13 @@ def storage_inventory(excluding=None):
             if record["id"] == excluding or not record_owns_container(record):
                 continue
             protected.add(image_name(record["id"]))
-            recipe = load_recipe(record["id"])
-            protected.add(recipe.get("baseImage", DEFAULT_BASE_IMAGE))
+            configuration = load_configuration(record["id"])
+            protected.add(configuration.get("baseImage", DEFAULT_BASE_IMAGE))
             try:
                 files.append(read_dockerfile(record["id"]))
             except (OSError, RuntimeError, UnicodeDecodeError):
                 pass
-            files.append(recipe.get("realizedDockerfile", ""))
+            files.append(configuration.get("realizedDockerfile", ""))
     identifiers = docker(["ps", "--all", "--quiet", "--no-trunc"], check=True).stdout.split()
     for identifier in identifiers:
         values = json.loads(docker(["inspect", identifier], check=True).stdout)
@@ -1260,10 +1302,10 @@ def rebuild(container_id):
             terminalShell=None,
         )
         set_build_progress(container_id, "preparing", "Preparing the container build…")
-        upgrade_definition(container_id, load_recipe(container_id))
+        upgrade_definition(container_id, load_configuration(container_id))
         if SUPPORT_IMAGE in read_dockerfile(container_id):
             ensure_support_image(log_path)
-        context = build_context(container_id)
+        context = stage_build_context(container_id)
         helpers = runtime_directory(container_id) / "Helpers"
         build_image(context, image_name(container_id), log_path, container_id=container_id,
                     helpers=helpers if helpers_build_context(helpers) else None)
@@ -1272,6 +1314,8 @@ def rebuild(container_id):
         reconcile_image_volumes(container_id)
         remove_runtime_container(container_id)
         create_runtime_container(container_id)
+        if legacy_build_context_directory(container_id).is_symlink():
+            legacy_build_context_directory(container_id).unlink()
         start_and_check_runtime(container_id)
         mark_realized(container_id)
         update_record(container_id, transientState=None, buildProgress=None, lastError="")
@@ -1342,7 +1386,7 @@ def operation_create(request):
         "memoryInMB": memory,
         "runtimeProviderID": PROVIDER_ID,
         "runtimeName": "outershell-container-" + container_id.lower(),
-        "projectResourceKey": recipe_resource_key(container_id),
+        "projectResourceKey": configuration_resource_key(container_id),
         "ownsContainer": True,
         "transientState": "creating",
         "lastError": "",
@@ -1361,9 +1405,9 @@ def operation_create(request):
     container_directory(container_id).mkdir(parents=True, exist_ok=True, mode=0o700)
     write_initial_definition(container_id, base_image)
     if any(key in request for key in settings):
-        recipe = load_recipe(container_id)
-        recipe.update(settings)
-        save_recipe(container_id, recipe)
+        configuration = load_configuration(container_id)
+        configuration.update(settings)
+        save_configuration(container_id, configuration)
     if initial_dockerfile is not None:
         write_dockerfile(container_id, initial_dockerfile)
     with Records() as records:
@@ -1387,12 +1431,12 @@ def operation_delete(request):
         owns_container = record_owns_container(record)
     if owns_container:
         remove_runtime_container(container_id)
-        for item in load_recipe(container_id).get("persistentData", []):
+        for item in load_configuration(container_id).get("persistentData", []):
             name = persistent_volume_name(container_id, item["id"])
             if docker(["volume", "inspect", name]).returncode == 0:
                 docker(["volume", "rm", name], check=True)
         remove_owned_image(container_id)
-        registry_resource_remove(recipe_resource_key(container_id))
+        registry_resource_remove(configuration_resource_key(container_id))
         shutil.rmtree(container_directory(container_id), ignore_errors=True)
     registry_container_remove(container_id)
     CONTAINER_RUNTIME_NAMES.pop(container_id, None)
@@ -1414,9 +1458,9 @@ def operation_update_dockerfile(request):
             continue
         image = next((field for field in fields[1:] if not field.startswith("--")), "")
         if image:
-            recipe = load_recipe(container_id)
-            recipe["baseImage"] = image
-            save_recipe(container_id, recipe)
+            configuration = load_configuration(container_id)
+            configuration["baseImage"] = image
+            save_configuration(container_id, configuration)
         break
 
 
@@ -1424,14 +1468,14 @@ def operation_update_configuration(request):
     container_id = request["workspaceID"]
     with Records() as records:
         require_managed_container(find_record(records.values, container_id))
-    recipe = load_recipe(container_id)
-    recipe["mounts"] = request.get("mounts") or []
-    recipe["environment"] = request.get("environment") or []
-    recipe["publishedPorts"] = request.get("publishedPorts") or []
+    configuration = load_configuration(container_id)
+    configuration["mounts"] = request.get("mounts") or []
+    configuration["environment"] = request.get("environment") or []
+    configuration["publishedPorts"] = request.get("publishedPorts") or []
     for key in ("networkMode", "useInit", "restartPolicy"):
         if key in request:
-            recipe[key] = request[key]
-    save_recipe(container_id, recipe)
+            configuration[key] = request[key]
+    save_configuration(container_id, configuration)
 
 
 def operation_update_resources(request):
@@ -1439,9 +1483,9 @@ def operation_update_resources(request):
     with Records() as records:
         require_managed_container(find_record(records.values, container_id))
     cpus, memory = requested_resources(request)
-    recipe = load_recipe(container_id)
-    recipe.setdefault("realizedResources", record_resources(container_id))
-    save_recipe(container_id, recipe)
+    configuration = load_configuration(container_id)
+    configuration.setdefault("realizedResources", record_resources(container_id))
+    save_configuration(container_id, configuration)
     update_record(container_id, cpus=cpus, memoryInMB=memory)
     if docker_state(container_id) == "absent":
         return {"resourcesApplied": False}
@@ -1454,9 +1498,9 @@ def operation_update_resources(request):
     if result.returncode != 0:
         return {"resourcesApplied": False,
                 "resourcesDetail": (result.stderr or result.stdout).strip()[:400]}
-    recipe = load_recipe(container_id)
-    recipe["realizedResources"] = {"cpus": cpus, "memoryInMB": memory}
-    save_recipe(container_id, recipe)
+    configuration = load_configuration(container_id)
+    configuration["realizedResources"] = {"cpus": cpus, "memoryInMB": memory}
+    save_configuration(container_id, configuration)
     return {"resourcesApplied": True}
 
 
@@ -1535,7 +1579,7 @@ def operation_prepare_share(request):
         require_managed_container(find_record(records.values, container_id))
     with Records() as records:
         record = dict(find_record(records.values, container_id))
-    recipe = load_recipe(container_id)
+    configuration = load_configuration(container_id)
     include_persistent = bool(request.get("includePersistentData", False))
     include_mounts = bool(request.get("includeMountedFolders", False))
     transfer_id = str(uuid.uuid4())
@@ -1544,23 +1588,23 @@ def operation_prepare_share(request):
     archive = root / "container.outershell-container"
     included_mounts = []
     persistent_data = [
-        item for item in recipe.get("persistentData", [])
+        item for item in configuration.get("persistentData", [])
         if item.get("isDeclared", True)
     ]
-    shared_recipe = dict(recipe)
-    shared_recipe["persistentData"] = persistent_data
-    shared_recipe_directory = root / "Recipe"
-    copy_recipe_tree(recipe_directory(container_id), shared_recipe_directory)
-    require_unlinked_tree(shared_recipe_directory)
-    for name in ["recipe.orwv"]:
-        stale_recipe = shared_recipe_directory / name
-        if stale_recipe.exists():
-            stale_recipe.unlink()
-    (shared_recipe_directory / "recipe.orwv").write_bytes(
-        offset_archive_encode(shared_recipe)
+    shared_configuration = dict(configuration)
+    shared_configuration["persistentData"] = persistent_data
+    shared_build_context = root / "BuildContext"
+    copy_build_context_tree(build_context_directory(container_id), shared_build_context)
+    require_unlinked_tree(shared_build_context)
+    for name in ["configuration.orwv"]:
+        stale_configuration = shared_build_context / name
+        if stale_configuration.exists():
+            stale_configuration.unlink()
+    (shared_build_context / "configuration.orwv").write_bytes(
+        offset_archive_encode(shared_configuration)
     )
     with tarfile.open(archive, "w:gz", compresslevel=1) as output:
-        output.add(shared_recipe_directory, arcname="Recipe", recursive=True)
+        output.add(shared_build_context, arcname="BuildContext", recursive=True)
         if include_persistent:
             for item in persistent_data:
                 snapshot = root / "Volume Archives" / (str(uuid.UUID(item["id"])) + ".tar")
@@ -1572,7 +1616,7 @@ def operation_prepare_share(request):
                     transfer_persistent_volume(container_id, item["id"], snapshot)
                 output.add(snapshot, arcname="Volume Archives/" + snapshot.name, recursive=False)
         if include_mounts:
-            for mount in recipe.get("mounts", []):
+            for mount in configuration.get("mounts", []):
                 source = pathlib.Path(mount.get("hostPath", ""))
                 if not source.exists():
                     continue
@@ -1582,14 +1626,14 @@ def operation_prepare_share(request):
                 included_mounts.append(mount)
         included_ids = {value["id"] for value in included_mounts}
         manifest = {
-            "version": 2,
+            "version": 3,
             "name": record["name"],
             "cpus": record.get("cpus", DEFAULT_CPUS),
             "memoryInMB": record.get("memoryInMB", DEFAULT_MEMORY_IN_MB),
             "sourceRuntimeProviderID": PROVIDER_ID,
             "includesPersistentData": include_persistent,
             "includedMounts": included_mounts,
-            "omittedMounts": [value for value in recipe.get("mounts", [])
+            "omittedMounts": [value for value in configuration.get("mounts", [])
                               if value["id"] not in included_ids],
         }
         encoded = offset_archive_encode(manifest)
@@ -1719,7 +1763,7 @@ def operation_finish_import(request):
                     source.extract(member, staging)
             staging.rename(extracted)
     manifest = offset_archive_decode((extracted / "manifest.orwv").read_bytes())
-    if manifest.get("version") != 2:
+    if manifest.get("version") != 3:
         raise ValueError("This shared container uses an unsupported format.")
     included_mounts = manifest.get("includedMounts", [])
     mount_directory_names = import_mount_directory_names(included_mounts)
@@ -1785,7 +1829,7 @@ def operation_finish_import(request):
         "memoryInMB": runnable_memory(manifest.get("memoryInMB", DEFAULT_MEMORY_IN_MB)),
         "runtimeProviderID": PROVIDER_ID,
         "runtimeName": "outershell-container-" + container_id.lower(),
-        "projectResourceKey": recipe_resource_key(container_id),
+        "projectResourceKey": configuration_resource_key(container_id),
         "ownsContainer": True,
         "transientState": "creating",
         "lastError": "",
@@ -1793,12 +1837,12 @@ def operation_finish_import(request):
     }
     target = container_directory(container_id)
     target.mkdir(parents=True, mode=0o700)
-    shutil.move(extracted / "Recipe", recipe_directory(container_id))
-    transferred_recipe_path = recipe_directory(container_id) / "recipe.orwv"
-    recipe = offset_archive_decode(transferred_recipe_path.read_bytes())
-    transferred_recipe_path.unlink()
-    save_recipe(container_id, recipe)
-    recipe = upgrade_definition(container_id, recipe)
+    shutil.move(extracted / "BuildContext", build_context_directory(container_id))
+    transferred_configuration_path = build_context_directory(container_id) / "configuration.orwv"
+    configuration = offset_archive_decode(transferred_configuration_path.read_bytes())
+    transferred_configuration_path.unlink()
+    save_configuration(container_id, configuration)
+    configuration = upgrade_definition(container_id, configuration)
     imported_mounts = []
     for mount in included_mounts:
         source = (
@@ -1818,13 +1862,13 @@ def operation_finish_import(request):
         imported = dict(mount)
         imported["hostPath"] = str(destination)
         imported_mounts.append(imported)
-    recipe["mounts"] = imported_mounts
+    configuration["mounts"] = imported_mounts
     for key in ["realizedMounts", "realizedDockerfile", "realizedDockerfileContents",
                 "realizedEnvironment", "realizedPublishedPorts", "realizedRuntimeSettings",
                 "realizedResources"]:
-        recipe.pop(key, None)
-    recipe["hasUntrackedChanges"] = False
-    save_recipe(container_id, recipe)
+        configuration.pop(key, None)
+    configuration["hasUntrackedChanges"] = False
+    save_configuration(container_id, configuration)
     persistent = extracted / "Volume Archives"
     if persistent.exists():
         shutil.move(persistent, target / "Volume Archives")
@@ -2030,7 +2074,7 @@ def with_endpoint_icon(app):
     return dict(app, iconData=data) if data else app
 
 
-def app_snapshots(container_id, recipe):
+def app_snapshots(container_id, configuration):
     result = container_exec(container_id, ["/usr/local/bin/outerctl", "app", "list"])
     if result.returncode != 0:
         return None
@@ -2042,7 +2086,7 @@ def app_snapshots(container_id, recipe):
     published_ports = runtime_published_ports(container_id)
     published_ports.update({
         int(value["containerPort"]): int(value["hostPort"])
-        for value in recipe.get("publishedPorts", [])
+        for value in configuration.get("publishedPorts", [])
         if value.get("containerPort") and value.get("hostPort")
     })
     lines = [line for line in result.stdout.splitlines() if line]
@@ -2421,50 +2465,50 @@ def outer_shell_support(container_id, state):
     return {"status": status, "detail": details.get(status, details["missing"])}
 
 
-def recipe_dictionary(record, recipe):
+def definition_dictionary(record, configuration):
     container_id = record["id"]
     dockerfile = read_dockerfile(container_id)
-    realized = recipe.get("realizedDockerfile")
+    realized = configuration.get("realizedDockerfile")
     needs_rebuild = (
         realized != dockerfile
-        or recipe.get("realizedMounts") != recipe.get("mounts", [])
-        or recipe.get("realizedEnvironment") != recipe.get("environment", [])
-        or recipe.get("realizedPublishedPorts") != recipe.get("publishedPorts", [])
-        or (recipe.get("realizedRuntimeSettings") or runtime_settings({})) != runtime_settings(recipe)
-        or recipe.get("realizedResources", {"cpus": record.get("cpus"), "memoryInMB": record.get("memoryInMB")})
+        or configuration.get("realizedMounts") != configuration.get("mounts", [])
+        or configuration.get("realizedEnvironment") != configuration.get("environment", [])
+        or configuration.get("realizedPublishedPorts") != configuration.get("publishedPorts", [])
+        or (configuration.get("realizedRuntimeSettings") or runtime_settings({})) != runtime_settings(configuration)
+        or configuration.get("realizedResources", {"cpus": record.get("cpus"), "memoryInMB": record.get("memoryInMB")})
         != {"cpus": record.get("cpus"), "memoryInMB": record.get("memoryInMB")}
     )
     return {
-        "baseImage": recipe.get("baseImage", DEFAULT_BASE_IMAGE),
+        "baseImage": configuration.get("baseImage", DEFAULT_BASE_IMAGE),
         "containerfile": dockerfile,
         "dockerfileHostPath": str(dockerfile_path(container_id)),
         "dockerfileGuestPath": "/var/lib/outershell/project/Dockerfile",
         "buildEngineAvailable": docker_path() is not None,
-        "definitionDirectory": str(recipe_directory(container_id)),
+        "definitionDirectory": str(build_context_directory(container_id)),
         "transferItems": [
             {"name": "Container definition", "detail": "Dockerfile and its build context", "status": "Included"},
-            {"name": "Mounted folders", "detail": f"{len(recipe.get('mounts', []))} local folder mapping(s)", "status": "Reconnect at destination"},
+            {"name": "Mounted folders", "detail": f"{len(configuration.get('mounts', []))} local folder mapping(s)", "status": "Reconnect at destination"},
             {"name": "Environment", "detail": "Runtime environment values", "status": "Review at destination"},
             {"name": "OCI image", "detail": image_name(container_id), "status": "Rebuild or push to a registry"},
         ],
         "needsRebuild": needs_rebuild,
         "hasUntrackedChanges": False,
-        "environment": recipe.get("environment", []),
-        "publishedPorts": recipe.get("publishedPorts", []),
+        "environment": configuration.get("environment", []),
+        "publishedPorts": configuration.get("publishedPorts", []),
         "supportsRuntimeSettings": True,
-        **runtime_settings(recipe),
+        **runtime_settings(configuration),
     }
 
 
-def runtime_description(recipe):
-    base = recipe.get("baseImage", DEFAULT_BASE_IMAGE).lower()
+def runtime_description(configuration):
+    base = configuration.get("baseImage", DEFAULT_BASE_IMAGE).lower()
     if "debian" in base:
         return "Debian GNU/Linux", "12 (bookworm)"
     if "ubuntu" in base:
         return "Ubuntu", base.rsplit(":", 1)[-1] if ":" in base else ""
     if "alpine" in base:
         return "Alpine Linux", base.rsplit(":", 1)[-1] if ":" in base else ""
-    return recipe.get("baseImage", "Linux"), ""
+    return configuration.get("baseImage", "Linux"), ""
 
 
 def attached_runtime_description(container_id):
@@ -2482,7 +2526,7 @@ def workspace_dictionary(record, overview=False):
     owns_container = record_owns_container(record)
     transient = record.get("transientState")
     state = transient or docker_state(container_id)
-    recipe = load_recipe(container_id) if owns_container else default_recipe()
+    configuration = load_configuration(container_id) if owns_container else default_configuration()
     try:
         support = outer_shell_support(container_id, state)
     except Exception as error:
@@ -2494,7 +2538,7 @@ def workspace_dictionary(record, overview=False):
     commands = record.get("cachedCommands", [])
     if state == "running" and support["status"] == "available":
         try:
-            discovered = app_snapshots(container_id, recipe)
+            discovered = app_snapshots(container_id, configuration)
         except Exception:
             discovered = None
         if discovered is not None:
@@ -2524,7 +2568,7 @@ def workspace_dictionary(record, overview=False):
     if state != "running":
         apps = [dict(app, isRunning=False, externalSocketPath=None) for app in apps]
     if owns_container:
-        operating_system, version = runtime_description(recipe)
+        operating_system, version = runtime_description(configuration)
     else:
         operating_system, version = attached_runtime_description(container_id)
     mounts = []
@@ -2532,16 +2576,16 @@ def workspace_dictionary(record, overview=False):
         mounts.append({
             "id": "00000000-0000-4000-8000-000000000002",
             "name": "Container project",
-            "hostPath": str(recipe_directory(container_id)),
+            "hostPath": str(build_context_directory(container_id)),
             "guestPath": "/var/lib/outershell/project",
             "isReadOnly": False,
             "isInfrastructure": True,
-            "isRecipeMount": True,
+            "isBuildContextMount": True,
         })
-        mounts += [dict(value, isInfrastructure=False, isRecipeMount=False)
-                   for value in recipe.get("mounts", [])]
+        mounts += [dict(value, isInfrastructure=False, isBuildContextMount=False)
+                   for value in configuration.get("mounts", [])]
     persistent = []
-    for item in recipe.get("persistentData", []):
+    for item in configuration.get("persistentData", []):
         if not item.get("isDeclared", True):
             continue
         persistent.append({
@@ -2576,7 +2620,7 @@ def workspace_dictionary(record, overview=False):
             "supportsShell": True,
             "supportsLiveMounts": owns_container,
             "supportsMounts": owns_container,
-            "supportsRecipes": owns_container,
+            "supportsDefinitions": owns_container,
         },
         "shellCommand": interactive_command(
             docker_cli_prefix()
@@ -2591,7 +2635,7 @@ def workspace_dictionary(record, overview=False):
         "commands": commands,
         "mounts": mounts,
         "persistentData": persistent,
-        "recipe": recipe_dictionary(record, recipe) if owns_container else None,
+        "definition": definition_dictionary(record, configuration) if owns_container else None,
         "outerShellSupport": support,
     }
     if record.get("buildProgress"):
@@ -2629,7 +2673,7 @@ def unavailable_workspace_dictionary(record, error):
             "supportsShell": True,
             "supportsLiveMounts": owns_container,
             "supportsMounts": owns_container,
-            "supportsRecipes": owns_container,
+            "supportsDefinitions": owns_container,
         },
         "shellCommand": interactive_command(
             docker_cli_prefix()
@@ -2644,7 +2688,7 @@ def unavailable_workspace_dictionary(record, error):
         "commands": [],
         "mounts": [],
         "persistentData": [],
-        "recipe": None,
+        "definition": None,
         "outerShellSupport": {
             "status": "unknown",
             "detail": f"This container's saved definition could not be read: {error}",
@@ -2797,7 +2841,7 @@ def handle_request(request):
             operation_update_configuration(request)
         elif operation == "updateResources":
             extra = operation_update_resources(request)
-        elif operation == "rebuildRecipe":
+        elif operation == "rebuild":
             operation_rebuild(request)
         elif operation in ("startApp", "stopApp", "restartApp"):
             operation_control_app(request)
@@ -2823,7 +2867,7 @@ def handle_request(request):
             icons = outer_shell_home() / "web-icons"
             icons.mkdir(parents=True, exist_ok=True, mode=0o700)
             for workspace in result.get("workspaces", []):
-                for field in ("recipe", "mounts", "persistentData"):
+                for field in ("definition", "mounts", "persistentData"):
                     workspace.pop(field, None)
                 for app in workspace.get("apps", []) + workspace.get("commands", []):
                     encoded = app.pop("iconData", None)

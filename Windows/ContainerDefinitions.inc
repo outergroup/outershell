@@ -18,15 +18,37 @@ static char *container_directory(const char *id) {
     return directory;
 }
 
-static char *container_recipe_directory(const char *id) {
+static char *container_legacy_build_context_directory(const char *id) {
     char *directory = container_directory(id);
-    char *recipe = directory ? win_join(directory, "Recipe") : NULL;
-    if (recipe && !win_secure_directory(recipe)) { free(recipe); recipe = NULL; }
-    free(directory); return recipe;
+    char *legacy = directory ? win_join(directory, "Recipe") : NULL;
+    free(directory); return legacy;
+}
+
+static bool container_path_exists(const char *path);
+// A container whose runtime mount still names the legacy "Recipe" folder keeps
+// using it until its next rebuild moves the folder to "BuildContext".
+static char *container_build_context_directory(const char *id) {
+    char *legacy = container_legacy_build_context_directory(id);
+    if (legacy && container_path_exists(legacy)) return legacy;
+    free(legacy);
+    char *directory = container_directory(id);
+    char *context = directory ? win_join(directory, "BuildContext") : NULL;
+    if (context && !win_secure_directory(context)) { free(context); context = NULL; }
+    free(directory); return context;
+}
+
+static char *container_move_build_context(const char *source, const char *id) {
+    char *directory = container_directory(id);
+    char *target = directory ? win_join(directory, "BuildContext") : NULL;
+    wchar_t *from = win_wide(source), *to = target ? win_wide(target) : NULL;
+    bool moved = from && to && MoveFileExW(from, to, 0);
+    free(directory); free(from); free(to);
+    if (!moved) { free(target); return NULL; }
+    return target;
 }
 
 static char *container_file(const char *id, const char *name) {
-    char *directory = !strcmp(name, "Dockerfile") ? container_recipe_directory(id) : container_directory(id);
+    char *directory = !strcmp(name, "Dockerfile") ? container_build_context_directory(id) : container_directory(id);
     char *path = directory ? win_join(directory, name) : NULL;
     free(directory);
     return path;
@@ -432,12 +454,12 @@ static char *container_base_image(const char *dockerfile) {
     free(copy); return result ? result : win_strdup("");
 }
 
-static void container_recipe_snapshot(Distribution *d, StringBuilder *json) {
+static void container_definition_snapshot(Distribution *d, StringBuilder *json) {
     char *dockerfile = container_read(d->id, "Dockerfile", "");
     char *realized = container_read(d->id, "Dockerfile.realized", "");
     char *config = container_read(d->id, "configuration", container_empty_configuration);
     char *prior = container_read(d->id, "configuration.realized", "");
-    char *path = container_file(d->id, "Dockerfile"), *directory = container_recipe_directory(d->id);
+    char *path = container_file(d->id, "Dockerfile"), *directory = container_build_context_directory(d->id);
     char *mounts = container_json_field(config, "mounts"), *env = container_json_field(config, "environment"), *ports = container_json_field(config, "publishedPorts");
     append(json, ",\"mounts\":"); append(json, mounts ? mounts : "[]");
     append(json, ",\"persistentData\":[");
@@ -462,7 +484,7 @@ static void container_recipe_snapshot(Distribution *d, StringBuilder *json) {
         }
     }
     free(persistent);
-    append(json, "],\"recipe\":{");
+    append(json, "],\"definition\":{");
     char *base_image = container_base_image(dockerfile);
     field(json, "baseImage", base_image); free(base_image); append(json, ","); field(json, "containerfile", dockerfile);
     append(json, ","); field(json, "dockerfileHostPath", path ? path : "");
@@ -539,7 +561,7 @@ static bool container_line_is(const char *start, size_t length, const char *text
     return length == strlen(text) && !memcmp(start, text, length);
 }
 
-// Rewrites recipes from before the support image. The old Outer Shell base
+// Rewrites Dockerfiles from before the support image. The old Outer Shell base
 // image becomes Debian plus the support line, and the old bootstrap install
 // steps become the support line.
 static char *container_upgraded_dockerfile(const char *dockerfile) {
@@ -587,7 +609,7 @@ static char *container_upgraded_dockerfile(const char *dockerfile) {
     return text.data ? text.data : win_strdup("");
 }
 
-// Builds the support image from the installed container bootstrap when a recipe
+// Builds the support image from the installed container bootstrap when a Dockerfile
 // uses it and the runtime does not have the current build of it yet.
 static bool container_prepare_support(Wsl *w, ContainerRuntime runtime, const char *dockerfile) {
     if (!strstr(dockerfile, container_support_image)) return true;
@@ -628,7 +650,7 @@ static bool container_prepare_support(Wsl *w, ContainerRuntime runtime, const ch
     return ok;
 }
 
-// Builds a container's image from its recipe. Docker builds also copy the
+// Builds a container's image from its build context. Docker builds also copy the
 // installed apps' container helpers into the image, in a final layer.
 static bool container_build(Wsl *w, ContainerRuntime runtime, const char *id, const char *dockerfile,
                             const char *image, const char *context, StringBuilder *output) {
@@ -662,7 +684,15 @@ static DWORD WINAPI container_rebuild_thread(void *context) {
     Distribution *d = context;
     Wsl *w = d->owner;
     EnterCriticalSection(&w->commands);
-    char *directory = container_recipe_directory(d->id);
+    char *directory = container_build_context_directory(d->id);
+    char *legacy_directory = container_legacy_build_context_directory(d->id);
+    if (directory && legacy_directory && !strcmp(directory, legacy_directory)) {
+        char *moved = container_move_build_context(directory, d->id);
+        if (moved) { free(directory); directory = moved; }
+        else { free(legacy_directory); legacy_directory = NULL; }
+    } else {
+        free(legacy_directory); legacy_directory = NULL;
+    }
     char *dockerfile = container_read(d->id, "Dockerfile", "");
     char *config = container_read(d->id, "configuration", container_empty_configuration);
     ContainerArguments args = {0};
@@ -736,6 +766,11 @@ static DWORD WINAPI container_rebuild_thread(void *context) {
              container_write(d->id, "configuration.realized", config, strlen(config));
         error = "The rebuilt container is running, but its saved build state could not be updated.";
     } else {
+        wchar_t *from = legacy_directory && directory ? win_wide(directory) : NULL;
+        wchar_t *to = from ? win_wide(legacy_directory) : NULL;
+        if (from && to && !MoveFileExW(from, to, 0))
+            fprintf(stderr, "Could not restore the build context folder of container %s\n", d->id);
+        free(from); free(to);
         if (created) {
             const char *remove[] = {d->container == RUNTIME_DOCKER ? "rm" : "remove", "--force", candidate, NULL};
             free(output.data); output = (StringBuilder){0};
@@ -748,7 +783,7 @@ static DWORD WINAPI container_rebuild_thread(void *context) {
                 error = "The replacement failed, and the previous container could not restart. Its data was retained.";
         }
     }
-    container_arguments_free(&args); free(directory); free(dockerfile); free(config); free(output.data);
+    container_arguments_free(&args); free(directory); free(legacy_directory); free(dockerfile); free(config); free(output.data);
     EnterCriticalSection(&w->gate);
     free(d->build_error); d->build_error = ok ? NULL : win_strdup(error); d->building = false;
     LeaveCriticalSection(&w->gate);

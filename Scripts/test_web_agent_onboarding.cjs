@@ -66,9 +66,9 @@ assert.match(editorAgent, /<h3>Claude Code<\/h3><button class="secondary-button"
 assert.match(editorAgent, /<h3>Codex<\/h3><button class="secondary-button" type="button" data-add-agent="1">Add/);
 assert.doesNotMatch(editorAgent, /data-action="configure-container"/);
 assert.doesNotMatch(context.codingAgentHTML("server", true), /data-add-agent/);
-context.state.addWorkspace.recipe = {containerfile: "FROM debian\nRUN outerctl image add-command --id claude --name x -- /bin/true"};
+context.state.addWorkspace.definition = {containerfile: "FROM debian\nRUN outerctl image add-command --id claude --name x -- /bin/true"};
 assert.match(context.codingAgentHTML("container", true), /<h3>Claude Code<\/h3><span class="catalog-installed">Added/);
-delete context.state.addWorkspace.recipe;
+delete context.state.addWorkspace.definition;
 const launcherItems = context.launcherItems;
 context.launcherItems = () => [{identity: "terminal", backend: {serviceID: "org.outershell.Terminal", serviceScope: "user"}}];
 assert.match(context.codingAgentHTML("container"), /data-action="open-terminal" data-safe-space-id="test">Open Terminal in this container/);

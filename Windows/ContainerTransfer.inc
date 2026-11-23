@@ -118,7 +118,7 @@ static char *container_read_value_file(const char *directory, const char *name) 
 static bool container_share(Distribution *d, HttpRequest *request, StringBuilder *extra) {
     if (!d->managed || d->building) return false;
     char *id = container_new_id(), *root = id ? container_transfer_directory(id, true) : NULL;
-    char *context = container_recipe_directory(d->id), *recipe = root ? win_join(root, "Recipe") : NULL;
+    char *context = container_build_context_directory(d->id), *build_context = root ? win_join(root, "BuildContext") : NULL;
     char *config = container_read(d->id, "configuration", container_empty_configuration);
     char *mounts = container_json_field(config, "mounts");
     char *include = container_json_field(request->body.data, "includeMountedFolders");
@@ -127,11 +127,11 @@ static bool container_share(Distribution *d, HttpRequest *request, StringBuilder
     bool persistent_included = include_data && !strcmp(include_data, "true");
     free(include_data);
     char *dockerfile = container_read(d->id, "Dockerfile", ""), *base_image = container_base_image(dockerfile);
-    StringBuilder shared_recipe = {0}; append(&shared_recipe, "{\"version\":1,");
-    field(&shared_recipe, "baseImage", base_image); append(&shared_recipe, ","); append(&shared_recipe, config + 1);
-    bool ok = root && context && recipe && container_tree(context, recipe, 0) &&
-              container_write_value_file(recipe, "recipe.orwv", shared_recipe.data);
-    free(dockerfile); free(base_image); free(shared_recipe.data);
+    StringBuilder shared_configuration = {0}; append(&shared_configuration, "{\"version\":1,");
+    field(&shared_configuration, "baseImage", base_image); append(&shared_configuration, ","); append(&shared_configuration, config + 1);
+    bool ok = root && context && build_context && container_tree(context, build_context, 0) &&
+              container_write_value_file(build_context, "configuration.orwv", shared_configuration.data);
+    free(dockerfile); free(base_image); free(shared_configuration.data);
     size_t count = 0;
     if (ok && included && mounts) {
         char *mount_root = win_join(root, "Mounted Folders"); ok = win_secure_directory(mount_root);
@@ -174,7 +174,7 @@ static bool container_share(Distribution *d, HttpRequest *request, StringBuilder
         }
         free(archives); free(items);
     }
-    StringBuilder manifest = {0}; append(&manifest, "{\"version\":2,"); field(&manifest, "name", d->name);
+    StringBuilder manifest = {0}; append(&manifest, "{\"version\":3,"); field(&manifest, "name", d->name);
     char limits[100]; snprintf(limits, sizeof(limits), ",\"cpus\":%u,\"memoryInMB\":%u,", d->cpus, d->memory_mb); append(&manifest, limits);
     field(&manifest, "sourceRuntimeProviderID", container_provider_id(d->container));
     append(&manifest, ",\"includesPersistentData\":"); append(&manifest, persistent_included ? "true" : "false"); append(&manifest, ",\"includedMounts\":"); append(&manifest, included && mounts ? mounts : "[]");
@@ -183,7 +183,7 @@ static bool container_share(Distribution *d, HttpRequest *request, StringBuilder
     StringBuilder output = {0};
     if (ok) {
         ok = container_write_value_file(root, "manifest.orwv", manifest.data);
-        const char *args[10] = {"-czf", archive, "-C", root, "manifest.orwv", "Recipe", NULL};
+        const char *args[10] = {"-czf", archive, "-C", root, "manifest.orwv", "BuildContext", NULL};
         size_t argc = 6;
         if (included) args[argc++] = "Mounted Folders";
         if (persistent_included) args[argc++] = "Volume Archives";
@@ -199,7 +199,7 @@ static bool container_share(Distribution *d, HttpRequest *request, StringBuilder
         }
     }
     if (!ok && root) container_tree(root, NULL, 0);
-    free(id); free(root); free(context); free(recipe); free(config); free(mounts); free(include); free(manifest.data); free(archive); free(output.data);
+    free(id); free(root); free(context); free(build_context); free(config); free(mounts); free(include); free(manifest.data); free(archive); free(output.data);
     return ok;
 }
 
@@ -269,7 +269,7 @@ static bool container_import(Wsl *w, HttpRequest *request, StringBuilder *extra,
     char *root = container_transfer_directory(transfer_id, false);
     char *archive = root ? win_join(root, "upload.outershell-container") : NULL;
     char *extracted = root ? win_join(root, "Extracted") : NULL;
-    char *recipe = extracted ? win_join(extracted, "Recipe") : NULL;
+    char *build_context = extracted ? win_join(extracted, "BuildContext") : NULL;
     char *manifest = NULL, *config = NULL, *name = NULL, *id = NULL, *target = NULL;
     char *mounts = NULL, *environment = NULL, *ports = NULL;
     bool ok = provider && (!strcmp(provider, "docker") || !strcmp(provider, "wsl.container")) && root;
@@ -281,13 +281,13 @@ static bool container_import(Wsl *w, HttpRequest *request, StringBuilder *extra,
     free(wide);
     if (ok) {
         manifest = container_read_value_file(extracted, "manifest.orwv");
-        config = container_read_value_file(recipe, "recipe.orwv");
+        config = container_read_value_file(build_context, "configuration.orwv");
         ok = manifest && config;
     }
     HttpRequest record = {0};
     if (ok) {
         record.body = (StringBuilder){manifest, strlen(manifest), 0};
-        ok = container_number(&record, "version", 0) == 2;
+        ok = container_number(&record, "version", 0) == 3;
         if (!ok) *error = "This archive uses an unsupported format. Export it again using the latest Outer Shell.";
         name = request_string(&record, "name"); mounts = container_json_field(manifest, "includedMounts");
         environment = container_json_field(config, "environment"); ports = container_json_field(config, "publishedPorts");
@@ -349,10 +349,10 @@ static bool container_import(Wsl *w, HttpRequest *request, StringBuilder *extra,
     }
     append(&imported, "]");
     if (ok) {
-        id = container_new_id(); target = id ? container_recipe_directory(id) : NULL;
-        ok = target && container_tree(recipe, target, 0);
+        id = container_new_id(); target = id ? container_build_context_directory(id) : NULL;
+        ok = target && container_tree(build_context, target, 0);
         if (ok) {
-            char *metadata = win_join(target, "recipe.orwv");
+            char *metadata = win_join(target, "configuration.orwv");
             wchar_t *wide_metadata = metadata ? win_wide(metadata) : NULL;
             ok = wide_metadata && DeleteFileW(wide_metadata);
             free(metadata); free(wide_metadata);
@@ -395,7 +395,7 @@ static bool container_import(Wsl *w, HttpRequest *request, StringBuilder *extra,
         }
     }
 done:
-    free(transfer_id); free(provider); free(destination); free(root); free(archive); free(extracted); free(recipe);
+    free(transfer_id); free(provider); free(destination); free(root); free(archive); free(extracted); free(build_context);
     free(manifest); free(config); free(name); free(id); free(target); free(mounts); free(environment); free(ports); free(imported.data);
     return ok;
 }

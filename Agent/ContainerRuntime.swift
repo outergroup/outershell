@@ -238,8 +238,8 @@ struct ContainerImageStorage {
                 return Int(image.reference.dropFirst("outershell/container-base:".count)) != nil
             }
             let prefix = "outershell/container-"
-            guard image.reference.hasPrefix(prefix), image.reference.hasSuffix(":recipe") else { return false }
-            return UUID(uuidString: String(image.reference.dropFirst(prefix.count).dropLast(":recipe".count))) != nil
+            guard image.reference.hasPrefix(prefix), image.reference.hasSuffix(":latest") else { return false }
+            return UUID(uuidString: String(image.reference.dropFirst(prefix.count).dropLast(":latest".count))) != nil
         }.sorted { $0.reference < $1.reference }
     }
 

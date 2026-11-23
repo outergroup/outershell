@@ -32,7 +32,7 @@ macos/              Xcode bundle project, when enabled
 server/             shared HTTP server and API, generated as Go or C
 artifacts/          compiled platform payloads; macOS builds land here
 deploy/             host/container service definitions and install scripts
-Dockerfile          OCI runtime image recipe, for containerized apps
+Dockerfile          OCI image build file, for containerized apps
 ```
 
 This directory is user-owned canonical source. New App defaults to
@@ -124,7 +124,7 @@ assets are part of the image.
 
 ## Open-web deployment
 
-Containerized apps use the same standard OCI/Dockerfile recipe on private hosts,
+Containerized apps use the same standard OCI Dockerfile on private hosts,
 Apple `container`, and public container platforms. The entrypoint listens on
 `$PORT` when supplied, or port 8080 otherwise. The image and task runner do not
 select or require a hosting provider.
