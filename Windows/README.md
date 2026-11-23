@@ -510,9 +510,10 @@ For a release payload, build static Linux `outershelld`, `outerctl`, and
 `outershell-socket-bridge` for the target Linux architecture. Run
 `build-container-bootstrap.ps1 -LinuxBinariesDirectory ... -OutputDirectory ...`,
 then pass that directory as `-ContainerBootstrapDirectory` to `build.ps1`.
-The installer copies this optional image-building payload. These Linux tools
-run inside containers; the Windows SSH helper continues to be synced by Outer
-Loop and is not installed. The default image is built locally on first creation.
+The installer copies this payload, which `Container/Support` describes: the
+`outershell/support` image is built from it locally on first use and rebuilt
+when the payload changes. These Linux tools run inside containers; the Windows
+SSH helper continues to be synced by Outer Loop and is not installed.
 
 Docker Desktop's Linux engine is also supported, alongside WSL containers. The
 host finds both per-user and all-users Docker Desktop installs and invokes the
@@ -546,7 +547,8 @@ with Windows-kernel containers; these are Linux containers.
 
 For integration coverage, run `test-containers.ps1 -Provider docker` and
 `test-containers.ps1 -Provider wsl.container` in an ordinary user session. The
-test builds its container from the provider's default base image, publishes a
+test builds its container from the provider's default base image and the
+`outershell/support` line, publishes a
 small HTTP server with `outerctl image add-app --tcp-port`, and needs network
 access for `apt-get` during that build. The tests cover named-pipe app
 forwarding, app/container controls, names, logs, actual
@@ -612,9 +614,9 @@ helper in the selected container's PID namespace, with BPF, PERFMON, SYS_PTRACE,
 SYS_ADMIN and IPC_LOCK capabilities and seccomp disabled for that helper. It does
 not change the target container's configuration or elevate the Windows task.
 The helper uses binary stdin/stdout transport, without publishing a port. The
-disposable container uses Outer Shell's base image, built on demand from the
-packaged container bootstrap, and the app copies its helper into it from the
-app's `helpers` folder (see `Resources/ContainerHelper.h`). Profile recordings
+disposable container uses a small `outershell/tracing` image (Debian with
+`linux-perf`), which the app builds on demand, and the app copies its helper
+into it from the app's `helpers` folder (see `Resources/ContainerHelper.h`). Profile recordings
 are retained under LocalAppData/OuterShell/tracing/Profile/<container-id>.
 
 WSLc helper transport and process discovery work, but current WSLc releases do

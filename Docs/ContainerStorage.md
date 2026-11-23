@@ -16,10 +16,11 @@ Failures are logged and do not turn successful builds into failures.
 Use **Container storage…** in the web overview or the native runtime menu for
 explicit cleanup. The native menu opens the same web screen in a new tab.
 No tagged images are selected by default. Cleanup with no selections only prunes
-orphaned cache data. The screen offers numeric superseded Outer Shell base images,
-older workspace images for this user, and unreferenced recipe images. It preserves:
+orphaned cache data. The screen offers legacy `outershell/container-base:<N>`
+images, legacy workspace images for this user, and unreferenced recipe images.
+It preserves:
 
-- The current base image and the newest installed workspace fallback.
+- The `outershell/support` image.
 - Images used by running or stopped Apple containers, including digest aliases.
 - Current Apple recipe images and base/Dockerfile references from saved recipes,
   including their last realized definitions.
@@ -54,9 +55,9 @@ forcing deletion. Failures retain the registration so deletion can be retried.
 Externally managed containers keep their images.
 
 Cleanup protects running and stopped containers, registered recipes, saved
-Dockerfile dependencies, shared image aliases, and the current base image.
-Only recognized Outer Shell recipe names and older numeric base versions are
-offered. macOS also offers superseded workspace images. Selections are validated
+Dockerfile dependencies, shared image aliases, and the `outershell/support` image.
+Only recognized Outer Shell recipe names and legacy numbered base images are
+offered. macOS also offers legacy workspace images. Selections are validated
 before cleanup and checked again immediately before each removal. Partial failures
 are reported. Windows conservatively skips named-image cleanup when saved
 Dockerfiles contain variables or digest-pinned dependencies.

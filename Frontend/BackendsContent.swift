@@ -673,7 +673,6 @@ private struct LocalWorkspaceRecord: Decodable, Equatable {
         }
 
         let baseImage: String
-        let installsOuterShellSupport: Bool
         let containerfile: String
         let dockerfileHostPath: String
         let dockerfileGuestPath: String
@@ -816,7 +815,6 @@ private struct LocalWorkspaceHostRequest: Encodable {
     let readOnly: Bool?
     let command: String?
     let baseImage: String?
-    let installsOuterShellSupport: Bool?
     let dockerfile: String?
     let mounts: [ContainerConfigurationMountRequest]?
     let environment: [ContainerConfigurationEnvironmentRequest]?
@@ -1030,12 +1028,6 @@ private extension Data {
         }
         return subdata(in: start..<(start + count))
     }
-}
-
-private enum BaseImageTemplate {
-    case outerShell
-    case customWithSupport
-    case customAsIs
 }
 
 private enum ContainerCreationResource {
@@ -1882,7 +1874,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private var creationCPUs = 4
     private var creationMemoryInMB = 8192
     private var creationBaseImage = "debian:bookworm"
-    private var baseImageTemplate = BaseImageTemplate.outerShell
     private var pendingCreationContainerName = ""
     private var isEditingCreationBaseImage = false
     private var workspaceNamePromptDismissesPanel = false
@@ -2184,9 +2175,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private var workspaceCreationBaseImageFrame = CGRect.zero
     private var workspaceCreationResourceFrames: [(frame: CGRect, resource: ContainerCreationResource, delta: Int)] = []
     private var workspaceCreationNameFieldFrame = CGRect.zero
-    private var workspaceOuterShellBaseImageFrame = CGRect.zero
-    private var workspaceCustomBaseImageFrame = CGRect.zero
-    private var workspaceCustomAsIsFrame = CGRect.zero
     private var workspaceDeletePanelFrame = CGRect.zero
     private var workspaceDeleteCancelFrame = CGRect.zero
     private var workspaceDeleteConfirmFrame = CGRect.zero
@@ -8471,8 +8459,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             dialogFrame = workspaceRenamePanelFrame
             fieldLabel = pendingMountPathEdit != nil ? "Folder path" : pendingEndpointRename != nil ? "Endpoint name" : isAddingWindowsContainerFolder ? "Windows server folder" : isCreatingWorkspace && !isEditingCreationBaseImage ? (editingResource == .cpus ? "Max CPUs" : editingResource == .memory ? "Max memory" : "Container name") : pendingWorkspaceRename != nil ? "Container name" : "Value"
             controls = [(workspaceRenameCancelFrame, "Cancel"), (workspaceRenameConfirmFrame, pendingMountPathEdit != nil ? "Save" : isAddingWindowsContainerFolder ? "Mount" : isCreatingWorkspace ? (isEditingCreationBaseImage ? "Done" : "Create") : pendingWorkspaceRename != nil ? "Rename" : "Save"),
-                        (workspaceCreationBaseImageFrame, "Choose base image"), (workspaceOuterShellBaseImageFrame, "Outer Shell base image"),
-                        (workspaceCustomBaseImageFrame, "Custom base image with support"), (workspaceCustomAsIsFrame, "Custom base image unchanged")] +
+                        (workspaceCreationBaseImageFrame, "Choose base image")] +
                 workspaceCreationResourceFrames.map {
                     ($0.frame, "\($0.delta < 0 ? "Decrease" : "Increase") \($0.resource == .cpus ? "CPUs, currently \(creationCPUs)" : "memory, currently \(ContainerResourceText.formatMemory(creationMemoryInMB))")")
                 } + workspaceCreationResourceValueFrames.map {
@@ -13211,14 +13198,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 let isInteractive = editorInputFieldFrame.contains(point) ||
                     workspaceCreationBaseImageFrame.contains(point) ||
                     workspaceCreationResourceFrames.contains(where: { $0.frame.contains(point) }) ||
-                    workspaceOuterShellBaseImageFrame.contains(point) ||
-                    workspaceCustomBaseImageFrame.contains(point) ||
-                    workspaceCustomAsIsFrame.contains(point) ||
                     workspaceRenameCancelFrame.contains(point) ||
                     workspaceRenameConfirmFrame.contains(point)
                 setCursorIfNeeded(
-                    editorInputFieldFrame.contains(point) &&
-                        (!isBaseImageChoicePrompt || baseImageTemplate != .outerShell)
+                    editorInputFieldFrame.contains(point)
                         ? .iBeam
                         : (isInteractive ? .pointingHand : .arrow)
                 )
@@ -13362,7 +13345,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 return
             }
             let index = characterIndexForEditorInput(at: point)
-            focusEditorInput()
+            if !editorInputController.isFocused {
+                focusEditorInput()
+            }
             if editorInputController.selectionRange?.contains(index) != true {
                 editorInputController.setCursorPosition(index, modifySelection: false)
             }
@@ -14094,29 +14079,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             if editingResource != nil, !editorInputFieldFrame.contains(point) {
                 commitResourceEdit(keepsEditingWhenInvalid: false)
             }
-            if workspaceOuterShellBaseImageFrame.contains(point) {
-                armButtonClick(frame: workspaceOuterShellBaseImageFrame) { [weak self] in
-                    self?.baseImageTemplate = .outerShell
-                    self?.blurEditorInput()
-                    self?.updateLayout()
-                }
-            } else if workspaceCustomBaseImageFrame.contains(point) {
-                armButtonClick(frame: workspaceCustomBaseImageFrame) { [weak self] in
-                    guard let self else { return }
-                    self.baseImageTemplate = .customWithSupport
-                    self.workspaceRenameName = self.creationBaseImage
-                    self.focusEditorInput(selectAll: true)
-                    self.updateLayout()
-                }
-            } else if workspaceCustomAsIsFrame.contains(point) {
-                armButtonClick(frame: workspaceCustomAsIsFrame) { [weak self] in
-                    guard let self else { return }
-                    self.baseImageTemplate = .customAsIs
-                    self.workspaceRenameName = self.creationBaseImage
-                    self.focusEditorInput(selectAll: true)
-                    self.updateLayout()
-                }
-            } else if let target = workspaceCreationResourceFrames.first(where: { $0.frame.contains(point) }) {
+            if let target = workspaceCreationResourceFrames.first(where: { $0.frame.contains(point) }) {
                 armButtonClick(frame: target.frame) { [weak self] in
                     self?.adjustCreationResource(target.resource, by: target.delta)
                 }
@@ -14129,15 +14092,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                     self.isEditingCreationBaseImage = true
                     self.workspaceRenameName = self.creationBaseImage
                     self.workspacePanelMessage = ""
-                    if self.baseImageTemplate == .outerShell {
-                        self.blurEditorInput()
-                    } else {
-                        self.focusEditorInput(selectAll: true)
-                    }
+                    self.focusEditorInput(selectAll: true)
                     self.updateLayout()
                 }
-            } else if editorInputFieldFrame.contains(point),
-                      !isBaseImageChoicePrompt || baseImageTemplate != .outerShell {
+            } else if editorInputFieldFrame.contains(point) {
                 let wasFocused = editorInputController.isFocused
                 let index = characterIndexForEditorInput(at: point)
                 focusEditorInput(selectAll: clickCount >= 3)
@@ -15796,7 +15754,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                       readOnly: Bool? = nil,
                                       command: String? = nil,
                                       baseImage: String? = nil,
-                                      installsOuterShellSupport: Bool? = nil,
                                       dockerfile: String? = nil,
                                       mounts: [ContainerConfigurationMountRequest]? = nil,
                                       environment: [ContainerConfigurationEnvironmentRequest]? = nil,
@@ -15831,7 +15788,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                                 readOnly: readOnly,
                                                 command: command,
                                                 baseImage: baseImage,
-                                                installsOuterShellSupport: installsOuterShellSupport,
                                                 dockerfile: dockerfile,
                                                 mounts: mounts,
                                                 environment: environment,
@@ -17305,7 +17261,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         creationMemoryInMB = resources?.defaultMemoryInMB ?? 8192
         editingResource = nil
         creationBaseImage = "debian:bookworm"
-        baseImageTemplate = .outerShell
         pendingCreationContainerName = "Container \(index)"
         isEditingCreationBaseImage = false
         pendingWorkspaceRename = nil
@@ -17941,17 +17896,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         )
     }
 
-    private func outerShellBaseImage(for providerID: String? = nil) -> String {
-        let selectedProviderID = providerID ?? selectedSafeSpaceProviderID
-        return availableSafeSpaceProviders.first(where: {
-            $0.id == selectedProviderID
-        })?.defaultBaseImage ?? "outershell/container-base:6"
-    }
-
-    private var selectedBaseImage: String {
-        baseImageTemplate == .outerShell ? outerShellBaseImage() : creationBaseImage
-    }
-
     private func showWorkspaceRename(_ workspace: LocalWorkspaceRecord) {
         editorInputController.resetUndoHistory()
         isAddingWindowsContainerFolder = false
@@ -18169,9 +18113,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             return
         }
         if isCreatingWorkspace && isEditingCreationBaseImage {
-            if baseImageTemplate != .outerShell {
-                creationBaseImage = name
-            }
+            creationBaseImage = name
             isEditingCreationBaseImage = false
             workspaceRenameName = pendingCreationContainerName
             workspacePanelMessage = ""
@@ -18210,8 +18152,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         } else if createsWorkspace {
             sendWorkspaceRequest(operation: "create",
                                  name: name,
-                                 baseImage: selectedBaseImage,
-                                 installsOuterShellSupport: baseImageTemplate == .customWithSupport)
+                                 baseImage: creationBaseImage)
         } else if let workspace {
             sendWorkspaceRequest(operation: "rename",
                                  workspaceID: workspace.id,
@@ -18433,9 +18374,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             workspaceCreationBaseImageFrame = .zero
             workspaceCreationResourceFrames.removeAll()
             workspaceCreationResourceValueFrames.removeAll()
-            workspaceOuterShellBaseImageFrame = .zero
-            workspaceCustomBaseImageFrame = .zero
-            workspaceCustomAsIsFrame = .zero
             workspaceDeletePanelFrame = .zero
             workspaceDeleteCancelFrame = .zero
             workspaceDeleteConfirmFrame = .zero
@@ -18484,9 +18422,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 ? min(max(height - 72, 360), 600)
                 : CGFloat(showsDeletePrompt
                     ? 184
-                    : (isBaseImageChoicePrompt
-                        ? 310
-                        : (isCreatingWorkspace && !isEditingCreationBaseImage ? 274 : 174))))
+                    : (isCreatingWorkspace && !isEditingCreationBaseImage ? 274 : 174)))
         workspacePanelFrame = CGRect(x: floor((width - panelWidth) / 2),
                                      y: floor((height - panelHeight) / 2),
                                      width: panelWidth,
@@ -19988,9 +19924,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             workspaceCreationBaseImageFrame = .zero
             workspaceCreationResourceFrames.removeAll()
             workspaceCreationResourceValueFrames.removeAll()
-            workspaceOuterShellBaseImageFrame = .zero
-            workspaceCustomBaseImageFrame = .zero
-            workspaceCustomAsIsFrame = .zero
             return
         }
 
@@ -20021,8 +19954,6 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             if pendingDockerfileWorkspace != nil &&
                 !isRenamingContainerConfiguration {
                 promptHeight = min(max(panelHeight - 96, 420), 760)
-            } else if isBaseImageChoicePrompt {
-                promptHeight = 310
             } else if isCreatingWorkspace && !isEditingCreationBaseImage {
                 promptHeight = 274
             } else {
@@ -20068,7 +19999,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             detail.string = "Choose where \(count) included folder\(count == 1 ? "" : "s") " +
                 "will be copied on this server. Paths inside the container will stay the same."
         } else if isCreatingWorkspace && isEditingCreationBaseImage {
-            detail.string = "Start with Outer Shell's image, add visible support steps to another image, or use it unchanged."
+            detail.string = "The image for the Dockerfile's FROM line. Outer Shell adds its support line after it."
         } else if isAddingWindowsContainerFolder {
             detail.string = "Enter a folder path on the Windows server. Rebuild the container to apply the mount."
         } else if pendingMountPathEdit != nil {
@@ -20150,9 +20081,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
         let showsCreationOptions = isCreatingWorkspace && !isEditingCreationBaseImage
         let localFieldFrame = CGRect(x: 18,
-                                     y: isBaseImageChoicePrompt
-                                        ? 80
-                                        : (showsCreationOptions ? 162 : 62),
+                                     y: showsCreationOptions ? 162 : 62,
                                      width: promptWidth - 36,
                                      height: isDockerfilePrompt
                                         ? max(promptHeight - 142, 160)
@@ -20168,137 +20097,10 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         )
         field.backgroundColor = resolvedCGColor(.textBackgroundColor)
         field.masksToBounds = true
-        field.opacity = isBaseImageChoicePrompt && baseImageTemplate == .outerShell ? 0.42 : 1
         prompt.addSublayer(field)
 
         let promptRootOrigin = workspaceRenamePanelFrame.origin
         workspaceCreationBaseImageFrame = .zero
-        workspaceOuterShellBaseImageFrame = .zero
-        workspaceCustomBaseImageFrame = .zero
-        workspaceCustomAsIsFrame = .zero
-        if isBaseImageChoicePrompt {
-            let localOuterShellFrame = CGRect(x: 18,
-                                              y: 184,
-                                              width: promptWidth - 36,
-                                              height: 30)
-            let outerShellOption = CALayer()
-            outerShellOption.frame = localOuterShellFrame
-            prompt.addSublayer(outerShellOption)
-            let outerShellSelection = CALayer()
-            outerShellSelection.frame = CGRect(x: 0, y: 6, width: 18, height: 18)
-            outerShellSelection.contentsGravity = .resizeAspect
-            outerShellSelection.contents = symbolCGImage(
-                named: baseImageTemplate == .outerShell
-                    ? "checkmark.circle.fill"
-                    : "circle",
-                pointSize: 13
-            )
-            outerShellOption.addSublayer(outerShellSelection)
-            let outerShellTitle = makeTextLayer(size: 12,
-                                                weight: .medium,
-                                                color: .labelColor)
-            outerShellTitle.string = "Outer Shell base image"
-            outerShellTitle.frame = CGRect(x: 26, y: 8,
-                                           width: localOuterShellFrame.width - 180,
-                                           height: 17)
-            outerShellOption.addSublayer(outerShellTitle)
-            let outerShellDetail = makeTextLayer(size: 10,
-                                                 weight: .regular,
-                                                 color: .secondaryLabelColor,
-                                                 alignment: .right)
-            outerShellDetail.string = "Recommended · managed"
-            outerShellDetail.frame = CGRect(x: localOuterShellFrame.width - 160,
-                                            y: 8,
-                                            width: 160,
-                                            height: 15)
-            outerShellOption.addSublayer(outerShellDetail)
-            workspaceOuterShellBaseImageFrame = localOuterShellFrame.offsetBy(
-                dx: promptRootOrigin.x,
-                dy: promptRootOrigin.y
-            )
-
-            let localCustomFrame = CGRect(x: 18,
-                                          y: 150,
-                                          width: promptWidth - 36,
-                                          height: 30)
-            let customOption = CALayer()
-            customOption.frame = localCustomFrame
-            prompt.addSublayer(customOption)
-            let customSelection = CALayer()
-            customSelection.frame = CGRect(x: 0, y: 6, width: 18, height: 18)
-            customSelection.contentsGravity = .resizeAspect
-            customSelection.contents = symbolCGImage(
-                named: baseImageTemplate == .customWithSupport
-                    ? "checkmark.circle.fill"
-                    : "circle",
-                pointSize: 13
-            )
-            customOption.addSublayer(customSelection)
-            let customTitle = makeTextLayer(size: 12,
-                                            weight: .medium,
-                                            color: .labelColor)
-            customTitle.string = "Custom image + support"
-            customTitle.frame = CGRect(x: 26, y: 8,
-                                       width: localCustomFrame.width - 136,
-                                       height: 17)
-            customOption.addSublayer(customTitle)
-            let customDetail = makeTextLayer(size: 10,
-                                             weight: .regular,
-                                             color: .secondaryLabelColor,
-                                             alignment: .right)
-            customDetail.string = "Visible install steps"
-            customDetail.frame = CGRect(x: localCustomFrame.width - 126,
-                                        y: 8,
-                                        width: 126,
-                                        height: 15)
-            customOption.addSublayer(customDetail)
-            workspaceCustomBaseImageFrame = localCustomFrame.offsetBy(
-                dx: promptRootOrigin.x,
-                dy: promptRootOrigin.y
-            )
-
-            let localAsIsFrame = CGRect(x: 18,
-                                        y: 116,
-                                        width: promptWidth - 36,
-                                        height: 30)
-            let asIsOption = CALayer()
-            asIsOption.frame = localAsIsFrame
-            prompt.addSublayer(asIsOption)
-            let asIsSelection = CALayer()
-            asIsSelection.frame = CGRect(x: 0, y: 6, width: 18, height: 18)
-            asIsSelection.contentsGravity = .resizeAspect
-            asIsSelection.contents = symbolCGImage(
-                named: baseImageTemplate == .customAsIs
-                    ? "checkmark.circle.fill"
-                    : "circle",
-                pointSize: 13
-            )
-            asIsOption.addSublayer(asIsSelection)
-            let asIsTitle = makeTextLayer(size: 12,
-                                          weight: .medium,
-                                          color: .labelColor)
-            asIsTitle.string = "Custom image as-is"
-            asIsTitle.frame = CGRect(x: 26, y: 8,
-                                     width: localAsIsFrame.width - 170,
-                                     height: 17)
-            asIsOption.addSublayer(asIsTitle)
-            let asIsDetail = makeTextLayer(size: 10,
-                                           weight: .regular,
-                                           color: .secondaryLabelColor,
-                                           alignment: .right)
-            asIsDetail.string = "Advanced · no assumptions"
-            asIsDetail.frame = CGRect(x: localAsIsFrame.width - 160,
-                                      y: 8,
-                                      width: 160,
-                                      height: 15)
-            asIsOption.addSublayer(asIsDetail)
-            workspaceCustomAsIsFrame = localAsIsFrame.offsetBy(
-                dx: promptRootOrigin.x,
-                dy: promptRootOrigin.y
-            )
-        }
-        workspaceCreationResourceFrames.removeAll()
-        workspaceCreationResourceValueFrames.removeAll()
         let editsResource = showsCreationOptions && editingResource != nil
         if showsCreationOptions {
             let steppers = renderResourceSteppers(
@@ -20337,9 +20139,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                                weight: .regular,
                                                color: .labelColor,
                                                monospaced: true)
-            baseImageValue.string = baseImageTemplate == .outerShell
-                ? "Outer Shell base image"
-                : creationBaseImage
+            baseImageValue.string = creationBaseImage
             baseImageValue.truncationMode = .middle
             baseImageValue.frame = CGRect(x: 9, y: 4,
                                           width: localBaseImageFrame.width - 34,

@@ -22,6 +22,11 @@ edit that Dockerfile and any files beside it. Prefer portable, noninteractive,
 idempotent Dockerfile instructions. A root process may edit this project
 directly. Do not create a second recipe or initialization system.
 
+Keep the line `COPY --from=outershell/support /outershell-rootfs/ /` directly
+after the Dockerfile's final `FROM`. It installs Outer Shell's in-container
+tools, which `outerctl image` lines and the container's startup depend on. You
+may change the `FROM` image, but keep this line after it.
+
 After recording a durable change, prefer to mirror it in the running container
 so the user can use it immediately. For example, install the same packages,
 write the same configuration, create the same directories, and start or

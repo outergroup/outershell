@@ -367,8 +367,23 @@ static bool container_image_volumes(Wsl *w, ContainerRuntime runtime, const char
     return ok;
 }
 
+static const char container_support_image[] = "outershell/support";
+static const char container_support_line[] = "COPY --from=outershell/support /outershell-rootfs/ /";
+static const char container_default_base_image[] = "debian:bookworm";
+static const char *const container_runtime_arguments[] = {
+    "--entrypoint", "/usr/local/bin/outershell-container-init", "--user", "0",
+    "--env", "XDG_RUNTIME_DIR=/run/user/0", "--env", "OUTERSHELLD_API_SOCKET=/run/user/0/outershelld-api"};
+
+static char *container_default_dockerfile(const char *image) {
+    StringBuilder dockerfile = {0};
+    append(&dockerfile, "FROM "); append(&dockerfile, image); append(&dockerfile, "\n");
+    append(&dockerfile, container_support_line); append(&dockerfile, "\n");
+    return dockerfile.data;
+}
+
 static bool container_definition_create(const char *id, const char *image) {
-    StringBuilder dockerfile = {0}; append(&dockerfile, "FROM "); append(&dockerfile, image); append(&dockerfile, "\n");
+    StringBuilder dockerfile = {0}; dockerfile.data = container_default_dockerfile(image);
+    dockerfile.length = dockerfile.data ? strlen(dockerfile.data) : 0;
     bool ok = container_write(id, "Dockerfile", dockerfile.data, dockerfile.length) &&
               container_write(id, "Dockerfile.realized", dockerfile.data, dockerfile.length) &&
               container_write(id, "configuration", container_empty_configuration, strlen(container_empty_configuration)) &&
@@ -452,7 +467,6 @@ static void container_recipe_snapshot(Distribution *d, StringBuilder *json) {
     append(json, ","); field(json, "dockerfileHostPath", path ? path : "");
     append(json, ","); field(json, "definitionDirectory", directory ? directory : "");
     append(json, ",\"dockerfileGuestPath\":\"/var/lib/outershell/project/Dockerfile\","
-                 "\"installsOuterShellSupport\":false,"
                  "\"buildEngineAvailable\":true,\"transferItems\":[],\"hasUntrackedChanges\":false,\"needsRebuild\":");
     append(json, strcmp(dockerfile, realized) || strcmp(config, prior) ? "true" : "false");
     append(json, ",\"environment\":"); append(json, env ? env : "[]");
@@ -520,43 +534,96 @@ static bool container_helpers_context(const char *directory) {
     free(local); free(home); free(apps); free(pattern); free(search);
     return found;
 }
-static const char container_base_prefix[] = "outershell/container-base:";
-static const char container_current_base_image[] = "outershell/container-base:24";
+static bool container_line_is(const char *start, size_t length, const char *text) {
+    return length == strlen(text) && !memcmp(start, text, length);
+}
 
-// Recipes keep the base image version they were created with. Rebuilds move
-// them to the current version, which carries the current container tools.
-static char *container_current_base(const char *dockerfile) {
+// Rewrites recipes from before the support image. The old Outer Shell base
+// image becomes Debian plus the support line, and the old bootstrap install
+// steps become the support line.
+static char *container_upgraded_dockerfile(const char *dockerfile) {
+    static const char legacy_base[] = "outershell/container-base:";
+    static const char legacy_copy[] = "COPY --chmod=0755 .outershell/bootstrap/ /tmp/outershell-bootstrap/";
+    static const char legacy_run[] = "RUN /tmp/outershell-bootstrap/install.sh && rm -rf /tmp/outershell-bootstrap";
     StringBuilder text = {0};
-    const char *cursor = dockerfile, *match;
-    while ((match = strstr(cursor, container_base_prefix))) {
-        const char *tag = match + strlen(container_base_prefix);
-        size_t digits = strspn(tag, "0123456789");
-        bytes(&text, cursor, (size_t)(match - cursor));
-        append(&text, digits ? container_current_base_image : container_base_prefix);
-        cursor = tag + digits;
+    const char *line = dockerfile;
+    while (*line) {
+        const char *newline = strchr(line, '\n');
+        size_t length = newline ? (size_t)(newline - line) : strlen(line);
+        const char *start = line, *end = line + length;
+        while (start < end && (*start == ' ' || *start == '\t')) start++;
+        while (end > start && (end[-1] == ' ' || end[-1] == '\t' || end[-1] == '\r')) end--;
+        size_t trimmed = (size_t)(end - start);
+        const char *image = NULL;
+        size_t image_length = 0;
+        if (trimmed > 5 && !_strnicmp(start, "FROM", 4) && (start[4] == ' ' || start[4] == '\t')) {
+            const char *field = start + 4;
+            while (field < end) {
+                while (field < end && (*field == ' ' || *field == '\t')) field++;
+                const char *field_end = field;
+                while (field_end < end && *field_end != ' ' && *field_end != '\t') field_end++;
+                if (field_end > field && strncmp(field, "--", 2)) { image = field; image_length = (size_t)(field_end - field); break; }
+                field = field_end;
+            }
+        }
+        if (container_line_is(start, trimmed, legacy_copy)) {
+            append(&text, container_support_line);
+            if (newline) append(&text, "\n");
+        } else if (container_line_is(start, trimmed, legacy_run)) {
+        } else if (image && image_length > strlen(legacy_base) && !strncmp(image, legacy_base, strlen(legacy_base))) {
+            bytes(&text, line, (size_t)(image - line));
+            append(&text, container_default_base_image);
+            bytes(&text, image + image_length, (size_t)(line + length - (image + image_length)));
+            append(&text, "\n");
+            append(&text, container_support_line);
+            if (newline) append(&text, "\n");
+        } else {
+            bytes(&text, line, length);
+            if (newline) append(&text, "\n");
+        }
+        line = newline ? newline + 1 : line + length;
     }
-    append(&text, cursor);
     return text.data ? text.data : win_strdup("");
 }
 
-// Builds the current base image from the installed container bootstrap when a
-// recipe uses it and the runtime does not have it yet.
-static bool container_prepare_base(Wsl *w, ContainerRuntime runtime, const char *dockerfile) {
-    if (!strstr(dockerfile, container_current_base_image)) return true;
-    StringBuilder output = {0};
-    const char *inspect[] = {"image", "inspect", container_current_base_image, NULL};
-    bool ok = capture_runtime(w, inspect, &output, runtime);
-    if (!ok) {
-        free(output.data);
-        output = (StringBuilder){0};
-        char *directory = win_executable_directory();
-        char *context = directory ? win_join(directory, "container-bootstrap") : NULL;
-        const char *build[] = {"build", "--progress", "plain", "--tag", container_current_base_image, context, NULL};
-        ok = context && capture_runtime(w, build, &output, runtime);
-        free(context);
-        free(directory);
+// Builds the support image from the installed container bootstrap when a recipe
+// uses it and the runtime does not have the current build of it yet.
+static bool container_prepare_support(Wsl *w, ContainerRuntime runtime, const char *dockerfile) {
+    if (!strstr(dockerfile, container_support_image)) return true;
+    static const char *const files[] = {"Dockerfile", "outershell-container-init", "bin\\outershelld",
+                                        "bin\\outerctl", "bin\\outershell-socket-bridge"};
+    char *directory = win_executable_directory();
+    char *context = directory ? win_join(directory, "container-bootstrap") : NULL;
+    char *local = win_folder(CSIDL_LOCAL_APPDATA);
+    char *home = local ? win_join(local, "OuterShell") : NULL;
+    char *marker = home ? win_join(home, runtime == RUNTIME_DOCKER ? "support-image-docker.sha256" : "support-image-wslc.sha256") : NULL;
+    StringBuilder hashes = {0}, previous = {0}, output = {0};
+    bool ok = context && marker;
+    for (size_t i = 0; ok && i < sizeof(files) / sizeof(*files); i++) {
+        char *path = win_join(context, files[i]);
+        StringBuilder data = {0};
+        char hash[65];
+        ok = path && win_read_file(path, 64u * 1024u * 1024u, &data);
+        if (ok) {
+            container_helper_sha256((const unsigned char *)(data.data ? data.data : ""), data.length, hash);
+            append(&hashes, files[i]); append(&hashes, "="); append(&hashes, hash); append(&hashes, "\n");
+        }
+        free(path); free(data.data);
     }
-    free(output.data);
+    char fingerprint[65] = {0};
+    if (ok) container_helper_sha256((const unsigned char *)hashes.data, hashes.length, fingerprint);
+    bool current = ok && win_read_file(marker, 1024, &previous) && previous.data && !strncmp(previous.data, fingerprint, 64);
+    if (current) {
+        const char *inspect[] = {"image", "inspect", container_support_image, NULL};
+        current = capture_runtime(w, inspect, &output, runtime);
+    }
+    if (ok && !current) {
+        free(output.data); output = (StringBuilder){0};
+        const char *build[] = {"build", "--progress", "plain", "--tag", container_support_image, context, NULL};
+        ok = capture_runtime(w, build, &output, runtime) && win_atomic_write(marker, fingerprint, 64);
+    }
+    free(directory); free(context); free(local); free(home); free(marker);
+    free(hashes.data); free(previous.data); free(output.data);
     return ok;
 }
 
@@ -568,8 +635,8 @@ static bool container_build(Wsl *w, ContainerRuntime runtime, const char *id, co
     char *helpers = directory && runtime == RUNTIME_DOCKER ? win_join(directory, "Helpers") : NULL;
     char *derived = directory ? win_join(directory, "Dockerfile.outershell") : NULL;
     StringBuilder text = {0}, source = {0};
-    if (!container_prepare_base(w, runtime, dockerfile)) {
-        append(output, "Could not prepare the Outer Shell container image from the installed container bootstrap.\n");
+    if (!container_prepare_support(w, runtime, dockerfile)) {
+        append(output, "Could not prepare the Outer Shell support image from the installed container bootstrap.\n");
         free(directory); free(helpers); free(derived);
         return false;
     }
@@ -607,9 +674,9 @@ static DWORD WINAPI container_rebuild_thread(void *context) {
     const char *error = "The container configuration is invalid.";
     bool ok = directory && *dockerfile && container_configuration(config, &args);
     container_arguments_free(&args); args = (ContainerArguments){0};
-    char *current = container_current_base(dockerfile);
+    char *current = container_upgraded_dockerfile(dockerfile);
     if (ok && strcmp(current, dockerfile)) {
-        error = "Could not update the Dockerfile to the current Outer Shell base image.";
+        error = "Could not update the Dockerfile to use the Outer Shell support image.";
         ok = container_write(d->id, "Dockerfile", current, strlen(current));
     }
     free(dockerfile); dockerfile = current;
@@ -628,6 +695,8 @@ static DWORD WINAPI container_rebuild_thread(void *context) {
     if (ok) {
         const char *prefix[] = {"create", "--name", name, "--cpus", cpus, "--memory", memory};
         for (size_t i = 0; i < sizeof(prefix) / sizeof(*prefix); i++) ok = container_argument(&args, prefix[i]) && ok;
+        for (size_t i = 0; i < sizeof(container_runtime_arguments) / sizeof(*container_runtime_arguments); i++)
+            ok = container_argument(&args, container_runtime_arguments[i]) && ok;
         StringBuilder mount = {0}; append(&mount, "type=bind,source="); append(&mount, directory);
         append(&mount, ",target=/var/lib/outershell/project");
         ok = ok && container_argument(&args, "--mount") && container_argument(&args, mount.data) &&

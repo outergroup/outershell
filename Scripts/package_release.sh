@@ -60,6 +60,8 @@ for arch in aarch64 x86_64; do
     require_file "${RUN_ROOT}/container-bootstrap/bin/${arch}/outerctl"
     require_file "${RUN_ROOT}/container-bootstrap/bin/${arch}/outershell-socket-bridge"
 done
+require_file "${RUN_ROOT}/container-bootstrap/Dockerfile"
+require_file "${RUN_ROOT}/container-bootstrap/outershell-container-init"
 for arch in aarch64 x86_64; do
     if wants_variant "linux-${arch}"; then
         require_file "${PACKAGE_ROOT}/RemoteLinuxBinaries/${arch}/outershelld"

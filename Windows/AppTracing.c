@@ -116,16 +116,27 @@ static bool docker_command(const char *const *args) {
     app_process_close(&child);
     return ok;
 }
+static const char tracing_image[] = "outershell/tracing";
+static const char tracing_dockerfile[] =
+    "FROM debian:bookworm-slim\n"
+    "RUN apt-get update && apt-get install -y --no-install-recommends linux-perf ca-certificates"
+    " && rm -rf /var/lib/apt/lists/*\n";
 static bool docker_image(void) {
-    const char *inspect[] = {"image", "inspect", "outershell/container-base:24",
-                             NULL};
+    const char *inspect[] = {"image", "inspect", tracing_image, NULL};
     if (docker_command(inspect))
         return true;
-    char *context = win_join(tracing_directory, "container-bootstrap");
-    const char *build[] = {"build", "--tag", "outershell/container-base:24",
-                           context, NULL};
-    bool ok = docker_command(build);
+    char *local = win_folder(CSIDL_LOCAL_APPDATA);
+    char *root = local ? win_join(local, "OuterShell/tracing") : NULL;
+    char *context = root ? win_join(root, "image") : NULL;
+    char *dockerfile = context ? win_join(context, "Dockerfile") : NULL;
+    bool ok = dockerfile && win_secure_directory(root) && win_secure_directory(context) &&
+              win_atomic_write(dockerfile, tracing_dockerfile, strlen(tracing_dockerfile));
+    const char *build[] = {"build", "--tag", tracing_image, context, NULL};
+    ok = ok && docker_command(build);
+    free(local);
+    free(root);
     free(context);
+    free(dockerfile);
     return ok;
 }
 static bool tracing_request(Connection *c, HttpRequest *r, Target *target) {
@@ -194,7 +205,7 @@ static bool tracing_request(Connection *c, HttpRequest *r, Target *target) {
         args[argument++] = context.data;
         args[argument++] = "-e";
         args[argument++] = name.data;
-        args[argument++] = docker ? "outershell/container-base:24" : target->id;
+        args[argument++] = docker ? tracing_image : target->id;
         args[argument] = NULL;
         const char *serve[] = {"serve", NULL};
         char error[512];

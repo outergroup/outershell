@@ -19,8 +19,8 @@ static bool storage_owned_reference(const char *reference) {
         return container_uuid(id) && !strcmp(reference + length + 36, ":latest");
     }
     prefix = "outershell/container-base:"; length = strlen(prefix);
-    if (strncmp(reference, prefix, length) || !reference[length] || strspn(reference + length, "0123456789") != strlen(reference + length)) return false;
-    return strtoul(reference + length, NULL, 10) < 21;
+    return !strncmp(reference, prefix, length) && reference[length] &&
+           strspn(reference + length, "0123456789") == strlen(reference + length);
 }
 
 static bool storage_next_object(const unsigned char **cursor, const unsigned char *end, StringBuilder *object) {
@@ -96,7 +96,7 @@ static bool storage_inventory(Wsl *w, ContainerRuntime runtime, const char *excl
             StringBuilder reference = {0}; append(&reference, repository); append(&reference, ":"); append(&reference, tag);
             StorageImage *image = win_alloc(sizeof(*image));
             image->reference = reference.data; image->digest = digest; digest = NULL;
-            image->protected = !strcmp(image->reference, "outershell/container-base:24") ||
+            image->protected = !strcmp(image->reference, "outershell/support:latest") ||
                 (definitions.data && (strstr(definitions.data, image->reference) || strstr(definitions.data, image->digest) || strchr(definitions.data, '$') || strstr(definitions.data, "@sha256:")));
             image->next = *images; *images = image;
         }

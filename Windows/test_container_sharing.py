@@ -115,6 +115,7 @@ b=Bridge(shell)
 ids=[]
 status,raw=b.request('/api/container-snapshot');assert status==200
 base=next(p['defaultBaseImage'] for p in json.loads(raw)['providers'] if p['id']=='docker')
+support='COPY --from=outershell/support /outershell-rootfs/ /'
 def op(operation,**values):
  values.update(operation=operation,requestID=str(uuid.uuid4()))
  status,body=b.request('/api/containers',json.dumps(values).encode(),'POST')
@@ -142,7 +143,7 @@ try:
   if w:break
   time.sleep(1)
  assert w;ids.append(w['id'])
- op('updateDockerfile',workspaceID=w['id'],dockerfile=f'FROM {base}\nRUN echo sharing > /share-test\n')
+ op('updateDockerfile',workspaceID=w['id'],dockerfile=f'FROM {base}\n{support}\nRUN echo sharing > /share-test\n')
  share=op('prepareShare',workspaceID=w['id'],includeMountedFolders=False,includePersistentData=False)
  h,archive=binary(share['transferID'],1)
  assert len(archive)==share['byteCount']
@@ -161,7 +162,7 @@ try:
  with tarfile.open(fileobj=memory,mode='w:gz') as tar:
   values={'manifest.orwv':codec['offset_archive_encode']({'version':2,'name':'Unix import '+uuid.uuid4().hex,'cpus':2,'memoryInMB':2048,'includedMounts':[],'omittedMounts':[]}),
           'Recipe/recipe.orwv':codec['offset_archive_encode']({'baseImage':base,'mounts':[],'environment':[{'name':'FROM_UNIX','value':'yes'}],'publishedPorts':[]}),
-          'Recipe/Dockerfile':f'FROM {base}\nRUN echo unix > /from-unix\n'.encode()}
+          'Recipe/Dockerfile':f'FROM {base}\n{support}\nRUN echo unix > /from-unix\n'.encode()}
   for name,value in values.items():
    info=tarfile.TarInfo(name);info.size=len(value);tar.addfile(info,io.BytesIO(value))
  upload=op('beginImport')
@@ -176,6 +177,18 @@ try:
  assert status==409
  result=op('finishImport',transferID=upload['transferID'],runtimeProviderID='docker');ids.append(result['importedWorkspaceID']);wait(ids[-1])
  print('PASS Unix-format import -> Docker',flush=True)
+ memory=io.BytesIO()
+ with tarfile.open(fileobj=memory,mode='w:gz') as tar:
+  values={'manifest.orwv':codec['offset_archive_encode']({'version':2,'name':'Legacy import '+uuid.uuid4().hex,'cpus':2,'memoryInMB':2048,'includedMounts':[],'omittedMounts':[]}),
+          'Recipe/recipe.orwv':codec['offset_archive_encode']({'baseImage':'outershell/container-base:24','mounts':[],'environment':[],'publishedPorts':[]}),
+          'Recipe/Dockerfile':b'FROM outershell/container-base:24\nRUN echo legacy > /legacy-marker\n'}
+  for name,value in values.items():
+   info=tarfile.TarInfo(name);info.size=len(value);tar.addfile(info,io.BytesIO(value))
+ upload=op('beginImport');binary(upload['transferID'],2,chunk=memory.getvalue())
+ result=op('finishImport',transferID=upload['transferID'],runtimeProviderID='docker');ids.append(result['importedWorkspaceID'])
+ legacy=wait(ids[-1])
+ assert legacy['recipe']['containerfile']==f'FROM {base}\n{support}\nRUN echo legacy > /legacy-marker\n',legacy['recipe']['containerfile']
+ print('PASS legacy base-image recipe rewritten to the support image and rebuilt',flush=True)
  upload=op('beginImport');endpoint='/api/container-transfers/'+upload['transferID']
  status,_=b.request(endpoint,b'x','PATCH',headers={'Upload-Protocol':'outershell-resumable-v1','Upload-Offset':'0','Origin':'http://untrusted.invalid'})
  assert status==403
@@ -200,7 +213,7 @@ try:
   info=tarfile.TarInfo('linux:name');info.type=tarfile.SYMTYPE;info.linkname='saved.txt';inner.addfile(info)
  with tarfile.open(fileobj=memory,mode='w:gz') as tar:
   values={'manifest.orwv':codec['offset_archive_encode']({'version':2,'name':transfer_name,'cpus':2,'memoryInMB':2048,'includedMounts':[mount],'omittedMounts':[]}),
-          'Recipe/recipe.orwv':codec['offset_archive_encode'](recipe), 'Recipe/Dockerfile':f'FROM {base}\nVOLUME /saved\n'.encode(),
+          'Recipe/recipe.orwv':codec['offset_archive_encode'](recipe), 'Recipe/Dockerfile':f'FROM {base}\n{support}\nVOLUME /saved\n'.encode(),
           f'Mounted Folders/{mount_id}/hello.txt':b'mounted contents',f'Volume Archives/{data_id}.tar':volume.getvalue()}
   for name,value in values.items():
    info=tarfile.TarInfo(name);info.size=len(value);tar.addfile(info,io.BytesIO(value))
@@ -224,7 +237,7 @@ try:
   with tarfile.open(fileobj=memory,mode='w:gz') as tar:
    safe_values={'manifest.orwv':codec['offset_archive_encode']({'version':2,'name':'Unsafe archive test','cpus':2,'memoryInMB':2048,'includedMounts':[],'omittedMounts':[]}),
                 'Recipe/recipe.orwv':codec['offset_archive_encode']({'mounts':[],'environment':[],'publishedPorts':[]}),
-                'Recipe/Dockerfile':f'FROM {base}\nVOLUME /saved\n'.encode(),'Recipe/source.txt':b'safe'}
+                'Recipe/Dockerfile':f'FROM {base}\n{support}\nVOLUME /saved\n'.encode(),'Recipe/source.txt':b'safe'}
    for safe_name,value in safe_values.items():
     safe_info=tarfile.TarInfo(safe_name);safe_info.size=len(value);tar.addfile(safe_info,io.BytesIO(value))
    info=tarfile.TarInfo(unsafe)

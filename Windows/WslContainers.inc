@@ -114,13 +114,8 @@ static bool create_container(Wsl *w, HttpRequest *request, const char **error) {
         strspn(image, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-/:@") != strlen(image) ||
         !cpus || cpus > 128 || memory < 128 || memory > 1048576)
         goto done;
-    if (!container_prepare_base(w, runtime, image)) {
-        *error = "Could not prepare the Outer Shell container image. Check the Outer Shell log and the installed container bootstrap.";
-        goto done;
-    }
-    free(output.data);
-    output = (StringBuilder){0};
-    ok = false;
+    if (!dockerfile) dockerfile = container_default_dockerfile(image);
+    if (!dockerfile) goto done;
     GUID guid;
     wchar_t guid_text[40];
     if (FAILED(CoCreateGuid(&guid)) || !StringFromGUID2(&guid, guid_text, 40)) goto done;
@@ -134,19 +129,15 @@ static bool create_container(Wsl *w, HttpRequest *request, const char **error) {
     *error = "Could not save the container definition.";
     if (!save_container_metadata(id, name, cpus, memory) || !container_definition_create(id, image)) goto done;
     char *context = container_recipe_directory(id);
-    char built_image[100];
-    const char *run_image = image;
-    if (dockerfile) {
-        if (!context || !container_write(id, "Dockerfile", dockerfile, strlen(dockerfile))) { free(context); goto done; }
-        snprintf(built_image, sizeof(built_image), "outershell/managed-%s:latest", id);
-        *error = "Could not build the container. Check the container build log.";
-        bool built = container_build(w, runtime, id, dockerfile, built_image, context, &output);
-        if (output.data) container_write(id, "build.log", output.data, output.length);
-        free(output.data); output = (StringBuilder){0};
-        if (!built) { free(context); goto done; }
-        if (!container_write(id, "Dockerfile.realized", dockerfile, strlen(dockerfile))) { free(context); goto done; }
-        run_image = built_image;
-    }
+    char run_image[100];
+    if (!context || !container_write(id, "Dockerfile", dockerfile, strlen(dockerfile))) { free(context); goto done; }
+    snprintf(run_image, sizeof(run_image), "outershell/managed-%s:latest", id);
+    *error = "Could not build the container. Check the container build log.";
+    bool built = container_build(w, runtime, id, dockerfile, run_image, context, &output);
+    if (output.data) container_write(id, "build.log", output.data, output.length);
+    free(output.data); output = (StringBuilder){0};
+    if (!built) { free(context); goto done; }
+    if (!container_write(id, "Dockerfile.realized", dockerfile, strlen(dockerfile))) { free(context); goto done; }
     StringBuilder mount = {0};
     if (context) { append(&mount, "type=bind,source="); append(&mount, context); append(&mount, ",target=/var/lib/outershell/project"); }
     snprintf(cpu_text, sizeof(cpu_text), "%u", cpus);
@@ -157,6 +148,8 @@ static bool create_container(Wsl *w, HttpRequest *request, const char **error) {
     ok = context && container_image_volumes(w, runtime, id, run_image);
     char *config = container_read(id, "configuration", container_empty_configuration);
     for (size_t i = 0; ok && i < sizeof(prefix) / sizeof(*prefix); i++) ok = container_argument(&args, prefix[i]);
+    for (size_t i = 0; ok && i < sizeof(container_runtime_arguments) / sizeof(*container_runtime_arguments); i++)
+        ok = container_argument(&args, container_runtime_arguments[i]);
     ok = ok && container_persistent_arguments(w, runtime, id, config, &args) && container_argument(&args, run_image);
     *error = "The container runtime could not create the container. Check the image name and the Outer Shell log.";
     ok = ok && capture_runtime(w, (const char *const *)args.values, &output, runtime);
@@ -304,7 +297,7 @@ static void container_provider(Wsl *w, StringBuilder *json, ContainerRuntime run
     append(json, ",\"setupURL\":");
     json_string(json, runtime == RUNTIME_DOCKER ? "https://docs.docker.com/desktop/setup/install/windows-install/" :
                 "https://learn.microsoft.com/windows/wsl/wsl-container");
-    append(json, ",\"defaultBaseImage\":\"outershell/container-base:24\"}");
+    append(json, ",\"defaultBaseImage\":\"debian:bookworm\"}");
 }
 
 static void container_snapshot(Distribution *d, StringBuilder *json) {

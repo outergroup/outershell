@@ -25,7 +25,18 @@ import uuid
 
 
 PROVIDER_ID = "docker"
-DEFAULT_BASE_IMAGE = "outershell/container-base:21"
+DEFAULT_BASE_IMAGE = "debian:bookworm"
+SUPPORT_IMAGE = "outershell/support"
+SUPPORT_LINE = "COPY --from=outershell/support /outershell-rootfs/ /"
+SUPPORT_CONTEXT_LABEL = "org.outershell.support-context"
+CONTAINER_INIT = "/usr/local/bin/outershell-container-init"
+CONTAINER_ENVIRONMENT = [
+    "XDG_RUNTIME_DIR=/run/user/0",
+    "OUTERSHELLD_API_SOCKET=/run/user/0/outershelld-api",
+]
+LEGACY_BASE_IMAGE_PREFIX = "outershell/container-base:"
+LEGACY_BOOTSTRAP_COPY = "COPY --chmod=0755 .outershell/bootstrap/ /tmp/outershell-bootstrap/"
+LEGACY_BOOTSTRAP_RUN = "RUN /tmp/outershell-bootstrap/install.sh && rm -rf /tmp/outershell-bootstrap"
 DEFAULT_CPUS = 4
 DEFAULT_MEMORY_IN_MB = 8192
 MINIMUM_MEMORY_IN_MB = 128
@@ -661,12 +672,8 @@ def docker_state(container_id):
     return "running" if result.stdout.strip() == "running" else "stopped"
 
 
-def default_dockerfile():
-    return """# syntax=docker/dockerfile:1
-FROM outershell/container-base:21
-USER root
-WORKDIR /root
-"""
+def default_dockerfile(base_image=DEFAULT_BASE_IMAGE):
+    return f"FROM {base_image}\n{SUPPORT_LINE}\n"
 
 
 def default_recipe():
@@ -717,37 +724,45 @@ def save_recipe(container_id, value):
     registry_resource_set(recipe_resource_key(container_id), value)
 
 
-def normalize_imported_builtin_base(container_id, recipe):
+def upgraded_dockerfile(contents):
+    lines = []
+    for line in contents.splitlines(keepends=True):
+        stripped = line.strip()
+        if stripped == LEGACY_BOOTSTRAP_COPY:
+            lines.append(SUPPORT_LINE + "\n")
+            continue
+        if stripped == LEGACY_BOOTSTRAP_RUN:
+            continue
+        fields = stripped.split()
+        image = None
+        if fields and fields[0].upper() == "FROM":
+            image = next((field for field in fields[1:] if not field.startswith("--")), None)
+        if image and image.startswith(LEGACY_BASE_IMAGE_PREFIX):
+            start = line.find(image)
+            replaced = line[:start] + DEFAULT_BASE_IMAGE + line[start + len(image):]
+            lines.append(replaced if replaced.endswith("\n") else replaced + "\n")
+            lines.append(SUPPORT_LINE + "\n")
+            continue
+        lines.append(line)
+    return "".join(lines)
+
+
+def upgrade_definition(container_id, recipe):
     path = dockerfile_path(container_id)
     contents = path.read_text()
-    lines = contents.splitlines(keepends=True)
-    imported_base = None
-    for index, line in enumerate(lines):
-        fields = line.strip().split()
-        if not fields or fields[0].upper() != "FROM":
-            continue
-        imported_base = next(
-            (field for field in fields[1:] if not field.startswith("--")),
-            None,
-        )
-        if imported_base and imported_base.startswith("outershell/container-base:"):
-            start = line.find(imported_base)
-            lines[index] = (
-                line[:start] + DEFAULT_BASE_IMAGE + line[start + len(imported_base):]
-            )
-            path.write_text("".join(lines))
-            recipe["baseImage"] = DEFAULT_BASE_IMAGE
-        break
+    upgraded = upgraded_dockerfile(contents)
+    if upgraded != contents:
+        path.write_text(upgraded)
+    if recipe.get("baseImage", "").startswith(LEGACY_BASE_IMAGE_PREFIX):
+        recipe["baseImage"] = DEFAULT_BASE_IMAGE
+        save_recipe(container_id, recipe)
     return recipe
 
 
 def write_initial_definition(container_id, base_image=None):
     directory = recipe_directory(container_id)
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-    contents = default_dockerfile()
-    if base_image and base_image != DEFAULT_BASE_IMAGE:
-        contents = contents.replace(DEFAULT_BASE_IMAGE, base_image, 1)
-    dockerfile_path(container_id).write_text(contents)
+    dockerfile_path(container_id).write_text(default_dockerfile(base_image or DEFAULT_BASE_IMAGE))
     save_recipe(container_id, default_recipe() | {"baseImage": base_image or DEFAULT_BASE_IMAGE})
 
 
@@ -774,95 +789,40 @@ def spawn_worker(action, container_id):
     log.close()
 
 
-def base_image_context(directory):
-    bootstrap = provider_resources()
-    if not bootstrap.is_dir():
-        raise RuntimeError("Outer Shell's container bootstrap resources are missing.")
-    shutil.copytree(bootstrap, directory / ".outershell" / "bootstrap")
-    install_script = directory / ".outershell" / "install.sh"
-    install_script.write_text("""#!/bin/sh
-set -eu
-architecture=$(uname -m)
-case "$architecture" in
-    aarch64|arm64) architecture=aarch64 ;;
-    x86_64|amd64) architecture=x86_64 ;;
-    *) echo "Unsupported container architecture: $architecture" >&2; exit 1 ;;
-esac
-source_directory="/tmp/outershell-bootstrap/bin/$architecture"
-test -x "$source_directory/outershelld"
-test -x "$source_directory/outerctl"
-test -x "$source_directory/outershell-socket-bridge"
-install -d -m 0755 /usr/local/bin /etc/outershell/apps.d /var/lib/outershell/services /var/lib/outershell/apps /run/user/0
-install -m 0755 "$source_directory/outershelld" /usr/local/bin/outershelld
-install -m 0755 "$source_directory/outerctl" /usr/local/bin/outerctl
-install -m 0755 "$source_directory/outershell-socket-bridge" /usr/local/bin/outershell-socket-bridge
-install -m 0755 /tmp/outershell-bootstrap/outershell-container-init /usr/local/bin/outershell-container-init
-""")
-    os.chmod(install_script, 0o755)
-    init_script = directory / ".outershell" / "bootstrap" / "outershell-container-init"
-    init_script.write_text("""#!/bin/sh
-set -eu
-export HOME=/root USER=root LOGNAME=root XDG_RUNTIME_DIR=/run/user/0
-export OUTER_SHELL_SERVICE_MANAGER=internal
-mkdir -p /run/user/0 /var/lib/outershell/services /var/lib/outershell/apps
-chmod 0700 /run/user/0
-rm -f /run/user/0/outershelld-api
-/usr/local/bin/outershelld \
-    --api-socket-path /run/user/0/outershelld-api \
-    --service-manager internal \
-    --services-dir /var/lib/outershell/services &
-daemon_pid=$!
-trap 'kill "$daemon_pid" 2>/dev/null || true; wait "$daemon_pid" 2>/dev/null || true' EXIT INT TERM
-attempt=0
-while [ ! -S /run/user/0/outershelld-api ]; do
-    kill -0 "$daemon_pid" 2>/dev/null || { wait "$daemon_pid"; exit 1; }
-    attempt=$((attempt + 1))
-    if [ "$attempt" -ge 200 ]; then
-        echo "Outer Shell's container daemon did not start." >&2
-        exit 1
-    fi
-    sleep 0.05
-done
-for registration in /etc/outershell/apps.d/*.sh; do
-    [ -f "$registration" ] || continue
-    /bin/sh "$registration" || true
-done
-wait "$daemon_pid"
-""")
-    os.chmod(init_script, 0o755)
-    (directory / "Dockerfile").write_text("""# syntax=docker/dockerfile:1
-FROM debian:bookworm
-USER root
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends libpng16-16 \
-    && rm -rf /var/lib/apt/lists/*
-COPY --chmod=0755 .outershell/install.sh /tmp/outershell-install.sh
-COPY --chmod=0755 .outershell/bootstrap/ /tmp/outershell-bootstrap/
-RUN /tmp/outershell-install.sh && rm -rf /tmp/outershell-install.sh /tmp/outershell-bootstrap
-ENV HOME=/root USER=root LOGNAME=root XDG_RUNTIME_DIR=/run/user/0
-USER root
-WORKDIR /root
-CMD ["/usr/local/bin/outershell-container-init"]
-""")
+def engine_architecture():
+    architecture = docker(["info", "--format", "{{.Architecture}}"]).stdout.strip()
+    return {"amd64": "x86_64", "arm64": "aarch64"}.get(architecture, architecture)
 
 
-def ensure_base_image(log_path):
-    with tempfile.TemporaryDirectory(prefix="outershell-base-") as temporary:
+def support_image_context(directory):
+    resources = provider_resources()
+    binaries = resources / "bin" / engine_architecture()
+    if not (resources / "Dockerfile").is_file() or not binaries.is_dir():
+        raise RuntimeError("Outer Shell's container support resources are missing.")
+    (directory / "bin").mkdir(parents=True)
+    for name in ["outershelld", "outerctl", "outershell-socket-bridge"]:
+        shutil.copy2(binaries / name, directory / "bin" / name)
+    for name in ["Dockerfile", "outershell-container-init"]:
+        shutil.copy2(resources / name, directory / name)
+
+
+def ensure_support_image(log_path):
+    with tempfile.TemporaryDirectory(prefix="outershell-support-") as temporary:
         context = pathlib.Path(temporary)
-        base_image_context(context)
+        support_image_context(context)
         digest = hashlib.sha256()
         for path in sorted(context.rglob("*")):
             if path.is_file():
                 digest.update(path.relative_to(context).as_posix().encode() + b"\0")
                 digest.update(hashlib.sha256(path.read_bytes()).digest())
-        label = "org.outershell.base-context"
         fingerprint = digest.hexdigest()
-        inspect = docker(["image", "inspect", "--format", '{{index .Config.Labels "' + label + '"}}', DEFAULT_BASE_IMAGE])
+        inspect = docker(["image", "inspect", "--format",
+                          '{{index .Config.Labels "' + SUPPORT_CONTEXT_LABEL + '"}}', SUPPORT_IMAGE])
         if inspect.returncode == 0 and inspect.stdout.strip() == fingerprint:
             return
         with (context / "Dockerfile").open("a") as dockerfile:
-            dockerfile.write(f"LABEL {label}={fingerprint}\n")
-        build_image(context, DEFAULT_BASE_IMAGE, log_path, base_build=True)
+            dockerfile.write(f"LABEL {SUPPORT_CONTEXT_LABEL}={fingerprint}\n")
+        build_image(context, SUPPORT_IMAGE, log_path)
 
 
 def set_build_progress(container_id, phase, detail, log="", instruction=None,
@@ -905,8 +865,7 @@ def installed_app_helpers(architecture):
 def helpers_build_context(directory):
     """Lays out installed apps' helpers for the Docker engine's architecture
     at their content-addressed paths. Returns False when there are none."""
-    architecture = docker(["info", "--format", "{{.Architecture}}"]).stdout.strip()
-    architecture = {"amd64": "x86_64", "arm64": "aarch64"}.get(architecture, architecture)
+    architecture = engine_architecture()
     if directory.exists():
         shutil.rmtree(directory)
     found = False
@@ -920,7 +879,7 @@ def helpers_build_context(directory):
     return found
 
 
-def build_image(context, tag, log_path, *, container_id=None, base_build=False, helpers=None):
+def build_image(context, tag, log_path, *, container_id=None, helpers=None):
     command = [docker_path(), "build", "--label", "org.outershell.managed=true", "--progress", "plain", "--tag", tag]
     if helpers:
         dockerfile = helpers.parent / "Dockerfile.outershell"
@@ -1040,7 +999,10 @@ def create_runtime_container(container_id):
     ]
     if settings["useInit"]:
         arguments.append("--init")
-    arguments += ["--network", settings["networkMode"], "--restart", settings["restartPolicy"]]
+    arguments += ["--network", settings["networkMode"], "--restart", settings["restartPolicy"],
+                  "--entrypoint", CONTAINER_INIT, "--user", "0"]
+    for variable in CONTAINER_ENVIRONMENT:
+        arguments += ["--env", variable]
     with Records() as records:
         record = find_record(records.values, container_id)
         cpus = record.get("cpus", DEFAULT_CPUS)
@@ -1109,11 +1071,7 @@ def storage_image_owned(reference):
             return True
         except ValueError:
             return False
-    prefix = "outershell/container-base:"
-    if reference.startswith(prefix):
-        version = reference[len(prefix):]
-        return version.isdecimal() and int(version) < int(DEFAULT_BASE_IMAGE.rsplit(":", 1)[1])
-    return False
+    return reference.startswith(LEGACY_BASE_IMAGE_PREFIX)
 
 
 def storage_inventory(excluding=None):
@@ -1124,7 +1082,7 @@ def storage_inventory(excluding=None):
         if not isinstance(values, list) or len(values) != 1 or not isinstance(values[0].get("Id"), str):
             raise ValueError("Docker returned invalid image metadata.")
         images.extend(values)
-    protected = {DEFAULT_BASE_IMAGE}
+    protected = {SUPPORT_IMAGE, SUPPORT_IMAGE + ":latest"}
     files = []
     with Records() as records:
         for record in records.values:
@@ -1247,7 +1205,9 @@ def rebuild(container_id):
             terminalShell=None,
         )
         set_build_progress(container_id, "preparing", "Preparing the container build…")
-        ensure_base_image(log_path)
+        upgrade_definition(container_id, load_recipe(container_id))
+        if SUPPORT_IMAGE in dockerfile_path(container_id).read_text():
+            ensure_support_image(log_path)
         context = build_context(container_id)
         helpers = runtime_directory(container_id) / "Helpers"
         build_image(context, image_name(container_id), log_path, container_id=container_id,
@@ -1285,7 +1245,7 @@ def start_and_check_runtime(container_id):
     result = docker(["inspect", "--format", "{{.State.Status}} {{.Path}}", name], check=True)
     state, _, entrypoint = result.stdout.strip().partition(" ")
     if state == "running":
-        if entrypoint != "/usr/local/bin/outershell-container-init":
+        if entrypoint != CONTAINER_INIT:
             return
         probe = docker(["exec", "--user", "0", name, "/bin/sh", "-c",
                         'i=0; while [ "$i" -lt 150 ]; do i=$((i + 1)); [ -S /run/user/0/outershelld-api ] && exit 0; sleep 0.1; done; exit 1'])
@@ -1782,10 +1742,7 @@ def operation_finish_import(request):
     recipe = offset_archive_decode(transferred_recipe_path.read_bytes())
     transferred_recipe_path.unlink()
     save_recipe(container_id, recipe)
-    recipe = normalize_imported_builtin_base(
-        container_id,
-        recipe,
-    )
+    recipe = upgrade_definition(container_id, recipe)
     imported_mounts = []
     for mount in included_mounts:
         source = (
@@ -2423,7 +2380,6 @@ def recipe_dictionary(record, recipe):
     )
     return {
         "baseImage": recipe.get("baseImage", DEFAULT_BASE_IMAGE),
-        "installsOuterShellSupport": False,
         "containerfile": dockerfile,
         "dockerfileHostPath": str(dockerfile_path(container_id)),
         "dockerfileGuestPath": "/var/lib/outershell/project/Dockerfile",
@@ -2446,7 +2402,7 @@ def recipe_dictionary(record, recipe):
 
 def runtime_description(recipe):
     base = recipe.get("baseImage", DEFAULT_BASE_IMAGE).lower()
-    if "debian" in base or "outershell/container-base" in base:
+    if "debian" in base:
         return "Debian GNU/Linux", "12 (bookworm)"
     if "ubuntu" in base:
         return "Ubuntu", base.rsplit(":", 1)[-1] if ":" in base else ""

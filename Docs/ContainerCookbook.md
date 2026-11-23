@@ -54,38 +54,28 @@ persistent volume may need to be reinstalled.
 
 ## Choose a base image
 
-Outer Shell's prepared image is the shortest path. New containers start from
-it, and their Dockerfile begins with a line like:
-
-```dockerfile
-FROM outershell/container-base:21
-```
-
-Outer Shell builds this image on the server, and its tag differs by container
-runtime. Keep the `FROM` line that Outer Shell generated rather than copying a
-tag from another server.
-
-An ordinary Linux image works too:
+New containers start from an ordinary Linux image, followed by one line that
+adds Outer Shell's in-container tools:
 
 ```dockerfile
 FROM debian:bookworm
+COPY --from=outershell/support /outershell-rootfs/ /
 ```
 
-When an ordinary image is selected, Outer Shell offers to add this portable
-project fragment immediately after `FROM`:
+`outershell/support` is a small local image that Outer Shell builds on each
+machine from its own `outershelld`, `outerctl`, socket bridge, and container
+init script, so the tools in a container always match the host. Keep the
+`COPY` line right after the final `FROM`: later `RUN outerctl image ...` lines
+need `outerctl`, and Outer Shell starts every managed container with its init
+script as the entrypoint. Any Linux image works, because the tools are static
+binaries that need only `/bin/sh` and standard file utilities.
 
-```dockerfile
-COPY --chmod=0755 .outershell/bootstrap/ /tmp/outershell-bootstrap/
-RUN /tmp/outershell-bootstrap/install.sh && rm -rf /tmp/outershell-bootstrap
-```
+A plain `docker build` elsewhere needs an `outershell/support` image on that
+machine too.
 
-The `.outershell/bootstrap` folder contains the small Linux binaries and startup
-script required to announce apps to Outer Shell. The prepared base image contains
-the same support already, so it does not need this fragment.
-
-If a custom image already provides compatible `outershelld`, `outerctl`, and the
-Outer Shell container-init entry point, turn off **Install Outer Shell support**.
-The generated Dockerfile will then rely on the base image's installation.
+Recipes from before this change, which start `FROM outershell/container-base:<N>`
+or install `.outershell/bootstrap`, are rewritten to this form on their next
+rebuild or import.
 
 ## Give container-configuration tools their instructions
 

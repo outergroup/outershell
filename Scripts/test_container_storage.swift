@@ -15,10 +15,13 @@ struct StorageTests {
                       image("outerloop/workspace-502:1"), image("outershell/container-base:custom")]
         func candidates(_ protected: Set<String> = [], _ files: [String] = [], _ input: [Image]? = nil) -> [String] {
             ContainerImageStorage.candidates(images: input ?? images, protected: protected,
-                dockerfiles: files, currentBase: "outershell/container-base:12",
-                workspacePrefix: "outerloop/workspace-501:").map(\.reference)
+                dockerfiles: files, workspacePrefix: "outerloop/workspace-501:").map(\.reference)
         }
-        precondition(Set(candidates()) == ["outershell/container-base:1", "outerloop/workspace-501:2", recipe])
+        precondition(Set(candidates()) == ["outershell/container-base:1", "outershell/container-base:12",
+                                           "outershell/container-base:18", "outerloop/workspace-501:2",
+                                           "outerloop/workspace-501:9", recipe])
+        precondition(!candidates(["outershell/support:latest"], [], [image("outershell/support:latest")])
+            .contains("outershell/support:latest"))
         precondition(!candidates([recipe]).contains(recipe))
         precondition(!candidates([], ["FROM outershell/container-base:1\nRUN echo $HOME"]).contains("outershell/container-base:1"))
         precondition(candidates([], ["ARG BASE\nFROM ${BASE}"]).isEmpty)
@@ -88,6 +91,6 @@ struct StorageTests {
         precondition(candidates([], ["FROM alias@sha256:manifest"], dockerImages).isEmpty)
         let unlabelled = try ContainerImageStorage.dockerImages(from: Data("[{\"Id\":\"sha256:other\",\"Config\":{}}]".utf8))
         precondition(candidates([], [], unlabelled).isEmpty)
-        print("PASS: current bases, workspace fallback, owned namespaces, recipes, variable references, digest aliases, malformed inventories, stale selections, deletion failures, and deduplication")
+        print("PASS: legacy bases, workspace images, support image protection, owned namespaces, recipes, variable references, digest aliases, malformed inventories, stale selections, deletion failures, and deduplication")
     }
 }

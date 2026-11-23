@@ -75,7 +75,22 @@ private func outerShellRegistryFreeContainers(
 private let outerShellRegistryContainerOwnedFlag: UInt32 = 0x01
 
 private let currentSafeSpaceRecipeVersion = 14
-private let rootContainerBaseImage = "outershell/container-base:17"
+private let defaultContainerBaseImage = "debian:bookworm"
+private let containerSupportImage = "outershell/support"
+private let containerSupportImageReferences: Set<String> = [
+    "outershell/support", "outershell/support:latest", "docker.io/outershell/support:latest"
+]
+private let containerSupportLine = "COPY --from=outershell/support /outershell-rootfs/ /"
+private let legacyContainerBaseImagePrefix = "outershell/container-base:"
+private let legacyBootstrapCopyLine = "COPY --chmod=0755 .outershell/bootstrap/ /tmp/outershell-bootstrap/"
+private let legacyBootstrapRunLine = "RUN /tmp/outershell-bootstrap/install.sh && rm -rf /tmp/outershell-bootstrap"
+private let containerInitPath = "/usr/local/bin/outershell-container-init"
+private let containerRuntimeArguments = [
+    "--entrypoint", containerInitPath,
+    "--user", "0",
+    "--env", "XDG_RUNTIME_DIR=/run/user/0",
+    "--env", "OUTERSHELLD_API_SOCKET=/run/user/0/outershelld-api"
+]
 private let containerTransferMagic = Data([0x4f, 0x53, 0x43, 0x54])
 private let containerTransferVersion: UInt16 = 1
 private let containerTransferRead: UInt16 = 1
@@ -127,8 +142,6 @@ private struct SafeSpaceRecipe: Codable {
     var version: Int
     var baseImage: String
     var realizedBaseImage: String?
-    var installsOuterShellSupport: Bool?
-    var realizedInstallsOuterShellSupport: Bool?
     var hasUntrackedChanges: Bool?
     var mounts: [SafeSpaceMount]?
     var realizedDockerfileContents: String?
@@ -925,7 +938,7 @@ final class SafeSpaceManager: @unchecked Sendable {
                 "id": "apple.container",
                 "name": "Apple container",
                 "detail": readiness["apple.container"]?.detail ?? "Runtime check failed.",
-                "defaultBaseImage": rootContainerBaseImage,
+                "defaultBaseImage": defaultContainerBaseImage,
                 "resources": resourceLimits(for: .appleContainer).map { $0.dictionary as Any } ?? NSNull(),
                 "isolationName": "",
                 "isAvailable": readiness["apple.container"]?.isAvailable ?? false,
@@ -945,7 +958,7 @@ final class SafeSpaceManager: @unchecked Sendable {
                 "id": "docker",
                 "name": "Docker",
                 "detail": readiness["docker"]?.detail ?? "Runtime check failed.",
-                "defaultBaseImage": rootContainerBaseImage,
+                "defaultBaseImage": defaultContainerBaseImage,
                 "resources": resourceLimits(for: .docker).map { $0.dictionary as Any } ?? NSNull(),
                 "isolationName": "",
                 "isAvailable": readiness["docker"]?.isAvailable ?? false,
@@ -1433,7 +1446,7 @@ final class SafeSpaceManager: @unchecked Sendable {
         let tag = baseImage.split(separator: "/").last.flatMap { component in
             component.split(separator: ":", maxSplits: 1).dropFirst().first.map(String.init)
         } ?? ""
-        if usesBuiltInOuterShellImage(baseImage) || lowercased.contains("debian") {
+        if lowercased.contains("debian") {
             let version = tag == "bookworm" || tag.isEmpty ? "12 (bookworm)" : tag
             return ("Debian GNU/Linux", version)
         }
@@ -1525,7 +1538,6 @@ final class SafeSpaceManager: @unchecked Sendable {
         }
         let requestedDockerfile = request["dockerfile"] as? String
         if let requestedDockerfile { try validateDockerfile(requestedDockerfile) }
-        let requestedSupportInstall = request["installsOuterShellSupport"] as? Bool
         let limits = resourceLimits(for: provider) ?? .host
         let resources: (cpus: Int, memoryInMB: Int)
         switch limits.validated(cpus: request["cpus"], memoryInMB: request["memoryInMB"]) {
@@ -1548,8 +1560,6 @@ final class SafeSpaceManager: @unchecked Sendable {
         if let requestedBaseImage {
             try saveRecipe(
                 newRecipe(baseImage: requestedBaseImage,
-                          installsOuterShellSupport: requestedSupportInstall ??
-                              !usesBuiltInOuterShellImage(requestedBaseImage),
                           hasUntrackedChanges: false),
                 for: record
             )
@@ -1614,7 +1624,6 @@ final class SafeSpaceManager: @unchecked Sendable {
         try FileManager.default.copyItem(at: sourceRecipe, to: destinationRecipe)
         var duplicatedRecipe = try recipe(for: source)
         duplicatedRecipe.realizedBaseImage = nil
-        duplicatedRecipe.realizedInstallsOuterShellSupport = nil
         duplicatedRecipe.realizedDockerfileContents = nil
         duplicatedRecipe.realizedMounts = nil
         duplicatedRecipe.realizedEnvironment = nil
@@ -1999,18 +2008,16 @@ final class SafeSpaceManager: @unchecked Sendable {
             contentsOf: importedDockerfileURL,
             encoding: .utf8
         )
-        if let importedBaseImage = dockerfileBaseImage(in: importedDockerfile),
-           importedBaseImage.hasPrefix("outershell/container-base:"),
-           importedBaseImage != rootContainerBaseImage,
-           let range = importedDockerfile.range(of: importedBaseImage) {
-            importedDockerfile.replaceSubrange(range, with: rootContainerBaseImage)
+        let upgradedImportedDockerfile = upgradedDockerfile(importedDockerfile)
+        if upgradedImportedDockerfile != importedDockerfile {
+            importedDockerfile = upgradedImportedDockerfile
             try importedDockerfile.write(
                 to: importedDockerfileURL,
                 atomically: true,
                 encoding: .utf8
             )
-            importedRecipe.baseImage = rootContainerBaseImage
         }
+        importedRecipe.baseImage = dockerfileBaseImage(in: importedDockerfile) ?? defaultContainerBaseImage
         var importedMounts: [SafeSpaceMount] = []
         for mount in manifest.includedMounts {
             let source = extracted.appendingPathComponent("Mounted Folders", isDirectory: true)
@@ -2335,6 +2342,7 @@ final class SafeSpaceManager: @unchecked Sendable {
             "--cpus", String(runnableResources(record).cpus),
             "--memory", "\(runnableResources(record).memoryInMB)M",
             "--init",
+        ] + containerRuntimeArguments + [
             "--label", "org.outershell.container-id=\(record.id.uuidString)",
             "--volume", "\(try recipeDirectory(record.id).path):/var/lib/outershell/project"
         ]
@@ -2383,6 +2391,7 @@ final class SafeSpaceManager: @unchecked Sendable {
             "--cpus", String(runnableResources(record).cpus),
             "--memory", "\(runnableResources(record).memoryInMB)m",
             "--init",
+        ] + containerRuntimeArguments + [
             "--label", "org.outershell.container-id=\(record.id.uuidString)",
             "--volume", "\(try recipeDirectory(record.id).path):/var/lib/outershell/project"
         ]
@@ -2555,7 +2564,7 @@ final class SafeSpaceManager: @unchecked Sendable {
             try requireSuccess(result, action: "inspect Docker images")
             images += try ContainerImageStorage.dockerImages(from: Data(result.stdout.utf8))
         }
-        var protected: Set<String> = [rootContainerBaseImage]
+        var protected = containerSupportImageReferences
         var files: [String] = []
         for record in try loadRecords() where record.id != id && recordOwnsContainer(record) {
             if runtimeProvider(for: record) == .docker { protected.insert(recipeImageReference(record.id)) }
@@ -2577,7 +2586,7 @@ final class SafeSpaceManager: @unchecked Sendable {
             protected.insert(digest)
         }
         return ContainerImageStorage.candidates(images: images, protected: protected, dockerfiles: files,
-            currentBase: rootContainerBaseImage, workspacePrefix: "outerloop/workspace-\(getuid()):")
+            workspacePrefix: "outerloop/workspace-\(getuid()):")
     }
 
     private func dockerStorage(request: [String: Any], operation: String) throws -> [String: Any] {
@@ -2608,7 +2617,7 @@ final class SafeSpaceManager: @unchecked Sendable {
     }
 
     private func appleStorageProtection(excluding id: UUID? = nil) throws -> (Set<String>, [String]) {
-        var protected = Set<String>()
+        var protected = containerSupportImageReferences
         var dockerfiles: [String] = []
         for record in try loadRecords() where record.id != id && recordOwnsContainer(record) {
             if runtimeProvider(for: record) == .appleContainer {
@@ -2636,7 +2645,7 @@ final class SafeSpaceManager: @unchecked Sendable {
         let (protected, dockerfiles) = try appleStorageProtection(excluding: id)
         return ContainerImageStorage.candidates(
             images: try appleStorageImages(), protected: protected, dockerfiles: dockerfiles,
-            currentBase: rootContainerBaseImage, workspacePrefix: "outerloop/workspace-\(getuid()):"
+            workspacePrefix: "outerloop/workspace-\(getuid()):"
         )
     }
 
@@ -4201,10 +4210,7 @@ final class SafeSpaceManager: @unchecked Sendable {
             return value
         }
         let value = newRecipe(
-            baseImage: try rootContainerBaseReference(
-                for: runtimeProvider(for: record)
-            ),
-            installsOuterShellSupport: false,
+            baseImage: defaultContainerBaseImage,
             hasUntrackedChanges: (try? runtimeState(record)) != "absent"
         )
         try saveRecipe(value, for: record)
@@ -4212,13 +4218,10 @@ final class SafeSpaceManager: @unchecked Sendable {
     }
 
     private func newRecipe(baseImage: String,
-                           installsOuterShellSupport: Bool,
                            hasUntrackedChanges: Bool) -> SafeSpaceRecipe {
         SafeSpaceRecipe(version: currentSafeSpaceRecipeVersion,
                         baseImage: baseImage,
                         realizedBaseImage: nil,
-                        installsOuterShellSupport: installsOuterShellSupport,
-                        realizedInstallsOuterShellSupport: nil,
                         hasUntrackedChanges: hasUntrackedChanges,
                         mounts: [],
                         realizedDockerfileContents: nil,
@@ -4243,7 +4246,6 @@ final class SafeSpaceManager: @unchecked Sendable {
             OffsetArchive.encode(normalizedValue),
             for: recipeResourceKey(record.id)
         )
-        try writeOuterShellBootstrap(to: directory, isRequired: true)
         let dockerfile = try dockerfileURL(record.id)
         if !FileManager.default.fileExists(atPath: dockerfile.path) {
             try generatedDockerfile(for: normalizedValue).write(
@@ -4261,13 +4263,8 @@ final class SafeSpaceManager: @unchecked Sendable {
 
     private func normalizedRecipe(_ value: SafeSpaceRecipe) -> SafeSpaceRecipe {
         var result = value
-        if result.baseImage.hasPrefix("outershell/container-base:") {
-            result.baseImage = rootContainerBaseImage
-        }
-        if usesBuiltInOuterShellImage(result.baseImage) {
-            result.installsOuterShellSupport = false
-        } else if result.installsOuterShellSupport == nil {
-            result.installsOuterShellSupport = true
+        if result.baseImage.hasPrefix(legacyContainerBaseImagePrefix) {
+            result.baseImage = defaultContainerBaseImage
         }
         if result.environment == nil {
             result.environment = []
@@ -4285,7 +4282,6 @@ final class SafeSpaceManager: @unchecked Sendable {
         var value = normalizedRecipe(try recipe(for: record))
         value.version = currentSafeSpaceRecipeVersion
         value.realizedBaseImage = value.baseImage
-        value.realizedInstallsOuterShellSupport = value.installsOuterShellSupport
         value.realizedDockerfileContents = try dockerfileContents(for: record)
         value.realizedMounts = value.mounts ?? []
         value.realizedEnvironment = value.environment ?? []
@@ -4308,7 +4304,6 @@ final class SafeSpaceManager: @unchecked Sendable {
             value.realizedMemoryInMB.map { $0 != record.memoryInMB } == true
         return [
             "baseImage": value.baseImage,
-            "installsOuterShellSupport": value.installsOuterShellSupport ?? false,
             "containerfile": dockerfile,
             "dockerfileHostPath": try dockerfileURL(record.id).path,
             "dockerfileGuestPath": "/var/lib/outershell/project/Dockerfile",
@@ -4355,83 +4350,110 @@ final class SafeSpaceManager: @unchecked Sendable {
     }
 
     private func generatedDockerfile(for value: SafeSpaceRecipe) -> String {
-        let value = normalizedRecipe(value)
-        var lines = [
-            "# syntax=docker/dockerfile:1",
-            "FROM \(value.baseImage)"
-        ]
-        if value.installsOuterShellSupport == true {
-            lines.append("")
-            lines.append(contentsOf: outerShellBootstrapInstructions())
+        "FROM \(normalizedRecipe(value).baseImage)\n\(containerSupportLine)\n"
+    }
+
+    private func upgradedDockerfile(_ contents: String) -> String {
+        var lines: [String] = []
+        for line in contents.components(separatedBy: "\n") {
+            let stripped = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            if stripped == legacyBootstrapCopyLine {
+                lines.append(containerSupportLine)
+                continue
+            }
+            if stripped == legacyBootstrapRunLine { continue }
+            let fields = stripped.split(whereSeparator: { $0.isWhitespace })
+            if fields.first?.uppercased() == "FROM",
+               let image = fields.dropFirst().first(where: { !$0.hasPrefix("--") }),
+               image.hasPrefix(legacyContainerBaseImagePrefix),
+               let range = line.range(of: String(image)) {
+                lines.append(line.replacingCharacters(in: range, with: defaultContainerBaseImage))
+                lines.append(containerSupportLine)
+                continue
+            }
+            lines.append(line)
         }
-        if usesManagedOuterShellSupport(value) {
-            lines.append("")
-            lines.append(contentsOf: outerShellRuntimeInstructions())
-        }
-        lines.append("")
         return lines.joined(separator: "\n")
     }
 
-    private func usesBuiltInOuterShellImage(_ image: String) -> Bool {
-        image == rootContainerBaseImage
-    }
-
-    private func usesManagedOuterShellSupport(_ value: SafeSpaceRecipe) -> Bool {
-        usesBuiltInOuterShellImage(value.baseImage) ||
-            value.installsOuterShellSupport == true
-    }
-
-    private func outerShellBootstrapInstructions() -> [String] {
-        [
-            "COPY --chmod=0755 .outershell/bootstrap/ /tmp/outershell-bootstrap/",
-            "RUN /tmp/outershell-bootstrap/install.sh && rm -rf /tmp/outershell-bootstrap"
-        ]
-    }
-
-    private func outerShellRuntimeInstructions() -> [String] {
-        [
-            "ENV HOME=/root USER=root LOGNAME=root XDG_RUNTIME_DIR=/run/user/0 OUTERSHELL_HOME=/var/lib/outershell OUTERSHELLD_API_SOCKET=/run/user/0/outershelld-api",
-            "USER root",
-            "WORKDIR /root",
-            "CMD [\"/usr/local/bin/outershell-container-init\"]"
-        ]
-    }
-
-    private func writeOuterShellBootstrap(to directory: URL,
-                                          isRequired: Bool) throws {
-        let outerShellDirectory = directory.appendingPathComponent(
-            ".outershell",
-            isDirectory: true
-        )
-        let destination = outerShellDirectory.appendingPathComponent(
-            "bootstrap",
-            isDirectory: true
-        )
-        if FileManager.default.fileExists(atPath: destination.path) {
-            try FileManager.default.removeItem(at: destination)
+    private func upgradeDefinition(for record: SafeSpaceRecord) throws {
+        let url = try dockerfileURL(record.id)
+        guard FileManager.default.fileExists(atPath: url.path) else { return }
+        let contents = try String(contentsOf: url, encoding: .utf8)
+        let upgraded = upgradedDockerfile(contents)
+        if upgraded != contents {
+            try upgraded.write(to: url, atomically: true, encoding: .utf8)
         }
-        guard isRequired else { return }
-        guard let source = containerBootstrapPayloadURL() else {
+    }
+
+    private func supportImageArchitecture(
+        for provider: SafeSpaceRuntimeProviderID
+    ) throws -> String {
+        let architecture: String
+        switch provider {
+        case .appleContainer:
+            architecture = cpuArchitecture()
+        case .docker:
+            let result = try runDocker(["info", "--format", "{{.Architecture}}"])
+            try requireSuccess(result, action: "inspect the Docker engine architecture")
+            architecture = result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        return ["arm64": "aarch64", "amd64": "x86_64"][architecture] ?? architecture
+    }
+
+    private func ensureSupportImage(for provider: SafeSpaceRuntimeProviderID) throws {
+        guard let resources = containerBootstrapPayloadURL() else {
             throw SafeSpaceManagerError.commandFailed(
-                "Outer Shell's portable container bootstrap is missing."
+                "Outer Shell's container support resources are missing."
             )
         }
-        try FileManager.default.createDirectory(
-            at: outerShellDirectory,
-            withIntermediateDirectories: true,
-            attributes: [.posixPermissions: 0o700]
-        )
-        try FileManager.default.copyItem(at: source, to: destination)
-        try outerShellContainerBootstrapInstallScript().write(
-            to: destination.appendingPathComponent("install.sh"),
-            atomically: true,
-            encoding: .utf8
-        )
-        try outerShellContainerInitScript().write(
-            to: destination.appendingPathComponent("outershell-container-init"),
-            atomically: true,
-            encoding: .utf8
-        )
+        let binaries = resources.appendingPathComponent("bin", isDirectory: true)
+            .appendingPathComponent(try supportImageArchitecture(for: provider), isDirectory: true)
+        let directory = try applicationDirectory()
+            .appendingPathComponent("Build Contexts", isDirectory: true)
+            .appendingPathComponent("outershell-support-\(UUID().uuidString)", isDirectory: true)
+        let bin = directory.appendingPathComponent("bin", isDirectory: true)
+        try FileManager.default.createDirectory(at: bin,
+                                                withIntermediateDirectories: true,
+                                                attributes: [.posixPermissions: 0o700])
+        defer { try? FileManager.default.removeItem(at: directory) }
+        var digestInput = Data()
+        for name in ["outershelld", "outerctl", "outershell-socket-bridge"] {
+            let destination = bin.appendingPathComponent(name)
+            try FileManager.default.copyItem(at: binaries.appendingPathComponent(name), to: destination)
+            digestInput.append(Data("bin/\(name)\0".utf8))
+            digestInput.append(Data(SHA256.hash(data: try Data(contentsOf: destination))))
+        }
+        for name in ["Dockerfile", "outershell-container-init"] {
+            let destination = directory.appendingPathComponent(name)
+            try FileManager.default.copyItem(at: resources.appendingPathComponent(name), to: destination)
+            digestInput.append(Data("\(name)\0".utf8))
+            digestInput.append(Data(SHA256.hash(data: try Data(contentsOf: destination))))
+        }
+        let fingerprint = SHA256.hash(data: digestInput).map { String(format: "%02x", $0) }.joined()
+        let marker = try applicationDirectory()
+            .appendingPathComponent("support-image-\(provider.rawValue).sha256")
+        if (try? String(contentsOf: marker, encoding: .utf8)) == fingerprint,
+           !(try containerImageReferences(provider: provider)).isDisjoint(with: containerSupportImageReferences) {
+            return
+        }
+        let dockerfile = directory.appendingPathComponent("Dockerfile")
+        try (try String(contentsOf: dockerfile, encoding: .utf8) +
+             "LABEL org.outershell.support-context=\(fingerprint)\n")
+            .write(to: dockerfile, atomically: true, encoding: .utf8)
+        let arguments = [
+            "build", "--file", "Dockerfile",
+            "--tag", containerSupportImage, "--progress", "plain", "."
+        ]
+        let result: (status: Int32, stdout: String, stderr: String)
+        switch provider {
+        case .appleContainer:
+            result = try runContainer(arguments, currentDirectoryURL: directory)
+        case .docker:
+            result = try runDocker(arguments, currentDirectoryURL: directory)
+        }
+        try requireSuccess(result, action: "prepare Outer Shell's container support image")
+        try fingerprint.write(to: marker, atomically: true, encoding: .utf8)
     }
 
     private func writeContainerProjectGuide(to directory: URL) throws {
@@ -4445,13 +4467,13 @@ final class SafeSpaceManager: @unchecked Sendable {
         # or: docker build --tag my-container .
         ```
 
-        The `FROM` instruction is your chosen base image. For a custom image, Outer Shell can use `.outershell/bootstrap` to install the small service-management tools that let apps announce themselves. You can omit that step when the base image already provides compatible Outer Shell support.
+        The `FROM` instruction is your chosen base image. The line `COPY --from=outershell/support /outershell-rootfs/ /` adds Outer Shell's small in-container tools, which let apps announce themselves. Outer Shell builds the `outershell/support` image on this machine, so a build elsewhere needs that image too.
 
         Outer Shell treats `Dockerfile` as the source of truth. The same project directory is mounted at `/var/lib/outershell/project` while the container runs, so a root process in the container can edit the Dockerfile and its build-context files directly. Rebuilding recreates the image from those files.
 
         Mounted folders are runtime configuration. They intentionally do not appear in the Dockerfile or become part of the image. Recreate those mounts separately when moving the container to another host.
 
-        The portable bootstrap expects a Linux image with `/bin/sh` and standard file utilities. Software snippets may have narrower requirements, such as a Debian-family image.
+        Outer Shell's tools are static Linux binaries and need only `/bin/sh` and standard file utilities in the image. Software snippets may have narrower requirements, such as a Debian-family image.
         """
         try guide.write(
             to: directory.appendingPathComponent("README.md"),
@@ -4482,74 +4504,6 @@ final class SafeSpaceManager: @unchecked Sendable {
         return candidates.first {
             FileManager.default.fileExists(atPath: $0.path)
         }
-    }
-
-    private func outerShellContainerBootstrapInstallScript() -> String {
-        """
-        #!/bin/sh
-        set -eu
-        architecture=$(/bin/uname -m)
-        case "${architecture}" in
-            aarch64|arm64) architecture=aarch64 ;;
-            x86_64|amd64) architecture=x86_64 ;;
-            *) /bin/echo "Unsupported architecture: ${architecture}" >&2; exit 1 ;;
-        esac
-        source_directory=/tmp/outershell-bootstrap/bin/${architecture}
-        test -x "${source_directory}/outershelld"
-        test -x "${source_directory}/outerctl"
-        test -x "${source_directory}/outershell-socket-bridge"
-        /bin/mkdir -p /usr/local/bin /run/user/0 /var/lib/outershell/services \
-            /var/lib/outershell/apps /etc/outershell/apps.d /root/.config/outerssh \
-            /root/.cache
-        /bin/cp "${source_directory}/outershelld" /usr/local/bin/outershelld
-        /bin/cp "${source_directory}/outerctl" /usr/local/bin/outerctl
-        /bin/cp "${source_directory}/outershell-socket-bridge" \
-            /usr/local/bin/outershell-socket-bridge
-        /bin/cp /tmp/outershell-bootstrap/outershell-container-init \
-            /usr/local/bin/outershell-container-init
-        /bin/chmod 0755 /usr/local/bin/outershelld /usr/local/bin/outerctl \
-            /usr/local/bin/outershell-socket-bridge \
-            /usr/local/bin/outershell-container-init
-        /bin/chmod 0700 /run/user/0 /root/.config/outerssh
-        """
-    }
-
-    private func outerShellContainerInitScript() -> String {
-        """
-        #!/bin/sh
-        set -eu
-        umask 022
-        /bin/mkdir -p /run/user/0 /root/.config/outerssh /var/lib/outershell/services \
-            /var/lib/outershell/apps /etc/outershell/apps.d /root/.cache
-        /bin/chmod 0700 /run/user/0 /root/.config/outerssh
-        /usr/bin/printf '%s\n' '%t/outershelld-api' \
-            >/root/.config/outerssh/http-unix.allow
-        /bin/chmod 0600 /root/.config/outerssh/http-unix.allow
-        export HOME=/root USER=root LOGNAME=root XDG_RUNTIME_DIR=/run/user/0
-        export OUTERSHELL_HOME=/var/lib/outershell
-        export OUTERSHELLD_API_SOCKET=/run/user/0/outershelld-api
-        /usr/local/bin/outershelld --service-manager internal \
-            --services-dir /var/lib/outershell/services \
-            --api-socket-path /run/user/0/outershelld-api --stay-alive &
-        daemon_pid=$!
-        /usr/bin/printf '%s\n' "${daemon_pid}" >/run/user/0/outershelld.pid
-        cleanup() {
-            /bin/kill "${daemon_pid}" 2>/dev/null || true
-            wait "${daemon_pid}" 2>/dev/null || true
-        }
-        trap cleanup EXIT INT TERM HUP
-        attempts=0
-        while [ ! -S /run/user/0/outershelld-api ] && [ "${attempts}" -lt 120 ]; do
-            attempts=$((attempts + 1))
-            /bin/sleep 0.1
-        done
-        for registration in /etc/outershell/apps.d/*.sh; do
-            [ -f "${registration}" ] || continue
-            /bin/sh "${registration}" || \
-                /usr/bin/printf 'App registration failed: %s\n' "${registration}" >&2
-        done
-        wait "${daemon_pid}"
-        """
     }
 
     private func recipeDirectory(_ id: UUID) throws -> URL {
@@ -5052,42 +5006,6 @@ final class SafeSpaceManager: @unchecked Sendable {
         )
     }
 
-    private func rootContainerBaseReference(
-        for provider: SafeSpaceRuntimeProviderID
-    ) throws -> String {
-        containerBaseImageLock.lock()
-        defer { containerBaseImageLock.unlock() }
-        let images = try containerImageReferences(provider: provider)
-        if images.contains(rootContainerBaseImage) {
-            return rootContainerBaseImage
-        }
-        if provider == .docker {
-            try buildRootContainerBase(
-                from: "debian:bookworm",
-                provider: provider
-            )
-            return rootContainerBaseImage
-        }
-        let prefix = "outerloop/workspace-\(getuid()):"
-        let references = images.compactMap { reference -> (version: Int, reference: String)? in
-            guard reference.hasPrefix(prefix),
-                  let version = Int(reference.dropFirst(prefix.count)) else {
-                return nil
-            }
-            return (version, reference)
-        }
-        guard let selected = references.max(by: { $0.version < $1.version }) else {
-            throw SafeSpaceManagerError.commandFailed(
-                "Outer Shell's container OCI image has not been installed."
-            )
-        }
-        try buildRootContainerBase(
-            from: selected.reference,
-            provider: provider
-        )
-        return rootContainerBaseImage
-    }
-
     private func containerImageReferences(
         provider: SafeSpaceRuntimeProviderID = .appleContainer
     ) throws -> Set<String> {
@@ -5230,59 +5148,6 @@ final class SafeSpaceManager: @unchecked Sendable {
         return normalized
     }
 
-    private func buildRootContainerBase(
-        from sourceImage: String,
-        provider: SafeSpaceRuntimeProviderID
-    ) throws {
-        let buildContextsDirectory = try applicationDirectory()
-            .appendingPathComponent("Build Contexts", isDirectory: true)
-        try FileManager.default.createDirectory(
-            at: buildContextsDirectory,
-            withIntermediateDirectories: true,
-            attributes: [.posixPermissions: 0o700]
-        )
-        let directory = buildContextsDirectory
-            .appendingPathComponent("outershell-container-base-\(UUID().uuidString)")
-        try FileManager.default.createDirectory(
-            at: directory,
-            withIntermediateDirectories: true,
-            attributes: [.posixPermissions: 0o700]
-        )
-        defer { try? FileManager.default.removeItem(at: directory) }
-        try writeOuterShellBootstrap(to: directory, isRequired: true)
-        let containerfile = """
-        FROM \(sourceImage)
-        USER root
-        COPY --chmod=0755 .outershell/bootstrap/ /tmp/outershell-bootstrap/
-        RUN /tmp/outershell-bootstrap/install.sh \\
-            && /bin/rm -rf /tmp/outershell-bootstrap \\
-            && /bin/rm -rf /home/workspace /etc/sudoers.d/workspace \\
-            && (/usr/sbin/userdel workspace 2>/dev/null || true) \\
-            && (/usr/sbin/groupdel workspace 2>/dev/null || true)
-        ENV HOME=/root USER=root LOGNAME=root XDG_RUNTIME_DIR=/run/user/0 OUTERSHELL_HOME=/var/lib/outershell OUTERSHELLD_API_SOCKET=/run/user/0/outershelld-api
-        USER root
-        WORKDIR /root
-        CMD ["/usr/local/bin/outershell-container-init"]
-        """
-        try containerfile.write(
-            to: directory.appendingPathComponent("Containerfile"),
-            atomically: true,
-            encoding: .utf8
-        )
-        let arguments = [
-            "build", "--file", "Containerfile",
-            "--tag", rootContainerBaseImage, "--progress", "plain", "."
-        ]
-        let result: (status: Int32, stdout: String, stderr: String)
-        switch provider {
-        case .appleContainer:
-            result = try runContainer(arguments, currentDirectoryURL: directory)
-        case .docker:
-            result = try runDocker(arguments, currentDirectoryURL: directory)
-        }
-        try requireSuccess(result, action: "prepare Outer Shell's root container image")
-    }
-
     private func runContainerBuild(_ record: SafeSpaceRecord,
                                    imageReference: String)
         throws -> (status: Int32, stdout: String, stderr: String) {
@@ -5296,11 +5161,10 @@ final class SafeSpaceManager: @unchecked Sendable {
             containerBaseImageLock.unlock()
             if runtimeProvider(for: record) == .appleContainer { scheduleAppleImageCleanup() }
         }
+        try upgradeDefinition(for: record)
         let value = normalizedRecipe(try recipe(for: record))
-        if value.baseImage == rootContainerBaseImage {
-            _ = try rootContainerBaseReference(
-                for: runtimeProvider(for: record)
-            )
+        if try dockerfileContents(for: record).contains(containerSupportImage) {
+            try ensureSupportImage(for: runtimeProvider(for: record))
         }
         try saveRecipe(value, for: record)
         let directory = try recipeDirectory(record.id)

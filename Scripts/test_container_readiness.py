@@ -53,26 +53,47 @@ class ReadinessTests(unittest.TestCase):
         with patch.dict(g, docker=docker, container_name=lambda _: "qa"):
             g["start_and_check_runtime"]("qa")
 
-    def test_changed_bootstrap_invalidates_base(self):
+    def test_changed_support_files_rebuild_support_image(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            daemon = root / "outershelld"
-            daemon.write_bytes(b"one")
+            binaries = root / "bin" / "aarch64"
+            binaries.mkdir(parents=True)
+            for name in ["outershelld", "outerctl", "outershell-socket-bridge"]:
+                (binaries / name).write_bytes(b"one")
+            (root / "Dockerfile").write_text("FROM scratch\n")
+            (root / "outershell-container-init").write_text("#!/bin/sh\n")
             labels = []
 
-            def build(context, *args, **kwargs):
+            def build(context, tag, *args, **kwargs):
+                self.assertEqual(tag, "outershell/support")
                 labels.append((context / "Dockerfile").read_text().splitlines()[-1].split("=")[1])
 
             def inspect(*args, **kwargs):
                 return subprocess.CompletedProcess([], 0, labels[-1] if labels else "", "")
 
-            with patch.dict(g, provider_resources=lambda: root, docker=inspect, build_image=build):
-                g["ensure_base_image"](None)
-                g["ensure_base_image"](None)
-                daemon.write_bytes(b"two")
-                g["ensure_base_image"](None)
+            with patch.dict(g, provider_resources=lambda: root, docker=inspect, build_image=build,
+                            engine_architecture=lambda: "aarch64"):
+                g["ensure_support_image"](None)
+                g["ensure_support_image"](None)
+                (binaries / "outershelld").write_bytes(b"two")
+                g["ensure_support_image"](None)
             self.assertEqual(len(labels), 2)
             self.assertNotEqual(*labels)
+
+    def test_legacy_dockerfiles_are_upgraded(self):
+        upgraded = g["upgraded_dockerfile"](
+            "# syntax=docker/dockerfile:1\nFROM outershell/container-base:21\nUSER root\n"
+        )
+        self.assertEqual(upgraded, "# syntax=docker/dockerfile:1\nFROM debian:bookworm\n"
+                         "COPY --from=outershell/support /outershell-rootfs/ /\nUSER root\n")
+        bootstrapped = g["upgraded_dockerfile"](
+            "FROM alpine:3.22\n\nCOPY --chmod=0755 .outershell/bootstrap/ /tmp/outershell-bootstrap/\n"
+            "RUN /tmp/outershell-bootstrap/install.sh && rm -rf /tmp/outershell-bootstrap\nRUN true\n"
+        )
+        self.assertEqual(bootstrapped, "FROM alpine:3.22\n\n"
+                         "COPY --from=outershell/support /outershell-rootfs/ /\nRUN true\n")
+        current = "FROM debian:bookworm\nCOPY --from=outershell/support /outershell-rootfs/ /\n"
+        self.assertEqual(g["upgraded_dockerfile"](current), current)
 
     def test_timeout(self):
         def timeout(*args, **kwargs):

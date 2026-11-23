@@ -208,14 +208,8 @@ struct ContainerImageStorage {
     }
 
     static func candidates(images: [Image], protected: Set<String>, dockerfiles: [String],
-                           currentBase: String, workspacePrefix: String) -> [Image] {
-        let newestWorkspace = images.compactMap { image -> (Int, String)? in
-            guard image.reference.hasPrefix(workspacePrefix),
-                  let version = Int(image.reference.dropFirst(workspacePrefix.count)) else { return nil }
-            return (version, image.reference)
-        }.max { $0.0 < $1.0 }?.1
-        var keep = protected.union([currentBase])
-        if let newestWorkspace { keep.insert(newestWorkspace) }
+                           workspacePrefix: String) -> [Image] {
+        var keep = protected
         if dockerfiles.contains(where: { text in
             text.replacingOccurrences(of: "\r\n", with: "\n").replacingOccurrences(of: "\\\n", with: " ").split(separator: "\n").contains { line in
                 let instruction = line.trimmingCharacters(in: .whitespaces).uppercased()
@@ -241,9 +235,7 @@ struct ContainerImageStorage {
                 return Int(image.reference.dropFirst(workspacePrefix.count)) != nil
             }
             if image.reference.hasPrefix("outershell/container-base:") {
-                guard let version = Int(image.reference.dropFirst("outershell/container-base:".count)),
-                      let current = currentBase.split(separator: ":").last.flatMap({ Int($0) }) else { return false }
-                return version < current
+                return Int(image.reference.dropFirst("outershell/container-base:".count)) != nil
             }
             let prefix = "outershell/container-"
             guard image.reference.hasPrefix(prefix), image.reference.hasSuffix(":recipe") else { return false }

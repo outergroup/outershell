@@ -698,8 +698,12 @@ final class SingleLineTextInputController<DelegateClass: SingleLineTextInputCont
     }
 
     private func visualLineOffset(from position: Int, delta: Int) -> Int? {
-        guard let visualLineWidth, visualLineWidth > 1 else { return nil }
-        let fragments = visualLineFragments(maxWidth: visualLineWidth)
+        let fragments: [Range<Int>]
+        if let visualLineWidth, visualLineWidth > 1 {
+            fragments = visualLineFragments(maxWidth: visualLineWidth)
+        } else {
+            fragments = paragraphFragments()
+        }
         guard !fragments.isEmpty else { return nil }
         let clamped = clamp(position)
         let currentIndex = visualLineIndex(for: clamped, in: fragments)
@@ -731,6 +735,16 @@ final class SingleLineTextInputController<DelegateClass: SingleLineTextInputCont
             return max(fragments.count - 1, 0)
         }
         return 0
+    }
+
+    private func paragraphFragments() -> [Range<Int>] {
+        var fragments: [Range<Int>] = []
+        var start = 0
+        for part in text.split(separator: "\n", omittingEmptySubsequences: false) {
+            fragments.append(start..<(start + part.count))
+            start += part.count + 1
+        }
+        return fragments
     }
 
     private func visualLineFragments(maxWidth: CGFloat) -> [Range<Int>] {

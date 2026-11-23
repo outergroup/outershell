@@ -50,9 +50,11 @@ if (!$Image) {
     $Image = ($snapshot.providers | Where-Object id -eq $Provider | Select-Object -First 1).defaultBaseImage
     if (!$Image) { throw "The $Provider provider did not report a default base image." }
 }
+$support = 'COPY --from=outershell/support /outershell-rootfs/ /'
 $marker = 'outershell-container-test-' + [guid]::NewGuid().ToString('N')
 $testDockerfile = @"
 FROM $Image
+$support
 RUN apt-get update && apt-get install -y --no-install-recommends bash curl python3 socat && rm -rf /var/lib/apt/lists/*
 RUN mkdir -p /srv/outershell-test && echo $marker > /srv/outershell-test/index.html
 RUN outerctl image add-app --id outershell-test --name "Container test" --tcp-port 8000 -- /usr/bin/python3 -m http.server 8000 --bind 127.0.0.1 --directory /srv/outershell-test
@@ -101,7 +103,7 @@ try {
     Operation 'rename' @{workspaceID=$id; name="$name renamed"} | Out-Null
     Wait-Container "$name renamed" 'running' | Out-Null
     Write-Output 'PASS container stop/start, rename, and app logs'
-    Operation 'updateDockerfile' @{workspaceID=$id; dockerfile="FROM $Image`nRUN echo rebuilt > /rebuilt-marker`n"} | Out-Null
+    Operation 'updateDockerfile' @{workspaceID=$id; dockerfile="FROM $Image`n$support`nRUN echo rebuilt > /rebuilt-marker`n"} | Out-Null
     $folder="$env:USERPROFILE\Downloads\OuterShell mount test"
     New-Item -ItemType Directory -Force $folder | Out-Null
     Set-Content "$folder\probe.txt" 'mount works'
@@ -130,7 +132,7 @@ try {
     $ErrorActionPreference='Stop'
     if(!$writeExit){throw 'Read-only mount allowed a write'}
     Write-Output 'PASS Dockerfile/configuration update, rebuild, read-only mount, environment, port mapping, and stable identity'
-    Operation 'updateDockerfile' @{workspaceID=$id;dockerfile="FROM $Image`nRUN exit 37`n"} | Out-Null
+    Operation 'updateDockerfile' @{workspaceID=$id;dockerfile="FROM $Image`n$support`nRUN exit 37`n"} | Out-Null
     Operation 'rebuildRecipe' @{workspaceID=$id} | Out-Null
     for($i=0;$i -lt 60;$i++) {
         $snapshot=Request '/api/container-snapshot' | ConvertFrom-Json

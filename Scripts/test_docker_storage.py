@@ -63,16 +63,15 @@ class StorageTests(unittest.TestCase):
         self.images[0]['RepoDigests']=['original@sha256:manifest']
         (self.root/'Dockerfile').write_text('FROM alias@sha256:manifest')
         self.assertEqual(self.candidates(), [])
-    def test_dynamic_and_current_base(self):
+    def test_dynamic_base_legacy_bases_and_support_image(self):
         Records.values=[{'id':ID,'ownsContainer':True}]
         (self.root/'Dockerfile').write_text('ARG BASE\nFROM ${BASE}')
         self.assertEqual(self.candidates(), [])
         Records.values=[]
-        self.images[0]['RepoTags']=['outershell/container-base:20']
-        self.assertEqual(self.candidates(), ['outershell/container-base:20'])
-        self.images[0]['RepoTags']=['outershell/container-base:21']
-        self.assertEqual(self.candidates(), [])
-        self.images[0]['RepoTags']=['outershell/container-base:22']
+        for tag in ['outershell/container-base:20','outershell/container-base:21']:
+            self.images[0]['RepoTags']=[tag]
+            self.assertEqual(self.candidates(), [tag])
+        self.images[0]['RepoTags']=['outershell/support:latest']
         self.assertEqual(self.candidates(), [])
     def test_dangling_requires_label(self):
         self.images[0]['RepoTags']=[]
