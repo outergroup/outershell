@@ -2797,6 +2797,15 @@ final class SafeSpaceManager: @unchecked Sendable {
         try saveCachedApps()
         if recordOwnsContainer(record) {
             try RegistryResourceStore.remove(configurationResourceKey(record.id))
+            do {
+                let directory = try safeSpaceDirectory(record.id)
+                if FileManager.default.fileExists(atPath: directory.path) {
+                    try FileManager.default.removeItem(at: directory)
+                }
+            } catch {
+                NSLog("Container folder removal failed for %@: %@",
+                      record.id.uuidString, error.localizedDescription)
+            }
         }
     }
 

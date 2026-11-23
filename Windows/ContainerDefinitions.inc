@@ -47,6 +47,49 @@ static char *container_move_build_context(const char *source, const char *id) {
     return target;
 }
 
+static bool container_remove_path(const wchar_t *path, unsigned depth) {
+    if (depth > 64) return false;
+    DWORD attributes = GetFileAttributesW(path);
+    if (attributes == INVALID_FILE_ATTRIBUTES) {
+        DWORD error = GetLastError();
+        return error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND;
+    }
+    if (attributes & FILE_ATTRIBUTE_READONLY)
+        SetFileAttributesW(path, attributes & ~FILE_ATTRIBUTE_READONLY);
+    if (!(attributes & FILE_ATTRIBUTE_DIRECTORY)) return DeleteFileW(path);
+    if (attributes & FILE_ATTRIBUTE_REPARSE_POINT) return RemoveDirectoryW(path);
+    size_t length = wcslen(path);
+    wchar_t *pattern = win_alloc((length + 3) * sizeof(wchar_t));
+    memcpy(pattern, path, length * sizeof(wchar_t));
+    memcpy(pattern + length, L"\\*", 3 * sizeof(wchar_t));
+    WIN32_FIND_DATAW entry;
+    HANDLE iterator = FindFirstFileW(pattern, &entry);
+    free(pattern);
+    bool ok = iterator != INVALID_HANDLE_VALUE;
+    if (ok) {
+        do {
+            if (!wcscmp(entry.cFileName, L".") || !wcscmp(entry.cFileName, L"..")) continue;
+            size_t name_length = wcslen(entry.cFileName);
+            wchar_t *child = win_alloc((length + name_length + 2) * sizeof(wchar_t));
+            memcpy(child, path, length * sizeof(wchar_t));
+            child[length] = L'\\';
+            memcpy(child + length + 1, entry.cFileName, (name_length + 1) * sizeof(wchar_t));
+            if (!container_remove_path(child, depth + 1)) ok = false;
+            free(child);
+        } while (FindNextFileW(iterator, &entry));
+        FindClose(iterator);
+    }
+    return ok && RemoveDirectoryW(path);
+}
+
+static bool container_remove_directory(const char *id) {
+    char *directory = container_directory(id);
+    wchar_t *wide = directory ? win_wide(directory) : NULL;
+    bool ok = wide && container_remove_path(wide, 0);
+    free(wide); free(directory);
+    return ok;
+}
+
 static char *container_file(const char *id, const char *name) {
     char *directory = !strcmp(name, "Dockerfile") ? container_build_context_directory(id) : container_directory(id);
     char *path = directory ? win_join(directory, name) : NULL;

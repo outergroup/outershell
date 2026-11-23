@@ -1515,6 +1515,8 @@ void wsl_serve(Wsl *w, Connection *c, HttpRequest *r) {
                 if (wide) DeleteFileW(wide);
                 free(wide);
                 free(path);
+                if (!container_remove_directory(d->id))
+                    fprintf(stderr, "Could not remove the folder of container %s: %lu\n", d->id, GetLastError());
                 d->present = false;
             }
         }

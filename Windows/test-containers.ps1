@@ -146,7 +146,16 @@ try {
 
 } finally {
     if ($id) {
+        $folder = Join-Path $env:LOCALAPPDATA "OuterShell\containers\$id"
+        $outside = Join-Path $env:TEMP "outershell-delete-test-$id"
+        New-Item -ItemType Directory -Force $outside | Out-Null
+        Set-Content (Join-Path $outside 'keep.txt') 'keep'
+        $context = @('BuildContext','Recipe') | ForEach-Object { Join-Path $folder $_ } | Where-Object { Test-Path $_ } | Select-Object -First 1
+        if ($context) { New-Item -ItemType Junction -Path (Join-Path $context 'outside') -Target $outside | Out-Null }
         Operation 'delete' @{workspaceID=$id} | Out-Null
-        Write-Output 'PASS delete disposable test container'
+        if (Test-Path $folder) { throw "Container folder remains after delete: $folder" }
+        if (!(Test-Path (Join-Path $outside 'keep.txt'))) { throw 'Delete followed a junction out of the container folder' }
+        Remove-Item $outside -Recurse -Force
+        Write-Output 'PASS delete disposable test container and its folder without following links'
     }
 }
