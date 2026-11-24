@@ -2136,11 +2136,15 @@ def endpoint_icon_directory():
     return config_home / "outerssh" / "endpoint-icons"
 
 
-def endpoint_icon_data(app):
+def endpoint_icon_data(app, container_id=None):
     """Returns the PNG icon Outer Loop cached for the app's host endpoint in
-    OuterSSH's per-user endpoint icon cache. See endpoint-icons.md."""
+    OuterSSH's per-user endpoint icon cache. See endpoint-icons.md. A stopped
+    container app has no published socket yet, so its relay path is computed."""
     port = app.get("publishedPort") or 0
     socket = app.get("externalSocketPath") or ""
+    inner = app.get("socketPath") or ""
+    if not socket and container_id and inner.startswith("/"):
+        socket = str(relay_path(container_id, inner))
     if 0 < port <= 65535:
         line = f"tcp localhost {port}"
     elif socket.startswith("/") and "\n" not in socket and "\r" not in socket:
@@ -2176,10 +2180,10 @@ def stat_is_regular(status):
     return (status.st_mode & 0o170000) == 0o100000
 
 
-def with_endpoint_icon(app):
+def with_endpoint_icon(app, container_id=None):
     if app.get("iconData"):
         return app
-    data = endpoint_icon_data(app)
+    data = endpoint_icon_data(app, container_id)
     return dict(app, iconData=data) if data else app
 
 
@@ -2682,7 +2686,7 @@ def workspace_dictionary(record, overview=False):
             record["cachedCommands"] = commands
         except Exception:
             pass
-    apps = [with_endpoint_icon(app) for app in apps]
+    apps = [with_endpoint_icon(app, container_id) for app in apps]
     if state != "running":
         apps = [dict(app, isRunning=False, externalSocketPath=None) for app in apps]
     if owns_container:
@@ -2768,7 +2772,7 @@ def workspace_dictionary(record, overview=False):
 def unavailable_workspace_dictionary(record, error):
     container_id = record["id"]
     owns_container = record_owns_container(record)
-    apps = [dict(with_endpoint_icon(app), isRunning=False, externalSocketPath=None)
+    apps = [dict(with_endpoint_icon(app, container_id), isRunning=False, externalSocketPath=None)
             for app in record.get("cachedApps", [])]
     return {
         "id": container_id,

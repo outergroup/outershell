@@ -1170,8 +1170,11 @@ bool outer_service_manager_load_service(OuterServiceManager *manager,
     OuterService loaded;
     if (!parse_service_file(path, service_id, &loaded, error, error_size)) return false;
 
-    if (outer_service_manager_has_service(manager, service_id) &&
-        !outer_service_manager_unload_service(manager, service_id, error, error_size)) {
+    pthread_mutex_lock(&manager->mutex);
+    OuterService *existing = find_service(manager, service_id);
+    bool was_running = existing && (existing->desired_running || existing->pid > 0);
+    pthread_mutex_unlock(&manager->mutex);
+    if (existing && !outer_service_manager_unload_service(manager, service_id, error, error_size)) {
         free_service(&loaded);
         return false;
     }
@@ -1184,7 +1187,7 @@ bool outer_service_manager_load_service(OuterServiceManager *manager,
             return false;
         }
     }
-    loaded.desired_running = loaded.start_mode == START_EAGER;
+    loaded.desired_running = loaded.start_mode == START_EAGER || was_running;
     loaded.state = loaded.desired_running ? "starting" : "stopped";
     loaded.restart_at_ms = monotonic_ms();
     OuterService *services = realloc(manager->services,

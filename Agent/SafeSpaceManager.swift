@@ -875,7 +875,7 @@ final class SafeSpaceManager: @unchecked Sendable {
                     let running = listedRecordIDs.contains(record.id)
                     return ["id": record.id.uuidString,
                             "name": record.name,
-                            "apps": (cachedApps[record.id] ?? []).map { appDictionary($0, running: running) }]
+                            "apps": (cachedApps[record.id] ?? []).map { appDictionary($0, running: running, containerID: record.id) }]
                 }
             }
             try publishEndpointNames(workspaces)
@@ -1171,7 +1171,7 @@ final class SafeSpaceManager: @unchecked Sendable {
             }
             let apps = lock.withSafeSpaceLock {
                 (cachedApps[record.id] ?? []).map {
-                    appDictionary($0, running: state == "running" && supportsRunningApps)
+                    appDictionary($0, running: state == "running" && supportsRunningApps, containerID: record.id)
                 }
             }
             let commands: [[String: Any]]
@@ -3966,17 +3966,18 @@ final class SafeSpaceManager: @unchecked Sendable {
             let old = Dictionary(uniqueKeysWithValues: (cachedApps[safeSpaceID] ?? []).map {
                 ($0.frontendID, $0)
             })
-            cachedApps[safeSpaceID] = snapshots.map {
-                SafeSpaceCachedApp(frontendID: $0.frontendID,
-                                   serviceID: $0.serviceID,
-                                   displayName: $0.displayName,
-                                   socketPath: $0.socketPath,
-                                   externalSocketPath: $0.externalSocketPath,
-                                   url: $0.url,
-                                   iconPath: $0.iconPath,
-                                   iconData: old[$0.frontendID]?.iconData,
-                                   isRunning: $0.isRunning,
-                                   publishedPort: $0.publishedPort)
+            cachedApps[safeSpaceID] = snapshots.map { snapshot in
+                let previous = old[snapshot.frontendID]
+                return SafeSpaceCachedApp(frontendID: snapshot.frontendID,
+                                          serviceID: snapshot.serviceID,
+                                          displayName: snapshot.displayName,
+                                          socketPath: snapshot.socketPath,
+                                          externalSocketPath: snapshot.externalSocketPath,
+                                          url: snapshot.url,
+                                          iconPath: snapshot.iconPath,
+                                          iconData: previous?.iconPath == snapshot.iconPath ? previous?.iconData : nil,
+                                          isRunning: snapshot.isRunning,
+                                          publishedPort: snapshot.publishedPort)
             }
         }
     }
@@ -4048,7 +4049,7 @@ final class SafeSpaceManager: @unchecked Sendable {
         path=\(shellQuoted(path))
         if [ -f "${path}" ]; then
             size="$(/usr/bin/stat -c '%s' "${path}" 2>/dev/null || true)"
-            if [ -n "${size}" ] && [ "${size}" -le 49152 ]; then
+            if [ -n "${size}" ] && [ "${size}" -le 524288 ]; then
                 /usr/bin/base64 -w 0 "${path}"
             fi
         fi
@@ -4063,7 +4064,7 @@ final class SafeSpaceManager: @unchecked Sendable {
             base64Encoded: encoded.trimmingCharacters(in: .whitespacesAndNewlines)
         ),
         !data.isEmpty,
-        data.count <= 48 * 1024,
+        data.count <= 512 * 1024,
         let image = NSBitmapImageRep(data: data),
         image.pixelsWide > 0,
         image.pixelsHigh > 0,
@@ -4075,7 +4076,8 @@ final class SafeSpaceManager: @unchecked Sendable {
     }
 
     private func appDictionary(_ app: SafeSpaceCachedApp,
-                               running: Bool) -> [String: Any] {
+                               running: Bool,
+                               containerID: UUID) -> [String: Any] {
         var value: [String: Any] = [
             "frontendID": app.frontendID,
             "serviceID": app.serviceID,
@@ -4087,19 +4089,22 @@ final class SafeSpaceManager: @unchecked Sendable {
             "isRunning": running && (app.isRunning ?? false),
             "publishedPort": app.publishedPort ?? 0
         ]
-        if let iconData = app.iconData ?? endpointIconData(for: app) {
+        if let iconData = app.iconData ?? endpointIconData(for: app, containerID: containerID) {
             value["iconData"] = iconData
         }
         return value
     }
 
     /// The icon Outer Loop cached on this Mac for the app's host endpoint, in
-    /// OuterSSH's per-user endpoint icon cache. See endpoint-icons.md.
-    private func endpointIconData(for app: SafeSpaceCachedApp) -> Data? {
+    /// OuterSSH's per-user endpoint icon cache. See endpoint-icons.md. A stopped
+    /// app has no published socket yet, so its relay path is computed.
+    private func endpointIconData(for app: SafeSpaceCachedApp, containerID: UUID) -> Data? {
         let line: String
+        let published = app.externalSocketPath.flatMap { $0.isEmpty ? nil : $0 }
+            ?? (app.socketPath.hasPrefix("/") ? relaySocketPath(containerID, socketPath: app.socketPath) : nil)
         if let port = app.publishedPort, port > 0, port <= 65535 {
             line = "tcp localhost \(port)"
-        } else if let socket = app.externalSocketPath, socket.hasPrefix("/"), !socket.contains("\n") {
+        } else if let socket = published, socket.hasPrefix("/"), !socket.contains("\n") {
             line = "unix \(socket)"
         } else {
             return nil
@@ -4915,17 +4920,18 @@ final class SafeSpaceManager: @unchecked Sendable {
             .appendingPathComponent(String(id.uuidString.lowercased().prefix(8)), isDirectory: true)
     }
 
-    private func publishedSocketPath(_ id: UUID, socketPath: String) throws -> String {
+    private func relaySocketPath(_ id: UUID, socketPath: String) -> String {
         let digest = socketPath.utf8.reduce(UInt64(14_695_981_039_346_656_037)) {
             ($0 ^ UInt64($1)) &* 1_099_511_628_211
         }
-        let directory = relayDirectory(id)
-        try FileManager.default.createDirectory(at: directory,
+        return relayDirectory(id).appendingPathComponent(String(format: "%016llx.sock", digest)).path
+    }
+
+    private func publishedSocketPath(_ id: UUID, socketPath: String) throws -> String {
+        try FileManager.default.createDirectory(at: relayDirectory(id),
                                                 withIntermediateDirectories: true,
                                                 attributes: [.posixPermissions: 0o700])
-        return directory.appendingPathComponent(
-            String(format: "%016llx.sock", digest)
-        ).path
+        return relaySocketPath(id, socketPath: socketPath)
     }
 
     private func authorizePublishedSocketPath(_ socketPath: String) throws {

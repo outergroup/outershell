@@ -38,6 +38,17 @@ with tempfile.TemporaryDirectory() as root:
     assert with_icon(socket_app)["iconData"] == encoded and "iconData" not in socket_app
     declared = dict(socket_app, iconData=b"declared")
     assert with_icon(declared)["iconData"] == b"declared"
+    container_id = "016d8738-d087-49e6-ab95-14d85e9bdb09"
+    stopped = {"serviceID": "site", "frontendID": "site:main", "externalSocketPath": "",
+               "socketPath": "/run/user/0/org.outershell.image.site", "publishedPort": 0, "iconPath": ""}
+    relay = str(provider["relay_path"](container_id, stopped["socketPath"]))
+    relay_icon = cache / (hashlib.sha256(f"unix {relay}".encode()).hexdigest() + ".png")
+    relay_icon.write_bytes(png)
+    relay_icon.chmod(0o600)
+    assert icon_data(stopped) is None
+    assert icon_data(stopped, container_id) == encoded
+    assert with_icon(stopped, container_id)["iconData"] == encoded
+    relay_icon.unlink()
     assert icon_data(dict(socket_app, externalSocketPath="relative.sock", publishedPort=0)) is None
     assert icon_data(dict(socket_app, externalSocketPath="", publishedPort=0)) is None
 
@@ -60,4 +71,5 @@ record = {"cachedApps": [dict(socket_app, iconData="old")]}
 update(record, [socket_app])
 assert record["cachedApps"] == [socket_app]
 print("PASS: container app icons come from the endpoint icon cache by published port or relay socket, "
-      "declared icons take precedence, and unsafe or invalid cache entries are ignored")
+      "stopped container apps use their computed relay socket, declared icons take precedence, "
+      "and unsafe or invalid cache entries are ignored")
