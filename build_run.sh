@@ -205,9 +205,9 @@ for architecture in aarch64 x86_64; do
     cp "${socket_bridge}" "${destination}/outershell-socket-bridge"
     cp "${socket_bridge}" "${run_destination}/outershell-socket-bridge"
 done
-for support_file in Dockerfile outershell-container-init; do
-    cp "${SCRIPT_DIR}/Container/Support/${support_file}" "${bootstrap_resource}/${support_file}"
-    cp "${SCRIPT_DIR}/Container/Support/${support_file}" "${bootstrap_run_resource}/${support_file}"
+for support_file in Dockerfile outershell-container-init share; do
+    cp -R "${SCRIPT_DIR}/Container/Support/${support_file}" "${bootstrap_resource}/${support_file}"
+    cp -R "${SCRIPT_DIR}/Container/Support/${support_file}" "${bootstrap_run_resource}/${support_file}"
 done
 rm -rf "${BUILD_ROOT}/${CONFIGURATION}/Outer Shell.app/Contents/Resources/bundled-apps"
 /usr/bin/codesign --force --sign - \

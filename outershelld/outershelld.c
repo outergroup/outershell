@@ -2491,6 +2491,7 @@ static bool quarantine_invalid_registry_binary(const char *registry_path, const 
 #include "RegistryStore.inc"
 #include "ContainerRegistration.inc"
 #include "../Backend/OffsetArchive.inc"
+#include "../Backend/OuterShellAppOrigin.h"
 
 static bool registry_store_open_user_readonly(RegistryStore *store, char *error, size_t error_size) {
     return registry_store_open_at(store, g_registry_database_path, false, error, error_size);
@@ -4578,7 +4579,9 @@ static bool append_registered_backend_payloads(const RegistryStore *database,
         char script_path[PATH_MAX] = "";
         managed_backend_script_path(service_id, effective_service_scope, script_path, sizeof(script_path));
         const char *public_base_url = is_self ? g_home_screen_public_base_url : "";
-        bool service_is_running = strcmp(status, "running") == 0;
+        bool externally_supervised = !has_launchd_unit && !has_systemd_unit && !has_outerservice && !is_self;
+        if (externally_supervised) snprintf(status, sizeof(status), "external");
+        bool service_is_running = externally_supervised || strcmp(status, "running") == 0;
         ok = build_frontends_array_payload(database,
                                            service_id,
                                            service_is_running,
@@ -14692,6 +14695,64 @@ static void run_api_reactor(int api_listener) {
     free(clients);
 }
 
+static char **outer_service_environment(void *context, const char *service_id) {
+    (void)context;
+    RegistryStore store;
+    char error[256];
+    if (!service_id || !registry_store_open_user_readonly(&store, error, sizeof(error))) return NULL;
+    const char *relay_directory = getenv("OUTERSHELL_RELAY_DIRECTORY");
+    StringBuilder origins = {0};
+    size_t count = 0;
+    char first[512] = "";
+    for (size_t index = 0; index < store.frontend_count; index++) {
+        const RegistryFrontendRecord *frontend = &store.frontends[index];
+        if (!frontend->service_id || strcmp(frontend->service_id, service_id) != 0 ||
+            frontend->endpoint_kind != OUTERSHELLD_API_FRONTEND_ENDPOINT_UNIX ||
+            !frontend->socket_path || frontend->socket_path[0] != '/') {
+            continue;
+        }
+        char relay[PATH_MAX];
+        const char *path = frontend->socket_path;
+        if (relay_directory && relay_directory[0] == '/' &&
+            outer_shell_container_relay_path(relay_directory, frontend->socket_path, relay, sizeof(relay))) {
+            path = relay;
+        } else if (frontend->external_socket_path && frontend->external_socket_path[0] == '/') {
+            path = frontend->external_socket_path;
+        }
+        char origin[512];
+        if (!outer_shell_unix_socket_origin(path,
+                                            frontend->endpoint_scheme == OUTERSHELLD_API_FRONTEND_SCHEME_HTTPS,
+                                            origin,
+                                            sizeof(origin)) ||
+            (origins.data && strstr(origins.data, origin))) {
+            continue;
+        }
+        if (count++) sb_append(&origins, " ");
+        sb_append(&origins, origin);
+        if (count == 1) snprintf(first, sizeof(first), "%s", origin);
+    }
+    registry_store_free(&store);
+    if (!count || !origins.data) {
+        free(origins.data);
+        return NULL;
+    }
+    char **values = calloc(3, sizeof(char *));
+    size_t plural_length = strlen("OUTERSHELL_APP_ORIGINS=") + origins.length + 1;
+    if (values) values[0] = malloc(plural_length);
+    if (values && values[0]) snprintf(values[0], plural_length, "OUTERSHELL_APP_ORIGINS=%s", origins.data);
+    if (values && values[0] && count == 1) {
+        size_t length = strlen("OUTERSHELL_APP_ORIGIN=") + strlen(first) + 1;
+        values[1] = malloc(length);
+        if (values[1]) snprintf(values[1], length, "OUTERSHELL_APP_ORIGIN=%s", first);
+    }
+    free(origins.data);
+    if (values && !values[0]) {
+        free(values);
+        return NULL;
+    }
+    return values;
+}
+
 static void outershelld_usage(const char *program) {
     fprintf(stderr, "Usage: %s [--api-socket-path PATH] [--database PATH] [--system-database PATH] [--bundled-apps-dir DIR] [--web-root DIR] [--public-base-url URL] [--service-manager system|internal] [--services-dir DIR] [--stay-alive] [--container-guest]\n", program);
 }
@@ -14774,7 +14835,9 @@ int OuterShelldMain(int argc, char **argv) {
             .launcher_path = executable,
             .api_socket_path = api_socket_path,
             .event_callback = outer_service_event,
-            .event_context = NULL
+            .event_context = NULL,
+            .environment_callback = outer_service_environment,
+            .environment_context = NULL
         };
         g_outer_service_manager = outer_service_manager_create(&options, manager_error, sizeof(manager_error));
         if (!g_outer_service_manager) {

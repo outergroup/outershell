@@ -71,6 +71,8 @@ for arch in aarch64 x86_64; do
 done
 require_file "${RUN_ROOT}/container-bootstrap/Dockerfile"
 require_file "${RUN_ROOT}/container-bootstrap/outershell-container-init"
+require_file "${RUN_ROOT}/container-bootstrap/share/OUTERCTL.md"
+require_file "${RUN_ROOT}/container-bootstrap/share/skills/outer-shell/SKILL.md"
 for arch in aarch64 x86_64; do
     if wants_variant "linux-${arch}"; then
         require_file "${PACKAGE_ROOT}/RemoteLinuxBinaries/${arch}/outershelld"

@@ -1766,8 +1766,7 @@ bool writeImageAppRegistration(const ImageAppRequest &request,
                     "/usr/local/bin/outerctl backend upsert --backend ", file) != EOF;
     if (ok) ok = shellQuote(file, serviceID);
     if (ok) ok = fputs(" --name ", file) != EOF && shellQuote(file, request.displayName);
-    if (ok) ok = fputs(" --service-file ", file) != EOF && shellQuote(file, servicePath);
-    if (ok) ok = fputs(" --outershell-owns true\n/usr/local/bin/outerctl app upsert --backend ", file) != EOF &&
+    if (ok) ok = fputs("\n/usr/local/bin/outerctl app upsert --backend ", file) != EOF &&
         shellQuote(file, serviceID);
     if (ok) ok = fputs(" --frontend-id ", file) != EOF;
     if (ok) {
@@ -1786,7 +1785,11 @@ bool writeImageAppRegistration(const ImageAppRequest &request,
     if (ok) ok = fputs("\n/usr/local/bin/outerctl log add --backend ", file) != EOF &&
         shellQuote(file, serviceID);
     if (ok) ok = fputs(" --path ", file) != EOF && shellQuote(file, logPath);
-    if (ok) ok = fputc('\n', file) != EOF;
+    if (ok) ok = fputs("\n/usr/local/bin/outerctl backend upsert --backend ", file) != EOF &&
+        shellQuote(file, serviceID);
+    if (ok) ok = fputs(" --name ", file) != EOF && shellQuote(file, request.displayName);
+    if (ok) ok = fputs(" --service-file ", file) != EOF && shellQuote(file, servicePath);
+    if (ok) ok = fputs(" --outershell-owns true\n", file) != EOF;
     return ok && finishImageFile(file, destination, 0755);
 }
 

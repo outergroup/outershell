@@ -15,7 +15,7 @@ update = provider["update_cached_apps"]
 png = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII="
 )
-encoded = base64.b64encode(png).decode()
+encoded = png
 
 with tempfile.TemporaryDirectory() as root:
     os.environ["XDG_CONFIG_HOME"] = root
@@ -36,8 +36,8 @@ with tempfile.TemporaryDirectory() as root:
     assert icon_data(socket_app) == encoded
     assert icon_data(port_app) == encoded
     assert with_icon(socket_app)["iconData"] == encoded and "iconData" not in socket_app
-    declared = dict(socket_app, iconData="declared")
-    assert with_icon(declared)["iconData"] == "declared"
+    declared = dict(socket_app, iconData=b"declared")
+    assert with_icon(declared)["iconData"] == b"declared"
     assert icon_data(dict(socket_app, externalSocketPath="relative.sock", publishedPort=0)) is None
     assert icon_data(dict(socket_app, externalSocketPath="", publishedPort=0)) is None
 

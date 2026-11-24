@@ -15,6 +15,7 @@ RUN outerctl image add-app \
     [--url /initial/path] \
     [--working-directory /absolute/path] \
     [--icon-path /absolute/path/icon.png] \
+    [--start manual|eager] \
     (--socket-argument=OPTION | --tcp-port PORT) \
     -- /absolute/path/to/server [ARGUMENTS...]
 ```
@@ -27,7 +28,10 @@ Use exactly one transport:
 - `--tcp-port PORT` starts the declared server and publishes its loopback TCP
   port through a Unix socket. The image must provide `bash` and `socat`.
 
-The service starts eagerly with the container and is restarted after failure.
+By default (`--start manual`), the service starts the first time the user
+opens the app after the container starts. Use `--start eager` for a service
+that should run whenever the container runs, such as one that does work in the
+background. Either way, it is restarted after failure.
 Its logs are exposed through Outer Shell. `--url` defaults to `/`, and
 `--working-directory` defaults to `/root`.
 
@@ -58,6 +62,38 @@ any host name, but some only accept `localhost` and reject everything else with
 `--ServerApp.allow_remote_access=True`. This is safe only because the server is
 reachable just through the container's Unix socket or its loopback address. Don't
 use it for a server on a published TCP port, especially with the token disabled.
+
+Apps that check the browser's `Origin` instead need the exact address. Outer
+Shell starts every app with it in `OUTERSHELL_APP_ORIGIN`, for example
+`http://f5yhe2lw….unix.outerssh.localhost`. The address is specific to the
+server and the container, so read it at startup rather than writing it into the
+Dockerfile. A start script can pass it to the app's allowed-origins setting
+before starting the app:
+
+```dockerfile
+RUN printf '%s\n' '#!/bin/sh' 'set -eu' \
+        'example-app config set allowed-origins "$OUTERSHELL_APP_ORIGIN"' \
+        'exec example-app serve --port 8000' \
+        > /usr/local/bin/example-app-start \
+    && chmod 0755 /usr/local/bin/example-app-start
+```
+
+`OUTERSHELL_APP_ORIGINS` lists every address when one app serves several
+endpoints; `OUTERSHELL_APP_ORIGIN` is set only when there is exactly one.
+
+## Publish an app in the running container
+
+A declaration in the Dockerfile takes effect at the next rebuild. To publish
+the same app right away, run the identical `outerctl image add-app` command in
+the running container, then run the registration script it writes:
+
+```sh
+sh /etc/outershell/apps.d/org.outershell.image.ID.sh
+```
+
+The app then appears in Outer Shell and starts like an app declared in the
+image. Running `outerctl image add-command` in the running container publishes
+a command-line tool the same way, without a separate script.
 
 ## Publish a command-line tool
 

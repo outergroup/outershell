@@ -425,6 +425,11 @@
     return parts.slice(0, 2).map(part => part[0]).join("").toUpperCase() || "A";
   }
 
+  function appIconDataURL(value) {
+    if (typeof value === "string") return value ? `data:image/png;base64,${value}` : "";
+    return dataURL(value);
+  }
+
   function dataURL(bytes) {
     if (!bytes || !bytes.length) return "";
     let binary = "";
@@ -444,7 +449,7 @@
 
   function launcherIconHTML(item) {
     const source = dataURL(item.backend?.iconData) || item.app?.iconURL || (item.app?.iconData
-      ? `data:image/png;base64,${escapeHTML(item.app.iconData)}`
+      ? appIconDataURL(item.app.iconData)
       : (item.frontend?.iconURL || dataURL(item.frontend?.iconData)));
     const content = source
       ? `<img src="${escapeHTML(source)}" alt="">`
@@ -460,7 +465,7 @@
 
   function listIconHTML(item) {
     const source = dataURL(item.backend?.iconData) || item.app?.iconURL || (item.app?.iconData
-      ? `data:image/png;base64,${escapeHTML(item.app.iconData)}`
+      ? appIconDataURL(item.app.iconData)
       : (item.frontend?.iconURL || dataURL(item.frontend?.iconData)));
     const content = source
       ? `<img src="${escapeHTML(source)}" alt="">`
@@ -469,7 +474,7 @@
   }
 
   function safeSpaceAppIconHTML(app) {
-    const source = app.iconURL || (app.iconData ? `data:image/png;base64,${app.iconData}` : "");
+    const source = app.iconURL || appIconDataURL(app.iconData);
     const content = source
       ? `<img src="${escapeHTML(source)}" alt="">`
       : `<span>${escapeHTML(initials(app.displayName || app.serviceID).slice(0, 1))}</span>`;
@@ -1700,6 +1705,9 @@ RUN outerctl image add-command --id codex --name "Codex" --working-directory /ro
     if (!retry && endpointFailure(endpoint, item.displayName)) {
       showLaunchFailure(item, endpoint, scope);
       return;
+    }
+    if (!endpointReady(endpoint) && !endpoint.backend.canControl) {
+      throw new Error(`${item.displayName} isn’t responding. Outer Shell doesn’t run it, so start it wherever it was set up.`);
     }
     if (!endpointReady(endpoint)) {
       toast(`Starting ${item.displayName}…`);

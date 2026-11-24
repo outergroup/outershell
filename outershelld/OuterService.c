@@ -88,6 +88,8 @@ struct OuterServiceManager {
     char *api_socket_path;
     OuterServiceEventCallback event_callback;
     void *event_context;
+    OuterServiceEnvironmentCallback environment_callback;
+    void *environment_context;
     OuterService *services;
     size_t service_count;
     pthread_mutex_t mutex;
@@ -588,10 +590,18 @@ static char **build_environment(const OuterServiceManager *manager,
                                 size_t socket_count) {
     size_t inherited_count = 0;
     if (service->inherit_environment) while (environ[inherited_count]) inherited_count++;
+    char **extra = manager->environment_callback
+        ? manager->environment_callback(manager->environment_context, service->id)
+        : NULL;
+    size_t extra_count = 0;
+    while (extra && extra[extra_count]) extra_count++;
     size_t capacity = inherited_count + service->pass_environment_count +
-                      service->environment_count + 7;
+                      service->environment_count + extra_count + 7;
     char **result = calloc(capacity, sizeof(char *));
-    if (!result) return NULL;
+    if (!result) {
+        free_strings(extra, extra_count);
+        return NULL;
+    }
     size_t count = 0;
     if (service->inherit_environment) {
         for (size_t index = 0; index < inherited_count; index++) {
@@ -618,6 +628,17 @@ static char **build_environment(const OuterServiceManager *manager,
             snprintf(result[count++], length, "OUTERSHELLD_API_SOCKET=%s", manager->api_socket_path);
         }
     }
+    for (size_t index = 0; index < extra_count; index++) {
+        const char *separator = strchr(extra[index], '=');
+        if (!separator) continue;
+        char name[256];
+        size_t name_length = (size_t)(separator - extra[index]);
+        if (name_length == 0 || name_length >= sizeof(name)) continue;
+        memcpy(name, extra[index], name_length);
+        name[name_length] = 0;
+        if (!service_environment_defines(service, name)) result[count++] = duplicate_string(extra[index]);
+    }
+    free_strings(extra, extra_count);
     for (size_t index = 0; index < service->environment_count; index++) {
         result[count++] = duplicate_string(service->environment[index]);
     }
@@ -988,6 +1009,8 @@ OuterServiceManager *outer_service_manager_create(const OuterServiceManagerOptio
     manager->api_socket_path = duplicate_string(options->api_socket_path);
     manager->event_callback = options->event_callback;
     manager->event_context = options->event_context;
+    manager->environment_callback = options->environment_callback;
+    manager->environment_context = options->environment_context;
     manager->wake_pipe[0] = manager->wake_pipe[1] = -1;
     pthread_mutex_init(&manager->mutex, NULL);
     if (!manager->services_directory || !manager->launcher_path || !manager->api_socket_path ||

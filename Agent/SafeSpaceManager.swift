@@ -1242,8 +1242,7 @@ final class SafeSpaceManager: @unchecked Sendable {
                 for key in ["apps", "commands"] {
                     value[key] = try (value[key] as? [[String: Any]] ?? []).map { item in
                         var item = item
-                        if let encoded = item.removeValue(forKey: "iconData") as? String,
-                           let data = Data(base64Encoded: encoded) {
+                        if let data = item.removeValue(forKey: "iconData") as? Data {
                             item["iconURL"] = try overviewIconURL(data)
                         }
                         return item
@@ -1469,7 +1468,7 @@ final class SafeSpaceManager: @unchecked Sendable {
             "iconPath": command.iconPath
         ]
         if let iconData = commandIconData(command, for: record) {
-            value["iconData"] = iconData.base64EncodedString()
+            value["iconData"] = iconData
         }
         return value
     }
@@ -2474,6 +2473,7 @@ final class SafeSpaceManager: @unchecked Sendable {
                 "--mount", try persistentMount(record, item: item) + ",target=" + item.guestPath
             ])
         }
+        arguments.append(contentsOf: ["--env", "OUTERSHELL_RELAY_DIRECTORY=\(relayDirectory(record.id).path)"])
         for variable in configuration.environment ?? [] {
             arguments.append(contentsOf: [
                 "--env", "\(variable.name)=\(variable.value)"
@@ -2526,6 +2526,7 @@ final class SafeSpaceManager: @unchecked Sendable {
                 "--mount", try persistentMount(record, item: item) + ",target=" + item.guestPath
             ])
         }
+        arguments.append(contentsOf: ["--env", "OUTERSHELL_RELAY_DIRECTORY=\(relayDirectory(record.id).path)"])
         for variable in configuration.environment ?? [] {
             arguments.append(contentsOf: ["--env", "\(variable.name)=\(variable.value)"])
         }
@@ -3617,6 +3618,14 @@ final class SafeSpaceManager: @unchecked Sendable {
     }
 
     private func socketOwner(in record: SafeSpaceRecord, socketPath: String) throws -> UInt32 {
+        let exists = try runRuntime(record, [
+            "exec", "--user", "root",
+            containerName(record.id),
+            "/usr/bin/test", "-S", socketPath
+        ])
+        guard exists.status == 0 else {
+            throw SafeSpaceManagerError.commandFailed("The app is still starting. Try again in a moment.")
+        }
         let result = try runRuntime(record, [
             "exec", "--user", "root",
             containerName(record.id),
@@ -4079,7 +4088,7 @@ final class SafeSpaceManager: @unchecked Sendable {
             "publishedPort": app.publishedPort ?? 0
         ]
         if let iconData = app.iconData ?? endpointIconData(for: app) {
-            value["iconData"] = iconData.base64EncodedString()
+            value["iconData"] = iconData
         }
         return value
     }
@@ -4566,8 +4575,11 @@ final class SafeSpaceManager: @unchecked Sendable {
             digestInput.append(Data("bin/\(name)\0".utf8))
             digestInput.append(Data(SHA256.hash(data: try Data(contentsOf: destination))))
         }
-        for name in ["Dockerfile", "outershell-container-init"] {
+        for name in ["Dockerfile", "outershell-container-init",
+                     "share/OUTERCTL.md", "share/skills/outer-shell/SKILL.md"] {
             let destination = directory.appendingPathComponent(name)
+            try FileManager.default.createDirectory(at: destination.deletingLastPathComponent(),
+                                                    withIntermediateDirectories: true)
             try FileManager.default.copyItem(at: resources.appendingPathComponent(name), to: destination)
             digestInput.append(Data("\(name)\0".utf8))
             digestInput.append(Data(SHA256.hash(data: try Data(contentsOf: destination))))
@@ -4897,15 +4909,17 @@ final class SafeSpaceManager: @unchecked Sendable {
             .appendingPathComponent(id.uuidString.lowercased(), isDirectory: true)
     }
 
+    private func relayDirectory(_ id: UUID) -> URL {
+        URL(fileURLWithPath: "/private/tmp/outershell-\(getuid())", isDirectory: true)
+            .appendingPathComponent("container-relays", isDirectory: true)
+            .appendingPathComponent(String(id.uuidString.lowercased().prefix(8)), isDirectory: true)
+    }
+
     private func publishedSocketPath(_ id: UUID, socketPath: String) throws -> String {
         let digest = socketPath.utf8.reduce(UInt64(14_695_981_039_346_656_037)) {
             ($0 ^ UInt64($1)) &* 1_099_511_628_211
         }
-        let directory = URL(fileURLWithPath: "/private/tmp/outershell-\(getuid())",
-                            isDirectory: true)
-            .appendingPathComponent("container-relays", isDirectory: true)
-            .appendingPathComponent(String(id.uuidString.lowercased().prefix(8)),
-                                    isDirectory: true)
+        let directory = relayDirectory(id)
         try FileManager.default.createDirectory(at: directory,
                                                 withIntermediateDirectories: true,
                                                 attributes: [.posixPermissions: 0o700])

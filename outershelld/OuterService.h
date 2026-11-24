@@ -8,12 +8,19 @@ typedef struct OuterServiceManager OuterServiceManager;
 
 typedef void (*OuterServiceEventCallback)(void *context, const char *service_id);
 
+/* Returns extra NAME=value entries for a service's environment as a
+ * NULL-terminated array that the manager frees, or NULL for none. Entries the
+ * service's own Environment lines define take precedence. */
+typedef char **(*OuterServiceEnvironmentCallback)(void *context, const char *service_id);
+
 typedef struct {
     const char *services_directory;
     const char *launcher_path;
     const char *api_socket_path;
     OuterServiceEventCallback event_callback;
     void *event_context;
+    OuterServiceEnvironmentCallback environment_callback;
+    void *environment_context;
 } OuterServiceManagerOptions;
 
 typedef struct {

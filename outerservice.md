@@ -70,6 +70,21 @@ Backlog=64
 | `LogPath` | Absolute combined stdout/stderr append log | inherited |
 | `Essential` | Shut down the internal manager if this service exits permanently | `false` |
 
+Every service also receives `OUTERSHELLD_API_SOCKET` and, when its backend has
+app endpoints on Unix sockets, the browser addresses Outer Loop uses for them:
+
+- `OUTERSHELL_APP_ORIGINS`: the origins of all the backend's Unix-socket
+  endpoints, separated by spaces, such as
+  `http://f5yhe2lw….unix.outerssh.localhost`.
+- `OUTERSHELL_APP_ORIGIN`: the same origin, set only when there is exactly one.
+
+Apps that check the `Origin` or `Host` header can trust these. Inside a
+container, the origin is that of the host-side relay socket, which the
+container's `outershelld` works out from `OUTERSHELL_RELAY_DIRECTORY`. The
+values are fixed when the service starts; an endpoint registered later appears
+after the service restarts. An `Environment` line with the same name replaces
+the computed value. TCP and named-pipe endpoints are not included.
+
 A socket section is named `[Socket.<descriptor-name>]`. Unix sockets use `Type=unix` and an absolute `Path`. IPv4 TCP sockets use `Type=tcp`, `Address` (default `127.0.0.1`), and `Port`. `Mode` applies to Unix sockets; `Backlog` defaults to 64.
 
 ## Activation and Lifecycle

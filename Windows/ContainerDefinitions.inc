@@ -671,7 +671,8 @@ static char *container_upgraded_dockerfile(const char *dockerfile) {
 static bool container_prepare_support(Wsl *w, ContainerRuntime runtime, const char *dockerfile) {
     if (!strstr(dockerfile, container_support_image)) return true;
     static const char *const files[] = {"Dockerfile", "outershell-container-init", "bin\\outershelld",
-                                        "bin\\outerctl", "bin\\outershell-socket-bridge"};
+                                        "bin\\outerctl", "bin\\outershell-socket-bridge",
+                                        "share\\OUTERCTL.md", "share\\skills\\outer-shell\\SKILL.md"};
     char *directory = win_executable_directory();
     char *context = directory ? win_join(directory, "container-bootstrap") : NULL;
     char *local = win_folder(CSIDL_LOCAL_APPDATA);

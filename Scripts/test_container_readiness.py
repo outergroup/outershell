@@ -62,6 +62,9 @@ class ReadinessTests(unittest.TestCase):
                 (binaries / name).write_bytes(b"one")
             (root / "Dockerfile").write_text("FROM scratch\n")
             (root / "outershell-container-init").write_text("#!/bin/sh\n")
+            skill = root / "share" / "skills" / "outer-shell" / "SKILL.md"
+            skill.parent.mkdir(parents=True)
+            skill.write_text("one\n")
             labels = []
 
             def build(context, tag, *args, **kwargs):
@@ -77,8 +80,10 @@ class ReadinessTests(unittest.TestCase):
                 g["ensure_support_image"](None)
                 (binaries / "outershelld").write_bytes(b"two")
                 g["ensure_support_image"](None)
-            self.assertEqual(len(labels), 2)
-            self.assertNotEqual(*labels)
+                skill.write_text("two\n")
+                g["ensure_support_image"](None)
+            self.assertEqual(len(labels), 3)
+            self.assertEqual(len(set(labels)), 3)
 
     def test_legacy_dockerfiles_are_upgraded(self):
         upgraded = g["upgraded_dockerfile"](

@@ -995,6 +995,7 @@ def support_image_context(directory):
         shutil.copy2(binaries / name, directory / "bin" / name)
     for name in ["Dockerfile", "outershell-container-init"]:
         shutil.copy2(resources / name, directory / name)
+    shutil.copytree(resources / "share", directory / "share")
 
 
 def ensure_support_image(log_path):
@@ -1194,6 +1195,7 @@ def create_runtime_container(container_id):
                   "--entrypoint", CONTAINER_INIT, "--user", "0"]
     for variable in CONTAINER_ENVIRONMENT:
         arguments += ["--env", variable]
+    arguments += ["--env", f"OUTERSHELL_RELAY_DIRECTORY={relay_directory(container_id)}"]
     with Records() as records:
         record = find_record(records.values, container_id)
         cpus = record.get("cpus", DEFAULT_CPUS)
@@ -2135,7 +2137,7 @@ def endpoint_icon_directory():
 
 
 def endpoint_icon_data(app):
-    """Returns the base64 icon Outer Loop cached for the app's host endpoint in
+    """Returns the PNG icon Outer Loop cached for the app's host endpoint in
     OuterSSH's per-user endpoint icon cache. See endpoint-icons.md."""
     port = app.get("publishedPort") or 0
     socket = app.get("externalSocketPath") or ""
@@ -2163,7 +2165,7 @@ def endpoint_icon_data(app):
         os.close(descriptor)
     if not data.startswith(b"\x89PNG\r\n\x1a\n"):
         return None
-    return base64.b64encode(data).decode("ascii")
+    return data
 
 
 def stat_is_directory(status):
@@ -2252,7 +2254,7 @@ def copy_icon(container_id, source, cache_name):
         return None
     if not data or len(data) > 512 * 1024:
         return None
-    return base64.b64encode(data).decode()
+    return data
 
 
 def operation_control_app(request):
@@ -2435,10 +2437,16 @@ esac
     ], check=True)
 
 
-def relay_path(container_id, inner_path):
+def relay_directory(container_id):
     runtime = pathlib.Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"))
-    digest = hashlib.sha256(inner_path.encode()).hexdigest()[:16]
-    return runtime / "outershell-relays" / container_id[:8] / (digest + ".sock")
+    return runtime / "outershell-relays" / container_id[:8]
+
+
+def relay_path(container_id, inner_path):
+    digest = 14695981039346656037
+    for byte in inner_path.encode():
+        digest = ((digest ^ byte) * 1099511628211) & 0xFFFFFFFFFFFFFFFF
+    return relay_directory(container_id) / f"{digest:016x}.sock"
 
 
 def stop_relays(container_id):
@@ -3025,9 +3033,8 @@ def handle_request(request):
                 for field in ("definition", "mounts", "persistentData"):
                     workspace.pop(field, None)
                 for app in workspace.get("apps", []) + workspace.get("commands", []):
-                    encoded = app.pop("iconData", None)
-                    if encoded:
-                        data = base64.b64decode(encoded, validate=True)
+                    data = app.pop("iconData", None)
+                    if data:
                         key = hashlib.sha256(data).hexdigest()
                         destination = icons / (key + ".png")
                         if not destination.exists():

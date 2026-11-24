@@ -9739,7 +9739,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                     if let current = response.workspaces.first(where: { $0.id == workspace.id }),
                        let ready = current.apps.first(where: { $0.serviceID == app.serviceID && $0.frontendID == app.frontendID }),
                        self.displayedWorkspaceState(for: current) == "running", ready.isRunning,
-                       ready.publishedPort > 0 || ready.externalSocketPath?.isEmpty == false || !ready.socketPath.isEmpty {
+                       ready.publishedPort > 0 || ready.externalSocketPath?.isEmpty == false {
                         self.launchingEndpoints.remove(key)
                         self.openWorkspaceApp(ready, in: current, opensInNewTab: opensInNewTab, opensInNewWindow: opensInNewWindow)
                         return
@@ -9759,7 +9759,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                   opensInNewTab: Bool,
                                   opensInNewWindow: Bool = false) {
         if !app.isRunning || displayedWorkspaceState(for: workspace) != "running" ||
-            (app.publishedPort <= 0 && app.externalSocketPath?.isEmpty != false && app.socketPath.isEmpty) {
+            (app.publishedPort <= 0 && app.externalSocketPath?.isEmpty != false) {
             prepareAndOpenWorkspaceApp(app, in: workspace, opensInNewTab: opensInNewTab, opensInNewWindow: opensInNewWindow)
             return
         }
@@ -9880,6 +9880,11 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                                               opensInNewWindow: Bool,
                                               didRecoverNetworking: Bool = false) {
         guard !launchingEndpoints.contains(launchKey(endpoint)), let controlEndpoint = workspaceAPIEndpoint(controlEndpoint), let urlSession else { return }
+        guard endpoint.backend.canControl else {
+            backendError = "\(displayName) isn’t responding. Outer Shell doesn’t run it, so start it wherever it was set up."
+            updateLayout()
+            return
+        }
         launchingEndpoints.insert(launchKey(endpoint))
         backendError = ""
         updateLayout()
