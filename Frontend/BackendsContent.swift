@@ -1831,6 +1831,9 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
     private var copyConfirmation: CopyConfirmation?
     private var isPerformingWorkspaceOperation = false
     private var addWorkspaceMessage = ""
+    /// Progress or the result of a container import, shown on the Manage containers card.
+    private var containerImportStatus = ""
+    private var containerImportStatusID = UUID()
     private var isRefreshingWorkspaces = false
     private var pendingWorkspaceOperations: [UUID: String] = [:]
     private var pendingWorkspaceOperationWorkspaceIDs: [UUID: UUID] = [:]
@@ -4285,7 +4288,8 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         let spacing: CGFloat = 10
         let contentWidth = min(iconSize + spacing + titleWidth, frame.width - 32)
         let contentX = floor((frame.width - contentWidth) / 2)
-        let titleY = addWorkspaceMessage.isEmpty ? floor((frame.height - 18) / 2) : floor(frame.height / 2)
+        let cardMessage = containerImportStatus.isEmpty ? addWorkspaceMessage : containerImportStatus
+        let titleY = cardMessage.isEmpty ? floor((frame.height - 18) / 2) : floor(frame.height / 2)
 
         let icon = CALayer()
         icon.frame = CGRect(x: contentX, y: titleY + 1, width: iconSize, height: iconSize)
@@ -4302,9 +4306,12 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                              height: 18)
         card.addSublayer(title)
 
-        if !addWorkspaceMessage.isEmpty {
-            let detail = makeTextLayer(size: 11, weight: .regular, color: .systemRed, alignment: .center)
-            detail.string = addWorkspaceMessage
+        if !cardMessage.isEmpty {
+            let detail = makeTextLayer(size: 11,
+                                       weight: .regular,
+                                       color: containerImportStatus.isEmpty ? .systemRed : .secondaryLabelColor,
+                                       alignment: .center)
+            detail.string = cardMessage
             detail.frame = CGRect(x: 16, y: titleY - 26, width: max(frame.width - 32, 1), height: 16)
             card.addSublayer(detail)
         }
@@ -16573,16 +16580,15 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
 
     private func importSharedContainer(at url: URL, runtimeProviderID: String) {
         isPerformingWorkspaceOperation = true
-        workspacePanelMessage = "Importing shared container…"
-        updateLayout()
+        setContainerImportStatus("Uploading \(url.lastPathComponent)…")
         performContainerTransferRequest(operation: "beginImport") { [weak self] result in
             guard let self else { return }
             switch result {
             case .failure(let error):
-                self.finishSharedContainerImport(error: error)
+                self.failSharedContainerImport(error: error)
             case .success(let response):
                 guard let transferID = response.transferID else {
-                    self.finishSharedContainerImport(message: "The server could not begin the import.")
+                    self.failSharedContainerImport(message: "The server could not begin the import.")
                     return
                 }
                 do {
@@ -16596,7 +16602,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                         retryCount: 0
                     )
                 } catch {
-                    self.finishSharedContainerImport(error: error)
+                    self.failSharedContainerImport(error: error)
                 }
             }
         }
@@ -16634,7 +16640,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         guard let endpoint = containerUploadEndpoint(transferID: transferID),
               let safeSpaceOperationSession else {
             try? handle.close()
-            finishSharedContainerImport(
+            failSharedContainerImport(
                 message: "Outer Shell's container transfer service is unavailable."
             )
             return
@@ -16663,7 +16669,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                       let offset = self.uploadOffset(from: response),
                       offset <= byteCount else {
                     try? handle.close()
-                    self.finishSharedContainerImport(
+                    self.failSharedContainerImport(
                         message: "The destination returned an invalid container transfer offset."
                     )
                     return
@@ -16692,7 +16698,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             data = try handle.read(upToCount: ContainerResumableUpload.segmentSize) ?? Data()
         } catch {
             try? handle.close()
-            finishSharedContainerImport(error: error)
+            failSharedContainerImport(error: error)
             return
         }
         if data.isEmpty {
@@ -16706,7 +16712,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         guard let endpoint = containerUploadEndpoint(transferID: transferID),
               let safeSpaceOperationSession else {
             try? handle.close()
-            finishSharedContainerImport(
+            failSharedContainerImport(
                 message: "Outer Shell's container transfer service is unavailable."
             )
             return
@@ -16735,7 +16741,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 }
                 guard let httpResponse = response as? HTTPURLResponse else {
                     try? handle.close()
-                    self.finishSharedContainerImport(
+                    self.failSharedContainerImport(
                         message: "The destination returned no container transfer response."
                     )
                     return
@@ -16755,7 +16761,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                       total > sentByteCount,
                       total <= byteCount else {
                     try? handle.close()
-                    self.finishSharedContainerImport(
+                    self.failSharedContainerImport(
                         message: "The destination did not accept the container transfer segment."
                     )
                     return
@@ -16763,8 +16769,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 let percent = byteCount > 0
                     ? min(Int((Double(total) / Double(byteCount)) * 100), 99)
                     : 0
-                self.workspacePanelMessage = "Importing shared container… \(percent)%"
-                self.updateLayout()
+                self.setContainerImportStatus("Uploading container… \(percent)%")
                 self.uploadSharedContainerSegment(
                     transferID: transferID,
                     runtimeProviderID: runtimeProviderID,
@@ -16787,6 +16792,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         if let mountDestinationRoot {
             values["mountDestinationRoot"] = mountDestinationRoot
         }
+        setContainerImportStatus("Importing container…")
         performContainerTransferRequest(
             operation: "finishImport",
             values: values
@@ -16796,11 +16802,12 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             case .failure(let error):
                 if self.pendingSharedContainerImport != nil {
                     self.isPerformingWorkspaceOperation = false
+                    self.containerImportStatus = ""
                     self.workspacePanelMessage = error.localizedDescription
                     self.focusEditorInput(selectAll: false)
                     self.updateLayout()
                 } else {
-                    self.finishSharedContainerImport(error: error)
+                    self.failSharedContainerImport(error: error)
                 }
             case .success(let response):
                 if response.needsMountDestination == true,
@@ -16814,6 +16821,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                         mounts: mounts
                     )
                     self.isPerformingWorkspaceOperation = false
+                    self.containerImportStatus = ""
                     self.workspaceNamePromptDismissesPanel = true
                     self.workspaceRenameName = suggestedMountRoot
                     self.workspacePanelMessage = ""
@@ -16835,7 +16843,7 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
                 self.workspaceNamePromptDismissesPanel = false
                 self.workspaceRenameName = ""
                 self.isShowingWorkspacePanel = false
-                self.finishSharedContainerImport(message: message)
+                self.completeSharedContainerImport(message: message)
                 self.scheduleWorkspaceRefresh()
             }
         }
@@ -16851,15 +16859,14 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
         guard retryCount < ContainerResumableUpload.maximumRetryCount,
               canRetryContainerTransfer(after: error) else {
             try? handle.close()
-            finishSharedContainerImport(error: error)
+            failSharedContainerImport(error: error)
             return
         }
         _ = recoverNetworkingIfNeeded(after: error)
         let percent = byteCount > 0
             ? min(Int((Double(sentByteCount) / Double(byteCount)) * 100), 99)
             : 0
-        workspacePanelMessage = "Importing shared container… \(percent)% · Reconnecting…"
-        updateLayout()
+        setContainerImportStatus("Uploading container… \(percent)% · Reconnecting…")
         let delay = min(pow(2.0, Double(retryCount)), 8.0)
         DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
             self?.resumeSharedContainerUpload(
@@ -16894,14 +16901,32 @@ private final class BackendsHandler: NSObject, OuterframeHostDelegate, SingleLin
             message.contains("temporarily unavailable")
     }
 
-    private func finishSharedContainerImport(error: Error) {
-        finishSharedContainerImport(message: error.localizedDescription)
+    private func setContainerImportStatus(_ status: String) {
+        containerImportStatus = status
+        containerImportStatusID = UUID()
+        updateLayout()
     }
 
-    private func finishSharedContainerImport(message: String) {
+    private func failSharedContainerImport(error: Error) {
+        failSharedContainerImport(message: error.localizedDescription)
+    }
+
+    private func failSharedContainerImport(message: String) {
         isPerformingWorkspaceOperation = false
-        workspacePanelMessage = message
-        updateLayout()
+        containerImportStatus = ""
+        containerImportStatusID = UUID()
+        showMessageDialog(title: "Could not import container", text: message)
+    }
+
+    private func completeSharedContainerImport(message: String) {
+        isPerformingWorkspaceOperation = false
+        setContainerImportStatus(message)
+        let statusID = containerImportStatusID
+        DispatchQueue.main.asyncAfter(deadline: .now() + 8) { [weak self] in
+            guard let self, self.containerImportStatusID == statusID else { return }
+            self.containerImportStatus = ""
+            self.updateLayout()
+        }
     }
 
     private struct ManagementPanel {
