@@ -13,12 +13,18 @@ class AuthorizationTests(unittest.TestCase):
     def check_scope(self, owner, socket_path, scope):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
+            tools = root / 'bin'
+            tools.mkdir()
+            stat = tools / 'stat'
+            stat.write_text(f'#!/bin/sh\n[ $# = 4 ] && [ "$1 $2 $3" = "-c %u --" ] && [ -n "$4" ] && printf "%s\\n" {owner}\n')
+            stat.chmod(0o755)
             def execute(container, command, **options):
                 self.assertEqual(container, 'container')
                 self.assertTrue(options['check'])
-                if command[0] == '/usr/bin/stat':
-                    self.assertEqual(command, ['/usr/bin/stat', '-c', '%u', '--', socket_path])
-                    return subprocess.CompletedProcess(command, 0, owner + '\n')
+                if command[-1] == socket_path:
+                    self.assertEqual(command[:2], ['/bin/sh', '-c'])
+                    return subprocess.run(command, env={'PATH': f'{tools}:/usr/bin:/bin'},
+                                          capture_output=True, text=True, check=True)
                 script = command[2].replace('/root/.config/outerssh', str(root / 'user')).replace('/etc/outerssh', str(root / 'system'))
                 return subprocess.run(['/bin/sh', '-c', script], check=True)
             with patch.dict(authorize.__globals__, container_exec=execute):

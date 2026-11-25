@@ -2387,7 +2387,8 @@ def authorize_container_socket(container_id, socket_path):
     if not socket_path.startswith("/"):
         raise ValueError("Container socket path must be absolute.")
     owner = container_exec(
-        container_id, ["/usr/bin/stat", "-c", "%u", "--", socket_path], check=True,
+        container_id, ["/bin/sh", "-c", 'exec stat -c %u -- "$1"', "sh", socket_path],
+        check=True,
     ).stdout.strip()
     user_socket = owner == "0" and socket_path.startswith("/run/user/0/")
     directory = "/root/.config/outerssh" if user_socket else "/etc/outerssh"
