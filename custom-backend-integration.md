@@ -208,6 +208,9 @@ Create `~/Library/LaunchAgents/com.example.TensorBoard.plist`:
   <key>Label</key>
   <string>com.example.TensorBoard</string>
 
+  <key>ProcessType</key>
+  <string>Interactive</string>
+
   <key>ProgramArguments</key>
   <array>
     <string>/Users/alice/Library/Application Support/example-tensorboard/run-tensorboard.sh</string>
@@ -234,6 +237,8 @@ Create `~/Library/LaunchAgents/com.example.TensorBoard.plist`:
 </dict>
 </plist>
 ```
+
+`ProcessType` `Interactive` gives the backend the same scheduling as an app, so it stays responsive when the machine is busy. Without it, launchd uses `Standard`, which throttles CPU and I/O.
 
 Replace `/Users/alice` with the real home directory. Then load the plist:
 

@@ -782,6 +782,7 @@ plist_path, app_id, backend_path, socket_path, app_root, log_path = sys.argv[1:]
 plist = {
     "Label": app_id,
     "AssociatedBundleIdentifiers": ["org.outershell.OuterShell.Agent"],
+    "ProcessType": "Interactive",
     "ProgramArguments": [
         backend_path,
         "--socket", socket_path,

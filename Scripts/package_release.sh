@@ -637,6 +637,8 @@ EOF
   <array>
     <string>org.outershell.OuterShell.Agent</string>
   </array>
+  <key>ProcessType</key>
+  <string>Interactive</string>
   <key>ProgramArguments</key>
   <array>
     <string>$app_executable_xml</string>

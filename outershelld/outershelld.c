@@ -3624,6 +3624,121 @@ static void bootout_launchd_service_and_wait(const char *quoted_target) {
     }
 }
 
+#ifdef __APPLE__
+// Outer Shell's agent reaps every child process from its frontend loop, so in
+// that process an exit status from popen() or system() is unreliable. These
+// helpers judge results by command output alone.
+static void capture_command_output(const char *command, char *output, size_t output_size) {
+    output[0] = '\0';
+    (void)run_launchctl_capture(command, output, output_size);
+    output[strcspn(output, "\n")] = '\0';
+}
+
+static void read_plist_value(const char *quoted_plist, const char *key, char *output, size_t output_size) {
+    char command[PATH_MAX * 2 + 128];
+    snprintf(command, sizeof(command), "/usr/libexec/PlistBuddy -c 'Print :%s' %s 2>/dev/null", key, quoted_plist);
+    capture_command_output(command, output, output_size);
+}
+
+static bool launchd_job_loaded(const char *quoted_target, char *status, size_t status_size) {
+    char command[512];
+    snprintf(command, sizeof(command), "launchctl print %s 2>/dev/null", quoted_target);
+    status[0] = '\0';
+    (void)run_launchctl_capture(command, status, status_size);
+    return strstr(status, "\tstate = ") != NULL;
+}
+
+// Gives a plist written before Outer Shell set ProcessType the Interactive
+// type, so launchd stops throttling that job. A loaded job that is not
+// running is reloaded now; a running one picks it up when launchd next loads it.
+static void upgrade_launchd_process_type(const char *label, const char *plist_path, const char *domain) {
+    if (!launchd_label_is_safe(label) || access(plist_path, F_OK) != 0) return;
+    char quoted_plist[PATH_MAX * 2], value[256];
+    shell_quote(plist_path, quoted_plist, sizeof(quoted_plist));
+    read_plist_value(quoted_plist, "ProcessType", value, sizeof(value));
+    if (value[0]) return;
+    char command[PATH_MAX * 2 + 128];
+    snprintf(command, sizeof(command), "/usr/libexec/PlistBuddy -c 'Add :ProcessType string Interactive' %s >/dev/null 2>&1", quoted_plist);
+    capture_command_output(command, value, sizeof(value));
+    read_plist_value(quoted_plist, "ProcessType", value, sizeof(value));
+    if (strcmp(value, "Interactive") != 0) {
+        log_event("Could not set ProcessType for %s.", label);
+        return;
+    }
+    char target[320], quoted_target[384], status[8192];
+    snprintf(target, sizeof(target), "%s/%s", domain, label);
+    shell_quote(target, quoted_target, sizeof(quoted_target));
+    if (!launchd_job_loaded(quoted_target, status, sizeof(status))) {
+        log_event("Set ProcessType Interactive for %s.", label);
+        return;
+    }
+    if (strstr(status, "\tstate = running")) {
+        log_event("Set ProcessType Interactive for %s; it applies when launchd next loads the job.", label);
+        return;
+    }
+    snprintf(command, sizeof(command), "launchctl bootout %s >/dev/null 2>&1", quoted_target);
+    capture_command_output(command, value, sizeof(value));
+    for (unsigned attempt = 0; attempt < 300 && launchd_job_loaded(quoted_target, status, sizeof(status)); attempt++)
+        usleep(100000);
+    char quoted_domain[64], output[1024] = "";
+    shell_quote(domain, quoted_domain, sizeof(quoted_domain));
+    snprintf(command, sizeof(command), "launchctl bootstrap %s %s 2>&1", quoted_domain, quoted_plist);
+    bool loaded = false;
+    for (unsigned attempt = 0; attempt < 20 && !loaded; attempt++) {
+        capture_command_output(command, output, sizeof(output));
+        loaded = launchd_job_loaded(quoted_target, status, sizeof(status));
+        if (!loaded) usleep(100000);
+    }
+    if (loaded)
+        log_event("Set ProcessType Interactive for %s and reloaded it.", label);
+    else
+        log_event("Set ProcessType Interactive for %s, but reloading it failed: %s", label, output);
+}
+
+static bool launchd_plist_is_outer_shell_job(const char *plist_path) {
+    char quoted_plist[PATH_MAX * 2], command[PATH_MAX * 2 + 128], output[4096] = "";
+    shell_quote(plist_path, quoted_plist, sizeof(quoted_plist));
+    snprintf(command, sizeof(command), "/usr/libexec/PlistBuddy -c 'Print :AssociatedBundleIdentifiers' %s 2>/dev/null", quoted_plist);
+    (void)run_launchctl_capture(command, output, sizeof(output));
+    return strstr(output, "org.outershell.OuterShell.Agent") != NULL;
+}
+
+// Covers every job Outer Shell wrote: bundled apps, services created from
+// Outer Shell's UI, and Outer Shell itself. Each names Outer Shell's agent in
+// AssociatedBundleIdentifiers, and its plist is named after its label.
+static void upgrade_outer_shell_launchd_process_types(void) {
+    bool system_scope = geteuid() == 0;
+    char directory[PATH_MAX], domain[64];
+    if (system_scope) {
+        snprintf(directory, sizeof(directory), "/Library/LaunchDaemons");
+        snprintf(domain, sizeof(domain), "system");
+    } else {
+        snprintf(directory, sizeof(directory), "%s/Library/LaunchAgents", home_directory());
+        snprintf(domain, sizeof(domain), "gui/%d", (int)getuid());
+    }
+    DIR *listing = opendir(directory);
+    if (!listing) return;
+    struct dirent *entry;
+    while ((entry = readdir(listing))) {
+        size_t length = strlen(entry->d_name);
+        if (length <= 6 || length - 6 >= 256 || strcmp(entry->d_name + length - 6, ".plist") != 0) continue;
+        char label[256], plist_path[PATH_MAX];
+        snprintf(label, sizeof(label), "%.*s", (int)(length - 6), entry->d_name);
+        if (!launchd_label_is_safe(label)) continue;
+        snprintf(plist_path, sizeof(plist_path), "%s/%s", directory, entry->d_name);
+        if (launchd_plist_is_outer_shell_job(plist_path))
+            upgrade_launchd_process_type(label, plist_path, domain);
+    }
+    closedir(listing);
+}
+
+static void *upgrade_outer_shell_launchd_process_types_main(void *context) {
+    (void)context;
+    upgrade_outer_shell_launchd_process_types();
+    return NULL;
+}
+#endif
+
 static void unload_launchd_service_if_needed(const char *label, const char *domain) {
     if (!launchd_label_is_safe(label) || launchd_is_system_domain(domain)) return;
     char target[320];
@@ -6995,6 +7110,8 @@ static bool ensure_root_helper_installed(const char *sudo_password, bool *needs_
             "    <array>\n"
             "        <string>org.outershell.OuterShell.Agent</string>\n"
             "    </array>\n"
+            "    <key>ProcessType</key>\n"
+            "    <string>Interactive</string>\n"
             "    <key>ProgramArguments</key>\n"
             "    <array>\n"
             "        <string>%s</string>\n"
@@ -10565,6 +10682,8 @@ static bool make_bundled_launchd_plist(const char *label,
                          "    <array>\n"
                          "        <string>org.outershell.OuterShell.Agent</string>\n"
                          "    </array>\n"
+                         "    <key>ProcessType</key>\n"
+                         "    <string>Interactive</string>\n"
                          "    <key>ProgramArguments</key>\n"
                          "    <array>\n");
     ok = ok && append_xml_string_element(builder, binary_path);
@@ -11421,6 +11540,8 @@ static bool make_launchd_plist(const char *label,
                          "    <array>\n"
                          "        <string>org.outershell.OuterShell.Agent</string>\n"
                          "    </array>\n"
+                         "    <key>ProcessType</key>\n"
+                         "    <string>Interactive</string>\n"
                          "    <key>ProgramArguments</key>\n"
                          "    <array>\n"
                          "        <string>");
@@ -14882,6 +15003,12 @@ int OuterShelldMain(int argc, char **argv) {
     }
 #ifndef __APPLE__
     if (!g_internal_service_manager) start_systemd_status_watcher();
+#else
+    if (!g_container_guest) {
+        pthread_t process_type_thread;
+        if (pthread_create(&process_type_thread, NULL, upgrade_outer_shell_launchd_process_types_main, NULL) == 0)
+            pthread_detach(process_type_thread);
+    }
 #endif
     run_api_reactor(api_listener);
     close(api_listener);
